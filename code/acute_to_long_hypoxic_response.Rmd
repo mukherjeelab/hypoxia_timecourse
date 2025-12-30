@@ -28,6 +28,8 @@ library(survival)
 library(DESeq2)
 library(limma)
 library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
 library(plotly)
 library(ggokabeito)
 library(ggvenn)
@@ -42,6 +44,8 @@ library(writexl)
 library(survminer)
 library(readxl)
 library(reshape2)
+library(pheatmap)
+library(ggridges)
 ```
 
 ```{r}
@@ -95,4 +99,1890 @@ table(deseq_4hr$class)
 
 cat("\n24hr significant genes:\n")
 table(deseq_24hr$class)
+```
+
+
+
+# Which genes are hypoxia up one hour? which overlap in all three?
+
+
+```{r}
+unique(deseq_1hr$class)
+
+up_1_hr <- deseq_1hr |> 
+  filter(class== "Hypoxia up") |> pull(symbol)
+up_4_hr <- deseq_4hr |> 
+  filter(class== "Hypoxia up")|> pull(symbol)
+
+up_24_hr <- deseq_24hr |>
+  filter(class== "Hypoxia up")|> pull(symbol)
+
+# Also get downregulated genes for sanity check
+down_1_hr <- deseq_1hr |>
+  filter(class== "Hypoxia down") |> pull(symbol)
+down_4_hr <- deseq_4hr |>
+  filter(class== "Hypoxia down")|> pull(symbol)
+down_24_hr <- deseq_24hr |>
+  filter(class== "Hypoxia down")|> pull(symbol)
+
+```
+
+## Analyze overlap of upregulated genes across timepoints
+
+```{r}
+# Calculate intersections
+int_1_4 <- intersect(up_1_hr, up_4_hr)
+int_1_24 <- intersect(up_1_hr, up_24_hr)
+int_4_24 <- intersect(up_4_hr, up_24_hr)
+int_all_three <- intersect(int_1_4, up_24_hr)
+
+# Count genes at each timepoint
+cat("Number of upregulated genes at each timepoint:\n")
+cat("1hr:", length(up_1_hr), "genes\n")
+cat("4hr:", length(up_4_hr), "genes\n")
+cat("24hr:", length(up_24_hr), "genes\n\n")
+
+# Count overlaps
+cat("Overlap between timepoints:\n")
+cat("1hr & 4hr:", length(int_1_4), "genes\n")
+cat("1hr & 24hr:", length(int_1_24), "genes\n")
+cat("4hr & 24hr:", length(int_4_24), "genes\n")
+cat("All three timepoints:", length(int_all_three), "genes\n\n")
+
+# Calculate unique genes per timepoint
+unique_1hr <- setdiff(up_1_hr, union(up_4_hr, up_24_hr))
+unique_4hr <- setdiff(up_4_hr, union(up_1_hr, up_24_hr))
+unique_24hr <- setdiff(up_24_hr, union(up_1_hr, up_4_hr))
+
+cat("Unique genes (not shared with other timepoints):\n")
+cat("Only 1hr:", length(unique_1hr), "genes\n")
+cat("Only 4hr:", length(unique_4hr), "genes\n")
+cat("Only 24hr:", length(unique_24hr), "genes\n\n")
+
+# What percentage of 1hr genes remain upregulated at later timepoints?
+pct_1hr_in_4hr <- round(length(int_1_4) / length(up_1_hr) * 100, 1)
+pct_1hr_in_24hr <- round(length(int_1_24) / length(up_1_hr) * 100, 1)
+pct_1hr_in_all <- round(length(int_all_three) / length(up_1_hr) * 100, 1)
+
+cat("Of the", length(up_1_hr), "genes upregulated at 1hr:\n")
+cat(pct_1hr_in_4hr, "% are also upregulated at 4hr\n")
+cat(pct_1hr_in_24hr, "% are also upregulated at 24hr\n")
+cat(pct_1hr_in_all, "% are upregulated at all three timepoints\n")
+```
+
+## Visualize gene overlap with Venn diagram
+
+```{r venn_diagram}
+# Create list for Venn diagram
+venn_list <- list(
+  "1hr" = up_1_hr,
+  "4hr" = up_4_hr,
+  "24hr" = up_24_hr
+)
+
+# Create Venn diagram
+venn_plot <- ggvenn(venn_list,
+                    fill_color = c("#E69F00", "#56B4E9", "#009E73"),
+                    stroke_size = 0.5,
+                    set_name_size = 4,
+                    text_size = 3) +
+  ggtitle("Upregulated genes across hypoxia timepoints (control cells)")
+
+venn_plot
+
+ggsave(here("plots/hypoxia_upregulated_venn.pdf"), venn_plot, width = 6, height = 5)
+```
+
+## Summary table of gene categories
+
+```{r summary_table}
+# Create comprehensive summary
+summary_df <- data.frame(
+  Category = c(
+    "All three timepoints",
+    "1hr & 4hr only",
+    "1hr & 24hr only",
+    "4hr & 24hr only",
+    "1hr only",
+    "4hr only",
+    "24hr only"
+  ),
+  Count = c(
+    length(int_all_three),
+    length(setdiff(int_1_4, up_24_hr)),
+    length(setdiff(int_1_24, up_4_hr)),
+    length(setdiff(int_4_24, up_1_hr)),
+    length(unique_1hr),
+    length(unique_4hr),
+    length(unique_24hr)
+  )
+)
+
+summary_df <- summary_df %>%
+  mutate(Percentage = round(Count / sum(Count) * 100, 1))
+
+datatable(summary_df,
+          caption = "Distribution of upregulated genes across timepoints",
+          options = list(pageLength = 10))
+```
+
+## Export gene lists for each category
+
+```{r export_gene_lists}
+# Create gene lists with additional information from DESeq results
+genes_all_three <- deseq_1hr %>%
+  filter(symbol %in% int_all_three) %>%
+  dplyr::select(gene_id, symbol) %>%
+  left_join(deseq_1hr %>% dplyr::select(gene_id, padj_1hr = padj, log2FC_1hr = log2FoldChange), by = "gene_id") %>%
+  left_join(deseq_4hr %>% dplyr::select(gene_id, padj_4hr = padj, log2FC_4hr = log2FoldChange), by = "gene_id") %>%
+  left_join(deseq_24hr %>% dplyr::select(gene_id, padj_24hr = padj, log2FC_24hr = log2FoldChange), by = "gene_id") %>%
+  arrange(desc(log2FC_1hr))
+
+genes_1hr_only <- deseq_1hr %>%
+  filter(symbol %in% unique_1hr) %>%
+  dplyr::select(gene_id, symbol, padj, log2FoldChange) %>%
+  arrange(desc(log2FoldChange))
+
+genes_4hr_only <- deseq_4hr %>%
+  filter(symbol %in% unique_4hr) %>%
+  dplyr::select(gene_id, symbol, padj, log2FoldChange) %>%
+  arrange(desc(log2FoldChange))
+
+genes_24hr_only <- deseq_24hr %>%
+  filter(symbol %in% unique_24hr) %>%
+  dplyr::select(gene_id, symbol, padj, log2FoldChange) %>%
+  arrange(desc(log2FoldChange))
+
+# Display genes upregulated at all three timepoints
+cat("\nTop genes upregulated at all three timepoints:\n")
+datatable(genes_all_three,
+          caption = paste("Genes upregulated at 1hr, 4hr, and 24hr (n =", length(int_all_three), ")"),
+          options = list(pageLength = 10))
+
+# Export to Excel
+gene_lists <- list(
+  "All_three_timepoints" = genes_all_three,
+  "1hr_only" = genes_1hr_only,
+  "4hr_only" = genes_4hr_only,
+  "24hr_only" = genes_24hr_only,
+  "1hr_and_4hr" = deseq_1hr %>% filter(symbol %in% setdiff(int_1_4, up_24_hr)) %>%
+    dplyr::select(gene_id, symbol, padj_1hr = padj, log2FC_1hr = log2FoldChange),
+  "1hr_and_24hr" = deseq_1hr %>% filter(symbol %in% setdiff(int_1_24, up_4_hr)) %>%
+    dplyr::select(gene_id, symbol, padj_1hr = padj, log2FC_1hr = log2FoldChange),
+  "4hr_and_24hr" = deseq_4hr %>% filter(symbol %in% setdiff(int_4_24, up_1_hr)) %>%
+    dplyr::select(gene_id, symbol, padj_4hr = padj, log2FC_4hr = log2FoldChange)
+)
+
+write_xlsx(gene_lists, here("output/hypoxia_upregulated_gene_lists.xlsx"))
+cat("\nGene lists exported to: output/hypoxia_upregulated_gene_lists.xlsx\n")
+```
+
+# GSEA: Hypoxia Response Pathway Analysis
+
+Perform Gene Set Enrichment Analysis (GSEA) on the ranked list of genes based on RNA log2 fold changes (hypoxia vs normoxia) at each timepoint, following the approach used in ribopipe-shiny.
+
+## Load MSigDB gene sets
+
+```{r load_msigdb}
+# Get Hallmark gene sets from MSigDB
+hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("Loaded MSigDB Hallmark gene sets:\n")
+cat("Number of pathways:", length(unique(hallmark$gs_name)), "\n")
+```
+
+## GSEA: 1hr Hypoxia
+
+```{r gsea_1hr}
+# Create ranked list based on RNA log2FC (hypoxia vs normoxia)
+ranked_list_1hr <- deseq_1hr$log2FoldChange
+names(ranked_list_1hr) <- deseq_1hr$symbol
+
+# Sort by LFC (descending) and remove duplicates
+ranked_list_1hr <- sort(ranked_list_1hr, decreasing = TRUE)
+ranked_list_1hr <- ranked_list_1hr[!duplicated(names(ranked_list_1hr))]
+
+cat("1hr Hypoxia ranked list:\n")
+cat("Total genes:", length(ranked_list_1hr), "\n")
+cat("LFC range:", round(min(ranked_list_1hr, na.rm = TRUE), 2), "to",
+    round(max(ranked_list_1hr, na.rm = TRUE), 2), "\n\n")
+
+# Run GSEA
+gsea_1hr <- GSEA(
+  geneList = ranked_list_1hr,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  minGSSize = 20,
+  maxGSSize = 1000,
+  TERM2GENE = hallmark
+)
+
+# Extract results
+gsea_1hr_results <- gsea_1hr@result %>%
+  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+  rename("leading_edge" = core_enrichment) %>%
+  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+         leading_edge_fraction = leading_edge_count / setSize)
+
+# Round numeric columns
+gsea_1hr_results[] <- lapply(gsea_1hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("GSEA 1hr - Top pathways:\n")
+print(gsea_1hr_results %>% filter(p.adjust < 0.05) %>% arrange(desc(abs(NES))) %>% head(10))
+
+# Dot plot for significant pathways
+p_gsea_1hr <- ggplot(gsea_1hr_results %>% filter(p.adjust < 0.05),
+                      aes(y = reorder(ID, NES), x = NES, fill = p.adjust, size = leading_edge_count)) +
+  geom_point(alpha = 0.7, shape = 21, color = "black") +
+  scale_size(range = c(2, 10)) +
+  scale_fill_viridis(discrete = FALSE, direction = -1) +
+  labs(y = "Pathways",
+       x = "Normalized Enrichment Score (NES)",
+       title = "GSEA: 1hr Hypoxia (Hallmark Pathways)",
+       size = "Number of Genes\nin Leading Edge",
+       fill = "Adjusted P-value") +
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 9))
+
+print(p_gsea_1hr)
+ggsave(here("plots/gsea_hallmark_1hr.pdf"), p_gsea_1hr, width = 10, height = 8)
+```
+
+## GSEA: 4hr Hypoxia
+
+```{r gsea_4hr}
+# Create ranked list
+ranked_list_4hr <- deseq_4hr$log2FoldChange
+names(ranked_list_4hr) <- deseq_4hr$symbol
+ranked_list_4hr <- sort(ranked_list_4hr, decreasing = TRUE)
+ranked_list_4hr <- ranked_list_4hr[!duplicated(names(ranked_list_4hr))]
+
+cat("4hr Hypoxia ranked list:\n")
+cat("Total genes:", length(ranked_list_4hr), "\n")
+cat("LFC range:", round(min(ranked_list_4hr, na.rm = TRUE), 2), "to",
+    round(max(ranked_list_4hr, na.rm = TRUE), 2), "\n\n")
+
+# Run GSEA
+gsea_4hr <- GSEA(
+  geneList = ranked_list_4hr,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  minGSSize = 20,
+  maxGSSize = 1000,
+  TERM2GENE = hallmark
+)
+
+# Extract results
+gsea_4hr_results <- gsea_4hr@result %>%
+  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+  rename("leading_edge" = core_enrichment) %>%
+  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+         leading_edge_fraction = leading_edge_count / setSize)
+
+gsea_4hr_results[] <- lapply(gsea_4hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("GSEA 4hr - Top pathways:\n")
+print(gsea_4hr_results %>% filter(p.adjust < 0.05) %>% arrange(desc(abs(NES))) %>% head(10))
+
+# Dot plot
+p_gsea_4hr <- ggplot(gsea_4hr_results %>% filter(p.adjust < 0.05),
+                      aes(y = reorder(ID, NES), x = NES, fill = p.adjust, size = leading_edge_count)) +
+  geom_point(alpha = 0.7, shape = 21, color = "black") +
+  scale_size(range = c(2, 10)) +
+  scale_fill_viridis(discrete = FALSE, direction = -1) +
+  labs(y = "Pathways",
+       x = "Normalized Enrichment Score (NES)",
+       title = "GSEA: 4hr Hypoxia (Hallmark Pathways)",
+       size = "Number of Genes\nin Leading Edge",
+       fill = "Adjusted P-value") +
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 9))
+
+print(p_gsea_4hr)
+ggsave(here("plots/gsea_hallmark_4hr.pdf"), p_gsea_4hr, width = 10, height = 8)
+```
+
+## GSEA: 24hr Hypoxia
+
+```{r gsea_24hr}
+# Create ranked list
+ranked_list_24hr <- deseq_24hr$log2FoldChange
+names(ranked_list_24hr) <- deseq_24hr$symbol
+ranked_list_24hr <- sort(ranked_list_24hr, decreasing = TRUE)
+ranked_list_24hr <- ranked_list_24hr[!duplicated(names(ranked_list_24hr))]
+
+cat("24hr Hypoxia ranked list:\n")
+cat("Total genes:", length(ranked_list_24hr), "\n")
+cat("LFC range:", round(min(ranked_list_24hr, na.rm = TRUE), 2), "to",
+    round(max(ranked_list_24hr, na.rm = TRUE), 2), "\n\n")
+
+# Run GSEA
+gsea_24hr <- GSEA(
+  geneList = ranked_list_24hr,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  minGSSize = 20,
+  maxGSSize = 1000,
+  TERM2GENE = hallmark
+)
+
+# Extract results
+gsea_24hr_results <- gsea_24hr@result %>%
+  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+  rename("leading_edge" = core_enrichment) %>%
+  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+         leading_edge_fraction = leading_edge_count / setSize)
+
+gsea_24hr_results[] <- lapply(gsea_24hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("GSEA 24hr - Top pathways:\n")
+print(gsea_24hr_results %>% filter(p.adjust < 0.05) %>% arrange(desc(abs(NES))) %>% head(10))
+
+# Dot plot
+p_gsea_24hr <- ggplot(gsea_24hr_results %>% filter(p.adjust < 0.05),
+                       aes(y = reorder(ID, NES), x = NES, fill = p.adjust, size = leading_edge_count)) +
+  geom_point(alpha = 0.7, shape = 21, color = "black") +
+  scale_size(range = c(2, 10)) +
+  scale_fill_viridis(discrete = FALSE, direction = -1) +
+  labs(y = "Pathways",
+       x = "Normalized Enrichment Score (NES)",
+       title = "GSEA: 24hr Hypoxia (Hallmark Pathways)",
+       size = "Number of Genes\nin Leading Edge",
+       fill = "Adjusted P-value") +
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 9))
+
+print(p_gsea_24hr)
+ggsave(here("plots/gsea_hallmark_24hr.pdf"), p_gsea_24hr, width = 10, height = 8)
+```
+
+## Export GSEA results
+
+```{r export_gsea}
+# Compile all GSEA results (exclude leading_edge column for Excel export)
+gsea_results_export <- list(
+  "GSEA_1hr" = gsea_1hr_results %>% dplyr::select(-leading_edge),
+  "GSEA_4hr" = gsea_4hr_results %>% dplyr::select(-leading_edge),
+  "GSEA_24hr" = gsea_24hr_results %>% dplyr::select(-leading_edge)
+)
+
+write_xlsx(gsea_results_export, here("output/hypoxia_gsea_hallmark.xlsx"))
+cat("\nGSEA results exported to: output/hypoxia_gsea_hallmark.xlsx\n")
+```
+
+## Additional Visualizations
+
+### 1. Heatmap: Pathway NES across timepoints
+
+Shows how pathway enrichment changes over the timecourse.
+
+```{r gsea_heatmap}
+# Combine results from all timepoints
+gsea_combined <- bind_rows(
+  gsea_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, NES, p.adjust, timepoint),
+  gsea_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, NES, p.adjust, timepoint),
+  gsea_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, NES, p.adjust, timepoint)
+)
+
+# Filter for pathways significant in at least one timepoint
+sig_pathways <- gsea_combined %>%
+  filter(p.adjust < 0.05) %>%
+  pull(ID) %>%
+  unique()
+
+# Reshape for heatmap
+gsea_wide <- gsea_combined %>%
+  filter(ID %in% sig_pathways) %>%
+  dplyr::select(ID, NES, timepoint) %>%
+  pivot_wider(names_from = timepoint, values_from = NES, values_fill = 0) %>%
+  column_to_rownames("ID")
+
+# Reorder columns
+gsea_wide <- gsea_wide %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Create significance annotation matrix
+sig_matrix <- gsea_combined %>%
+  filter(ID %in% sig_pathways) %>%
+  dplyr::select(ID, p.adjust, timepoint) %>%
+  mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+  dplyr::select(ID, timepoint, sig) %>%
+  pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+  column_to_rownames("ID")
+
+# Reorder columns to match gsea_wide
+sig_matrix <- sig_matrix %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Ensure row order matches between gsea_wide and sig_matrix
+sig_matrix <- sig_matrix[rownames(gsea_wide), ]
+
+# Create heatmap
+if (nrow(gsea_wide) > 0) {
+  p_heatmap <- pheatmap(
+    gsea_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    breaks = seq(-3, 3, length.out = 101),
+    display_numbers = sig_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "GSEA NES Across Timepoints (* = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 12
+  )
+
+  # Save
+  pdf(here("plots/gsea_heatmap_timecourse.pdf"), width = 8, height = 10)
+  print(p_heatmap)
+  dev.off()
+
+  cat("Heatmap shows", nrow(gsea_wide), "significant pathways\n")
+} else {
+  cat("No significant pathways found for heatmap\n")
+}
+```
+
+# ORA: Hallmark Pathway Enrichment for Upregulated Genes
+
+Perform Over-Representation Analysis (ORA) to test if upregulated genes at each timepoint are enriched for Hallmark pathways.
+
+## ORA: 1hr Upregulated Genes
+
+```{r ora_hallmark_1hr}
+# Run ORA on upregulated genes at 1hr
+ora_1hr <- enricher(
+  gene = up_1_hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_1hr_results <- ora_1hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_1hr_results[] <- lapply(ora_1hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA Hallmark 1hr - Enriched pathways:\n")
+print(ora_1hr_results %>% filter(p.adjust < 0.05) %>% arrange(p.adjust) %>% head(10))
+
+# Dot plot
+if (nrow(ora_1hr_results %>% filter(p.adjust < 0.05)) > 0) {
+  p_ora_1hr <- ggplot(ora_1hr_results %>% filter(p.adjust < 0.05),
+                        aes(y = reorder(ID, GeneRatio_numeric), x = GeneRatio_numeric,
+                            fill = p.adjust, size = Count)) +
+    geom_point(alpha = 0.7, shape = 21, color = "black") +
+    scale_size(range = c(2, 10)) +
+    scale_fill_viridis(discrete = FALSE, direction = -1) +
+    labs(y = "Pathways",
+         x = "Gene Ratio",
+         title = "ORA: 1hr Upregulated Genes (Hallmark Pathways)",
+         size = "Gene Count",
+         fill = "Adjusted P-value") +
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_ora_1hr)
+  ggsave(here("plots/ora_hallmark_1hr.pdf"), p_ora_1hr, width = 10, height = 8)
+} else {
+  cat("No significant pathways for 1hr upregulated genes\n")
+}
+```
+
+## ORA: 4hr Upregulated Genes
+
+```{r ora_hallmark_4hr}
+# Run ORA on upregulated genes at 4hr
+ora_4hr <- enricher(
+  gene = up_4_hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_4hr_results <- ora_4hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_4hr_results[] <- lapply(ora_4hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA Hallmark 4hr - Enriched pathways:\n")
+print(ora_4hr_results %>% filter(p.adjust < 0.05) %>% arrange(p.adjust) %>% head(10))
+
+# Dot plot
+if (nrow(ora_4hr_results %>% filter(p.adjust < 0.05)) > 0) {
+  p_ora_4hr <- ggplot(ora_4hr_results %>% filter(p.adjust < 0.05),
+                        aes(y = reorder(ID, GeneRatio_numeric), x = GeneRatio_numeric,
+                            fill = p.adjust, size = Count)) +
+    geom_point(alpha = 0.7, shape = 21, color = "black") +
+    scale_size(range = c(2, 10)) +
+    scale_fill_viridis(discrete = FALSE, direction = -1) +
+    labs(y = "Pathways",
+         x = "Gene Ratio",
+         title = "ORA: 4hr Upregulated Genes (Hallmark Pathways)",
+         size = "Gene Count",
+         fill = "Adjusted P-value") +
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_ora_4hr)
+  ggsave(here("plots/ora_hallmark_4hr.pdf"), p_ora_4hr, width = 10, height = 8)
+} else {
+  cat("No significant pathways for 4hr upregulated genes\n")
+}
+```
+
+## ORA: 24hr Upregulated Genes
+
+```{r ora_hallmark_24hr}
+# Run ORA on upregulated genes at 24hr
+ora_24hr <- enricher(
+  gene = up_24_hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_24hr_results <- ora_24hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_24hr_results[] <- lapply(ora_24hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA Hallmark 24hr - Enriched pathways:\n")
+print(ora_24hr_results %>% filter(p.adjust < 0.05) %>% arrange(p.adjust) %>% head(10))
+
+# Dot plot
+if (nrow(ora_24hr_results %>% filter(p.adjust < 0.05)) > 0) {
+  p_ora_24hr <- ggplot(ora_24hr_results %>% filter(p.adjust < 0.05),
+                         aes(y = reorder(ID, GeneRatio_numeric), x = GeneRatio_numeric,
+                             fill = p.adjust, size = Count)) +
+    geom_point(alpha = 0.7, shape = 21, color = "black") +
+    scale_size(range = c(2, 10)) +
+    scale_fill_viridis(discrete = FALSE, direction = -1) +
+    labs(y = "Pathways",
+         x = "Gene Ratio",
+         title = "ORA: 24hr Upregulated Genes (Hallmark Pathways)",
+         size = "Gene Count",
+         fill = "Adjusted P-value") +
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_ora_24hr)
+  ggsave(here("plots/ora_hallmark_24hr.pdf"), p_ora_24hr, width = 10, height = 8)
+} else {
+  cat("No significant pathways for 24hr upregulated genes\n")
+}
+```
+
+## Export ORA results
+
+```{r export_ora}
+# Compile all ORA results
+ora_results_export <- list(
+  "ORA_1hr" = ora_1hr_results %>% dplyr::select(-GeneRatio_numeric),
+  "ORA_4hr" = ora_4hr_results %>% dplyr::select(-GeneRatio_numeric),
+  "ORA_24hr" = ora_24hr_results %>% dplyr::select(-GeneRatio_numeric)
+)
+
+write_xlsx(ora_results_export, here("output/hypoxia_ora_hallmark.xlsx"))
+cat("\nORA results exported to: output/hypoxia_ora_hallmark.xlsx\n")
+```
+
+## ORA Heatmap: Pathway enrichment across timepoints
+
+```{r ora_heatmap}
+# Combine results from all timepoints
+ora_combined <- bind_rows(
+  ora_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint)
+)
+
+# Filter for pathways significant in at least one timepoint
+sig_ora_pathways <- ora_combined %>%
+  filter(p.adjust < 0.05) %>%
+  pull(ID) %>%
+  unique()
+
+# Reshape for heatmap
+ora_wide <- ora_combined %>%
+  filter(ID %in% sig_ora_pathways) %>%
+  dplyr::select(ID, GeneRatio_numeric, timepoint) %>%
+  pivot_wider(names_from = timepoint, values_from = GeneRatio_numeric, values_fill = 0) %>%
+  column_to_rownames("ID")
+
+# Reorder columns
+ora_wide <- ora_wide %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Create significance annotation matrix
+sig_ora_matrix <- ora_combined %>%
+  filter(ID %in% sig_ora_pathways) %>%
+  dplyr::select(ID, p.adjust, timepoint) %>%
+  mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+  dplyr::select(ID, timepoint, sig) %>%
+  pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+  column_to_rownames("ID")
+
+# Reorder columns to match ora_wide
+sig_ora_matrix <- sig_ora_matrix %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Ensure row order matches
+sig_ora_matrix <- sig_ora_matrix[rownames(ora_wide), ]
+
+# Create heatmap
+if (nrow(ora_wide) > 0) {
+  p_ora_heatmap <- pheatmap(
+    ora_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("white", "red"))(100),
+    breaks = seq(0, max(ora_wide), length.out = 101),
+    display_numbers = sig_ora_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "ORA Gene Ratio Across Timepoints - Hallmark (* = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 12
+  )
+
+  # Save
+  pdf(here("plots/ora_heatmap_timecourse.pdf"), width = 8, height = 10)
+  print(p_ora_heatmap)
+  dev.off()
+
+  cat("ORA heatmap shows", nrow(ora_wide), "significant pathways\n")
+} else {
+  cat("No significant pathways found for ORA heatmap\n")
+}
+```
+
+# ORA: Hallmark Pathway Enrichment for Downregulated Genes (Sanity Check)
+
+Perform Over-Representation Analysis (ORA) on downregulated genes to check for expected pathway depletion patterns.
+
+## ORA: 1hr Downregulated Genes
+
+```{r ora_hallmark_down_1hr}
+# Run ORA on downregulated genes at 1hr
+ora_down_1hr <- enricher(
+  gene = down_1_hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_down_1hr_results <- ora_down_1hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_down_1hr_results[] <- lapply(ora_down_1hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA Hallmark 1hr Downregulated - Enriched pathways:\n")
+print(ora_down_1hr_results %>% filter(p.adjust < 0.05) %>% arrange(p.adjust) %>% head(10))
+
+# Dot plot
+if (nrow(ora_down_1hr_results %>% filter(p.adjust < 0.05)) > 0) {
+  p_ora_down_1hr <- ggplot(ora_down_1hr_results %>% filter(p.adjust < 0.05),
+                        aes(y = reorder(ID, GeneRatio_numeric), x = GeneRatio_numeric,
+                            fill = p.adjust, size = Count)) +
+    geom_point(alpha = 0.7, shape = 21, color = "black") +
+    scale_size(range = c(2, 10)) +
+    scale_fill_viridis(discrete = FALSE, direction = -1) +
+    labs(y = "Pathways",
+         x = "Gene Ratio",
+         title = "ORA: 1hr Downregulated Genes (Hallmark Pathways)",
+         size = "Gene Count",
+         fill = "Adjusted P-value") +
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_ora_down_1hr)
+  ggsave(here("plots/ora_hallmark_down_1hr.pdf"), p_ora_down_1hr, width = 10, height = 8)
+} else {
+  cat("No significant pathways for 1hr downregulated genes\n")
+}
+```
+
+## ORA: 4hr Downregulated Genes
+
+```{r ora_hallmark_down_4hr}
+# Run ORA on downregulated genes at 4hr
+ora_down_4hr <- enricher(
+  gene = down_4_hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_down_4hr_results <- ora_down_4hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_down_4hr_results[] <- lapply(ora_down_4hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA Hallmark 4hr Downregulated - Enriched pathways:\n")
+print(ora_down_4hr_results %>% filter(p.adjust < 0.05) %>% arrange(p.adjust) %>% head(10))
+
+# Dot plot
+if (nrow(ora_down_4hr_results %>% filter(p.adjust < 0.05)) > 0) {
+  p_ora_down_4hr <- ggplot(ora_down_4hr_results %>% filter(p.adjust < 0.05),
+                        aes(y = reorder(ID, GeneRatio_numeric), x = GeneRatio_numeric,
+                            fill = p.adjust, size = Count)) +
+    geom_point(alpha = 0.7, shape = 21, color = "black") +
+    scale_size(range = c(2, 10)) +
+    scale_fill_viridis(discrete = FALSE, direction = -1) +
+    labs(y = "Pathways",
+         x = "Gene Ratio",
+         title = "ORA: 4hr Downregulated Genes (Hallmark Pathways)",
+         size = "Gene Count",
+         fill = "Adjusted P-value") +
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_ora_down_4hr)
+  ggsave(here("plots/ora_hallmark_down_4hr.pdf"), p_ora_down_4hr, width = 10, height = 8)
+} else {
+  cat("No significant pathways for 4hr downregulated genes\n")
+}
+```
+
+## ORA: 24hr Downregulated Genes
+
+```{r ora_hallmark_down_24hr}
+# Run ORA on downregulated genes at 24hr
+ora_down_24hr <- enricher(
+  gene = down_24_hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_down_24hr_results <- ora_down_24hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_down_24hr_results[] <- lapply(ora_down_24hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA Hallmark 24hr Downregulated - Enriched pathways:\n")
+print(ora_down_24hr_results %>% filter(p.adjust < 0.05) %>% arrange(p.adjust) %>% head(10))
+
+# Dot plot
+if (nrow(ora_down_24hr_results %>% filter(p.adjust < 0.05)) > 0) {
+  p_ora_down_24hr <- ggplot(ora_down_24hr_results %>% filter(p.adjust < 0.05),
+                         aes(y = reorder(ID, GeneRatio_numeric), x = GeneRatio_numeric,
+                             fill = p.adjust, size = Count)) +
+    geom_point(alpha = 0.7, shape = 21, color = "black") +
+    scale_size(range = c(2, 10)) +
+    scale_fill_viridis(discrete = FALSE, direction = -1) +
+    labs(y = "Pathways",
+         x = "Gene Ratio",
+         title = "ORA: 24hr Downregulated Genes (Hallmark Pathways)",
+         size = "Gene Count",
+         fill = "Adjusted P-value") +
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_ora_down_24hr)
+  ggsave(here("plots/ora_hallmark_down_24hr.pdf"), p_ora_down_24hr, width = 10, height = 8)
+} else {
+  cat("No significant pathways for 24hr downregulated genes\n")
+}
+```
+
+## Export ORA results (Downregulated)
+
+```{r export_ora_down}
+# Compile all ORA results for downregulated genes
+ora_down_results_export <- list(
+  "ORA_Down_1hr" = ora_down_1hr_results %>% dplyr::select(-GeneRatio_numeric),
+  "ORA_Down_4hr" = ora_down_4hr_results %>% dplyr::select(-GeneRatio_numeric),
+  "ORA_Down_24hr" = ora_down_24hr_results %>% dplyr::select(-GeneRatio_numeric)
+)
+
+write_xlsx(ora_down_results_export, here("output/hypoxia_ora_hallmark_downregulated.xlsx"))
+cat("\nORA results for downregulated genes exported to: output/hypoxia_ora_hallmark_downregulated.xlsx\n")
+```
+
+## ORA Heatmap: Pathway enrichment across timepoints (Downregulated)
+
+```{r ora_heatmap_down}
+# Combine results from all timepoints
+ora_down_combined <- bind_rows(
+  ora_down_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_down_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_down_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint)
+)
+
+# Filter for pathways significant in at least one timepoint
+sig_ora_down_pathways <- ora_down_combined %>%
+  filter(p.adjust < 0.05) %>%
+  pull(ID) %>%
+  unique()
+
+# Reshape for heatmap
+ora_down_wide <- ora_down_combined %>%
+  filter(ID %in% sig_ora_down_pathways) %>%
+  dplyr::select(ID, GeneRatio_numeric, timepoint) %>%
+  pivot_wider(names_from = timepoint, values_from = GeneRatio_numeric, values_fill = 0) %>%
+  column_to_rownames("ID")
+
+# Reorder columns
+ora_down_wide <- ora_down_wide %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Create significance annotation matrix
+sig_ora_down_matrix <- ora_down_combined %>%
+  filter(ID %in% sig_ora_down_pathways) %>%
+  dplyr::select(ID, p.adjust, timepoint) %>%
+  mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+  dplyr::select(ID, timepoint, sig) %>%
+  pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+  column_to_rownames("ID")
+
+# Reorder columns to match ora_down_wide
+sig_ora_down_matrix <- sig_ora_down_matrix %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Ensure row order matches
+sig_ora_down_matrix <- sig_ora_down_matrix[rownames(ora_down_wide), ]
+
+# Create heatmap
+if (nrow(ora_down_wide) > 0) {
+  p_ora_down_heatmap <- pheatmap(
+    ora_down_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("white", "blue"))(100),
+    breaks = seq(0, max(ora_down_wide), length.out = 101),
+    display_numbers = sig_ora_down_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "ORA Gene Ratio Across Timepoints - Downregulated (* = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 12
+  )
+
+  # Save
+  pdf(here("plots/ora_heatmap_downregulated_timecourse.pdf"), width = 8, height = 10)
+  print(p_ora_down_heatmap)
+  dev.off()
+
+  cat("ORA heatmap for downregulated genes shows", nrow(ora_down_wide), "significant pathways\n")
+} else {
+  cat("No significant pathways found for ORA heatmap (downregulated genes)\n")
+}
+```
+
+# GSEA: KEGG Pathways
+
+Perform the same GSEA analysis using KEGG pathways instead of Hallmark pathways.
+
+## Load KEGG gene sets
+
+```{r load_kegg}
+# Get KEGG pathways from MSigDB
+kegg_pathways_df <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("Loaded MSigDB KEGG gene sets:\n")
+cat("Number of pathways:", length(unique(kegg_pathways_df$gs_name)), "\n")
+```
+
+## GSEA: 1hr Hypoxia (KEGG)
+
+```{r gsea_kegg_1hr}
+# Run GSEA with KEGG pathways
+set.seed(42)
+gsea_kegg_1hr <- GSEA(
+  geneList = ranked_list_1hr,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  minGSSize = 20,
+  maxGSSize = 1000,
+  TERM2GENE = kegg_pathways_df
+)
+
+# Extract results
+gsea_kegg_1hr_results <- gsea_kegg_1hr@result %>%
+  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+  rename("leading_edge" = core_enrichment) %>%
+  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+         leading_edge_fraction = leading_edge_count / setSize)
+
+# Round numeric columns
+gsea_kegg_1hr_results[] <- lapply(gsea_kegg_1hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("GSEA KEGG 1hr - Top pathways:\n")
+print(gsea_kegg_1hr_results %>% filter(p.adjust < 0.05) %>% arrange(desc(abs(NES))) %>% head(10))
+
+# Dot plot for significant pathways
+p_gsea_kegg_1hr <- ggplot(gsea_kegg_1hr_results %>% filter(p.adjust < 0.05),
+                      aes(y = reorder(ID, NES), x = NES, fill = p.adjust, size = leading_edge_count)) +
+  geom_point(alpha = 0.7, shape = 21, color = "black") +
+  scale_size(range = c(2, 10)) +
+  scale_fill_viridis(discrete = FALSE, direction = -1) +
+  labs(y = "Pathways",
+       x = "Normalized Enrichment Score (NES)",
+       title = "GSEA: 1hr Hypoxia (KEGG Pathways)",
+       size = "Number of Genes\nin Leading Edge",
+       fill = "Adjusted P-value") +
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_gsea_kegg_1hr)
+ggsave(here("plots/gsea_kegg_1hr.pdf"), p_gsea_kegg_1hr, width = 10, height = 8)
+```
+
+## GSEA: 4hr Hypoxia (KEGG)
+
+```{r gsea_kegg_4hr}
+# Run GSEA
+set.seed(42)
+gsea_kegg_4hr <- GSEA(
+  geneList = ranked_list_4hr,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  minGSSize = 20,
+  maxGSSize = 1000,
+  TERM2GENE = kegg_pathways_df
+)
+
+# Extract results
+gsea_kegg_4hr_results <- gsea_kegg_4hr@result %>%
+  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+  rename("leading_edge" = core_enrichment) %>%
+  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+         leading_edge_fraction = leading_edge_count / setSize)
+
+gsea_kegg_4hr_results[] <- lapply(gsea_kegg_4hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("GSEA KEGG 4hr - Top pathways:\n")
+print(gsea_kegg_4hr_results %>% filter(p.adjust < 0.05) %>% arrange(desc(abs(NES))) %>% head(10))
+
+# Dot plot
+p_gsea_kegg_4hr <- ggplot(gsea_kegg_4hr_results %>% filter(p.adjust < 0.05),
+                      aes(y = reorder(ID, NES), x = NES, fill = p.adjust, size = leading_edge_count)) +
+  geom_point(alpha = 0.7, shape = 21, color = "black") +
+  scale_size(range = c(2, 10)) +
+  scale_fill_viridis(discrete = FALSE, direction = -1) +
+  labs(y = "Pathways",
+       x = "Normalized Enrichment Score (NES)",
+       title = "GSEA: 4hr Hypoxia (KEGG Pathways)",
+       size = "Number of Genes\nin Leading Edge",
+       fill = "Adjusted P-value") +
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_gsea_kegg_4hr)
+ggsave(here("plots/gsea_kegg_4hr.pdf"), p_gsea_kegg_4hr, width = 10, height = 8)
+```
+
+## GSEA: 24hr Hypoxia (KEGG)
+
+```{r gsea_kegg_24hr}
+# Run GSEA
+set.seed(42)
+gsea_kegg_24hr <- GSEA(
+  geneList = ranked_list_24hr,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  minGSSize = 20,
+  maxGSSize = 1000,
+  TERM2GENE = kegg_pathways_df
+)
+
+# Extract results
+gsea_kegg_24hr_results <- gsea_kegg_24hr@result %>%
+  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+  rename("leading_edge" = core_enrichment) %>%
+  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+         leading_edge_fraction = leading_edge_count / setSize)
+
+gsea_kegg_24hr_results[] <- lapply(gsea_kegg_24hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("GSEA KEGG 24hr - Top pathways:\n")
+print(gsea_kegg_24hr_results %>% filter(p.adjust < 0.05) %>% arrange(desc(abs(NES))) %>% head(10))
+
+# Dot plot
+p_gsea_kegg_24hr <- ggplot(gsea_kegg_24hr_results %>% filter(p.adjust < 0.05),
+                       aes(y = reorder(ID, NES), x = NES, fill = p.adjust, size = leading_edge_count)) +
+  geom_point(alpha = 0.7, shape = 21, color = "black") +
+  scale_size(range = c(2, 10)) +
+  scale_fill_viridis(discrete = FALSE, direction = -1) +
+  labs(y = "Pathways",
+       x = "Normalized Enrichment Score (NES)",
+       title = "GSEA: 24hr Hypoxia (KEGG Pathways)",
+       size = "Number of Genes\nin Leading Edge",
+       fill = "Adjusted P-value") +
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_gsea_kegg_24hr)
+ggsave(here("plots/gsea_kegg_24hr.pdf"), p_gsea_kegg_24hr, width = 10, height = 8)
+```
+
+## Export KEGG GSEA results
+
+```{r export_gsea_kegg}
+# Compile all KEGG GSEA results
+gsea_kegg_results_export <- list(
+  "GSEA_KEGG_1hr" = gsea_kegg_1hr_results %>% dplyr::select(-leading_edge),
+  "GSEA_KEGG_4hr" = gsea_kegg_4hr_results %>% dplyr::select(-leading_edge),
+  "GSEA_KEGG_24hr" = gsea_kegg_24hr_results %>% dplyr::select(-leading_edge)
+)
+
+write_xlsx(gsea_kegg_results_export, here("output/hypoxia_gsea_kegg.xlsx"))
+cat("\nKEGG GSEA results exported to: output/hypoxia_gsea_kegg.xlsx\n")
+```
+
+## KEGG Heatmap: Pathway NES across timepoints
+
+```{r gsea_kegg_heatmap}
+# Combine results from all timepoints
+gsea_kegg_combined <- bind_rows(
+  gsea_kegg_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, NES, p.adjust, timepoint),
+  gsea_kegg_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, NES, p.adjust, timepoint),
+  gsea_kegg_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, NES, p.adjust, timepoint)
+)
+
+# Filter for pathways significant in at least one timepoint
+sig_kegg_pathways <- gsea_kegg_combined %>%
+  filter(p.adjust < 0.05) %>%
+  pull(ID) %>%
+  unique()
+
+# Reshape for heatmap
+gsea_kegg_wide <- gsea_kegg_combined %>%
+  filter(ID %in% sig_kegg_pathways) %>%
+  dplyr::select(ID, NES, timepoint) %>%
+  pivot_wider(names_from = timepoint, values_from = NES, values_fill = 0) %>%
+  column_to_rownames("ID")
+
+# Reorder columns
+gsea_kegg_wide <- gsea_kegg_wide %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Create significance annotation matrix
+sig_kegg_matrix <- gsea_kegg_combined %>%
+  filter(ID %in% sig_kegg_pathways) %>%
+  dplyr::select(ID, p.adjust, timepoint) %>%
+  mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+  dplyr::select(ID, timepoint, sig) %>%
+  pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+  column_to_rownames("ID")
+
+# Reorder columns to match gsea_kegg_wide
+sig_kegg_matrix <- sig_kegg_matrix %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+# Ensure row order matches
+sig_kegg_matrix <- sig_kegg_matrix[rownames(gsea_kegg_wide), ]
+
+# Create heatmap
+if (nrow(gsea_kegg_wide) > 0) {
+  p_kegg_heatmap <- pheatmap(
+    gsea_kegg_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    breaks = seq(-3, 3, length.out = 101),
+    display_numbers = sig_kegg_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "GSEA NES Across Timepoints - KEGG (* = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 12
+  )
+
+  # Save
+  pdf(here("plots/gsea_kegg_heatmap_timecourse.pdf"), width = 8, height = 10)
+  print(p_kegg_heatmap)
+  dev.off()
+
+  cat("KEGG heatmap shows", nrow(gsea_kegg_wide), "significant pathways\n")
+} else {
+  cat("No significant KEGG pathways found for heatmap\n")
+}
+```
+
+# Comprehensive Analysis: Hypoxia Response with Knockdown Effects
+
+
+## Load Translation Category Data
+
+```{r load_translation_categories}
+# Load hypoxia response categories
+hyp_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+hyp_4hr <- read_csv(here("output", "translation_categories_4hr.csv"))
+hyp_24hr <- read_csv(here("output", "translation_categories_24hr.csv"))
+
+# Load eIF3d knockdown categories
+si3d_norm_1hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv"))
+si3d_norm_4hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_4hr.csv"))
+si3d_norm_24hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_24hr.csv"))
+si3d_hyp_1hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"))
+si3d_hyp_4hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"))
+si3d_hyp_24hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv"))
+
+# Load eIF3e knockdown categories
+si3e_norm_1hr <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_normoxia_1hr.csv"))
+si3e_norm_4hr <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_normoxia_4hr.csv"))
+si3e_norm_24hr <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_normoxia_24hr.csv"))
+si3e_hyp_1hr <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv"))
+si3e_hyp_4hr <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_hypoxia_4hr.csv"))
+si3e_hyp_24hr <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_hypoxia_24hr.csv"))
+
+# Get gene symbols from deseq_1hr (already loaded)
+gene_symbols <- deseq_1hr %>% dplyr::select(gene_id, symbol)
+
+cat("Loaded all translation category data\n")
+```
+
+## Get TE-Regulated Genes from Hypoxia Response
+
+```{r get_te_regulated_genes}
+# Get genes with TE regulation (Exclusive, Buffered, TE_only) at any timepoint
+te_regulated_genes <- bind_rows(
+  hyp_1hr %>% filter(category %in% c("Exclusive", "Buffered", "TE_only")) %>% dplyr::select(gene_id),
+  hyp_4hr %>% filter(category %in% c("Exclusive", "Buffered", "TE_only")) %>% dplyr::select(gene_id),
+  hyp_24hr %>% filter(category %in% c("Exclusive", "Buffered", "TE_only")) %>% dplyr::select(gene_id)
+)
+
+# Get unique gene list
+te_regulated_gene_ids <- unique(te_regulated_genes$gene_id)
+
+cat("Total genes with TE regulation in hypoxia response:", length(te_regulated_gene_ids), "\n")
+cat("Breakdown by timepoint:\n")
+cat("  1hr:", sum(hyp_1hr$category %in% c("Exclusive", "Buffered", "TE_only")), "genes\n")
+cat("  4hr:", sum(hyp_4hr$category %in% c("Exclusive", "Buffered", "TE_only")), "genes\n")
+cat("  24hr:", sum(hyp_24hr$category %in% c("Exclusive", "Buffered", "TE_only")), "genes\n")
+```
+
+## Create Helper Function
+
+```{r helper_function}
+# Function to determine if TE is significantly changed
+# TE is significant in categories: Exclusive, Buffered, TE_only
+# TE is NOT significant in: Forwarded, Not_sig
+is_te_not_significant <- function(category) {
+  category %in% c("Forwarded", "Not_sig")
+}
+```
+
+## Build Comprehensive Table
+
+```{r build_table}
+# Start with TE-regulated genes from hypoxia response
+analysis_table <- data.frame(gene_id = te_regulated_gene_ids)
+
+colnames(analysis_table)
+
+# Add gene symbols
+analysis_table <- analysis_table %>%
+  left_join(gene_symbols, by = "gene_id")
+
+# Add hypoxia response data (include LFC and TE padj only)
+analysis_table <- analysis_table %>%
+  left_join(hyp_1hr %>% 
+            rename(hyp_1hr_rna_lfc = rna_lfc, hyp_1hr_ribo_lfc = ribo_lfc, hyp_1hr_te_lfc = te_lfc,
+                   hyp_1hr_category = category,
+                   te_padj_1hr = te_padj),
+            by = "gene_id") %>%
+  left_join(hyp_4hr %>%
+            rename(hyp_4hr_rna_lfc = rna_lfc, hyp_4hr_ribo_lfc = ribo_lfc, hyp_4hr_te_lfc = te_lfc,
+                    hyp_4hr_category = category,
+                    te_padj_4hr = te_padj),
+            by = "gene_id") %>%
+  left_join(hyp_24hr %>%
+            rename(hyp_24hr_rna_lfc = rna_lfc, hyp_24hr_ribo_lfc = ribo_lfc, hyp_24hr_te_lfc = te_lfc,
+                 hyp_24hr_category = category,
+                 te_padj_24hr = te_padj),
+            by = "gene_id")
+
+```
+
+```{r add_si3d_data}
+# Add eIF3d knockdown data (include LFC and TE padj only)
+analysis_table <- analysis_table %>%
+  left_join(si3d_norm_1hr %>% 
+            rename(si3d_norm_1hr_rna_lfc = rna_lfc, si3d_norm_1hr_ribo_lfc = ribo_lfc, si3d_norm_1hr_te_lfc = te_lfc,
+                   si3d_norm_1hr_category = category), by = "gene_id") %>%
+  left_join(si3d_norm_4hr %>% 
+            rename(si3d_norm_4hr_rna_lfc = rna_lfc, si3d_norm_4hr_ribo_lfc = ribo_lfc, si3d_norm_4hr_te_lfc = te_lfc,
+                   si3d_norm_4hr_category = category), by = "gene_id") %>%
+  left_join(si3d_norm_24hr %>% 
+            rename(si3d_norm_24hr_rna_lfc = rna_lfc, si3d_norm_24hr_ribo_lfc = ribo_lfc, si3d_norm_24hr_te_lfc = te_lfc,
+                   si3d_norm_24hr_category = category), by = "gene_id") %>%
+  left_join(si3d_hyp_1hr %>% 
+            rename(si3d_hyp_1hr_rna_lfc = rna_lfc, si3d_hyp_1hr_ribo_lfc = ribo_lfc, si3d_hyp_1hr_te_lfc = te_lfc,
+                   si3d_hyp_1hr_category = category), by = "gene_id") %>%
+  left_join(si3d_hyp_4hr %>% 
+            rename(si3d_hyp_4hr_rna_lfc = rna_lfc, si3d_hyp_4hr_ribo_lfc = ribo_lfc, si3d_hyp_4hr_te_lfc = te_lfc,
+                    si3d_hyp_4hr_category = category), by = "gene_id") %>%
+  left_join(si3d_hyp_24hr %>% 
+            rename(si3d_hyp_24hr_rna_lfc = rna_lfc, si3d_hyp_24hr_ribo_lfc = ribo_lfc, si3d_hyp_24hr_te_lfc = te_lfc,
+                   si3d_hyp_24hr_category = category), by = "gene_id")
+
+```
+
+```{r add_si3e_data}
+# Add eIF3e knockdown data (include LFC and TE padj only)
+analysis_table <- analysis_table %>%
+  left_join(si3e_norm_1hr %>% 
+            rename(si3e_norm_1hr_rna_lfc = rna_lfc, si3e_norm_1hr_ribo_lfc = ribo_lfc, si3e_norm_1hr_te_lfc = te_lfc,
+                  si3e_norm_1hr_category = category,
+                  si3e_norm_1hr_padj = te_padj), by = "gene_id") %>%
+  left_join(si3e_norm_4hr %>% 
+            rename(si3e_norm_4hr_rna_lfc = rna_lfc, si3e_norm_4hr_ribo_lfc = ribo_lfc, si3e_norm_4hr_te_lfc = te_lfc,
+                   si3e_norm_4hr_category = category,
+                   si3e_norm_4hr_padj = te_padj), by = "gene_id") %>%
+  left_join(si3e_norm_24hr %>% 
+            rename(si3e_norm_24hr_rna_lfc = rna_lfc, si3e_norm_24hr_ribo_lfc = ribo_lfc, si3e_norm_24hr_te_lfc = te_lfc,
+                  si3e_norm_24hr_category = category,
+                  si3e_norm_24hr_padj = te_padj), by = "gene_id") %>%
+  left_join(si3e_hyp_1hr %>% 
+            rename(si3e_hyp_1hr_rna_lfc = rna_lfc, si3e_hyp_1hr_ribo_lfc = ribo_lfc, si3e_hyp_1hr_te_lfc = te_lfc,
+                    si3e_hyp_1hr_category = category), by = "gene_id") %>%
+  left_join(si3e_hyp_4hr %>% 
+            rename(si3e_hyp_4hr_rna_lfc = rna_lfc, si3e_hyp_4hr_ribo_lfc = ribo_lfc, si3e_hyp_4hr_te_lfc = te_lfc,
+                   si3e_hyp_4hr_category = category,
+                   si3e_hyp_4hr_padj=te_padj), by = "gene_id") %>%
+  left_join(si3e_hyp_24hr %>% 
+            rename(si3e_hyp_24hr_rna_lfc = rna_lfc, si3e_hyp_24hr_ribo_lfc = ribo_lfc, si3e_hyp_24hr_te_lfc = te_lfc,
+                   si3e_hyp_24hr_category = category,
+                   si3e_hyp_24hr_padj=te_padj), by = "gene_id")
+
+cat("Total columns in analysis table:", ncol(analysis_table), "\n")
+```
+
+## Add Interpretable Columns
+
+```{r add_interpretable_columns}
+# Add columns indicating TE regulation status
+analysis_table <- analysis_table %>%
+  mutate(
+    # Hypoxia response TE direction
+    hyp_1hr_te_dir = case_when(
+      is.na(hyp_1hr_te_lfc) ~ "NA",
+      hyp_1hr_te_lfc > 0 ~ "Up",
+      hyp_1hr_te_lfc < 0 ~ "Down",
+      TRUE ~ "No change"
+    ),
+    hyp_4hr_te_dir = case_when(
+      is.na(hyp_4hr_te_lfc) ~ "NA",
+      hyp_4hr_te_lfc > 0 ~ "Up",
+      hyp_4hr_te_lfc < 0 ~ "Down",
+      TRUE ~ "No change"
+    ),
+    hyp_24hr_te_dir = case_when(
+      is.na(hyp_24hr_te_lfc) ~ "NA",
+      hyp_24hr_te_lfc > 0 ~ "Up",
+      hyp_24hr_te_lfc < 0 ~ "Down",
+      TRUE ~ "No change"
+    ),
+
+    # eIF3d knockdown - TE not significant?
+    si3d_norm_1hr_te_not_sig = is_te_not_significant(si3d_norm_1hr_category),
+    si3d_norm_4hr_te_not_sig = is_te_not_significant(si3d_norm_4hr_category),
+    si3d_norm_24hr_te_not_sig = is_te_not_significant(si3d_norm_24hr_category),
+    si3d_hyp_1hr_te_not_sig = is_te_not_significant(si3d_hyp_1hr_category),
+    si3d_hyp_4hr_te_not_sig = is_te_not_significant(si3d_hyp_4hr_category),
+    si3d_hyp_24hr_te_not_sig = is_te_not_significant(si3d_hyp_24hr_category),
+
+    # eIF3e knockdown - TE not significant?
+    si3e_norm_1hr_te_not_sig = is_te_not_significant(si3e_norm_1hr_category),
+    si3e_norm_4hr_te_not_sig = is_te_not_significant(si3e_norm_4hr_category),
+    si3e_norm_24hr_te_not_sig = is_te_not_significant(si3e_norm_24hr_category),
+    si3e_hyp_1hr_te_not_sig = is_te_not_significant(si3e_hyp_1hr_category),
+    si3e_hyp_4hr_te_not_sig = is_te_not_significant(si3e_hyp_4hr_category),
+    si3e_hyp_24hr_te_not_sig = is_te_not_significant(si3e_hyp_24hr_category)
+  )
+
+cat("Added interpretable columns\n")
+```
+
+
+genes_of_interest
+
+
+```{r}
+genes_of_interest <- analysis_table |> 
+  filter(hyp_1hr_category=="Exclusive" & hyp_1hr_te_lfc>0) |> 
+  filter(hyp_4hr_te_lfc > 0) |> 
+    filter(hyp_24hr_te_lfc > 0)
+
+
+```
+
+
+
+# Effect of knockdown on hypoxic response
+
+Read in deseq results
+
+```{r}
+#sictrl
+hyp_response_deseq_1hr <-read_csv(here("output", "translation_categories_1hr.csv")) |> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+  rename(sictrl_1hr_te_lfc = te_lfc, sictrl_1hr_te_padj = te_padj)
+hyp_response_deseq_4hr<-read_csv(here("output", "translation_categories_4hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+    rename(sictrl_4hr_te_lfc = te_lfc, sictrl_4hr_te_padj = te_padj)
+
+hyp_response_deseq_24hr<-read_csv(here("output", "translation_categories_24hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+    rename(sictrl_24hr_te_lfc = te_lfc, sictrl_24hr_te_padj = te_padj)
+
+
+#3e
+hyp_response_deseq_1hr_3e_kd <- read_csv(here("output", "translation_categories_si3e_1hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+    rename(si3e_1hr_te_lfc = te_lfc, si3e_1hr_te_padj = te_padj)
+
+hyp_response_deseq_4hr_3e_kd<- read_csv(here("output", "translation_categories_si3e_4hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+      rename(si3e_4hr_te_lfc = te_lfc, si3e_4hr_te_padj = te_padj)
+
+hyp_response_deseq_24hr_3e_kd<- read_csv(here("output", "translation_categories_si3e_24hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+      rename(si3e_24hr_te_lfc = te_lfc, si3e_24hr_te_padj = te_padj)
+
+
+#3d
+hyp_response_deseq_1hr_3d_kd<- read_csv(here("output", "translation_categories_si3d_1hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+      rename(si3d_1hr_te_lfc = te_lfc, si3d_1hr_te_padj = te_padj)
+
+hyp_response_deseq_4hr_3d_kd<- read_csv(here("output", "translation_categories_si3d_4hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+        rename(si3d_4hr_te_lfc = te_lfc, si3d_4hr_te_padj = te_padj)
+
+hyp_response_deseq_24hr_3d_kd<- read_csv(here("output", "translation_categories_si3d_24hr.csv"))|> 
+  dplyr::select(gene_id, te_lfc, te_padj) |> 
+        rename(si3d_24hr_te_lfc = te_lfc, si3d_24hr_te_padj = te_padj)
+
+
+all_hypoxic_response <-hyp_response_deseq_1hr |> 
+  left_join(hyp_response_deseq_4hr) |> 
+    left_join(hyp_response_deseq_24hr) |> 
+    left_join(hyp_response_deseq_1hr_3e_kd) |> 
+    left_join(hyp_response_deseq_4hr_3e_kd) |> 
+    left_join(hyp_response_deseq_24hr_3e_kd) |> 
+    left_join(hyp_response_deseq_1hr_3d_kd) |> 
+    left_join(hyp_response_deseq_4hr_3d_kd) |> 
+    left_join(hyp_response_deseq_24hr_3d_kd)
+
+  
+
+head(all_hypoxic_response)
+```
+
+
+
+
+# 1 hr - 3e KD
+
+```{r}
+
+colnames(all_hypoxic_response)
+
+sig_sictrl_1hr <- all_hypoxic_response %>%
+  filter(sictrl_1hr_te_padj <0.05)
+
+
+#counts sig_sictrl
+ctrl_down <- sig_sictrl_1hr %>%
+  filter(sictrl_1hr_te_lfc < 0) %>%
+  nrow()
+
+ctrl_up <- sig_sictrl_1hr %>%
+  filter(sictrl_1hr_te_lfc > 0) %>%
+  nrow()
+
+
+
+
+#counts si3e
+si3e_down <- sig_sictrl_1hr %>%
+  filter(si3e_1hr_te_lfc < 0) %>%
+  filter(si3e_1hr_te_padj < 0.05) %>%
+  nrow()
+
+si3e_up <- sig_sictrl_1hr %>%
+  filter(si3e_1hr_te_lfc > 0) %>%
+  filter(si3e_1hr_te_padj < 0.05) %>%
+  nrow()
+
+
+# Create summary table (transposed with up/down as rows)
+summary_table <- data.frame(
+  Direction = c("Up", "Down"),
+  `si-CTRL` = c(ctrl_up, ctrl_down),
+  `si-eIF3e` = c(si3e_up, si3e_down),
+  check.names = FALSE
+)
+
+# Create table grob
+table_grob <- gridExtra::tableGrob(summary_table, rows = NULL, theme = gridExtra::ttheme_minimal(base_size = 9))
+
+scatter_3e_1hr_plot <- ggplot(data = sig_sictrl_1hr, aes(x = sictrl_1hr_te_lfc, y = si3e_1hr_te_lfc)) +
+  ylim(-2,2) +
+  xlim(-2,2) +
+  geom_hline(yintercept = 0, color = "grey") +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point(alpha=.25) +
+  ylab(bquote(Log[2]~"si-eIF3e LFC"~"TE: hypoxia vs normoxia")) +
+  xlab(bquote(Log[2]~"si-CTRL LFC"~"TE: hypoxia vs normoxia")) +
+    # theme_cowplot(font_size = 9)+
+  theme_prism()
+
+scatter_3e_1hr_plot <- ggMarginal(scatter_3e_1hr_plot, type = "histogram",
+           xparams = list(binwidth = .1, fill = "grey"),
+           yparams = list(binwidth = .1, fill = "#56B4E9")
+           )
+
+# Combine plot and table
+scatter_3e_1hr <- cowplot::plot_grid(scatter_3e_1hr_plot, table_grob, ncol = 1, rel_heights = c(1, 0.15))
+
+scatter_3e_1hr
+
+ggsave(filename= here("plots/si3e_1hr_response.pdf"), scatter_3e_1hr, height=4, width=4)
+
+
+
+```
+
+
+
+
+# 1 hr - 3d KD
+
+```{r}
+
+colnames(all_hypoxic_response)
+
+sig_sictrl_1hr <- all_hypoxic_response %>%
+  filter(sictrl_1hr_te_padj <0.05)
+
+
+#counts sig_sictrl
+ctrl_down <- sig_sictrl_1hr %>%
+  filter(sictrl_1hr_te_lfc < 0) %>%
+  nrow()
+
+ctrl_up <- sig_sictrl_1hr %>%
+  filter(sictrl_1hr_te_lfc > 0) %>%
+  nrow()
+
+
+
+
+#counts si3d
+si3d_down <- sig_sictrl_1hr %>%
+  filter(si3d_1hr_te_lfc < 0) %>%
+  filter(si3d_1hr_te_padj < 0.05) %>%
+  nrow()
+
+si3d_up <- sig_sictrl_1hr %>%
+  filter(si3d_1hr_te_lfc > 0) %>%
+  filter(si3d_1hr_te_padj < 0.05) %>%
+  nrow()
+
+
+# Create summary table (transposed with up/down as rows)
+summary_table <- data.frame(
+  Direction = c("Up", "Down"),
+  `si-CTRL` = c(ctrl_up, ctrl_down),
+  `si-eIF3d` = c(si3d_up, si3d_down),
+  check.names = FALSE
+)
+
+# Create table grob
+table_grob <- gridExtra::tableGrob(summary_table, rows = NULL, theme = gridExtra::ttheme_minimal(base_size = 9))
+
+scatter_3d_1hr_plot <- ggplot(data = sig_sictrl_1hr, aes(x = sictrl_1hr_te_lfc, y = si3d_1hr_te_lfc)) +
+  ylim(-2,2) +
+  xlim(-2,2) +
+  geom_hline(yintercept = 0, color = "grey") +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point(alpha=.25) +
+  ylab(bquote(Log[2]~"si-eIF3d LFC"~"TE: hypoxia vs normoxia")) +
+  xlab(bquote(Log[2]~"si-CTRL LFC"~"TE: hypoxia vs normoxia")) +
+    # theme_cowplot(font_size = 9)+
+  theme_prism()
+
+scatter_3d_1hr_plot <- ggMarginal(scatter_3d_1hr_plot, type = "histogram",
+           xparams = list(binwidth = .1, fill = "grey"),
+           yparams = list(binwidth = .1, fill = "#E69F00")
+           )
+
+# Combine plot and table
+scatter_3d_1hr <- cowplot::plot_grid(scatter_3d_1hr_plot, table_grob, ncol = 1, rel_heights = c(1, 0.15))
+
+scatter_3d_1hr
+
+ggsave(filename= here("plots/si3d_1hr_response.pdf"), scatter_3d_1hr, height=4, width=4)
+
+
+
+```
+
+
+# 4 hr - 3e KD
+
+```{r}
+
+colnames(all_hypoxic_response)
+
+sig_sictrl_4hr <- all_hypoxic_response %>%
+  filter(sictrl_4hr_te_padj <0.05)
+
+
+#counts sig_sictrl
+ctrl_down <- sig_sictrl_4hr %>%
+  filter(sictrl_4hr_te_lfc < 0) %>%
+  nrow()
+
+ctrl_up <- sig_sictrl_4hr %>%
+  filter(sictrl_4hr_te_lfc > 0) %>%
+  nrow()
+
+
+
+
+#counts si3e
+si3e_down <- sig_sictrl_4hr %>%
+  filter(si3e_4hr_te_lfc < 0) %>%
+  filter(si3e_4hr_te_padj < 0.05) %>%
+  nrow()
+
+si3e_up <- sig_sictrl_4hr %>%
+  filter(si3e_4hr_te_lfc > 0) %>%
+  filter(si3e_4hr_te_padj < 0.05) %>%
+  nrow()
+
+
+# Create summary table (transposed with up/down as rows)
+summary_table <- data.frame(
+  Direction = c("Up", "Down"),
+  `si-CTRL` = c(ctrl_up, ctrl_down),
+  `si-eIF3e` = c(si3e_up, si3e_down),
+  check.names = FALSE
+)
+
+# Create table grob
+table_grob <- gridExtra::tableGrob(summary_table, rows = NULL, theme = gridExtra::ttheme_minimal(base_size = 9))
+
+scatter_3e_4hr_plot <- ggplot(data = sig_sictrl_4hr, aes(x = sictrl_4hr_te_lfc, y = si3e_4hr_te_lfc)) +
+  ylim(-2,2) +
+  xlim(-2,2) +
+  geom_hline(yintercept = 0, color = "grey") +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point(alpha=.25) +
+  ylab(bquote(Log[2]~"si-eIF3e LFC"~"TE: hypoxia vs normoxia")) +
+  xlab(bquote(Log[2]~"si-CTRL LFC"~"TE: hypoxia vs normoxia")) +
+    # theme_cowplot(font_size = 9)+
+  theme_prism()
+
+scatter_3e_4hr_plot <- ggMarginal(scatter_3e_4hr_plot, type = "histogram",
+           xparams = list(binwidth = .1, fill = "grey"),
+           yparams = list(binwidth = .1, fill = "#56B4E9")
+           )
+
+# Combine plot and table
+scatter_3e_4hr <- cowplot::plot_grid(scatter_3e_4hr_plot, table_grob, ncol = 1, rel_heights = c(1, 0.15))
+
+scatter_3e_4hr
+
+ggsave(filename= here("plots/si3e_4hr_response.pdf"), scatter_3e_4hr, height=4, width=4)
+
+
+
+```
+
+
+
+
+# 4 hr - 3d KD
+
+```{r}
+
+colnames(all_hypoxic_response)
+
+sig_sictrl_4hr <- all_hypoxic_response %>%
+  filter(sictrl_4hr_te_padj <0.05)
+
+
+#counts sig_sictrl
+ctrl_down <- sig_sictrl_4hr %>%
+  filter(sictrl_4hr_te_lfc < 0) %>%
+  nrow()
+
+ctrl_up <- sig_sictrl_4hr %>%
+  filter(sictrl_4hr_te_lfc > 0) %>%
+  nrow()
+
+
+
+
+#counts si3d
+si3d_down <- sig_sictrl_4hr %>%
+  filter(si3d_4hr_te_lfc < 0) %>%
+  filter(si3d_4hr_te_padj < 0.05) %>%
+  nrow()
+
+si3d_up <- sig_sictrl_4hr %>%
+  filter(si3d_4hr_te_lfc > 0) %>%
+  filter(si3d_4hr_te_padj < 0.05) %>%
+  nrow()
+
+
+# Create summary table (transposed with up/down as rows)
+summary_table <- data.frame(
+  Direction = c("Up", "Down"),
+  `si-CTRL` = c(ctrl_up, ctrl_down),
+  `si-eIF3d` = c(si3d_up, si3d_down),
+  check.names = FALSE
+)
+
+# Create table grob
+table_grob <- gridExtra::tableGrob(summary_table, rows = NULL, theme = gridExtra::ttheme_minimal(base_size = 9))
+
+scatter_3d_4hr_plot <- ggplot(data = sig_sictrl_4hr, aes(x = sictrl_4hr_te_lfc, y = si3d_4hr_te_lfc)) +
+  ylim(-2,2) +
+  xlim(-2,2) +
+  geom_hline(yintercept = 0, color = "grey") +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point(alpha=.25) +
+  ylab(bquote(Log[2]~"si-eIF3d LFC"~"TE: hypoxia vs normoxia")) +
+  xlab(bquote(Log[2]~"si-CTRL LFC"~"TE: hypoxia vs normoxia")) +
+    # theme_cowplot(font_size = 9)+
+  theme_prism()
+
+scatter_3d_4hr_plot <- ggMarginal(scatter_3d_4hr_plot, type = "histogram",
+           xparams = list(binwidth = .1, fill = "grey"),
+           yparams = list(binwidth = .1, fill = "#E69F00")
+           )
+
+# Combine plot and table
+scatter_3d_4hr <- cowplot::plot_grid(scatter_3d_4hr_plot, table_grob, ncol = 1, rel_heights = c(1, 0.15))
+
+scatter_3d_4hr
+
+ggsave(filename= here("plots/si3d_4hr_response.pdf"), scatter_3d_4hr, height=4, width=4)
+
+
+
+```
+
+
+# 24 hr - 3e KD
+
+```{r}
+
+colnames(all_hypoxic_response)
+
+sig_sictrl_24hr <- all_hypoxic_response %>%
+  filter(sictrl_24hr_te_padj <0.05)
+
+
+#counts sig_sictrl
+ctrl_down <- sig_sictrl_24hr %>%
+  filter(sictrl_24hr_te_lfc < 0) %>%
+  nrow()
+
+ctrl_up <- sig_sictrl_24hr %>%
+  filter(sictrl_24hr_te_lfc > 0) %>%
+  nrow()
+
+
+
+
+#counts si3e
+si3e_down <- sig_sictrl_24hr %>%
+  filter(si3e_24hr_te_lfc < 0) %>%
+  filter(si3e_24hr_te_padj < 0.05) %>%
+  nrow()
+
+si3e_up <- sig_sictrl_24hr %>%
+  filter(si3e_24hr_te_lfc > 0) %>%
+  filter(si3e_24hr_te_padj < 0.05) %>%
+  nrow()
+
+
+# Create summary table (transposed with up/down as rows)
+summary_table <- data.frame(
+  Direction = c("Up", "Down"),
+  `si-CTRL` = c(ctrl_up, ctrl_down),
+  `si-eIF3e` = c(si3e_up, si3e_down),
+  check.names = FALSE
+)
+
+# Create table grob
+table_grob <- gridExtra::tableGrob(summary_table, rows = NULL, theme = gridExtra::ttheme_minimal(base_size = 9))
+
+scatter_3e_24hr_plot <- ggplot(data = sig_sictrl_24hr, aes(x = sictrl_24hr_te_lfc, y = si3e_24hr_te_lfc)) +
+  ylim(-2,2) +
+  xlim(-2,2) +
+  geom_hline(yintercept = 0, color = "grey") +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point(alpha=.25) +
+  ylab(bquote(Log[2]~"si-eIF3e LFC"~"TE: hypoxia vs normoxia")) +
+  xlab(bquote(Log[2]~"si-CTRL LFC"~"TE: hypoxia vs normoxia")) +
+    # theme_cowplot(font_size = 9)+
+  theme_prism()
+
+scatter_3e_24hr_plot <- ggMarginal(scatter_3e_24hr_plot, type = "histogram",
+           xparams = list(binwidth = .1, fill = "grey"),
+           yparams = list(binwidth = .1, fill = "#56B4E9")
+           )
+
+# Combine plot and table
+scatter_3e_24hr <- cowplot::plot_grid(scatter_3e_24hr_plot, table_grob, ncol = 1, rel_heights = c(1, 0.15))
+
+scatter_3e_24hr
+
+ggsave(filename= here("plots/si3e_24hr_response.pdf"), scatter_3e_24hr, height=4, width=4)
+
+
+
+```
+
+
+
+
+# 24 hr - 3d KD
+
+```{r}
+
+colnames(all_hypoxic_response)
+
+sig_sictrl_24hr <- all_hypoxic_response %>%
+  filter(sictrl_24hr_te_padj <0.05)
+
+
+#counts sig_sictrl
+ctrl_down <- sig_sictrl_24hr %>%
+  filter(sictrl_24hr_te_lfc < 0) %>%
+  nrow()
+
+ctrl_up <- sig_sictrl_24hr %>%
+  filter(sictrl_24hr_te_lfc > 0) %>%
+  nrow()
+
+
+
+
+#counts si3d
+si3d_down <- sig_sictrl_24hr %>%
+  filter(si3d_24hr_te_lfc < 0) %>%
+  filter(si3d_24hr_te_padj < 0.05) %>%
+  nrow()
+
+si3d_up <- sig_sictrl_24hr %>%
+  filter(si3d_24hr_te_lfc > 0) %>%
+  filter(si3d_24hr_te_padj < 0.05) %>%
+  nrow()
+
+
+# Create summary table (transposed with up/down as rows)
+summary_table <- data.frame(
+  Direction = c("Up", "Down"),
+  `si-CTRL` = c(ctrl_up, ctrl_down),
+  `si-eIF3d` = c(si3d_up, si3d_down),
+  check.names = FALSE
+)
+
+# Create table grob
+table_grob <- gridExtra::tableGrob(summary_table, rows = NULL, theme = gridExtra::ttheme_minimal(base_size = 9))
+
+scatter_3d_24hr_plot <- ggplot(data = sig_sictrl_24hr, aes(x = sictrl_24hr_te_lfc, y = si3d_24hr_te_lfc)) +
+  ylim(-2,2) +
+  xlim(-2,2) +
+  geom_hline(yintercept = 0, color = "grey") +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point(alpha=.25) +
+  ylab(bquote(Log[2]~"si-eIF3d LFC"~"TE: hypoxia vs normoxia")) +
+  xlab(bquote(Log[2]~"si-CTRL LFC"~"TE: hypoxia vs normoxia")) +
+    # theme_cowplot(font_size = 9)+
+  theme_prism()
+
+scatter_3d_24hr_plot <- ggMarginal(scatter_3d_24hr_plot, type = "histogram",
+           xparams = list(binwidth = .1, fill = "grey"),
+           yparams = list(binwidth = .1, fill = "#E69F00")
+           )
+
+# Combine plot and table
+scatter_3d_24hr <- cowplot::plot_grid(scatter_3d_24hr_plot, table_grob, ncol = 1, rel_heights = c(1, 0.15))
+
+scatter_3d_24hr
+
+ggsave(filename= here("plots/si3d_24hr_response.pdf"), scatter_3d_24hr, height=4, width=4)
+
+
+
 ```
