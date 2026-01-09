@@ -1,0 +1,443 @@
+---
+title: "Comparison of DESeq2 Strategies: Rmd vs Shiny App"
+author: "Kate"
+date: "2025-12-09"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+This analysis compares two DESeq2 strategies:
+1. The deFunction approach used in the rna_ribo_te_analysis.Rmd
+2. The approach built into the Shiny app
+
+We're testing siCtrl vs si3e in normoxia at 1 hour, comparing:
+- TE analysis WITH spike-ins
+- TE analysis WITHOUT spike-ins
+
+We count significantly regulated genes (padj < 0.05, no LFC cutoff) and compare to the Shiny app results.
+
+```{r load_libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(janitor)
+```
+
+```{r load_functions}
+source(here("code/functions.R"))
+cat("Loaded deFunction and related functions\n")
+```
+
+# Load Data
+
+## Load raw counts from Shiny app
+
+```{r load_raw_counts}
+# Load the raw filtered counts from the Shiny app
+raw_counts <- read_csv("~/Downloads/raw_filtered_counts_2025-12-09.csv") %>%
+  column_to_rownames("gene_id")
+
+cat("Raw counts dimensions:", dim(raw_counts), "\n")
+```
+
+## Extract human genes from raw counts
+
+The raw counts file from the Shiny app only contains human genes (drosophila spike-ins are in a separate file).
+
+```{r separate_genes}
+# The raw counts should only have human genes (ENSG IDs)
+gene_ids <- rownames(raw_counts)
+is_human <- grepl("^ENSG", gene_ids)
+
+cat("Total genes in raw counts:", length(gene_ids), "\n")
+cat("Human genes (ENSG):", sum(is_human), "\n")
+
+# Extract human genes (should be all of them)
+human_counts <- raw_counts[is_human, ]
+
+cat("\nHuman counts dimensions:", dim(human_counts), "\n")
+cat("All genes are human:", all(is_human), "\n")
+```
+
+## Load and filter metadata for siCtrl vs si3e comparison at 1hr normoxia
+
+```{r create_metadata}
+# Load the full metadata file
+metadata_full <- read_csv(here("output", "metadata_clean.csv"))
+
+# Filter for sictrl and si3e at normoxia 1hr
+metadata_comparison <- metadata_full %>%
+  filter(treatment %in% c("sictrl", "si3e"),
+         condition == "normoxia",
+         hours == 1)
+
+# The raw counts have column names like: siCTRL_normoxia_1_a_ribo
+# We need to create sample names that match this format AND add the sample ID
+# Format: {TREATMENT}_{condition}_{hours}_{rep}_{library}_{id}
+
+metadata_comparison <- metadata_comparison %>%
+  mutate(
+    # Convert treatment to match raw counts format (sictrl -> siCTRL)
+    treatment_formatted = case_when(
+      treatment == "sictrl" ~ "siCTRL",
+      treatment == "si3e" ~ "si3e",
+      treatment == "si3d" ~ "si3d",
+      TRUE ~ treatment
+    ),
+    # Create sample name matching raw counts format with ID at the end
+    # Use .data$rep to avoid conflict with rep() function
+    sample_name_with_id = paste0(treatment_formatted, "_", condition, "_", hours, "_", .data$rep, "_", library, "_", id),
+    # Also keep the raw counts column name for matching
+    sample_name_raw = paste0(treatment_formatted, "_", condition, "_", hours, "_", .data$rep, "_", library)
+  )
+
+print(metadata_comparison %>% select(id, treatment, library, rep, sample_name_raw, sample_name_with_id))
+
+# Get the sample names (with IDs) for downstream analysis
+sample_names <- metadata_comparison$sample_name_with_id
+
+# But use the raw format names to extract from the raw counts
+sample_names_raw <- metadata_comparison$sample_name_raw
+
+# CRITICAL: Match Shiny app behavior - filter out genes with rowSums <= 1 ACROSS ALL SAMPLES
+# The Shiny app applies this filter to ALL samples first, then subsets to comparison samples
+# This is done in server.R line 1997, but raw_counts_mat has ALL samples at that point
+cat("\nHuman counts dimensions (before rowSums filter):", dim(human_counts), "\n")
+
+# Remove symbol column if present, we only need numeric counts for filtering
+if ("symbol" %in% colnames(human_counts)) {
+  human_counts_numeric <- human_counts %>% select(-symbol)
+} else {
+  human_counts_numeric <- human_counts
+}
+
+# Make rownames unique and filter by rowSums across ALL samples
+rownames(human_counts_numeric) <- make.unique(rownames(human_counts_numeric))
+human_counts_filtered <- human_counts_numeric[rowSums(human_counts_numeric) > 1, ]
+
+cat("Human counts dimensions (after removing rowSums <= 1 across all samples):", dim(human_counts_filtered), "\n")
+
+# NOW filter to just the comparison samples
+counts_comparison <- human_counts_filtered[, sample_names_raw]
+
+cat("Filtered counts dimensions (after subsetting to comparison samples):", dim(counts_comparison), "\n")
+cat("Column names in counts:\n")
+print(colnames(counts_comparison))
+cat("Counts contain only human genes (no drosophila):", !any(grepl("^FBgn", rownames(counts_comparison))), "\n")
+
+# Update metadata to use the raw sample names (without IDs) for matching with counts
+# CRITICAL: Set comparison_variable to match Shiny app format: treatment_condition_hours
+# This matches what the Shiny app does (e.g., "siCTRL_normoxia_1" or "si3e_normoxia_1")
+metadata_comparison <- metadata_comparison %>%
+  select(id, library, replicate = rep, treatment, treatment_formatted, condition, hours, sample_name = sample_name_raw) %>%
+  mutate(comparison_variable = paste(treatment_formatted, condition, hours, sep = "_")) %>%
+  select(-treatment_formatted)
+
+cat("\nMetadata structure:\n")
+print(metadata_comparison)
+cat("\nComparison variable values:", unique(metadata_comparison$comparison_variable), "\n")
+cat("These should be: siCTRL_normoxia_1 and si3e_normoxia_1\n")
+```
+
+## Prepare spike-in data (top 500 drosophila genes)
+
+```{r load_spikein}
+# The raw_filtered_counts file doesn't contain drosophila genes
+# (they're removed by the Shiny app's raw_counts() reactive)
+# Instead, load the spike-in matrix that was exported by the Shiny app
+# This contains the 500 drosophila spike-in genes used for normalization
+
+# Load spike-in matrix from Shiny app export
+spikein_matrix_full <- read_csv("/Users/katematlin/github/ribopipe-shiny/spikeInMatrix.csv") %>%
+  column_to_rownames("gene_id")
+
+cat("Spike-in matrix dimensions (all samples):", dim(spikein_matrix_full), "\n")
+
+# Filter to our comparison samples
+spikein_comparison <- spikein_matrix_full[, sample_names_raw]
+
+cat("Spike-in matrix dimensions (comparison samples):", dim(spikein_comparison), "\n")
+
+# Get the spike-in IDs (should be 500)
+top500_ids <- rownames(spikein_comparison)
+
+cat("Number of spike-in genes:", length(top500_ids), "\n")
+
+# CRITICAL: Ensure spike-in matrix columns match the filtered counts_comparison
+if (!identical(colnames(spikein_comparison), colnames(counts_comparison))) {
+  cat("WARNING: Spike-in columns don't match counts columns. Reordering...\n")
+  spikein_comparison <- spikein_comparison[, colnames(counts_comparison), drop = FALSE]
+}
+
+cat("All spike-ins are drosophila:", all(grepl("^FBgn", top500_ids)), "\n")
+cat("Spike-in sample names match count matrix:", identical(colnames(spikein_comparison), colnames(counts_comparison)), "\n")
+
+# Verify these are drosophila genes (should start with "FBgn")
+cat("First few spike-in gene IDs:", head(top500_ids), "\n")
+```
+
+## Create normalized matrix for both strategies
+
+We need a normalized matrix for deFunction. We'll create two versions:
+1. WITH spike-ins: Uses top 500 drosophila genes for size factor estimation
+2. WITHOUT spike-ins: Standard DESeq2 normalization (no drosophila)
+
+```{r create_norm_matrices}
+# Create normalized matrix WITH spike-ins
+# This will combine human counts with drosophila spike-ins, use spike-ins for normalization
+# Use the SAME control_condition format as the Shiny app
+normMatrix_withSpikes <- createNormMatrix(
+  allCounts = counts_comparison,
+  metadata = metadata_comparison,
+  control_condition = "siCTRL_normoxia_1",
+  spikein = spikein_comparison,
+  keepSpikes = top500_ids
+)
+
+cat("Normalized matrix WITH spike-ins dimensions:", dim(normMatrix_withSpikes), "\n")
+cat("Contains drosophila genes:", any(grepl("^FBgn", rownames(normMatrix_withSpikes))), "\n")
+
+# Create normalized matrix WITHOUT spike-ins
+# This will only have human genes, no drosophila
+# Use the SAME control_condition format as the Shiny app
+normMatrix_noSpikes <- createNormMatrix(
+  allCounts = counts_comparison,
+  metadata = metadata_comparison,
+  control_condition = "siCTRL_normoxia_1",
+  spikein = NULL,
+  keepSpikes = NULL
+)
+
+is_dros_withSpikes <- grepl("^FBgn", rownames(normMatrix_withSpikes))
+  if (any(is_dros_withSpikes)) {
+    normMatrix_withSpikes <- normMatrix_withSpikes[!is_dros_withSpikes, , drop = FALSE]
+    cat("Removed", sum(is_dros_withSpikes), "drosophila genes from spike-in normalized matrix\n")
+  }
+
+
+cat("\nNormalized matrix WITHOUT spike-ins dimensions:", dim(normMatrix_noSpikes), "\n")
+cat("Contains drosophila genes:", any(grepl("^FBgn", rownames(normMatrix_noSpikes))), "\n")
+
+cat("\nNormalized matrices created successfully\n")
+```
+
+# Run DESeq2 Analysis
+
+## Strategy 1: WITH Spike-ins
+
+```{r deseq_with_spikes}
+# Use the SAME comparison_variable format as the Shiny app
+res_te_withSpikes <- deFunction(
+  countsMatrix = counts_comparison,
+  allCounts_Norm = normMatrix_withSpikes,
+  metadata = metadata_comparison,
+  control_condition = "siCTRL_normoxia_1",
+  test_condition = "si3e_normoxia_1",
+  spikeInMatrix = spikein_comparison,
+  keepSpikes = top500_ids,
+  mode = "TE"
+)
+
+cat("\n=== WITH SPIKE-INS RESULTS ===\n")
+cat("Total genes:", nrow(res_te_withSpikes), "\n")
+
+# Count significant genes with padj < 0.05 (no LFC cutoff)
+sig_withSpikes <- res_te_withSpikes %>%
+  filter(!is.na(padj), padj < 0.05)
+
+n_sig_withSpikes <- nrow(sig_withSpikes)
+n_up_withSpikes <- sum(sig_withSpikes$log2FoldChange > 0)
+n_down_withSpikes <- sum(sig_withSpikes$log2FoldChange < 0)
+
+cat("Significant genes (padj < 0.05):", n_sig_withSpikes, "\n")
+cat("  Up-regulated:", n_up_withSpikes, "\n")
+cat("  Down-regulated:", n_down_withSpikes, "\n")
+```
+
+## Strategy 2: WITHOUT Spike-ins
+
+```{r deseq_without_spikes}
+# Use the SAME comparison_variable format as the Shiny app
+res_te_noSpikes <- deFunction(
+  countsMatrix = counts_comparison,
+  allCounts_Norm = normMatrix_noSpikes,
+  metadata = metadata_comparison,
+  control_condition = "siCTRL_normoxia_1",
+  test_condition = "si3e_normoxia_1",
+  spikeInMatrix = NULL,
+  keepSpikes = NULL,
+  mode = "TE"
+)
+
+cat("\n=== WITHOUT SPIKE-INS RESULTS ===\n")
+cat("Total genes:", nrow(res_te_noSpikes), "\n")
+
+# Count significant genes with padj < 0.05 (no LFC cutoff)
+sig_noSpikes <- res_te_noSpikes %>%
+  filter(!is.na(padj), padj < 0.05)
+
+n_sig_noSpikes <- nrow(sig_noSpikes)
+n_up_noSpikes <- sum(sig_noSpikes$log2FoldChange > 0)
+n_down_noSpikes <- sum(sig_noSpikes$log2FoldChange < 0)
+
+cat("Significant genes (padj < 0.05):", n_sig_noSpikes, "\n")
+cat("  Up-regulated:", n_up_noSpikes, "\n")
+cat("  Down-regulated:", n_down_noSpikes, "\n")
+```
+
+# Load Shiny App Results
+
+```{r load_app_results}
+# Load TE results from Shiny app
+app_spike <- read_csv("~/Downloads/spike_delta_te.csv")
+app_nospike <- read_csv("~/Downloads/no_spikedelta_te.csv")
+
+cat("\n=== SHINY APP RESULTS ===\n")
+
+# Count significant genes from app (padj < 0.05, no LFC cutoff)
+app_spike_sig <- app_spike %>%
+  filter(!is.na(padj), padj < 0.05)
+
+n_app_spike_sig <- nrow(app_spike_sig)
+n_app_spike_up <- sum(app_spike_sig$log2FoldChange > 0)
+n_app_spike_down <- sum(app_spike_sig$log2FoldChange < 0)
+
+cat("\nApp WITH spike-ins:\n")
+cat("  Total significant:", n_app_spike_sig, "\n")
+cat("  Up-regulated:", n_app_spike_up, "\n")
+cat("  Down-regulated:", n_app_spike_down, "\n")
+
+app_nospike_sig <- app_nospike %>%
+  filter(!is.na(padj), padj < 0.05)
+
+n_app_nospike_sig <- nrow(app_nospike_sig)
+n_app_nospike_up <- sum(app_nospike_sig$log2FoldChange > 0)
+n_app_nospike_down <- sum(app_nospike_sig$log2FoldChange < 0)
+
+cat("\nApp WITHOUT spike-ins:\n")
+cat("  Total significant:", n_app_nospike_sig, "\n")
+cat("  Up-regulated:", n_app_nospike_up, "\n")
+cat("  Down-regulated:", n_app_nospike_down, "\n")
+```
+
+# Comparison Summary
+
+```{r comparison_table}
+# Create comparison table
+comparison_df <- data.frame(
+  Method = c("Rmd with spikes", "Rmd no spikes", "App with spikes", "App no spikes"),
+  Total_Significant = c(n_sig_withSpikes, n_sig_noSpikes, n_app_spike_sig, n_app_nospike_sig),
+  Up_Regulated = c(n_up_withSpikes, n_up_noSpikes, n_app_spike_up, n_app_nospike_up),
+  Down_Regulated = c(n_down_withSpikes, n_down_noSpikes, n_app_spike_down, n_app_nospike_down)
+)
+
+cat("\n=== COMPARISON SUMMARY ===\n")
+print(comparison_df)
+
+# Calculate differences
+cat("\n=== DIFFERENCES ===\n")
+cat("Rmd WITH spikes vs App WITH spikes:\n")
+cat("  Difference in total significant:", n_sig_withSpikes - n_app_spike_sig, "\n")
+cat("  Difference in up-regulated:", n_up_withSpikes - n_app_spike_up, "\n")
+cat("  Difference in down-regulated:", n_down_withSpikes - n_app_spike_down, "\n")
+
+cat("\nRmd NO spikes vs App NO spikes:\n")
+cat("  Difference in total significant:", n_sig_noSpikes - n_app_nospike_sig, "\n")
+cat("  Difference in up-regulated:", n_up_noSpikes - n_app_nospike_up, "\n")
+cat("  Difference in down-regulated:", n_down_noSpikes - n_app_nospike_down, "\n")
+```
+
+# Visualization
+
+```{r plot_comparison}
+library(ggplot2)
+
+# Reshape for plotting
+comparison_long <- comparison_df %>%
+  pivot_longer(cols = c(Up_Regulated, Down_Regulated),
+               names_to = "Direction",
+               values_to = "Count")
+
+# Create bar plot
+ggplot(comparison_long, aes(x = Method, y = Count, fill = Direction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Up_Regulated" = "#E74C3C", "Down_Regulated" = "#3498DB")) +
+  labs(title = "Comparison of DESeq2 Strategies: siCtrl vs si3e (normoxia 1hr)",
+       subtitle = "TE Analysis: Significant genes with padj < 0.05",
+       x = "Method",
+       y = "Number of Genes",
+       fill = "Direction") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(here("plots/deseq_strategy_comparison.pdf"), width = 8, height = 6)
+```
+
+# Detailed Gene-Level Comparison
+
+Let's look at which genes are called significant in each method:
+
+```{r gene_overlap}
+# Get gene lists
+genes_rmd_spikes <- res_te_withSpikes %>%
+  filter(!is.na(padj), padj < 0.05) %>%
+  pull(gene_id)
+
+genes_rmd_nospikes <- res_te_noSpikes %>%
+  filter(!is.na(padj), padj < 0.05) %>%
+  pull(gene_id)
+
+genes_app_spikes <- app_spike %>%
+  filter(!is.na(padj), padj < 0.05) %>%
+  pull(gene_id)
+
+genes_app_nospikes <- app_nospike %>%
+  filter(!is.na(padj), padj < 0.05) %>%
+  pull(gene_id)
+
+# Compare overlap for WITH spikes
+overlap_spikes <- length(intersect(genes_rmd_spikes, genes_app_spikes))
+only_rmd_spikes <- length(setdiff(genes_rmd_spikes, genes_app_spikes))
+only_app_spikes <- length(setdiff(genes_app_spikes, genes_rmd_spikes))
+
+cat("\n=== OVERLAP: WITH SPIKE-INS ===\n")
+cat("Common to both methods:", overlap_spikes, "\n")
+cat("Only in Rmd method:", only_rmd_spikes, "\n")
+cat("Only in App method:", only_app_spikes, "\n")
+
+# Compare overlap for WITHOUT spikes
+overlap_nospikes <- length(intersect(genes_rmd_nospikes, genes_app_nospikes))
+only_rmd_nospikes <- length(setdiff(genes_rmd_nospikes, genes_app_nospikes))
+only_app_nospikes <- length(setdiff(genes_app_nospikes, genes_rmd_nospikes))
+
+cat("\n=== OVERLAP: WITHOUT SPIKE-INS ===\n")
+cat("Common to both methods:", overlap_nospikes, "\n")
+cat("Only in Rmd method:", only_rmd_nospikes, "\n")
+cat("Only in App method:", only_app_nospikes, "\n")
+```
+
+# Save Results
+
+```{r save_results}
+# Save comparison summary
+write_csv(comparison_df, here("output", "deseq_strategy_comparison_summary.csv"))
+
+# Save detailed results
+write_csv(res_te_withSpikes, here("output", "te_results_rmd_withSpikes_sictrl_vs_si3e_1hr.csv"))
+write_csv(res_te_noSpikes, here("output", "te_results_rmd_noSpikes_sictrl_vs_si3e_1hr.csv"))
+
+cat("\nResults saved to output/\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

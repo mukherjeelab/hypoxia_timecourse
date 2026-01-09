@@ -1,0 +1,1531 @@
+---
+title: "TE Heatmap - All Conditions and Timepoints"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+# Overview
+
+This analysis creates a heatmap of translation efficiency (TE) values across all conditions, treatments, and timepoints. Z-scores are calculated for each gene across all samples to show relative changes in TE.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r load_libraries, message=TRUE, warning=TRUE}
+library(here)
+library(tidyverse)
+library(pheatmap)
+library(clusterProfiler)
+library(msigdbr)
+library(writexl)
+
+cat("Libraries loaded successfully\n")
+cat("clusterProfiler version:", as.character(packageVersion("clusterProfiler")), "\n")
+```
+
+# Load Hallmark Gene Sets
+
+Load MSigDB Hallmark gene sets for pathway enrichment analysis.
+
+```{r load_hallmark, message=TRUE, warning=TRUE}
+# Load MSigDB Hallmark gene sets for human
+cat("Loading Hallmark gene sets...\n")
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H")
+cat("Hallmark sets loaded, rows:", nrow(hallmark_sets), "\n")
+
+# Create gene set format for clusterProfiler (TERM2GENE)
+hallmark_term2gene <- hallmark_sets %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("Created TERM2GENE format\n")
+cat("Number of pathways:", length(unique(hallmark_term2gene$gs_name)), "\n")
+cat("Total gene-pathway pairs:", nrow(hallmark_term2gene), "\n")
+```
+
+# Load TE Data
+
+Load the complete TE lists for all timepoints.
+
+```{r load_te_data}
+# Load TE data for all timepoints (spike-ins already removed in calculate_te_from_normalized_counts.Rmd)
+te_1hr <- read_csv(here("output", "complete_te_list_all_1hr.csv"))
+te_4hr <- read_csv(here("output", "complete_te_list_all_4hr.csv"))
+te_24hr <- read_csv(here("output", "complete_te_list_all_24hr.csv"))
+
+cat("Loaded TE data:\n")
+cat("1hr:", nrow(te_1hr), "genes\n")
+cat("4hr:", nrow(te_4hr), "genes\n")
+cat("24hr:", nrow(te_24hr), "genes\n")
+```
+
+# Extract TE Columns
+
+Extract only the TE columns from each timepoint and combine them.
+
+```{r extract_te_columns}
+# Get TE columns (those containing "_TE_")
+te_cols_1hr <- grep("_TE_", colnames(te_1hr), value = TRUE)
+te_cols_4hr <- grep("_TE_", colnames(te_4hr), value = TRUE)
+te_cols_24hr <- grep("_TE_", colnames(te_24hr), value = TRUE)
+
+# Extract TE values
+te_matrix_1hr <- te_1hr %>%
+  dplyr::select(gene_id, all_of(te_cols_1hr)) %>%
+  column_to_rownames("gene_id")
+
+te_matrix_4hr <- te_4hr %>%
+  dplyr::select(gene_id, all_of(te_cols_4hr)) %>%
+  column_to_rownames("gene_id")
+
+te_matrix_24hr <- te_24hr %>%
+  dplyr::select(gene_id, all_of(te_cols_24hr)) %>%
+  column_to_rownames("gene_id")
+
+cat("TE matrix dimensions:\n")
+cat("1hr:", dim(te_matrix_1hr), "\n")
+cat("4hr:", dim(te_matrix_4hr), "\n")
+cat("24hr:", dim(te_matrix_24hr), "\n")
+```
+
+# Order Columns
+
+Order columns in the specified order: sictrl -> si3d -> si3e, within each: normoxia -> hypoxia, within each: 1hr -> 4hr -> 24hr.
+
+```{r order_columns}
+# Combine all timepoints first
+# Ensure all matrices have the same genes
+common_genes <- Reduce(intersect, list(rownames(te_matrix_1hr),
+                                        rownames(te_matrix_4hr),
+                                        rownames(te_matrix_24hr)))
+
+te_matrix_1hr <- te_matrix_1hr[common_genes, ]
+te_matrix_4hr <- te_matrix_4hr[common_genes, ]
+te_matrix_24hr <- te_matrix_24hr[common_genes, ]
+
+cat("Number of common genes:", length(common_genes), "\n")
+
+# Create a combined data frame with all column info
+all_cols <- data.frame(
+  col_name = c(colnames(te_matrix_1hr), colnames(te_matrix_4hr), colnames(te_matrix_24hr)),
+  timepoint = c(rep("1hr", ncol(te_matrix_1hr)),
+                rep("4hr", ncol(te_matrix_4hr)),
+                rep("24hr", ncol(te_matrix_24hr))),
+  stringsAsFactors = FALSE
+)
+
+# Parse column names to extract condition and treatment
+# Format: condition_treatment_timepoint_rep_type_id
+all_cols$condition <- sapply(strsplit(all_cols$col_name, "_"), `[`, 1)
+all_cols$treatment <- sapply(strsplit(all_cols$col_name, "_"), `[`, 2)
+all_cols$rep <- sapply(strsplit(all_cols$col_name, "_"), `[`, 4)
+
+# Set factor levels for ordering
+all_cols$treatment <- factor(all_cols$treatment, levels = c("sictrl", "si3d", "si3e"))
+all_cols$condition <- factor(all_cols$condition, levels = c("normoxia", "hypoxia"))
+all_cols$timepoint <- factor(all_cols$timepoint, levels = c("1hr", "4hr", "24hr"))
+
+# Order by treatment, then condition, then timepoint, then replicate
+all_cols_ordered <- all_cols %>%
+  arrange(treatment, condition, timepoint, rep)
+
+# Create matrices for each timepoint with ordered columns
+te_matrix_1hr_ordered <- te_matrix_1hr[, all_cols_ordered$col_name[all_cols_ordered$timepoint == "1hr"]]
+te_matrix_4hr_ordered <- te_matrix_4hr[, all_cols_ordered$col_name[all_cols_ordered$timepoint == "4hr"]]
+te_matrix_24hr_ordered <- te_matrix_24hr[, all_cols_ordered$col_name[all_cols_ordered$timepoint == "24hr"]]
+
+# Combine into single matrix in the correct order
+te_matrix_all <- cbind(te_matrix_1hr_ordered, te_matrix_4hr_ordered, te_matrix_24hr_ordered)
+
+# Reorder the entire matrix according to all_cols_ordered
+te_matrix_all <- te_matrix_all[, all_cols_ordered$col_name]
+
+cat("Combined TE matrix dimensions:", dim(te_matrix_all), "\n")
+cat("Column order preview (first 6):\n")
+print(head(colnames(te_matrix_all)))
+```
+
+# Calculate Z-scores
+
+Calculate z-scores for each gene across all samples.
+
+```{r calculate_zscores}
+# Calculate z-scores row-wise (for each gene across all samples)
+te_matrix_zscore <- t(scale(t(te_matrix_all)))
+
+# Check for genes with zero variance (will have NaN z-scores)
+genes_with_nan <- rownames(te_matrix_zscore)[rowSums(is.na(te_matrix_zscore)) > 0]
+cat("Number of genes with NaN z-scores (zero variance):", length(genes_with_nan), "\n")
+
+# Remove genes with NaN z-scores
+if (length(genes_with_nan) > 0) {
+  te_matrix_zscore <- te_matrix_zscore[!rownames(te_matrix_zscore) %in% genes_with_nan, ]
+  cat("Removed", length(genes_with_nan), "genes with zero variance\n")
+}
+
+cat("Final matrix for heatmap:", dim(te_matrix_zscore), "\n")
+```
+
+# Create Column Annotations
+
+Create annotations to show the groupings in the heatmap.
+
+```{r create_annotations}
+# Create annotation data frame using the ordered column info
+col_anno <- data.frame(
+  Treatment = all_cols_ordered$treatment,
+  Condition = all_cols_ordered$condition,
+  Timepoint = all_cols_ordered$timepoint,
+  row.names = all_cols_ordered$col_name
+)
+
+# Ensure factors are in the correct order
+col_anno$Treatment <- factor(col_anno$Treatment, levels = c("sictrl", "si3d", "si3e"))
+col_anno$Condition <- factor(col_anno$Condition, levels = c("normoxia", "hypoxia"))
+col_anno$Timepoint <- factor(col_anno$Timepoint, levels = c("1hr", "4hr", "24hr"))
+
+# Define colors for annotations
+anno_colors <- list(
+  Treatment = c("sictrl" = "#808080", "si3d" = "#E69F00", "si3e" = "#56B4E9"),
+  Condition = c("normoxia" = "#009E73", "hypoxia" = "#CC79A7"),
+  Timepoint = c("1hr" = "#E0E0E0", "4hr" = "#A0A0A0", "24hr" = "#606060")
+)
+
+cat("Column annotations created\n")
+cat("Annotation structure:\n")
+print(head(col_anno))
+```
+
+# Create Heatmap
+
+Generate the heatmap with pheatmap.
+
+```{r create_heatmap, fig.width=12, fig.height=10}
+# Create heatmap
+pheatmap(
+  te_matrix_zscore,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores Across All Conditions and Timepoints",
+  fontsize = 10,
+  border_color = NA
+)
+```
+
+# Save Heatmap
+
+Save the heatmap as a PDF.
+
+```{r save_heatmap}
+# Save as PDF
+pdf(here("plots", "te_heatmap_all_conditions.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores Across All Conditions and Timepoints",
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("Heatmap saved to plots/te_heatmap_all_conditions.pdf\n")
+```
+
+# Optional: Filter to Top Variable Genes
+
+Create a heatmap with only the top most variable genes for better visualization.
+
+```{r filter_top_variable}
+# Calculate variance for each gene
+gene_vars <- apply(te_matrix_zscore, 1, var, na.rm = TRUE)
+
+# Select top 1000 most variable genes
+top_n_genes <- 1000
+top_genes <- names(sort(gene_vars, decreasing = TRUE)[1:top_n_genes])
+
+te_matrix_zscore_top <- te_matrix_zscore[top_genes, ]
+
+cat("Selected top", top_n_genes, "most variable genes\n")
+```
+
+```{r heatmap_top_variable, fig.width=12, fig.height=10}
+# Create heatmap with top variable genes
+pheatmap(
+  te_matrix_zscore_top,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - Top ", top_n_genes, " Most Variable Genes"),
+  fontsize = 10,
+  border_color = NA
+)
+```
+
+```{r save_heatmap_top_variable}
+# Save as PDF
+pdf(here("plots", "te_heatmap_top_variable_genes.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore_top,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - Top ", top_n_genes, " Most Variable Genes"),
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("Top variable genes heatmap saved to plots/te_heatmap_top_variable_genes.pdf\n")
+```
+
+# Filter for Genes Most Changed in Acute Hypoxic Response (siCtrl 1hr)
+
+Identify genes with the largest TE changes between normoxia and hypoxia at 1hr in sictrl condition.
+
+```{r filter_acute_hypoxia_response}
+# Get normoxia sictrl 1hr samples
+normoxia_sictrl_1hr_cols <- all_cols_ordered %>%
+  filter(treatment == "sictrl", condition == "normoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+# Get hypoxia sictrl 1hr samples
+hypoxia_sictrl_1hr_cols <- all_cols_ordered %>%
+  filter(treatment == "sictrl", condition == "hypoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+# Calculate mean TE for each condition
+mean_te_normoxia_1hr <- rowMeans(te_matrix_all[, normoxia_sictrl_1hr_cols], na.rm = TRUE)
+mean_te_hypoxia_1hr <- rowMeans(te_matrix_all[, hypoxia_sictrl_1hr_cols], na.rm = TRUE)
+
+# Calculate TE change (hypoxia - normoxia)
+te_change_1hr <- mean_te_hypoxia_1hr - mean_te_normoxia_1hr
+
+# Get top changed genes
+n_top_changed <- 500
+top_increased <- names(sort(te_change_1hr, decreasing = TRUE)[1:n_top_changed])
+top_decreased <- names(sort(te_change_1hr, decreasing = FALSE)[1:n_top_changed])
+top_changed_genes <- c(top_increased, top_decreased)
+
+cat("Genes with largest TE increase in hypoxia (1hr sictrl):", length(top_increased), "\n")
+cat("Genes with largest TE decrease in hypoxia (1hr sictrl):", length(top_decreased), "\n")
+cat("Total genes for heatmap:", length(top_changed_genes), "\n")
+
+# Create summary data frame
+te_change_summary <- data.frame(
+  gene_id = names(te_change_1hr),
+  te_change = te_change_1hr,
+  mean_normoxia = mean_te_normoxia_1hr,
+  mean_hypoxia = mean_te_hypoxia_1hr
+) %>%
+  arrange(desc(abs(te_change)))
+
+cat("\nTop 10 most changed genes:\n")
+print(head(te_change_summary, 10))
+
+# Save the TE change summary
+write_csv(te_change_summary, here("output", "te_change_sictrl_normoxia_vs_hypoxia_1hr.csv"))
+cat("\nSaved TE change summary to output/te_change_sictrl_normoxia_vs_hypoxia_1hr.csv\n")
+```
+
+```{r heatmap_acute_hypoxia_response, fig.width=12, fig.height=10}
+# Filter z-score matrix to top changed genes
+te_matrix_zscore_acute <- te_matrix_zscore[top_changed_genes, ]
+
+# Create heatmap
+pheatmap(
+  te_matrix_zscore_acute,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - Top ", length(top_changed_genes),
+                " Genes Changed in Acute Hypoxic Response (siCtrl 1hr)"),
+  fontsize = 10,
+  border_color = NA
+)
+```
+
+```{r save_heatmap_acute_hypoxia}
+# Save as PDF
+pdf(here("plots", "te_heatmap_acute_hypoxia_response.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore_acute,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - Top ", length(top_changed_genes),
+                " Genes Changed in Acute Hypoxic Response (siCtrl 1hr)"),
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("Acute hypoxia response heatmap saved to plots/te_heatmap_acute_hypoxia_response.pdf\n")
+```
+
+# Filter for Genes with Increased TE in Hypoxia (siCtrl 1hr)
+
+Create a heatmap showing only genes that increase TE in response to hypoxia at 1hr in sictrl.
+
+```{r filter_te_increase_hypoxia}
+# Get genes with increased TE in hypoxia (top N)
+n_increased <- 500
+genes_increased_te <- names(sort(te_change_1hr, decreasing = TRUE)[1:n_increased])
+
+cat("Number of genes with increased TE in hypoxia:", length(genes_increased_te), "\n")
+cat("TE change range:", range(te_change_1hr[genes_increased_te]), "\n")
+
+# Create summary for increased genes
+te_increase_summary <- te_change_summary %>%
+  filter(gene_id %in% genes_increased_te) %>%
+  arrange(desc(te_change))
+
+cat("\nTop 10 genes with increased TE in hypoxia:\n")
+print(head(te_increase_summary, 10))
+
+# Save the increased TE genes
+write_csv(te_increase_summary, here("output", "te_increased_in_hypoxia_sictrl_1hr.csv"))
+cat("\nSaved increased TE genes to output/te_increased_in_hypoxia_sictrl_1hr.csv\n")
+```
+
+```{r heatmap_te_increase_hypoxia, fig.width=12, fig.height=10}
+# Filter z-score matrix to genes with increased TE
+te_matrix_zscore_increased <- te_matrix_zscore[genes_increased_te, ]
+
+# Create heatmap
+
+heatmap <- 
+  pheatmap(
+  te_matrix_zscore_increased,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - Top ", n_increased,
+                " Genes with Increased TE in Hypoxia (siCtrl 1hr)"),
+  fontsize = 10,
+  border_color = NA
+)
+print(heatmap)
+```
+
+```{r save_heatmap_te_increase}
+# Save as PDF
+pdf(here("plots", "te_heatmap_increased_in_hypoxia.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore_increased,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - Top ", n_increased,
+                " Genes with Increased TE in Hypoxia (siCtrl 1hr)"),
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("Increased TE in hypoxia heatmap saved to plots/te_heatmap_increased_in_hypoxia.pdf\n")
+```
+
+# Filter for Genes with Hypoxic Response Affected by si3d/si3e
+
+Identify genes that change in hypoxia in sictrl but have reduced/no response in si3d or si3e knockdowns.
+
+```{r calculate_hypoxia_response_all_treatments}
+# Get sample columns for each treatment/condition combination at 1hr
+normoxia_sictrl_1hr <- all_cols_ordered %>%
+  filter(treatment == "sictrl", condition == "normoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+hypoxia_sictrl_1hr <- all_cols_ordered %>%
+  filter(treatment == "sictrl", condition == "hypoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+normoxia_si3d_1hr <- all_cols_ordered %>%
+  filter(treatment == "si3d", condition == "normoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+hypoxia_si3d_1hr <- all_cols_ordered %>%
+  filter(treatment == "si3d", condition == "hypoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+normoxia_si3e_1hr <- all_cols_ordered %>%
+  filter(treatment == "si3e", condition == "normoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+hypoxia_si3e_1hr <- all_cols_ordered %>%
+  filter(treatment == "si3e", condition == "hypoxia", timepoint == "1hr") %>%
+  pull(col_name)
+
+# Calculate hypoxia response (hypoxia - normoxia) for each treatment
+hypoxia_response_sictrl <- rowMeans(te_matrix_all[, hypoxia_sictrl_1hr], na.rm = TRUE) -
+                           rowMeans(te_matrix_all[, normoxia_sictrl_1hr], na.rm = TRUE)
+
+hypoxia_response_si3d <- rowMeans(te_matrix_all[, hypoxia_si3d_1hr], na.rm = TRUE) -
+                         rowMeans(te_matrix_all[, normoxia_si3d_1hr], na.rm = TRUE)
+
+hypoxia_response_si3e <- rowMeans(te_matrix_all[, hypoxia_si3e_1hr], na.rm = TRUE) -
+                         rowMeans(te_matrix_all[, normoxia_si3e_1hr], na.rm = TRUE)
+
+# Calculate the difference in hypoxia response
+# Positive values = hypoxia response is blunted in knockdown
+response_diff_si3d <- hypoxia_response_sictrl - hypoxia_response_si3d
+response_diff_si3e <- hypoxia_response_sictrl - hypoxia_response_si3e
+
+cat("Calculated hypoxia response for all treatments\n")
+```
+
+```{r filter_blunted_response}
+# Find genes with strong hypoxic response in sictrl that is blunted in si3d or si3e
+# Criteria:
+# 1. Strong hypoxic response in sictrl (TE change > threshold)
+# 2. Reduced response in si3d or si3e (difference in response > threshold)
+
+min_sictrl_response <- 0.5  # Minimum TE change in sictrl hypoxia response
+min_blunted_diff <- 0.3     # Minimum difference showing blunted response
+
+# Genes with blunted response in si3d
+genes_blunted_si3d <- names(which(
+  abs(hypoxia_response_sictrl) > min_sictrl_response &
+  response_diff_si3d > min_blunted_diff
+))
+
+# Genes with blunted response in si3e
+genes_blunted_si3e <- names(which(
+  abs(hypoxia_response_sictrl) > min_sictrl_response &
+  response_diff_si3e > min_blunted_diff
+))
+
+# Genes blunted in either si3d or si3e
+genes_blunted_either <- unique(c(genes_blunted_si3d, genes_blunted_si3e))
+
+cat("Genes with blunted hypoxic response in si3d:", length(genes_blunted_si3d), "\n")
+cat("Genes with blunted hypoxic response in si3e:", length(genes_blunted_si3e), "\n")
+cat("Genes with blunted response in either knockdown:", length(genes_blunted_either), "\n")
+
+# Create summary data frame
+blunted_response_summary <- data.frame(
+  gene_id = names(hypoxia_response_sictrl),
+  sictrl_response = hypoxia_response_sictrl,
+  si3d_response = hypoxia_response_si3d,
+  si3e_response = hypoxia_response_si3e,
+  diff_si3d = response_diff_si3d,
+  diff_si3e = response_diff_si3e
+) %>%
+  filter(gene_id %in% genes_blunted_either) %>%
+  arrange(desc(pmax(diff_si3d, diff_si3e)))
+
+cat("\nTop 10 genes with most blunted hypoxic response:\n")
+print(head(blunted_response_summary, 10))
+
+# Save summary
+write_csv(blunted_response_summary, here("output", "genes_with_blunted_hypoxia_response.csv"))
+cat("\nSaved blunted response genes to output/genes_with_blunted_hypoxia_response.csv\n")
+```
+
+```{r heatmap_blunted_response, fig.width=12, fig.height=10}
+# Filter z-score matrix to genes with blunted response
+te_matrix_zscore_blunted <- te_matrix_zscore[genes_blunted_either, ]
+
+# Create heatmap
+heatmap_blunted <- pheatmap(
+  te_matrix_zscore_blunted,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - ", length(genes_blunted_either),
+                " Genes with Blunted Hypoxic Response in si3d/si3e"),
+  fontsize = 10,
+  border_color = NA
+)
+print(heatmap_blunted)
+```
+
+```{r save_heatmap_blunted_response}
+# Save as PDF
+pdf(here("plots", "te_heatmap_blunted_hypoxia_response.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore_blunted,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - ", length(genes_blunted_either),
+                " Genes with Blunted Hypoxic Response in si3d/si3e"),
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("Blunted hypoxia response heatmap saved to plots/te_heatmap_blunted_hypoxia_response.pdf\n")
+```
+
+# Blunted Response Heatmap - Normoxia vs Hypoxia Split
+
+Create the same heatmap but with all normoxia samples on the left and all hypoxia samples on the right.
+
+```{r reorder_columns_by_condition}
+# Reorder columns: condition first, then treatment, then timepoint
+all_cols_by_condition <- all_cols_ordered %>%
+  arrange(condition, treatment, timepoint, rep)
+
+# Reorder the z-score matrix for blunted genes
+te_matrix_zscore_blunted_reordered <- te_matrix_zscore_blunted[, all_cols_by_condition$col_name]
+
+# Create new column annotations
+col_anno_by_condition <- data.frame(
+  Condition = all_cols_by_condition$condition,
+  Treatment = all_cols_by_condition$treatment,
+  Timepoint = all_cols_by_condition$timepoint,
+  row.names = all_cols_by_condition$col_name
+)
+
+# Ensure factors are in the correct order
+col_anno_by_condition$Condition <- factor(col_anno_by_condition$Condition, levels = c("normoxia", "hypoxia"))
+col_anno_by_condition$Treatment <- factor(col_anno_by_condition$Treatment, levels = c("sictrl", "si3d", "si3e"))
+col_anno_by_condition$Timepoint <- factor(col_anno_by_condition$Timepoint, levels = c("1hr", "4hr", "24hr"))
+
+cat("Reordered matrix by condition\n")
+cat("Column order: normoxia samples (all treatments/timepoints), then hypoxia samples (all treatments/timepoints)\n")
+```
+
+```{r heatmap_blunted_by_condition, fig.width=12, fig.height=10}
+# Create heatmap with condition-based ordering
+heatmap_blunted_cond <- pheatmap(
+  te_matrix_zscore_blunted_reordered,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno_by_condition,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - ", length(genes_blunted_either),
+                " Genes with Blunted Hypoxic Response (Normoxia | Hypoxia)"),
+  fontsize = 10,
+  border_color = NA
+)
+print(heatmap_blunted_cond)
+```
+
+```{r save_heatmap_blunted_by_condition}
+# Save as PDF
+pdf(here("plots", "te_heatmap_blunted_hypoxia_response_by_condition.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore_blunted_reordered,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno_by_condition,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = paste0("TE Z-scores - ", length(genes_blunted_either),
+                " Genes with Blunted Hypoxic Response (Normoxia | Hypoxia)"),
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("Condition-split blunted hypoxia response heatmap saved to plots/te_heatmap_blunted_hypoxia_response_by_condition.pdf\n")
+```
+
+# All Genes Heatmap - Normoxia vs Hypoxia Split
+
+Create a heatmap with all genes, organized with normoxia samples on the left and hypoxia samples on the right.
+
+```{r reorder_all_genes_by_condition}
+# Reorder the full z-score matrix by condition
+te_matrix_zscore_all_reordered <- te_matrix_zscore[, all_cols_by_condition$col_name]
+
+cat("Reordered full matrix by condition\n")
+cat("Total genes:", nrow(te_matrix_zscore_all_reordered), "\n")
+cat("Column order: normoxia (all treatments/timepoints) | hypoxia (all treatments/timepoints)\n")
+```
+
+```{r heatmap_all_genes_by_condition, fig.width=12, fig.height=10}
+# Create heatmap with all genes
+heatmap_all_cond <- pheatmap(
+  te_matrix_zscore_all_reordered,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno_by_condition,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores - All Genes (Normoxia | Hypoxia)",
+  fontsize = 10,
+  border_color = NA
+)
+print(heatmap_all_cond)
+```
+
+```{r save_heatmap_all_genes_by_condition}
+# Save as PDF
+pdf(here("plots", "te_heatmap_all_genes_by_condition.pdf"), width = 12, height = 10)
+pheatmap(
+  te_matrix_zscore_all_reordered,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = col_anno_by_condition,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores - All Genes (Normoxia | Hypoxia)",
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("All genes heatmap by condition saved to plots/te_heatmap_all_genes_by_condition.pdf\n")
+```
+
+# All Genes Heatmap - All Timepoints, Clustered by siCtrl Response
+
+Create a heatmap with all genes and all timepoints, organized by treatment with normoxia and hypoxia side-by-side, clustered by sictrl hypoxic response across the timecourse.
+
+```{r reorder_all_timepoints_by_treatment}
+# Order all samples by treatment, then condition, then timepoint
+cols_all_by_treatment <- all_cols_ordered %>%
+  arrange(treatment, condition, timepoint, rep)
+
+# Reorder the full z-score matrix
+te_matrix_zscore_by_treatment <- te_matrix_zscore[, cols_all_by_treatment$col_name]
+
+# Create column annotations
+col_anno_by_treatment <- data.frame(
+  Treatment = cols_all_by_treatment$treatment,
+  Condition = cols_all_by_treatment$condition,
+  Timepoint = cols_all_by_treatment$timepoint,
+  row.names = cols_all_by_treatment$col_name
+)
+
+col_anno_by_treatment$Treatment <- factor(col_anno_by_treatment$Treatment, levels = c("sictrl", "si3d", "si3e"))
+col_anno_by_treatment$Condition <- factor(col_anno_by_treatment$Condition, levels = c("normoxia", "hypoxia"))
+col_anno_by_treatment$Timepoint <- factor(col_anno_by_treatment$Timepoint, levels = c("1hr", "4hr", "24hr"))
+
+cat("Reordered all samples by treatment\n")
+cat("Total genes:", nrow(te_matrix_zscore_by_treatment), "\n")
+cat("Total samples:", ncol(te_matrix_zscore_by_treatment), "\n")
+cat("Column order: sictrl (norm/hyp: 1hr, 4hr, 24hr) | si3d (norm/hyp: 1hr, 4hr, 24hr) | si3e (norm/hyp: 1hr, 4hr, 24hr)\n")
+```
+
+```{r cluster_by_sictrl_timecourse}
+# Cluster genes based on sictrl samples across all timepoints and conditions
+sictrl_all_cols <- cols_all_by_treatment %>%
+  filter(treatment == "sictrl") %>%
+  pull(col_name)
+
+# Extract sictrl data for clustering
+te_matrix_sictrl_all <- te_matrix_zscore_by_treatment[, sictrl_all_cols]
+
+# Perform hierarchical clustering on sictrl timecourse data
+row_clustering_timecourse <- hclust(dist(te_matrix_sictrl_all))
+
+cat("Clustered genes based on sictrl response across all timepoints and conditions\n")
+```
+
+# Elbow Plot for K-means Clustering
+
+Determine the optimal number of clusters for k-means clustering by examining the within-cluster sum of squares (WSS) for different k values.
+
+```{r elbow_plot}
+# Test k-means with different numbers of clusters
+k_values <- 2:15
+wss <- numeric(length(k_values))
+
+# Calculate WSS for each k
+set.seed(123)  # For reproducibility
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  kmeans_result <- kmeans(te_matrix_sictrl_all, centers = k, nstart = 25)
+  wss[i] <- kmeans_result$tot.withinss
+  cat("k =", k, "WSS =", round(wss[i], 2), "\n")
+}
+
+# Create elbow plot
+elbow_data <- data.frame(k = k_values, wss = wss)
+
+ggplot(elbow_data, aes(x = k, y = wss)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  labs(
+    title = "Elbow Plot for K-means Clustering",
+    subtitle = "Based on siCtrl samples across all timepoints and conditions",
+    x = "Number of Clusters (k)",
+    y = "Within-Cluster Sum of Squares (WSS)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  ) +
+  scale_x_continuous(breaks = k_values)
+```
+
+```{r heatmap_all_genes_all_timepoints, fig.width=14, fig.height=10}
+# Create heatmap with all genes and timepoints, using sictrl-based clustering
+heatmap_all_timecourse <- pheatmap(
+  te_matrix_zscore_by_treatment,
+  cluster_rows = row_clustering_timecourse,
+  cluster_cols = FALSE,
+  annotation_col = col_anno_by_treatment,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores - All Genes, All Timepoints (Clustered by siCtrl Timecourse)",
+  fontsize = 10,
+  border_color = NA
+)
+print(heatmap_all_timecourse)
+```
+
+```{r save_heatmap_all_genes_all_timepoints}
+# Save as PDF
+pdf(here("plots", "te_heatmap_all_genes_all_timepoints_by_treatment.pdf"), width = 14, height = 10)
+pheatmap(
+  te_matrix_zscore_by_treatment,
+  cluster_rows = row_clustering_timecourse,
+  cluster_cols = FALSE,
+  annotation_col = col_anno_by_treatment,
+  annotation_colors = anno_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores - All Genes, All Timepoints (Clustered by siCtrl Timecourse)",
+  fontsize = 10,
+  border_color = NA
+)
+dev.off()
+
+cat("All genes all timepoints heatmap saved to plots/te_heatmap_all_genes_all_timepoints_by_treatment.pdf\n")
+```
+
+# All Genes Heatmap - K-means Clustering with 8 Clusters
+
+Create the same heatmap as above but using k-means clustering with k=8 clusters instead of hierarchical clustering.
+
+```{r kmeans_clustering_k8}
+# Perform k-means clustering with k=8 on sictrl data
+set.seed(123)  # For reproducibility
+kmeans_k8 <- kmeans(te_matrix_sictrl_all, centers = 8, nstart = 25)
+
+cat("K-means clustering with k=8 completed\n")
+cat("Cluster sizes:\n")
+cluster_sizes <- table(kmeans_k8$cluster)
+print(cluster_sizes)
+
+# Order genes by cluster
+cluster_order <- order(kmeans_k8$cluster)
+
+# Reorder columns by condition (normoxia | hypoxia)
+te_matrix_zscore_by_condition_kmeans <- te_matrix_zscore_by_treatment[cluster_order, all_cols_by_condition$col_name]
+
+# Create row annotation with cluster assignments
+row_anno <- data.frame(
+  Cluster = paste0("C", kmeans_k8$cluster[cluster_order],
+                   " (n=", cluster_sizes[kmeans_k8$cluster[cluster_order]], ")"),
+  row.names = rownames(te_matrix_zscore_by_condition_kmeans)
+)
+
+# Make cluster a factor to maintain order
+row_anno$Cluster <- factor(row_anno$Cluster,
+                           levels = unique(row_anno$Cluster))
+
+# Define colors for clusters
+cluster_colors <- setNames(
+  rainbow(8, s = 0.6, v = 0.8),
+  unique(row_anno$Cluster)
+)
+
+# Calculate positions for gaps between clusters
+cluster_boundaries <- cumsum(as.numeric(cluster_sizes[order(as.numeric(names(cluster_sizes)))]))
+gaps_positions <- cluster_boundaries[-length(cluster_boundaries)]
+
+cat("\nCluster boundaries for gaps:\n")
+print(gaps_positions)
+```
+
+```{r heatmap_kmeans_k8, fig.width=14, fig.height=10}
+# Create heatmap with k-means clustering (k=8)
+
+dev.off()
+heatmap_kmeans_k8 <- pheatmap(
+  te_matrix_zscore_by_condition_kmeans,
+  cluster_rows = FALSE,  # Already ordered by cluster
+  cluster_cols = FALSE,
+  annotation_row = row_anno,
+  annotation_col = col_anno_by_condition,
+  annotation_colors = list(
+    Cluster = cluster_colors,
+    Condition = anno_colors$Condition,
+    Treatment = anno_colors$Treatment,
+    Timepoint = anno_colors$Timepoint
+  ),
+  gaps_row = gaps_positions,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores - All Genes, All Timepoints (K-means k=8, Normoxia | Hypoxia)",
+  fontsize = 10,
+  fontsize_row = 8,
+  border_color = NA
+)
+print(heatmap_kmeans_k8)
+```
+
+```{r save_heatmap_kmeans_k8}
+# Save as PDF
+pdf(here("plots", "te_heatmap_all_genes_kmeans_k8.pdf"), width = 14, height = 10)
+pheatmap(
+  te_matrix_zscore_by_condition_kmeans,
+  cluster_rows = FALSE,  # Already ordered by cluster
+  cluster_cols = FALSE,
+  annotation_row = row_anno,
+  annotation_col = col_anno_by_condition,
+  annotation_colors = list(
+    Cluster = cluster_colors,
+    Condition = anno_colors$Condition,
+    Treatment = anno_colors$Treatment,
+    Timepoint = anno_colors$Timepoint
+  ),
+  gaps_row = gaps_positions,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-2, 2, length.out = 101),
+  main = "TE Z-scores - All Genes, All Timepoints (K-means k=8, Normoxia | Hypoxia)",
+  fontsize = 10,
+  fontsize_row = 8,
+  border_color = NA
+)
+dev.off()
+
+cat("K-means (k=8) heatmap saved to plots/te_heatmap_all_genes_kmeans_k8.pdf\n")
+```
+
+# ORA: Pathway Enrichment for K-means Clusters
+
+Perform Over-Representation Analysis (ORA) using Hallmark gene sets for each of the 8 k-means clusters.
+
+## Extract Genes from Each Cluster
+
+```{r extract_cluster_genes}
+# Get genes for each cluster
+cluster_genes_list <- list()
+
+for (i in 1:8) {
+  # Get genes in this cluster
+  cluster_genes <- names(kmeans_k8$cluster[kmeans_k8$cluster == i])
+  cluster_genes_list[[paste0("Cluster_", i)]] <- cluster_genes
+
+  cat("Cluster", i, ":", length(cluster_genes), "genes\n")
+
+  # Save gene list to file
+  write.csv(
+    data.frame(gene_id = cluster_genes),
+    here("output", paste0("cluster_", i, "_genes.csv")),
+    row.names = FALSE
+  )
+}
+
+cat("\nGene lists saved to output/cluster_*_genes.csv\n")
+```
+
+## ORA for Each Cluster
+
+```{r ora_clusters}
+# Initialize list to store ORA results
+ora_cluster_results <- list()
+
+# Perform ORA for each cluster
+for (i in 1:8) {
+  cat("\n=== Cluster", i, "===\n")
+
+  # Run ORA
+  ora_result <- enricher(
+    gene = cluster_genes_list[[paste0("Cluster_", i)]],
+    TERM2GENE = hallmark_term2gene,
+    pAdjustMethod = "fdr",
+    pvalueCutoff = 1,
+    qvalueCutoff = 1,
+    minGSSize = 15,
+    maxGSSize = 500
+  )
+
+  # Extract and format results
+  if (nrow(ora_result@result) > 0) {
+    ora_df <- ora_result@result %>%
+      dplyr::select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count, geneID) %>%
+      mutate(
+        GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"),
+                                   function(x) as.numeric(x[1])/as.numeric(x[2])),
+        Cluster = i
+      )
+
+    # Round numeric columns
+    ora_df <- ora_df %>%
+      mutate(
+        pvalue = round(pvalue, 6),
+        p.adjust = round(p.adjust, 6),
+        GeneRatio_numeric = round(GeneRatio_numeric, 4)
+      )
+
+    ora_cluster_results[[paste0("Cluster_", i)]] <- ora_df
+
+    # Print significant pathways
+    sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+    cat("Significant pathways (p.adjust < 0.05):", nrow(sig_pathways), "\n")
+
+    if (nrow(sig_pathways) > 0) {
+      cat("\nTop pathways:\n")
+      print(sig_pathways %>%
+              arrange(p.adjust) %>%
+              dplyr::select(ID, GeneRatio, p.adjust, Count) %>%
+              head(5))
+    }
+  } else {
+    cat("No enriched pathways found\n")
+    ora_cluster_results[[paste0("Cluster_", i)]] <- data.frame()
+  }
+}
+```
+
+## Visualize ORA Results - Individual Cluster Plots
+
+### Cluster 1
+
+```{r ora_cluster_1_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_1"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 1 (", length(cluster_genes_list[["Cluster_1"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_1.pdf"), p, width = 10, height = 8)
+    cat("Cluster 1 plot saved\n")
+  } else {
+    cat("Cluster 1: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 1: No ORA results\n")
+}
+```
+
+### Cluster 2
+
+```{r ora_cluster_2_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_2"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 2 (", length(cluster_genes_list[["Cluster_2"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_2.pdf"), p, width = 10, height = 8)
+    cat("Cluster 2 plot saved\n")
+  } else {
+    cat("Cluster 2: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 2: No ORA results\n")
+}
+```
+
+### Cluster 3
+
+```{r ora_cluster_3_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_3"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 3 (", length(cluster_genes_list[["Cluster_3"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_3.pdf"), p, width = 10, height = 8)
+    cat("Cluster 3 plot saved\n")
+  } else {
+    cat("Cluster 3: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 3: No ORA results\n")
+}
+```
+
+### Cluster 4
+
+```{r ora_cluster_4_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_4"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 4 (", length(cluster_genes_list[["Cluster_4"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_4.pdf"), p, width = 10, height = 8)
+    cat("Cluster 4 plot saved\n")
+  } else {
+    cat("Cluster 4: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 4: No ORA results\n")
+}
+```
+
+### Cluster 5
+
+```{r ora_cluster_5_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_5"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 5 (", length(cluster_genes_list[["Cluster_5"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_5.pdf"), p, width = 10, height = 8)
+    cat("Cluster 5 plot saved\n")
+  } else {
+    cat("Cluster 5: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 5: No ORA results\n")
+}
+```
+
+### Cluster 6
+
+```{r ora_cluster_6_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_6"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 6 (", length(cluster_genes_list[["Cluster_6"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_6.pdf"), p, width = 10, height = 8)
+    cat("Cluster 6 plot saved\n")
+  } else {
+    cat("Cluster 6: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 6: No ORA results\n")
+}
+```
+
+### Cluster 7
+
+```{r ora_cluster_7_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_7"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 7 (", length(cluster_genes_list[["Cluster_7"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_7.pdf"), p, width = 10, height = 8)
+    cat("Cluster 7 plot saved\n")
+  } else {
+    cat("Cluster 7: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 7: No ORA results\n")
+}
+```
+
+### Cluster 8
+
+```{r ora_cluster_8_plot, fig.width=10, fig.height=8}
+ora_df <- ora_cluster_results[["Cluster_8"]]
+
+if (nrow(ora_df) > 0) {
+  sig_pathways <- ora_df %>% filter(p.adjust < 0.05)
+
+  if (nrow(sig_pathways) > 0) {
+    plot_data <- sig_pathways %>%
+      arrange(p.adjust) %>%
+      head(20)
+
+    p <- ggplot(plot_data,
+                aes(y = reorder(ID, GeneRatio_numeric),
+                    x = GeneRatio_numeric,
+                    fill = p.adjust,
+                    size = Count)) +
+      geom_point(alpha = 0.7, shape = 21, color = "black") +
+      scale_size(range = c(3, 10)) +
+      scale_fill_viridis_c(direction = -1) +
+      labs(y = "Hallmark Pathways",
+           x = "Gene Ratio",
+           title = paste0("ORA: Cluster 8 (", length(cluster_genes_list[["Cluster_8"]]), " genes)"),
+           size = "Gene Count",
+           fill = "Adjusted\nP-value") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        plot.title = element_text(face = "bold")
+      )
+
+    print(p)
+    ggsave(here("plots", "ora_cluster_8.pdf"), p, width = 10, height = 8)
+    cat("Cluster 8 plot saved\n")
+  } else {
+    cat("Cluster 8: No significant pathways to plot\n")
+  }
+} else {
+  cat("Cluster 8: No ORA results\n")
+}
+```
+
+## Combined ORA Heatmap Across All Clusters
+
+```{r ora_combined_heatmap, fig.width=12, fig.height=10}
+# Combine all ORA results
+ora_all_clusters <- bind_rows(ora_cluster_results)
+
+if (nrow(ora_all_clusters) > 0) {
+  # Filter for pathways significant in at least one cluster
+  sig_pathways_any <- ora_all_clusters %>%
+    filter(p.adjust < 0.05) %>%
+    pull(ID) %>%
+    unique()
+
+  if (length(sig_pathways_any) > 0) {
+    # Create wide format for heatmap (pathways x clusters)
+    ora_wide <- ora_all_clusters %>%
+      filter(ID %in% sig_pathways_any) %>%
+      dplyr::select(ID, Cluster, GeneRatio_numeric) %>%
+      pivot_wider(names_from = Cluster,
+                  values_from = GeneRatio_numeric,
+                  names_prefix = "Cluster_") %>%
+      column_to_rownames("ID")
+
+    # Replace NA with 0
+    ora_wide[is.na(ora_wide)] <- 0
+
+    # Create significance matrix for annotation
+    sig_matrix <- ora_all_clusters %>%
+      filter(ID %in% sig_pathways_any) %>%
+      dplyr::select(ID, Cluster, p.adjust) %>%
+      pivot_wider(names_from = Cluster,
+                  values_from = p.adjust,
+                  names_prefix = "Cluster_") %>%
+      column_to_rownames("ID")
+
+    sig_matrix[is.na(sig_matrix)] <- 1
+    sig_matrix <- ifelse(sig_matrix < 0.05, "*", "")
+    sig_matrix <- sig_matrix[rownames(ora_wide), colnames(ora_wide)]
+
+    # Create heatmap
+    p_ora_heatmap <- pheatmap(
+      ora_wide,
+      cluster_rows = TRUE,
+      cluster_cols = FALSE,
+      scale = "none",
+      color = colorRampPalette(c("white", "orange", "red"))(100),
+      breaks = seq(0, max(ora_wide), length.out = 101),
+      display_numbers = sig_matrix,
+      number_color = "black",
+      fontsize_number = 12,
+      main = "ORA Gene Ratio Across K-means Clusters - Hallmark (* = p.adjust < 0.05)",
+      fontsize_row = 9,
+      fontsize_col = 10,
+      cellwidth = 30,
+      cellheight = 12,
+      border_color = "grey60"
+    )
+
+    print(p_ora_heatmap)
+
+    # Save heatmap
+    pdf(here("plots", "ora_kmeans_clusters_heatmap.pdf"), width = 12, height = 10)
+    print(p_ora_heatmap)
+    dev.off()
+
+    cat("\nORA heatmap shows", nrow(ora_wide), "pathways across 8 clusters\n")
+    cat("Heatmap saved to plots/ora_kmeans_clusters_heatmap.pdf\n")
+  } else {
+    cat("No significant pathways found across any cluster\n")
+  }
+} else {
+  cat("No ORA results to visualize\n")
+}
+```
+
+## Export ORA Results
+
+```{r export_ora_results}
+# Prepare export list (remove geneID column for readability in Excel)
+ora_export_list <- list()
+
+for (i in 1:8) {
+  if (nrow(ora_cluster_results[[paste0("Cluster_", i)]]) > 0) {
+    ora_export_list[[paste0("Cluster_", i)]] <-
+      ora_cluster_results[[paste0("Cluster_", i)]] %>%
+      dplyr::select(-GeneRatio_numeric, -Cluster, -geneID) %>%
+      arrange(p.adjust)
+  }
+}
+
+# Export to Excel
+if (length(ora_export_list) > 0) {
+  write_xlsx(ora_export_list, here("output", "ora_kmeans_clusters_hallmark.xlsx"))
+  cat("\nORA results exported to: output/ora_kmeans_clusters_hallmark.xlsx\n")
+}
+
+# Print summary statistics
+cat("\n=== ORA Summary ===\n")
+for (i in 1:8) {
+  n_genes <- length(cluster_genes_list[[paste0("Cluster_", i)]])
+
+  if (nrow(ora_cluster_results[[paste0("Cluster_", i)]]) > 0) {
+    n_sig <- ora_cluster_results[[paste0("Cluster_", i)]] %>%
+      filter(p.adjust < 0.05) %>%
+      nrow()
+
+    top_pathway <- ora_cluster_results[[paste0("Cluster_", i)]] %>%
+      filter(p.adjust < 0.05) %>%
+      arrange(p.adjust) %>%
+      slice(1) %>%
+      pull(ID)
+
+    cat("Cluster", i, ":", n_genes, "genes,", n_sig, "significant pathways")
+    if (length(top_pathway) > 0) {
+      cat(", Top:", top_pathway[1])
+    }
+    cat("\n")
+  } else {
+    cat("Cluster", i, ":", n_genes, "genes, 0 significant pathways\n")
+  }
+}
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

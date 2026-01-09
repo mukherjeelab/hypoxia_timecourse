@@ -1,0 +1,970 @@
+---
+title: "Translation Factors in Hypoxic Response"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(here)
+library(clusterProfiler)
+library(enrichplot)
+library(pheatmap)
+library(writexl)
+```
+
+## Load TE Changes from Hypoxia Timecourse
+
+```{r load_te_data}
+# Load TE changes from hypoxia timecourse at all three timepoints
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+te_4hr <- read_csv(here("output", "translation_categories_4hr.csv"))
+te_24hr <- read_csv(here("output", "translation_categories_24hr.csv"))
+
+# Load gene symbols from annotation file
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"))
+
+# Keep one entry per gene (prefer protein_coding, then deduplicate)
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+# Add gene symbols to TE data and prepare for GSEA
+# Handle duplicate gene symbols by keeping the gene with highest absolute LFC
+te_1hr_gsea <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_4hr_gsea <- te_4hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_24hr_gsea <- te_24hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Loaded TE data with gene symbols:\n")
+cat("1hr:", nrow(te_1hr_gsea), "genes\n")
+cat("  - With symbols:", sum(!is.na(te_1hr_gsea$symbol)), "\n")
+cat("  - Without symbols (NA):", sum(is.na(te_1hr_gsea$symbol)), "\n")
+cat("4hr:", nrow(te_4hr_gsea), "genes\n")
+cat("  - With symbols:", sum(!is.na(te_4hr_gsea$symbol)), "\n")
+cat("24hr:", nrow(te_24hr_gsea), "genes\n")
+cat("  - With symbols:", sum(!is.na(te_24hr_gsea$symbol)), "\n")
+```
+
+## Load Translation Factor Signatures from Literature
+
+```{r load_translation_signatures}
+# Load translation factor signatures from literature
+translation_sigs <- read_csv(here("accessories", "translation_signatures_literature.csv"))
+
+cat("Loaded translation signatures:\n")
+print(colnames(translation_sigs))
+cat("\nNumber of genes in signature dataset:", nrow(translation_sigs), "\n")
+```
+
+## Load Teleman riboseq data
+
+
+
+```{r define-resistant-4e}
+
+res_riboseq_symbol <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv")
+
+# First remove duplicates from the entire dataset (keep gene with highest baseMean)
+res_riboseq_dedup <- res_riboseq_symbol %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Total genes after removing duplicates:", nrow(res_riboseq_dedup), "\n")
+
+# Resistant genes: log2FC > 1 and padj < 0.05
+# Positive = resistant to 4E inhibition (still translated when eIF4E is inhibited)
+resistant_4E <- res_riboseq_dedup %>%
+  filter(log2FoldChange > 1) %>%
+  filter(padj < 0.05)
+
+cat("Number of 4E-resistant genes (LFC > 1, padj < 0.05):", nrow(resistant_4E), "\n")
+if(nrow(resistant_4E) > 0) {
+  cat("log2FC range:", round(min(resistant_4E$log2FoldChange), 2), "to",
+      round(max(resistant_4E$log2FoldChange), 2), "\n")
+}
+
+# Create gene set for overlap analysis - use pull() to extract vector
+resistant_set <- data.frame(
+  gs_name = "Resistant_4E",
+  gene = resistant_4E %>% pull(symbol)
+)
+
+# Show top resistant genes
+resistant_4E %>%
+  arrange(desc(log2FoldChange)) %>%
+  dplyr::select(symbol, log2FoldChange, padj, baseMean) %>%
+  head(20)
+```
+
+## Define sensitive 4E lists
+
+```{r define-sensitive-4e}
+
+# Sensitive genes: log2FC < -1 and padj < 0.05
+# Negative = sensitive to 4E inhibition (reduced translation when eIF4E is inhibited)
+sensitive_4E <- res_riboseq_dedup %>%
+  filter(log2FoldChange < -1) %>%
+  filter(padj < 0.05)
+
+cat("Number of 4E-sensitive genes (LFC < -1, padj < 0.05):", nrow(sensitive_4E), "\n")
+if(nrow(sensitive_4E) > 0) {
+  cat("log2FC range:", round(min(sensitive_4E$log2FoldChange), 2), "to",
+      round(max(sensitive_4E$log2FoldChange), 2), "\n")
+}
+
+# Create gene set for overlap analysis - use pull() to extract vector
+sensitive_set <- data.frame(
+  gs_name = "Sensitive_4E",
+  gene = sensitive_4E %>% pull(symbol)
+)
+
+# Show top sensitive genes (most negative log2FC)
+sensitive_4E %>%
+  arrange(log2FoldChange) %>%
+  dplyr::select(symbol, log2FoldChange, padj, baseMean) %>%
+  head(20)
+```
+
+## Combine Resistant and Sensitive 4E Gene Sets for GSEA
+
+```{r combine-4e-genesets}
+# Combine resistant and sensitive gene sets into TERM2GENE format for GSEA
+# This creates two separate gene sets: Resistant_4E and Sensitive_4E
+# IMPORTANT: TERM2GENE needs columns in order: term, gene (column names don't matter, just order)
+teleman_4E_genesets <- bind_rows(resistant_set, sensitive_set) %>%
+  dplyr::select(gs_name, gene)  # Ensure correct column order
+
+cat("Gene sets for GSEA (TERM2GENE format):\n")
+cat("Total gene entries:", nrow(teleman_4E_genesets), "\n")
+cat("Number of gene sets: 2\n")
+cat("  - Resistant_4E:", sum(teleman_4E_genesets$gs_name == "Resistant_4E"), "genes\n")
+cat("  - Sensitive_4E:", sum(teleman_4E_genesets$gs_name == "Sensitive_4E"), "genes\n")
+
+# Define gene lists for overlap checking
+te_genes_1hr <- unique(te_1hr_gsea$symbol)
+te_genes_4hr <- unique(te_4hr_gsea$symbol)
+te_genes_24hr <- unique(te_24hr_gsea$symbol)
+
+# Check overlap with TE data
+resistant_genes <- unique(resistant_set$gene)
+sensitive_genes <- unique(sensitive_set$gene)
+
+cat("\nResistant_4E overlap with TE data:\n")
+cat("1hr:", length(intersect(resistant_genes, te_genes_1hr)), "genes\n")
+cat("4hr:", length(intersect(resistant_genes, te_genes_4hr)), "genes\n")
+cat("24hr:", length(intersect(resistant_genes, te_genes_24hr)), "genes\n\n")
+
+cat("Sensitive_4E overlap with TE data:\n")
+cat("1hr:", length(intersect(sensitive_genes, te_genes_1hr)), "genes\n")
+cat("4hr:", length(intersect(sensitive_genes, te_genes_4hr)), "genes\n")
+cat("24hr:", length(intersect(sensitive_genes, te_genes_24hr)), "genes\n")
+```
+
+## Prepare Translation Signatures for GSEA
+
+```{r prepare-translation-sigs}
+# Convert translation_sigs to TERM2GENE format for GSEA
+translation_sigs_term2gene <- translation_sigs %>%
+  dplyr::select(gs_name, db_gene_symbol) %>%
+  filter(!is.na(db_gene_symbol)) %>%
+  rename(gene = db_gene_symbol)
+
+# Check gene set sizes and overlaps
+cat("\nTranslation Signature Gene Sets:\n")
+translation_sigs_summary <- translation_sigs_term2gene %>%
+  group_by(gs_name) %>%
+  summarize(total_genes = n(), .groups = 'drop') %>%
+  arrange(desc(total_genes))
+print(translation_sigs_summary)
+
+# Check overlap with TE data
+cat("\nOverlap with TE data (1hr):\n")
+for(gs in unique(translation_sigs_term2gene$gs_name)) {
+  genes <- translation_sigs_term2gene %>% filter(gs_name == gs) %>% pull(gene)
+  overlap <- length(intersect(genes, te_genes_1hr))
+  cat(sprintf("  %s: %d / %d genes\n", gs, overlap, length(genes)))
+}
+```
+
+## Prepare Ranked Lists for GSEA
+
+```{r prepare-ranked-lists}
+# Create ranked lists based on TE log2FC for each timepoint
+ranked_list_te_1hr <- te_1hr_gsea$log2FoldChange
+names(ranked_list_te_1hr) <- te_1hr_gsea$symbol
+ranked_list_te_1hr <- ranked_list_te_1hr[!is.na(ranked_list_te_1hr)]
+ranked_list_te_1hr <- sort(ranked_list_te_1hr, decreasing = TRUE)
+
+ranked_list_te_4hr <- te_4hr_gsea$log2FoldChange
+names(ranked_list_te_4hr) <- te_4hr_gsea$symbol
+ranked_list_te_4hr <- ranked_list_te_4hr[!is.na(ranked_list_te_4hr)]
+ranked_list_te_4hr <- sort(ranked_list_te_4hr, decreasing = TRUE)
+
+ranked_list_te_24hr <- te_24hr_gsea$log2FoldChange
+names(ranked_list_te_24hr) <- te_24hr_gsea$symbol
+ranked_list_te_24hr <- ranked_list_te_24hr[!is.na(ranked_list_te_24hr)]
+ranked_list_te_24hr <- sort(ranked_list_te_24hr, decreasing = TRUE)
+
+cat("Ranked lists prepared:\n")
+cat("1hr:", length(ranked_list_te_1hr), "genes\n")
+cat("  - Range:", round(min(ranked_list_te_1hr), 3), "to", round(max(ranked_list_te_1hr), 3), "\n")
+cat("  - Duplicated names:", sum(duplicated(names(ranked_list_te_1hr))), "\n")
+cat("4hr:", length(ranked_list_te_4hr), "genes\n")
+cat("24hr:", length(ranked_list_te_24hr), "genes\n")
+
+# Check overlap with gene sets
+cat("\nGene set overlap check:\n")
+cat("Resistant genes in ranked list 1hr:", sum(resistant_genes %in% names(ranked_list_te_1hr)), "/", length(resistant_genes), "\n")
+cat("Sensitive genes in ranked list 1hr:", sum(sensitive_genes %in% names(ranked_list_te_1hr)), "/", length(sensitive_genes), "\n")
+```
+
+## Teleman 4E GSEA
+
+## GSEA: TE 1hr
+
+```{r gsea_te_1hr}
+# Run GSEA (unweighted)
+gsea_te_1hr <- GSEA(
+  geneList = ranked_list_te_1hr,
+  exponent = 0,  # Use unweighted Kolmogorov-Smirnov statistic
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  TERM2GENE = teleman_4E_genesets,
+  minGSSize = 10,
+  maxGSSize = 1000  # Increased to accommodate larger gene sets (574-628 genes)
+)
+
+# Extract results - ALWAYS extract, even if not significant
+if (nrow(gsea_te_1hr@result) > 0) {
+  gsea_te_1hr_results <- gsea_te_1hr@result %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+    rename("leading_edge" = core_enrichment) %>%
+    mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+           leading_edge_fraction = leading_edge_count / setSize)
+
+  gsea_te_1hr_results[] <- lapply(gsea_te_1hr_results, function(x) {
+    if (is.numeric(x)) round(x, 4) else x
+  })
+
+  cat("GSEA TE 1hr results:\n")
+  print(gsea_te_1hr_results %>% dplyr::select(ID, NES, pvalue, p.adjust, setSize))
+} else {
+  # Create empty dataframe with correct structure
+  gsea_te_1hr_results <- data.frame(
+    ID = character(),
+    NES = numeric(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    setSize = numeric(),
+    leading_edge = character(),
+    leading_edge_count = numeric(),
+    leading_edge_fraction = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("GSEA TE 1hr - No gene sets met minimum size requirement (minGSSize = 10)\n")
+}
+
+# Create enrichment score plots if results exist
+if(nrow(gsea_te_1hr_results) > 0) {
+  # Create individual plots for each gene set with NES and padj annotations
+  for(i in 1:nrow(gsea_te_1hr@result)) {
+    gene_set_name <- gsea_te_1hr@result$ID[i]
+    nes_val <- round(gsea_te_1hr@result$NES[i], 3)
+    padj_val <- formatC(gsea_te_1hr@result$p.adjust[i], format = "e", digits = 2)
+
+    plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+    p <- gseaplot2(gsea_te_1hr,
+                   geneSetID = i,
+                   title = plot_title,
+                   pvalue_table = FALSE,
+                   ES_geom = "line")
+    print(p)
+  }
+
+  # Save each gene set to separate PDF files
+  for(i in 1:nrow(gsea_te_1hr@result)) {
+    gene_set_name <- gsea_te_1hr@result$ID[i]
+    nes_val <- round(gsea_te_1hr@result$NES[i], 3)
+    padj_val <- formatC(gsea_te_1hr@result$p.adjust[i], format = "e", digits = 2)
+
+    plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+    cat("Plotting gene set:", gene_set_name, "\n")
+
+    # Save to individual PDF file
+    pdf_name <- sprintf("teleman_4E_gsea_enrichment_1hr_%s.pdf", gene_set_name)
+    pdf(here("plots", pdf_name), width = 8, height = 4)
+
+    p <- gseaplot2(gsea_te_1hr,
+                   geneSetID = i,
+                   title = plot_title,
+                   pvalue_table = FALSE,
+                   ES_geom = "line")
+    print(p)
+    dev.off()
+  }
+
+  cat("Total plots created for 1hr:", nrow(gsea_te_1hr@result), "\n")
+}
+```
+
+## GSEA: TE 4hr
+
+```{r gsea_te_4hr}
+# Run GSEA (unweighted)
+gsea_te_4hr <- GSEA(
+  geneList = ranked_list_te_4hr,
+  exponent = 0,  # Use unweighted Kolmogorov-Smirnov statistic
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  TERM2GENE = teleman_4E_genesets,
+  minGSSize = 10,
+  maxGSSize = 1000  # Increased to accommodate larger gene sets (574-628 genes)
+)
+
+# Extract results - ALWAYS extract, even if not significant
+if (nrow(gsea_te_4hr@result) > 0) {
+  gsea_te_4hr_results <- gsea_te_4hr@result %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+    rename("leading_edge" = core_enrichment) %>%
+    mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+           leading_edge_fraction = leading_edge_count / setSize)
+
+  gsea_te_4hr_results[] <- lapply(gsea_te_4hr_results, function(x) {
+    if (is.numeric(x)) round(x, 4) else x
+  })
+
+  cat("GSEA TE 4hr results:\n")
+  print(gsea_te_4hr_results %>% dplyr::select(ID, NES, pvalue, p.adjust, setSize))
+} else {
+  # Create empty dataframe with correct structure
+  gsea_te_4hr_results <- data.frame(
+    ID = character(),
+    NES = numeric(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    setSize = numeric(),
+    leading_edge = character(),
+    leading_edge_count = numeric(),
+    leading_edge_fraction = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("GSEA TE 4hr - No gene sets met minimum size requirement (minGSSize = 10)\n")
+}
+
+# Create enrichment score plots if results exist
+if(nrow(gsea_te_4hr_results) > 0) {
+  # Create individual plots for each gene set with NES and padj annotations
+  for(i in 1:nrow(gsea_te_4hr@result)) {
+    gene_set_name <- gsea_te_4hr@result$ID[i]
+    nes_val <- round(gsea_te_4hr@result$NES[i], 3)
+    padj_val <- formatC(gsea_te_4hr@result$p.adjust[i], format = "e", digits = 2)
+
+    plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+    p <- gseaplot2(gsea_te_4hr,
+                   geneSetID = i,
+                   title = plot_title,
+                   pvalue_table = FALSE,
+                   ES_geom = "line")
+    print(p)
+  }
+
+  # Save each gene set to separate PDF files
+  for(i in 1:nrow(gsea_te_4hr@result)) {
+    gene_set_name <- gsea_te_4hr@result$ID[i]
+    nes_val <- round(gsea_te_4hr@result$NES[i], 3)
+    padj_val <- formatC(gsea_te_4hr@result$p.adjust[i], format = "e", digits = 2)
+
+    plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+    cat("Plotting gene set:", gene_set_name, "\n")
+
+    # Save to individual PDF file
+    pdf_name <- sprintf("teleman_4E_gsea_enrichment_4hr_%s.pdf", gene_set_name)
+    pdf(here("plots", pdf_name), width = 8, height = 4)
+
+    p <- gseaplot2(gsea_te_4hr,
+                   geneSetID = i,
+                   title = plot_title,
+                   pvalue_table = FALSE,
+                   ES_geom = "line")
+    print(p)
+    dev.off()
+  }
+
+  cat("Total plots created for 4hr:", nrow(gsea_te_4hr@result), "\n")
+}
+```
+
+## GSEA: TE 24hr
+
+```{r gsea_te_24hr}
+# Run GSEA (unweighted)
+gsea_te_24hr <- GSEA(
+  geneList = ranked_list_te_24hr,
+  exponent = 0,  # Use unweighted Kolmogorov-Smirnov statistic
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  TERM2GENE = teleman_4E_genesets,
+  minGSSize = 10,
+  maxGSSize = 1000  # Increased to accommodate larger gene sets (574-628 genes)
+)
+
+# Extract results - ALWAYS extract, even if not significant
+if (nrow(gsea_te_24hr@result) > 0) {
+  gsea_te_24hr_results <- gsea_te_24hr@result %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+    rename("leading_edge" = core_enrichment) %>%
+    mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+           leading_edge_fraction = leading_edge_count / setSize)
+
+  gsea_te_24hr_results[] <- lapply(gsea_te_24hr_results, function(x) {
+    if (is.numeric(x)) round(x, 4) else x
+  })
+
+  cat("GSEA TE 24hr results:\n")
+  print(gsea_te_24hr_results %>% dplyr::select(ID, NES, pvalue, p.adjust, setSize))
+} else {
+  # Create empty dataframe with correct structure
+  gsea_te_24hr_results <- data.frame(
+    ID = character(),
+    NES = numeric(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    setSize = numeric(),
+    leading_edge = character(),
+    leading_edge_count = numeric(),
+    leading_edge_fraction = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("GSEA TE 24hr - No gene sets met minimum size requirement (minGSSize = 10)\n")
+}
+
+# Create enrichment score plots if results exist
+if(nrow(gsea_te_24hr_results) > 0) {
+  # Create individual plots for each gene set with NES and padj annotations
+  for(i in 1:nrow(gsea_te_24hr@result)) {
+    gene_set_name <- gsea_te_24hr@result$ID[i]
+    nes_val <- round(gsea_te_24hr@result$NES[i], 3)
+    padj_val <- formatC(gsea_te_24hr@result$p.adjust[i], format = "e", digits = 2)
+
+    plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+    p <- gseaplot2(gsea_te_24hr,
+                   geneSetID = i,
+                   title = plot_title,
+                   pvalue_table = FALSE,
+                   ES_geom = "line")
+    print(p)
+  }
+
+  # Save each gene set to separate PDF files
+  for(i in 1:nrow(gsea_te_24hr@result)) {
+    gene_set_name <- gsea_te_24hr@result$ID[i]
+    nes_val <- round(gsea_te_24hr@result$NES[i], 3)
+    padj_val <- formatC(gsea_te_24hr@result$p.adjust[i], format = "e", digits = 2)
+
+    plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+    cat("Plotting gene set:", gene_set_name, "\n")
+
+    # Save to individual PDF file
+    pdf_name <- sprintf("teleman_4E_gsea_enrichment_24hr_%s.pdf", gene_set_name)
+    pdf(here("plots", pdf_name), width = 8, height = 4)
+
+    p <- gseaplot2(gsea_te_24hr,
+                   geneSetID = i,
+                   title = plot_title,
+                   pvalue_table = FALSE,
+                   ES_geom = "line")
+    print(p)
+    dev.off()
+  }
+
+  cat("Total plots created for 24hr:", nrow(gsea_te_24hr@result), "\n")
+}
+```
+
+# GSEA: Translation Signatures from Literature
+
+## GSEA: Translation Sigs 1hr
+
+```{r gsea_translation_sigs_1hr}
+# Run GSEA (unweighted)
+gsea_trans_1hr <- GSEA(
+  geneList = ranked_list_te_1hr,
+  exponent = 0,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  TERM2GENE = translation_sigs_term2gene,
+  minGSSize = 10,
+  maxGSSize = 2000  # Larger to accommodate sets up to 1,558 genes
+)
+
+# Extract results - ALWAYS extract, even if not significant
+if (nrow(gsea_trans_1hr@result) > 0) {
+  gsea_trans_1hr_results <- gsea_trans_1hr@result %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+    rename("leading_edge" = core_enrichment) %>%
+    mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+           leading_edge_fraction = leading_edge_count / setSize)
+
+  gsea_trans_1hr_results[] <- lapply(gsea_trans_1hr_results, function(x) {
+    if (is.numeric(x)) round(x, 4) else x
+  })
+
+  cat("GSEA Translation Sigs 1hr results:\n")
+  print(gsea_trans_1hr_results %>% dplyr::select(ID, NES, pvalue, p.adjust, setSize))
+} else {
+  gsea_trans_1hr_results <- data.frame(
+    ID = character(),
+    NES = numeric(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    setSize = numeric(),
+    leading_edge = character(),
+    leading_edge_count = numeric(),
+    leading_edge_fraction = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("GSEA Translation Sigs 1hr - No gene sets met minimum size requirement\n")
+}
+
+# Create enrichment plots for significant results
+if(nrow(gsea_trans_1hr_results) > 0) {
+  sig_results <- gsea_trans_1hr_results %>% filter(p.adjust < 0.05)
+  if(nrow(sig_results) > 0) {
+    for(i in which(gsea_trans_1hr@result$p.adjust < 0.05)) {
+      gene_set_name <- gsea_trans_1hr@result$ID[i]
+      nes_val <- round(gsea_trans_1hr@result$NES[i], 3)
+      padj_val <- formatC(gsea_trans_1hr@result$p.adjust[i], format = "e", digits = 2)
+
+      plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+      # Save to individual PDF
+      pdf_name <- sprintf("translation_sigs_gsea_enrichment_1hr_%s.pdf",
+                         gsub(" ", "_", gene_set_name))
+      pdf(here("plots", pdf_name), width = 8, height = 4)
+      p <- gseaplot2(gsea_trans_1hr,
+                     geneSetID = i,
+                     title = plot_title,
+                     pvalue_table = FALSE,
+                     ES_geom = "line")
+      print(p)
+      dev.off()
+    }
+    cat("Created", nrow(sig_results), "enrichment plots for significant results\n")
+  }
+}
+```
+
+## GSEA: Translation Sigs 4hr
+
+```{r gsea_translation_sigs_4hr}
+# Run GSEA (unweighted)
+gsea_trans_4hr <- GSEA(
+  geneList = ranked_list_te_4hr,
+  exponent = 0,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  TERM2GENE = translation_sigs_term2gene,
+  minGSSize = 10,
+  maxGSSize = 2000
+)
+
+# Extract results - ALWAYS extract, even if not significant
+if (nrow(gsea_trans_4hr@result) > 0) {
+  gsea_trans_4hr_results <- gsea_trans_4hr@result %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+    rename("leading_edge" = core_enrichment) %>%
+    mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+           leading_edge_fraction = leading_edge_count / setSize)
+
+  gsea_trans_4hr_results[] <- lapply(gsea_trans_4hr_results, function(x) {
+    if (is.numeric(x)) round(x, 4) else x
+  })
+
+  cat("GSEA Translation Sigs 4hr results:\n")
+  print(gsea_trans_4hr_results %>% dplyr::select(ID, NES, pvalue, p.adjust, setSize))
+} else {
+  gsea_trans_4hr_results <- data.frame(
+    ID = character(),
+    NES = numeric(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    setSize = numeric(),
+    leading_edge = character(),
+    leading_edge_count = numeric(),
+    leading_edge_fraction = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("GSEA Translation Sigs 4hr - No gene sets met minimum size requirement\n")
+}
+
+# Create enrichment plots for significant results
+if(nrow(gsea_trans_4hr_results) > 0) {
+  sig_results <- gsea_trans_4hr_results %>% filter(p.adjust < 0.05)
+  if(nrow(sig_results) > 0) {
+    for(i in which(gsea_trans_4hr@result$p.adjust < 0.05)) {
+      gene_set_name <- gsea_trans_4hr@result$ID[i]
+      nes_val <- round(gsea_trans_4hr@result$NES[i], 3)
+      padj_val <- formatC(gsea_trans_4hr@result$p.adjust[i], format = "e", digits = 2)
+
+      plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+      # Save to individual PDF
+      pdf_name <- sprintf("translation_sigs_gsea_enrichment_4hr_%s.pdf",
+                         gsub(" ", "_", gene_set_name))
+      pdf(here("plots", pdf_name), width = 8, height = 4)
+      p <- gseaplot2(gsea_trans_4hr,
+                     geneSetID = i,
+                     title = plot_title,
+                     pvalue_table = FALSE,
+                     ES_geom = "line")
+      print(p)
+      dev.off()
+    }
+    cat("Created", nrow(sig_results), "enrichment plots for significant results\n")
+  }
+}
+```
+
+## GSEA: Translation Sigs 24hr
+
+```{r gsea_translation_sigs_24hr}
+# Run GSEA (unweighted)
+gsea_trans_24hr <- GSEA(
+  geneList = ranked_list_te_24hr,
+  exponent = 0,
+  eps = 0,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  TERM2GENE = translation_sigs_term2gene,
+  minGSSize = 10,
+  maxGSSize = 2000
+)
+
+# Extract results - ALWAYS extract, even if not significant
+if (nrow(gsea_trans_24hr@result) > 0) {
+  gsea_trans_24hr_results <- gsea_trans_24hr@result %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
+    rename("leading_edge" = core_enrichment) %>%
+    mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
+           leading_edge_fraction = leading_edge_count / setSize)
+
+  gsea_trans_24hr_results[] <- lapply(gsea_trans_24hr_results, function(x) {
+    if (is.numeric(x)) round(x, 4) else x
+  })
+
+  cat("GSEA Translation Sigs 24hr results:\n")
+  print(gsea_trans_24hr_results %>% dplyr::select(ID, NES, pvalue, p.adjust, setSize))
+} else {
+  gsea_trans_24hr_results <- data.frame(
+    ID = character(),
+    NES = numeric(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    setSize = numeric(),
+    leading_edge = character(),
+    leading_edge_count = numeric(),
+    leading_edge_fraction = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("GSEA Translation Sigs 24hr - No gene sets met minimum size requirement\n")
+}
+
+# Create enrichment plots for significant results
+if(nrow(gsea_trans_24hr_results) > 0) {
+  sig_results <- gsea_trans_24hr_results %>% filter(p.adjust < 0.05)
+  if(nrow(sig_results) > 0) {
+    for(i in which(gsea_trans_24hr@result$p.adjust < 0.05)) {
+      gene_set_name <- gsea_trans_24hr@result$ID[i]
+      nes_val <- round(gsea_trans_24hr@result$NES[i], 3)
+      padj_val <- formatC(gsea_trans_24hr@result$p.adjust[i], format = "e", digits = 2)
+
+      plot_title <- sprintf("%s\nNES = %s, padj = %s", gene_set_name, nes_val, padj_val)
+
+      # Save to individual PDF
+      pdf_name <- sprintf("translation_sigs_gsea_enrichment_24hr_%s.pdf",
+                         gsub(" ", "_", gene_set_name))
+      pdf(here("plots", pdf_name), width = 8, height = 4)
+      p <- gseaplot2(gsea_trans_24hr,
+                     geneSetID = i,
+                     title = plot_title,
+                     pvalue_table = FALSE,
+                     ES_geom = "line")
+      print(p)
+      dev.off()
+    }
+    cat("Created", nrow(sig_results), "enrichment plots for significant results\n")
+  }
+}
+```
+
+## Export TE GSEA Results
+
+```{r export_gsea_te}
+# Compile all TE GSEA results - handle empty results
+prepare_for_export <- function(df) {
+  if (nrow(df) > 0 && "leading_edge" %in% colnames(df)) {
+    return(df %>% dplyr::select(-leading_edge))
+  } else if (nrow(df) > 0) {
+    return(df)
+  } else {
+    # Return empty dataframe with basic structure
+    return(data.frame(
+      ID = character(),
+      NES = numeric(),
+      pvalue = numeric(),
+      p.adjust = numeric(),
+      setSize = numeric(),
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+gsea_te_results_export <- list(
+  "GSEA_TE_1hr" = prepare_for_export(gsea_te_1hr_results),
+  "GSEA_TE_4hr" = prepare_for_export(gsea_te_4hr_results),
+  "GSEA_TE_24hr" = prepare_for_export(gsea_te_24hr_results)
+)
+
+write_xlsx(gsea_te_results_export, here("output/teleman_4E_gsea_te_timecourse.xlsx"))
+cat("\nTE GSEA results exported to: output/teleman_4E_gsea_te_timecourse.xlsx\n")
+```
+
+## TE GSEA Heatmap: Gene Set NES Across Timepoints (Always Show)
+
+```{r gsea_te_heatmap}
+# Combine results from all timepoints - ALWAYS combine, regardless of significance
+gsea_te_combined <- bind_rows(
+  gsea_te_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, NES, p.adjust, timepoint),
+  gsea_te_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, NES, p.adjust, timepoint),
+  gsea_te_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, NES, p.adjust, timepoint)
+)
+
+# Always create heatmap if we have any results
+if (nrow(gsea_te_combined) > 0) {
+  # Reshape for heatmap
+  gsea_te_wide <- gsea_te_combined %>%
+    dplyr::select(ID, NES, timepoint) %>%
+    pivot_wider(names_from = timepoint, values_from = NES, values_fill = 0) %>%
+    column_to_rownames("ID")
+
+  # Ensure all three timepoint columns exist
+  for (tp in c("1hr", "4hr", "24hr")) {
+    if (!tp %in% colnames(gsea_te_wide)) {
+      gsea_te_wide[[tp]] <- 0
+    }
+  }
+  # Reorder columns
+  gsea_te_wide <- gsea_te_wide[, c("1hr", "4hr", "24hr"), drop = FALSE]
+
+  # Create significance annotation matrix
+  sig_te_matrix <- gsea_te_combined %>%
+    dplyr::select(ID, p.adjust, timepoint) %>%
+    mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+    dplyr::select(-p.adjust) %>%
+    pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+    column_to_rownames("ID")
+
+  # Ensure all three timepoint columns exist
+  for (tp in c("1hr", "4hr", "24hr")) {
+    if (!tp %in% colnames(sig_te_matrix)) {
+      sig_te_matrix[[tp]] <- ""
+    }
+  }
+  # Reorder columns and ensure row order matches
+  sig_te_matrix <- sig_te_matrix[rownames(gsea_te_wide), c("1hr", "4hr", "24hr"), drop = FALSE]
+
+  # Create heatmap
+  p_te_heatmap <- pheatmap(
+    gsea_te_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks = seq(-3, 3, length.out = 51),
+    display_numbers = sig_te_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "Teleman 4E Gene Sets (LFC Threshold) - TE GSEA NES Across Timepoints (* = p.adjust < 0.05)",
+    fontsize_row = 10,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 30
+  )
+
+  # Save
+  pdf(here("plots/teleman_4E_gsea_te_heatmap_timecourse.pdf"), width = 8, height = 6)
+  print(p_te_heatmap)
+  dev.off()
+
+  cat("TE heatmap shows", nrow(gsea_te_wide), "gene sets\n")
+} else {
+  cat("No GSEA results available for TE heatmap\n")
+}
+```
+
+## Translation Signatures GSEA Heatmap and Table
+
+```{r translation_sigs_heatmap_and_table}
+# Combine results from all timepoints
+gsea_trans_combined <- bind_rows(
+  gsea_trans_1hr_results %>% mutate(timepoint = "1hr") %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, timepoint),
+  gsea_trans_4hr_results %>% mutate(timepoint = "4hr") %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, timepoint),
+  gsea_trans_24hr_results %>% mutate(timepoint = "24hr") %>%
+    dplyr::select(ID, NES, pvalue, p.adjust, setSize, timepoint)
+)
+
+# Create comprehensive table with NES and p.adjust for all gene sets
+gsea_trans_table <- gsea_trans_combined %>%
+  pivot_wider(
+    id_cols = ID,
+    names_from = timepoint,
+    values_from = c(NES, p.adjust, setSize),
+    names_glue = "{timepoint}_{.value}"
+  ) %>%
+  arrange(ID)
+
+# Export table
+write_xlsx(
+  list("Translation_Sigs_GSEA" = gsea_trans_table),
+  here("output/translation_sigs_gsea_te_timecourse_table.xlsx")
+)
+
+cat("\nTranslation Signatures GSEA Table exported to: output/translation_sigs_gsea_te_timecourse_table.xlsx\n")
+print(gsea_trans_table)
+
+# Create heatmap showing ALL pathways
+if (nrow(gsea_trans_combined) > 0) {
+  # Create heatmap with all gene sets (no filtering)
+  gsea_trans_wide <- gsea_trans_combined %>%
+    dplyr::select(ID, NES, timepoint) %>%
+    pivot_wider(names_from = timepoint, values_from = NES, values_fill = 0) %>%
+    column_to_rownames("ID")
+
+  # Ensure all three timepoint columns exist
+  for (tp in c("1hr", "4hr", "24hr")) {
+    if (!tp %in% colnames(gsea_trans_wide)) {
+      gsea_trans_wide[[tp]] <- 0
+    }
+  }
+  gsea_trans_wide <- gsea_trans_wide[, c("1hr", "4hr", "24hr"), drop = FALSE]
+
+  # Create significance annotation matrix for all gene sets
+  sig_trans_matrix <- gsea_trans_combined %>%
+    dplyr::select(ID, p.adjust, timepoint) %>%
+    mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+    dplyr::select(-p.adjust) %>%
+    pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+    column_to_rownames("ID")
+
+  # Ensure all columns exist and match row order
+  for (tp in c("1hr", "4hr", "24hr")) {
+    if (!tp %in% colnames(sig_trans_matrix)) {
+      sig_trans_matrix[[tp]] <- ""
+    }
+  }
+  sig_trans_matrix <- sig_trans_matrix[rownames(gsea_trans_wide), c("1hr", "4hr", "24hr"), drop = FALSE]
+dev.off()
+  # Create heatmap with all gene sets
+  pheatmap(
+    gsea_trans_wide,
+    cluster_rows = TRUE,  # Cluster rows to group similar patterns
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks = seq(-3, 3, length.out = 51),
+    display_numbers = sig_trans_matrix,
+    number_color = "black",
+    fontsize_number = 12,
+    main = "Translation Signatures - TE GSEA NES Across Timepoints\n(All gene sets, * = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 50,
+    cellheight = 20
+  )
+dev.off()
+  # Save heatmap to PDF with dynamic height based on number of gene sets
+  pdf_height <- max(8, nrow(gsea_trans_wide) * 0.3 + 2)
+  pdf(here("plots/translation_sigs_gsea_te_heatmap_timecourse.pdf"),
+      width = 8, height = pdf_height)
+  pheatmap(
+    gsea_trans_wide,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks = seq(-3, 3, length.out = 51),
+    display_numbers = sig_trans_matrix,
+    number_color = "black",
+    fontsize_number = 12,
+    main = "Translation Signatures - TE GSEA NES Across Timepoints\n(All gene sets, * = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 50,
+    cellheight = 20
+  )
+  dev.off()
+
+  cat("Heatmap shows all", nrow(gsea_trans_wide), "gene sets\n")
+} else {
+  cat("\nNo GSEA results available for heatmap\n")
+}
+```
+
+## Export Translation Signatures GSEA Results
+
+```{r export_gsea_translation_sigs}
+# Export translation signatures GSEA results for each timepoint
+gsea_trans_results_export <- list(
+  "GSEA_Translation_1hr" = prepare_for_export(gsea_trans_1hr_results),
+  "GSEA_Translation_4hr" = prepare_for_export(gsea_trans_4hr_results),
+  "GSEA_Translation_24hr" = prepare_for_export(gsea_trans_24hr_results)
+)
+
+write_xlsx(gsea_trans_results_export,
+           here("output/translation_sigs_gsea_te_timecourse_detailed.xlsx"))
+
+cat("\nTranslation Signatures GSEA detailed results exported to: output/translation_sigs_gsea_te_timecourse_detailed.xlsx\n")
+```
+
