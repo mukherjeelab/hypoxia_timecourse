@@ -1,0 +1,1403 @@
+---
+title: "Hypoxic 3d Gene Set Characterization: Leading Edge Analysis"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This analysis characterizes the leading edge genes from eIF3d and eIF3e gene sets when tested against the siCtrl hypoxic TE response. Unlike the previous top-20 analysis, this extracts the **full leading edge** directly from fgsea's `leadingEdge` column.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+library(ggplot2)
+library(fgsea)
+library(writexl)
+library(clusterProfiler)
+library(msigdbr)
+library(pheatmap)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(rstatix)
+library(tximport)
+library(scales)
+library(FeatureReachR)
+```
+
+# Load Data
+
+## Gene Annotation
+
+```{r load_gene_annotation}
+# Load gene symbols from annotation file
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"))
+
+# Keep one entry per gene (prefer protein_coding, then deduplicate)
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+cat("Gene annotation loaded:", nrow(gene_symbols), "genes\n")
+```
+
+## TE Data (siCtrl Hypoxic Response)
+
+```{r load_te_data}
+# Load TE changes from hypoxia timecourse at all three timepoints
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+te_4hr <- read_csv(here("output", "translation_categories_4hr.csv"))
+te_24hr <- read_csv(here("output", "translation_categories_24hr.csv"))
+
+cat("Loaded TE data:\n")
+cat("1hr:", nrow(te_1hr), "genes\n")
+cat("4hr:", nrow(te_4hr), "genes\n")
+cat("24hr:", nrow(te_24hr), "genes\n")
+```
+
+## Prepare TE Data with Gene Symbols
+
+```{r prepare_te_data}
+# Add gene symbols to TE data
+# Handle duplicate gene symbols by keeping the gene with highest absolute LFC
+te_1hr_gsea <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_4hr_gsea <- te_4hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_24hr_gsea <- te_24hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Prepared TE data with gene symbols:\n")
+cat("1hr:", nrow(te_1hr_gsea), "genes with symbols\n")
+cat("4hr:", nrow(te_4hr_gsea), "genes with symbols\n")
+cat("24hr:", nrow(te_24hr_gsea), "genes with symbols\n")
+```
+
+## Load Custom Gene Sets
+
+```{r load_custom_genesets}
+# Load custom gene sets from CSV
+custom_genesets_raw <- read_csv(here("accessories", "all_combined_sigs_1_19_26.csv"))
+
+# Filter to MDA-MB-231 gene sets
+custom_genesets <- custom_genesets_raw %>%
+  filter(str_starts(gs_name, "MDA-MB-231_")) %>%
+  # Exclude overlap gene sets
+  filter(!str_detect(gs_name, "overlap")) %>%
+  # Exclude genes where db_gene_symbol is just an ENSG ID (no standard gene symbol)
+  filter(!str_starts(db_gene_symbol, "ENSG")) %>%
+  # Remove any NA values in gene symbols
+  filter(!is.na(db_gene_symbol), db_gene_symbol != "") %>%
+  dplyr::select(gs_name, db_gene_symbol) %>%
+  distinct()
+
+cat("Loaded custom MDA-MB-231 gene sets:\n")
+cat("Number of gene sets:", length(unique(custom_genesets$gs_name)), "\n")
+cat("Total gene-pathway associations:", nrow(custom_genesets), "\n")
+
+# Convert to fgsea format (named list of gene vectors)
+pathways_fgsea <- custom_genesets %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(db_gene_symbol), .groups = "drop") %>%
+  deframe()
+
+cat("\nConverted to fgsea format:", length(pathways_fgsea), "pathways\n")
+```
+
+## Helper Function to Extract Gene Sets
+
+```{r helper_function}
+# Function to extract genes from a specific gene set
+get_geneset_genes <- function(geneset_name) {
+  custom_genesets %>%
+    filter(gs_name == geneset_name) %>%
+    pull(db_gene_symbol) %>%
+    unique()
+}
+```
+
+# Create Ranked Lists (TE LFC)
+
+```{r create_ranked_lists}
+# Create ranked list from TE LFC (hypoxia vs normoxia in siCtrl)
+create_ranked_list <- function(te_df) {
+  ranked <- te_df$log2FoldChange
+  names(ranked) <- te_df$symbol
+  ranked <- sort(ranked, decreasing = TRUE)
+  ranked <- ranked[!duplicated(names(ranked))]
+  return(ranked)
+}
+
+ranked_list_1hr <- create_ranked_list(te_1hr_gsea)
+ranked_list_4hr <- create_ranked_list(te_4hr_gsea)
+ranked_list_24hr <- create_ranked_list(te_24hr_gsea)
+
+cat("Created ranked lists (TE LFC):\n")
+cat("1hr:", length(ranked_list_1hr), "genes, range:",
+    round(min(ranked_list_1hr), 2), "to", round(max(ranked_list_1hr), 2), "\n")
+cat("4hr:", length(ranked_list_4hr), "genes, range:",
+    round(min(ranked_list_4hr), 2), "to", round(max(ranked_list_4hr), 2), "\n")
+cat("24hr:", length(ranked_list_24hr), "genes, range:",
+    round(min(ranked_list_24hr), 2), "to", round(max(ranked_list_24hr), 2), "\n")
+```
+
+# Run fgsea Analysis
+
+```{r run_fgsea}
+# Run fgsea for each timepoint
+set.seed(42)
+
+fgsea_1hr <- fgsea(
+  pathways = pathways_fgsea,
+  stats = ranked_list_1hr,
+  minSize = 1,
+  maxSize = 5000,
+  gseaParam = 0,
+  nproc = 1
+)
+
+fgsea_4hr <- fgsea(
+  pathways = pathways_fgsea,
+  stats = ranked_list_4hr,
+  minSize = 1,
+  maxSize = 5000,
+  gseaParam = 0,
+  nproc = 1
+)
+
+fgsea_24hr <- fgsea(
+  pathways = pathways_fgsea,
+  stats = ranked_list_24hr,
+  minSize = 1,
+  maxSize = 5000,
+  gseaParam = 0,
+  nproc = 1
+)
+
+cat("fgsea complete:\n")
+cat("1hr: tested", nrow(fgsea_1hr), "pathways\n")
+cat("4hr: tested", nrow(fgsea_4hr), "pathways\n")
+cat("24hr: tested", nrow(fgsea_24hr), "pathways\n")
+```
+
+# Extract Full Leading Edge Genes
+
+```{r extract_leading_edge}
+# Function to extract full leading edge genes for a specific gene set
+extract_leading_edge <- function(fgsea_result, geneset_name, timepoint) {
+  result <- fgsea_result %>%
+    filter(pathway == geneset_name)
+
+  if (nrow(result) == 0) {
+    warning(paste("Gene set not found:", geneset_name))
+    return(NULL)
+  }
+
+  # The leadingEdge column is a list column containing gene names
+  leading_edge_genes <- result$leadingEdge[[1]]
+
+  data.frame(
+    geneset = geneset_name,
+    timepoint = timepoint,
+    gene = leading_edge_genes,
+    NES = result$NES,
+    pval = result$pval,
+    padj = result$padj,
+    setSize = result$size,
+    leading_edge_count = length(leading_edge_genes)
+  )
+}
+
+# Extract leading edge for 3d promotes at each timepoint (LFC > 0.5)
+le_3d_1hr <- extract_leading_edge(fgsea_1hr, "MDA-MB-231_hypoxia_3d_promotes_TE_1hr_lfc0.5", "1hr")
+le_3d_4hr <- extract_leading_edge(fgsea_4hr, "MDA-MB-231_hypoxia_3d_promotes_TE_4hr_lfc0.5", "4hr")
+le_3d_24hr <- extract_leading_edge(fgsea_24hr, "MDA-MB-231_hypoxia_3d_promotes_TE_24hr_lfc0.5", "24hr")
+
+# Extract leading edge for 3e promotes at each timepoint (LFC > 0.5)
+le_3e_1hr <- extract_leading_edge(fgsea_1hr, "MDA-MB-231_hypoxia_3e_promotes_TE_1hr_lfc0.5", "1hr")
+le_3e_4hr <- extract_leading_edge(fgsea_4hr, "MDA-MB-231_hypoxia_3e_promotes_TE_4hr_lfc0.5", "4hr")
+le_3e_24hr <- extract_leading_edge(fgsea_24hr, "MDA-MB-231_hypoxia_3e_promotes_TE_24hr_lfc0.5", "24hr")
+
+# Combine 3d results
+le_3d_combined <- bind_rows(le_3d_1hr, le_3d_4hr, le_3d_24hr)
+
+# Combine 3e results
+le_3e_combined <- bind_rows(le_3e_1hr, le_3e_4hr, le_3e_24hr)
+
+cat("\n3d Leading Edge Summary:\n")
+cat("1hr:", nrow(le_3d_1hr), "genes (NES:", round(le_3d_1hr$NES[1], 2),
+    ", padj:", format(le_3d_1hr$padj[1], scientific = TRUE, digits = 2), ")\n")
+cat("4hr:", nrow(le_3d_4hr), "genes (NES:", round(le_3d_4hr$NES[1], 2),
+    ", padj:", format(le_3d_4hr$padj[1], scientific = TRUE, digits = 2), ")\n")
+cat("24hr:", nrow(le_3d_24hr), "genes (NES:", round(le_3d_24hr$NES[1], 2),
+    ", padj:", format(le_3d_24hr$padj[1], scientific = TRUE, digits = 2), ")\n")
+
+cat("\n3e Leading Edge Summary:\n")
+cat("1hr:", nrow(le_3e_1hr), "genes (NES:", round(le_3e_1hr$NES[1], 2),
+    ", padj:", format(le_3e_1hr$padj[1], scientific = TRUE, digits = 2), ")\n")
+cat("4hr:", nrow(le_3e_4hr), "genes (NES:", round(le_3e_4hr$NES[1], 2),
+    ", padj:", format(le_3e_4hr$padj[1], scientific = TRUE, digits = 2), ")\n")
+cat("24hr:", nrow(le_3e_24hr), "genes (NES:", round(le_3e_24hr$NES[1], 2),
+    ", padj:", format(le_3e_24hr$padj[1], scientific = TRUE, digits = 2), ")\n")
+```
+
+# Density Plots
+
+## 3d-Promoted Genes (Timepoint-Matched)
+
+```{r density_3d_promotes, fig.width=10, fig.height=4}
+# Get timepoint-specific gene sets
+genes_3d_1hr <- get_geneset_genes("MDA-MB-231_hypoxia_3d_promotes_TE_1hr_lfc0.5")
+genes_3d_4hr <- get_geneset_genes("MDA-MB-231_hypoxia_3d_promotes_TE_4hr_lfc0.5")
+genes_3d_24hr <- get_geneset_genes("MDA-MB-231_hypoxia_3d_promotes_TE_24hr_lfc0.5")
+
+cat("3d Promotes gene counts:\n")
+cat("1hr:", length(genes_3d_1hr), "\n")
+cat("4hr:", length(genes_3d_4hr), "\n")
+cat("24hr:", length(genes_3d_24hr), "\n")
+
+# Combine with timepoint-matched classification
+te_combined_3d <- bind_rows(
+  te_1hr_gsea %>%
+    mutate(timepoint = "1hr",
+           gene_group = ifelse(symbol %in% genes_3d_1hr, "3d Promotes", "Other")),
+  te_4hr_gsea %>%
+    mutate(timepoint = "4hr",
+           gene_group = ifelse(symbol %in% genes_3d_4hr, "3d Promotes", "Other")),
+  te_24hr_gsea %>%
+    mutate(timepoint = "24hr",
+           gene_group = ifelse(symbol %in% genes_3d_24hr, "3d Promotes", "Other"))
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")))
+
+# Label data for gene counts
+label_data_3d <- data.frame(
+  timepoint = factor(c("1hr", "4hr", "24hr"), levels = c("1hr", "4hr", "24hr")),
+  label = c(
+    paste0("n = ", length(genes_3d_1hr)),
+    paste0("n = ", length(genes_3d_4hr)),
+    paste0("n = ", length(genes_3d_24hr))
+  )
+)
+
+# Create density plot
+p_density_3d <- ggplot(te_combined_3d, aes(x = log2FoldChange, color = gene_group)) +
+  geom_density(size = 1) +
+  scale_color_manual(
+    values = c("3d Promotes" = "#E69F00", "Other" = "#808080"),
+    name = ""
+  ) +
+  facet_wrap(~timepoint, nrow = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = label_data_3d, aes(x = -1.5, y = Inf, label = label), vjust = 1.5,
+            inherit.aes = FALSE, size = 4, color = "#E69F00") +
+  labs(
+    title = "Hypoxic TE Response: 3d-Promoted Genes (Timepoint-Matched)",
+    subtitle = "Hypoxia 3d promotes TE (LFC>0.5) at each timepoint",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Density"
+  ) +
+  xlim(-2, 0.5) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_density_3d)
+
+ggsave(
+  here("plots", "density_3d_promotes_hypoxia_characterization.pdf"),
+  plot = p_density_3d,
+  width = 10,
+  height = 4
+)
+```
+
+## 3e-Promoted Genes (Timepoint-Matched)
+
+```{r density_3e_promotes, fig.width=10, fig.height=4}
+# Get timepoint-specific gene sets
+genes_3e_1hr <- get_geneset_genes("MDA-MB-231_hypoxia_3e_promotes_TE_1hr_lfc0.5")
+genes_3e_4hr <- get_geneset_genes("MDA-MB-231_hypoxia_3e_promotes_TE_4hr_lfc0.5")
+genes_3e_24hr <- get_geneset_genes("MDA-MB-231_hypoxia_3e_promotes_TE_24hr_lfc0.5")
+
+cat("3e Promotes gene counts:\n")
+cat("1hr:", length(genes_3e_1hr), "\n")
+cat("4hr:", length(genes_3e_4hr), "\n")
+cat("24hr:", length(genes_3e_24hr), "\n")
+
+# Combine with timepoint-matched classification
+te_combined_3e <- bind_rows(
+  te_1hr_gsea %>%
+    mutate(timepoint = "1hr",
+           gene_group = ifelse(symbol %in% genes_3e_1hr, "3e Promotes", "Other")),
+  te_4hr_gsea %>%
+    mutate(timepoint = "4hr",
+           gene_group = ifelse(symbol %in% genes_3e_4hr, "3e Promotes", "Other")),
+  te_24hr_gsea %>%
+    mutate(timepoint = "24hr",
+           gene_group = ifelse(symbol %in% genes_3e_24hr, "3e Promotes", "Other"))
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")))
+
+# Label data for gene counts
+label_data_3e <- data.frame(
+  timepoint = factor(c("1hr", "4hr", "24hr"), levels = c("1hr", "4hr", "24hr")),
+  label = c(
+    paste0("n = ", length(genes_3e_1hr)),
+    paste0("n = ", length(genes_3e_4hr)),
+    paste0("n = ", length(genes_3e_24hr))
+  )
+)
+
+# Create density plot
+p_density_3e <- ggplot(te_combined_3e, aes(x = log2FoldChange, color = gene_group)) +
+  geom_density(size = 1) +
+  scale_color_manual(
+    values = c("3e Promotes" = "#56B4E9", "Other" = "#808080"),
+    name = ""
+  ) +
+  facet_wrap(~timepoint, nrow = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = label_data_3e, aes(x = -1.5, y = Inf, label = label), vjust = 1.5,
+            inherit.aes = FALSE, size = 4, color = "#56B4E9") +
+  labs(
+    title = "Hypoxic TE Response: 3e-Promoted Genes (Timepoint-Matched)",
+    subtitle = "Hypoxia 3e promotes TE (LFC>0.5) at each timepoint",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Density"
+  ) +
+  xlim(-2, 0.5) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_density_3e)
+
+ggsave(
+  here("plots", "density_3e_promotes_hypoxia_characterization.pdf"),
+  plot = p_density_3e,
+  width = 10,
+  height = 4
+)
+```
+
+## Leading Edge Genes Only (3d Promotes)
+
+This plot shows the distribution of ONLY the leading edge genes (those contributing to the enrichment signal) vs all other genes.
+
+```{r density_leading_edge_3d, fig.width=10, fig.height=4}
+# Get leading edge gene lists
+le_genes_3d_1hr <- le_3d_1hr$gene
+le_genes_3d_4hr <- le_3d_4hr$gene
+le_genes_3d_24hr <- le_3d_24hr$gene
+
+cat("3d Leading Edge gene counts:\n")
+cat("1hr:", length(le_genes_3d_1hr), "\n")
+cat("4hr:", length(le_genes_3d_4hr), "\n")
+cat("24hr:", length(le_genes_3d_24hr), "\n")
+
+# Combine TE data with leading edge classification
+te_combined_le_3d <- bind_rows(
+  te_1hr_gsea %>%
+    mutate(timepoint = "1hr",
+           gene_group = ifelse(symbol %in% le_genes_3d_1hr, "Leading Edge", "Other")),
+  te_4hr_gsea %>%
+    mutate(timepoint = "4hr",
+           gene_group = ifelse(symbol %in% le_genes_3d_4hr, "Leading Edge", "Other")),
+  te_24hr_gsea %>%
+    mutate(timepoint = "24hr",
+           gene_group = ifelse(symbol %in% le_genes_3d_24hr, "Leading Edge", "Other"))
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")))
+
+# Label data
+label_data_le_3d <- data.frame(
+  timepoint = factor(c("1hr", "4hr", "24hr"), levels = c("1hr", "4hr", "24hr")),
+  label = c(
+    paste0("n = ", length(le_genes_3d_1hr)),
+    paste0("n = ", length(le_genes_3d_4hr)),
+    paste0("n = ", length(le_genes_3d_24hr))
+  )
+)
+
+# Density plot for leading edge
+p_density_le_3d <- ggplot(te_combined_le_3d, aes(x = log2FoldChange, color = gene_group)) +
+  geom_density(size = 1) +
+  scale_color_manual(
+    values = c("Leading Edge" = "#D55E00", "Other" = "#808080"),
+    name = ""
+  ) +
+  facet_wrap(~timepoint, nrow = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = label_data_le_3d, aes(x = -1.5, y = Inf, label = label), vjust = 1.5,
+            inherit.aes = FALSE, size = 4, color = "#D55E00") +
+  labs(
+    title = "Hypoxic TE Response: Leading Edge Genes from 3d Promotes Enrichment",
+    subtitle = "Full leading edge extracted from fgsea (hypoxia 3d promotes TE, LFC>0.5)",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Density"
+  ) +
+  xlim(-2, 0.5) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_density_le_3d)
+
+ggsave(
+  here("plots", "density_leading_edge_3d_promotes_hypoxia.pdf"),
+  plot = p_density_le_3d,
+  width = 10,
+  height = 4
+)
+```
+
+## Leading Edge Genes Only (3e Promotes)
+
+```{r density_leading_edge_3e, fig.width=10, fig.height=4}
+# Get leading edge gene lists
+le_genes_3e_1hr <- le_3e_1hr$gene
+le_genes_3e_4hr <- le_3e_4hr$gene
+le_genes_3e_24hr <- le_3e_24hr$gene
+
+cat("3e Leading Edge gene counts:\n")
+cat("1hr:", length(le_genes_3e_1hr), "\n")
+cat("4hr:", length(le_genes_3e_4hr), "\n")
+cat("24hr:", length(le_genes_3e_24hr), "\n")
+
+# Combine TE data with leading edge classification
+te_combined_le_3e <- bind_rows(
+  te_1hr_gsea %>%
+    mutate(timepoint = "1hr",
+           gene_group = ifelse(symbol %in% le_genes_3e_1hr, "Leading Edge", "Other")),
+  te_4hr_gsea %>%
+    mutate(timepoint = "4hr",
+           gene_group = ifelse(symbol %in% le_genes_3e_4hr, "Leading Edge", "Other")),
+  te_24hr_gsea %>%
+    mutate(timepoint = "24hr",
+           gene_group = ifelse(symbol %in% le_genes_3e_24hr, "Leading Edge", "Other"))
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")))
+
+# Label data
+label_data_le_3e <- data.frame(
+  timepoint = factor(c("1hr", "4hr", "24hr"), levels = c("1hr", "4hr", "24hr")),
+  label = c(
+    paste0("n = ", length(le_genes_3e_1hr)),
+    paste0("n = ", length(le_genes_3e_4hr)),
+    paste0("n = ", length(le_genes_3e_24hr))
+  )
+)
+
+# Density plot for leading edge
+p_density_le_3e <- ggplot(te_combined_le_3e, aes(x = log2FoldChange, color = gene_group)) +
+  geom_density(size = 1) +
+  scale_color_manual(
+    values = c("Leading Edge" = "#0072B2", "Other" = "#808080"),
+    name = ""
+  ) +
+  facet_wrap(~timepoint, nrow = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = label_data_le_3e, aes(x = -1.5, y = Inf, label = label), vjust = 1.5,
+            inherit.aes = FALSE, size = 4, color = "#0072B2") +
+  labs(
+    title = "Hypoxic TE Response: Leading Edge Genes from 3e Promotes Enrichment",
+    subtitle = "Full leading edge extracted from fgsea (hypoxia 3e promotes TE, LFC>0.5)",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Density"
+  ) +
+  xlim(-2, 0.5) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_density_le_3e)
+
+ggsave(
+  here("plots", "density_leading_edge_3e_promotes_hypoxia.pdf"),
+  plot = p_density_le_3e,
+  width = 10,
+  height = 4
+)
+```
+
+# Leading Edge Summary Table
+
+```{r leading_edge_summary_table}
+# Create summary table of leading edge genes for 3d promotes
+le_summary_3d <- data.frame(
+  Timepoint = c("1hr", "4hr", "24hr"),
+  Leading_Edge_Genes = c(
+    length(le_genes_3d_1hr),
+    length(le_genes_3d_4hr),
+    length(le_genes_3d_24hr)
+  ),
+  Gene_Set_Size = c(
+    le_3d_1hr$setSize[1],
+    le_3d_4hr$setSize[1],
+    le_3d_24hr$setSize[1]
+  ),
+  NES = c(
+    round(le_3d_1hr$NES[1], 3),
+    round(le_3d_4hr$NES[1], 3),
+    round(le_3d_24hr$NES[1], 3)
+  ),
+  pval = c(
+    format(le_3d_1hr$pval[1], scientific = TRUE, digits = 2),
+    format(le_3d_4hr$pval[1], scientific = TRUE, digits = 2),
+    format(le_3d_24hr$pval[1], scientific = TRUE, digits = 2)
+  ),
+  padj = c(
+    format(le_3d_1hr$padj[1], scientific = TRUE, digits = 2),
+    format(le_3d_4hr$padj[1], scientific = TRUE, digits = 2),
+    format(le_3d_24hr$padj[1], scientific = TRUE, digits = 2)
+  )
+)
+
+cat("\n3d Promotes Leading Edge Summary:\n")
+print(le_summary_3d)
+knitr::kable(le_summary_3d, caption = "3d Promotes: Leading Edge Summary by Timepoint")
+```
+
+# ORA Analysis: Leading Edge Genes with Hallmark Genesets
+
+## Load Hallmark Genesets
+
+```{r load_hallmark}
+# Load MSigDB Hallmark gene sets
+hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("Loaded MSigDB Hallmark gene sets:\n")
+cat("Number of pathways:", length(unique(hallmark$gs_name)), "\n")
+```
+
+## Load KEGG Pathways
+
+```{r load_kegg}
+# Load MSigDB KEGG pathways
+kegg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("Loaded MSigDB KEGG pathways:\n")
+cat("Number of pathways:", length(unique(kegg$gs_name)), "\n")
+```
+
+## ORA: 1hr Leading Edge Genes
+
+```{r ora_1hr}
+# Run ORA on 1hr leading edge genes
+ora_1hr <- enricher(
+  gene = le_genes_3d_1hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_1hr_results <- ora_1hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_1hr_results[] <- lapply(ora_1hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA 1hr - Top pathways (p.adjust < 0.05):\n")
+print(ora_1hr_results %>% filter(p.adjust < 0.05) %>% head(10))
+```
+
+## ORA: 4hr Leading Edge Genes
+
+```{r ora_4hr}
+# Run ORA on 4hr leading edge genes
+ora_4hr <- enricher(
+  gene = le_genes_3d_4hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_4hr_results <- ora_4hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_4hr_results[] <- lapply(ora_4hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA 4hr - Top pathways (p.adjust < 0.05):\n")
+print(ora_4hr_results %>% filter(p.adjust < 0.05) %>% head(10))
+```
+
+## ORA: 24hr Leading Edge Genes
+
+```{r ora_24hr}
+# Run ORA on 24hr leading edge genes
+ora_24hr <- enricher(
+  gene = le_genes_3d_24hr,
+  TERM2GENE = hallmark,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_24hr_results <- ora_24hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_24hr_results[] <- lapply(ora_24hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("ORA 24hr - Top pathways (p.adjust < 0.05):\n")
+print(ora_24hr_results %>% filter(p.adjust < 0.05) %>% head(10))
+```
+
+# ORA Analysis: Leading Edge Genes with KEGG Pathways
+
+## KEGG ORA: 1hr Leading Edge Genes
+
+```{r ora_kegg_1hr}
+# Run ORA on 1hr leading edge genes with KEGG pathways
+ora_kegg_1hr <- enricher(
+  gene = le_genes_3d_1hr,
+  TERM2GENE = kegg,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_kegg_1hr_results <- ora_kegg_1hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_kegg_1hr_results[] <- lapply(ora_kegg_1hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("KEGG ORA 1hr - Top pathways (p.adjust < 0.05):\n")
+print(ora_kegg_1hr_results %>% filter(p.adjust < 0.05) %>% head(10))
+```
+
+## KEGG ORA: 4hr Leading Edge Genes
+
+```{r ora_kegg_4hr}
+# Run ORA on 4hr leading edge genes with KEGG pathways
+ora_kegg_4hr <- enricher(
+  gene = le_genes_3d_4hr,
+  TERM2GENE = kegg,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_kegg_4hr_results <- ora_kegg_4hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_kegg_4hr_results[] <- lapply(ora_kegg_4hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("KEGG ORA 4hr - Top pathways (p.adjust < 0.05):\n")
+print(ora_kegg_4hr_results %>% filter(p.adjust < 0.05) %>% head(10))
+```
+
+## KEGG ORA: 24hr Leading Edge Genes
+
+```{r ora_kegg_24hr}
+# Run ORA on 24hr leading edge genes with KEGG pathways
+ora_kegg_24hr <- enricher(
+  gene = le_genes_3d_24hr,
+  TERM2GENE = kegg,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+# Extract results
+ora_kegg_24hr_results <- ora_kegg_24hr@result %>%
+  dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+  mutate(GeneRatio_numeric = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1])/as.numeric(x[2])))
+
+ora_kegg_24hr_results[] <- lapply(ora_kegg_24hr_results, function(x) {
+  if (is.numeric(x)) round(x, 4) else x
+})
+
+cat("KEGG ORA 24hr - Top pathways (p.adjust < 0.05):\n")
+print(ora_kegg_24hr_results %>% filter(p.adjust < 0.05) %>% head(10))
+```
+
+## ORA Heatmap: Leading Edge Genes Across Timepoints
+
+```{r ora_heatmap, fig.width=8, fig.height=10}
+# Combine results from all timepoints
+ora_combined <- bind_rows(
+  ora_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint)
+)
+
+# Filter for pathways significant in at least one timepoint
+sig_ora_pathways <- ora_combined %>%
+  filter(p.adjust < 0.05) %>%
+  pull(ID) %>%
+  unique()
+
+cat("Pathways significant in at least one timepoint:", length(sig_ora_pathways), "\n")
+
+if (length(sig_ora_pathways) > 0) {
+  # Reshape for heatmap
+  ora_wide <- ora_combined %>%
+    filter(ID %in% sig_ora_pathways) %>%
+    dplyr::select(ID, GeneRatio_numeric, timepoint) %>%
+    pivot_wider(names_from = timepoint, values_from = GeneRatio_numeric, values_fill = 0) %>%
+    column_to_rownames("ID")
+
+  # Reorder columns
+  ora_wide <- ora_wide %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+  # Create significance annotation matrix
+  sig_ora_matrix <- ora_combined %>%
+    filter(ID %in% sig_ora_pathways) %>%
+    dplyr::select(ID, p.adjust, timepoint) %>%
+    mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+    dplyr::select(ID, timepoint, sig) %>%
+    pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+    column_to_rownames("ID")
+
+  # Reorder columns to match ora_wide
+  sig_ora_matrix <- sig_ora_matrix %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+  # Ensure row order matches
+  sig_ora_matrix <- sig_ora_matrix[rownames(ora_wide), ]
+
+  # Clean up pathway names (remove HALLMARK_ prefix)
+  rownames(ora_wide) <- gsub("HALLMARK_", "", rownames(ora_wide))
+  rownames(sig_ora_matrix) <- gsub("HALLMARK_", "", rownames(sig_ora_matrix))
+
+  # Create heatmap
+  p_ora_heatmap <- pheatmap(
+    ora_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("white", "red"))(100),
+    breaks = seq(0, max(ora_wide), length.out = 101),
+    display_numbers = sig_ora_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "ORA: 3d Leading Edge Genes - Hallmark Pathways\n(* = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 12
+  )
+
+  # Save
+  pdf(here("plots", "ora_heatmap_3d_leading_edge.pdf"), width = 8, height = 10)
+  print(p_ora_heatmap)
+  dev.off()
+
+  cat("\nSaved: plots/ora_heatmap_3d_leading_edge.pdf\n")
+} else {
+  cat("No pathways significant at p.adjust < 0.05\n")
+}
+```
+
+## KEGG ORA Heatmap: Leading Edge Genes Across Timepoints
+
+```{r ora_kegg_heatmap, fig.width=8, fig.height=10}
+# Combine KEGG results from all timepoints
+ora_kegg_combined <- bind_rows(
+  ora_kegg_1hr_results %>% mutate(timepoint = "1hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_kegg_4hr_results %>% mutate(timepoint = "4hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint),
+  ora_kegg_24hr_results %>% mutate(timepoint = "24hr") %>% dplyr::select(ID, GeneRatio_numeric, p.adjust, timepoint)
+)
+
+# Filter for pathways significant in at least one timepoint
+sig_kegg_pathways <- ora_kegg_combined %>%
+  filter(p.adjust < 0.05) %>%
+  pull(ID) %>%
+  unique()
+
+cat("KEGG pathways significant in at least one timepoint:", length(sig_kegg_pathways), "\n")
+
+if (length(sig_kegg_pathways) > 0) {
+  # Reshape for heatmap
+  ora_kegg_wide <- ora_kegg_combined %>%
+    filter(ID %in% sig_kegg_pathways) %>%
+    dplyr::select(ID, GeneRatio_numeric, timepoint) %>%
+    pivot_wider(names_from = timepoint, values_from = GeneRatio_numeric, values_fill = 0) %>%
+    column_to_rownames("ID")
+
+  # Reorder columns
+  ora_kegg_wide <- ora_kegg_wide %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+  # Create significance annotation matrix
+  sig_kegg_matrix <- ora_kegg_combined %>%
+    filter(ID %in% sig_kegg_pathways) %>%
+    dplyr::select(ID, p.adjust, timepoint) %>%
+    mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+    dplyr::select(ID, timepoint, sig) %>%
+    pivot_wider(names_from = timepoint, values_from = sig, values_fill = "") %>%
+    column_to_rownames("ID")
+
+  # Reorder columns to match ora_kegg_wide
+  sig_kegg_matrix <- sig_kegg_matrix %>% dplyr::select(`1hr`, `4hr`, `24hr`)
+
+  # Ensure row order matches
+  sig_kegg_matrix <- sig_kegg_matrix[rownames(ora_kegg_wide), ]
+
+  # Clean up pathway names (remove KEGG_ prefix)
+  rownames(ora_kegg_wide) <- gsub("KEGG_", "", rownames(ora_kegg_wide))
+  rownames(sig_kegg_matrix) <- gsub("KEGG_", "", rownames(sig_kegg_matrix))
+
+  # Create heatmap
+  p_ora_kegg_heatmap <- pheatmap(
+    ora_kegg_wide,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = colorRampPalette(c("white", "red"))(100),
+    breaks = seq(0, max(ora_kegg_wide), length.out = 101),
+    display_numbers = sig_kegg_matrix,
+    number_color = "black",
+    fontsize_number = 14,
+    main = "ORA: 3d Leading Edge Genes - KEGG Pathways\n(* = p.adjust < 0.05)",
+    fontsize_row = 8,
+    fontsize_col = 10,
+    cellwidth = 40,
+    cellheight = 12
+  )
+
+  # Save
+  pdf(here("plots", "ora_heatmap_kegg_3d_leading_edge.pdf"), width = 8, height = 10)
+  print(p_ora_kegg_heatmap)
+  dev.off()
+
+  cat("\nSaved: plots/ora_heatmap_kegg_3d_leading_edge.pdf\n")
+} else {
+  cat("No KEGG pathways significant at p.adjust < 0.05\n")
+}
+```
+
+# 5' UTR Characterization of Leading Edge Genes
+
+Characterize the 5' UTRs of the 1hr leading edge genes (3d promotes) by analyzing length and GC content.
+
+## Load TxDb and Gene Info
+
+```{r load_txdb}
+# Load pre-built TxDb from Gencode v26
+txdb <- loadDb("/Users/katematlin/github/mpra_preliminary/accessories/txdb.gencode26.sqlite")
+
+# Load gene info for transcript-to-symbol mapping
+geneInfo <- read_csv("/Users/katematlin/github/mpra_preliminary/accessories/gencode.v26.primary.info.csv.gz",
+                     col_names = FALSE) %>%
+  filter(!str_detect(X2, "pre_"))
+
+colnames(geneInfo) <- c("gene_id", "transcript_id", "biotype", "symbol")
+
+# Create transcript to gene mapping
+tx2gene <- geneInfo[, c("transcript_id", "gene_id")]
+gene_symbol_map <- geneInfo %>% dplyr::select(gene_id, symbol) %>% distinct()
+
+cat("Loaded TxDb and gene info\n")
+cat("Transcripts in geneInfo:", nrow(geneInfo), "\n")
+```
+
+## Load Salmon Quantification
+
+```{r load_salmon}
+# Get list of salmon quant files
+salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
+salmon_samples <- list.dirs(salmon_dir, recursive = FALSE, full.names = FALSE)
+
+# Build file paths
+salmon_files <- file.path(salmon_dir, salmon_samples, "quant.sf.gz")
+names(salmon_files) <- salmon_samples
+
+# Filter to files that exist
+salmon_files <- salmon_files[file.exists(salmon_files)]
+cat("Found", length(salmon_files), "Salmon quant files\n")
+
+# Import with tximport (transcript-level)
+txi_transcripts <- tximport(salmon_files, type = "salmon", tx2gene = tx2gene, txOut = TRUE)
+
+# Get transcript abundances and find most abundant transcript per gene
+transcript_abundance <- txi_transcripts$abundance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  left_join(tx2gene, by = "transcript_id")
+
+# Sum counts across all samples and select most abundant transcript per gene
+most_abundant_tx <- transcript_abundance %>%
+  mutate(total_abundance = rowSums(across(where(is.numeric)), na.rm = TRUE)) %>%
+  dplyr::select(transcript_id, gene_id, total_abundance) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  group_by(gene_id_clean) %>%
+  slice_max(total_abundance, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Selected most abundant transcript for", nrow(most_abundant_tx), "genes\n")
+```
+
+## Extract 5' UTR Regions
+
+```{r extract_utr5}
+# Extract 5' UTR regions from TxDb
+utr5 <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+
+# Calculate 5' UTR widths
+utr5_widths <- sum(width(utr5)) %>%
+  as.data.frame() %>%
+  rownames_to_column("transcript_id")
+colnames(utr5_widths) <- c("transcript_id", "utr5_width")
+
+cat("Extracted 5' UTR widths for", nrow(utr5_widths), "transcripts\n")
+```
+
+## Extract 5' UTR Sequences
+
+```{r extract_utr5_sequences}
+# Get genome sequences
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# Extract 5' UTR sequences
+utr5_sequences <- extractTranscriptSeqs(genome, utr5) %>% as.data.frame()
+
+# Format sequences
+utr5_seq <- utr5_sequences %>%
+  rownames_to_column("transcript_id") %>%
+  dplyr::rename("sequence" = "x") %>%
+  mutate(seq_length = str_length(sequence))
+
+cat("Extracted sequences for", nrow(utr5_seq), "5' UTRs\n")
+```
+
+## Calculate GC Content
+
+```{r calculate_gc}
+# GC content function
+gc_content <- function(seq) {
+  seq <- str_to_upper(seq)
+  gc_count <- str_count(seq, "[GC]")
+  total_length <- str_length(seq)
+  return((gc_count / total_length) * 100)
+}
+
+# Add GC content to sequences
+utr5_seq <- utr5_seq %>%
+  mutate(gc_percent = gc_content(sequence))
+
+cat("Calculated GC content\n")
+cat("Median GC content:", round(median(utr5_seq$gc_percent, na.rm = TRUE), 2), "%\n")
+```
+
+## Merge UTR Data with Leading Edge Genes
+
+```{r merge_utr_leading_edge}
+# Map leading edge gene symbols to transcripts
+# First, add gene symbols to most_abundant_tx
+most_abundant_tx <- most_abundant_tx %>%
+  left_join(gene_symbol_map %>% mutate(gene_id_clean = sub("\\..*", "", gene_id)),
+            by = "gene_id_clean")
+
+# Merge UTR data with transcript selection
+utr_data <- most_abundant_tx %>%
+  left_join(utr5_widths, by = "transcript_id") %>%
+  left_join(utr5_seq %>% dplyr::select(transcript_id, gc_percent), by = "transcript_id") %>%
+  filter(!is.na(utr5_width), !is.na(gc_percent))
+
+# Classify genes: Leading Edge (1hr) vs Other
+utr_data <- utr_data %>%
+  mutate(gene_group = ifelse(symbol %in% le_genes_3d_1hr, "Leading Edge (1hr)", "Other"))
+
+cat("\nUTR data merged:\n")
+cat("Total genes with UTR data:", nrow(utr_data), "\n")
+cat("Leading Edge (1hr) genes:", sum(utr_data$gene_group == "Leading Edge (1hr)"), "\n")
+cat("Other genes:", sum(utr_data$gene_group == "Other"), "\n")
+```
+
+## Density Plot: 5' UTR Length
+
+```{r density_utr_length, fig.width=8, fig.height=5}
+# Calculate medians
+median_le <- median(utr_data$utr5_width[utr_data$gene_group == "Leading Edge (1hr)"], na.rm = TRUE)
+median_other <- median(utr_data$utr5_width[utr_data$gene_group == "Other"], na.rm = TRUE)
+
+# Count genes in each group
+n_le <- sum(utr_data$gene_group == "Leading Edge (1hr)")
+n_other <- sum(utr_data$gene_group == "Other")
+
+cat("Median 5' UTR length:\n")
+cat("Leading Edge (1hr):", round(median_le, 1), "nt (n =", n_le, ")\n")
+cat("Other:", round(median_other, 1), "nt (n =", n_other, ")\n")
+
+# Density plot with log2 scale
+p_utr_length <- ggplot(utr_data, aes(x = utr5_width, color = gene_group)) +
+  geom_density(size = 1) +
+  scale_x_continuous(trans = "log2",
+                     breaks = trans_breaks("log2", function(x) 2^x, n = 10),
+                     labels = trans_format("log2", math_format(2^.x))) +
+  scale_color_manual(values = c("Leading Edge (1hr)" = "#E69F00", "Other" = "#808080"),
+                     name = "") +
+  geom_vline(xintercept = median_le, color = "#E69F00", linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = median_other, color = "#808080", linetype = "dashed", alpha = 0.7) +
+  annotate("text", x = 16, y = Inf, vjust = 1.5, hjust = 0,
+           label = paste0("Leading Edge: n = ", n_le), color = "#E69F00", size = 4) +
+  annotate("text", x = 16, y = Inf, vjust = 3, hjust = 0,
+           label = paste0("Other: n = ", n_other), color = "#808080", size = 4) +
+  labs(
+    title = "5' UTR Length: 3d Leading Edge (1hr) vs Other Genes",
+    x = "5' UTR Length (nt, log2 scale)",
+    y = "Density"
+  ) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_utr_length)
+
+ggsave(here("plots", "density_utr5_length_leading_edge.pdf"), p_utr_length, width = 8, height = 5)
+
+# Wilcoxon test
+wilcox_length <- utr_data %>%
+  wilcox_test(utr5_width ~ gene_group, ref.group = "Other")
+
+cat("\nWilcoxon test (5' UTR length):\n")
+print(wilcox_length)
+```
+
+## Density Plot: GC Content
+
+```{r density_gc_content, fig.width=8, fig.height=5}
+# Calculate medians
+median_gc_le <- median(utr_data$gc_percent[utr_data$gene_group == "Leading Edge (1hr)"], na.rm = TRUE)
+median_gc_other <- median(utr_data$gc_percent[utr_data$gene_group == "Other"], na.rm = TRUE)
+
+cat("Median 5' UTR GC content:\n")
+cat("Leading Edge (1hr):", round(median_gc_le, 2), "% (n =", n_le, ")\n")
+cat("Other:", round(median_gc_other, 2), "% (n =", n_other, ")\n")
+
+# Density plot
+p_gc_content <- ggplot(utr_data, aes(x = gc_percent, color = gene_group)) +
+  geom_density(size = 1) +
+  scale_color_manual(values = c("Leading Edge (1hr)" = "#E69F00", "Other" = "#808080"),
+                     name = "") +
+  geom_vline(xintercept = median_gc_le, color = "#E69F00", linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = median_gc_other, color = "#808080", linetype = "dashed", alpha = 0.7) +
+  annotate("text", x = 20, y = Inf, vjust = 1.5, hjust = 0,
+           label = paste0("Leading Edge: n = ", n_le), color = "#E69F00", size = 4) +
+  annotate("text", x = 20, y = Inf, vjust = 3, hjust = 0,
+           label = paste0("Other: n = ", n_other), color = "#808080", size = 4) +
+  labs(
+    title = "5' UTR GC Content: 3d Leading Edge (1hr) vs Other Genes",
+    x = "GC Content (%)",
+    y = "Density"
+  ) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_gc_content)
+
+ggsave(here("plots", "density_utr5_gc_leading_edge.pdf"), p_gc_content, width = 8, height = 5)
+
+# Wilcoxon test
+wilcox_gc <- utr_data %>%
+  wilcox_test(gc_percent ~ gene_group, ref.group = "Other")
+
+cat("\nWilcoxon test (GC content):\n")
+print(wilcox_gc)
+```
+
+## Summary Table: UTR Characteristics
+
+```{r utr_summary_table}
+# Summary statistics
+utr_summary <- utr_data %>%
+  group_by(gene_group) %>%
+  summarize(
+    n_genes = n(),
+    median_length = median(utr5_width, na.rm = TRUE),
+    mean_length = mean(utr5_width, na.rm = TRUE),
+    median_gc = median(gc_percent, na.rm = TRUE),
+    mean_gc = mean(gc_percent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\n5' UTR Characteristics Summary:\n")
+print(utr_summary)
+knitr::kable(utr_summary, digits = 2, caption = "5' UTR Characteristics: Leading Edge vs Other Genes")
+```
+
+# 5' UTR Sequence Motif Analysis
+
+Compare sequence motifs in 5' UTRs of Leading Edge (1hr) genes versus size-matched control genes.
+
+## Prepare Sequence Sets for Motif Analysis
+
+```{r prepare_motif_sequences}
+# Get sequences for leading edge genes
+le_sequences <- utr_data %>%
+  filter(gene_group == "Leading Edge (1hr)") %>%
+  left_join(utr5_seq %>% dplyr::select(transcript_id, sequence), by = "transcript_id") %>%
+  filter(!is.na(sequence), sequence != "")
+
+le_seq_set <- DNAStringSet(le_sequences$sequence)
+
+# Get control sequences (size-matched random sample from "Other" genes)
+other_sequences <- utr_data %>%
+  filter(gene_group == "Other") %>%
+  left_join(utr5_seq %>% dplyr::select(transcript_id, sequence), by = "transcript_id") %>%
+  filter(!is.na(sequence), sequence != "")
+
+set.seed(42)
+n_le <- nrow(le_sequences)
+control_sample <- other_sequences[sample(nrow(other_sequences), n_le), ]
+control_seq_set <- DNAStringSet(control_sample$sequence)
+
+cat("Sequence sets prepared:\n")
+cat("Leading Edge sequences:", length(le_seq_set), "\n")
+cat("Control sequences:", length(control_seq_set), "\n")
+```
+
+## RBP Motif Analysis with RBNS_PWM (RNA Bind-N-Seq)
+
+```{r rbns_motif_analysis, fig.width=10, fig.height=8}
+# Run motif comparison using RBNS PWMs
+rbns_results <- motif_compare(RBNS_PWM, le_seq_set, control_seq_set)
+
+# Filter significant results
+rbns_sig <- rbns_results %>%
+  filter(p_adj < 0.05)
+
+cat("RBNS PWM Analysis:\n")
+cat("Total motifs tested:", nrow(rbns_results), "\n")
+cat("Significant motifs (p.adj < 0.05):", nrow(rbns_sig), "\n")
+
+# Visualize enriched motifs
+if (nrow(rbns_sig %>% filter(log2FC > 0)) > 0) {
+  p_rbns <- ggplot(rbns_sig %>% filter(log2FC > 0), aes(x = reorder(motif, log2FC), y = log2FC)) +
+    geom_bar(stat = "identity", fill = "#E69F00") +
+    coord_flip() +
+    theme_cowplot() +
+    labs(title = "Enriched RBP Motifs in 3d Leading Edge 5' UTRs",
+         subtitle = "RNA Bind-N-Seq PWMs, p.adj < 0.05",
+         x = "", y = "log2 Fold Change")
+
+  print(p_rbns)
+
+  ggsave(here("plots", "motif_rbns_3d_leading_edge.pdf"), p_rbns, width = 10, height = 8)
+  cat("\nSaved: plots/motif_rbns_3d_leading_edge.pdf\n")
+} else {
+  cat("No significantly enriched RBNS motifs found\n")
+}
+
+# Show significant results
+if (nrow(rbns_sig) > 0) {
+  cat("\nSignificant RBNS motifs:\n")
+  print(rbns_sig %>% arrange(desc(log2FC)))
+}
+```
+
+## RBP Motif Analysis with CISBPRNA_hs_PWM (CLIP-seq)
+
+```{r cisbp_motif_analysis, fig.width=10, fig.height=8}
+# Run motif comparison using CISBP-RNA PWMs
+cisbp_results <- motif_compare(CISBPRNA_hs_PWM, le_seq_set, control_seq_set)
+
+# Filter significant results
+cisbp_sig <- cisbp_results %>%
+  filter(p_adj < 0.05)
+
+cat("CISBP-RNA PWM Analysis:\n")
+cat("Total motifs tested:", nrow(cisbp_results), "\n")
+cat("Significant motifs (p.adj < 0.05):", nrow(cisbp_sig), "\n")
+
+# Visualize enriched motifs
+if (nrow(cisbp_sig %>% filter(log2FC > 0)) > 0) {
+  p_cisbp <- ggplot(cisbp_sig %>% filter(log2FC > 0), aes(x = reorder(motif, log2FC), y = log2FC)) +
+    geom_bar(stat = "identity", fill = "#E69F00") +
+    coord_flip() +
+    theme_cowplot() +
+    labs(title = "Enriched RBP Motifs in 3d Leading Edge 5' UTRs",
+         subtitle = "CISBP-RNA CLIP-seq PWMs, p.adj < 0.05",
+         x = "", y = "log2 Fold Change")
+
+  print(p_cisbp)
+
+  ggsave(here("plots", "motif_cisbp_3d_leading_edge.pdf"), p_cisbp, width = 10, height = 8)
+  cat("\nSaved: plots/motif_cisbp_3d_leading_edge.pdf\n")
+} else {
+  cat("No significantly enriched CISBP-RNA motifs found\n")
+}
+
+# Show significant results
+if (nrow(cisbp_sig) > 0) {
+  cat("\nSignificant CISBP-RNA motifs:\n")
+  print(cisbp_sig %>% arrange(desc(log2FC)))
+}
+```
+
+## 6-mer Enrichment Analysis
+
+```{r sixmer_analysis, fig.width=10, fig.height=8}
+# Count 6-mers in each set
+sixmers <- data.frame(
+  oligonucleotideFrequency(le_seq_set, width = 6, simplify.as = "matrix") %>% colSums(),
+  oligonucleotideFrequency(control_seq_set, width = 6, simplify.as = "matrix") %>% colSums()
+)
+colnames(sixmers) <- c("le_count", "control_count")
+
+# Calculate frequency and enrichment
+sixmer_enrich <- sixmers %>%
+  mutate(le_freq = le_count / sum(le_count),
+         control_freq = control_count / sum(control_count),
+         log2FC = log2(le_freq / control_freq)) %>%
+  rownames_to_column("motif") %>%
+  mutate(le_NOT_count = sum(le_count) - le_count,
+         control_NOT_count = sum(control_count) - control_count)
+
+# Fisher's exact test for each 6-mer
+fisher_results <- data.frame()
+for (i in sixmer_enrich$motif) {
+  test_row <- sixmer_enrich %>% filter(motif == i)
+  conting <- data.frame(
+    "case" = c(test_row$le_count, test_row$le_NOT_count),
+    "control" = c(test_row$control_count, test_row$control_NOT_count)
+  )
+  fisher_p <- fisher_test(conting, detailed = TRUE)$p
+  fisher_results <- rbind(fisher_results, data.frame(motif = i, pval = fisher_p))
+}
+
+sixmer_final <- sixmer_enrich %>%
+  left_join(fisher_results, by = "motif") %>%
+  mutate(padj = p.adjust(pval, method = "fdr"))
+
+# Filter significant enriched 6-mers
+sig_sixmers <- sixmer_final %>%
+  filter(padj < 0.05, log2FC > 0) %>%
+  arrange(desc(log2FC))
+
+cat("6-mer Enrichment Analysis:\n")
+cat("Total 6-mers tested:", nrow(sixmer_final), "\n")
+cat("Significant enriched 6-mers (FDR < 0.05, log2FC > 0):", nrow(sig_sixmers), "\n")
+
+# Visualize top enriched 6-mers
+if (nrow(sig_sixmers) > 0) {
+  p_sixmer <- ggplot(sig_sixmers %>% head(20), aes(x = reorder(motif, log2FC), y = log2FC)) +
+    size=6+
+    geom_bar(stat = "identity", fill = "#E69F00") +
+    coord_flip() +
+    theme_cowplot() +
+    labs(title = "Top Enriched 6-mers in 3d Leading Edge 5' UTRs",
+         subtitle = "Fisher's exact test, FDR < 0.05",
+         x = "", y = "log2 Fold Change over Control")
+
+  print(p_sixmer)
+
+  ggsave(here("plots", "sixmer_enrichment_3d_leading_edge.pdf"), p_sixmer, width = 10, height = 8)
+  cat("\nSaved: plots/sixmer_enrichment_3d_leading_edge.pdf\n")
+
+  cat("\nTop 20 enriched 6-mers:\n")
+  print(sig_sixmers %>% head(20) %>% dplyr::select(motif, log2FC, le_count, control_count, padj))
+} else {
+  cat("No significantly enriched 6-mers found\n")
+}
+```
+
+# Export Results
+
+```{r export_results}
+# Export leading edge gene lists
+leading_edge_export <- list(
+  "3d_1hr" = le_3d_1hr %>% dplyr::select(gene, NES, pval, padj, setSize, leading_edge_count),
+  "3d_4hr" = le_3d_4hr %>% dplyr::select(gene, NES, pval, padj, setSize, leading_edge_count),
+  "3d_24hr" = le_3d_24hr %>% dplyr::select(gene, NES, pval, padj, setSize, leading_edge_count),
+  "3e_1hr" = le_3e_1hr %>% dplyr::select(gene, NES, pval, padj, setSize, leading_edge_count),
+  "3e_4hr" = le_3e_4hr %>% dplyr::select(gene, NES, pval, padj, setSize, leading_edge_count),
+  "3e_24hr" = le_3e_24hr %>% dplyr::select(gene, NES, pval, padj, setSize, leading_edge_count)
+)
+
+write_xlsx(leading_edge_export, here("output", "3d_3e_promotes_leading_edge_genes.xlsx"))
+
+# Export fgsea summary for 3d and 3e promotes genesets
+fgsea_summary <- bind_rows(
+  fgsea_1hr %>%
+    filter(str_detect(pathway, "3d_promotes|3e_promotes")) %>%
+    filter(str_detect(pathway, "lfc0.5")) %>%
+    mutate(ranked_list_timepoint = "1hr"),
+  fgsea_4hr %>%
+    filter(str_detect(pathway, "3d_promotes|3e_promotes")) %>%
+    filter(str_detect(pathway, "lfc0.5")) %>%
+    mutate(ranked_list_timepoint = "4hr"),
+  fgsea_24hr %>%
+    filter(str_detect(pathway, "3d_promotes|3e_promotes")) %>%
+    filter(str_detect(pathway, "lfc0.5")) %>%
+    mutate(ranked_list_timepoint = "24hr")
+) %>%
+  mutate(leading_edge_count = sapply(leadingEdge, length)) %>%
+  dplyr::select(pathway, ranked_list_timepoint, NES, pval, padj, size, leading_edge_count) %>%
+  arrange(pathway, ranked_list_timepoint)
+
+write_csv(fgsea_summary, here("output", "3d_3e_promotes_fgsea_summary.csv"))
+
+cat("\nExported results:\n")
+cat("- output/3d_3e_promotes_leading_edge_genes.xlsx\n")
+cat("- output/3d_3e_promotes_fgsea_summary.csv\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

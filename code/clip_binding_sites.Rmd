@@ -1,0 +1,678 @@
+---
+title: "CLIP Binding Sites Analysis - Lamper Cap-Binding Data"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(here)
+library(cowplot)
+library(readxl)
+library(janitor)
+library(rstatix)
+```
+
+## Overview
+
+This analysis examines whether eIF3d cap-binding targets (from Lamper et al. glucose deprivation experiments) show differential hypoxic response compared to other genes.
+
+## Load TE Changes from Hypoxia Timecourse
+
+```{r load_te_data}
+# Load TE changes from hypoxia timecourse at all three timepoints
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+te_4hr <- read_csv(here("output", "translation_categories_4hr.csv"))
+te_24hr <- read_csv(here("output", "translation_categories_24hr.csv"))
+
+# Load gene symbols from annotation file
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"))
+
+# Keep one entry per gene (prefer protein_coding, then deduplicate)
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+# Add gene symbols to TE data and prepare for analysis
+# Handle duplicate gene symbols by keeping the gene with highest absolute LFC
+te_1hr_gsea <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_4hr_gsea <- te_4hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_24hr_gsea <- te_24hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Loaded TE data with gene symbols:\n")
+cat("1hr:", nrow(te_1hr_gsea), "genes\n")
+cat("4hr:", nrow(te_4hr_gsea), "genes\n")
+cat("24hr:", nrow(te_24hr_gsea), "genes\n")
+```
+
+## Load Lamper Cap-Binding Data
+
+```{r load_lamper_data}
+# Load Lamper et al. cap-binding data (glucose deprivation cap binders)
+lamper_data <- read_xlsx("/Users/katematlin/github/mpra_preliminary/data/lamper-s3.xlsx") %>%
+  clean_names()
+
+cat("Lamper data columns after clean_names():\n")
+print(colnames(lamper_data))
+
+cat("\nLamper data dimensions:", nrow(lamper_data), "rows x", ncol(lamper_data), "columns\n")
+head(lamper_data)
+```
+
+## Define Cap-Binding Gene Sets
+
+Using thresholds from original analysis:
+- Glucose deprivation cap binders: `log2fold_change_glu > 2 & padj_glu < 0.005`
+- Complete media cap binders: `log2fold_change_cm > 2 & padj_cm < 0.005`
+
+```{r define_cap_binders}
+# Convert columns to numeric (they may be stored as character in Excel)
+lamper_data <- lamper_data %>%
+  mutate(
+    log2fold_change_cm = as.numeric(log2fold_change_cm),
+    log2fold_change_glu = as.numeric(log2fold_change_glu),
+    padj_cm = as.numeric(padj_cm),
+    padj_glu = as.numeric(padj_glu)
+  )
+
+# Define glucose deprivation cap binders (GLU_HIT)
+glu_cap_binders <- lamper_data %>%
+  filter(log2fold_change_glu > 2 & padj_glu < 0.005) %>%
+  pull(ensembl_gene_id)
+
+# Define complete media cap binders (CM_HIT)
+cm_cap_binders <- lamper_data %>%
+  filter(log2fold_change_cm > 2 & padj_cm < 0.005) %>%
+  pull(ensembl_gene_id)
+
+cat("Number of glucose deprivation cap binders (GLU_HIT):", length(glu_cap_binders), "\n")
+cat("Number of complete media cap binders (CM_HIT):", length(cm_cap_binders), "\n")
+cat("Overlap between GLU and CM:", length(intersect(glu_cap_binders, cm_cap_binders)), "\n")
+```
+
+## Classify Genes by Cap-Binding Status
+
+```{r classify_genes}
+# Strip version numbers from gene IDs for matching
+# TE data has versioned IDs (e.g., ENSG00000000003.17)
+# Lamper data may have unversioned IDs
+
+# Clean gene IDs in TE data
+te_1hr_cap_status <- te_1hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    cap_status = case_when(
+      gene_id_clean %in% glu_cap_binders ~ "Glucose Dep. Cap Binder",
+      TRUE ~ "Other"
+    )
+  )
+
+te_4hr_cap_status <- te_4hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    cap_status = case_when(
+      gene_id_clean %in% glu_cap_binders ~ "Glucose Dep. Cap Binder",
+      TRUE ~ "Other"
+    )
+  )
+
+te_24hr_cap_status <- te_24hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    cap_status = case_when(
+      gene_id_clean %in% glu_cap_binders ~ "Glucose Dep. Cap Binder",
+      TRUE ~ "Other"
+    )
+  )
+
+# Report overlap statistics
+cat("\nOverlap with TE data:\n")
+cat("1hr - Glucose cap binders found:", sum(te_1hr_cap_status$cap_status == "Glucose Dep. Cap Binder"), "\n")
+cat("4hr - Glucose cap binders found:", sum(te_4hr_cap_status$cap_status == "Glucose Dep. Cap Binder"), "\n")
+cat("24hr - Glucose cap binders found:", sum(te_24hr_cap_status$cap_status == "Glucose Dep. Cap Binder"), "\n")
+```
+
+## ECDF Plot: Hypoxic Response by Cap-Binding Status (1 Hour)
+
+```{r ecdf_1hr, fig.width=6, fig.height=5}
+# Create ECDF plot for 1 hour
+p_1hr <- ggplot(te_1hr_cap_status, aes(x = log2FoldChange, color = cap_status)) +
+  stat_ecdf(size = 1.2) +
+  scale_color_manual(
+    values = c("Glucose Dep. Cap Binder" = "#D55E00", "Other" = "#808080"),
+    name = "Cap-Binding Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Hypoxic Response by eIF3d Cap-Binding Status (Lamper)",
+    subtitle = "Translation Efficiency Changes at 1 Hour",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-1, 1)
+
+print(p_1hr)
+
+# Save the plot
+ggsave(
+  here("plots", "ecdf_cap_binders_glu_1hr.pdf"),
+  plot = p_1hr,
+  width = 5,
+  height = 4
+)
+```
+
+## ECDF Plot: Hypoxic Response by Cap-Binding Status (4 Hours)
+
+```{r ecdf_4hr, fig.width=6, fig.height=5}
+# Create ECDF plot for 4 hours
+p_4hr <- ggplot(te_4hr_cap_status, aes(x = log2FoldChange, color = cap_status)) +
+  stat_ecdf(size = 1.2) +
+  scale_color_manual(
+    values = c("Glucose Dep. Cap Binder" = "#D55E00", "Other" = "#808080"),
+    name = "Cap-Binding Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Hypoxic Response by eIF3d Cap-Binding Status (Lamper)",
+    subtitle = "Translation Efficiency Changes at 4 Hours",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-1, 1)
+
+print(p_4hr)
+
+# Save the plot
+ggsave(
+  here("plots", "ecdf_cap_binders_glu_4hr.pdf"),
+  plot = p_4hr,
+  width = 5,
+  height = 4
+)
+```
+
+## ECDF Plot: Hypoxic Response by Cap-Binding Status (24 Hours)
+
+```{r ecdf_24hr, fig.width=6, fig.height=5}
+# Create ECDF plot for 24 hours
+p_24hr <- ggplot(te_24hr_cap_status, aes(x = log2FoldChange, color = cap_status)) +
+  stat_ecdf(size = 1.2) +
+  scale_color_manual(
+    values = c("Glucose Dep. Cap Binder" = "#D55E00", "Other" = "#808080"),
+    name = "Cap-Binding Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Hypoxic Response by eIF3d Cap-Binding Status (Lamper)",
+    subtitle = "Translation Efficiency Changes at 24 Hours",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-1, 1)
+
+print(p_24hr)
+
+# Save the plot
+ggsave(
+  here("plots", "ecdf_cap_binders_glu_24hr.pdf"),
+  plot = p_24hr,
+  width = 5,
+  height = 4
+)
+```
+
+## Statistical Tests
+
+```{r statistical_tests}
+# Perform KS tests comparing cap binders vs other genes
+ks_1hr <- ks.test(
+  te_1hr_cap_status %>% filter(cap_status == "Glucose Dep. Cap Binder") %>% pull(log2FoldChange),
+  te_1hr_cap_status %>% filter(cap_status == "Other") %>% pull(log2FoldChange)
+)
+
+ks_4hr <- ks.test(
+  te_4hr_cap_status %>% filter(cap_status == "Glucose Dep. Cap Binder") %>% pull(log2FoldChange),
+  te_4hr_cap_status %>% filter(cap_status == "Other") %>% pull(log2FoldChange)
+)
+
+ks_24hr <- ks.test(
+  te_24hr_cap_status %>% filter(cap_status == "Glucose Dep. Cap Binder") %>% pull(log2FoldChange),
+  te_24hr_cap_status %>% filter(cap_status == "Other") %>% pull(log2FoldChange)
+)
+
+# Perform Wilcoxon tests using rstatix
+wilcox_1hr <- te_1hr_cap_status %>%
+  wilcox_test(log2FoldChange ~ cap_status)
+
+wilcox_4hr <- te_4hr_cap_status %>%
+  wilcox_test(log2FoldChange ~ cap_status)
+
+wilcox_24hr <- te_24hr_cap_status %>%
+  wilcox_test(log2FoldChange ~ cap_status)
+
+# Compile statistics
+stats_results <- data.frame(
+  timepoint = c("1hr", "4hr", "24hr"),
+  n_cap_binders = c(
+    sum(te_1hr_cap_status$cap_status == "Glucose Dep. Cap Binder"),
+    sum(te_4hr_cap_status$cap_status == "Glucose Dep. Cap Binder"),
+    sum(te_24hr_cap_status$cap_status == "Glucose Dep. Cap Binder")
+  ),
+  n_other = c(
+    sum(te_1hr_cap_status$cap_status == "Other"),
+    sum(te_4hr_cap_status$cap_status == "Other"),
+    sum(te_24hr_cap_status$cap_status == "Other")
+  ),
+  median_cap_binders = c(
+    median(te_1hr_cap_status$log2FoldChange[te_1hr_cap_status$cap_status == "Glucose Dep. Cap Binder"]),
+    median(te_4hr_cap_status$log2FoldChange[te_4hr_cap_status$cap_status == "Glucose Dep. Cap Binder"]),
+    median(te_24hr_cap_status$log2FoldChange[te_24hr_cap_status$cap_status == "Glucose Dep. Cap Binder"])
+  ),
+  median_other = c(
+    median(te_1hr_cap_status$log2FoldChange[te_1hr_cap_status$cap_status == "Other"]),
+    median(te_4hr_cap_status$log2FoldChange[te_4hr_cap_status$cap_status == "Other"]),
+    median(te_24hr_cap_status$log2FoldChange[te_24hr_cap_status$cap_status == "Other"])
+  ),
+  ks_statistic = c(ks_1hr$statistic, ks_4hr$statistic, ks_24hr$statistic),
+  ks_pvalue = c(ks_1hr$p.value, ks_4hr$p.value, ks_24hr$p.value),
+  wilcox_statistic = c(wilcox_1hr$statistic, wilcox_4hr$statistic, wilcox_24hr$statistic),
+  wilcox_pvalue = c(wilcox_1hr$p, wilcox_4hr$p, wilcox_24hr$p)
+)
+
+cat("\nStatistical Test Results:\n")
+print(stats_results)
+
+# Export statistics
+write_csv(stats_results, here("output", "cap_binder_statistics.csv"))
+cat("\nStatistics exported to: output/cap_binder_statistics.csv\n")
+```
+
+## Faceted All-Timepoints Plot
+
+```{r faceted_plot, fig.width=10, fig.height=4}
+# Combine all timepoints for faceted plot
+te_combined <- bind_rows(
+  te_1hr_cap_status %>% mutate(timepoint = "1 Hour"),
+  te_4hr_cap_status %>% mutate(timepoint = "4 Hours"),
+  te_24hr_cap_status %>% mutate(timepoint = "24 Hours")
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1 Hour", "4 Hours", "24 Hours")))
+
+# Calculate counts for annotations
+count_labels <- te_combined %>%
+  group_by(timepoint, cap_status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = paste0("n=", n)) %>%
+  mutate(
+    x = 0.7,
+    y = case_when(
+      cap_status == "Glucose Dep. Cap Binder" ~ 0.15,
+      TRUE ~ 0.05
+    )
+  )
+
+# Create faceted ECDF plot
+p_faceted <- ggplot(te_combined, aes(x = log2FoldChange, color = cap_status)) +
+  stat_ecdf(size = 1.2) +
+  scale_color_manual(
+    values = c("Glucose Dep. Cap Binder" = "#D55E00", "Other" = "#808080"),
+    name = "Cap-Binding Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = count_labels, aes(x = x, y = y, label = label, color = cap_status),
+            size = 3, show.legend = FALSE) +
+  facet_wrap(~timepoint, nrow = 1) +
+  labs(
+    title = "Hypoxic Response by eIF3d Cap-Binding Status (Lamper)",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlim(-1, 1)
+
+print(p_faceted)
+
+# Save the faceted plot
+ggsave(
+  here("plots", "ecdf_cap_binders_glu_all_timepoints.pdf"),
+  plot = p_faceted,
+  width = 10,
+  height = 4
+)
+```
+
+## Complete Media Cap Binders Analysis
+
+For comparison, also analyze complete media cap binders.
+
+```{r cm_cap_binders, fig.width=10, fig.height=4}
+# Classify genes by CM cap-binding status
+te_1hr_cm_status <- te_1hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    cap_status = case_when(
+      gene_id_clean %in% cm_cap_binders ~ "Complete Media Cap Binder",
+      TRUE ~ "Other"
+    )
+  )
+
+te_4hr_cm_status <- te_4hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    cap_status = case_when(
+      gene_id_clean %in% cm_cap_binders ~ "Complete Media Cap Binder",
+      TRUE ~ "Other"
+    )
+  )
+
+te_24hr_cm_status <- te_24hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    cap_status = case_when(
+      gene_id_clean %in% cm_cap_binders ~ "Complete Media Cap Binder",
+      TRUE ~ "Other"
+    )
+  )
+
+cat("\nComplete Media Cap Binder overlap with TE data:\n")
+cat("1hr:", sum(te_1hr_cm_status$cap_status == "Complete Media Cap Binder"), "\n")
+cat("4hr:", sum(te_4hr_cm_status$cap_status == "Complete Media Cap Binder"), "\n")
+cat("24hr:", sum(te_24hr_cm_status$cap_status == "Complete Media Cap Binder"), "\n")
+
+# Combine all timepoints for faceted plot
+te_cm_combined <- bind_rows(
+  te_1hr_cm_status %>% mutate(timepoint = "1 Hour"),
+  te_4hr_cm_status %>% mutate(timepoint = "4 Hours"),
+  te_24hr_cm_status %>% mutate(timepoint = "24 Hours")
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1 Hour", "4 Hours", "24 Hours")))
+
+# Calculate counts for annotations
+count_labels_cm <- te_cm_combined %>%
+  group_by(timepoint, cap_status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = paste0("n=", n)) %>%
+  mutate(
+    x = 0.7,
+    y = case_when(
+      cap_status == "Complete Media Cap Binder" ~ 0.15,
+      TRUE ~ 0.05
+    )
+  )
+
+# Create faceted ECDF plot for CM cap binders
+p_cm_faceted <- ggplot(te_cm_combined, aes(x = log2FoldChange, color = cap_status)) +
+  stat_ecdf(size = 1.2) +
+  scale_color_manual(
+    values = c("Complete Media Cap Binder" = "#0072B2", "Other" = "#808080"),
+    name = "Cap-Binding Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = count_labels_cm, aes(x = x, y = y, label = label, color = cap_status),
+            size = 3, show.legend = FALSE) +
+  facet_wrap(~timepoint, nrow = 1) +
+  labs(
+    title = "Hypoxic Response by eIF3d Cap-Binding Status (Lamper - Complete Media)",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlim(-1, 1)
+
+print(p_cm_faceted)
+
+# Save the CM faceted plot
+ggsave(
+  here("plots", "ecdf_cap_binders_cm_all_timepoints.pdf"),
+  plot = p_cm_faceted,
+  width = 10,
+  height = 4
+)
+```
+
+## Lee PAR-CLIP eIF3d Binding Analysis
+
+Analyze eIF3d binding targets from Lee et al. 2015 PAR-CLIP data.
+
+```{r load_lee_parclip}
+# Load Lee 2015 PAR-CLIP data
+lee_parclip <- read_csv("/Users/katematlin/github/mpra_preliminary/data/lee_parclip.csv") %>%
+  clean_names()
+
+cat("Lee PAR-CLIP data columns:\n")
+print(colnames(lee_parclip))
+
+cat("\nSubunit distribution:\n")
+print(table(lee_parclip$subunit))
+
+# Filter for eIF3d-specific binding and get unique gene IDs
+lee_eif3d_genes <- lee_parclip %>%
+  filter(subunit == "d") %>%
+  pull(ensembl_id) %>%
+  unique() %>%
+  str_replace("\\..*", "")  # Strip version numbers if present
+
+cat("\nNumber of eIF3d-bound genes (Lee PAR-CLIP):", length(lee_eif3d_genes), "\n")
+```
+
+```{r classify_lee_binding}
+# Classify genes by Lee eIF3d binding status
+te_1hr_lee_status <- te_1hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    binding_status = case_when(
+      gene_id_clean %in% lee_eif3d_genes ~ "eIF3d-Bound (Lee)",
+      TRUE ~ "Other"
+    )
+  )
+
+te_4hr_lee_status <- te_4hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    binding_status = case_when(
+      gene_id_clean %in% lee_eif3d_genes ~ "eIF3d-Bound (Lee)",
+      TRUE ~ "Other"
+    )
+  )
+
+te_24hr_lee_status <- te_24hr_gsea %>%
+  mutate(gene_id_clean = str_replace(gene_id, "\\..*", "")) %>%
+  mutate(
+    binding_status = case_when(
+      gene_id_clean %in% lee_eif3d_genes ~ "eIF3d-Bound (Lee)",
+      TRUE ~ "Other"
+    )
+  )
+
+# Report overlap statistics
+cat("\nLee eIF3d-bound genes overlap with TE data:\n")
+cat("1hr - eIF3d-bound genes found:", sum(te_1hr_lee_status$binding_status == "eIF3d-Bound (Lee)"), "\n")
+cat("4hr - eIF3d-bound genes found:", sum(te_4hr_lee_status$binding_status == "eIF3d-Bound (Lee)"), "\n")
+cat("24hr - eIF3d-bound genes found:", sum(te_24hr_lee_status$binding_status == "eIF3d-Bound (Lee)"), "\n")
+```
+
+```{r lee_ecdf_plot, fig.width=10, fig.height=4}
+# Combine all timepoints for faceted plot
+te_lee_combined <- bind_rows(
+  te_1hr_lee_status %>% mutate(timepoint = "1 Hour"),
+  te_4hr_lee_status %>% mutate(timepoint = "4 Hours"),
+  te_24hr_lee_status %>% mutate(timepoint = "24 Hours")
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1 Hour", "4 Hours", "24 Hours")))
+
+# Calculate counts for annotations
+count_labels_lee <- te_lee_combined %>%
+  group_by(timepoint, binding_status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = paste0("n=", n)) %>%
+  mutate(
+    x = 0.7,
+    y = case_when(
+      binding_status == "eIF3d-Bound (Lee)" ~ 0.15,
+      TRUE ~ 0.05
+    )
+  )
+
+# Create faceted ECDF plot with green color for Lee data
+p_lee_faceted <- ggplot(te_lee_combined, aes(x = log2FoldChange, color = binding_status)) +
+  stat_ecdf(size = 1.2) +
+  scale_color_manual(
+    values = c("eIF3d-Bound (Lee)" = "#009E73", "Other" = "#808080"),
+    name = "eIF3d Binding Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = count_labels_lee, aes(x = x, y = y, label = label, color = binding_status),
+            size = 3, show.legend = FALSE) +
+  facet_wrap(~timepoint, nrow = 1) +
+  labs(
+    title = "Hypoxic Response by eIF3d Binding Status (Lee PAR-CLIP)",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlim(-1, 1)
+
+print(p_lee_faceted)
+
+# Save the Lee PAR-CLIP faceted plot
+ggsave(
+  here("plots", "ecdf_eif3d_lee_parclip_all_timepoints.pdf"),
+  plot = p_lee_faceted,
+  width = 10,
+  height = 4
+)
+```
+
+```{r lee_statistical_tests}
+# Perform KS tests comparing Lee eIF3d-bound vs other genes
+ks_lee_1hr <- ks.test(
+  te_1hr_lee_status %>% filter(binding_status == "eIF3d-Bound (Lee)") %>% pull(log2FoldChange),
+  te_1hr_lee_status %>% filter(binding_status == "Other") %>% pull(log2FoldChange)
+)
+
+ks_lee_4hr <- ks.test(
+  te_4hr_lee_status %>% filter(binding_status == "eIF3d-Bound (Lee)") %>% pull(log2FoldChange),
+  te_4hr_lee_status %>% filter(binding_status == "Other") %>% pull(log2FoldChange)
+)
+
+ks_lee_24hr <- ks.test(
+  te_24hr_lee_status %>% filter(binding_status == "eIF3d-Bound (Lee)") %>% pull(log2FoldChange),
+  te_24hr_lee_status %>% filter(binding_status == "Other") %>% pull(log2FoldChange)
+)
+
+# Perform Wilcoxon tests using rstatix
+wilcox_lee_1hr <- te_1hr_lee_status %>%
+  wilcox_test(log2FoldChange ~ binding_status)
+
+wilcox_lee_4hr <- te_4hr_lee_status %>%
+  wilcox_test(log2FoldChange ~ binding_status)
+
+wilcox_lee_24hr <- te_24hr_lee_status %>%
+  wilcox_test(log2FoldChange ~ binding_status)
+
+# Compile Lee PAR-CLIP statistics
+lee_stats_results <- data.frame(
+  timepoint = c("1hr", "4hr", "24hr"),
+  n_eif3d_bound = c(
+    sum(te_1hr_lee_status$binding_status == "eIF3d-Bound (Lee)"),
+    sum(te_4hr_lee_status$binding_status == "eIF3d-Bound (Lee)"),
+    sum(te_24hr_lee_status$binding_status == "eIF3d-Bound (Lee)")
+  ),
+  n_other = c(
+    sum(te_1hr_lee_status$binding_status == "Other"),
+    sum(te_4hr_lee_status$binding_status == "Other"),
+    sum(te_24hr_lee_status$binding_status == "Other")
+  ),
+  median_eif3d_bound = c(
+    median(te_1hr_lee_status$log2FoldChange[te_1hr_lee_status$binding_status == "eIF3d-Bound (Lee)"]),
+    median(te_4hr_lee_status$log2FoldChange[te_4hr_lee_status$binding_status == "eIF3d-Bound (Lee)"]),
+    median(te_24hr_lee_status$log2FoldChange[te_24hr_lee_status$binding_status == "eIF3d-Bound (Lee)"])
+  ),
+  median_other = c(
+    median(te_1hr_lee_status$log2FoldChange[te_1hr_lee_status$binding_status == "Other"]),
+    median(te_4hr_lee_status$log2FoldChange[te_4hr_lee_status$binding_status == "Other"]),
+    median(te_24hr_lee_status$log2FoldChange[te_24hr_lee_status$binding_status == "Other"])
+  ),
+  ks_statistic = c(ks_lee_1hr$statistic, ks_lee_4hr$statistic, ks_lee_24hr$statistic),
+  ks_pvalue = c(ks_lee_1hr$p.value, ks_lee_4hr$p.value, ks_lee_24hr$p.value),
+  wilcox_statistic = c(wilcox_lee_1hr$statistic, wilcox_lee_4hr$statistic, wilcox_lee_24hr$statistic),
+  wilcox_pvalue = c(wilcox_lee_1hr$p, wilcox_lee_4hr$p, wilcox_lee_24hr$p)
+)
+
+cat("\nLee PAR-CLIP Statistical Test Results:\n")
+print(lee_stats_results)
+
+# Export Lee PAR-CLIP statistics
+write_csv(lee_stats_results, here("output", "lee_parclip_statistics.csv"))
+cat("\nLee PAR-CLIP statistics exported to: output/lee_parclip_statistics.csv\n")
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```

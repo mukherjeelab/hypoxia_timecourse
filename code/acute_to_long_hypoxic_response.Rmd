@@ -30,6 +30,8 @@ library(limma)
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(enrichplot)
+library(fgsea)
+library(patchwork)
 library(plotly)
 library(ggokabeito)
 library(ggvenn)
@@ -1990,6 +1992,10 @@ te_combined <- bind_rows(
     mutate(Timepoint = "24hr")
 )
 
+# Set timepoint order
+te_combined <- te_combined %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("1hr", "4hr", "24hr")))
+
 # Create significance classification
 te_combined <- te_combined %>%
   mutate(
@@ -2834,7 +2840,7 @@ Perform GSEA analysis using custom gene sets derived from MDA-MB-231 cell line e
 
 ```{r load_custom_genesets}
 # Load custom gene sets from CSV
-custom_genesets_raw <- read_csv(here("accessories", "all_combined_sigs_12_9_25.csv"))
+custom_genesets_raw <- read_csv(here("accessories", "all_combined_sigs_1_13_26.csv"))
 
 # Filter to MDA-MB-231 gene sets and create TERM2GENE format
 custom_genesets <- custom_genesets_raw %>%
@@ -2863,39 +2869,53 @@ cat("Min:", min(geneset_sizes$size), "\n")
 cat("Max:", max(geneset_sizes$size), "\n")
 cat("Mean:", round(mean(geneset_sizes$size), 1), "\n")
 cat("Median:", median(geneset_sizes$size), "\n")
+
+# Convert to fgsea format (named list of gene vectors)
+pathways_fgsea <- custom_genesets %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(db_gene_symbol), .groups = "drop") %>%
+  deframe()
+
+unique(custom_genesets$gs_name)
+
+cat("\nConverted to fgsea format:", length(pathways_fgsea), "pathways\n")
 ```
 
 ## GSEA: 1hr Hypoxia (Custom Gene Sets)
 
-```{r gsea_custom_1hr}
-# Run GSEA with custom gene sets (using pre-existing ranked list)
+```{r fgsea_custom_1hr}
+# Run fgsea with custom gene sets (much faster than clusterProfiler)
 set.seed(42)
-gsea_custom_1hr <- GSEA(
-  geneList = ranked_list_1hr,
-  eps = 0,
-  pAdjustMethod = "fdr",
-  pvalueCutoff = 1,
-  minGSSize = 10,     # Lower than Hallmark/KEGG to capture smaller custom sets
-  maxGSSize = 1000,   # Filter out very large sets (2500-gene sets)
-  TERM2GENE = custom_genesets
+fgsea_custom_1hr <- fgsea(
+  pathways = pathways_fgsea,
+  stats = ranked_list_1hr,
+  minSize = 1,        # Allow all gene set sizes
+  maxSize = 5000,     # Allow larger gene sets like hypoxia_3d_promotes_TE_1hr (1608 genes)
+  gseaParam = 0,      # Unweighted GSEA (equivalent to exponent=0)
+  nproc = 1           # Use parallel processing if desired
 )
 
-# Extract results
-gsea_custom_1hr_results <- gsea_custom_1hr@result %>%
-  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
-  rename("leading_edge" = core_enrichment) %>%
-  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
-         leading_edge_fraction = leading_edge_count / setSize)
+# Format results to match previous output structure
+gsea_custom_1hr_results <- fgsea_custom_1hr %>%
+  as_tibble() %>%
+  rename(ID = pathway,
+         p.adjust = padj,
+         setSize = size) %>%
+  mutate(leading_edge = sapply(leadingEdge, function(x) paste(x, collapse = "/")),
+         leading_edge_count = sapply(leadingEdge, length),
+         leading_edge_fraction = leading_edge_count / setSize) %>%
+  dplyr::select(ID, NES, pval, p.adjust, setSize, leading_edge,
+                leading_edge_count, leading_edge_fraction) %>%
+  arrange(p.adjust)
 
 # Round numeric columns
-gsea_custom_1hr_results[] <- lapply(gsea_custom_1hr_results, function(x) {
-  if (is.numeric(x)) round(x, 4) else x
-})
+gsea_custom_1hr_results <- gsea_custom_1hr_results %>%
+  mutate(across(where(is.numeric), ~round(.x, 4)))
 
-cat("GSEA Custom 1hr - Top pathways:\n")
+cat("fgsea Custom 1hr - Top pathways:\n")
 cat("Total pathways tested:", nrow(gsea_custom_1hr_results), "\n")
 cat("Significant pathways (p.adjust < 0.05):",
-    sum(gsea_custom_1hr_results$p.adjust < 0.05), "\n\n")
+    sum(gsea_custom_1hr_results$p.adjust < 0.05, na.rm = TRUE), "\n\n")
 print(gsea_custom_1hr_results %>%
         filter(p.adjust < 0.05) %>%
         arrange(desc(abs(NES))) %>%
@@ -2904,34 +2924,36 @@ print(gsea_custom_1hr_results %>%
 
 ## GSEA: 4hr Hypoxia (Custom Gene Sets)
 
-```{r gsea_custom_4hr}
-# Run GSEA with custom gene sets
+```{r fgsea_custom_4hr}
+# Run fgsea with custom gene sets
 set.seed(42)
-gsea_custom_4hr <- GSEA(
-  geneList = ranked_list_4hr,
-  eps = 0,
-  pAdjustMethod = "fdr",
-  pvalueCutoff = 1,
-  minGSSize = 10,
-  maxGSSize = 1000,
-  TERM2GENE = custom_genesets
+fgsea_custom_4hr <- fgsea(
+  pathways = pathways_fgsea,
+  stats = ranked_list_4hr,
+  minSize = 1,
+  maxSize = 5000,
+  gseaParam = 0,      # Unweighted GSEA
+  nproc = 1
 )
 
-# Extract results
-gsea_custom_4hr_results <- gsea_custom_4hr@result %>%
-  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
-  rename("leading_edge" = core_enrichment) %>%
-  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
-         leading_edge_fraction = leading_edge_count / setSize)
+# Format results
+gsea_custom_4hr_results <- fgsea_custom_4hr %>%
+  as_tibble() %>%
+  rename(ID = pathway,
+         p.adjust = padj,
+         setSize = size) %>%
+  mutate(leading_edge = sapply(leadingEdge, function(x) paste(x, collapse = "/")),
+         leading_edge_count = sapply(leadingEdge, length),
+         leading_edge_fraction = leading_edge_count / setSize) %>%
+  dplyr::select(ID, NES, pval, p.adjust, setSize, leading_edge,
+                leading_edge_count, leading_edge_fraction) %>%
+  arrange(p.adjust) %>%
+  mutate(across(where(is.numeric), ~round(.x, 4)))
 
-gsea_custom_4hr_results[] <- lapply(gsea_custom_4hr_results, function(x) {
-  if (is.numeric(x)) round(x, 4) else x
-})
-
-cat("GSEA Custom 4hr - Top pathways:\n")
+cat("fgsea Custom 4hr - Top pathways:\n")
 cat("Total pathways tested:", nrow(gsea_custom_4hr_results), "\n")
 cat("Significant pathways (p.adjust < 0.05):",
-    sum(gsea_custom_4hr_results$p.adjust < 0.05), "\n\n")
+    sum(gsea_custom_4hr_results$p.adjust < 0.05, na.rm = TRUE), "\n\n")
 print(gsea_custom_4hr_results %>%
         filter(p.adjust < 0.05) %>%
         arrange(desc(abs(NES))) %>%
@@ -2940,34 +2962,36 @@ print(gsea_custom_4hr_results %>%
 
 ## GSEA: 24hr Hypoxia (Custom Gene Sets)
 
-```{r gsea_custom_24hr}
-# Run GSEA with custom gene sets
+```{r fgsea_custom_24hr}
+# Run fgsea with custom gene sets
 set.seed(42)
-gsea_custom_24hr <- GSEA(
-  geneList = ranked_list_24hr,
-  eps = 0,
-  pAdjustMethod = "fdr",
-  pvalueCutoff = 1,
-  minGSSize = 10,
-  maxGSSize = 1000,
-  TERM2GENE = custom_genesets
+fgsea_custom_24hr <- fgsea(
+  pathways = pathways_fgsea,
+  stats = ranked_list_24hr,
+  minSize = 1,
+  maxSize = 5000,
+  gseaParam = 0,      # Unweighted GSEA
+  nproc = 1
 )
 
-# Extract results
-gsea_custom_24hr_results <- gsea_custom_24hr@result %>%
-  dplyr::select(ID, NES, pvalue, p.adjust, setSize, core_enrichment) %>%
-  rename("leading_edge" = core_enrichment) %>%
-  mutate(leading_edge_count = sapply(strsplit(leading_edge, "/"), length),
-         leading_edge_fraction = leading_edge_count / setSize)
+# Format results
+gsea_custom_24hr_results <- fgsea_custom_24hr %>%
+  as_tibble() %>%
+  rename(ID = pathway,
+         p.adjust = padj,
+         setSize = size) %>%
+  mutate(leading_edge = sapply(leadingEdge, function(x) paste(x, collapse = "/")),
+         leading_edge_count = sapply(leadingEdge, length),
+         leading_edge_fraction = leading_edge_count / setSize) %>%
+  dplyr::select(ID, NES, pval, p.adjust, setSize, leading_edge,
+                leading_edge_count, leading_edge_fraction) %>%
+  arrange(p.adjust) %>%
+  mutate(across(where(is.numeric), ~round(.x, 4)))
 
-gsea_custom_24hr_results[] <- lapply(gsea_custom_24hr_results, function(x) {
-  if (is.numeric(x)) round(x, 4) else x
-})
-
-cat("GSEA Custom 24hr - Top pathways:\n")
+cat("fgsea Custom 24hr - Top pathways:\n")
 cat("Total pathways tested:", nrow(gsea_custom_24hr_results), "\n")
 cat("Significant pathways (p.adjust < 0.05):",
-    sum(gsea_custom_24hr_results$p.adjust < 0.05), "\n\n")
+    sum(gsea_custom_24hr_results$p.adjust < 0.05, na.rm = TRUE), "\n\n")
 print(gsea_custom_24hr_results %>%
         filter(p.adjust < 0.05) %>%
         arrange(desc(abs(NES))) %>%
@@ -3065,6 +3089,563 @@ if (nrow(gsea_custom_wide) > 0) {
   cat("Heatmap saved to: plots/gsea_custom_heatmap_timecourse.pdf\n")
 } else {
   cat("No significant custom pathways found for heatmap\n")
+}
+```
+
+
+# Running Enrichment Plots: eIF3d Regulation of TE (Cross-Timepoint Analysis)
+
+## Running Enrichment Plots: Hypoxia 3d Promotes TE (Cross-Timepoint)
+
+Generate running enrichment plots showing how genes promoted by eIF3d (in hypoxia conditions) are enriched across ALL THREE hypoxic response timepoints. This cross-timepoint design reveals whether eIF3d's regulatory effects are temporally stable or dynamic during the hypoxic timecourse.
+
+```{r fgsea_enrichment_hypoxia_3d_promotes_crosstime}
+# Loop over each gene set timepoint to create separate PDFs
+for (geneset_tp in c("1hr_lfc1.5", "4hr_lfc1", "24hr_lfc1")) {
+  plots_list <- list()
+  set_name <- paste0("MDA-MB-231_hypoxia_3d_promotes_TE_", geneset_tp)
+
+  # Get gene set size from any results object
+  geneset_size <- gsea_custom_1hr_results %>%
+    filter(ID == set_name) %>%
+    pull(setSize)
+
+  cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+  # Test this gene set against all three hypoxic response timepoints
+  for (response_tp in c("1hr", "4hr", "24hr")) {
+    ranked_list <- get(paste0("ranked_list_", response_tp))
+    results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+    if (set_name %in% results_df$ID) {
+      pathway_stats <- results_df %>% filter(ID == set_name)
+      nes_val <- round(pathway_stats$NES, 3)
+      padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+      tryCatch({
+        plots_list[[response_tp]] <- plotEnrichment(
+          pathways_fgsea[[set_name]],
+          ranked_list
+        ) +
+          labs(
+            title = paste0("Gene Set: 3d Promotes TE ", geneset_tp),
+            subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                            " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+          ) +
+          theme_minimal() +
+          theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+                plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+        cat("  Created plot:", geneset_tp, "gene set vs", response_tp, "response (NES:", nes_val, ")\n")
+      }, error = function(e) {
+        cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+      })
+    } else {
+      cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+    }
+  }
+
+  # Combine 3 plots (one per response timepoint) and save
+  if (length(plots_list) > 0) {
+    combined_plot <- wrap_plots(plots_list, ncol = 3)
+    output_file <- here(paste0("plots/fgsea_enrichment_hypoxia_3d_promotes_TE_", geneset_tp, "_geneset.pdf"))
+    ggsave(output_file, combined_plot, width = 18, height = 6)
+    cat("Saved:", output_file, "\n")
+  } else {
+    cat("No plots created for", set_name, "\n")
+  }
+}
+```
+
+## Running Enrichment Plots: Hypoxia 3d Inhibits TE (Cross-Timepoint)
+
+Generate running enrichment plots showing how genes inhibited by eIF3d (in hypoxia conditions) are enriched across ALL THREE hypoxic response timepoints.
+
+```{r fgsea_enrichment_hypoxia_3d_inhibits_crosstime}
+# Loop over each gene set timepoint to create separate PDFs
+for (geneset_tp in c("1hr_lfc1", "4hr_lfc1", "24hr_lfc1")) {
+  plots_list <- list()
+  set_name <- paste0("MDA-MB-231_hypoxia_3d_inhibits_TE_", geneset_tp)
+
+  # Get gene set size
+  geneset_size <- gsea_custom_1hr_results %>%
+    filter(ID == set_name) %>%
+    pull(setSize)
+
+  cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+  # Test this gene set against all three hypoxic response timepoints
+  for (response_tp in c("1hr", "4hr", "24hr")) {
+    ranked_list <- get(paste0("ranked_list_", response_tp))
+    results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+    if (set_name %in% results_df$ID) {
+      pathway_stats <- results_df %>% filter(ID == set_name)
+      nes_val <- round(pathway_stats$NES, 3)
+      padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+      tryCatch({
+        plots_list[[response_tp]] <- plotEnrichment(
+          pathways_fgsea[[set_name]],
+          ranked_list
+        ) +
+          labs(
+            title = paste0("Gene Set: 3d Inhibits TE ", geneset_tp),
+            subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                            " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+          ) +
+          theme_minimal() +
+          theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+                plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+        cat("  Created plot:", geneset_tp, "gene set vs", response_tp, "response (NES:", nes_val, ")\n")
+      }, error = function(e) {
+        cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+      })
+    } else {
+      cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+    }
+  }
+
+  # Combine and save
+  if (length(plots_list) > 0) {
+    combined_plot <- wrap_plots(plots_list, ncol = 3)
+    output_file <- here(paste0("plots/fgsea_enrichment_hypoxia_3d_inhibits_TE_", geneset_tp, "_geneset.pdf"))
+    ggsave(output_file, combined_plot, width = 18, height = 6)
+    cat("Saved:", output_file, "\n")
+  } else {
+    cat("No plots created for", set_name, "\n")
+  }
+}
+```
+
+## Running Enrichment Plots: Normoxia 3d Promotes TE (Combined)
+
+Generate running enrichment plots showing how the combined normoxia 3d promotes TE gene set is enriched across all three siCtrl hypoxic response timepoints. This shows how genes promoted by eIF3d under baseline (normoxia) conditions respond to hypoxic stress.
+
+```{r fgsea_enrichment_normoxia_3d_promotes}
+plots_list <- list()
+set_name <- "MDA-MB-231_normoxia_3d_promotes_TE_combined"
+
+# Get gene set size
+geneset_size <- gsea_custom_1hr_results %>%
+  filter(ID == set_name) %>%
+  pull(setSize)
+
+cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+# Test against all three hypoxic response timepoints
+for (response_tp in c("1hr", "4hr", "24hr")) {
+  ranked_list <- get(paste0("ranked_list_", response_tp))
+  results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+  if (set_name %in% results_df$ID) {
+    pathway_stats <- results_df %>% filter(ID == set_name)
+    nes_val <- round(pathway_stats$NES, 3)
+    padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+    tryCatch({
+      plots_list[[response_tp]] <- plotEnrichment(
+        pathways_fgsea[[set_name]],
+        ranked_list
+      ) +
+        labs(
+          title = "Gene Set: Normoxia 3d Promotes TE (Combined)",
+          subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                          " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+              plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+      cat("  Created plot: vs", response_tp, "response (NES:", nes_val, ")\n")
+    }, error = function(e) {
+      cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+    })
+  } else {
+    cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+  }
+}
+
+# Combine and save
+if (length(plots_list) > 0) {
+  combined_plot <- wrap_plots(plots_list, ncol = 3)
+  ggsave(here("plots/fgsea_enrichment_normoxia_3d_promotes_TE_combined.pdf"),
+         combined_plot, width = 18, height = 6)
+  cat("Saved: plots/fgsea_enrichment_normoxia_3d_promotes_TE_combined.pdf\n")
+} else {
+  cat("No plots created for", set_name, "\n")
+}
+```
+
+## Extract Early-Ranking Genes from Hypoxia 3d Promotes TE Enrichment
+
+Identify which genes in each timepoint's gene set appear at the far left of the enrichment plot (highest LFC). These are the genes driving the initial increase in the running enrichment score.
+
+```{r extract_early_ranking_genes_hypoxia_3d_promotes_1hr}
+# 1hr: Gene set 3d promotes TE 1hr lfc1 vs 1hr hypoxia ranked list
+set_name_1hr <- "MDA-MB-231_hypoxia_3d_promotes_TE_1hr_lfc1"
+geneset_genes_1hr <- pathways_fgsea[[set_name_1hr]]
+
+gene_ranks_1hr <- match(geneset_genes_1hr, names(ranked_list_1hr))
+names(gene_ranks_1hr) <- geneset_genes_1hr
+
+early_genes_hypoxia_3d_promotes_1hr <- data.frame(
+  gene = geneset_genes_1hr,
+  rank = gene_ranks_1hr,
+  lfc_1hr = ranked_list_1hr[geneset_genes_1hr]
+) %>%
+  filter(!is.na(rank)) %>%
+  arrange(rank)
+
+top20_hypoxia_3d_promotes_1hr <- head(early_genes_hypoxia_3d_promotes_1hr, 20)
+top20_hypoxia_3d_promotes_1hr
+
+write_csv(top20_hypoxia_3d_promotes_1hr, here("counts/top20_hypoxia_3d_promotes_1hr.csv"))
+```
+
+```{r extract_early_ranking_genes_hypoxia_3d_promotes_4hr}
+# 4hr: Gene set 3d promotes TE 4hr lfc1 vs 4hr hypoxia ranked list
+set_name_4hr <- "MDA-MB-231_hypoxia_3d_promotes_TE_4hr_lfc1"
+geneset_genes_4hr <- pathways_fgsea[[set_name_4hr]]
+
+gene_ranks_4hr <- match(geneset_genes_4hr, names(ranked_list_4hr))
+names(gene_ranks_4hr) <- geneset_genes_4hr
+
+early_genes_hypoxia_3d_promotes_4hr <- data.frame(
+  gene = geneset_genes_4hr,
+  rank = gene_ranks_4hr,
+  lfc_4hr = ranked_list_4hr[geneset_genes_4hr]
+) %>%
+  filter(!is.na(rank)) %>%
+  arrange(rank)
+
+top20_hypoxia_3d_promotes_4hr <- head(early_genes_hypoxia_3d_promotes_4hr, 20)
+top20_hypoxia_3d_promotes_4hr
+
+write_csv(top20_hypoxia_3d_promotes_4hr, here("counts/top20_hypoxia_3d_promotes_4hr.csv"))
+```
+
+```{r extract_early_ranking_genes_hypoxia_3d_promotes_24hr}
+# 24hr: Gene set 3d promotes TE 24hr lfc1 vs 24hr hypoxia ranked list
+set_name_24hr <- "MDA-MB-231_hypoxia_3d_promotes_TE_24hr_lfc1"
+geneset_genes_24hr <- pathways_fgsea[[set_name_24hr]]
+
+gene_ranks_24hr <- match(geneset_genes_24hr, names(ranked_list_24hr))
+names(gene_ranks_24hr) <- geneset_genes_24hr
+
+early_genes_hypoxia_3d_promotes_24hr <- data.frame(
+  gene = geneset_genes_24hr,
+  rank = gene_ranks_24hr,
+  lfc_24hr = ranked_list_24hr[geneset_genes_24hr]
+) %>%
+  filter(!is.na(rank)) %>%
+  arrange(rank)
+
+top20_hypoxia_3d_promotes_24hr <- head(early_genes_hypoxia_3d_promotes_24hr, 20)
+top20_hypoxia_3d_promotes_24hr
+
+write_csv(top20_hypoxia_3d_promotes_24hr, here("counts/top20_hypoxia_3d_promotes_24hr.csv"))
+```
+
+## Running Enrichment Plots: Normoxia 3d Inhibits TE (Combined)
+
+Generate running enrichment plots showing how the combined normoxia 3d inhibits TE gene set is enriched across all three siCtrl hypoxic response timepoints. This shows how genes inhibited by eIF3d under baseline (normoxia) conditions respond to hypoxic stress.
+
+```{r fgsea_enrichment_normoxia_3d_inhibits}
+plots_list <- list()
+set_name <- "MDA-MB-231_normoxia_3d_inhibits_TE_combined"
+
+# Get gene set size
+geneset_size <- gsea_custom_1hr_results %>%
+  filter(ID == set_name) %>%
+  pull(setSize)
+
+cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+# Test against all three hypoxic response timepoints
+for (response_tp in c("1hr", "4hr", "24hr")) {
+  ranked_list <- get(paste0("ranked_list_", response_tp))
+  results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+  if (set_name %in% results_df$ID) {
+    pathway_stats <- results_df %>% filter(ID == set_name)
+    nes_val <- round(pathway_stats$NES, 3)
+    padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+    tryCatch({
+      plots_list[[response_tp]] <- plotEnrichment(
+        pathways_fgsea[[set_name]],
+        ranked_list
+      ) +
+        labs(
+          title = "Gene Set: Normoxia 3d Inhibits TE (Combined)",
+          subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                          " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+              plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+      cat("  Created plot: vs", response_tp, "response (NES:", nes_val, ")\n")
+    }, error = function(e) {
+      cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+    })
+  } else {
+    cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+  }
+}
+
+# Combine and save
+if (length(plots_list) > 0) {
+  combined_plot <- wrap_plots(plots_list, ncol = 3)
+  ggsave(here("plots/fgsea_enrichment_normoxia_3d_inhibits_TE_combined.pdf"),
+         combined_plot, width = 18, height = 6)
+  cat("Saved: plots/fgsea_enrichment_normoxia_3d_inhibits_TE_combined.pdf\n")
+} else {
+  cat("No plots created for", set_name, "\n")
+}
+```
+
+## Running Enrichment Plots: Normoxia 3e Promotes TE (Combined)
+
+Generate running enrichment plots showing how the combined normoxia 3e promotes TE gene set is enriched across all three siCtrl hypoxic response timepoints. This shows how genes promoted by eIF3e under baseline (normoxia) conditions respond to hypoxic stress.
+
+```{r fgsea_enrichment_normoxia_3e_promotes}
+plots_list <- list()
+set_name <- "MDA-MB-231_normoxia_3e_promotes_TE_combined"
+
+# Get gene set size
+geneset_size <- gsea_custom_1hr_results %>%
+  filter(ID == set_name) %>%
+  pull(setSize)
+
+cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+# Test against all three hypoxic response timepoints
+for (response_tp in c("1hr", "4hr", "24hr")) {
+  ranked_list <- get(paste0("ranked_list_", response_tp))
+  results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+  if (set_name %in% results_df$ID) {
+    pathway_stats <- results_df %>% filter(ID == set_name)
+    nes_val <- round(pathway_stats$NES, 3)
+    padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+    tryCatch({
+      plots_list[[response_tp]] <- plotEnrichment(
+        pathways_fgsea[[set_name]],
+        ranked_list
+      ) +
+        labs(
+          title = "Gene Set: Normoxia 3e Promotes TE (Combined)",
+          subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                          " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+              plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+      cat("  Created plot: vs", response_tp, "response (NES:", nes_val, ")\n")
+    }, error = function(e) {
+      cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+    })
+  } else {
+    cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+  }
+}
+
+# Combine and save
+if (length(plots_list) > 0) {
+  combined_plot <- wrap_plots(plots_list, ncol = 3)
+  ggsave(here("plots/fgsea_enrichment_normoxia_3e_promotes_TE_combined.pdf"),
+         combined_plot, width = 18, height = 6)
+  cat("Saved: plots/fgsea_enrichment_normoxia_3e_promotes_TE_combined.pdf\n")
+} else {
+  cat("No plots created for", set_name, "\n")
+}
+```
+
+## Running Enrichment Plots: Normoxia 3e Inhibits TE (Combined)
+
+Generate running enrichment plots showing how the combined normoxia 3e inhibits TE gene set is enriched across all three siCtrl hypoxic response timepoints. This shows how genes inhibited by eIF3e under baseline (normoxia) conditions respond to hypoxic stress.
+
+```{r fgsea_enrichment_normoxia_3e_inhibits}
+plots_list <- list()
+set_name <- "MDA-MB-231_normoxia_3e_inhibits_TE_combined"
+
+# Get gene set size
+geneset_size <- gsea_custom_1hr_results %>%
+  filter(ID == set_name) %>%
+  pull(setSize)
+
+cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+# Test against all three hypoxic response timepoints
+for (response_tp in c("1hr", "4hr", "24hr")) {
+  ranked_list <- get(paste0("ranked_list_", response_tp))
+  results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+  if (set_name %in% results_df$ID) {
+    pathway_stats <- results_df %>% filter(ID == set_name)
+    nes_val <- round(pathway_stats$NES, 3)
+    padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+    tryCatch({
+      plots_list[[response_tp]] <- plotEnrichment(
+        pathways_fgsea[[set_name]],
+        ranked_list
+      ) +
+        labs(
+          title = "Gene Set: Normoxia 3e Inhibits TE (Combined)",
+          subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                          " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+              plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+      cat("  Created plot: vs", response_tp, "response (NES:", nes_val, ")\n")
+    }, error = function(e) {
+      cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+    })
+  } else {
+    cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+  }
+}
+
+# Combine and save
+if (length(plots_list) > 0) {
+  combined_plot <- wrap_plots(plots_list, ncol = 3)
+  ggsave(here("plots/fgsea_enrichment_normoxia_3e_inhibits_TE_combined.pdf"),
+         combined_plot, width = 18, height = 6)
+  cat("Saved: plots/fgsea_enrichment_normoxia_3e_inhibits_TE_combined.pdf\n")
+} else {
+  cat("No plots created for", set_name, "\n")
+}
+```
+
+## Running Enrichment Plots: Hypoxia 3e Promotes TE (Cross-Timepoint)
+
+Generate running enrichment plots showing how genes promoted by eIF3e (in hypoxia conditions) are enriched across ALL THREE hypoxic response timepoints. This cross-timepoint design reveals whether eIF3e's regulatory effects are temporally stable or dynamic during the hypoxic timecourse.
+
+```{r fgsea_enrichment_hypoxia_3e_promotes_crosstime}
+# Loop over each gene set timepoint to create separate PDFs
+for (geneset_tp in c("1hr_lfc1", "4hr_lfc1", "24hr_lfc1")) {
+  plots_list <- list()
+  set_name <- paste0("MDA-MB-231_hypoxia_3e_promotes_TE_", geneset_tp)
+
+  # Get gene set size from any results object
+  geneset_size <- gsea_custom_1hr_results %>%
+    filter(ID == set_name) %>%
+    pull(setSize)
+
+  cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+  # Test this gene set against all three hypoxic response timepoints
+  for (response_tp in c("1hr", "4hr", "24hr")) {
+    ranked_list <- get(paste0("ranked_list_", response_tp))
+    results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+    if (set_name %in% results_df$ID) {
+      pathway_stats <- results_df %>% filter(ID == set_name)
+      nes_val <- round(pathway_stats$NES, 3)
+      padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+      tryCatch({
+        plots_list[[response_tp]] <- plotEnrichment(
+          pathways_fgsea[[set_name]],
+          ranked_list
+        ) +
+          labs(
+            title = paste0("Gene Set: 3e Promotes TE ", geneset_tp),
+            subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                            " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+          ) +
+          theme_minimal() +
+          theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+                plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+        cat("  Created plot:", geneset_tp, "gene set vs", response_tp, "response (NES:", nes_val, ")\n")
+      }, error = function(e) {
+        cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+      })
+    } else {
+      cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+    }
+  }
+
+  # Combine 3 plots (one per response timepoint) and save
+  if (length(plots_list) > 0) {
+    combined_plot <- wrap_plots(plots_list, ncol = 3)
+    output_file <- here(paste0("plots/fgsea_enrichment_hypoxia_3e_promotes_TE_", geneset_tp, "_geneset.pdf"))
+    ggsave(output_file, combined_plot, width = 18, height = 6)
+    cat("Saved:", output_file, "\n")
+  } else {
+    cat("No plots created for", set_name, "\n")
+  }
+}
+```
+
+## Running Enrichment Plots: Hypoxia 3e Inhibits TE (Cross-Timepoint)
+
+Generate running enrichment plots showing how genes inhibited by eIF3e (in hypoxia conditions) are enriched across ALL THREE hypoxic response timepoints.
+
+```{r fgsea_enrichment_hypoxia_3e_inhibits_crosstime}
+# Loop over each gene set timepoint to create separate PDFs
+for (geneset_tp in c("1hr_lfc1", "4hr_lfc1", "24hr_lfc1")) {
+  plots_list <- list()
+  set_name <- paste0("MDA-MB-231_hypoxia_3e_inhibits_TE_", geneset_tp)
+
+  # Get gene set size
+  geneset_size <- gsea_custom_1hr_results %>%
+    filter(ID == set_name) %>%
+    pull(setSize)
+
+  cat("\n=== Processing", set_name, "(n=", geneset_size, "genes) ===\n")
+
+  # Test this gene set against all three hypoxic response timepoints
+  for (response_tp in c("1hr", "4hr", "24hr")) {
+    ranked_list <- get(paste0("ranked_list_", response_tp))
+    results_df <- get(paste0("gsea_custom_", response_tp, "_results"))
+
+    if (set_name %in% results_df$ID) {
+      pathway_stats <- results_df %>% filter(ID == set_name)
+      nes_val <- round(pathway_stats$NES, 3)
+      padj_val <- formatC(pathway_stats$p.adjust, format = "e", digits = 2)
+
+      tryCatch({
+        plots_list[[response_tp]] <- plotEnrichment(
+          pathways_fgsea[[set_name]],
+          ranked_list
+        ) +
+          labs(
+            title = paste0("Gene Set: 3e Inhibits TE ", geneset_tp),
+            subtitle = paste0("Response: ", response_tp, " Hypoxia | n=", geneset_size,
+                            " genes | NES: ", nes_val, " | p.adj: ", padj_val)
+          ) +
+          theme_minimal() +
+          theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+                plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+        cat("  Created plot:", geneset_tp, "gene set vs", response_tp, "response (NES:", nes_val, ")\n")
+      }, error = function(e) {
+        cat("  Error creating plot for", set_name, "vs", response_tp, ":", conditionMessage(e), "\n")
+      })
+    } else {
+      cat("  Warning:", set_name, "not found in", response_tp, "GSEA results\n")
+    }
+  }
+
+  # Combine and save
+  if (length(plots_list) > 0) {
+    combined_plot <- wrap_plots(plots_list, ncol = 3)
+    output_file <- here(paste0("plots/fgsea_enrichment_hypoxia_3e_inhibits_TE_", geneset_tp, "_geneset.pdf"))
+    ggsave(output_file, combined_plot, width = 18, height = 6)
+    cat("Saved:", output_file, "\n")
+  } else {
+    cat("No plots created for", set_name, "\n")
+  }
 }
 ```
 
