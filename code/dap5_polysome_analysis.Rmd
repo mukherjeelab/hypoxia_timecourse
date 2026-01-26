@@ -1,0 +1,613 @@
+---
+title: "DAP5 Polysome Profiling Analysis"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(here)
+library(cowplot)
+library(janitor)
+library(rstatix)
+library(DESeq2)
+```
+
+## Overview
+
+This analysis examines whether DAP5-dependent genes (from polysome profiling data, GSE115142) show differential hypoxic response compared to other genes. DAP5 (eIF4G2) is an alternative translation initiation factor that can promote cap-independent translation.
+
+We use DESeq2 with an interaction model to identify genes with significantly different translation efficiency (TE) between DAP5 overexpression and control conditions.
+
+## Load Polysome Data
+
+```{r load_polysome_data}
+# Load polysome profiling data from GSE115142
+# Columns: gene symbol, then count data for DAP5 overexpression and control (NS) conditions
+polysome_raw <- read_tsv(
+  here("accessories", "GSE115142_quant.featurecounts.counts.rev.cleaned.trDap5_alternative.txt"),
+  col_names = TRUE,
+  show_col_types = FALSE
+)
+
+# The first column is unnamed - it contains gene symbols
+colnames(polysome_raw)[1] <- "symbol"
+
+cat("Polysome data dimensions:", nrow(polysome_raw), "genes x", ncol(polysome_raw), "columns\n")
+cat("\nColumn names:\n")
+print(colnames(polysome_raw))
+
+# Check library sizes
+lib_sizes <- colSums(polysome_raw %>% select(where(is.numeric)), na.rm = TRUE)
+cat("\nLibrary sizes:\n")
+print(lib_sizes)
+cat("\nLibrary size fold difference (max/min):", max(lib_sizes) / min(lib_sizes), "\n")
+```
+
+## DESeq2 Analysis for Differential Translation Efficiency
+
+We use DESeq2 with an interaction model to test for genes where the Heavy/Total ratio differs between DAP5 and control conditions.
+
+Design: ~ condition + fraction + condition:fraction
+
+The interaction term (condition:fraction) tests for differential TE.
+
+```{r deseq2_setup}
+# Select only Heavy (HD) and Total (T) fractions for TE analysis
+# DAP5: TR_R4_Dap5_HD, TR_R4_Dap5_T, TR_R5_Dap5_HD, TR_R5_Dap5_T
+# NS: TR_R11_NS_HD, TR_R11_NS_T, TR_R3_NS_HD, TR_R3_NS_T
+
+# Create count matrix with only HD and T samples
+count_cols <- c("TR_R4_Dap5_HD", "TR_R4_Dap5_T",
+                "TR_R5_Dap5_HD", "TR_R5_Dap5_T",
+                "TR_R11_NS_HD", "TR_R11_NS_T",
+                "TR_R3_NS_HD", "TR_R3_NS_T")
+
+# Aggregate duplicate gene symbols by summing counts
+polysome_aggregated <- polysome_raw %>%
+  select(symbol, all_of(count_cols)) %>%
+  group_by(symbol) %>%
+  summarise(across(everything(), sum)) %>%
+  ungroup()
+
+count_matrix <- polysome_aggregated %>%
+  column_to_rownames("symbol") %>%
+  as.matrix()
+
+# Create sample metadata
+sample_info <- data.frame(
+  sample = count_cols,
+  condition = c("DAP5", "DAP5", "DAP5", "DAP5", "NS", "NS", "NS", "NS"),
+  fraction = c("HD", "T", "HD", "T", "HD", "T", "HD", "T"),
+  replicate = c("R4", "R4", "R5", "R5", "R11", "R11", "R3", "R3"),
+  row.names = count_cols
+)
+
+# Set factor levels (NS as reference for condition, T as reference for fraction)
+sample_info$condition <- factor(sample_info$condition, levels = c("NS", "DAP5"))
+sample_info$fraction <- factor(sample_info$fraction, levels = c("T", "HD"))
+
+cat("Sample metadata:\n")
+print(sample_info)
+```
+
+```{r deseq2_run}
+# Create DESeq2 dataset with interaction design
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = sample_info,
+  design = ~ condition + fraction + condition:fraction
+)
+
+# Filter low-count genes (at least 10 reads total across samples)
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+cat("\nGenes after filtering:", nrow(dds), "\n")
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Get results for the interaction term (differential TE)
+# This tests: is the HD/T ratio different between DAP5 and NS?
+res_interaction <- results(dds, name = "conditionDAP5.fractionHD")
+
+# Convert to data frame and add gene symbols
+deseq_results <- as.data.frame(res_interaction) %>%
+  rownames_to_column("symbol") %>%
+  arrange(padj)
+
+cat("\nDESeq2 results summary:\n")
+summary(res_interaction)
+
+cat("\nTop genes by adjusted p-value:\n")
+head(deseq_results, 10)
+```
+
+## Define DAP5-Dependent Gene Sets
+
+Using DESeq2 results with thresholds:
+- **padj < 0.05** (statistically significant)
+- **|log2FC| > 0.5** (~1.4-fold change in TE)
+
+- **DAP5-Promoted**: genes with significant positive interaction (TE increased by DAP5)
+- **DAP5-Inhibited**: genes with significant negative interaction (TE decreased by DAP5)
+
+```{r define_dap5_genesets}
+# Define thresholds
+padj_threshold <- 0.05
+log2fc_threshold <- 0.5
+
+# Classify genes by DAP5 dependence using DESeq2 results
+deseq_classified <- deseq_results %>%
+  mutate(
+    dap5_status = case_when(
+      !is.na(padj) & padj < padj_threshold & log2FoldChange > log2fc_threshold ~ "DAP5-Promoted",
+      !is.na(padj) & padj < padj_threshold & log2FoldChange < -log2fc_threshold ~ "DAP5-Inhibited",
+      TRUE ~ "Other"
+    )
+  )
+
+# Report gene counts
+cat("\nDAP5 classification counts (DESeq2, padj <", padj_threshold, "& |log2FC| >", log2fc_threshold, "):\n")
+print(table(deseq_classified$dap5_status))
+
+# Extract gene sets
+dap5_promoted_genes <- deseq_classified %>%
+  filter(dap5_status == "DAP5-Promoted") %>%
+  pull(symbol)
+
+dap5_inhibited_genes <- deseq_classified %>%
+  filter(dap5_status == "DAP5-Inhibited") %>%
+  pull(symbol)
+
+cat("\nDAP5-Promoted genes:", length(dap5_promoted_genes), "\n")
+cat("DAP5-Inhibited genes:", length(dap5_inhibited_genes), "\n")
+
+# Show distribution of log2FC for significant genes
+cat("\nlog2FC distribution for DAP5-Promoted genes:\n")
+print(summary(deseq_classified$log2FoldChange[deseq_classified$dap5_status == "DAP5-Promoted"]))
+
+cat("\nlog2FC distribution for DAP5-Inhibited genes:\n")
+print(summary(deseq_classified$log2FoldChange[deseq_classified$dap5_status == "DAP5-Inhibited"]))
+```
+
+## Volcano Plot of DESeq2 Results
+
+```{r volcano_plot, fig.width=7, fig.height=6}
+# Create volcano plot
+p_volcano <- ggplot(deseq_classified, aes(x = log2FoldChange, y = -log10(padj), color = dap5_status)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(
+    values = c("DAP5-Promoted" = "#D55E00", "DAP5-Inhibited" = "#0072B2", "Other" = "#808080"),
+    name = "DAP5 Status"
+  ) +
+  geom_vline(xintercept = c(-log2fc_threshold, log2fc_threshold), linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = -log10(padj_threshold), linetype = "dashed", color = "gray40") +
+  labs(
+    title = "DAP5 Effect on Translation Efficiency",
+    subtitle = paste0("DESeq2 interaction term (padj < ", padj_threshold, ", |log2FC| > ", log2fc_threshold, ")"),
+    x = "log2 Fold Change (DAP5 effect on TE)",
+    y = "-log10(adjusted p-value)"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-4, 4)
+
+print(p_volcano)
+
+ggsave(
+  here("plots", "volcano_dap5_polysome_deseq2.pdf"),
+  plot = p_volcano,
+  width = 7,
+  height = 6
+)
+```
+
+## Load Hypoxia TE Data
+
+```{r load_te_data}
+# Load TE changes from hypoxia timecourse at all three timepoints
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"), show_col_types = FALSE)
+te_4hr <- read_csv(here("output", "translation_categories_4hr.csv"), show_col_types = FALSE)
+te_24hr <- read_csv(here("output", "translation_categories_24hr.csv"), show_col_types = FALSE)
+
+# Load gene symbols from annotation file
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"),
+                      show_col_types = FALSE)
+
+# Keep one entry per gene (prefer protein_coding, then deduplicate)
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+# Add gene symbols to TE data and prepare for analysis
+# Handle duplicate gene symbols by keeping the gene with highest absolute LFC
+# Note: Using dplyr:: prefix to avoid conflicts with DESeq2/S4Vectors packages
+te_1hr_gsea <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  dplyr::rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  dplyr::slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_4hr_gsea <- te_4hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  dplyr::rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  dplyr::slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_24hr_gsea <- te_24hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  dplyr::rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  dplyr::slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Loaded TE data with gene symbols:\n")
+cat("1hr:", nrow(te_1hr_gsea), "genes\n")
+cat("4hr:", nrow(te_4hr_gsea), "genes\n")
+cat("24hr:", nrow(te_24hr_gsea), "genes\n")
+```
+
+## Classify Genes by DAP5 Status
+
+```{r classify_genes}
+# Classify genes by DAP5 dependence status (using DESeq2-defined gene sets)
+te_1hr_dap5_status <- te_1hr_gsea %>%
+  mutate(
+    dap5_status = case_when(
+      symbol %in% dap5_promoted_genes ~ "DAP5-Promoted",
+      symbol %in% dap5_inhibited_genes ~ "DAP5-Inhibited",
+      TRUE ~ "Other"
+    )
+  )
+
+te_4hr_dap5_status <- te_4hr_gsea %>%
+  mutate(
+    dap5_status = case_when(
+      symbol %in% dap5_promoted_genes ~ "DAP5-Promoted",
+      symbol %in% dap5_inhibited_genes ~ "DAP5-Inhibited",
+      TRUE ~ "Other"
+    )
+  )
+
+te_24hr_dap5_status <- te_24hr_gsea %>%
+  mutate(
+    dap5_status = case_when(
+      symbol %in% dap5_promoted_genes ~ "DAP5-Promoted",
+      symbol %in% dap5_inhibited_genes ~ "DAP5-Inhibited",
+      TRUE ~ "Other"
+    )
+  )
+
+# Report overlap statistics
+cat("\nOverlap with hypoxia TE data:\n")
+cat("1hr - DAP5-Promoted found:", sum(te_1hr_dap5_status$dap5_status == "DAP5-Promoted"), "\n")
+cat("1hr - DAP5-Inhibited found:", sum(te_1hr_dap5_status$dap5_status == "DAP5-Inhibited"), "\n")
+cat("4hr - DAP5-Promoted found:", sum(te_4hr_dap5_status$dap5_status == "DAP5-Promoted"), "\n")
+cat("4hr - DAP5-Inhibited found:", sum(te_4hr_dap5_status$dap5_status == "DAP5-Inhibited"), "\n")
+cat("24hr - DAP5-Promoted found:", sum(te_24hr_dap5_status$dap5_status == "DAP5-Promoted"), "\n")
+cat("24hr - DAP5-Inhibited found:", sum(te_24hr_dap5_status$dap5_status == "DAP5-Inhibited"), "\n")
+```
+
+## ECDF Plot: Hypoxic Response by DAP5 Status (1 Hour)
+
+```{r ecdf_1hr, fig.width=6, fig.height=5}
+# Create ECDF plot for 1 hour
+p_1hr <- ggplot(te_1hr_dap5_status, aes(x = log2FoldChange, color = dap5_status)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("DAP5-Promoted" = "#D55E00", "DAP5-Inhibited" = "#0072B2", "Other" = "#808080"),
+    name = "DAP5 Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Hypoxic Response by DAP5 Dependence",
+    subtitle = "Translation Efficiency Changes at 1 Hour",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-1, 1)
+
+print(p_1hr)
+
+# Save the plot
+ggsave(
+  here("plots", "ecdf_dap5_polysome_1hr.pdf"),
+  plot = p_1hr,
+  width = 5,
+  height = 4
+)
+```
+
+## ECDF Plot: Hypoxic Response by DAP5 Status (4 Hours)
+
+```{r ecdf_4hr, fig.width=6, fig.height=5}
+# Create ECDF plot for 4 hours
+p_4hr <- ggplot(te_4hr_dap5_status, aes(x = log2FoldChange, color = dap5_status)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("DAP5-Promoted" = "#D55E00", "DAP5-Inhibited" = "#0072B2", "Other" = "#808080"),
+    name = "DAP5 Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Hypoxic Response by DAP5 Dependence",
+    subtitle = "Translation Efficiency Changes at 4 Hours",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-1, 1)
+
+print(p_4hr)
+
+# Save the plot
+ggsave(
+  here("plots", "ecdf_dap5_polysome_4hr.pdf"),
+  plot = p_4hr,
+  width = 5,
+  height = 4
+)
+```
+
+## ECDF Plot: Hypoxic Response by DAP5 Status (24 Hours)
+
+```{r ecdf_24hr, fig.width=6, fig.height=5}
+# Create ECDF plot for 24 hours
+p_24hr <- ggplot(te_24hr_dap5_status, aes(x = log2FoldChange, color = dap5_status)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("DAP5-Promoted" = "#D55E00", "DAP5-Inhibited" = "#0072B2", "Other" = "#808080"),
+    name = "DAP5 Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Hypoxic Response by DAP5 Dependence",
+    subtitle = "Translation Efficiency Changes at 24 Hours",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  xlim(-1, 1)
+
+print(p_24hr)
+
+# Save the plot
+ggsave(
+  here("plots", "ecdf_dap5_polysome_24hr.pdf"),
+  plot = p_24hr,
+  width = 5,
+  height = 4
+)
+```
+
+## Faceted All-Timepoints Plot
+
+```{r faceted_plot, fig.width=10, fig.height=4}
+# Combine all timepoints for faceted plot
+te_combined <- bind_rows(
+  te_1hr_dap5_status %>% mutate(timepoint = "1 Hour"),
+  te_4hr_dap5_status %>% mutate(timepoint = "4 Hours"),
+  te_24hr_dap5_status %>% mutate(timepoint = "24 Hours")
+) %>%
+  mutate(timepoint = factor(timepoint, levels = c("1 Hour", "4 Hours", "24 Hours")))
+
+# Calculate counts for annotations
+count_labels <- te_combined %>%
+  group_by(timepoint, dap5_status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = paste0("n=", n)) %>%
+  mutate(
+    x = 0.7,
+    y = case_when(
+      dap5_status == "DAP5-Promoted" ~ 0.20,
+      dap5_status == "DAP5-Inhibited" ~ 0.10,
+      TRUE ~ 0.03
+    )
+  )
+
+# Create faceted ECDF plot
+p_faceted <- ggplot(te_combined, aes(x = log2FoldChange, color = dap5_status)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("DAP5-Promoted" = "#D55E00", "DAP5-Inhibited" = "#0072B2", "Other" = "#808080"),
+    name = "DAP5 Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = count_labels, aes(x = x, y = y, label = label, color = dap5_status),
+            size = 3, show.legend = FALSE) +
+  facet_wrap(~timepoint, nrow = 1) +
+  labs(
+    title = "Hypoxic Response by DAP5 Dependence (GSE115142, DESeq2)",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlim(-3, 1)
+
+print(p_faceted)
+
+# Save the faceted plot
+ggsave(
+  here("plots", "ecdf_dap5_polysome_all_timepoints.pdf"),
+  plot = p_faceted,
+  width = 10,
+  height = 4
+)
+```
+
+## Statistical Tests
+
+```{r statistical_tests}
+# Helper function to run statistical tests for a given comparison
+run_stats_tests <- function(te_data, group1_name, group2_name) {
+  group1_vals <- te_data %>% filter(dap5_status == group1_name) %>% pull(log2FoldChange)
+  group2_vals <- te_data %>% filter(dap5_status == group2_name) %>% pull(log2FoldChange)
+
+  if (length(group1_vals) < 2 || length(group2_vals) < 2) {
+    return(list(
+      ks_stat = NA, ks_p = NA,
+      wilcox_stat = NA, wilcox_p = NA,
+      n1 = length(group1_vals), n2 = length(group2_vals),
+      median1 = ifelse(length(group1_vals) > 0, median(group1_vals), NA),
+      median2 = ifelse(length(group2_vals) > 0, median(group2_vals), NA)
+    ))
+  }
+
+  ks_result <- ks.test(group1_vals, group2_vals)
+  wilcox_result <- wilcox.test(group1_vals, group2_vals)
+
+  return(list(
+    ks_stat = ks_result$statistic,
+    ks_p = ks_result$p.value,
+    wilcox_stat = wilcox_result$statistic,
+    wilcox_p = wilcox_result$p.value,
+    n1 = length(group1_vals),
+    n2 = length(group2_vals),
+    median1 = median(group1_vals),
+    median2 = median(group2_vals)
+  ))
+}
+
+# Run tests for DAP5-Promoted vs Other
+stats_promoted_1hr <- run_stats_tests(te_1hr_dap5_status, "DAP5-Promoted", "Other")
+stats_promoted_4hr <- run_stats_tests(te_4hr_dap5_status, "DAP5-Promoted", "Other")
+stats_promoted_24hr <- run_stats_tests(te_24hr_dap5_status, "DAP5-Promoted", "Other")
+
+# Run tests for DAP5-Inhibited vs Other
+stats_inhibited_1hr <- run_stats_tests(te_1hr_dap5_status, "DAP5-Inhibited", "Other")
+stats_inhibited_4hr <- run_stats_tests(te_4hr_dap5_status, "DAP5-Inhibited", "Other")
+stats_inhibited_24hr <- run_stats_tests(te_24hr_dap5_status, "DAP5-Inhibited", "Other")
+
+# Compile statistics
+stats_results <- data.frame(
+  timepoint = rep(c("1hr", "4hr", "24hr"), 2),
+  comparison = c(rep("DAP5-Promoted vs Other", 3), rep("DAP5-Inhibited vs Other", 3)),
+  n_test_group = c(
+    stats_promoted_1hr$n1, stats_promoted_4hr$n1, stats_promoted_24hr$n1,
+    stats_inhibited_1hr$n1, stats_inhibited_4hr$n1, stats_inhibited_24hr$n1
+  ),
+  n_other = c(
+    stats_promoted_1hr$n2, stats_promoted_4hr$n2, stats_promoted_24hr$n2,
+    stats_inhibited_1hr$n2, stats_inhibited_4hr$n2, stats_inhibited_24hr$n2
+  ),
+  median_test_group = c(
+    stats_promoted_1hr$median1, stats_promoted_4hr$median1, stats_promoted_24hr$median1,
+    stats_inhibited_1hr$median1, stats_inhibited_4hr$median1, stats_inhibited_24hr$median1
+  ),
+  median_other = c(
+    stats_promoted_1hr$median2, stats_promoted_4hr$median2, stats_promoted_24hr$median2,
+    stats_inhibited_1hr$median2, stats_inhibited_4hr$median2, stats_inhibited_24hr$median2
+  ),
+  ks_statistic = c(
+    stats_promoted_1hr$ks_stat, stats_promoted_4hr$ks_stat, stats_promoted_24hr$ks_stat,
+    stats_inhibited_1hr$ks_stat, stats_inhibited_4hr$ks_stat, stats_inhibited_24hr$ks_stat
+  ),
+  ks_pvalue = c(
+    stats_promoted_1hr$ks_p, stats_promoted_4hr$ks_p, stats_promoted_24hr$ks_p,
+    stats_inhibited_1hr$ks_p, stats_inhibited_4hr$ks_p, stats_inhibited_24hr$ks_p
+  ),
+  wilcox_statistic = c(
+    stats_promoted_1hr$wilcox_stat, stats_promoted_4hr$wilcox_stat, stats_promoted_24hr$wilcox_stat,
+    stats_inhibited_1hr$wilcox_stat, stats_inhibited_4hr$wilcox_stat, stats_inhibited_24hr$wilcox_stat
+  ),
+  wilcox_pvalue = c(
+    stats_promoted_1hr$wilcox_p, stats_promoted_4hr$wilcox_p, stats_promoted_24hr$wilcox_p,
+    stats_inhibited_1hr$wilcox_p, stats_inhibited_4hr$wilcox_p, stats_inhibited_24hr$wilcox_p
+  )
+)
+
+cat("\nStatistical Test Results:\n")
+print(stats_results)
+
+# Export statistics
+write_csv(stats_results, here("output", "dap5_polysome_statistics.csv"))
+cat("\nStatistics exported to: output/dap5_polysome_statistics.csv\n")
+```
+
+## Export Gene Sets and DESeq2 Results
+
+```{r export_genesets}
+# Export full DESeq2 results
+write_csv(deseq_results, here("output", "dap5_deseq2_full_results.csv"))
+cat("Full DESeq2 results exported to: output/dap5_deseq2_full_results.csv\n")
+
+# Create gene set data frame (only significant genes, |log2FC| > 0.5)
+geneset_df <- deseq_classified %>%
+  filter(dap5_status != "Other") %>%
+  select(symbol, log2FoldChange, padj, dap5_status) %>%
+  arrange(dap5_status, desc(abs(log2FoldChange)))
+
+cat("\nGene set summary (DESeq2, padj <", padj_threshold, "& |log2FC| >", log2fc_threshold, "):\n")
+print(table(geneset_df$dap5_status))
+
+# Export gene sets
+write_csv(geneset_df, here("output", "genesets", "dap5_polysome_genesets.csv"))
+cat("\nGene sets exported to: output/genesets/dap5_polysome_genesets.csv\n")
+
+# Create stricter gene set with |log2FC| > 1 threshold
+log2fc_threshold_strict <- 1.0
+
+geneset_strict_df <- deseq_results %>%
+  mutate(
+    dap5_status = case_when(
+      !is.na(padj) & padj < padj_threshold & log2FoldChange > log2fc_threshold_strict ~ "DAP5-Promoted",
+      !is.na(padj) & padj < padj_threshold & log2FoldChange < -log2fc_threshold_strict ~ "DAP5-Inhibited",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(dap5_status != "Other") %>%
+  select(symbol, log2FoldChange, padj, dap5_status) %>%
+  arrange(dap5_status, desc(abs(log2FoldChange)))
+
+cat("\nStricter gene set summary (DESeq2, padj <", padj_threshold, "& |log2FC| >", log2fc_threshold_strict, "):\n")
+print(table(geneset_strict_df$dap5_status))
+
+# Export stricter gene sets
+write_csv(geneset_strict_df, here("output", "genesets", "dap5_polysome_genesets_lfc1.csv"))
+cat("\nStricter gene sets exported to: output/genesets/dap5_polysome_genesets_lfc1.csv\n")
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```

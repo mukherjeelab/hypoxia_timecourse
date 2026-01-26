@@ -1,0 +1,642 @@
+---
+title: "Feature Extraction for Hypoxia Response Prediction"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This analysis extracts mRNA sequence and structural features for all genes to build a predictive model of Translation Efficiency (TE) Log2 Fold Change at 1 hour hypoxia.
+
+## Feature Categories
+
+| Category | Features | Count |
+|----------|----------|-------|
+| **Region Lengths** | 5'UTR, CDS, 3'UTR lengths + log2 transforms | 7 |
+| **GC Content** | GC% for 5'UTR, CDS, 3'UTR, full transcript | 4 |
+| **K-mer Frequencies** | 4-mers in 5'UTR (256) | 256 |
+| **RBP Motifs** | RBNS and CISBP-RNA PWM scores | ~50-100 |
+| **Codon Usage** | GC3 content | 1 |
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(tximport)
+library(scales)
+library(FeatureReachR)
+```
+
+# Load Data
+
+## Gene Annotation
+
+```{r load_gene_annotation}
+# Load gene symbols from annotation file
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"))
+
+# Keep one entry per gene (prefer protein_coding, then deduplicate)
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+cat("Gene annotation loaded:", nrow(gene_symbols), "genes\n")
+```
+
+## TE Data (1hr Hypoxia Response)
+
+```{r load_te_data}
+# Load TE changes from hypoxia timecourse at 1hr
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+
+cat("Loaded TE data:", nrow(te_1hr), "genes\n")
+
+# Add gene symbols
+te_1hr <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  filter(!is.na(symbol))
+
+cat("TE data with symbols:", nrow(te_1hr), "genes\n")
+```
+
+## Load TxDb and Genome
+
+```{r load_txdb}
+# Load pre-built TxDb from Gencode v26
+txdb <- loadDb("/Users/katematlin/github/mpra_preliminary/accessories/txdb.gencode26.sqlite")
+
+# Load gene info for transcript-to-symbol mapping
+geneInfo <- read_csv("/Users/katematlin/github/mpra_preliminary/accessories/gencode.v26.primary.info.csv.gz",
+                     col_names = FALSE) %>%
+  filter(!str_detect(X2, "pre_"))
+
+colnames(geneInfo) <- c("gene_id", "transcript_id", "biotype", "symbol")
+
+# Create transcript to gene mapping
+tx2gene <- geneInfo[, c("transcript_id", "gene_id")]
+gene_symbol_map <- geneInfo %>% dplyr::select(gene_id, symbol) %>% distinct()
+
+# Load genome
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cat("Loaded TxDb and genome\n")
+cat("Transcripts in geneInfo:", nrow(geneInfo), "\n")
+```
+
+# Select Most Abundant Transcript Per Gene
+
+```{r load_salmon}
+# Get list of salmon quant files
+salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
+salmon_samples <- list.dirs(salmon_dir, recursive = FALSE, full.names = FALSE)
+
+# Build file paths
+salmon_files <- file.path(salmon_dir, salmon_samples, "quant.sf.gz")
+names(salmon_files) <- salmon_samples
+
+# Filter to files that exist
+salmon_files <- salmon_files[file.exists(salmon_files)]
+cat("Found", length(salmon_files), "Salmon quant files\n")
+
+# Import with tximport (transcript-level)
+txi_transcripts <- tximport(salmon_files, type = "salmon", tx2gene = tx2gene, txOut = TRUE)
+
+# Get transcript abundances and find most abundant transcript per gene
+transcript_abundance <- txi_transcripts$abundance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  left_join(tx2gene, by = "transcript_id")
+
+# Sum counts across all samples and select most abundant transcript per gene
+most_abundant_tx <- transcript_abundance %>%
+  mutate(total_abundance = rowSums(across(where(is.numeric)), na.rm = TRUE)) %>%
+  dplyr::select(transcript_id, gene_id, total_abundance) %>%
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    # Strip version numbers from transcript IDs for joining with TxDb data
+    transcript_id_clean = sub("\\..*", "", transcript_id)
+  ) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(total_abundance, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Add gene symbols
+most_abundant_tx <- most_abundant_tx %>%
+  left_join(gene_symbol_map %>% mutate(gene_id_clean = sub("\\..*", "", gene_id)),
+            by = "gene_id_clean")
+
+cat("Selected most abundant transcript for", nrow(most_abundant_tx), "genes (all)\n")
+
+# Filter to only genes with TE data (reduces from ~50k to ~12k)
+te_gene_ids <- te_1hr %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  pull(gene_id_clean) %>%
+  unique()
+
+most_abundant_tx <- most_abundant_tx %>%
+  filter(gene_id_clean %in% te_gene_ids)
+
+cat("After filtering to genes with TE data:", nrow(most_abundant_tx), "genes\n")
+
+# Check transcript ID formats
+cat("\nExample transcript IDs from Salmon:", head(most_abundant_tx$transcript_id, 3), "\n")
+cat("Example transcript IDs (cleaned):", head(most_abundant_tx$transcript_id_clean, 3), "\n")
+```
+
+# Extract Region Lengths
+
+## 5' UTR, CDS, and 3' UTR Widths
+
+```{r extract_regions}
+# Extract regions from TxDb
+utr5 <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr3 <- threeUTRsByTranscript(txdb, use.names = TRUE)
+cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+# Calculate widths
+# Strip version numbers from TxDb transcript IDs to match Salmon IDs
+
+head(utr5_widths)
+
+# utr5_widths <- sum(width(utr5)) %>%
+#   as.data.frame() %>%
+#   rownames_to_column("transcript_id_raw") %>%
+#   dplyr::mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+#   dplyr::select(transcript_id_clean, utr5_length = `.`)
+
+utr5_widths <- as.data.frame(utr5) %>%
+  group_by(group_name) %>%
+  summarise(
+    utr5_length = sum(width),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", group_name)
+  ) %>%
+  dplyr::select(transcript_id_clean, utr5_length)
+
+# utr3_widths <- sum(width(utr3)) %>%
+#   as.data.frame() %>%
+#   rownames_to_column("transcript_id_raw") %>%
+#   mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+#   dplyr::select(transcript_id_clean, utr3_length = `.`)
+
+# cds_widths <- sum(width(cds)) %>%
+#   as.data.frame() %>%
+#   rownames_to_column("transcript_id_raw") %>%
+#   mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+#   dplyr::select(transcript_id_clean, cds_length = `.`)
+
+utr3_widths <- as.data.frame(utr3) %>%
+  group_by(group_name) %>%
+  summarise(
+    utr3_length = sum(width),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", group_name)
+  ) %>%
+  select(transcript_id_clean, utr3_length)
+
+cds_widths <- as.data.frame(cds) %>%
+  group_by(group_name) %>%
+  summarise(
+    cds_length = sum(width),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", group_name)
+  ) %>%
+  select(transcript_id_clean, cds_length)
+
+cat("Extracted region widths:\n")
+cat("5' UTRs:", nrow(utr5_widths), "\n")
+cat("3' UTRs:", nrow(utr3_widths), "\n")
+cat("CDS:", nrow(cds_widths), "\n")
+cat("\nExample TxDb transcript IDs (cleaned):", head(utr5_widths$transcript_id_clean, 3), "\n")
+```
+
+# Extract Sequences
+
+```{r extract_sequences}
+# Extract 5' UTR sequences
+# Strip version numbers from TxDb transcript IDs to match Salmon IDs
+utr5_sequences <- extractTranscriptSeqs(genome, utr5) %>% as.data.frame()
+utr5_seq <- utr5_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("utr5_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, utr5_sequence)
+
+# Extract 3' UTR sequences
+utr3_sequences <- extractTranscriptSeqs(genome, utr3) %>% as.data.frame()
+utr3_seq <- utr3_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("utr3_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, utr3_sequence)
+
+# Extract CDS sequences
+cds_sequences <- extractTranscriptSeqs(genome, cds) %>% as.data.frame()
+cds_seq <- cds_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("cds_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, cds_sequence)
+
+cat("Extracted sequences:\n")
+cat("5' UTRs:", nrow(utr5_seq), "\n")
+cat("3' UTRs:", nrow(utr3_seq), "\n")
+cat("CDS:", nrow(cds_seq), "\n")
+```
+
+# Calculate GC Content
+
+```{r calculate_gc}
+# GC content function
+gc_content <- function(seq) {
+  seq <- str_to_upper(seq)
+  gc_count <- str_count(seq, "[GC]")
+  total_length <- str_length(seq)
+  result <- (gc_count / total_length) * 100
+  result[total_length == 0] <- NA
+  return(result)
+}
+
+# Calculate GC content for each region
+utr5_gc <- utr5_seq %>%
+  mutate(utr5_gc = gc_content(utr5_sequence)) %>%
+  dplyr::select(transcript_id_clean, utr5_gc)
+
+utr3_gc <- utr3_seq %>%
+  mutate(utr3_gc = gc_content(utr3_sequence)) %>%
+  dplyr::select(transcript_id_clean, utr3_gc)
+
+cds_gc <- cds_seq %>%
+  mutate(cds_gc = gc_content(cds_sequence)) %>%
+  dplyr::select(transcript_id_clean, cds_gc)
+
+cat("Calculated GC content for all regions\n")
+```
+
+# Calculate 4-mer Frequencies in 5' UTR
+
+```{r calculate_4mers}
+# Get transcripts that we'll use (those with 5' UTR sequences)
+# Use transcript_id_clean for joining with TxDb data
+valid_transcripts <- most_abundant_tx %>%
+  filter(transcript_id_clean %in% utr5_seq$transcript_id_clean)
+
+cat("Transcripts with 5' UTR data:", nrow(valid_transcripts), "out of", nrow(most_abundant_tx), "\n")
+
+# Create DNAStringSet for 5' UTR sequences
+utr5_for_kmers <- utr5_seq %>%
+  filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
+         !is.na(utr5_sequence),
+         utr5_sequence != "")
+
+# Filter out very short sequences (need at least 4nt for 4-mers)
+utr5_for_kmers <- utr5_for_kmers %>%
+  filter(str_length(utr5_sequence) >= 4)
+
+utr5_dna <- DNAStringSet(utr5_for_kmers$utr5_sequence)
+names(utr5_dna) <- utr5_for_kmers$transcript_id_clean
+
+# Calculate 4-mer frequencies (as proportions)
+kmer4_matrix <- oligonucleotideFrequency(utr5_dna, width = 4, as.prob = TRUE)
+
+# Convert to data frame
+kmer4_df <- as.data.frame(kmer4_matrix) %>%
+  mutate(transcript_id_clean = utr5_for_kmers$transcript_id_clean)
+
+# Add prefix to column names for clarity
+colnames(kmer4_df)[1:256] <- paste0("utr5_4mer_", colnames(kmer4_df)[1:256])
+
+cat("Calculated 4-mer frequencies for", nrow(kmer4_df), "transcripts\n")
+cat("Number of 4-mer features:", 256, "\n")
+```
+
+# Calculate GC3 Content (Third Codon Position GC)
+
+```{r calculate_gc3}
+# Function to calculate GC3 content
+calculate_gc3 <- function(cds_sequence) {
+  if (is.na(cds_sequence) || nchar(cds_sequence) < 3) {
+    return(NA)
+  }
+
+  # Split into codons
+  seq <- str_to_upper(cds_sequence)
+  seq_len <- nchar(seq)
+
+  # Only use complete codons
+  complete_codons <- seq_len %/% 3
+  if (complete_codons == 0) return(NA)
+
+  # Extract third positions
+  third_positions <- sapply(1:complete_codons, function(i) {
+    substr(seq, (i-1)*3 + 3, (i-1)*3 + 3)
+  })
+
+  # Calculate GC percentage at third position
+  gc_count <- sum(third_positions %in% c("G", "C"))
+  gc3 <- (gc_count / length(third_positions)) * 100
+
+  return(gc3)
+}
+
+# Calculate GC3 for all CDS sequences
+cds_gc3 <- cds_seq %>%
+  mutate(gc3 = sapply(cds_sequence, calculate_gc3)) %>%
+  dplyr::select(transcript_id_clean, gc3)
+
+cat("Calculated GC3 content\n")
+cat("Median GC3:", round(median(cds_gc3$gc3, na.rm = TRUE), 2), "%\n")
+```
+
+# Calculate RBP Motif Scores
+
+```{r rbp_motifs}
+# Use FeatureReachR to calculate PWM scores for RBNS motifs
+
+# Prepare 5' UTR sequences as DNAStringSet
+utr5_for_motifs <- utr5_seq %>%
+  filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
+         !is.na(utr5_sequence),
+         utr5_sequence != "",
+         str_length(utr5_sequence) >= 6)
+
+utr5_motif_dna <- DNAStringSet(utr5_for_motifs$utr5_sequence)
+names(utr5_motif_dna) <- utr5_for_motifs$transcript_id_clean
+
+# Calculate RBNS PWM match counts
+# Using a simplified approach - count motif occurrences per kb
+cat("Calculating RBP motif scores...\n")
+
+# Get RBNS PWM names
+rbns_names <- names(RBNS_PWM)
+cat("Number of RBNS motifs:", length(rbns_names), "\n")
+
+# Function to count PWM matches in sequences
+count_pwm_matches <- function(pwm, sequences, min_score = 0.8) {
+  # Convert to matrix if needed
+  pwm_matrix <- as.matrix(pwm)
+
+  # Count matches per sequence
+  counts <- sapply(sequences, function(seq) {
+    if (length(seq) < ncol(pwm_matrix)) return(0)
+
+    tryCatch({
+      matches <- matchPWM(pwm_matrix, seq, min.score = paste0(min_score * 100, "%"))
+      length(matches)
+    }, error = function(e) 0)
+  })
+
+  return(counts)
+}
+
+# Calculate motif counts for a subset of key RBPs
+# Focus on RBPs known to be relevant to hypoxia/translation
+key_rbps <- c("PCBP1", "PCBP2", "PTBP1", "HNRNPA2B1", "ELAVL1", "SRSF1", "SRSF2",
+              "SRSF3", "SRSF7", "KHDRBS1", "KHSRP", "CELF1", "MBNL1", "QKI",
+              "RBM4", "RBM24", "IGF2BP1", "IGF2BP2", "IGF2BP3", "FMR1", "FXR1",
+              "FXR2", "CPEB1", "CPEB4", "TARDBP", "FUS", "HNRNPC", "HNRNPK",
+              "HNRNPL", "HNRNPM", "U2AF2", "TIA1", "TIAL1", "ZFP36", "YBX1")
+
+# Find matching RBNS PWMs
+available_rbps <- rbns_names[sapply(key_rbps, function(rbp) {
+  any(str_detect(rbns_names, fixed(rbp, ignore_case = TRUE)))
+})]
+
+cat("Key RBPs with available RBNS PWMs:", length(available_rbps), "\n")
+
+# Initialize motif score dataframe
+motif_scores <- data.frame(transcript_id_clean = utr5_for_motifs$transcript_id_clean)
+
+# Calculate scores for each available RBP
+for (rbp_pattern in key_rbps) {
+  matching_pwms <- rbns_names[str_detect(rbns_names, fixed(rbp_pattern, ignore_case = TRUE))]
+
+  if (length(matching_pwms) > 0) {
+    # Use first matching PWM
+    pwm_name <- matching_pwms[1]
+    pwm <- RBNS_PWM[[pwm_name]]
+
+    # Count matches
+    counts <- count_pwm_matches(pwm, utr5_motif_dna)
+
+    # Normalize by sequence length (per kb)
+    seq_lengths <- width(utr5_motif_dna)
+    normalized_counts <- (counts / seq_lengths) * 1000
+
+    # Add to dataframe
+    col_name <- paste0("rbp_", gsub("[^A-Za-z0-9]", "_", rbp_pattern))
+    motif_scores[[col_name]] <- normalized_counts
+
+    cat("Processed:", rbp_pattern, "(", pwm_name, ")\n")
+  }
+}
+
+cat("Calculated motif scores for", ncol(motif_scores) - 1, "RBPs\n")
+```
+
+# Assemble Feature Matrix
+
+```{r assemble_features}
+# Start with most abundant transcripts and TE data
+# Use transcript_id_clean for all joins with TxDb-derived data
+head(feature_matrix)
+
+
+feature_matrix <- most_abundant_tx %>%
+  dplyr::select(transcript_id, transcript_id_clean, gene_id = gene_id.x, symbol) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", transcript_id),
+    gene_id_clean       = sub("\\..*", "", gene_id)) |> 
+  # Add TE data (join by gene_id)
+  left_join(te_1hr %>%
+              mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+              dplyr::select(gene_id_clean, te_lfc, te_padj),
+            by = "gene_id_clean") %>%
+  # Add region lengths (join by transcript_id_clean)
+  left_join(utr5_widths, by = "transcript_id_clean") %>%
+  left_join(utr3_widths, by = "transcript_id_clean") %>%
+  left_join(cds_widths, by = "transcript_id_clean") %>%
+  # Add log2 transformed lengths
+  mutate(
+    log2_utr5_length = log2(utr5_length + 1),
+    log2_utr3_length = log2(utr3_length + 1),
+    log2_cds_length = log2(cds_length + 1),
+    total_length = utr5_length + cds_length + utr3_length,
+    log2_total_length = log2(total_length + 1)
+  ) %>%
+  # Add GC content (join by transcript_id_clean)
+  left_join(utr5_gc, by = "transcript_id_clean") %>%
+  left_join(utr3_gc, by = "transcript_id_clean") %>%
+  left_join(cds_gc, by = "transcript_id_clean") %>%
+  # Calculate total transcript GC (weighted average)
+  mutate(
+    transcript_gc = (utr5_gc * utr5_length + cds_gc * cds_length + utr3_gc * utr3_length) /
+                    (utr5_length + cds_length + utr3_length)
+  ) %>%
+  # Add GC3 (join by transcript_id_clean)
+  left_join(cds_gc3, by = "transcript_id_clean") %>%
+  # Add 4-mer frequencies (join by transcript_id_clean)
+  left_join(kmer4_df, by = "transcript_id_clean") %>%
+  # Add RBP motif scores (join by transcript_id_clean)
+  left_join(motif_scores, by = "transcript_id_clean")
+
+# Check join success
+cat("\nJoin diagnostics:\n")
+cat("Total transcripts:", nrow(most_abundant_tx), "\n")
+cat("With 5' UTR length:", sum(!is.na(feature_matrix$utr5_length)), "\n")
+cat("With CDS length:", sum(!is.na(feature_matrix$cds_length)), "\n")
+cat("With 3' UTR length:", sum(!is.na(feature_matrix$utr3_length)), "\n")
+cat("With TE data:", sum(!is.na(feature_matrix$te_lfc)), "\n")
+
+# Filter to genes with TE data and valid features
+feature_matrix <- feature_matrix %>%
+  filter(!is.na(te_lfc),
+         !is.na(utr5_length),
+         !is.na(cds_length))
+
+cat("\nFeature matrix assembled:\n")
+cat("Genes:", nrow(feature_matrix), "\n")
+cat("Features:", ncol(feature_matrix) - 4, "(excluding gene_id, transcript_id, symbol, te_lfc, te_padj)\n")
+```
+
+# Quality Control
+
+```{r quality_control}
+# Check for missing values
+missing_summary <- feature_matrix %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+cat("\nFeatures with missing values:\n")
+print(missing_summary %>% head(20))
+
+# Summary of key features
+cat("\n\nFeature summaries:\n")
+cat("\n5' UTR length:\n")
+print(summary(feature_matrix$utr5_length))
+
+cat("\n3' UTR length:\n")
+print(summary(feature_matrix$utr3_length))
+
+cat("\nCDS length:\n")
+print(summary(feature_matrix$cds_length))
+
+cat("\n5' UTR GC content:\n")
+print(summary(feature_matrix$utr5_gc))
+
+cat("\nTE log2 fold change (target):\n")
+print(summary(feature_matrix$te_lfc))
+```
+
+# Visualize Feature Distributions
+
+```{r visualize_distributions, fig.width=12, fig.height=10}
+# Create histogram of key features
+p1 <- ggplot(feature_matrix, aes(x = log2_utr5_length)) +
+  geom_histogram(bins = 50, fill = "#0072B2", alpha = 0.7) +
+  theme_cowplot() +
+  labs(title = "5' UTR Length (log2)", x = "log2(length + 1)", y = "Count")
+
+p2 <- ggplot(feature_matrix, aes(x = log2_cds_length)) +
+  geom_histogram(bins = 50, fill = "#E69F00", alpha = 0.7) +
+  theme_cowplot() +
+  labs(title = "CDS Length (log2)", x = "log2(length + 1)", y = "Count")
+
+p3 <- ggplot(feature_matrix, aes(x = log2_utr3_length)) +
+  geom_histogram(bins = 50, fill = "#009E73", alpha = 0.7) +
+  theme_cowplot() +
+  labs(title = "3' UTR Length (log2)", x = "log2(length + 1)", y = "Count")
+
+p4 <- ggplot(feature_matrix, aes(x = utr5_gc)) +
+  geom_histogram(bins = 50, fill = "#CC79A7", alpha = 0.7) +
+  theme_cowplot() +
+  labs(title = "5' UTR GC Content", x = "GC %", y = "Count")
+
+p5 <- ggplot(feature_matrix, aes(x = cds_gc)) +
+  geom_histogram(bins = 50, fill = "#D55E00", alpha = 0.7) +
+  theme_cowplot() +
+  labs(title = "CDS GC Content", x = "GC %", y = "Count")
+
+p6 <- ggplot(feature_matrix, aes(x = te_lfc)) +
+  geom_histogram(bins = 50, fill = "#56B4E9", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  theme_cowplot() +
+  labs(title = "TE Log2 Fold Change (Target)", x = "TE LFC", y = "Count")
+
+combined_plot <- plot_grid(p1, p2, p3, p4, p5, p6, ncol = 3)
+print(combined_plot)
+
+ggsave(here("plots", "feature_distributions_predictive_model.pdf"),
+       plot = combined_plot, width = 12, height = 10)
+```
+
+# Create Binned TE Category for Stratified Sampling
+
+```{r create_bins}
+# Create bins for stratified train/test split
+feature_matrix <- feature_matrix %>%
+  mutate(te_lfc_bin = cut(te_lfc,
+                          breaks = quantile(te_lfc, probs = seq(0, 1, 0.2), na.rm = TRUE),
+                          include.lowest = TRUE,
+                          labels = c("Q1", "Q2", "Q3", "Q4", "Q5")))
+
+cat("\nTE LFC bins for stratified sampling:\n")
+print(table(feature_matrix$te_lfc_bin))
+```
+
+# Export Feature Matrix
+
+```{r export_features}
+# Create output directory if needed
+dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
+
+# Export as CSV
+write_csv(feature_matrix, here("output", "predictive_modeling", "feature_matrix_1hr.csv"))
+cat("Exported: output/predictive_modeling/feature_matrix_1hr.csv\n")
+
+# Export as RDS for faster loading
+saveRDS(feature_matrix, here("output", "predictive_modeling", "feature_matrix_1hr.rds"))
+cat("Exported: output/predictive_modeling/feature_matrix_1hr.rds\n")
+
+# Summary
+cat("\n\nFinal Feature Matrix Summary:\n")
+cat("Total genes:", nrow(feature_matrix), "\n")
+cat("Total features:", ncol(feature_matrix), "\n")
+cat("  - Identifiers: gene_id, transcript_id, symbol\n")
+cat("  - Target: te_lfc, te_padj, te_lfc_bin\n")
+cat("  - Region lengths: 7 features\n")
+cat("  - GC content: 5 features\n")
+cat("  - 4-mer frequencies: 256 features\n")
+cat("  - RBP motif scores:", ncol(motif_scores) - 1, "features\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

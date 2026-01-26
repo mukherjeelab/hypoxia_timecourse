@@ -1,0 +1,753 @@
+---
+title: "Hypoxic RBP Knockdown Analysis"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(here)
+library(cowplot)
+library(readxl)
+library(janitor)
+library(rstatix)
+```
+
+## Overview
+
+This analysis examines how RNA-binding protein (RBP) knockdowns affect protein production in hypoxia, based on TMT-pSILAC proteomics data from Ho et al. 2020 ("A network of RNA-binding proteins controls translation efficiency to activate anaerobic metabolism", Nature Communications).
+
+We compare RBP-dependent genes' translation efficiency response across hypoxia timepoints using ECDF plots.
+
+## Load and Process RBP Knockdown Data
+
+```{r load_rbp_data}
+# Load TMT-pSILAC proteomics data from Ho et al. 2020
+# Sheet "Figure 2b" contains 1,726 proteins with abundance measurements
+rbp_data <- read_xlsx("/Users/katematlin/Downloads/41467_2020_16504_MOESM3_ESM.xlsx",
+                      sheet = "Figure 2b") %>%
+  clean_names()
+
+cat("RBP knockdown data columns after clean_names():\n")
+print(colnames(rbp_data))
+
+cat("\nRBP knockdown data dimensions:", nrow(rbp_data), "rows x", ncol(rbp_data), "columns\n")
+head(rbp_data)
+```
+
+```{r calculate_log2fc}
+# After clean_names(), the columns are:
+# - gene_symbol
+# - normoxia_abundance_126
+# - hypoxia_abundance_average_127c
+# - hypoxia_pcbp1_si_rna_abundance_128c
+# - hypoxia_pcbp2_si_rna_abundance_129c
+# - hypoxia_ptbp1_si_rna_abundance_130n
+# - hypoxia_hn_rnp_a2_b1_si_rna_abundance_130c
+# - hypoxia_hu_r_si_rna_abundance_131
+
+# Calculate log2 fold changes: log2(KD abundance / Hypoxia control abundance)
+# Filter for proteins with ≥2 unique peptides for confident quantification
+min_peptides <- 2
+
+rbp_log2fc <- rbp_data %>%
+  mutate(
+    symbol = gene_symbol,
+    n_unique_peptides = as.numeric(number_unique_peptides),
+    normoxia = as.numeric(normoxia_abundance_126),
+    hypoxia_ctrl = as.numeric(hypoxia_abundance_average_127c),
+    pcbp1_abundance = as.numeric(hypoxia_pcbp1_si_rna_abundance_128c),
+    pcbp2_abundance = as.numeric(hypoxia_pcbp2_si_rna_abundance_129c),
+    ptbp1_abundance = as.numeric(hypoxia_ptbp1_si_rna_abundance_130n),
+    hnrnpa2b1_abundance = as.numeric(hypoxia_hn_rnp_a2_b1_si_rna_abundance_130c),
+    hur_abundance = as.numeric(hypoxia_hu_r_si_rna_abundance_131)
+  ) %>%
+  # Filter for minimum peptide count
+  filter(n_unique_peptides >= min_peptides) %>%
+  # Calculate log2FC for each RBP knockdown vs hypoxia control
+  mutate(
+    log2fc_pcbp1 = log2(pcbp1_abundance / hypoxia_ctrl),
+    log2fc_pcbp2 = log2(pcbp2_abundance / hypoxia_ctrl),
+    log2fc_ptbp1 = log2(ptbp1_abundance / hypoxia_ctrl),
+    log2fc_hnrnpa2b1 = log2(hnrnpa2b1_abundance / hypoxia_ctrl),
+    log2fc_hur = log2(hur_abundance / hypoxia_ctrl)
+  ) %>%
+  dplyr::select(symbol, n_unique_peptides, normoxia, hypoxia_ctrl,
+                pcbp1_abundance, pcbp2_abundance, ptbp1_abundance,
+                hnrnpa2b1_abundance, hur_abundance,
+                log2fc_pcbp1, log2fc_pcbp2, log2fc_ptbp1,
+                log2fc_hnrnpa2b1, log2fc_hur) %>%
+  filter(!is.na(symbol))
+
+cat("\nApplied filter: ≥", min_peptides, "unique peptides\n")
+
+cat("\nProcessed RBP log2FC data:\n")
+cat("Number of genes:", nrow(rbp_log2fc), "\n")
+head(rbp_log2fc)
+
+# Summary statistics for each RBP
+cat("\nLog2FC summary for each RBP knockdown:\n")
+cat("\nPCBP1:\n")
+print(summary(rbp_log2fc$log2fc_pcbp1))
+cat("\nPCBP2:\n")
+print(summary(rbp_log2fc$log2fc_pcbp2))
+cat("\nPTBP1:\n")
+print(summary(rbp_log2fc$log2fc_ptbp1))
+cat("\nhnRNP A2/B1:\n")
+print(summary(rbp_log2fc$log2fc_hnrnpa2b1))
+cat("\nHuR:\n")
+print(summary(rbp_log2fc$log2fc_hur))
+```
+
+## Define RBP-Dependent Gene Sets
+
+**Filtering criteria:**
+- Minimum 2 unique peptides (for confident protein quantification)
+- |log2FC| > 0.5 threshold for RBP dependency
+
+**Categories:**
+- **RBP-Promoted**: log2FC < -0.5 (protein DOWN when RBP knocked down, meaning RBP promotes its production)
+- **RBP-Inhibited**: log2FC > 0.5 (protein UP when RBP knocked down, meaning RBP inhibits its production)
+
+*Note: The TMT-pSILAC proteomics data provides abundance ratios without per-protein p-values, which is common for this type of experiment. We use a peptide count filter plus fold change threshold as quality criteria.*
+
+```{r define_genesets}
+# Define threshold
+lfc_threshold <- 0.5
+
+# Function to classify genes by RBP dependency
+classify_rbp_dependency <- function(log2fc, threshold = 0.5) {
+  case_when(
+    log2fc < -threshold ~ "RBP-Promoted",
+    log2fc > threshold ~ "RBP-Inhibited",
+    TRUE ~ "Other"
+  )
+}
+
+# Classify genes for each RBP
+rbp_classified <- rbp_log2fc %>%
+  mutate(
+    pcbp1_status = classify_rbp_dependency(log2fc_pcbp1, lfc_threshold),
+    pcbp2_status = classify_rbp_dependency(log2fc_pcbp2, lfc_threshold),
+    ptbp1_status = classify_rbp_dependency(log2fc_ptbp1, lfc_threshold),
+    hnrnpa2b1_status = classify_rbp_dependency(log2fc_hnrnpa2b1, lfc_threshold),
+    hur_status = classify_rbp_dependency(log2fc_hur, lfc_threshold)
+  )
+
+# Count genes in each category for each RBP
+cat("\nGene counts by RBP dependency (|log2FC| > 0.5):\n\n")
+
+rbp_counts <- data.frame(
+  RBP = c("PCBP1", "PCBP2", "PTBP1", "hnRNP A2/B1", "HuR"),
+  Promoted = c(
+    sum(rbp_classified$pcbp1_status == "RBP-Promoted", na.rm = TRUE),
+    sum(rbp_classified$pcbp2_status == "RBP-Promoted", na.rm = TRUE),
+    sum(rbp_classified$ptbp1_status == "RBP-Promoted", na.rm = TRUE),
+    sum(rbp_classified$hnrnpa2b1_status == "RBP-Promoted", na.rm = TRUE),
+    sum(rbp_classified$hur_status == "RBP-Promoted", na.rm = TRUE)
+  ),
+  Inhibited = c(
+    sum(rbp_classified$pcbp1_status == "RBP-Inhibited", na.rm = TRUE),
+    sum(rbp_classified$pcbp2_status == "RBP-Inhibited", na.rm = TRUE),
+    sum(rbp_classified$ptbp1_status == "RBP-Inhibited", na.rm = TRUE),
+    sum(rbp_classified$hnrnpa2b1_status == "RBP-Inhibited", na.rm = TRUE),
+    sum(rbp_classified$hur_status == "RBP-Inhibited", na.rm = TRUE)
+  ),
+  Other = c(
+    sum(rbp_classified$pcbp1_status == "Other", na.rm = TRUE),
+    sum(rbp_classified$pcbp2_status == "Other", na.rm = TRUE),
+    sum(rbp_classified$ptbp1_status == "Other", na.rm = TRUE),
+    sum(rbp_classified$hnrnpa2b1_status == "Other", na.rm = TRUE),
+    sum(rbp_classified$hur_status == "Other", na.rm = TRUE)
+  )
+)
+
+print(rbp_counts)
+```
+
+## Load Hypoxia TE Data
+
+```{r load_te_data}
+# Load TE changes from hypoxia timecourse at all three timepoints
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+te_4hr <- read_csv(here("output", "translation_categories_4hr.csv"))
+te_24hr <- read_csv(here("output", "translation_categories_24hr.csv"))
+
+# Load gene symbols from annotation file
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"))
+
+# Keep one entry per gene (prefer protein_coding, then deduplicate)
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+# Add gene symbols to TE data and prepare for analysis
+# Handle duplicate gene symbols by keeping the gene with highest absolute LFC
+te_1hr_gsea <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_4hr_gsea <- te_4hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+te_24hr_gsea <- te_24hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  rename(log2FoldChange = te_lfc, padj = te_padj) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Loaded TE data with gene symbols:\n")
+cat("1hr:", nrow(te_1hr_gsea), "genes\n")
+cat("4hr:", nrow(te_4hr_gsea), "genes\n")
+cat("24hr:", nrow(te_24hr_gsea), "genes\n")
+```
+
+## ECDF Analysis Functions
+
+```{r ecdf_functions}
+# Function to create ECDF plot for a single RBP at a single timepoint
+create_ecdf_plot <- function(te_data, rbp_status_col, rbp_name, timepoint_label) {
+
+  # Merge TE data with RBP classification
+  merged_data <- te_data %>%
+    inner_join(rbp_classified %>% dplyr::select(symbol, !!sym(rbp_status_col)),
+               by = "symbol")
+
+  # Rename status column for consistent plotting
+  merged_data <- merged_data %>%
+    rename(rbp_status = !!sym(rbp_status_col))
+
+  # Count genes in each category
+  n_promoted <- sum(merged_data$rbp_status == "RBP-Promoted", na.rm = TRUE)
+  n_inhibited <- sum(merged_data$rbp_status == "RBP-Inhibited", na.rm = TRUE)
+  n_other <- sum(merged_data$rbp_status == "Other", na.rm = TRUE)
+
+  # Create plot
+  p <- ggplot(merged_data, aes(x = log2FoldChange, color = rbp_status)) +
+    stat_ecdf(linewidth = 1.2) +
+    scale_color_manual(
+      values = c("RBP-Promoted" = "#D55E00", "RBP-Inhibited" = "#0072B2", "Other" = "#808080"),
+      name = paste0(rbp_name, " Status"),
+      labels = c(
+        "RBP-Promoted" = paste0("RBP-Promoted (n=", n_promoted, ")"),
+        "RBP-Inhibited" = paste0("RBP-Inhibited (n=", n_inhibited, ")"),
+        "Other" = paste0("Other (n=", n_other, ")")
+      )
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+    labs(
+      title = paste0("Hypoxic TE Response by ", rbp_name, " Dependency"),
+      subtitle = paste0("Translation Efficiency Changes at ", timepoint_label),
+      x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+      y = "Cumulative Proportion"
+    ) +
+    theme_cowplot() +
+    theme(
+      legend.position = "top",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5)
+    ) +
+    xlim(-1, 1)
+
+  return(list(plot = p, data = merged_data))
+}
+
+# Function to create faceted plot for all timepoints
+create_faceted_ecdf_plot <- function(rbp_status_col, rbp_name, rbp_short_name) {
+
+  # Merge TE data with RBP classification for each timepoint
+  merged_1hr <- te_1hr_gsea %>%
+    inner_join(rbp_classified %>% dplyr::select(symbol, !!sym(rbp_status_col)),
+               by = "symbol") %>%
+    rename(rbp_status = !!sym(rbp_status_col)) %>%
+    mutate(timepoint = "1 Hour")
+
+  merged_4hr <- te_4hr_gsea %>%
+    inner_join(rbp_classified %>% dplyr::select(symbol, !!sym(rbp_status_col)),
+               by = "symbol") %>%
+    rename(rbp_status = !!sym(rbp_status_col)) %>%
+    mutate(timepoint = "4 Hours")
+
+  merged_24hr <- te_24hr_gsea %>%
+    inner_join(rbp_classified %>% dplyr::select(symbol, !!sym(rbp_status_col)),
+               by = "symbol") %>%
+    rename(rbp_status = !!sym(rbp_status_col)) %>%
+    mutate(timepoint = "24 Hours")
+
+  # Combine all timepoints
+  te_combined <- bind_rows(merged_1hr, merged_4hr, merged_24hr) %>%
+    mutate(timepoint = factor(timepoint, levels = c("1 Hour", "4 Hours", "24 Hours")))
+
+  # Calculate counts for annotations
+  count_labels <- te_combined %>%
+    group_by(timepoint, rbp_status) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label = paste0("n=", n)) %>%
+    mutate(
+      x = 0.7,
+      y = case_when(
+        rbp_status == "RBP-Promoted" ~ 0.25,
+        rbp_status == "RBP-Inhibited" ~ 0.15,
+        TRUE ~ 0.05
+      )
+    )
+
+  # Create faceted ECDF plot
+  p <- ggplot(te_combined, aes(x = log2FoldChange, color = rbp_status)) +
+    stat_ecdf(linewidth = 1.2) +
+    scale_color_manual(
+      values = c("RBP-Promoted" = "#D55E00", "RBP-Inhibited" = "#0072B2", "Other" = "#808080"),
+      name = paste0(rbp_name, " Status")
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+    geom_text(data = count_labels, aes(x = x, y = y, label = label, color = rbp_status),
+              size = 2.5, show.legend = FALSE) +
+    facet_wrap(~timepoint, nrow = 1) +
+    labs(
+      title = paste0("Hypoxic TE Response by ", rbp_name, " Dependency"),
+      x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+      y = "Cumulative Proportion"
+    ) +
+    theme_cowplot() +
+    theme(
+      legend.position = "top",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      strip.background = element_rect(fill = "gray90"),
+      strip.text = element_text(face = "bold")
+    ) +
+    xlim(-3, 1)
+
+  return(list(plot = p, data = te_combined))
+}
+```
+
+## ECDF Plots for Each RBP
+
+### PCBP1
+
+```{r ecdf_pcbp1, fig.width=10, fig.height=4}
+pcbp1_result <- create_faceted_ecdf_plot("pcbp1_status", "PCBP1", "PCBP1")
+print(pcbp1_result$plot)
+
+ggsave(
+  here("plots", "ecdf_rbp_PCBP1_all_timepoints.pdf"),
+  plot = pcbp1_result$plot,
+  width = 10,
+  height = 4
+)
+```
+
+### PCBP2
+
+```{r ecdf_pcbp2, fig.width=10, fig.height=4}
+pcbp2_result <- create_faceted_ecdf_plot("pcbp2_status", "PCBP2", "PCBP2")
+print(pcbp2_result$plot)
+
+ggsave(
+  here("plots", "ecdf_rbp_PCBP2_all_timepoints.pdf"),
+  plot = pcbp2_result$plot,
+  width = 10,
+  height = 4
+)
+```
+
+### PTBP1
+
+```{r ecdf_ptbp1, fig.width=10, fig.height=4}
+ptbp1_result <- create_faceted_ecdf_plot("ptbp1_status", "PTBP1", "PTBP1")
+print(ptbp1_result$plot)
+
+ggsave(
+  here("plots", "ecdf_rbp_PTBP1_all_timepoints.pdf"),
+  plot = ptbp1_result$plot,
+  width = 10,
+  height = 4
+)
+```
+
+### hnRNP A2/B1
+
+```{r ecdf_hnrnpa2b1, fig.width=10, fig.height=4}
+hnrnpa2b1_result <- create_faceted_ecdf_plot("hnrnpa2b1_status", "hnRNP A2/B1", "hnRNPA2B1")
+print(hnrnpa2b1_result$plot)
+
+ggsave(
+  here("plots", "ecdf_rbp_hnRNPA2B1_all_timepoints.pdf"),
+  plot = hnrnpa2b1_result$plot,
+  width = 10,
+  height = 4
+)
+```
+
+### HuR
+
+```{r ecdf_hur, fig.width=10, fig.height=4}
+hur_result <- create_faceted_ecdf_plot("hur_status", "HuR", "HuR")
+print(hur_result$plot)
+
+ggsave(
+  here("plots", "ecdf_rbp_HuR_all_timepoints.pdf"),
+  plot = hur_result$plot,
+  width = 10,
+  height = 4
+)
+```
+
+## Statistical Tests
+
+```{r statistical_tests}
+# Function to perform statistical tests for one RBP at one timepoint
+perform_tests <- function(te_data, rbp_status_col, rbp_name, timepoint) {
+
+  merged_data <- te_data %>%
+    inner_join(rbp_classified %>% dplyr::select(symbol, !!sym(rbp_status_col)),
+               by = "symbol") %>%
+    rename(rbp_status = !!sym(rbp_status_col))
+
+  # Get vectors for each group
+  promoted <- merged_data %>%
+    filter(rbp_status == "RBP-Promoted") %>%
+    pull(log2FoldChange)
+  inhibited <- merged_data %>%
+    filter(rbp_status == "RBP-Inhibited") %>%
+    pull(log2FoldChange)
+  other <- merged_data %>%
+    filter(rbp_status == "Other") %>%
+    pull(log2FoldChange)
+
+  results <- data.frame(
+    rbp = rbp_name,
+    timepoint = timepoint,
+    n_promoted = length(promoted),
+    n_inhibited = length(inhibited),
+    n_other = length(other),
+    median_promoted = ifelse(length(promoted) > 0, median(promoted), NA),
+    median_inhibited = ifelse(length(inhibited) > 0, median(inhibited), NA),
+    median_other = ifelse(length(other) > 0, median(other), NA)
+  )
+
+  # KS test: Promoted vs Other
+  if (length(promoted) >= 3 && length(other) >= 3) {
+    ks_promoted <- ks.test(promoted, other)
+    results$ks_promoted_vs_other_stat <- ks_promoted$statistic
+    results$ks_promoted_vs_other_pval <- ks_promoted$p.value
+  } else {
+    results$ks_promoted_vs_other_stat <- NA
+    results$ks_promoted_vs_other_pval <- NA
+  }
+
+  # KS test: Inhibited vs Other
+  if (length(inhibited) >= 3 && length(other) >= 3) {
+    ks_inhibited <- ks.test(inhibited, other)
+    results$ks_inhibited_vs_other_stat <- ks_inhibited$statistic
+    results$ks_inhibited_vs_other_pval <- ks_inhibited$p.value
+  } else {
+    results$ks_inhibited_vs_other_stat <- NA
+    results$ks_inhibited_vs_other_pval <- NA
+  }
+
+  # Wilcoxon test: Promoted vs Other
+  if (length(promoted) >= 3 && length(other) >= 3) {
+    wilcox_promoted <- wilcox.test(promoted, other)
+    results$wilcox_promoted_vs_other_stat <- wilcox_promoted$statistic
+    results$wilcox_promoted_vs_other_pval <- wilcox_promoted$p.value
+  } else {
+    results$wilcox_promoted_vs_other_stat <- NA
+    results$wilcox_promoted_vs_other_pval <- NA
+  }
+
+  # Wilcoxon test: Inhibited vs Other
+  if (length(inhibited) >= 3 && length(other) >= 3) {
+    wilcox_inhibited <- wilcox.test(inhibited, other)
+    results$wilcox_inhibited_vs_other_stat <- wilcox_inhibited$statistic
+    results$wilcox_inhibited_vs_other_pval <- wilcox_inhibited$p.value
+  } else {
+    results$wilcox_inhibited_vs_other_stat <- NA
+    results$wilcox_inhibited_vs_other_pval <- NA
+  }
+
+  return(results)
+}
+
+# Define RBP info for iteration
+rbp_info <- list(
+  list(col = "pcbp1_status", name = "PCBP1"),
+  list(col = "pcbp2_status", name = "PCBP2"),
+  list(col = "ptbp1_status", name = "PTBP1"),
+  list(col = "hnrnpa2b1_status", name = "hnRNP_A2B1"),
+  list(col = "hur_status", name = "HuR")
+)
+
+# Perform tests for all RBPs and timepoints
+all_stats <- data.frame()
+
+for (rbp in rbp_info) {
+  for (tp in list(list(data = te_1hr_gsea, label = "1hr"),
+                  list(data = te_4hr_gsea, label = "4hr"),
+                  list(data = te_24hr_gsea, label = "24hr"))) {
+    stats <- perform_tests(tp$data, rbp$col, rbp$name, tp$label)
+    all_stats <- bind_rows(all_stats, stats)
+  }
+}
+
+cat("\nStatistical Test Results:\n")
+print(all_stats %>%
+        dplyr::select(rbp, timepoint, n_promoted, n_inhibited,
+                      median_promoted, median_inhibited, median_other,
+                      ks_promoted_vs_other_pval, ks_inhibited_vs_other_pval))
+```
+
+## Summary Comparison Plot
+
+```{r summary_heatmap, fig.width=10, fig.height=6}
+# Create summary data for heatmap
+# Show -log10(p-value) for KS test, with sign indicating direction
+
+summary_data <- all_stats %>%
+  mutate(
+    # Calculate effect direction based on median difference
+    promoted_effect = median_promoted - median_other,
+    inhibited_effect = median_inhibited - median_other,
+    # Create signed -log10 p-values for visualization
+    promoted_score = -log10(ks_promoted_vs_other_pval) * sign(promoted_effect),
+    inhibited_score = -log10(ks_inhibited_vs_other_pval) * sign(inhibited_effect)
+  ) %>%
+  dplyr::select(rbp, timepoint, promoted_score, inhibited_score,
+                ks_promoted_vs_other_pval, ks_inhibited_vs_other_pval)
+
+# Reshape for heatmap
+summary_long <- summary_data %>%
+  pivot_longer(
+    cols = c(promoted_score, inhibited_score),
+    names_to = "comparison",
+    values_to = "score"
+  ) %>%
+  mutate(
+    comparison = case_when(
+      comparison == "promoted_score" ~ "RBP-Promoted",
+      comparison == "inhibited_score" ~ "RBP-Inhibited"
+    ),
+    timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")),
+    rbp = factor(rbp, levels = c("PCBP1", "PCBP2", "PTBP1", "hnRNP_A2B1", "HuR"))
+  )
+
+# Get corresponding p-values
+summary_long <- summary_long %>%
+  mutate(
+    pval = case_when(
+      comparison == "RBP-Promoted" ~ summary_data$ks_promoted_vs_other_pval[match(paste(rbp, timepoint), paste(summary_data$rbp, summary_data$timepoint))],
+      comparison == "RBP-Inhibited" ~ summary_data$ks_inhibited_vs_other_pval[match(paste(rbp, timepoint), paste(summary_data$rbp, summary_data$timepoint))]
+    ),
+    significance = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+# Create heatmap
+p_heatmap <- ggplot(summary_long, aes(x = timepoint, y = rbp, fill = score)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = significance), color = "black", size = 4) +
+  scale_fill_gradient2(
+    low = "#0072B2", mid = "white", high = "#D55E00",
+    midpoint = 0,
+    name = "Signed\n-log10(p)",
+    limits = c(-3, 3),
+    oob = scales::squish
+  ) +
+  facet_wrap(~comparison, nrow = 1) +
+  labs(
+    title = "RBP Dependency Effects on Hypoxic TE Response",
+    subtitle = "Positive: higher TE in hypoxia | Negative: lower TE in hypoxia",
+    x = "Hypoxia Timepoint",
+    y = "RBP Knockdown"
+  ) +
+  theme_cowplot() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_heatmap)
+
+ggsave(
+  here("plots", "ecdf_rbp_summary_heatmap.pdf"),
+  plot = p_heatmap,
+  width = 8,
+  height = 5
+)
+```
+
+```{r bar_plot_summary, fig.width=12, fig.height=5}
+# Create bar plot showing median TE shifts
+median_summary <- all_stats %>%
+  dplyr::select(rbp, timepoint, median_promoted, median_inhibited, median_other) %>%
+  pivot_longer(
+    cols = c(median_promoted, median_inhibited),
+    names_to = "category",
+    values_to = "median_te"
+  ) %>%
+  mutate(
+    category = case_when(
+      category == "median_promoted" ~ "RBP-Promoted",
+      category == "median_inhibited" ~ "RBP-Inhibited"
+    ),
+    # Calculate difference from "Other"
+    delta_median = median_te - median_other,
+    timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")),
+    rbp = factor(rbp, levels = c("PCBP1", "PCBP2", "PTBP1", "hnRNP_A2B1", "HuR"))
+  )
+
+p_bar <- ggplot(median_summary, aes(x = rbp, y = delta_median, fill = category)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_fill_manual(
+    values = c("RBP-Promoted" = "#D55E00", "RBP-Inhibited" = "#0072B2"),
+    name = "Gene Category"
+  ) +
+  facet_wrap(~timepoint, nrow = 1) +
+  labs(
+    title = "Median TE Shift of RBP-Dependent Genes vs Other Genes",
+    subtitle = "Delta = Median(RBP-category) - Median(Other)",
+    x = "RBP",
+    y = "Delta Median TE log2FC"
+  ) +
+  theme_cowplot() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+print(p_bar)
+
+ggsave(
+  here("plots", "ecdf_rbp_median_shift_barplot.pdf"),
+  plot = p_bar,
+  width = 12,
+  height = 5
+)
+```
+
+## Combined All-RBPs Faceted Plot
+
+```{r combined_all_rbps, fig.width=15, fig.height=12}
+# Create a comprehensive faceted plot with all RBPs and timepoints
+
+# Prepare combined data
+all_rbp_combined <- data.frame()
+
+for (rbp in rbp_info) {
+  for (tp in list(list(data = te_1hr_gsea, label = "1 Hour"),
+                  list(data = te_4hr_gsea, label = "4 Hours"),
+                  list(data = te_24hr_gsea, label = "24 Hours"))) {
+    merged <- tp$data %>%
+      inner_join(rbp_classified %>% dplyr::select(symbol, !!sym(rbp$col)),
+                 by = "symbol") %>%
+      rename(rbp_status = !!sym(rbp$col)) %>%
+      mutate(
+        rbp_name = rbp$name,
+        timepoint = tp$label
+      )
+    all_rbp_combined <- bind_rows(all_rbp_combined, merged)
+  }
+}
+
+all_rbp_combined <- all_rbp_combined %>%
+  mutate(
+    timepoint = factor(timepoint, levels = c("1 Hour", "4 Hours", "24 Hours")),
+    rbp_name = factor(rbp_name, levels = c("PCBP1", "PCBP2", "PTBP1", "hnRNP_A2B1", "HuR"))
+  )
+
+# Create comprehensive faceted plot
+p_all_rbps <- ggplot(all_rbp_combined, aes(x = log2FoldChange, color = rbp_status)) +
+  stat_ecdf(linewidth = 0.8) +
+  scale_color_manual(
+    values = c("RBP-Promoted" = "#D55E00", "RBP-Inhibited" = "#0072B2", "Other" = "#808080"),
+    name = "RBP Status"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_grid(rbp_name ~ timepoint) +
+  labs(
+    title = "Hypoxic TE Response by RBP Dependency",
+    subtitle = "All RBPs across all timepoints",
+    x = "TE log2 Fold Change (Hypoxia vs Normoxia)",
+    y = "Cumulative Proportion"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlim(-1, 1)
+
+print(p_all_rbps)
+
+ggsave(
+  here("plots", "ecdf_rbp_all_timepoints_faceted.pdf"),
+  plot = p_all_rbps,
+  width = 12,
+  height = 12
+)
+```
+
+## Export Results
+
+```{r export_results}
+# Export full processed log2FC data
+write_csv(rbp_log2fc, here("output", "rbp_knockdown_log2fc.csv"))
+cat("Exported: output/rbp_knockdown_log2fc.csv\n")
+
+# Export statistics table
+write_csv(all_stats, here("output", "rbp_knockdown_statistics.csv"))
+cat("Exported: output/rbp_knockdown_statistics.csv\n")
+
+# Export gene sets for each RBP
+geneset_output <- rbp_classified %>%
+  dplyr::select(symbol,
+                pcbp1_status, log2fc_pcbp1,
+                pcbp2_status, log2fc_pcbp2,
+                ptbp1_status, log2fc_ptbp1,
+                hnrnpa2b1_status, log2fc_hnrnpa2b1,
+                hur_status, log2fc_hur)
+
+write_csv(geneset_output, here("output", "genesets", "rbp_dependent_genesets.csv"))
+cat("Exported: output/genesets/rbp_dependent_genesets.csv\n")
+
+cat("\nAll output files exported successfully.\n")
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```

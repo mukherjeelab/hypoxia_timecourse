@@ -384,7 +384,204 @@ deFunction <- function(countsMatrix, allCounts_Norm, metadata,
 #' - Not_sig: No significant changes
 #'
 #' Reference: Harnett et al. 2022
-#'
+
+# te design, time normalized
+
+deFunction_time_normalized <- function(countsMatrix, allCounts_Norm, metadata,
+                                       control_condition, test_condition,
+                                       spikeInMatrix = NULL, keepSpikes = NULL,
+                                       mode = c("TE", "RNA", "RIBO")) {
+
+  mode <- match.arg(mode)
+  message("\n=== Running deFunction in ", mode, " mode ===")
+  message("Control: ", control_condition, " vs Test: ", test_condition)
+
+  ## ---------------------------
+  ## Counts preprocessing
+  ## ---------------------------
+  allCounts <- round(as.matrix(countsMatrix), 0)
+
+  allCounts <- allCounts[!apply(is.na(allCounts), 1, all), , drop = FALSE]
+  allCounts <- allCounts[, !apply(is.na(allCounts), 2, all), drop = FALSE]
+
+  ## ---------------------------
+  ## Spike-in handling
+  ## ---------------------------
+  is_empty_spike <- is.null(spikeInMatrix) ||
+    (is.matrix(spikeInMatrix) && nrow(spikeInMatrix) == 0) ||
+    (is.data.frame(spikeInMatrix) && nrow(spikeInMatrix) == 0)
+
+  if (!is_empty_spike) {
+    message("Processing spike-in data for normalization")
+    spikeInMatrix <- round(as.matrix(spikeInMatrix), 0)
+
+    if (!identical(colnames(allCounts), colnames(spikeInMatrix))) {
+      spikeInMatrix <- spikeInMatrix[, colnames(allCounts), drop = FALSE]
+    }
+
+    countsMatrix <- rbind(allCounts, spikeInMatrix)
+
+    if (!is.null(keepSpikes) && length(keepSpikes) > 0) {
+      Spikeindices <- which(rownames(countsMatrix) %in% keepSpikes)
+      message("Found ", length(Spikeindices), " spike-in genes for size factor estimation")
+    } else {
+      Spikeindices <- NULL
+    }
+  } else {
+    countsMatrix <- allCounts
+    Spikeindices <- NULL
+  }
+
+  ## ---------------------------
+  ## Metadata filtering
+  ## ---------------------------
+  metadata_filtered <- metadata %>%
+    dplyr::filter(
+      !is.na(comparison_variable),
+      !is.na(library),
+      !is.na(hours),
+      comparison_variable %in% c(control_condition, test_condition)
+    )
+
+  if (nrow(metadata_filtered) == 0) {
+    stop("No samples found after filtering for condition/library/hours")
+  }
+
+  ## ---------------------------
+  ## Sample selection by mode
+  ## ---------------------------
+  if (mode == "RNA") {
+    samples_use <- metadata_filtered %>%
+      dplyr::filter(library == "rna") %>%
+      dplyr::pull(sample_name)
+  } else if (mode == "RIBO") {
+    samples_use <- metadata_filtered %>%
+      dplyr::filter(library == "ribo") %>%
+      dplyr::pull(sample_name)
+  } else {
+    samples_use <- metadata_filtered %>% dplyr::pull(sample_name)
+  }
+
+  if (length(samples_use) == 0) {
+    stop("No samples found for mode: ", mode)
+  }
+
+  counts_use <- countsMatrix[, samples_use, drop = FALSE]
+
+  metadata_use <- metadata_filtered %>%
+    dplyr::filter(sample_name %in% samples_use) %>%
+    dplyr::arrange(match(sample_name, colnames(counts_use)))
+
+  ## ---------------------------
+  ## Sample info (INCLUDES HOURS)
+  ## ---------------------------
+  sample_info <- metadata_use %>%
+    dplyr::mutate(
+      Condition = factor(comparison_variable,
+                         levels = c(control_condition, test_condition)),
+      SeqType   = factor(library, levels = c("rna", "ribo")),
+      hours     = factor(hours)
+    ) %>%
+    dplyr::select(Condition, SeqType, hours)
+
+  ## ---------------------------
+  ## DESeq2 design
+  ## ---------------------------
+  if (mode == "TE") {
+    message("Using time-adjusted TE design: ~ hours + Condition + SeqType + Condition:SeqType")
+    ddsMat <- DESeq2::DESeqDataSetFromMatrix(
+      countData = counts_use,
+      colData   = sample_info,
+      design    = ~ hours + Condition + SeqType + Condition:SeqType
+    )
+  } else {
+    message("Using time-adjusted simple design: ~ hours + Condition")
+    ddsMat <- DESeq2::DESeqDataSetFromMatrix(
+      countData = counts_use,
+      colData   = sample_info %>% dplyr::select(Condition, hours),
+      design    = ~ hours + Condition
+    )
+  }
+
+  ## ---------------------------
+  ## Size factor estimation
+  ## ---------------------------
+  if (is.null(Spikeindices) || length(Spikeindices) == 0) {
+    ddsMat <- DESeq2::estimateSizeFactors(ddsMat)
+  } else {
+    ddsMat <- DESeq2::estimateSizeFactors(ddsMat, controlGenes = Spikeindices)
+  }
+
+  if (!is.null(Spikeindices) && length(Spikeindices) > 0) {
+    dds_noSpikes <- ddsMat[-Spikeindices, ]
+    sizeFactors(dds_noSpikes) <- sizeFactors(ddsMat)
+    ddsMat <- dds_noSpikes
+  }
+
+  ## ---------------------------
+  ## Run DESeq2
+  ## ---------------------------
+  ddsMat <- DESeq2::DESeq(ddsMat)
+
+  all_results <- resultsNames(ddsMat)
+  print(all_results)
+
+  ## ---------------------------
+  ## Coefficient selection
+  ## ---------------------------
+  if (mode == "TE") {
+    te_coef1 <- paste0("Condition", test_condition, ".SeqTyperibo")
+    te_coef2 <- paste0("Condition", test_condition,
+                       "_vs_", control_condition, ".SeqTyperibo")
+
+    if (te_coef1 %in% all_results) {
+      coef_name <- te_coef1
+    } else if (te_coef2 %in% all_results) {
+      coef_name <- te_coef2
+    } else {
+      coef_name <- grep("SeqTyperibo", all_results, value = TRUE)[1]
+    }
+  } else {
+    coef_name <- paste0("Condition_", test_condition, "_vs_", control_condition)
+    if (!coef_name %in% all_results) {
+      coef_name <- all_results[2]
+    }
+  }
+
+  ## ---------------------------
+  ## Results + shrinkage
+  ## ---------------------------
+  res <- DESeq2::results(ddsMat, name = coef_name, independentFiltering = FALSE)
+  res <- DESeq2::lfcShrink(ddsMat, coef = coef_name, res = res, type = "apeglm")
+
+  res_df <- as.data.frame(res) %>%
+    tibble::rownames_to_column("gene_id")
+
+  norm_counts_filtered <- allCounts_Norm[, samples_use, drop = FALSE] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene_id")
+
+  res_final <- dplyr::right_join(norm_counts_filtered, res_df, by = "gene_id")
+
+  message("Analysis complete. Significant genes (padj < 0.05): ",
+          sum(res_final$padj < 0.05, na.rm = TRUE))
+
+  return(res_final)
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 categorize_translation_changes <- function(res_rna, res_ribo, res_te,
                                           padj_cutoff = 0.05,
                                           lfc_cutoff = 0.58496250072) {
