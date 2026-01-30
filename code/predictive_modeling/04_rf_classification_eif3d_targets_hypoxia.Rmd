@@ -196,36 +196,39 @@ cat("\nTest set class proportions:\n")
 print(prop.table(table(test_data$eif3d_target)))
 ```
 
-# Balance Training Set
+# Calculate Class Weights
 
-```{r balance_training}
-# Downsample majority class to balance training set
-train_features_for_balance <- train_data %>%
-  dplyr::select(all_of(feature_cols_final))
-train_target <- train_data$eif3d_target
+```{r class_weights}
+# Calculate class weights (inverse frequency weighting)
+# This gives higher weight to the minority "promotes" class
+class_counts <- table(train_data$eif3d_target)
+n_total <- nrow(train_data)
 
-# Downsample using caret
-set.seed(9)
-train_balanced_data <- downSample(
-  x = train_features_for_balance,
-  y = train_target,
-  yname = "eif3d_target"
+# Weight minority class proportionally higher
+weight_promotes <- n_total / (2 * class_counts["promotes"])
+weight_does_not_promote <- n_total / (2 * class_counts["does_not_promote"])
+
+# Create case weight vector
+case_weights <- ifelse(
+  train_data$eif3d_target == "promotes",
+  weight_promotes,
+  weight_does_not_promote
 )
 
-cat("\nBalanced training set:\n")
-print(table(train_balanced_data$eif3d_target))
-cat("\nBalanced training set proportions:\n")
-print(prop.table(table(train_balanced_data$eif3d_target)))
+cat("\nClass weights:\n")
+cat("  promotes:", round(weight_promotes, 2), "\n")
+cat("  does_not_promote:", round(weight_does_not_promote, 2), "\n")
+cat("  Weight ratio:", round(weight_promotes / weight_does_not_promote, 1), ":1\n")
 
-cat("\nOriginal training size:", nrow(train_data), "\n")
-cat("Balanced training size:", nrow(train_balanced_data), "\n")
+cat("\nTraining set size:", nrow(train_data), "(using all samples with class weights)\n")
 ```
 
 # Train Random Forest Classifier
 
 ```{r train_model}
-# Prepare training data for ranger
-train_for_model <- train_balanced_data
+# Prepare full training data (no downsampling)
+train_for_model <- train_data %>%
+  dplyr::select(eif3d_target, all_of(feature_cols_final))
 
 cat("Training random forest classifier...\n")
 cat("Features:", length(feature_cols_final), "\n")
@@ -239,6 +242,7 @@ rf_classifier <- ranger(
   num.trees = 500,
   importance = "impurity",
   probability = TRUE,
+  case.weights = case_weights,  # Use class weights instead of downsampling
   seed = 9,
   verbose = TRUE
 )
@@ -260,49 +264,17 @@ test_features <- test_data %>%
 pred_probs <- predict(rf_classifier, test_features)$predictions
 pred_promotes_prob <- pred_probs[, "promotes"]
 
-# Get class predictions (default threshold 0.5)
-pred_class <- factor(
-  ifelse(pred_promotes_prob >= 0.5, "promotes", "does_not_promote"),
-  levels = c("does_not_promote", "promotes")
-)
-
 # Actual labels
 actual <- test_data$eif3d_target
 
-cat("Predictions summary:\n")
-cat("Predicted promotes:", sum(pred_class == "promotes"), "\n")
+cat("Probability predictions obtained for", length(pred_promotes_prob), "test samples\n")
 cat("Actual promotes:", sum(actual == "promotes"), "\n")
+cat("Probability range:", round(min(pred_promotes_prob), 4), "-", round(max(pred_promotes_prob), 4), "\n")
 ```
 
-## Confusion Matrix
+## ROC Curve and Threshold Optimization
 
-```{r confusion_matrix}
-# Create confusion matrix
-cm <- confusionMatrix(pred_class, actual, positive = "promotes")
-print(cm)
-
-# Extract key metrics
-accuracy <- cm$overall["Accuracy"]
-balanced_accuracy <- cm$byClass["Balanced Accuracy"]
-sensitivity <- cm$byClass["Sensitivity"]  # Recall
-specificity <- cm$byClass["Specificity"]
-precision <- cm$byClass["Precision"]
-f1 <- cm$byClass["F1"]
-
-cat("\n========================================\n")
-cat("Key Classification Metrics\n")
-cat("========================================\n")
-cat("Accuracy:", round(accuracy, 4), "\n")
-cat("Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
-cat("Sensitivity (Recall):", round(sensitivity, 4), "\n")
-cat("Specificity:", round(specificity, 4), "\n")
-cat("Precision:", round(precision, 4), "\n")
-cat("F1 Score:", round(f1, 4), "\n")
-```
-
-## ROC Curve and AUC
-
-```{r roc_curve, fig.width=8, fig.height=6}
+```{r roc_and_threshold, fig.width=8, fig.height=6}
 # Calculate ROC curve
 roc_obj <- roc(
   response = actual,
@@ -314,7 +286,28 @@ roc_obj <- roc(
 auc_value <- auc(roc_obj)
 cat("AUC-ROC:", round(auc_value, 4), "\n")
 
-# Plot ROC curve
+# Find Youden's J optimal threshold (maximizes sensitivity + specificity - 1)
+coords_youden <- coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"),
+                        best.method = "youden")
+
+# Find threshold for 90% sensitivity
+target_sensitivity <- 0.90
+coords_high_sens <- coords(roc_obj, x = target_sensitivity, input = "sensitivity",
+                           ret = c("threshold", "specificity"))
+
+# Use Youden threshold as the optimal threshold
+optimal_threshold <- coords_youden$threshold
+
+cat("\n========================================\n")
+cat("Threshold Analysis\n")
+cat("========================================\n")
+cat("Youden optimal threshold:", round(optimal_threshold, 4), "\n")
+cat("  -> Expected Sensitivity:", round(coords_youden$sensitivity, 3), "\n")
+cat("  -> Expected Specificity:", round(coords_youden$specificity, 3), "\n")
+cat("\nHigh-sensitivity threshold (90% sens):", round(coords_high_sens$threshold, 4), "\n")
+cat("  -> Expected Specificity:", round(coords_high_sens$specificity, 3), "\n")
+
+# Plot ROC curve with optimal threshold marked
 roc_df <- data.frame(
   sensitivity = roc_obj$sensitivities,
   specificity = roc_obj$specificities
@@ -323,10 +316,15 @@ roc_df <- data.frame(
 p_roc <- ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
   geom_line(color = "#0072B2", linewidth = 1.2) +
   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = 1 - coords_youden$specificity, y = coords_youden$sensitivity),
+             color = "red", size = 3) +
+  annotate("text", x = 1 - coords_youden$specificity + 0.05, y = coords_youden$sensitivity,
+           label = paste0("Youden\n(", round(optimal_threshold, 3), ")"),
+           color = "red", size = 3, hjust = 0) +
   theme_cowplot() +
   labs(
     title = "ROC Curve: eIF3d Target Classification (Hypoxia)",
-    subtitle = paste0("AUC = ", round(auc_value, 3)),
+    subtitle = paste0("AUC = ", round(auc_value, 3), " | Optimal threshold = ", round(optimal_threshold, 3)),
     x = "False Positive Rate (1 - Specificity)",
     y = "True Positive Rate (Sensitivity)"
   ) +
@@ -340,6 +338,66 @@ print(p_roc)
 
 ggsave(here("plots", "rf_classification_roc_eif3d_promotes_hypoxia_1hr.pdf"),
        plot = p_roc, width = 8, height = 6)
+```
+
+## Apply Optimal Threshold and Evaluate
+
+```{r confusion_matrix}
+# Get class predictions using Youden optimal threshold
+pred_class <- factor(
+  ifelse(pred_promotes_prob >= optimal_threshold, "promotes", "does_not_promote"),
+  levels = c("does_not_promote", "promotes")
+)
+
+cat("Using Youden optimal threshold:", round(optimal_threshold, 4), "\n")
+cat("Predicted promotes:", sum(pred_class == "promotes"), "\n")
+cat("Actual promotes:", sum(actual == "promotes"), "\n")
+
+# Create confusion matrix
+cm <- confusionMatrix(pred_class, actual, positive = "promotes")
+print(cm)
+
+# Extract key metrics
+accuracy <- cm$overall["Accuracy"]
+balanced_accuracy <- cm$byClass["Balanced Accuracy"]
+sensitivity <- cm$byClass["Sensitivity"]  # Recall
+specificity <- cm$byClass["Specificity"]
+precision <- cm$byClass["Precision"]
+f1 <- cm$byClass["F1"]
+
+cat("\n========================================\n")
+cat("Key Classification Metrics (Youden Threshold)\n")
+cat("========================================\n")
+cat("Threshold:", round(optimal_threshold, 4), "\n")
+cat("Accuracy:", round(accuracy, 4), "\n")
+cat("Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("Sensitivity (Recall):", round(sensitivity, 4), "\n")
+cat("Specificity:", round(specificity, 4), "\n")
+cat("Precision:", round(precision, 4), "\n")
+cat("F1 Score:", round(f1, 4), "\n")
+```
+
+## Alternative: High-Sensitivity Threshold
+
+```{r high_sensitivity_threshold}
+# Get predictions at high-sensitivity threshold (90% sensitivity)
+pred_class_high_sens <- factor(
+  ifelse(pred_promotes_prob >= coords_high_sens$threshold, "promotes", "does_not_promote"),
+  levels = c("does_not_promote", "promotes")
+)
+
+cm_high_sens <- confusionMatrix(pred_class_high_sens, actual, positive = "promotes")
+
+cat("\n========================================\n")
+cat("Metrics at High-Sensitivity Threshold (90% target)\n")
+cat("========================================\n")
+cat("Threshold:", round(coords_high_sens$threshold, 4), "\n")
+cat("Sensitivity:", round(cm_high_sens$byClass["Sensitivity"], 4), "\n")
+cat("Specificity:", round(cm_high_sens$byClass["Specificity"], 4), "\n")
+cat("Precision:", round(cm_high_sens$byClass["Precision"], 4), "\n")
+cat("F1 Score:", round(cm_high_sens$byClass["F1"], 4), "\n")
+cat("\nConfusion matrix:\n")
+print(cm_high_sens$table)
 ```
 
 ## Confusion Matrix Visualization
@@ -386,41 +444,53 @@ cv_results <- lapply(seq_along(folds), function(i) {
   train_cv <- model_data[-test_idx, ]
   test_cv <- model_data[test_idx, ]
 
-  # Balance training fold
-  train_cv_features <- train_cv %>% dplyr::select(all_of(feature_cols_final))
-  train_cv_target <- train_cv$eif3d_target
+  # Calculate class weights for this fold
+  fold_counts <- table(train_cv$eif3d_target)
+  n_fold <- nrow(train_cv)
+  fold_weight_promotes <- n_fold / (2 * fold_counts["promotes"])
+  fold_weight_does_not <- n_fold / (2 * fold_counts["does_not_promote"])
+  fold_case_weights <- ifelse(train_cv$eif3d_target == "promotes",
+                              fold_weight_promotes, fold_weight_does_not)
 
-  train_cv_balanced <- downSample(
-    x = train_cv_features,
-    y = train_cv_target,
-    yname = "eif3d_target"
-  )
+  # Prepare training data
+  train_cv_for_model <- train_cv %>%
+    dplyr::select(eif3d_target, all_of(feature_cols_final))
 
-  # Train model
+  # Train with class weights
   rf_cv <- ranger(
     formula = eif3d_target ~ .,
-    data = train_cv_balanced,
+    data = train_cv_for_model,
     num.trees = 500,
     probability = TRUE,
+    case.weights = fold_case_weights,
     seed = 9
   )
 
   # Prepare test data
   test_cv_features <- test_cv %>% dplyr::select(all_of(feature_cols_final))
 
-  # Predict
+  # Get probability predictions
   pred_probs_cv <- predict(rf_cv, test_cv_features)$predictions[, "promotes"]
+
+  # Calculate ROC and find Youden optimal threshold for this fold
+  roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv,
+                levels = c("does_not_promote", "promotes"), direction = "<", quiet = TRUE)
+  coords_youden_cv <- coords(roc_cv, "best", ret = c("threshold", "sensitivity", "specificity"),
+                              best.method = "youden")
+  fold_threshold <- coords_youden_cv$threshold
+
+  # Apply Youden threshold for predictions
   pred_class_cv <- factor(
-    ifelse(pred_probs_cv >= 0.5, "promotes", "does_not_promote"),
+    ifelse(pred_probs_cv >= fold_threshold, "promotes", "does_not_promote"),
     levels = c("does_not_promote", "promotes")
   )
 
   # Calculate metrics
   cm_cv <- confusionMatrix(pred_class_cv, test_cv$eif3d_target, positive = "promotes")
-  roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv, levels = c("does_not_promote", "promotes"), direction = "<")
 
   data.frame(
     fold = i,
+    Threshold = fold_threshold,
     AUC = as.numeric(auc(roc_cv)),
     Balanced_Accuracy = cm_cv$byClass["Balanced Accuracy"],
     Sensitivity = cm_cv$byClass["Sensitivity"],
@@ -435,11 +505,13 @@ rownames(cv_results_df) <- NULL
 
 cat("\n========================================\n")
 cat("5-Fold Stratified Cross-Validation Results\n")
+cat("(Using Youden optimal threshold per fold)\n")
 cat("========================================\n\n")
 print(cv_results_df)
 
 # Summary statistics
 cat("\nMean CV Performance (+/- SD):\n")
+cat("Threshold:", round(mean(cv_results_df$Threshold), 4), "+/-", round(sd(cv_results_df$Threshold), 4), "\n")
 cat("AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
 cat("Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-", round(sd(cv_results_df$Balanced_Accuracy), 4), "\n")
 cat("Sensitivity:", round(mean(cv_results_df$Sensitivity), 4), "+/-", round(sd(cv_results_df$Sensitivity), 4), "\n")
@@ -620,11 +692,12 @@ cat("  - Class imbalance ratio:", round(n_does_not / n_promotes, 1), ":1\n")
 cat("  - Features:", length(feature_cols_final), "\n\n")
 
 cat("Training:\n")
-cat("  - Original training set:", nrow(train_data), "\n")
-cat("  - Balanced training set:", nrow(train_balanced_data), "\n")
-cat("  - Test set:", nrow(test_data), "\n\n")
+cat("  - Training set:", nrow(train_data), "(using class weights)\n")
+cat("  - Weight ratio:", round(weight_promotes / weight_does_not_promote, 1), ":1 (promotes:does_not_promote)\n")
+cat("  - Test set:", nrow(test_data), "\n")
+cat("  - Decision threshold: Youden optimal (", round(optimal_threshold, 4), ")\n\n")
 
-cat("Model Performance (Test Set):\n")
+cat("Model Performance (Test Set @ Youden Threshold):\n")
 cat("  - AUC-ROC:", round(as.numeric(auc_value), 4), "\n")
 cat("  - Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
 cat("  - Sensitivity (Recall):", round(sensitivity, 4), "\n")
@@ -632,9 +705,12 @@ cat("  - Specificity:", round(specificity, 4), "\n")
 cat("  - Precision:", round(precision, 4), "\n")
 cat("  - F1 Score:", round(f1, 4), "\n\n")
 
-cat("Cross-Validation (5-fold):\n")
+cat("Cross-Validation (5-fold, Youden threshold per fold):\n")
+cat("  - Mean Threshold:", round(mean(cv_results_df$Threshold), 4), "+/-", round(sd(cv_results_df$Threshold), 4), "\n")
 cat("  - Mean AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
-cat("  - Mean Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-", round(sd(cv_results_df$Balanced_Accuracy), 4), "\n\n")
+cat("  - Mean Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-", round(sd(cv_results_df$Balanced_Accuracy), 4), "\n")
+cat("  - Mean Sensitivity:", round(mean(cv_results_df$Sensitivity), 4), "+/-", round(sd(cv_results_df$Sensitivity), 4), "\n")
+cat("  - Mean Specificity:", round(mean(cv_results_df$Specificity), 4), "+/-", round(sd(cv_results_df$Specificity), 4), "\n\n")
 
 cat("Top 5 Features:\n")
 for (i in 1:5) {

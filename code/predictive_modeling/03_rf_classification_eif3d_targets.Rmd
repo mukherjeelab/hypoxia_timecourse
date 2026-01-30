@@ -1,5 +1,5 @@
 ---
-title: "Random Forest Classification: eIF3d Target Prediction"
+title: "Random Forest Classification: eIF3d Target Prediction (Negative Control Set)"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
@@ -13,60 +13,66 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # Overview
 
-This analysis builds a binary classification model to predict whether a gene is an eIF3d target (promotes TE) vs. non-target in 1 hour normoxia, based on mRNA sequence features.
+Binary classification: does a gene's mRNA sequence predict whether eIF3d promotes its translation?
 
-**Target Definition:**
+- **Positive class ("promotes")**: Genes from `normoxia_3d_promotes_TE_1hr_lfc0.5.csv`
+- **Negative class ("does_not_promote")**: Genes from `negative_control_genes.csv` (not regulated by eIF3d in any condition/timepoint)
 
-- **Positive class ("promotes")**: Genes from `normoxia_3d_promotes_TE_1hr_lfc0.5.csv` (TE padj < 0.05, LFC > 0.5 in siCtrl vs si3d)
-- **Negative class ("does_not_promote")**: All other genes
-
-# Load Libraries
+# Setup
 
 ```{r load_libraries}
 library(tidyverse)
 library(here)
-library(cowplot)
 library(ranger)
 library(caret)
 library(pROC)
-library(scales)
+library(cowplot)
 ```
 
 # Load Data
 
 ```{r load_data}
-# Load feature matrix
-features <- readRDS(here("output", "predictive_modeling", "feature_matrix_1hr.rds"))
-cat("Loaded feature matrix:", nrow(features), "genes x", ncol(features), "features\n")
+# Feature matrix
+features <- readRDS(here("output", "predictive_modeling", "feature_matrix_1hr_targeted.rds"))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
 
-# Load target gene list (eIF3d promotes TE)
+# Positive class: eIF3d promotes TE in 1hr normoxia
 promotes_genes <- read_csv(here("output", "genesets", "normoxia_3d_promotes_TE_1hr_lfc0.5.csv"))
-cat("Loaded", nrow(promotes_genes), "eIF3d target genes (promotes TE)\n")
+cat("Promotes genes:", nrow(promotes_genes), "\n")
 
-# Check column names in target file
-cat("\nTarget file columns:", paste(colnames(promotes_genes), collapse = ", "), "\n")
+# Negative class: genes not regulated by eIF3d in any condition
+negative_control_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv")) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+cat("Negative control genes:", nrow(negative_control_genes), "\n")
 ```
 
-# Create Binary Target Variable
+# Create Binary Target
 
 ```{r create_target}
-# Create binary target: promotes vs does_not_promote
+set.seed(9)
+number_to_match <- length(promotes_genes$ensembl_gene)
+
+# Label genes
 features <- features %>%
-  mutate(eif3d_target = factor(
-    ifelse(gene_id_clean %in% promotes_genes$ensembl_gene, "promotes", "does_not_promote"),
-    levels = c("does_not_promote", "promotes")
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% promotes_genes$ensembl_gene ~ "promotes",
+    gene_id_clean %in% sample(negative_control_genes$gene_id_clean, number_to_match) ~ "does_not_promote",
+    TRUE ~ NA_character_
   ))
 
-# Check class distribution
-cat("\nClass distribution:\n")
-print(table(features$eif3d_target))
-cat("\nClass proportions:\n")
-print(prop.table(table(features$eif3d_target)))
+# Keep only labeled genes
+model_genes <- features %>%
+  filter(!is.na(eif3d_target)) %>%
+  mutate(eif3d_target = factor(eif3d_target, levels = c("does_not_promote", "promotes")))
 
-# Calculate class imbalance ratio
-n_promotes <- sum(features$eif3d_target == "promotes")
-n_does_not <- sum(features$eif3d_target == "does_not_promote")
-cat("\nClass imbalance ratio (negative:positive):", round(n_does_not / n_promotes, 1), ":1\n")
+nrow(model_genes)
+
+cat("Positive (promotes):", sum(model_genes$eif3d_target == "promotes"), "\n")
+cat("Negative (does_not_promote):", sum(model_genes$eif3d_target == "does_not_promote"), "\n")
+cat("Total:", nrow(model_genes), "\n")
+cat("Imbalance ratio (neg:pos):",
+    round(sum(model_genes$eif3d_target == "does_not_promote") /
+          sum(model_genes$eif3d_target == "promotes"), 1), ":1\n")
 ```
 
 # Preprocessing
@@ -74,100 +80,109 @@ cat("\nClass imbalance ratio (negative:positive):", round(n_does_not / n_promote
 ## Remove Near-Zero Variance Features
 
 ```{r remove_nzv}
-# Identify feature columns (exclude identifiers and target)
-id_cols <- c("gene_id", "gene_id.x", "gene_id.y", "gene_id_clean",
+# # Identify feature columns (exclude identifiers and target)
+# id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+#              "transcript_id", "transcript_id_clean", "transcript_id_raw",
+#              "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+
+# all_cols <- colnames(model_genes)
+# id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+# id_cols <- unique(c(id_cols, id_pattern_cols))
+
+# feature_cols <- setdiff(colnames(model_genes), id_cols)
+# cat("Initial feature count:", length(feature_cols), "\n")
+
+# # Remove near-zero variance
+# nzv <- nearZeroVar(model_genes[, feature_cols], saveMetrics = TRUE)
+# nzv_to_remove <- rownames(nzv)[nzv$nzv]
+# feature_cols <- setdiff(feature_cols, nzv_to_remove)
+# cat("Removed", length(nzv_to_remove), "NZV features\n")
+# cat("Features after NZV removal:", length(feature_cols), "\n")
+```
+
+```{r}
+library(Boruta)
+
+# Identify feature columns (same as before)
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
              "transcript_id", "transcript_id_clean", "transcript_id_raw",
              "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
 
-# Also exclude any column containing identifier patterns
-all_cols <- colnames(features)
+all_cols <- colnames(model_genes)
 id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
 id_cols <- unique(c(id_cols, id_pattern_cols))
 
-feature_cols <- setdiff(colnames(features), id_cols)
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count:", length(feature_cols), "\n")
 
-cat("Columns excluded as identifiers:\n")
-print(intersect(colnames(features), id_cols))
-cat("\nInitial feature count:", length(feature_cols), "\n")
+# ---- Boruta feature selection ----
+set.seed(9)
 
-# Create feature-only dataframe for preprocessing
-feature_data <- features %>%
-  dplyr::select(all_of(feature_cols))
+boruta_res <- Boruta(
+  x = model_genes[, feature_cols],
+  y = as.factor(model_genes$eif3d_target),  # classification
+  doTrace = 2
+)
 
-# Check for near-zero variance features
-nzv <- nearZeroVar(feature_data, saveMetrics = TRUE)
-nzv_features <- rownames(nzv)[nzv$nzv]
+# Resolve tentative features
+boruta_res <- TentativeRoughFix(boruta_res)
 
-cat("Near-zero variance features to remove:", length(nzv_features), "\n")
+# Keep confirmed features only
+selected_features <- getSelectedAttributes(boruta_res, withTentative = FALSE)
 
-# Remove NZV features
-feature_cols_clean <- setdiff(feature_cols, nzv_features)
-cat("Features after NZV removal:", length(feature_cols_clean), "\n")
+cat("Selected features after Boruta:", length(selected_features), "\n")
+
+# Update feature set for RF
+feature_cols <- selected_features
+
+
+plot(boruta_res, las = 2, cex.axis = 0.7)
+
+attStats(boruta_res) %>%
+  arrange(desc(meanImp))
 ```
 
-## Handle Missing Values
 
-```{r handle_missing}
-# Check missing values in remaining features
-missing_counts <- features %>%
-  dplyr::select(all_of(feature_cols_clean)) %>%
+
+
+## Median-Impute Missing Values
+
+```{r impute_missing}
+missing_counts <- model_genes %>%
+  dplyr::select(all_of(feature_cols)) %>%
   summarise(across(everything(), ~sum(is.na(.)))) %>%
   pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
   filter(n_missing > 0) %>%
   arrange(desc(n_missing))
 
-cat("Features with missing values:\n")
-print(missing_counts)
+cat("Features with missing values:", nrow(missing_counts), "\n")
+if (nrow(missing_counts) > 0) print(missing_counts)
 
-# Impute missing values with median
-features_imputed <- features %>%
-  mutate(across(all_of(feature_cols_clean), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+model_genes <- model_genes %>%
+  mutate(across(all_of(feature_cols), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
 
-# Verify no missing values in features
-remaining_na <- features_imputed %>%
-  dplyr::select(all_of(feature_cols_clean)) %>%
-  summarise(total_na = sum(is.na(.))) %>%
-  pull(total_na)
-
-cat("\nRemaining missing values after imputation:", remaining_na, "\n")
+cat("Remaining NAs:", sum(is.na(model_genes[, feature_cols])), "\n")
 ```
 
 ## Remove Highly Correlated Features
 
 ```{r remove_correlated}
-# Calculate correlation matrix (only for numeric features)
-feature_matrix_for_cor <- features_imputed %>%
-  dplyr::select(all_of(feature_cols_clean)) %>%
-  dplyr::select(where(is.numeric))
-
-# Find highly correlated pairs (r > 0.9)
-cor_matrix <- cor(feature_matrix_for_cor, use = "pairwise.complete.obs")
-
-# Find features to remove based on correlation
+cor_matrix <- cor(model_genes[, feature_cols], use = "pairwise.complete.obs")
 high_cor <- findCorrelation(cor_matrix, cutoff = 0.9, names = TRUE)
 
 cat("Highly correlated features to remove:", length(high_cor), "\n")
-if (length(high_cor) > 0) {
-  cat("Examples:", paste(head(high_cor, 10), collapse = ", "), "\n")
-}
-
-# Remove highly correlated features
-feature_cols_final <- setdiff(feature_cols_clean, high_cor)
-cat("Final feature count:", length(feature_cols_final), "\n")
+feature_cols <- setdiff(feature_cols, high_cor)
+cat("Final feature count:", length(feature_cols), "\n")
 ```
 
-# Prepare Data for Modeling
+# Prepare Modeling Data
 
 ```{r prepare_data}
-# Create final dataset for modeling
-model_data <- features_imputed %>%
-  dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols_final)) %>%
-  filter(!is.na(eif3d_target))
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols))
 
-cat("Final dataset dimensions:", nrow(model_data), "genes x", length(feature_cols_final), "features\n")
-
-# Summary of target variable
-cat("\nTarget variable distribution:\n")
+cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+cat("\nClass distribution:\n")
 print(table(model_data$eif3d_target))
 ```
 
@@ -176,165 +191,92 @@ print(table(model_data$eif3d_target))
 ```{r train_test_split}
 set.seed(9)
 
-# Stratified split (80/20)
 train_idx <- createDataPartition(model_data$eif3d_target, p = 0.8, list = FALSE)
 train_data <- model_data[train_idx, ]
 test_data <- model_data[-train_idx, ]
 
-cat("Training set:", nrow(train_data), "genes\n")
-cat("Test set:", nrow(test_data), "genes\n")
-
-# Verify stratification
-cat("\nTrain set class distribution:\n")
+cat("Training set:", nrow(train_data), "\n")
 print(table(train_data$eif3d_target))
-cat("\nTrain set class proportions:\n")
-print(prop.table(table(train_data$eif3d_target)))
-
-cat("\nTest set class distribution:\n")
+cat("\nTest set:", nrow(test_data), "\n")
 print(table(test_data$eif3d_target))
-cat("\nTest set class proportions:\n")
-print(prop.table(table(test_data$eif3d_target)))
 ```
 
-# Balance Training Set
+# Train Random Forest
 
-```{r balance_training}
-# Downsample majority class to balance training set
-train_features_for_balance <- train_data %>%
-  dplyr::select(all_of(feature_cols_final))
-train_target <- train_data$eif3d_target
+```{r train_rf}
+# Class weights (inverse frequency)
+class_counts <- table(train_data$eif3d_target)
+n_train <- nrow(train_data)
+weight_promotes <- n_train / (2 * class_counts["promotes"])
+weight_does_not_promote <- n_train / (2 * class_counts["does_not_promote"])
 
-# Downsample using caret
+case_weights <- ifelse(train_data$eif3d_target == "promotes",
+                       weight_promotes, weight_does_not_promote)
+
+cat("Class weights — promotes:", round(weight_promotes, 2),
+    ", does_not_promote:", round(weight_does_not_promote, 2), "\n")
+
+# Train
 set.seed(9)
-train_balanced_data <- downSample(
-  x = train_features_for_balance,
-  y = train_target,
-  yname = "eif3d_target"
-)
-
-cat("\nBalanced training set:\n")
-print(table(train_balanced_data$eif3d_target))
-cat("\nBalanced training set proportions:\n")
-print(prop.table(table(train_balanced_data$eif3d_target)))
-
-cat("\nOriginal training size:", nrow(train_data), "\n")
-cat("Balanced training size:", nrow(train_balanced_data), "\n")
-```
-
-# Train Random Forest Classifier
-
-```{r train_model}
-# Prepare training data for ranger
-train_for_model <- train_balanced_data
-
-cat("Training random forest classifier...\n")
-cat("Features:", length(feature_cols_final), "\n")
-cat("Training samples:", nrow(train_for_model), "\n")
-
-# Train random forest with probability estimation
-set.seed(9)
-rf_classifier <- ranger(
+rf_model <- ranger(
   formula = eif3d_target ~ .,
-  data = train_for_model,
+  data = train_data %>% dplyr::select(eif3d_target, all_of(feature_cols)),
   num.trees = 500,
   importance = "impurity",
   probability = TRUE,
-  seed = 9,
-  verbose = TRUE
+  case.weights = case_weights,
+  seed = 9
 )
 
-cat("\nModel training complete!\n")
-print(rf_classifier)
+print(rf_model)
 ```
 
-# Model Evaluation
-
-## Predictions on Test Set
-
-```{r predictions}
-# Prepare test features
-test_features <- test_data %>%
-  dplyr::select(all_of(feature_cols_final))
-
-# Get probability predictions
-pred_probs <- predict(rf_classifier, test_features)$predictions
-pred_promotes_prob <- pred_probs[, "promotes"]
-
-# Get class predictions (default threshold 0.5)
-pred_class <- factor(
-  ifelse(pred_promotes_prob >= 0.5, "promotes", "does_not_promote"),
-  levels = c("does_not_promote", "promotes")
-)
-
-# Actual labels
-actual <- test_data$eif3d_target
-
-cat("Predictions summary:\n")
-cat("Predicted promotes:", sum(pred_class == "promotes"), "\n")
-cat("Actual promotes:", sum(actual == "promotes"), "\n")
-```
-
-## Confusion Matrix
-
-```{r confusion_matrix}
-# Create confusion matrix
-cm <- confusionMatrix(pred_class, actual, positive = "promotes")
-print(cm)
-
-# Extract key metrics
-accuracy <- cm$overall["Accuracy"]
-balanced_accuracy <- cm$byClass["Balanced Accuracy"]
-sensitivity <- cm$byClass["Sensitivity"]  # Recall
-specificity <- cm$byClass["Specificity"]
-precision <- cm$byClass["Precision"]
-f1 <- cm$byClass["F1"]
-
-cat("\n========================================\n")
-cat("Key Classification Metrics\n")
-cat("========================================\n")
-cat("Accuracy:", round(accuracy, 4), "\n")
-cat("Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
-cat("Sensitivity (Recall):", round(sensitivity, 4), "\n")
-cat("Specificity:", round(specificity, 4), "\n")
-cat("Precision:", round(precision, 4), "\n")
-cat("F1 Score:", round(f1, 4), "\n")
-```
+# Evaluate on Test Set
 
 ## ROC Curve and AUC
 
 ```{r roc_curve, fig.width=8, fig.height=6}
-# Calculate ROC curve
-roc_obj <- roc(
-  response = actual,
-  predictor = pred_promotes_prob,
-  levels = c("does_not_promote", "promotes"),
-  direction = "<"
-)
+# Predictions
+pred_probs <- predict(rf_model, test_data %>% dplyr::select(all_of(feature_cols)))$predictions
+pred_promotes_prob <- pred_probs[, "promotes"]
+actual <- test_data$eif3d_target
 
+# ROC
+roc_obj <- roc(response = actual, predictor = pred_promotes_prob,
+               levels = c("does_not_promote", "promotes"), direction = "<")
 auc_value <- auc(roc_obj)
-cat("AUC-ROC:", round(auc_value, 4), "\n")
+cat("AUC:", round(auc_value, 4), "\n")
 
-# Plot ROC curve
-roc_df <- data.frame(
-  sensitivity = roc_obj$sensitivities,
-  specificity = roc_obj$specificities
-)
+# Youden threshold
+coords_youden <- coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"),
+                        best.method = "youden")
+optimal_threshold <- coords_youden$threshold
+
+cat("Youden threshold:", round(optimal_threshold, 4), "\n")
+cat("  Sensitivity:", round(coords_youden$sensitivity, 3), "\n")
+cat("  Specificity:", round(coords_youden$specificity, 3), "\n")
+
+# Plot
+roc_df <- data.frame(sensitivity = roc_obj$sensitivities,
+                     specificity = roc_obj$specificities)
 
 p_roc <- ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
   geom_line(color = "#0072B2", linewidth = 1.2) +
   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = 1 - coords_youden$specificity, y = coords_youden$sensitivity),
+             color = "red", size = 3) +
+  annotate("text", x = 1 - coords_youden$specificity + 0.05, y = coords_youden$sensitivity,
+           label = paste0("Youden\n(", round(optimal_threshold, 3), ")"),
+           color = "red", size = 3, hjust = 0) +
   theme_cowplot() +
   labs(
     title = "ROC Curve: eIF3d Target Classification",
-    subtitle = paste0("AUC = ", round(auc_value, 3)),
+    subtitle = paste0("AUC = ", round(auc_value, 3),
+                      " | Threshold = ", round(optimal_threshold, 3)),
     x = "False Positive Rate (1 - Specificity)",
     y = "True Positive Rate (Sensitivity)"
   ) +
-  coord_equal() +
-  theme(
-    plot.title = element_text(size = 14, face = "bold"),
-    plot.subtitle = element_text(size = 12)
-  )
+  coord_equal()
 
 print(p_roc)
 
@@ -342,10 +284,37 @@ ggsave(here("plots", "rf_classification_roc_eif3d_promotes_1hr.pdf"),
        plot = p_roc, width = 8, height = 6)
 ```
 
-## Confusion Matrix Visualization
+## Confusion Matrix
+
+```{r confusion_matrix}
+pred_class <- factor(
+  ifelse(pred_promotes_prob >= optimal_threshold, "promotes", "does_not_promote"),
+  levels = c("does_not_promote", "promotes")
+)
+
+cm <- confusionMatrix(pred_class, actual, positive = "promotes")
+print(cm)
+
+# Extract metrics
+accuracy <- cm$overall["Accuracy"]
+balanced_accuracy <- cm$byClass["Balanced Accuracy"]
+sensitivity <- cm$byClass["Sensitivity"]
+specificity <- cm$byClass["Specificity"]
+precision <- cm$byClass["Precision"]
+f1 <- cm$byClass["F1"]
+
+cat("\nKey Metrics (Youden Threshold):\n")
+cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
+cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("  Sensitivity:", round(sensitivity, 4), "\n")
+cat("  Specificity:", round(specificity, 4), "\n")
+cat("  Precision:", round(precision, 4), "\n")
+cat("  F1:", round(f1, 4), "\n")
+```
+
+## Confusion Matrix Plot
 
 ```{r confusion_matrix_plot, fig.width=6, fig.height=5}
-# Create confusion matrix data for plotting
 cm_table <- as.data.frame(cm$table)
 colnames(cm_table) <- c("Predicted", "Actual", "Freq")
 
@@ -356,14 +325,10 @@ p_cm <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
   theme_cowplot() +
   labs(
     title = "Confusion Matrix",
-    subtitle = paste0("Balanced Acc = ", round(balanced_accuracy, 3), ", F1 = ", round(f1, 3)),
-    x = "Actual Class",
-    y = "Predicted Class"
+    subtitle = paste0("Balanced Acc = ", round(balanced_accuracy, 3),
+                      ", F1 = ", round(f1, 3))
   ) +
-  theme(
-    legend.position = "none",
-    plot.title = element_text(size = 14, face = "bold")
-  )
+  theme(legend.position = "none")
 
 print(p_cm)
 
@@ -375,52 +340,52 @@ ggsave(here("plots", "rf_classification_confusion_matrix_eif3d_promotes_1hr.pdf"
 
 ```{r cross_validation}
 set.seed(9)
-
-# Create stratified folds
 folds <- createFolds(model_data$eif3d_target, k = 5, list = TRUE)
 
 cv_results <- lapply(seq_along(folds), function(i) {
-  cat("Processing fold", i, "...\n")
+  cat("Fold", i, "...\n")
 
   test_idx <- folds[[i]]
   train_cv <- model_data[-test_idx, ]
   test_cv <- model_data[test_idx, ]
 
-  # Balance training fold
-  train_cv_features <- train_cv %>% dplyr::select(all_of(feature_cols_final))
-  train_cv_target <- train_cv$eif3d_target
-
-  train_cv_balanced <- downSample(
-    x = train_cv_features,
-    y = train_cv_target,
-    yname = "eif3d_target"
+  # Class weights for this fold
+  fold_counts <- table(train_cv$eif3d_target)
+  n_fold <- nrow(train_cv)
+  fold_weights <- ifelse(
+    train_cv$eif3d_target == "promotes",
+    n_fold / (2 * fold_counts["promotes"]),
+    n_fold / (2 * fold_counts["does_not_promote"])
   )
 
-  # Train model
+  # Train
   rf_cv <- ranger(
     formula = eif3d_target ~ .,
-    data = train_cv_balanced,
+    data = train_cv %>% dplyr::select(eif3d_target, all_of(feature_cols)),
     num.trees = 500,
     probability = TRUE,
+    case.weights = fold_weights,
     seed = 9
   )
 
-  # Prepare test data
-  test_cv_features <- test_cv %>% dplyr::select(all_of(feature_cols_final))
-
   # Predict
-  pred_probs_cv <- predict(rf_cv, test_cv_features)$predictions[, "promotes"]
+  pred_probs_cv <- predict(rf_cv, test_cv %>% dplyr::select(all_of(feature_cols)))$predictions[, "promotes"]
+
+  # ROC + Youden threshold
+  roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv,
+                levels = c("does_not_promote", "promotes"), direction = "<", quiet = TRUE)
+  coords_cv <- coords(roc_cv, "best", ret = c("threshold", "sensitivity", "specificity"),
+                      best.method = "youden")
+
   pred_class_cv <- factor(
-    ifelse(pred_probs_cv >= 0.5, "promotes", "does_not_promote"),
+    ifelse(pred_probs_cv >= coords_cv$threshold, "promotes", "does_not_promote"),
     levels = c("does_not_promote", "promotes")
   )
-
-  # Calculate metrics
   cm_cv <- confusionMatrix(pred_class_cv, test_cv$eif3d_target, positive = "promotes")
-  roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv, levels = c("does_not_promote", "promotes"), direction = "<")
 
   data.frame(
     fold = i,
+    Threshold = coords_cv$threshold,
     AUC = as.numeric(auc(roc_cv)),
     Balanced_Accuracy = cm_cv$byClass["Balanced Accuracy"],
     Sensitivity = cm_cv$byClass["Sensitivity"],
@@ -433,36 +398,27 @@ cv_results <- lapply(seq_along(folds), function(i) {
 cv_results_df <- bind_rows(cv_results)
 rownames(cv_results_df) <- NULL
 
-cat("\n========================================\n")
-cat("5-Fold Stratified Cross-Validation Results\n")
-cat("========================================\n\n")
+cat("\n5-Fold CV Results:\n")
 print(cv_results_df)
 
-# Summary statistics
-cat("\nMean CV Performance (+/- SD):\n")
-cat("AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
-cat("Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-", round(sd(cv_results_df$Balanced_Accuracy), 4), "\n")
-cat("Sensitivity:", round(mean(cv_results_df$Sensitivity), 4), "+/-", round(sd(cv_results_df$Sensitivity), 4), "\n")
-cat("Specificity:", round(mean(cv_results_df$Specificity), 4), "+/-", round(sd(cv_results_df$Specificity), 4), "\n")
-cat("Precision:", round(mean(cv_results_df$Precision, na.rm = TRUE), 4), "+/-", round(sd(cv_results_df$Precision, na.rm = TRUE), 4), "\n")
-cat("F1:", round(mean(cv_results_df$F1, na.rm = TRUE), 4), "+/-", round(sd(cv_results_df$F1, na.rm = TRUE), 4), "\n")
+cat("\nMean +/- SD:\n")
+for (metric in c("AUC", "Balanced_Accuracy", "Sensitivity", "Specificity", "Precision", "F1")) {
+  vals <- cv_results_df[[metric]]
+  cat(metric, ":", round(mean(vals, na.rm = TRUE), 4), "+/-",
+      round(sd(vals, na.rm = TRUE), 4), "\n")
+}
 ```
 
 # Feature Importance
 
 ```{r feature_importance, fig.width=10, fig.height=10}
-# Extract feature importance
 importance_df <- data.frame(
-  feature = names(rf_classifier$variable.importance),
-  importance = rf_classifier$variable.importance
+  feature = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
 ) %>%
   arrange(desc(importance))
 
-# Show top 30 features
-cat("\nTop 30 Most Important Features:\n")
-print(importance_df %>% head(30))
-
-# Create clean feature names for plotting
+# Clean names for plotting
 importance_df <- importance_df %>%
   mutate(
     feature_clean = feature %>%
@@ -475,7 +431,10 @@ importance_df <- importance_df %>%
       str_replace("_gc$", " GC%")
   )
 
-# Plot top 30 features
+cat("Top 30 Features:\n")
+print(importance_df %>% head(30) %>% dplyr::select(feature, importance))
+
+# Bar plot
 p_importance <- importance_df %>%
   head(30) %>%
   ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
@@ -483,8 +442,8 @@ p_importance <- importance_df %>%
   coord_flip() +
   theme_cowplot() +
   labs(
-    title = "Top 30 Features for eIF3d Target Classification",
-    subtitle = "Random Forest Variable Importance (Impurity)",
+    title = "Top 30 Features: eIF3d Target Classification",
+    subtitle = "Variable Importance (Impurity)",
     x = "",
     y = "Variable Importance"
   )
@@ -495,46 +454,46 @@ ggsave(here("plots", "rf_classification_feature_importance_eif3d_promotes_1hr.pd
        plot = p_importance, width = 10, height = 10)
 ```
 
-# Feature Category Analysis
+## Feature Category Summary
 
 ```{r feature_categories, fig.width=10, fig.height=6}
-# Categorize features
 importance_df <- importance_df %>%
   mutate(
     category = case_when(
       str_detect(feature, "^utr5_4mer_") ~ "5' UTR 4-mers",
       str_detect(feature, "^utr3_4mer_") ~ "3' UTR 4-mers",
       str_detect(feature, "^cds_4mer_") ~ "CDS 4-mers",
-      str_detect(feature, "^rbp_") ~ "RBP Motifs",
+      str_detect(feature, "^rbp_|^rbns_|^cisbp_") ~ "RBP Motifs",
+      str_detect(feature, "^clip_") ~ "CLIP Binding",
+      str_detect(feature, "^sig_") ~ "Signatures",
       str_detect(feature, "length|Length") ~ "Region Lengths",
       str_detect(feature, "_gc$|gc3$|GC") ~ "GC Content",
+      str_detect(feature, "^is_") ~ "4E/DAP5",
       TRUE ~ "Other"
     )
   )
 
-# Summarize importance by category
-category_importance <- importance_df %>%
+category_summary <- importance_df %>%
   group_by(category) %>%
   summarise(
     n_features = n(),
     total_importance = sum(importance),
     mean_importance = mean(importance),
-    max_importance = max(importance),
-    top_feature = feature[which.max(importance)]
+    top_feature = feature[which.max(importance)],
+    .groups = "drop"
   ) %>%
   arrange(desc(total_importance))
 
-cat("\nFeature Importance by Category:\n")
-print(category_importance)
+cat("\nImportance by Category:\n")
+print(category_summary)
 
-# Plot category importance
-p_category <- ggplot(category_importance, aes(x = reorder(category, total_importance), y = total_importance)) +
+p_category <- ggplot(category_summary,
+                     aes(x = reorder(category, total_importance), y = total_importance)) +
   geom_bar(stat = "identity", fill = "#56B4E9") +
   coord_flip() +
   theme_cowplot() +
   labs(
     title = "Feature Importance by Category",
-    subtitle = "eIF3d Target Classification",
     x = "",
     y = "Total Variable Importance"
   )
@@ -548,49 +507,35 @@ ggsave(here("plots", "rf_classification_importance_by_category_eif3d_promotes_1h
 # Export Results
 
 ```{r export_results}
-# Create output directory if needed
 output_dir <- here("output", "predictive_modeling")
 
-# Save model
-saveRDS(rf_classifier, file.path(output_dir, "rf_classifier_eif3d_promotes_normoxia_1hr.rds"))
-cat("Exported: rf_classifier_eif3d_promotes_normoxia_1hr.rds\n")
+# Model
+saveRDS(rf_model, file.path(output_dir, "rf_classifier_eif3d_promotes_normoxia_1hr.rds"))
 
-# Save importance
+# Feature importance
 write_csv(importance_df, file.path(output_dir, "rf_classification_importance_eif3d_promotes_1hr.csv"))
-cat("Exported: rf_classification_importance_eif3d_promotes_1hr.csv\n")
 
-# Save performance metrics
+# Performance summary
 performance_df <- data.frame(
-  Metric = c("AUC", "Accuracy", "Balanced_Accuracy", "Sensitivity", "Specificity", "Precision", "F1"),
-  Test_Set = c(as.numeric(auc_value), accuracy, balanced_accuracy, sensitivity, specificity, precision, f1),
-  CV_Mean = c(
-    mean(cv_results_df$AUC),
-    NA,
-    mean(cv_results_df$Balanced_Accuracy),
-    mean(cv_results_df$Sensitivity),
-    mean(cv_results_df$Specificity),
-    mean(cv_results_df$Precision, na.rm = TRUE),
-    mean(cv_results_df$F1, na.rm = TRUE)
-  ),
-  CV_SD = c(
-    sd(cv_results_df$AUC),
-    NA,
-    sd(cv_results_df$Balanced_Accuracy),
-    sd(cv_results_df$Sensitivity),
-    sd(cv_results_df$Specificity),
-    sd(cv_results_df$Precision, na.rm = TRUE),
-    sd(cv_results_df$F1, na.rm = TRUE)
-  )
+  Metric = c("AUC", "Accuracy", "Balanced_Accuracy", "Sensitivity",
+             "Specificity", "Precision", "F1"),
+  Test_Set = c(as.numeric(auc_value), accuracy, balanced_accuracy,
+               sensitivity, specificity, precision, f1),
+  CV_Mean = c(mean(cv_results_df$AUC), NA, mean(cv_results_df$Balanced_Accuracy),
+              mean(cv_results_df$Sensitivity), mean(cv_results_df$Specificity),
+              mean(cv_results_df$Precision, na.rm = TRUE),
+              mean(cv_results_df$F1, na.rm = TRUE)),
+  CV_SD = c(sd(cv_results_df$AUC), NA, sd(cv_results_df$Balanced_Accuracy),
+            sd(cv_results_df$Sensitivity), sd(cv_results_df$Specificity),
+            sd(cv_results_df$Precision, na.rm = TRUE),
+            sd(cv_results_df$F1, na.rm = TRUE))
 )
-
 write_csv(performance_df, file.path(output_dir, "rf_classification_performance_eif3d_promotes_1hr.csv"))
-cat("Exported: rf_classification_performance_eif3d_promotes_1hr.csv\n")
 
-# Save CV results
+# CV results
 write_csv(cv_results_df, file.path(output_dir, "rf_classification_cv_results_eif3d_promotes_1hr.csv"))
-cat("Exported: rf_classification_cv_results_eif3d_promotes_1hr.csv\n")
 
-# Save predictions
+# Predictions
 predictions_export <- data.frame(
   gene_id = test_data$gene_id_clean,
   symbol = test_data$symbol,
@@ -599,59 +544,40 @@ predictions_export <- data.frame(
   prob_promotes = pred_promotes_prob,
   prob_does_not_promote = pred_probs[, "does_not_promote"]
 )
-
 write_csv(predictions_export, file.path(output_dir, "rf_classification_predictions_eif3d_promotes_1hr.csv"))
-cat("Exported: rf_classification_predictions_eif3d_promotes_1hr.csv\n")
+
+cat("Exported: model RDS, importance CSV, performance CSV, CV results CSV, predictions CSV\n")
 ```
 
 # Summary
 
 ```{r summary}
-cat("\n")
 cat("========================================\n")
-cat("CLASSIFICATION MODEL SUMMARY\n")
+cat("CLASSIFICATION SUMMARY\n")
 cat("========================================\n\n")
 
-cat("Dataset:\n")
-cat("  - Total genes:", nrow(model_data), "\n")
-cat("  - Positive class (promotes):", sum(model_data$eif3d_target == "promotes"), "\n")
-cat("  - Negative class (does_not_promote):", sum(model_data$eif3d_target == "does_not_promote"), "\n")
-cat("  - Class imbalance ratio:", round(n_does_not / n_promotes, 1), ":1\n")
-cat("  - Features:", length(feature_cols_final), "\n\n")
+cat("Classes:\n")
+cat("  Positive (promotes):", sum(model_data$eif3d_target == "promotes"), "\n")
+cat("  Negative (does_not_promote):", sum(model_data$eif3d_target == "does_not_promote"), "\n")
+cat("  Features:", length(feature_cols), "\n\n")
 
-cat("Training:\n")
-cat("  - Original training set:", nrow(train_data), "\n")
-cat("  - Balanced training set:", nrow(train_balanced_data), "\n")
-cat("  - Test set:", nrow(test_data), "\n\n")
+cat("Test Set Performance (Youden threshold =", round(optimal_threshold, 4), "):\n")
+cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
+cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("  Sensitivity:", round(sensitivity, 4), "\n")
+cat("  Specificity:", round(specificity, 4), "\n")
+cat("  Precision:", round(precision, 4), "\n")
+cat("  F1:", round(f1, 4), "\n\n")
 
-cat("Model Performance (Test Set):\n")
-cat("  - AUC-ROC:", round(as.numeric(auc_value), 4), "\n")
-cat("  - Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
-cat("  - Sensitivity (Recall):", round(sensitivity, 4), "\n")
-cat("  - Specificity:", round(specificity, 4), "\n")
-cat("  - Precision:", round(precision, 4), "\n")
-cat("  - F1 Score:", round(f1, 4), "\n\n")
-
-cat("Cross-Validation (5-fold):\n")
-cat("  - Mean AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
-cat("  - Mean Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-", round(sd(cv_results_df$Balanced_Accuracy), 4), "\n\n")
+cat("5-Fold CV:\n")
+cat("  AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
+cat("  Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-",
+    round(sd(cv_results_df$Balanced_Accuracy), 4), "\n\n")
 
 cat("Top 5 Features:\n")
 for (i in 1:5) {
   cat("  ", i, ". ", importance_df$feature[i], " (", round(importance_df$importance[i], 2), ")\n", sep = "")
 }
-
-cat("\nInterpretation:\n")
-cat("  - AUC > 0.5 indicates better than random classification\n")
-cat("  - AUC > 0.7 indicates acceptable discrimination\n")
-cat("  - AUC > 0.8 indicates excellent discrimination\n")
-
-cat("\nOutput Files:\n")
-cat("  - rf_classifier_eif3d_promotes_normoxia_1hr.rds\n")
-cat("  - rf_classification_importance_eif3d_promotes_1hr.csv\n")
-cat("  - rf_classification_performance_eif3d_promotes_1hr.csv\n")
-cat("  - rf_classification_cv_results_eif3d_promotes_1hr.csv\n")
-cat("  - rf_classification_predictions_eif3d_promotes_1hr.csv\n")
 cat("========================================\n")
 ```
 

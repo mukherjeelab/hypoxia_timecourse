@@ -1,0 +1,231 @@
+---
+title: "Negative Control Gene Set for Random Forest"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This analysis identifies genes that are **not regulated** by eIF3d knockdown in any condition (normoxia or hypoxia) at any timepoint (1hr, 4hr, 24hr). These genes serve as a negative control set for Random Forest classification.
+
+## Criteria
+
+A gene must satisfy **all** of the following across all 6 eIF3d comparisons (2 conditions x 3 timepoints):
+
+- `|te_lfc| < 0.5` (small effect size)
+- `te_padj > 0.5` (clearly non-significant)
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+# Define File List
+
+```{r define_files}
+# Build file paths for all 6 eIF3d comparisons
+comparisons <- expand.grid(
+  protein = "si3d",
+  condition = c("normoxia", "hypoxia"),
+  timepoint = c("1hr", "4hr", "24hr"),
+  stringsAsFactors = FALSE
+)
+
+comparisons <- comparisons %>%
+  mutate(
+    file = here("output",
+                paste0("translation_categories_", protein, "_vs_sictrl_",
+                       condition, "_", timepoint, ".csv")),
+    label = paste(protein, condition, timepoint, sep = "_")
+  )
+
+cat("Defined", nrow(comparisons), "comparisons:\n")
+print(comparisons %>% select(label, file))
+```
+
+# Load All 6 Datasets
+
+```{r load_data}
+all_data <- comparisons %>%
+  rowwise() %>%
+  mutate(data = list(read_csv(file, show_col_types = FALSE))) %>%
+  ungroup()
+
+# Verify all files loaded
+cat("\nRows per comparison:\n")
+all_data %>%
+  mutate(n_genes = map_int(data, nrow)) %>%
+  select(label, n_genes) %>%
+  print(n = 6)
+```
+
+# Filter Each Dataset
+
+```{r filter_datasets}
+# For each comparison, flag genes passing criteria: |te_lfc| < 0.5 AND te_padj > 0.5
+passing_genes <- all_data %>%
+  mutate(
+    passing = map(data, function(df) {
+      df %>%
+        filter(abs(te_lfc) < 0.5, te_padj > 0.5) %>%
+        pull(gene_id)
+    })
+  )
+
+# Report how many genes pass each individual filter
+cat("\nGenes passing criteria per comparison:\n")
+passing_genes %>%
+  mutate(n_passing = map_int(passing, length)) %>%
+  select(label, n_passing) %>%
+  print(n = 6)
+```
+
+# Intersect Across All 6 Comparisons
+
+```{r intersect}
+# Find genes present in ALL 6 datasets
+all_gene_sets <- map(all_data$data, ~ pull(.x, gene_id))
+genes_in_all <- Reduce(intersect, all_gene_sets)
+cat("Genes measured in all 6 comparisons:", length(genes_in_all), "\n")
+
+# Find genes passing criteria in ALL 6 comparisons
+passing_sets <- passing_genes$passing
+negative_control_ids <- Reduce(intersect, passing_sets)
+
+# Also require presence in all 6 datasets
+negative_control_ids <- intersect(negative_control_ids, genes_in_all)
+cat("Genes passing criteria in all 6 comparisons:", length(negative_control_ids), "\n")
+```
+
+# Build Output Table
+
+```{r build_output}
+# Get symbol mapping from one of the datasets
+symbol_map <- all_data$data[[1]] %>%
+  select(gene_id, symbol) %>%
+  distinct()
+
+# Build output with gene_id, symbol, and count of comparisons measured
+negative_control_genes <- tibble(gene_id = negative_control_ids) %>%
+  left_join(symbol_map, by = "gene_id") %>%
+  mutate(n_comparisons = 6L) %>%
+  arrange(gene_id)
+
+nrow(negative_control_genes)
+
+cat("\nNegative control set:", nrow(negative_control_genes), "genes\n")
+head(negative_control_genes, 20)
+```
+
+# QC & Summary
+
+```{r qc_summary}
+# Verify: no gene in the negative set has |te_lfc| >= 0.5 or te_padj <= 0.5 in any condition
+cat("=== Verification ===\n\n")
+
+verification <- all_data %>%
+  mutate(
+    violations = map(data, function(df) {
+      df %>%
+        filter(gene_id %in% negative_control_ids) %>%
+        filter(abs(te_lfc) >= 0.5 | te_padj <= 0.5)
+    })
+  )
+
+n_violations <- sum(map_int(verification$violations, nrow))
+cat("Total violations across all comparisons:", n_violations, "\n")
+
+if (n_violations > 0) {
+  warning("Found violations! Inspect the verification object.")
+} else {
+  cat("PASS: No gene in the negative set violates the criteria in any condition.\n")
+}
+```
+
+```{r qc_distributions, fig.width=10, fig.height=6}
+# Collect TE LFC values for negative control genes across all comparisons
+neg_ctrl_te <- all_data %>%
+  mutate(
+    neg_te = map2(data, label, function(df, lbl) {
+      df %>%
+        filter(gene_id %in% negative_control_ids) %>%
+        select(gene_id, te_lfc, te_padj) %>%
+        mutate(comparison = lbl)
+    })
+  ) %>%
+  pull(neg_te) %>%
+  bind_rows()
+
+cat("\n=== TE LFC distribution in negative control set ===\n")
+cat("Overall:\n")
+print(summary(neg_ctrl_te$te_lfc))
+
+cat("\nPer comparison:\n")
+neg_ctrl_te %>%
+  group_by(comparison) %>%
+  summarise(
+    mean_te_lfc = mean(te_lfc),
+    median_te_lfc = median(te_lfc),
+    sd_te_lfc = sd(te_lfc),
+    min_te_lfc = min(te_lfc),
+    max_te_lfc = max(te_lfc),
+    .groups = "drop"
+  ) %>%
+  print(n = 6)
+
+# Plot TE LFC distributions
+ggplot(neg_ctrl_te, aes(x = te_lfc)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~comparison, ncol = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dotted", color = "grey40") +
+  theme_minimal() +
+  labs(title = "TE LFC Distribution of Negative Control Genes",
+       subtitle = paste(nrow(negative_control_genes), "genes across 6 eIF3d comparisons"),
+       x = "TE Log2 Fold Change", y = "Count")
+```
+
+```{r qc_padj, fig.width=10, fig.height=6}
+# Plot te_padj distributions
+ggplot(neg_ctrl_te, aes(x = te_padj)) +
+  geom_histogram(bins = 50, fill = "coral", alpha = 0.7) +
+  facet_wrap(~comparison, ncol = 3) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "TE padj Distribution of Negative Control Genes",
+       x = "TE padj", y = "Count")
+```
+
+# Export
+
+```{r export}
+# Create output directory if needed
+dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
+
+# Save as CSV
+write_csv(negative_control_genes,
+          here("output", "predictive_modeling", "negative_control_genes.csv"))
+cat("Exported: output/predictive_modeling/negative_control_genes.csv\n")
+
+# Save as RDS
+saveRDS(negative_control_genes,
+        here("output", "predictive_modeling", "negative_control_genes.rds"))
+cat("Exported: output/predictive_modeling/negative_control_genes.rds\n")
+
+cat("\nFinal negative control set:", nrow(negative_control_genes), "genes\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

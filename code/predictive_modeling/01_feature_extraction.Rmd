@@ -21,9 +21,15 @@ This analysis extracts mRNA sequence and structural features for all genes to bu
 |----------|----------|-------|
 | **Region Lengths** | 5'UTR, CDS, 3'UTR lengths + log2 transforms | 7 |
 | **GC Content** | GC% for 5'UTR, CDS, 3'UTR, full transcript | 4 |
-| **K-mer Frequencies** | 4-mers in 5'UTR (256) | 256 |
-| **RBP Motifs** | RBNS and CISBP-RNA PWM scores | ~50-100 |
+| **K-mer Frequencies** | 4-mers in 5'UTR | 256 |
+| **K-mer Frequencies** | 5-mers in 5'UTR | 1,024 |
+| **K-mer Frequencies** | 6-mers in 5'UTR | 4,096 |
+| **RBP Motifs** | RBNS + CISBP-RNA PWM scores (all motifs, 5'UTR/CDS/3'UTR) | ~900 |
 | **Codon Usage** | GC3 content | 1 |
+| **4E Resistance** | Teleman riboseq 4E-resistant/sensitive status | 2 |
+| **DAP5 Sensitivity** | Weber 2022 DAP5 KD up/down status | 2 |
+| **Translation Signatures** | eIF3d/3e signature membership (lfc0.5) | 34 |
+| **eIF3 CLIP Binding** | Bound/regional binding per CLIP dataset | ~28 |
 
 # Load Libraries
 
@@ -37,6 +43,7 @@ library(Biostrings)
 library(tximport)
 library(scales)
 library(FeatureReachR)
+library(readxl)
 ```
 
 # Load Data
@@ -79,25 +86,22 @@ cat("TE data with symbols:", nrow(te_1hr), "genes\n")
 ## Load TxDb and Genome
 
 ```{r load_txdb}
-# Load pre-built TxDb from Gencode v26
-txdb <- loadDb("/Users/katematlin/github/mpra_preliminary/accessories/txdb.gencode26.sqlite")
+# Load pre-built TxDb from Gencode v49
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
 
-# Load gene info for transcript-to-symbol mapping
-geneInfo <- read_csv("/Users/katematlin/github/mpra_preliminary/accessories/gencode.v26.primary.info.csv.gz",
-                     col_names = FALSE) %>%
-  filter(!str_detect(X2, "pre_"))
+# Load transcript-to-gene mapping (v49, human only)
+tx2gene <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                    col_names = c("transcript_id", "gene_id")) %>%
+  filter(str_starts(transcript_id, "ENST"))
 
-colnames(geneInfo) <- c("gene_id", "transcript_id", "biotype", "symbol")
-
-# Create transcript to gene mapping
-tx2gene <- geneInfo[, c("transcript_id", "gene_id")]
-gene_symbol_map <- geneInfo %>% dplyr::select(gene_id, symbol) %>% distinct()
+# Reuse v49 gene annotation already loaded above
+gene_symbol_map <- gene_symbols
 
 # Load genome
 genome <- BSgenome.Hsapiens.UCSC.hg38
 
 cat("Loaded TxDb and genome\n")
-cat("Transcripts in geneInfo:", nrow(geneInfo), "\n")
+cat("Transcripts in tx2gene:", nrow(tx2gene), "\n")
 ```
 
 # Select Most Abundant Transcript Per Gene
@@ -173,8 +177,6 @@ cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
 # Calculate widths
 # Strip version numbers from TxDb transcript IDs to match Salmon IDs
 
-head(utr5_widths)
-
 # utr5_widths <- sum(width(utr5)) %>%
 #   as.data.frame() %>%
 #   rownames_to_column("transcript_id_raw") %>%
@@ -213,7 +215,7 @@ utr3_widths <- as.data.frame(utr3) %>%
   mutate(
     transcript_id_clean = sub("\\..*", "", group_name)
   ) %>%
-  select(transcript_id_clean, utr3_length)
+  dplyr::select(transcript_id_clean, utr3_length)
 
 cds_widths <- as.data.frame(cds) %>%
   group_by(group_name) %>%
@@ -224,7 +226,7 @@ cds_widths <- as.data.frame(cds) %>%
   mutate(
     transcript_id_clean = sub("\\..*", "", group_name)
   ) %>%
-  select(transcript_id_clean, cds_length)
+  dplyr::select(transcript_id_clean, cds_length)
 
 cat("Extracted region widths:\n")
 cat("5' UTRs:", nrow(utr5_widths), "\n")
@@ -324,13 +326,64 @@ kmer4_matrix <- oligonucleotideFrequency(utr5_dna, width = 4, as.prob = TRUE)
 
 # Convert to data frame
 kmer4_df <- as.data.frame(kmer4_matrix) %>%
-  mutate(transcript_id_clean = utr5_for_kmers$transcript_id_clean)
+  mutate(transcript_id_clean = utr5_for_kmers$transcript_id_clean) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
 
 # Add prefix to column names for clarity
 colnames(kmer4_df)[1:256] <- paste0("utr5_4mer_", colnames(kmer4_df)[1:256])
 
 cat("Calculated 4-mer frequencies for", nrow(kmer4_df), "transcripts\n")
 cat("Number of 4-mer features:", 256, "\n")
+```
+
+# Calculate 5-mer Frequencies in 5' UTR
+
+```{r calculate_5mers}
+# Filter sequences with at least 5nt
+utr5_for_5mers <- utr5_for_kmers %>%
+  filter(str_length(utr5_sequence) >= 5)
+
+utr5_dna_5mer <- DNAStringSet(utr5_for_5mers$utr5_sequence)
+names(utr5_dna_5mer) <- utr5_for_5mers$transcript_id_clean
+
+# Calculate 5-mer frequencies (as proportions)
+kmer5_matrix <- oligonucleotideFrequency(utr5_dna_5mer, width = 5, as.prob = TRUE)
+
+# Convert to data frame
+kmer5_df <- as.data.frame(kmer5_matrix) %>%
+  mutate(transcript_id_clean = utr5_for_5mers$transcript_id_clean) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
+
+# Add prefix to column names for clarity
+colnames(kmer5_df)[1:1024] <- paste0("utr5_5mer_", colnames(kmer5_df)[1:1024])
+
+cat("Calculated 5-mer frequencies for", nrow(kmer5_df), "transcripts\n")
+cat("Number of 5-mer features:", 1024, "\n")
+```
+
+# Calculate 6-mer Frequencies in 5' UTR
+
+```{r calculate_6mers}
+# Filter sequences with at least 6nt
+utr5_for_6mers <- utr5_for_kmers %>%
+  filter(str_length(utr5_sequence) >= 6)
+
+utr5_dna_6mer <- DNAStringSet(utr5_for_6mers$utr5_sequence)
+names(utr5_dna_6mer) <- utr5_for_6mers$transcript_id_clean
+
+# Calculate 6-mer frequencies (as proportions)
+kmer6_matrix <- oligonucleotideFrequency(utr5_dna_6mer, width = 6, as.prob = TRUE)
+
+# Convert to data frame
+kmer6_df <- as.data.frame(kmer6_matrix) %>%
+  mutate(transcript_id_clean = utr5_for_6mers$transcript_id_clean) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
+
+# Add prefix to column names for clarity
+colnames(kmer6_df)[1:4096] <- paste0("utr5_6mer_", colnames(kmer6_df)[1:4096])
+
+cat("Calculated 6-mer frequencies for", nrow(kmer6_df), "transcripts\n")
+cat("Number of 6-mer features:", 4096, "\n")
 ```
 
 # Calculate GC3 Content (Third Codon Position GC)
@@ -371,90 +424,255 @@ cat("Calculated GC3 content\n")
 cat("Median GC3:", round(median(cds_gc3$gc3, na.rm = TRUE), 2), "%\n")
 ```
 
-# Calculate RBP Motif Scores
+# 4E Resistance & DAP5 Sensitivity
+
+```{r 4e_dap5}
+# Load Teleman riboseq data (4E-BP1 overexpression)
+teleman_data <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv") %>%
+  dplyr::filter(!is.na(symbol)) %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+resistant_4e_symbols <- teleman_data %>% dplyr::filter(log2FoldChange > 1, padj < 0.05) %>% dplyr::pull(symbol)
+sensitive_4e_symbols <- teleman_data %>% dplyr::filter(log2FoldChange < -1, padj < 0.05) %>% dplyr::pull(symbol)
+
+cat("4E-resistant genes:", length(resistant_4e_symbols), "\n")
+cat("4E-sensitive genes:", length(sensitive_4e_symbols), "\n")
+
+# Load DAP5 data (Weber 2022)
+dap5_data <- read_xlsx(here("accessories", "dap5kd_riboseq_weber2022.xlsx")) %>%
+  dplyr::filter(!is.na(geneIDs), comment != "no")
+
+dap5_repressed_symbols <- dap5_data %>% dplyr::filter(comment == "up") %>% dplyr::pull(geneIDs)
+dap5_promoted_symbols <- dap5_data %>% dplyr::filter(comment == "down") %>% dplyr::pull(geneIDs)
+
+cat("DAP5-repressed genes (up with KD):", length(dap5_repressed_symbols), "\n")
+cat("DAP5-promoted genes (down with KD):", length(dap5_promoted_symbols), "\n")
+```
+
+# Translation Signature Membership
+
+```{r signature_membership}
+# Load all TE signatures
+all_sigs <- read_csv(here("output", "genesets", "all_te_signatures.csv"))
+
+# Select lfc0.5 signatures for feature extraction
+selected_sig_names <- c(
+  # Hypoxia eIF3d per timepoint (lfc0.5)
+  "hypoxia_3d_promotes_TE_1hr_lfc0.5", "hypoxia_3d_inhibits_TE_1hr_lfc0.5",
+  "hypoxia_3d_promotes_TE_4hr_lfc0.5", "hypoxia_3d_inhibits_TE_4hr_lfc0.5",
+  "hypoxia_3d_promotes_TE_24hr_lfc0.5", "hypoxia_3d_inhibits_TE_24hr_lfc0.5",
+  # Hypoxia eIF3e per timepoint (lfc0.5)
+  "hypoxia_3e_promotes_TE_1hr_lfc0.5", "hypoxia_3e_inhibits_TE_1hr_lfc0.5",
+  "hypoxia_3e_promotes_TE_4hr_lfc0.5", "hypoxia_3e_inhibits_TE_4hr_lfc0.5",
+  "hypoxia_3e_promotes_TE_24hr_lfc0.5", "hypoxia_3e_inhibits_TE_24hr_lfc0.5",
+  # Normoxia eIF3d/3e combined (lfc0.5)
+  "normoxia_3d_promotes_TE_combined_lfc0.5", "normoxia_3d_inhibits_TE_combined_lfc0.5",
+  "normoxia_3e_promotes_TE_combined_lfc0.5", "normoxia_3e_inhibits_TE_combined_lfc0.5",
+  # Hypoxia response (lfc0.5)
+  "hypoxia_response_increases_TE_1hr_lfc0.5", "hypoxia_response_decreases_TE_1hr_lfc0.5",
+  "hypoxia_response_increases_TE_4hr_lfc0.5", "hypoxia_response_decreases_TE_4hr_lfc0.5",
+  "hypoxia_response_increases_TE_24hr_lfc0.5", "hypoxia_response_decreases_TE_24hr_lfc0.5",
+  # Hypoxia response inhibited_by (lfc0.5)
+  "hypoxia_response_increases_TE_1hr_inhibited_by_3d_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_1hr_inhibited_by_3d_lfc0.5",
+  "hypoxia_response_increases_TE_1hr_inhibited_by_3e_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_1hr_inhibited_by_3e_lfc0.5",
+  "hypoxia_response_increases_TE_4hr_inhibited_by_3d_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_4hr_inhibited_by_3d_lfc0.5",
+  "hypoxia_response_increases_TE_4hr_inhibited_by_3e_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_4hr_inhibited_by_3e_lfc0.5",
+  "hypoxia_response_increases_TE_24hr_inhibited_by_3d_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_24hr_inhibited_by_3d_lfc0.5",
+  "hypoxia_response_increases_TE_24hr_inhibited_by_3e_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_24hr_inhibited_by_3e_lfc0.5"
+)
+
+# Filter to selected signatures and pivot to wide binary format
+sig_features <- all_sigs %>%
+  dplyr::filter(gs_name %in% selected_sig_names) %>%
+  dplyr::distinct(db_gene_symbol, gs_name) %>%
+  dplyr::mutate(member = 1L) %>%
+  tidyr::pivot_wider(
+    names_from = gs_name,
+    values_from = member,
+    values_fill = 0L,
+    names_prefix = "sig_"
+  ) %>%
+  dplyr::rename(symbol = db_gene_symbol)
+
+cat("Signature features created:", ncol(sig_features) - 1, "signatures\n")
+cat("Genes with any signature membership:", nrow(sig_features), "\n")
+```
+
+# eIF3 CLIP Binding Features
+
+```{r clip_binding}
+# Load CLIP score card data
+# Each CLIP column contains a string encoding binding status and region:
+#   "not bound", "5UTR", "CDS", "3UTRs", "5UTR & CDS", "3UTRs, cds, 5UTRs",
+#   "cap_binder", "other", etc.
+# We parse these into binary bound + regional features per condition.
+# Note: lee_int_stress, lee_complete_media, lee_glu_dep only have "not bound"
+#   and "cap_binder" — no regional info, so only _bound will have 1s for those.
+clip_data <- read_csv("/Users/katematlin/github/mpra_preliminary/score_card.csv")
+
+# Define CLIP conditions
+clip_conditions <- c("lee_parclip_a_b_d_g", "lee_parclip_d_only", "cate_undiff_npcs",
+                      "cate_diff_npcs", "lee_int_stress", "lee_complete_media", "lee_glu_dep")
+
+# Create gene_id_clean for joining
+clip_data <- clip_data %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+# Build CLIP features: bound status and regional binding per condition
+clip_features <- clip_data %>%
+  dplyr::select(gene_id_clean) %>%
+  dplyr::distinct()
+
+for (condition in clip_conditions) {
+  bound_col <- paste0("clip_", condition, "_bound")
+  utr5_col <- paste0("clip_", condition, "_5utr")
+  cds_col <- paste0("clip_", condition, "_cds")
+  utr3_col <- paste0("clip_", condition, "_3utr")
+
+  # Extract the string column for this condition and parse regions
+  # "cap_binder" → bound only (no region assigned)
+  # "other" → bound only (no region assigned)
+  condition_data <- clip_data %>%
+    dplyr::select(gene_id_clean, value = all_of(condition)) %>%
+    dplyr::mutate(
+      value_lower = tolower(value),
+      !!bound_col := as.integer(value_lower != "not bound"),
+      !!utr5_col  := as.integer(str_detect(value_lower, "5utr")),
+      !!cds_col   := as.integer(str_detect(value_lower, "cds")),
+      !!utr3_col  := as.integer(str_detect(value_lower, "3utr"))
+    ) %>%
+    dplyr::select(gene_id_clean, all_of(c(bound_col, utr5_col, cds_col, utr3_col)))
+
+  clip_features <- clip_features %>%
+    dplyr::left_join(condition_data, by = "gene_id_clean")
+}
+
+# Fill any remaining NAs with 0
+clip_features <- clip_features %>%
+  dplyr::mutate(across(-gene_id_clean, ~as.integer(replace_na(., 0L))))
+
+# Drop columns that are all zero (no informative signal)
+all_zero_cols <- names(clip_features)[sapply(clip_features, function(x) is.numeric(x) && sum(x) == 0)]
+if (length(all_zero_cols) > 0) {
+  cat("Dropping", length(all_zero_cols), "all-zero CLIP columns:", paste(all_zero_cols, collapse = ", "), "\n")
+  clip_features <- clip_features %>%
+    dplyr::select(-all_of(all_zero_cols))
+}
+
+cat("CLIP features retained:", ncol(clip_features) - 1, "features\n")
+cat("Genes with CLIP data:", nrow(clip_features), "\n")
+```
+
+# Calculate RBP Motif Scores (Unbiased - All Motifs, All Regions)
 
 ```{r rbp_motifs}
-# Use FeatureReachR to calculate PWM scores for RBNS motifs
+# Score all RBP motifs from both RBNS_PWM and CISBPRNA_hs_PWM databases
+# across 5' UTR, CDS, and 3' UTR regions
+# This unbiased approach lets the Random Forest determine which motifs are predictive
 
-# Prepare 5' UTR sequences as DNAStringSet
-utr5_for_motifs <- utr5_seq %>%
+# --- Prepare sequences for each region ---
+
+# 5' UTR
+utr5_motif_seqs <- utr5_seq %>%
   filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
          !is.na(utr5_sequence),
          utr5_sequence != "",
          str_length(utr5_sequence) >= 6)
 
-utr5_motif_dna <- DNAStringSet(utr5_for_motifs$utr5_sequence)
-names(utr5_motif_dna) <- utr5_for_motifs$transcript_id_clean
+utr5_dna_motif <- DNAStringSet(utr5_motif_seqs$utr5_sequence)
+names(utr5_dna_motif) <- utr5_motif_seqs$transcript_id_clean
 
-# Calculate RBNS PWM match counts
-# Using a simplified approach - count motif occurrences per kb
-cat("Calculating RBP motif scores...\n")
+# CDS
+cds_motif_seqs <- cds_seq %>%
+  filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
+         !is.na(cds_sequence),
+         cds_sequence != "",
+         str_length(cds_sequence) >= 6)
 
-# Get RBNS PWM names
-rbns_names <- names(RBNS_PWM)
-cat("Number of RBNS motifs:", length(rbns_names), "\n")
+cds_dna_motif <- DNAStringSet(cds_motif_seqs$cds_sequence)
+names(cds_dna_motif) <- cds_motif_seqs$transcript_id_clean
 
-# Function to count PWM matches in sequences
-count_pwm_matches <- function(pwm, sequences, min_score = 0.8) {
-  # Convert to matrix if needed
-  pwm_matrix <- as.matrix(pwm)
+# 3' UTR
+utr3_motif_seqs <- utr3_seq %>%
+  filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
+         !is.na(utr3_sequence),
+         utr3_sequence != "",
+         str_length(utr3_sequence) >= 6)
 
-  # Count matches per sequence
-  counts <- sapply(sequences, function(seq) {
-    if (length(seq) < ncol(pwm_matrix)) return(0)
+utr3_dna_motif <- DNAStringSet(utr3_motif_seqs$utr3_sequence)
+names(utr3_dna_motif) <- utr3_motif_seqs$transcript_id_clean
 
-    tryCatch({
-      matches <- matchPWM(pwm_matrix, seq, min.score = paste0(min_score * 100, "%"))
-      length(matches)
-    }, error = function(e) 0)
-  })
+cat("Sequences for motif scoring:\n")
+cat("  5' UTR:", length(utr5_dna_motif), "\n")
+cat("  CDS:", length(cds_dna_motif), "\n")
+cat("  3' UTR:", length(utr3_dna_motif), "\n")
+cat("RBNS motifs available:", length(RBNS_PWM), "\n")
+cat("CISBP-RNA motifs available:", length(CISBPRNA_hs_PWM), "\n")
 
-  return(counts)
-}
+# --- Helper function to score all motifs from a PWM list against a set of sequences ---
+score_pwm_list <- function(pwm_list, sequences, db_prefix, region_prefix) {
+  seq_lengths <- width(sequences)
+  scores <- data.frame(transcript_id_clean = names(sequences))
 
-# Calculate motif counts for a subset of key RBPs
-# Focus on RBPs known to be relevant to hypoxia/translation
-key_rbps <- c("PCBP1", "PCBP2", "PTBP1", "HNRNPA2B1", "ELAVL1", "SRSF1", "SRSF2",
-              "SRSF3", "SRSF7", "KHDRBS1", "KHSRP", "CELF1", "MBNL1", "QKI",
-              "RBM4", "RBM24", "IGF2BP1", "IGF2BP2", "IGF2BP3", "FMR1", "FXR1",
-              "FXR2", "CPEB1", "CPEB4", "TARDBP", "FUS", "HNRNPC", "HNRNPK",
-              "HNRNPL", "HNRNPM", "U2AF2", "TIA1", "TIAL1", "ZFP36", "YBX1")
+  for (motif_name in names(pwm_list)) {
+    pwm <- pwm_list[[motif_name]]
+    pwm_matrix <- as.matrix(pwm)
 
-# Find matching RBNS PWMs
-available_rbps <- rbns_names[sapply(key_rbps, function(rbp) {
-  any(str_detect(rbns_names, fixed(rbp, ignore_case = TRUE)))
-})]
+    counts <- sapply(sequences, function(seq) {
+      if (length(seq) < ncol(pwm_matrix)) return(0)
+      tryCatch({
+        length(matchPWM(pwm_matrix, seq, min.score = "80%"))
+      }, error = function(e) 0)
+    })
 
-cat("Key RBPs with available RBNS PWMs:", length(available_rbps), "\n")
-
-# Initialize motif score dataframe
-motif_scores <- data.frame(transcript_id_clean = utr5_for_motifs$transcript_id_clean)
-
-# Calculate scores for each available RBP
-for (rbp_pattern in key_rbps) {
-  matching_pwms <- rbns_names[str_detect(rbns_names, fixed(rbp_pattern, ignore_case = TRUE))]
-
-  if (length(matching_pwms) > 0) {
-    # Use first matching PWM
-    pwm_name <- matching_pwms[1]
-    pwm <- RBNS_PWM[[pwm_name]]
-
-    # Count matches
-    counts <- count_pwm_matches(pwm, utr5_motif_dna)
-
-    # Normalize by sequence length (per kb)
-    seq_lengths <- width(utr5_motif_dna)
-    normalized_counts <- (counts / seq_lengths) * 1000
-
-    # Add to dataframe
-    col_name <- paste0("rbp_", gsub("[^A-Za-z0-9]", "_", rbp_pattern))
-    motif_scores[[col_name]] <- normalized_counts
-
-    cat("Processed:", rbp_pattern, "(", pwm_name, ")\n")
+    col_name <- paste0(db_prefix, "_", region_prefix, "_", gsub("[^A-Za-z0-9]", "_", motif_name))
+    scores[[col_name]] <- (counts / seq_lengths) * 1000
   }
+
+  return(scores)
 }
 
-cat("Calculated motif scores for", ncol(motif_scores) - 1, "RBPs\n")
+# --- Score RBNS motifs in all three regions ---
+cat("Scoring RBNS motifs in 5' UTR...\n")
+rbns_utr5 <- score_pwm_list(RBNS_PWM, utr5_dna_motif, "rbns", "utr5")
+cat("Scoring RBNS motifs in CDS...\n")
+rbns_cds <- score_pwm_list(RBNS_PWM, cds_dna_motif, "rbns", "cds")
+cat("Scoring RBNS motifs in 3' UTR...\n")
+rbns_utr3 <- score_pwm_list(RBNS_PWM, utr3_dna_motif, "rbns", "utr3")
+
+cat("Scored", length(names(RBNS_PWM)), "RBNS motifs x 3 regions\n")
+
+# --- Score CISBP-RNA motifs in all three regions ---
+cat("Scoring CISBP-RNA motifs in 5' UTR...\n")
+cisbp_utr5 <- score_pwm_list(CISBPRNA_hs_PWM, utr5_dna_motif, "cisbp", "utr5")
+cat("Scoring CISBP-RNA motifs in CDS...\n")
+cisbp_cds <- score_pwm_list(CISBPRNA_hs_PWM, cds_dna_motif, "cisbp", "cds")
+cat("Scoring CISBP-RNA motifs in 3' UTR...\n")
+cisbp_utr3 <- score_pwm_list(CISBPRNA_hs_PWM, utr3_dna_motif, "cisbp", "utr3")
+
+cat("Scored", length(names(CISBPRNA_hs_PWM)), "CISBP-RNA motifs x 3 regions\n")
+
+# --- Merge all motif scores ---
+# Use full outer joins so transcripts missing a region get NA (filled later)
+motif_scores <- rbns_utr5 %>%
+  full_join(rbns_cds, by = "transcript_id_clean") %>%
+  full_join(rbns_utr3, by = "transcript_id_clean") %>%
+  full_join(cisbp_utr5, by = "transcript_id_clean") %>%
+  full_join(cisbp_cds, by = "transcript_id_clean") %>%
+  full_join(cisbp_utr3, by = "transcript_id_clean")
+
+cat("Total RBP motif features:", ncol(motif_scores) - 1, "\n")
+cat("  Per database: RBNS =", length(RBNS_PWM), ", CISBP-RNA =", length(CISBPRNA_hs_PWM), "\n")
+cat("  Per region: 5' UTR, CDS, 3' UTR\n")
 ```
 
 # Assemble Feature Matrix
@@ -462,9 +680,6 @@ cat("Calculated motif scores for", ncol(motif_scores) - 1, "RBPs\n")
 ```{r assemble_features}
 # Start with most abundant transcripts and TE data
 # Use transcript_id_clean for all joins with TxDb-derived data
-head(feature_matrix)
-
-
 feature_matrix <- most_abundant_tx %>%
   dplyr::select(transcript_id, transcript_id_clean, gene_id = gene_id.x, symbol) %>%
   mutate(
@@ -500,8 +715,33 @@ feature_matrix <- most_abundant_tx %>%
   left_join(cds_gc3, by = "transcript_id_clean") %>%
   # Add 4-mer frequencies (join by transcript_id_clean)
   left_join(kmer4_df, by = "transcript_id_clean") %>%
+  # Add 5-mer frequencies (join by transcript_id_clean)
+  left_join(kmer5_df, by = "transcript_id_clean") %>%
+  # Add 6-mer frequencies (join by transcript_id_clean)
+  left_join(kmer6_df, by = "transcript_id_clean") %>%
   # Add RBP motif scores (join by transcript_id_clean)
-  left_join(motif_scores, by = "transcript_id_clean")
+  left_join(motif_scores, by = "transcript_id_clean") %>%
+  # Add 4E resistance and DAP5 features
+  mutate(
+    is_4e_resistant = as.integer(symbol %in% resistant_4e_symbols),
+    is_4e_sensitive = as.integer(symbol %in% sensitive_4e_symbols),
+    is_dap5_repressed = as.integer(symbol %in% dap5_repressed_symbols),
+    is_dap5_promoted = as.integer(symbol %in% dap5_promoted_symbols)
+  ) %>%
+  # Add signature membership
+  left_join(sig_features, by = "symbol") %>%
+  # Add CLIP binding
+  left_join(clip_features, by = "gene_id_clean")
+
+# Fill NA features with 0
+# K-mer frequencies: transcripts without a 5' UTR (or too short for a given k)
+# have zero occurrences of every k-mer; utr5_length already captures the absence
+feature_matrix <- feature_matrix %>%
+  dplyr::mutate(across(starts_with("utr5_4mer_"), ~replace_na(., 0))) %>%
+  dplyr::mutate(across(starts_with("utr5_5mer_"), ~replace_na(., 0))) %>%
+  dplyr::mutate(across(starts_with("utr5_6mer_"), ~replace_na(., 0))) %>%
+  dplyr::mutate(across(starts_with("sig_"), ~replace_na(., 0L))) %>%
+  dplyr::mutate(across(starts_with("clip_"), ~replace_na(., 0L)))
 
 # Check join success
 cat("\nJoin diagnostics:\n")
@@ -516,6 +756,17 @@ feature_matrix <- feature_matrix %>%
   filter(!is.na(te_lfc),
          !is.na(utr5_length),
          !is.na(cds_length))
+
+# Drop any binary feature columns (sig_, clip_, is_) that are all zero after filtering
+binary_prefixes <- c("sig_", "clip_", "is_")
+binary_cols <- names(feature_matrix)[sapply(names(feature_matrix), function(n) any(str_starts(n, binary_prefixes)))]
+all_zero_binary <- binary_cols[sapply(binary_cols, function(col) sum(feature_matrix[[col]]) == 0)]
+if (length(all_zero_binary) > 0) {
+  cat("Dropping", length(all_zero_binary), "all-zero binary columns:\n")
+  cat(" ", paste(all_zero_binary, collapse = ", "), "\n")
+  feature_matrix <- feature_matrix %>%
+    dplyr::select(-all_of(all_zero_binary))
+}
 
 cat("\nFeature matrix assembled:\n")
 cat("Genes:", nrow(feature_matrix), "\n")
@@ -632,7 +883,12 @@ cat("  - Target: te_lfc, te_padj, te_lfc_bin\n")
 cat("  - Region lengths: 7 features\n")
 cat("  - GC content: 5 features\n")
 cat("  - 4-mer frequencies: 256 features\n")
-cat("  - RBP motif scores:", ncol(motif_scores) - 1, "features\n")
+cat("  - 5-mer frequencies: 1024 features\n")
+cat("  - 6-mer frequencies: 4096 features\n")
+cat("  - RBP motif scores (RBNS + CISBP-RNA, unbiased):", ncol(motif_scores) - 1, "features\n")
+cat("  - 4E resistance/sensitivity: 4 features\n")
+cat("  - Translation signatures:", sum(str_detect(names(feature_matrix), "^sig_")), "features\n")
+cat("  - CLIP binding:", sum(str_detect(names(feature_matrix), "^clip_")), "features\n")
 ```
 
 # Session Info
