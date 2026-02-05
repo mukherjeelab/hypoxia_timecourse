@@ -1,0 +1,406 @@
+---
+title: "Prepare Data for ORFquant"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE}
+library(here)
+library(tidyverse)
+```
+
+```{r load-metadata}
+metadata_231 <- read_csv(here("accessories", "metadata_231_timecourse.csv"))
+```
+
+```{r inspect-metadata}
+# View structure and summary
+glimpse(metadata_231)
+head(metadata_231)
+```
+
+## Generate BAM Merge Scripts for Cluster
+
+Generate text files listing BAM paths for each group (replicates merged) and bsub scripts to run `samtools merge` on the cluster.
+
+```{r define-cluster-paths}
+# Define cluster paths
+bam_base_path <- "/beevol/home/bartholk/kateData_ribo/2025_MDAcells_riboseq2/STAR"
+cluster_base_path <- "/beevol/home/matlinka/eif3e_hypoxia/ORFquant/orfquant_hypoxia_timecourse/merge_bams"
+merged_output_path <- file.path(cluster_base_path, "merged_bams")
+bam_lists_path <- file.path(cluster_base_path, "bam_lists")
+```
+
+```{r create-output-directories}
+# Create output directories
+dir.create(here("cluster_scripts", "bam_lists"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("cluster_scripts", "merge_bams"), recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r generate-merge-scripts}
+# Track group names for master script
+group_names <- c()
+
+# Group by condition, treatment, hours and write files (RiboSeq only)
+metadata_231 %>%
+  filter(type == "RiboSeq") %>%
+  mutate(bam_path = file.path(bam_base_path, paste0(id, ".bam"))) %>%
+  group_by(condition, treatment, hours) %>%
+  group_walk(~{
+    group_name <- paste(.y$condition, .y$treatment, "RiboSeq", paste0(.y$hours, "h"), sep = "_")
+    group_names <<- c(group_names, group_name)
+
+    # Write BAM list file
+    writeLines(.x$bam_path, here("cluster_scripts", "bam_lists", paste0(group_name, ".txt")))
+
+    # Write bsub script
+    bsub_content <- glue::glue('#!/bin/bash
+#BSUB -q rna
+#BSUB -R "select[mem>30] rusage[mem=30]"
+#BSUB -R "span[hosts=1]"
+#BSUB -o {cluster_base_path}/logs/merge_{group_name}_%J.log
+#BSUB -e {cluster_base_path}/logs/merge_{group_name}_%J.out
+
+module load samtools
+
+samtools merge {merged_output_path}/{group_name}_merged.bam -b {bam_lists_path}/{group_name}.txt
+')
+    writeLines(bsub_content, here("cluster_scripts", "merge_bams", paste0("merge_", group_name, ".bsub")))
+  })
+
+# Report number of groups processed
+cat("Generated scripts for", length(group_names), "groups\n")
+```
+
+```{r generate-master-submit-script}
+# Write master submit script
+submit_lines <- c("#!/bin/bash", "", paste0("cd ", cluster_base_path, "/merged_bams"), "")
+submit_lines <- c(submit_lines, paste0("bsub < merge_", group_names, ".bsub"))
+writeLines(submit_lines, here("cluster_scripts", "submit_all_merges.bsub"))
+
+cat("Master submit script created at cluster_scripts/submit_all_merges.bsub\n")
+```
+
+```{r verify-outputs}
+# Verify outputs
+bam_list_files <- list.files(here("cluster_scripts", "bam_lists"), pattern = "\\.txt$")
+bsub_files <- list.files(here("cluster_scripts", "merge_bams"), pattern = "\\.bsub$")
+master_script_exists <- file.exists(here("cluster_scripts", "submit_all_merges.bsub"))
+
+cat("BAM list files created:", length(bam_list_files), "\n")
+cat("bsub scripts created:", length(bsub_files), "\n")
+cat("Master submit script exists:", master_script_exists, "\n")
+
+# Show example BAM list file
+example_bam_list <- bam_list_files[1]
+cat("\nExample BAM list file (", example_bam_list, "):\n", sep = "")
+cat(readLines(here("cluster_scripts", "bam_lists", example_bam_list)), sep = "\n")
+
+# Show example bsub script
+example_bsub <- bsub_files[1]
+cat("\nExample bsub script (", example_bsub, "):\n", sep = "")
+cat(readLines(here("cluster_scripts", "merge_bams", example_bsub)), sep = "\n")
+```
+
+## Process BAM Files for RiboseQC
+
+The merged BAM files from riboPipe use `hs_X` chromosome naming (e.g., hs_1, hs_2) but the GENCODE annotation uses `chr` naming (chr1, chr2). We need to:
+1. Rename chromosomes from `hs_X` to `chr` format
+2. Filter to main chromosomes only (chr1-22, X, Y, M) to match the annotation
+
+```{r define-riboseqc-paths}
+# Define RiboseQC cluster paths
+riboseqc_base_path <- "/beevol/home/matlinka/eif3e_hypoxia/ORFquant/orfquant_hypoxia_timecourse/riboseqc"
+gtf_file <- "/beevol/home/bartholk/riboPipe_comps/star_index/v45/gencode.v45.annotation.gtf.gz"
+genome_seq <- "/beevol/home/bartholk/riboPipe_comps/star_index/v45/GRCh38.primary_assembly.genome.fa"
+annotation_file <- file.path(riboseqc_base_path, "gencode.v45.annotation.gtf.gz_Rannot")
+twobit_file <- file.path(riboseqc_base_path, "GRCh38.primary_assembly.genome.2bit")
+bams_filtered_path <- file.path(riboseqc_base_path, "bams_filtered")
+```
+
+```{r create-riboseqc-directories}
+# Create output directories for RiboseQC scripts
+dir.create(here("cluster_scripts", "riboseqc", "r_scripts"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("cluster_scripts", "riboseqc", "bsub_scripts"), recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r generate-2bit-conversion-script}
+# Generate script to convert FASTA to 2bit format (run first on cluster)
+convert_2bit_content <- glue::glue('#!/usr/bin/env bash
+#BSUB -q rna
+#BSUB -o {riboseqc_base_path}/logs/convert_2bit_%J.log
+#BSUB -e {riboseqc_base_path}/logs/convert_2bit_%J.out
+
+. /usr/share/Modules/init/bash
+module load ucsc/v349
+
+faToTwoBit /beevol/home/bartholk/riboPipe_comps/star_index/v45/GRCh38.primary_assembly.genome.fa \\
+  {twobit_file}
+')
+writeLines(convert_2bit_content, here("cluster_scripts", "riboseqc", "convert_to_2bit.bsub"))
+cat("Created convert_to_2bit.bsub\n")
+```
+
+```{r generate-annotation-prep-scripts}
+# Generate R script to prepare RiboseQC annotation
+prepare_annotation_r <- glue::glue('library(RiboseQC)
+
+prepare_annotation_files(
+  annotation_directory = "{riboseqc_base_path}",
+  twobit_file = "{twobit_file}",
+  gtf_file = "{gtf_file}",
+  genome_seq = "{genome_seq}",
+  scientific_name = "Homo.sapiens",
+  annotation_name = "gencode.v45",
+  export_bed_tables_TxDb = FALSE,
+  forge_BSgenome = FALSE,
+  create_TxDb = TRUE
+)
+')
+writeLines(prepare_annotation_r, here("cluster_scripts", "riboseqc", "prepare_annotation.R"))
+
+# Generate bsub script to run annotation preparation
+prepare_annotation_bsub <- glue::glue('#!/usr/bin/env bash
+#BSUB -n 10
+#BSUB -q rna
+#BSUB -R "select[mem>30] rusage[mem=30]"
+#BSUB -R "span[hosts=1]"
+#BSUB -o {riboseqc_base_path}/logs/prepare_annotation_%J.log
+#BSUB -e {riboseqc_base_path}/logs/prepare_annotation_%J.out
+
+. /usr/share/Modules/init/bash
+source ~/.bashrc
+conda activate working_orf
+
+cd {riboseqc_base_path}
+Rscript prepare_annotation.R
+')
+writeLines(prepare_annotation_bsub, here("cluster_scripts", "riboseqc", "prepare_annotation.bsub"))
+cat("Created prepare_annotation.R and prepare_annotation.bsub\n")
+```
+
+## Process BAM Chromosomes
+
+The riboPipe BAM files use `hs_X` chromosome naming but GENCODE uses `chr`. This script:
+1. Renames chromosomes from hs_X to chr format
+2. Filters to main chromosomes (chr1-22, X, Y, M) to avoid seqlevel mismatches
+
+```{r generate-bam-processing-script}
+# Generate script to process BAM chromosomes
+bam_process_content <- glue::glue('#!/bin/bash
+# Process merged BAMs: rename chromosomes and filter to main chroms
+# Run this AFTER merging BAMs and BEFORE running RiboseQC
+
+cd {riboseqc_base_path}
+module load samtools
+
+# Create output directories
+mkdir -p bams_chr bams_filtered
+
+# Create header with chr naming (from first merged BAM)
+FIRST_BAM=$(ls {merged_output_path}/*_merged.bam | grep -v tmp | head -1)
+samtools view -H $FIRST_BAM | sed "s/SN:hs_/SN:chr/" > new_header.sam
+
+# Create filtered header with only main chromosomes
+samtools view -H $FIRST_BAM | grep -v "^@SQ" > header_filtered.sam
+samtools view -H $FIRST_BAM | grep "^@SQ" | sed "s/SN:hs_/SN:chr/" | grep -E "SN:chr([0-9]+|X|Y|M)\\b" >> header_filtered.sam
+
+# Define main chromosomes
+CHROMS="chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 chr21 chr22 chrX chrY chrM"
+
+# Process each merged BAM
+for bam in {merged_output_path}/hypoxia_*_merged.bam {merged_output_path}/normoxia_*_merged.bam; do
+  name=$(basename "$bam")
+  echo "Processing $name..."
+
+  # Rename chromosomes
+  samtools reheader new_header.sam "$bam" > bams_chr/"$name"
+  samtools index bams_chr/"$name"
+
+  # Filter to main chromosomes and apply filtered header
+  samtools view -h -b bams_chr/"$name" $CHROMS > bams_filtered/"$name".tmp
+  samtools reheader header_filtered.sam bams_filtered/"$name".tmp > bams_filtered/"$name"
+  rm bams_filtered/"$name".tmp
+  samtools index bams_filtered/"$name"
+done
+
+echo "Done! Filtered BAMs are in bams_filtered/"
+')
+writeLines(bam_process_content, here("cluster_scripts", "riboseqc", "process_bam_chromosomes.sh"))
+cat("Created process_bam_chromosomes.sh\n")
+```
+
+## Generate RiboseQC Scripts
+
+```{r generate-riboseqc-scripts}
+# Generate R and bsub scripts for each group
+# Reuses group_names from the merge section above
+# Uses filtered BAMs with chr naming and main chromosomes only
+
+for (group_name in group_names) {
+  # R script for RiboseQC analysis
+  r_script_content <- glue::glue('library(devtools)
+library("RiboseQC")
+
+RiboseQC_analysis(
+  annotation_file = "{annotation_file}",
+  bam_files = "{bams_filtered_path}/{group_name}_merged.bam",
+  report_file = "{group_name}_riboseqc.html",
+  write_tmp_files = TRUE
+)
+')
+  writeLines(r_script_content, here("cluster_scripts", "riboseqc", "r_scripts", paste0("riboseqc_", group_name, ".R")))
+
+  # bsub script
+  bsub_content <- glue::glue('#!/usr/bin/env bash
+#BSUB -n 10
+#BSUB -q rna
+#BSUB -R "select[mem>30] rusage[mem=30]"
+#BSUB -R "span[hosts=1]"
+#BSUB -o {riboseqc_base_path}/logs/riboseqc_{group_name}_%J.log
+#BSUB -e {riboseqc_base_path}/logs/riboseqc_{group_name}_%J.out
+
+. /usr/share/Modules/init/bash
+source ~/.bashrc
+conda activate working_orf
+
+cd {riboseqc_base_path}
+Rscript r_scripts/riboseqc_{group_name}.R
+')
+  writeLines(bsub_content, here("cluster_scripts", "riboseqc", "bsub_scripts", paste0("riboseqc_", group_name, ".bsub")))
+}
+
+cat("Generated RiboseQC scripts for", length(group_names), "groups\n")
+```
+
+```{r generate-riboseqc-master-submit}
+# Write master submit script for all RiboseQC jobs
+submit_lines <- c(
+  "#!/bin/bash",
+  "",
+  paste0("cd ", riboseqc_base_path),
+  ""
+)
+submit_lines <- c(submit_lines, paste0("bsub < bsub_scripts/riboseqc_", group_names, ".bsub"))
+writeLines(submit_lines, here("cluster_scripts", "riboseqc", "submit_all_riboseqc.bsub"))
+
+cat("Master submit script created at cluster_scripts/riboseqc/submit_all_riboseqc.bsub\n")
+```
+
+```{r verify-riboseqc-outputs}
+# Verify RiboseQC outputs
+r_script_files <- list.files(here("cluster_scripts", "riboseqc", "r_scripts"), pattern = "\\.R$")
+riboseqc_bsub_files <- list.files(here("cluster_scripts", "riboseqc", "bsub_scripts"), pattern = "\\.bsub$")
+convert_script_exists <- file.exists(here("cluster_scripts", "riboseqc", "convert_to_2bit.bsub"))
+prep_annotation_exists <- file.exists(here("cluster_scripts", "riboseqc", "prepare_annotation.R"))
+riboseqc_master_exists <- file.exists(here("cluster_scripts", "riboseqc", "submit_all_riboseqc.bsub"))
+
+cat("RiboseQC R scripts created:", length(r_script_files), "\n")
+cat("RiboseQC bsub scripts created:", length(riboseqc_bsub_files), "\n")
+cat("convert_to_2bit.bsub exists:", convert_script_exists, "\n")
+cat("prepare_annotation.R exists:", prep_annotation_exists, "\n")
+cat("Master submit script exists:", riboseqc_master_exists, "\n")
+
+# Show example R script
+example_r_script <- r_script_files[1]
+cat("\nExample R script (", example_r_script, "):\n", sep = "")
+cat(readLines(here("cluster_scripts", "riboseqc", "r_scripts", example_r_script)), sep = "\n")
+
+# Show example bsub script
+example_riboseqc_bsub <- riboseqc_bsub_files[1]
+cat("\nExample bsub script (", example_riboseqc_bsub, "):\n", sep = "")
+cat(readLines(here("cluster_scripts", "riboseqc", "bsub_scripts", example_riboseqc_bsub)), sep = "\n")
+```
+
+## Execution Order on Cluster
+
+Run these steps in order:
+
+1. **Merge BAMs**: `bash submit_all_merges.bsub`
+2. **Convert FASTA to 2bit**: `bsub < convert_to_2bit.bsub`
+3. **Prepare annotation**: `bsub < prepare_annotation.bsub` (wait for 2bit to complete)
+4. **Process BAM chromosomes**: `bash process_bam_chromosomes.sh` (wait for merges to complete)
+5. **Run RiboseQC**: `bash submit_all_riboseqc.bsub` (wait for annotation and BAM processing)
+
+## Generate ORFquant Scripts
+
+After RiboseQC completes, run ORFquant for translation quantification.
+
+```{r define-orfquant-paths}
+# Define ORFquant cluster paths
+orfquant_base_path <- "/beevol/home/matlinka/eif3e_hypoxia/ORFquant/orfquant_hypoxia_timecourse/orfquant"
+```
+
+```{r create-orfquant-directories}
+# Create output directories for ORFquant scripts
+dir.create(here("cluster_scripts", "orfquant", "r_scripts"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("cluster_scripts", "orfquant", "bsub_scripts"), recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r generate-orfquant-scripts}
+# Generate R and bsub scripts for each group
+
+for (group_name in group_names) {
+  # R script for ORFquant analysis
+  r_script_content <- glue::glue('library(ORFquant)
+
+run_ORFquant(
+  for_ORFquant_file = "{riboseqc_base_path}/{group_name}_riboseqc_for_ORFquant",
+  annotation_file = "{annotation_file}",
+  n_cores = 10,
+  prefix = "{group_name}"
+)
+')
+  writeLines(r_script_content, here("cluster_scripts", "orfquant", "r_scripts", paste0("orfquant_", group_name, ".R")))
+
+  # bsub script
+  bsub_content <- glue::glue('#!/usr/bin/env bash
+#BSUB -n 10
+#BSUB -q rna
+#BSUB -R "select[mem>50] rusage[mem=50]"
+#BSUB -R "span[hosts=1]"
+#BSUB -o {orfquant_base_path}/logs/orfquant_{group_name}_%J.log
+#BSUB -e {orfquant_base_path}/logs/orfquant_{group_name}_%J.out
+
+. /usr/share/Modules/init/bash
+source ~/.bashrc
+conda activate working_orf
+
+cd {orfquant_base_path}
+Rscript r_scripts/orfquant_{group_name}.R
+')
+  writeLines(bsub_content, here("cluster_scripts", "orfquant", "bsub_scripts", paste0("orfquant_", group_name, ".bsub")))
+}
+
+cat("Generated ORFquant scripts for", length(group_names), "groups\n")
+```
+
+```{r generate-orfquant-master-submit}
+# Write master submit script for all ORFquant jobs
+submit_lines <- c(
+  "#!/bin/bash",
+  "",
+  paste0("cd ", orfquant_base_path),
+  ""
+)
+submit_lines <- c(submit_lines, paste0("bsub < bsub_scripts/orfquant_", group_names, ".bsub"))
+writeLines(submit_lines, here("cluster_scripts", "orfquant", "submit_all_orfquant.bsub"))
+
+cat("Master submit script created at cluster_scripts/orfquant/submit_all_orfquant.bsub\n")
+```
+
+```{r verify-orfquant-outputs}
+# Verify ORFquant outputs
+orfquant_r_files <- list.files(here("cluster_scripts", "orfquant", "r_scripts"), pattern = "\\.R$")
+orfquant_bsub_files <- list.files(here("cluster_scripts", "orfquant", "bsub_scripts"), pattern = "\\.bsub$")
+
+cat("ORFquant R scripts created:", length(orfquant_r_files), "\n")
+cat("ORFquant bsub scripts created:", length(orfquant_bsub_files), "\n")
+```
