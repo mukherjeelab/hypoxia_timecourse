@@ -1,0 +1,665 @@
+---
+title: "Combined Feature Extraction for Hypoxia Response Prediction"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This analysis builds the full feature matrix by combining:
+- **UTR descriptive features**: region lengths, GC content, GC3 (computed here)
+- **Biological features**: eIF3 CLIP binding, 4E resistance, DAP5 sensitivity (from 01b)
+- **Pre-computed sequence features**: k-mer frequencies and RBP motif scores (from `01c_kmer_motif_precompute.Rmd`)
+
+## Feature Categories
+
+| Category | Features | Count |
+|----------|----------|-------|
+| **Region Lengths** | 5'UTR, CDS, 3'UTR lengths | 3 |
+| **GC Content** | GC% for 5'UTR, CDS, 3'UTR | 3 |
+| **GC3** | Third codon position GC content | 1 |
+| **4-mer Frequencies** | 4-mers in 5'UTR | 256 |
+| **5-mer Frequencies** | 5-mers in 5'UTR | 1,024 |
+| **6-mer Frequencies** | 6-mers in 5'UTR | 4,096 |
+| **RBP Motif Scores** | RBNS + CISBP-RNA PWMs across 5'UTR/CDS/3'UTR | ~900 |
+| **eIF3 CLIP Binding** | Regional (5utr/cds/3utr) × 7 conditions | ~21 |
+| **4E Resistance** | Continuous LFC (4e_resistance_score_lfc) | 1 |
+| **DAP5 KD (Weber 2022)** | Continuous negated LFC (dap5_promoted_score_weber_lfc) | 1 |
+| **DAP5 Polysome (GSE115142)** | Continuous LFC (dap5_promoted_score_polysome_lfc) | 1 |
+| **eIF4E-IP Baseline (Teleman)** | Continuous LFC (eif4e_ip_vehicle_lfc) | 1 |
+| **eIF4E-IP 4E Inhibition (Teleman)** | Continuous LFC (eif4e_ip_4e_inhib_lfc) | 1 |
+| **Literature Translation Signatures** | Binary membership in 25 published gene sets | 25 |
+| **Total predictors** | | **~6,333** |
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(tximport)
+```
+
+# Load Gene Annotation
+
+```{r load_gene_annotation}
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"))
+
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  arrange(gene_id, type == "protein_coding") %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, symbol)
+
+cat("Gene annotation loaded:", nrow(gene_symbols), "genes\n")
+```
+
+# Load TE Data (1hr Hypoxia Response)
+
+```{r load_te_data}
+te_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+
+cat("Loaded TE data:", nrow(te_1hr), "genes\n")
+
+te_1hr <- te_1hr %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  filter(!is.na(symbol))
+
+cat("TE data with symbols:", nrow(te_1hr), "genes\n")
+```
+
+# Load TxDb and Genome
+
+```{r load_txdb}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+
+tx2gene <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                    col_names = c("transcript_id", "gene_id")) %>%
+  filter(str_starts(transcript_id, "ENST"))
+
+gene_symbol_map <- gene_symbols
+
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cat("Loaded TxDb and genome\n")
+cat("Transcripts in tx2gene:", nrow(tx2gene), "\n")
+```
+
+# Select Most Abundant Transcript Per Gene
+
+```{r load_salmon}
+salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
+salmon_samples <- list.dirs(salmon_dir, recursive = FALSE, full.names = FALSE)
+
+salmon_files <- file.path(salmon_dir, salmon_samples, "quant.sf.gz")
+names(salmon_files) <- salmon_samples
+
+salmon_files <- salmon_files[file.exists(salmon_files)]
+cat("Found", length(salmon_files), "Salmon quant files\n")
+
+txi_transcripts <- tximport(salmon_files, type = "salmon", tx2gene = tx2gene, txOut = TRUE)
+
+transcript_abundance <- txi_transcripts$abundance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  left_join(tx2gene, by = "transcript_id")
+
+most_abundant_tx <- transcript_abundance %>%
+  mutate(total_abundance = rowSums(across(where(is.numeric)), na.rm = TRUE)) %>%
+  dplyr::select(transcript_id, gene_id, total_abundance) %>%
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    transcript_id_clean = sub("\\..*", "", transcript_id)
+  ) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(total_abundance, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+most_abundant_tx <- most_abundant_tx %>%
+  left_join(gene_symbol_map %>% mutate(gene_id_clean = sub("\\..*", "", gene_id)),
+            by = "gene_id_clean")
+
+cat("Selected most abundant transcript for", nrow(most_abundant_tx), "genes (all)\n")
+
+te_gene_ids <- te_1hr %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  pull(gene_id_clean) %>%
+  unique()
+
+most_abundant_tx <- most_abundant_tx %>%
+  filter(gene_id_clean %in% te_gene_ids)
+
+cat("After filtering to genes with TE data:", nrow(most_abundant_tx), "genes\n")
+
+cat("\nExample transcript IDs from Salmon:", head(most_abundant_tx$transcript_id, 3), "\n")
+cat("Example transcript IDs (cleaned):", head(most_abundant_tx$transcript_id_clean, 3), "\n")
+```
+
+# Extract Region Lengths
+
+```{r extract_regions}
+utr5 <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr3 <- threeUTRsByTranscript(txdb, use.names = TRUE)
+cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+utr5_widths <- as.data.frame(utr5) %>%
+  group_by(group_name) %>%
+  summarise(
+    utr5_length = sum(width),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", group_name)
+  ) %>%
+  dplyr::select(transcript_id_clean, utr5_length)
+
+utr3_widths <- as.data.frame(utr3) %>%
+  group_by(group_name) %>%
+  summarise(
+    utr3_length = sum(width),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", group_name)
+  ) %>%
+  dplyr::select(transcript_id_clean, utr3_length)
+
+cds_widths <- as.data.frame(cds) %>%
+  group_by(group_name) %>%
+  summarise(
+    cds_length = sum(width),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", group_name)
+  ) %>%
+  dplyr::select(transcript_id_clean, cds_length)
+
+cat("Extracted region widths:\n")
+cat("5' UTRs:", nrow(utr5_widths), "\n")
+cat("3' UTRs:", nrow(utr3_widths), "\n")
+cat("CDS:", nrow(cds_widths), "\n")
+cat("\nExample TxDb transcript IDs (cleaned):", head(utr5_widths$transcript_id_clean, 3), "\n")
+```
+
+# Extract Sequences & Calculate GC Content
+
+```{r extract_sequences_gc}
+# Extract 5' UTR sequences
+utr5_sequences <- extractTranscriptSeqs(genome, utr5) %>% as.data.frame()
+utr5_seq <- utr5_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("utr5_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, utr5_sequence)
+
+# Extract 3' UTR sequences
+utr3_sequences <- extractTranscriptSeqs(genome, utr3) %>% as.data.frame()
+utr3_seq <- utr3_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("utr3_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, utr3_sequence)
+
+# Extract CDS sequences
+cds_sequences <- extractTranscriptSeqs(genome, cds) %>% as.data.frame()
+cds_seq <- cds_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("cds_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, cds_sequence)
+
+cat("Extracted sequences:\n")
+cat("5' UTRs:", nrow(utr5_seq), "\n")
+cat("3' UTRs:", nrow(utr3_seq), "\n")
+cat("CDS:", nrow(cds_seq), "\n")
+
+# GC content function
+gc_content <- function(seq) {
+  seq <- str_to_upper(seq)
+  gc_count <- str_count(seq, "[GC]")
+  total_length <- str_length(seq)
+  result <- (gc_count / total_length) * 100
+  result[total_length == 0] <- NA
+  return(result)
+}
+
+# Calculate GC content for each region
+utr5_gc <- utr5_seq %>%
+  mutate(utr5_gc = gc_content(utr5_sequence)) %>%
+  dplyr::select(transcript_id_clean, utr5_gc)
+
+utr3_gc <- utr3_seq %>%
+  mutate(utr3_gc = gc_content(utr3_sequence)) %>%
+  dplyr::select(transcript_id_clean, utr3_gc)
+
+cds_gc <- cds_seq %>%
+  mutate(cds_gc = gc_content(cds_sequence)) %>%
+  dplyr::select(transcript_id_clean, cds_gc)
+
+cat("Calculated GC content for all regions\n")
+```
+
+# Calculate GC3
+
+```{r calculate_gc3}
+calculate_gc3 <- function(cds_sequence) {
+  if (is.na(cds_sequence) || nchar(cds_sequence) < 3) {
+    return(NA)
+  }
+
+  seq <- str_to_upper(cds_sequence)
+  seq_len <- nchar(seq)
+
+  complete_codons <- seq_len %/% 3
+  if (complete_codons == 0) return(NA)
+
+  third_positions <- sapply(1:complete_codons, function(i) {
+    substr(seq, (i-1)*3 + 3, (i-1)*3 + 3)
+  })
+
+  gc_count <- sum(third_positions %in% c("G", "C"))
+  gc3 <- (gc_count / length(third_positions)) * 100
+
+  return(gc3)
+}
+
+cds_gc3 <- cds_seq %>%
+  mutate(gc3 = sapply(cds_sequence, calculate_gc3)) %>%
+  dplyr::select(transcript_id_clean, gc3)
+
+cat("Calculated GC3 content\n")
+cat("Median GC3:", round(median(cds_gc3$gc3, na.rm = TRUE), 2), "%\n")
+```
+
+# eIF3 CLIP Binding Features
+
+```{r clip_binding}
+clip_data <- read_csv("/Users/katematlin/github/mpra_preliminary/score_card.csv")
+
+clip_conditions <- c("lee_parclip_a_b_d_g", "lee_parclip_d_only", "cate_undiff_npcs",
+                      "cate_diff_npcs", "lee_int_stress", "lee_complete_media", "lee_glu_dep")
+
+clip_data <- clip_data %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+clip_features <- clip_data %>%
+  dplyr::select(gene_id_clean) %>%
+  dplyr::distinct()
+
+for (condition in clip_conditions) {
+  utr5_col <- paste0("clip_", condition, "_5utr")
+  cds_col <- paste0("clip_", condition, "_cds")
+  utr3_col <- paste0("clip_", condition, "_3utr")
+
+  condition_data <- clip_data %>%
+    dplyr::select(gene_id_clean, value = all_of(condition)) %>%
+    dplyr::mutate(
+      value_lower = tolower(value),
+      !!utr5_col  := as.integer(str_detect(value_lower, "5utr")),
+      !!cds_col   := as.integer(str_detect(value_lower, "cds")),
+      !!utr3_col  := as.integer(str_detect(value_lower, "3utr"))
+    ) %>%
+    dplyr::select(gene_id_clean, all_of(c(utr5_col, cds_col, utr3_col)))
+
+  clip_features <- clip_features %>%
+    dplyr::left_join(condition_data, by = "gene_id_clean")
+}
+
+clip_features <- clip_features %>%
+  dplyr::mutate(across(-gene_id_clean, ~as.integer(replace_na(., 0L))))
+
+# Drop columns that are all zero
+all_zero_cols <- names(clip_features)[sapply(clip_features, function(x) is.numeric(x) && sum(x) == 0)]
+if (length(all_zero_cols) > 0) {
+  cat("Dropping", length(all_zero_cols), "all-zero CLIP columns:", paste(all_zero_cols, collapse = ", "), "\n")
+  clip_features <- clip_features %>%
+    dplyr::select(-all_of(all_zero_cols))
+}
+
+cat("CLIP features retained:", ncol(clip_features) - 1, "features\n")
+cat("Genes with CLIP data:", nrow(clip_features), "\n")
+```
+
+# 4E Resistance Features
+
+```{r 4e_resistance}
+teleman_data <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv") %>%
+  dplyr::filter(!is.na(symbol)) %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+teleman_features <- teleman_data %>%
+  dplyr::transmute(symbol = symbol, `4e_resistance_score_lfc` = log2FoldChange)
+
+cat("Genes with 4E resistance score:", nrow(teleman_features), "\n")
+```
+
+# eIF4E-IP CLIP Binding Features (Teleman)
+
+```{r eif4e_ip_features}
+# eIF4E-IP vehicle (baseline binding)
+eif4e_ip_vehicle <- read_csv("/Users/katematlin/github/mpra_preliminary/res_ip_vehicle.csv") %>%
+  dplyr::filter(!is.na(symbol)) %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+eif4e_ip_vehicle_features <- eif4e_ip_vehicle %>%
+  dplyr::transmute(symbol = symbol, eif4e_ip_vehicle_lfc = log2FoldChange)
+
+cat("Genes with eIF4E-IP vehicle LFC:", nrow(eif4e_ip_vehicle_features), "\n")
+
+# eIF4E-IP 4E inhibition
+eif4e_ip_4e_inhib <- read_csv("/Users/katematlin/github/mpra_preliminary/res_ip_4E.csv") %>%
+  dplyr::filter(!is.na(symbol)) %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+eif4e_ip_4e_inhib_features <- eif4e_ip_4e_inhib %>%
+  dplyr::transmute(symbol = symbol, eif4e_ip_4e_inhib_lfc = log2FoldChange)
+
+cat("Genes with eIF4E-IP 4E inhibition LFC:", nrow(eif4e_ip_4e_inhib_features), "\n")
+```
+
+# DAP5 KD Features (Weber 2022)
+
+```{r dap5_weber}
+dap5_data <- read_xlsx(here("accessories", "dap5kd_riboseq_weber2022.xlsx")) %>%
+  dplyr::filter(!is.na(geneIDs), comment != "no")
+
+dap5_weber_features <- dap5_data %>%
+  dplyr::transmute(
+    symbol = geneIDs,
+    dap5_promoted_score_weber_lfc = -`log2FC_TE(DAP5KO vs control)`
+  )
+
+cat("Genes with DAP5 Weber promoted score:", nrow(dap5_weber_features), "\n")
+```
+
+# DAP5 Polysome Features (GSE115142)
+
+```{r dap5_polysome}
+dap5_polysome <- read_csv(here("output", "dap5_deseq2_full_results.csv"))
+
+cat("DAP5 polysome DESeq2 results:", nrow(dap5_polysome), "genes\n")
+
+dap5_polysome_features <- dap5_polysome %>%
+  dplyr::transmute(
+    symbol = symbol,
+    dap5_promoted_score_polysome_lfc = log2FoldChange
+  ) %>%
+  dplyr::filter(!is.na(symbol))
+
+cat("Genes with DAP5 polysome promoted score:", nrow(dap5_polysome_features), "\n")
+```
+
+# Load Pre-computed K-mer and Motif Features
+
+```{r load_precomputed}
+kmer_features <- readRDS(here("output", "predictive_modeling", "precomputed_kmer_features.rds"))
+motif_features <- readRDS(here("output", "predictive_modeling", "precomputed_motif_features.rds"))
+precomputed_tx <- readRDS(here("output", "predictive_modeling", "precomputed_most_abundant_tx.rds"))
+
+cat("Loaded pre-computed features:\n")
+cat("  K-mer features:", ncol(kmer_features) - 1, "features for", nrow(kmer_features), "transcripts\n")
+cat("  Motif features:", ncol(motif_features) - 1, "features for", nrow(motif_features), "transcripts\n")
+cat("  Most abundant tx (precomputed):", nrow(precomputed_tx), "transcripts\n")
+```
+
+## Load ORFquant ORF-type Features
+
+```{r load_orfquant}
+orfquant_features <- read_csv(
+  here("output", "predictive_modeling", "orfquant_orf_types_normoxia_siCTRL.csv")
+)
+```
+
+# Translation Signature Features (Literature)
+
+```{r translation_signatures}
+lit_sigs <- read_csv(here("accessories", "translation_signatures_literature_1_9_25.csv"),
+                     show_col_types = FALSE)
+
+# Clean gs_name to valid column names with lit_ prefix
+lit_sigs_wide <- lit_sigs %>%
+  dplyr::mutate(
+    feature_name = paste0("lit_", str_replace_all(gs_name, "[ -]+", "_")),
+    value = 1L
+  ) %>%
+  dplyr::select(symbol = db_gene_symbol, feature_name, value) %>%
+  dplyr::distinct(symbol, feature_name, .keep_all = TRUE) %>%
+  pivot_wider(names_from = feature_name, values_from = value, values_fill = 0L)
+
+cat("Literature translation signatures loaded:\n")
+cat("  Gene sets:", n_distinct(lit_sigs$gs_name), "\n")
+cat("  Genes with any signature:", nrow(lit_sigs_wide), "\n")
+cat("  Features:", ncol(lit_sigs_wide) - 1, "\n")
+```
+
+# Assemble Feature Matrix
+
+```{r assemble_features}
+# Start with most abundant transcripts and TE data
+feature_matrix <- most_abundant_tx %>%
+  dplyr::select(transcript_id, transcript_id_clean, gene_id = gene_id.x, symbol) %>%
+  mutate(
+    transcript_id_clean = sub("\\..*", "", transcript_id),
+    gene_id_clean       = sub("\\..*", "", gene_id)) |>
+  # Add TE data (join by gene_id)
+  left_join(te_1hr %>%
+              mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+              dplyr::select(gene_id_clean, te_lfc, te_padj),
+            by = "gene_id_clean") %>%
+  # Add region lengths (join by transcript_id_clean)
+  left_join(utr5_widths, by = "transcript_id_clean") %>%
+  left_join(utr3_widths, by = "transcript_id_clean") %>%
+  left_join(cds_widths, by = "transcript_id_clean") %>%
+  # Add GC content (join by transcript_id_clean)
+  left_join(utr5_gc, by = "transcript_id_clean") %>%
+  left_join(utr3_gc, by = "transcript_id_clean") %>%
+  left_join(cds_gc, by = "transcript_id_clean") %>%
+  # Add GC3 (join by transcript_id_clean)
+  left_join(cds_gc3, by = "transcript_id_clean") %>%
+  # Add pre-computed k-mer frequencies (join by transcript_id_clean)
+  left_join(kmer_features, by = "transcript_id_clean") %>%
+  # Add pre-computed RBP motif scores (join by transcript_id_clean)
+  left_join(motif_features, by = "transcript_id_clean") %>%
+  # Add CLIP binding (join by gene_id_clean)
+  left_join(clip_features, by = "gene_id_clean") %>%
+  # Add ORFquant ORF-type features (join by gene_id_clean)
+  left_join(orfquant_features, by = "gene_id_clean") %>%
+  # Add 4E resistance LFC (by symbol)
+  left_join(teleman_features, by = "symbol") %>%
+  # Add DAP5 Weber LFC (by symbol)
+  left_join(dap5_weber_features, by = "symbol") %>%
+  # Add DAP5 polysome LFC (by symbol)
+  left_join(dap5_polysome_features, by = "symbol") %>%
+  # Add eIF4E-IP vehicle LFC (by symbol)
+  left_join(eif4e_ip_vehicle_features, by = "symbol") %>%
+  # Add eIF4E-IP 4E inhibition LFC (by symbol)
+  left_join(eif4e_ip_4e_inhib_features, by = "symbol") %>%
+  # Add literature translation signatures (by symbol)
+  left_join(lit_sigs_wide, by = "symbol")
+
+# Fill NAs with 0
+# K-mer frequencies: transcripts without a 5' UTR (or too short) get 0
+feature_matrix <- feature_matrix %>%
+  dplyr::mutate(across(starts_with("utr5_4mer_"), ~replace_na(., 0))) %>%
+  dplyr::mutate(across(starts_with("utr5_5mer_"), ~replace_na(., 0))) %>%
+  dplyr::mutate(across(starts_with("utr5_6mer_"), ~replace_na(., 0))) %>%
+  dplyr::mutate(across(starts_with("clip_"), ~replace_na(., 0L))) %>%
+  dplyr::mutate(across(starts_with("lit_"), ~replace_na(., 0L))) %>%
+  dplyr::mutate(across(starts_with("orfquant_"), ~replace_na(., 0L)))
+
+# Check join success
+cat("\nJoin diagnostics:\n")
+cat("Total transcripts:", nrow(most_abundant_tx), "\n")
+cat("With 5' UTR length:", sum(!is.na(feature_matrix$utr5_length)), "\n")
+cat("With CDS length:", sum(!is.na(feature_matrix$cds_length)), "\n")
+cat("With 3' UTR length:", sum(!is.na(feature_matrix$utr3_length)), "\n")
+cat("With TE data:", sum(!is.na(feature_matrix$te_lfc)), "\n")
+
+# Filter to genes with TE data and valid features
+feature_matrix <- feature_matrix %>%
+  filter(!is.na(te_lfc),
+         !is.na(utr5_length),
+         !is.na(cds_length))
+
+# Drop any binary feature columns that are all zero after filtering
+binary_prefixes <- c("clip_", "lit_", "orfquant_")
+binary_cols <- names(feature_matrix)[sapply(names(feature_matrix), function(n) any(str_starts(n, binary_prefixes)))]
+all_zero_binary <- binary_cols[sapply(binary_cols, function(col) sum(feature_matrix[[col]], na.rm = TRUE) == 0)]
+if (length(all_zero_binary) > 0) {
+  cat("Dropping", length(all_zero_binary), "all-zero binary columns:\n")
+  cat(" ", paste(all_zero_binary, collapse = ", "), "\n")
+  feature_matrix <- feature_matrix %>%
+    dplyr::select(-all_of(all_zero_binary))
+}
+
+# --- Negative control attrition diagnostic ---
+neg_ctrl <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+neg_ids <- neg_ctrl$gene_id_clean
+
+cat("\n=== Negative control gene attrition ===\n")
+cat("Total negative control genes:", length(neg_ids), "\n")
+cat("Unique genes in feature_matrix:", n_distinct(feature_matrix$gene_id_clean), "\n")
+cat("Neg ctrl genes in feature_matrix:",
+    n_distinct(feature_matrix$gene_id_clean[feature_matrix$gene_id_clean %in% neg_ids]), "\n")
+cat("Neg ctrl genes NOT in feature_matrix:",
+    sum(!neg_ids %in% feature_matrix$gene_id_clean), "\n")
+cat("Duplicate gene_id_clean rows in feature_matrix:",
+    nrow(feature_matrix) - n_distinct(feature_matrix$gene_id_clean), "\n")
+
+cat("\nFeature matrix assembled:\n")
+cat("Genes:", nrow(feature_matrix), "\n")
+cat("Total columns:", ncol(feature_matrix), "\n")
+```
+
+# Create Binned TE Category for Stratified Sampling
+
+```{r create_bins}
+feature_matrix <- feature_matrix %>%
+  mutate(te_lfc_bin = cut(te_lfc,
+                          breaks = quantile(te_lfc, probs = seq(0, 1, 0.2), na.rm = TRUE),
+                          include.lowest = TRUE,
+                          labels = c("Q1", "Q2", "Q3", "Q4", "Q5")))
+
+cat("\nTE LFC bins for stratified sampling:\n")
+print(table(feature_matrix$te_lfc_bin))
+```
+
+# Quality Control
+
+```{r quality_control}
+# Check for missing values
+missing_summary <- feature_matrix %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+cat("\nFeatures with missing values:\n")
+if (nrow(missing_summary) > 0) {
+  print(missing_summary)
+} else {
+  cat("None (all features complete)\n")
+}
+
+# Summarize binary feature counts
+cat("\nBinary feature summary (non-zero counts):\n")
+binary_cols_final <- names(feature_matrix)[sapply(names(feature_matrix), function(n) any(str_starts(n, c("clip_", "lit_"))))]
+for (col in binary_cols_final) {
+  cat(sprintf("  %s: %d genes\n", col, sum(feature_matrix[[col]], na.rm = TRUE)))
+}
+
+# Summary of continuous features
+cat("\n4E resistance LFC summary:\n")
+print(summary(feature_matrix$`4e_resistance_score_lfc`))
+
+cat("\nDAP5 Weber promoted score LFC summary:\n")
+print(summary(feature_matrix$dap5_promoted_score_weber_lfc))
+
+cat("\nDAP5 polysome promoted score LFC summary:\n")
+print(summary(feature_matrix$dap5_promoted_score_polysome_lfc))
+
+cat("\neIF4E-IP vehicle LFC summary:\n")
+print(summary(feature_matrix$eif4e_ip_vehicle_lfc))
+
+cat("\neIF4E-IP 4E inhibition LFC summary:\n")
+print(summary(feature_matrix$eif4e_ip_4e_inhib_lfc))
+
+# Region length and GC summaries
+cat("\n5' UTR length:\n")
+print(summary(feature_matrix$utr5_length))
+
+cat("\n3' UTR length:\n")
+print(summary(feature_matrix$utr3_length))
+
+cat("\nCDS length:\n")
+print(summary(feature_matrix$cds_length))
+
+cat("\n5' UTR GC content:\n")
+print(summary(feature_matrix$utr5_gc))
+
+cat("\nGC3 content:\n")
+print(summary(feature_matrix$gc3))
+
+cat("\nTE log2 fold change (target):\n")
+print(summary(feature_matrix$te_lfc))
+```
+
+# Export Feature Matrix
+
+```{r export_features}
+dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
+
+write_csv(feature_matrix, here("output", "predictive_modeling", "feature_matrix_1hr_combined.csv"))
+cat("Exported: output/predictive_modeling/feature_matrix_1hr_combined.csv\n")
+
+saveRDS(feature_matrix, here("output", "predictive_modeling", "feature_matrix_1hr_combined.rds"))
+cat("Exported: output/predictive_modeling/feature_matrix_1hr_combined.rds\n")
+
+cat("\n\nFinal Feature Matrix Summary:\n")
+cat("Total genes:", nrow(feature_matrix), "\n")
+cat("Total columns:", ncol(feature_matrix), "\n")
+cat("  - Identifiers: gene_id, gene_id_clean, transcript_id, transcript_id_clean, symbol\n")
+cat("  - Target: te_lfc, te_padj, te_lfc_bin\n")
+cat("  - Region lengths: 3 features\n")
+cat("  - GC content: 3 features\n")
+cat("  - GC3: 1 feature\n")
+cat("  - 4-mer frequencies: 256 features\n")
+cat("  - 5-mer frequencies: 1024 features\n")
+cat("  - 6-mer frequencies: 4096 features\n")
+cat("  - RBP motif scores:", sum(str_detect(names(feature_matrix), "^rbns_|^cisbp_")), "features\n")
+cat("  - CLIP binding:", sum(str_detect(names(feature_matrix), "^clip_")), "features\n")
+cat("  - 4E resistance: 1 feature (4e_resistance_score_lfc)\n")
+cat("  - DAP5 KD (Weber): 1 feature (dap5_promoted_score_weber_lfc)\n")
+cat("  - DAP5 polysome: 1 feature (dap5_promoted_score_polysome_lfc)\n")
+cat("  - eIF4E-IP (Teleman): 2 features (eif4e_ip_vehicle_lfc, eif4e_ip_4e_inhib_lfc)\n")
+cat("  - Literature translation signatures:", sum(str_detect(names(feature_matrix), "^lit_")), "features\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
