@@ -1,0 +1,646 @@
+---
+title: "`r paste0('Random Forest Classification (No Boruta): eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set: "targeted"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# Defaults for interactive use (overwritten by YAML params when knitting)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    condition = "hypoxia",
+    gene      = "3d",
+    direction = "promotes",
+    timepoint = "1hr",
+    lfc       = "0.5",
+    feature_set = "targeted" #targeted or combined
+  )
+}
+
+# Derived file paths and labels from params
+geneset_csv <- paste0(params$condition, "_", params$gene, "_", params$direction,
+                      "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
+feature_matrix_rds <- paste0("feature_matrix_", params$timepoint, "_combined.rds")
+suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 params$condition, "_", params$timepoint, "_lfc", params$lfc,
+                 "_", params$feature_set, "_no_boruta")
+pos_label <- params$direction
+neg_label <- paste0("does_not_", sub("s$", "", params$direction))
+gene_label <- paste0("eIF", params$gene)
+
+cat("Gene set CSV:", geneset_csv, "\n")
+cat("Feature matrix:", feature_matrix_rds, "\n")
+cat("Output suffix:", suffix, "\n")
+cat("Positive label:", pos_label, "\n")
+cat("Negative label:", neg_label, "\n")
+```
+
+# Overview
+
+Binary classification without Boruta feature selection: does a gene's mRNA sequence predict whether `r gene_label` `r params$direction` its translation?
+
+- **Positive class ("`r pos_label`")**: Genes from `` `r geneset_csv` ``
+- **Negative class ("`r neg_label`")**: Genes from `negative_control_genes.csv` (not regulated by `r gene_label` in any condition/timepoint)
+
+## Parameters
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `condition` | `"hypoxia"`, `"normoxia"` | Experimental condition |
+| `gene` | `"3d"`, `"3e"` | eIF3 subunit |
+| `direction` | `"promotes"`, `"inhibits"` | Direction of TE regulation |
+| `timepoint` | `"1hr"`, `"4hr"`, `"24hr"` | Hypoxia timepoint |
+| `lfc` | `"0.5"`, `"1"` | Log2 fold change threshold for gene set |
+| `feature_set` | `"targeted"`, `"combined"` | `"targeted"` = combined minus k-mers & RBP motifs (biological + lengths + GC + ORFquant + literature signatures); `"combined"` = all features |
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+library(cowplot)
+
+```
+
+# Load Data
+
+```{r load_data}
+# Feature matrix
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+# Positive class
+positive_genes <- read_csv(here("output", "genesets", geneset_csv))
+cat("Positive genes:", nrow(positive_genes), "\n")
+
+# Negative class: genes not regulated by eIF3d in any condition
+negative_control_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv")) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+cat("Negative control genes:", nrow(negative_control_genes), "\n")
+```
+
+# Create Binary Target
+
+```{r create_target}
+set.seed(9)
+number_to_match <- min(length(positive_genes$ensembl_gene), nrow(negative_control_genes))
+
+# Label genes
+features <- features %>%
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+    gene_id_clean %in% sample(negative_control_genes$gene_id_clean, number_to_match) ~ neg_label,
+    TRUE ~ NA_character_
+  ))
+
+# Keep only labeled genes
+model_genes <- features %>%
+  filter(!is.na(eif3d_target)) %>%
+  mutate(eif3d_target = factor(eif3d_target, levels = c(neg_label, pos_label)))
+
+nrow(model_genes)
+
+cat("Positive (", pos_label, "):", sum(model_genes$eif3d_target == pos_label), "\n")
+cat("Negative (", neg_label, "):", sum(model_genes$eif3d_target == neg_label), "\n")
+cat("Total:", nrow(model_genes), "\n")
+cat("Imbalance ratio (neg:pos):",
+    round(sum(model_genes$eif3d_target == neg_label) /
+          sum(model_genes$eif3d_target == pos_label), 1), ":1\n")
+```
+
+# Preprocessing
+
+## Filter Features (No Boruta)
+
+```{r filter_features}
+# Identify feature columns (exclude ID/target cols) — same logic as 06
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+all_cols <- colnames(model_genes)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols <- unique(c(id_cols, id_pattern_cols))
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count (all combined):", length(feature_cols), "\n")
+
+# If targeted: remove k-mer and RBP motif columns
+if (params$feature_set == "targeted") {
+  kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+  excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
+  feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+  cat("Targeted mode: removed", length(excluded), "k-mer/motif columns\n")
+}
+cat("Feature count after filtering:", length(feature_cols), "\n")
+```
+
+## Median-Impute Missing Values
+
+```{r impute_missing}
+missing_counts <- model_genes %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+cat("Features with missing values:", nrow(missing_counts), "\n")
+if (nrow(missing_counts) > 0) print(missing_counts)
+
+model_genes <- model_genes %>%
+  mutate(across(all_of(feature_cols), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+cat("Remaining NAs:", sum(is.na(model_genes[, feature_cols])), "\n")
+```
+
+# Prepare Modeling Data
+
+```{r prepare_data}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols))
+
+cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+cat("\nClass distribution:\n")
+print(table(model_data$eif3d_target))
+```
+
+# Train/Test Split
+
+```{r train_test_split}
+set.seed(9)
+
+train_idx <- createDataPartition(model_data$eif3d_target, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data <- model_data[-train_idx, ]
+
+cat("Training set:", nrow(train_data), "\n")
+print(table(train_data$eif3d_target))
+cat("\nTest set:", nrow(test_data), "\n")
+print(table(test_data$eif3d_target))
+```
+
+# Train Random Forest
+
+```{r train_rf}
+# Classes are already balanced (neg sampled to match pos count), so no case weights needed.
+set.seed(9)
+rf_model <- ranger(
+  x = train_data[, feature_cols],
+  y = train_data$eif3d_target,
+  num.trees = 500,
+  importance = "impurity",
+  probability = TRUE,
+  seed = 9
+)
+
+print(rf_model)
+```
+
+# Evaluate on Test Set
+
+## ROC Curve and AUC
+
+```{r roc_curve, fig.width=8, fig.height=6}
+# Predictions
+pred_probs <- predict(rf_model, test_data[, feature_cols])$predictions
+pred_pos_prob <- pred_probs[, pos_label]
+actual <- test_data$eif3d_target
+
+# ROC
+roc_obj <- roc(response = actual, predictor = pred_pos_prob,
+               levels = c(neg_label, pos_label), direction = "<")
+auc_value <- auc(roc_obj)
+cat("AUC:", round(auc_value, 4), "\n")
+
+# Youden threshold
+coords_youden <- coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"),
+                        best.method = "youden")
+optimal_threshold <- coords_youden$threshold
+
+cat("Youden threshold:", round(optimal_threshold, 4), "\n")
+cat("  Sensitivity:", round(coords_youden$sensitivity, 3), "\n")
+cat("  Specificity:", round(coords_youden$specificity, 3), "\n")
+
+# Plot
+roc_df <- data.frame(sensitivity = roc_obj$sensitivities,
+                     specificity = roc_obj$specificities)
+
+p_roc <- ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "#0072B2", linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = 1 - coords_youden$specificity, y = coords_youden$sensitivity),
+             color = "red", size = 3) +
+  annotate("text", x = 1 - coords_youden$specificity + 0.05, y = coords_youden$sensitivity,
+           label = paste0("Youden\n(", round(optimal_threshold, 3), ")"),
+           color = "red", size = 3, hjust = 0) +
+  theme_cowplot() +
+  labs(
+    title = paste0("ROC Curve: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = paste0("AUC = ", round(auc_value, 3),
+                      " | Threshold = ", round(optimal_threshold, 3)),
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  coord_equal()
+
+print(p_roc)
+
+ggsave(here("plots", paste0("rf_classification_roc_", suffix, ".pdf")),
+       plot = p_roc, width = 8, height = 6)
+```
+
+## Confusion Matrix
+
+```{r confusion_matrix}
+pred_class <- factor(
+  ifelse(pred_pos_prob >= optimal_threshold, pos_label, neg_label),
+  levels = c(neg_label, pos_label)
+)
+
+cm <- confusionMatrix(pred_class, actual, positive = pos_label)
+print(cm)
+
+# Extract metrics
+accuracy <- cm$overall["Accuracy"]
+balanced_accuracy <- cm$byClass["Balanced Accuracy"]
+sensitivity <- cm$byClass["Sensitivity"]
+specificity <- cm$byClass["Specificity"]
+precision <- cm$byClass["Precision"]
+f1 <- cm$byClass["F1"]
+
+cat("\nKey Metrics (Youden Threshold):\n")
+cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
+cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("  Sensitivity:", round(sensitivity, 4), "\n")
+cat("  Specificity:", round(specificity, 4), "\n")
+cat("  Precision:", round(precision, 4), "\n")
+cat("  F1:", round(f1, 4), "\n")
+```
+
+## Confusion Matrix Plot
+
+```{r confusion_matrix_plot, fig.width=6, fig.height=5}
+cm_table <- as.data.frame(cm$table)
+colnames(cm_table) <- c("Predicted", "Actual", "Freq")
+
+p_cm <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#0072B2") +
+  theme_cowplot() +
+  labs(
+    title = paste0("Confusion Matrix (", tools::toTitleCase(params$condition), ")"),
+    subtitle = paste0("Balanced Acc = ", round(balanced_accuracy, 3),
+                      ", F1 = ", round(f1, 3))
+  ) +
+  theme(legend.position = "none")
+
+print(p_cm)
+
+ggsave(here("plots", paste0("rf_classification_confusion_matrix_", suffix, ".pdf")),
+       plot = p_cm, width = 6, height = 5)
+```
+
+# 5-Fold Stratified Cross-Validation
+
+```{r cross_validation}
+set.seed(9)
+folds <- createFolds(model_data$eif3d_target, k = 5, list = TRUE)
+
+cv_results <- lapply(seq_along(folds), function(i) {
+  cat("Fold", i, "...\n")
+
+  test_idx <- folds[[i]]
+  train_cv <- model_data[-test_idx, ]
+  test_cv <- model_data[test_idx, ]
+
+  # Train (classes already balanced, no case weights needed)
+  rf_cv <- ranger(
+    x = train_cv[, feature_cols],
+    y = train_cv$eif3d_target,
+    num.trees = 500,
+    probability = TRUE,
+    seed = 9
+  )
+
+  # Predict
+  pred_probs_cv <- predict(rf_cv, test_cv[, feature_cols])$predictions[, pos_label]
+
+  # ROC + Youden threshold
+  roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv,
+                levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+  coords_cv <- coords(roc_cv, "best", ret = c("threshold", "sensitivity", "specificity"),
+                      best.method = "youden")
+
+  pred_class_cv <- factor(
+    ifelse(pred_probs_cv >= coords_cv$threshold, pos_label, neg_label),
+    levels = c(neg_label, pos_label)
+  )
+  cm_cv <- confusionMatrix(pred_class_cv, test_cv$eif3d_target, positive = pos_label)
+
+  data.frame(
+    fold = i,
+    Threshold = coords_cv$threshold,
+    AUC = as.numeric(auc(roc_cv)),
+    Balanced_Accuracy = cm_cv$byClass["Balanced Accuracy"],
+    Sensitivity = cm_cv$byClass["Sensitivity"],
+    Specificity = cm_cv$byClass["Specificity"],
+    Precision = cm_cv$byClass["Precision"],
+    F1 = cm_cv$byClass["F1"]
+  )
+})
+
+cv_results_df <- bind_rows(cv_results)
+rownames(cv_results_df) <- NULL
+
+cat("\n5-Fold CV Results:\n")
+print(cv_results_df)
+
+cat("\nMean +/- SD:\n")
+for (metric in c("AUC", "Balanced_Accuracy", "Sensitivity", "Specificity", "Precision", "F1")) {
+  vals <- cv_results_df[[metric]]
+  cat(metric, ":", round(mean(vals, na.rm = TRUE), 4), "+/-",
+      round(sd(vals, na.rm = TRUE), 4), "\n")
+}
+```
+
+# Feature Importance
+
+```{r feature_importance, fig.width=10, fig.height=10}
+importance_df <- data.frame(
+  feature = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
+) %>%
+  arrange(desc(importance))
+
+# Clean names for plotting
+importance_df <- importance_df %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_", "CDS 4mer: ") %>%
+      str_replace("^rbp_", "RBP: ") %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%")
+  )
+
+cat("Top 30 Features:\n")
+print(importance_df %>% head(30) %>% dplyr::select(feature, importance))
+
+# Bar plot
+p_importance <- importance_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Top 30 Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Impurity)",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance)
+
+ggsave(here("plots", paste0("rf_classification_feature_importance_", suffix, ".pdf")),
+       plot = p_importance, width = 10, height = 10)
+
+# All-features bar plot (cap at top 60 to avoid oversized PDFs)
+importance_all_plot <- importance_df %>% head(60)
+all_height <- max(6, nrow(importance_all_plot) * 0.35)
+
+p_importance_all <- importance_all_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Top ", nrow(importance_all_plot), " Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Impurity)",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance_all)
+
+ggsave(here("plots", paste0("rf_classification_feature_importance_all_", suffix, ".pdf")),
+       plot = p_importance_all, width = 10, height = all_height)
+
+# Custom-features-only bar plot (exclude k-mer and RBP motif features, cap at top 60)
+importance_custom <- importance_df %>%
+  filter(!str_detect(feature, "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbp_|^rbns_|^cisbp_")) %>%
+  head(60)
+
+custom_height <- max(6, nrow(importance_custom) * 0.35)
+
+p_importance_custom <- importance_custom %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Custom Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Impurity) — CLIP, 4E/DAP5, Signatures, Lengths, GC",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance_custom)
+
+ggsave(here("plots", paste0("rf_classification_feature_importance_custom_", suffix, ".pdf")),
+       plot = p_importance_custom, width = 10, height = custom_height)
+```
+
+## Feature Category Summary
+
+```{r feature_categories, fig.width=10, fig.height=6}
+importance_df <- importance_df %>%
+  mutate(
+    category = case_when(
+      str_detect(feature, "^orfquant_")                       ~ "ORFquant",
+      str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
+      str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
+      str_detect(feature, "^cds_4mer_")                       ~ "CDS 4-mers",
+      str_detect(feature, "^rbns_|^cisbp_")                   ~ "RBP Motifs",
+      str_detect(feature, "^clip_")                           ~ "CLIP Binding",
+      str_detect(feature, "^lit_")                            ~ "Literature Signatures",
+      str_detect(feature, "length|Length")                     ~ "Region Lengths",
+      str_detect(feature, "_gc$|^gc3$")                       ~ "GC Content",
+      str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_")  ~ "4E / DAP5",
+      TRUE                                                    ~ "Other"
+    )
+  )
+
+category_summary <- importance_df %>%
+  group_by(category) %>%
+  summarise(
+    n_features = n(),
+    total_importance = sum(importance),
+    mean_importance = mean(importance),
+    top_feature = feature[which.max(importance)],
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_importance))
+
+cat("\nImportance by Category:\n")
+print(category_summary)
+
+p_category <- ggplot(category_summary,
+                     aes(x = reorder(category, total_importance), y = total_importance)) +
+  geom_bar(stat = "identity", fill = "#56B4E9") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Feature Importance by Category (", tools::toTitleCase(params$condition), ")"),
+    x = "",
+    y = "Total Variable Importance"
+  )
+
+print(p_category)
+
+ggsave(here("plots", paste0("rf_classification_importance_by_category_", suffix, ".pdf")),
+       plot = p_category, width = 10, height = 6)
+```
+
+# Export Results
+
+```{r export_results}
+output_dir <- here("output", "predictive_modeling")
+
+# Model
+saveRDS(rf_model, file.path(output_dir, paste0("rf_classifier_", suffix, ".rds")))
+
+# Feature importance
+write_csv(importance_df, file.path(output_dir, paste0("rf_classification_importance_", suffix, ".csv")))
+
+# Performance summary
+performance_df <- data.frame(
+  Metric = c("AUC", "Accuracy", "Balanced_Accuracy", "Sensitivity",
+             "Specificity", "Precision", "F1"),
+  Test_Set = c(as.numeric(auc_value), accuracy, balanced_accuracy,
+               sensitivity, specificity, precision, f1),
+  CV_Mean = c(mean(cv_results_df$AUC), NA, mean(cv_results_df$Balanced_Accuracy),
+              mean(cv_results_df$Sensitivity), mean(cv_results_df$Specificity),
+              mean(cv_results_df$Precision, na.rm = TRUE),
+              mean(cv_results_df$F1, na.rm = TRUE)),
+  CV_SD = c(sd(cv_results_df$AUC), NA, sd(cv_results_df$Balanced_Accuracy),
+            sd(cv_results_df$Sensitivity), sd(cv_results_df$Specificity),
+            sd(cv_results_df$Precision, na.rm = TRUE),
+            sd(cv_results_df$F1, na.rm = TRUE))
+)
+write_csv(performance_df, file.path(output_dir, paste0("rf_classification_performance_", suffix, ".csv")))
+
+# CV results
+write_csv(cv_results_df, file.path(output_dir, paste0("rf_classification_cv_results_", suffix, ".csv")))
+
+# Predictions
+predictions_export <- data.frame(
+  gene_id = test_data$gene_id_clean,
+  symbol = test_data$symbol,
+  actual = actual,
+  predicted = pred_class,
+  prob_pos = pred_pos_prob,
+  prob_neg = pred_probs[, neg_label]
+)
+write_csv(predictions_export, file.path(output_dir, paste0("rf_classification_predictions_", suffix, ".csv")))
+
+cat("Exported: model RDS, importance CSV, performance CSV, CV results CSV, predictions CSV\n")
+```
+
+# Summary
+
+```{r summary}
+cat("========================================\n")
+cat(paste0("CLASSIFICATION SUMMARY (", tools::toTitleCase(params$condition), ")\n"))
+cat("========================================\n\n")
+
+cat("Parameters:\n")
+cat("  Condition:", params$condition, "\n")
+cat("  Gene:", paste0("eIF", params$gene), "\n")
+cat("  Direction:", params$direction, "\n")
+cat("  Timepoint:", params$timepoint, "\n")
+cat("  LFC threshold:", params$lfc, "\n")
+cat("  Feature set:", params$feature_set, "(no Boruta selection)\n\n")
+
+cat("Classes:\n")
+cat("  Positive (", pos_label, "):", sum(model_data$eif3d_target == pos_label), "\n")
+cat("  Negative (", neg_label, "):", sum(model_data$eif3d_target == neg_label), "\n")
+cat("  Features:", length(feature_cols), "\n\n")
+
+cat("Test Set Performance (Youden threshold =", round(optimal_threshold, 4), "):\n")
+cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
+cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("  Sensitivity:", round(sensitivity, 4), "\n")
+cat("  Specificity:", round(specificity, 4), "\n")
+cat("  Precision:", round(precision, 4), "\n")
+cat("  F1:", round(f1, 4), "\n\n")
+
+cat("5-Fold CV:\n")
+cat("  AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
+cat("  Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-",
+    round(sd(cv_results_df$Balanced_Accuracy), 4), "\n\n")
+
+cat("Top 5 Features:\n")
+for (i in 1:5) {
+  cat("  ", i, ". ", importance_df$feature[i], " (", round(importance_df$importance[i], 2), ")\n", sep = "")
+}
+
+cat("========================================\n")
+```
+
+# Final Feature Importance Plot
+
+```{r final_importance_plot, fig.width=8, fig.height=max(4, min(60, length(feature_cols)) * 0.35)}
+# Lollipop plot of top features (cap at 60)
+importance_final_plot <- importance_df %>% head(60)
+final_height <- max(4, nrow(importance_final_plot) * 0.35)
+
+p_final_importance <- importance_final_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_segment(aes(xend = reorder(feature_clean, importance), y = 0, yend = importance),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(size = 3, color = "#0072B2") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Feature Importance: ", gene_label, " Target Classification"),
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | LFC ", params$lfc, " | AUC = ", round(as.numeric(auc_value), 3)),
+    x = "",
+    y = "Variable Importance (Impurity)"
+  )
+
+print(p_final_importance)
+
+ggsave(here("plots", paste0("rf_final_importance_", suffix, ".pdf")),
+       plot = p_final_importance, width = 8,
+       height = final_height)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
