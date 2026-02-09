@@ -1,0 +1,338 @@
+---
+title: "`r paste0('Feature Directionality Analysis: eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set: "targeted"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# Defaults for interactive use (overwritten by YAML params when knitting)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    condition = "hypoxia",
+    gene      = "3d",
+    direction = "promotes",
+    timepoint = "1hr",
+    lfc       = "0.5",
+    feature_set = "targeted" #targeted or combined
+  )
+}
+
+# Derived file paths and labels from params
+geneset_csv <- paste0(params$condition, "_", params$gene, "_", params$direction,
+                      "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
+feature_matrix_rds <- paste0("feature_matrix_", params$timepoint, "_combined.rds")
+suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 params$condition, "_", params$timepoint, "_lfc", params$lfc,
+                 "_", params$feature_set, "_no_boruta")
+pos_label <- params$direction
+neg_label <- paste0("does_not_", sub("s$", "", params$direction))
+gene_label <- paste0("eIF", params$gene)
+
+cat("Gene set CSV:", geneset_csv, "\n")
+cat("Feature matrix:", feature_matrix_rds, "\n")
+cat("Output suffix:", suffix, "\n")
+cat("Positive label:", pos_label, "\n")
+cat("Negative label:", neg_label, "\n")
+```
+
+# Overview
+
+Post-hoc directionality analysis of features from the no-Boruta RF classifier (07). For each feature, we compute point-biserial correlations and Wilcoxon rank-sum tests to determine whether the feature is higher or lower in the `r pos_label` class.
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+```
+
+# Load Data
+
+```{r load_data}
+# Feature matrix (same as 07 — always use the combined matrix)
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+# Positive class
+positive_genes <- read_csv(here("output", "genesets", geneset_csv))
+cat("Positive genes:", nrow(positive_genes), "\n")
+
+# Negative class: genes not regulated by eIF3d in any condition
+negative_control_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv")) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+cat("Negative control genes:", nrow(negative_control_genes), "\n")
+
+# Importance from 07
+importance_file <- here("output", "predictive_modeling",
+                        paste0("rf_classification_importance_", suffix, ".csv"))
+importance_df <- read_csv(importance_file)
+cat("Features in importance table:", nrow(importance_df), "\n")
+```
+
+# Recreate Binary Target
+
+Identical logic and seed to 07 so that the same gene sets are used.
+
+```{r create_target}
+set.seed(9)
+number_to_match <- min(length(positive_genes$ensembl_gene), nrow(negative_control_genes))
+
+# Label genes
+features <- features %>%
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+    gene_id_clean %in% sample(negative_control_genes$gene_id_clean, number_to_match) ~ neg_label,
+    TRUE ~ NA_character_
+  ))
+
+# Keep only labeled genes
+model_genes <- features %>%
+  filter(!is.na(eif3d_target)) %>%
+  mutate(eif3d_target = factor(eif3d_target, levels = c(neg_label, pos_label)))
+
+cat("Positive (", pos_label, "):", sum(model_genes$eif3d_target == pos_label), "\n")
+cat("Negative (", neg_label, "):", sum(model_genes$eif3d_target == neg_label), "\n")
+cat("Total:", nrow(model_genes), "\n")
+```
+
+# Compute Directionality
+
+```{r compute_directionality}
+# Binary numeric target for correlation (0 = neg, 1 = pos)
+target_numeric <- as.numeric(model_genes$eif3d_target) - 1
+
+directionality <- importance_df %>%
+  rowwise() %>%
+  mutate(
+    mean_promotes = mean(model_genes[[feature]][target_numeric == 1], na.rm = TRUE),
+    mean_does_not_promote = mean(model_genes[[feature]][target_numeric == 0], na.rm = TRUE),
+    diff = mean_promotes - mean_does_not_promote,
+    correlation = tryCatch(
+      cor(model_genes[[feature]], target_numeric, use = "complete.obs"),
+      error = function(e) NA_real_
+    ),
+    wilcox_p = tryCatch({
+      wt <- wilcox.test(model_genes[[feature]][target_numeric == 1],
+                        model_genes[[feature]][target_numeric == 0])
+      wt$p.value
+    }, error = function(e) NA_real_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    wilcox_p_adj = p.adjust(wilcox_p, method = "BH"),
+    direction = case_when(
+      is.na(correlation) ~ NA_character_,
+      correlation >= 0   ~ "Higher in promotes",
+      TRUE               ~ "Lower in promotes"
+    )
+  ) %>%
+  arrange(desc(importance))
+
+cat("Directionality computed for", nrow(directionality), "features\n")
+cat("Higher in promotes:", sum(directionality$direction == "Higher in promotes", na.rm = TRUE), "\n")
+cat("Lower in promotes:", sum(directionality$direction == "Lower in promotes", na.rm = TRUE), "\n")
+cat("Significant (Wilcox BH p < 0.05):", sum(directionality$wilcox_p_adj < 0.05, na.rm = TRUE), "\n")
+```
+
+# Plots
+
+## 1. Combined Importance + Directionality (Top 30)
+
+```{r plot_importance_directionality, fig.width=10, fig.height=10}
+plot_data <- directionality %>%
+  filter(!is.na(direction)) %>%
+  head(30) %>%
+  mutate(
+    neg_log10_p = -log10(pmax(wilcox_p, 1e-30)),
+    feature_clean = fct_reorder(feature_clean, importance)
+  )
+
+p_combined <- ggplot(plot_data, aes(x = feature_clean, y = importance)) +
+  geom_segment(aes(xend = feature_clean, y = 0, yend = importance),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(aes(color = direction, size = neg_log10_p)) +
+  scale_color_manual(
+    values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+    name = "Direction"
+  ) +
+  scale_size_continuous(name = "-log10(p)", range = c(2, 7)) +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Top 30 Features: Importance + Directionality"),
+    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+                      " | ", params$timepoint, " | LFC ", params$lfc),
+    x = "",
+    y = "Variable Importance (Impurity)"
+  )
+
+print(p_combined)
+
+ggsave(here("plots", paste0("rf_directionality_importance_", suffix, ".pdf")),
+       plot = p_combined, width = 10, height = 10)
+```
+
+## 2. Correlation Bar Plot (Significant Features)
+
+```{r plot_correlation_bars, fig.width=10, fig.height=8}
+sig_features <- directionality %>%
+  filter(!is.na(correlation), wilcox_p_adj < 0.05) %>%
+  mutate(feature_clean = fct_reorder(feature_clean, abs(correlation)))
+
+if (nrow(sig_features) > 0) {
+  bar_height <- max(6, nrow(sig_features) * 0.35)
+
+  p_corr <- ggplot(sig_features, aes(x = feature_clean, y = correlation, fill = direction)) +
+    geom_col() +
+    scale_fill_manual(
+      values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+      name = "Direction"
+    ) +
+    coord_flip() +
+    theme_cowplot() +
+    labs(
+      title = "Point-Biserial Correlation with Target Class",
+      subtitle = paste0("Features with Wilcoxon BH-adjusted p < 0.05 (n = ", nrow(sig_features), ")"),
+      x = "",
+      y = "Correlation"
+    )
+
+  print(p_corr)
+
+  ggsave(here("plots", paste0("rf_directionality_correlation_", suffix, ".pdf")),
+         plot = p_corr, width = 10, height = bar_height)
+} else {
+  cat("No features with BH-adjusted p < 0.05\n")
+}
+```
+
+## 3. Volcano-Style Plot
+
+```{r plot_volcano, fig.width=10, fig.height=8}
+volcano_data <- directionality %>%
+  filter(!is.na(correlation), !is.na(wilcox_p)) %>%
+  mutate(neg_log10_p = -log10(pmax(wilcox_p, 1e-30)))
+
+# Label top features by importance
+top_n_label <- min(10, nrow(volcano_data))
+label_data <- volcano_data %>% head(top_n_label)
+
+p_volcano <- ggplot(volcano_data, aes(x = correlation, y = neg_log10_p)) +
+  geom_point(aes(size = importance, color = direction), alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50") +
+  ggrepel::geom_text_repel(
+    data = label_data,
+    aes(label = feature_clean),
+    size = 3, max.overlaps = 20, segment.color = "grey50"
+  ) +
+  scale_color_manual(
+    values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+    name = "Direction"
+  ) +
+  scale_size_continuous(name = "RF Importance", range = c(1, 8)) +
+  theme_cowplot() +
+  labs(
+    title = "Volcano Plot: Correlation vs. Significance",
+    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+                      " | ", params$timepoint, " | LFC ", params$lfc),
+    x = "Point-Biserial Correlation",
+    y = "-log10(Wilcoxon p-value)"
+  )
+
+print(p_volcano)
+
+ggsave(here("plots", paste0("rf_directionality_volcano_", suffix, ".pdf")),
+       plot = p_volcano, width = 10, height = 8)
+```
+
+## 4. Category-Level Summary
+
+```{r plot_category_summary, fig.width=10, fig.height=6}
+category_dir <- directionality %>%
+  filter(!is.na(correlation)) %>%
+  group_by(category) %>%
+  summarise(
+    n_features = n(),
+    mean_correlation = mean(correlation, na.rm = TRUE),
+    n_higher = sum(direction == "Higher in promotes"),
+    n_lower = sum(direction == "Lower in promotes"),
+    prop_higher = n_higher / n_features,
+    n_significant = sum(wilcox_p_adj < 0.05, na.rm = TRUE),
+    mean_importance = mean(importance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_importance))
+
+cat("\nCategory-Level Directionality Summary:\n")
+print(category_dir)
+
+# Grouped bar: proportion higher vs lower per category
+category_long <- category_dir %>%
+  dplyr::select(category, n_higher, n_lower) %>%
+  pivot_longer(cols = c(n_higher, n_lower), names_to = "dir", values_to = "count") %>%
+  mutate(dir = ifelse(dir == "n_higher", "Higher in promotes", "Lower in promotes"))
+
+p_cat <- ggplot(category_long,
+                aes(x = reorder(category, count, sum), y = count, fill = dir)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(
+    values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+    name = "Direction"
+  ) +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = "Feature Direction by Category",
+    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+                      " | ", params$timepoint),
+    x = "",
+    y = "Number of Features"
+  )
+
+print(p_cat)
+
+ggsave(here("plots", paste0("rf_directionality_category_", suffix, ".pdf")),
+       plot = p_cat, width = 10, height = 6)
+```
+
+# Export
+
+```{r export}
+output_dir <- here("output", "predictive_modeling")
+
+# Full directionality table
+export_df <- directionality %>%
+  dplyr::select(feature, mean_promotes, mean_does_not_promote, diff,
+                correlation, wilcox_p, wilcox_p_adj, importance, category, direction)
+
+write_csv(export_df, file.path(output_dir,
+          paste0("rf_feature_directionality_", suffix, ".csv")))
+
+cat("Exported: rf_feature_directionality_", suffix, ".csv\n")
+cat("  Rows:", nrow(export_df), "\n")
+cat("  Significant (BH p < 0.05):", sum(export_df$wilcox_p_adj < 0.05, na.rm = TRUE), "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
