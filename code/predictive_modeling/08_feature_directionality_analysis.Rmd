@@ -1,5 +1,5 @@
 ---
-title: "`r paste0('Feature Directionality Analysis: eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
+title: "`r paste0('Feature Directionality Analysis: eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ', clip_', params$clip_mode, ')')`"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
@@ -10,6 +10,7 @@ params:
   timepoint: "1hr"
   lfc: "0.5"
   feature_set: "combined"
+  clip_mode: "aggregate"
   source_model: "no_boruta"
 editor_options:
   chunk_output_type: console
@@ -31,7 +32,8 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     direction = "promotes",
     timepoint = "1hr",
     lfc       = "0.5",
-    feature_set = "combined", #targeted or combined
+    feature_set = "clip_split", #targeted, combined, structure, or clip_split
+    clip_mode   = "aggregate", # "individual", "aggregate", or "both"
     source_model = "no_boruta" # "no_boruta" (07) or "boruta" (06)
   )
 }
@@ -39,16 +41,22 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
 # Derived file paths and labels from params
 geneset_csv <- paste0(params$condition, "_", params$gene, "_", params$direction,
                       "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
-feature_matrix_rds <- paste0("feature_matrix_", params$timepoint, "_combined.rds")
+feature_matrix_rds <- if (params$feature_set == "clip_split") {
+  paste0("feature_matrix_", params$timepoint, "_clip_split.rds")
+} else if (params$feature_set == "structure") {
+  paste0("feature_matrix_", params$timepoint, "_structure.rds")
+} else {
+  paste0("feature_matrix_", params$timepoint, "_combined.rds")
+}
 # Suffix matches 06 (boruta) or 07 (no_boruta) output naming
 if (params$source_model == "no_boruta") {
   suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
                    params$condition, "_", params$timepoint, "_lfc", params$lfc,
-                   "_", params$feature_set, "_no_boruta")
+                   "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
 } else {
   suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
                    params$condition, "_", params$timepoint, "_lfc", params$lfc,
-                   "_", params$feature_set)
+                   "_", params$feature_set, "_clip", params$clip_mode)
 }
 pos_label <- params$direction
 neg_label <- paste0("does_not_", sub("s$", "", params$direction))
@@ -170,19 +178,19 @@ plot_data <- directionality %>%
   filter(!is.na(direction)) %>%
   head(30) %>%
   mutate(
-    neg_log10_p = -log10(pmax(wilcox_p, 1e-30)),
+    abs_correlation = abs(correlation),
     feature_clean = fct_reorder(feature_clean, importance)
   )
 
 p_combined <- ggplot(plot_data, aes(x = feature_clean, y = importance)) +
   geom_segment(aes(xend = feature_clean, y = 0, yend = importance),
                color = "grey60", linewidth = 0.6) +
-  geom_point(aes(color = direction, size = neg_log10_p)) +
+  geom_point(aes(color = direction, size = abs_correlation)) +
   scale_color_manual(
-    values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+    values = c("Higher in promotes" = "#009E73", "Lower in promotes" = "#D55E00"),
     name = "Direction"
   ) +
-  scale_size_continuous(name = "-log10(p)", range = c(2, 7)) +
+  scale_size_continuous(name = "|Correlation|", range = c(2, 7)) +
   coord_flip() +
   theme_cowplot() +
   labs(
@@ -217,7 +225,7 @@ if (nrow(sig_features) > 0) {
   p_corr <- ggplot(sig_features, aes(x = feature_clean, y = correlation, fill = direction)) +
     geom_col() +
     scale_fill_manual(
-      values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+      values = c("Higher in promotes" = "#009E73", "Lower in promotes" = "#D55E00"),
       name = "Direction"
     ) +
     coord_flip() +
@@ -258,7 +266,7 @@ p_volcano <- ggplot(volcano_data, aes(x = correlation, y = neg_log10_p)) +
     size = 3, max.overlaps = 20, segment.color = "grey50"
   ) +
   scale_color_manual(
-    values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+    values = c("Higher in promotes" = "#009E73", "Lower in promotes" = "#D55E00"),
     name = "Direction"
   ) +
   scale_size_continuous(name = "RF Importance", range = c(1, 8)) +
@@ -277,7 +285,74 @@ ggsave(here("plots", paste0("rf_directionality_volcano_", suffix, ".pdf")),
        plot = p_volcano, width = 10, height = 8)
 ```
 
-## 4. Category-Level Summary
+## 4. Importance vs. Log2 Fold Change
+
+```{r plot_importance_vs_lfc, fig.width=10, fig.height=8}
+lfc_data <- directionality %>%
+  filter(!is.na(correlation),
+         mean_promotes > 0, mean_does_not_promote > 0) %>%
+  mutate(log2fc = log2(mean_promotes / mean_does_not_promote))
+
+# Shared base plot
+base_lfc_plot <- ggplot(lfc_data, aes(x = log2fc, y = importance)) +
+  geom_point(aes(color = direction), alpha = 0.7, size = 2.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(
+    values = c("Higher in promotes" = "#009E73", "Lower in promotes" = "#D55E00"),
+    name = "Direction"
+  ) +
+  theme_cowplot() +
+  labs(
+    x = paste0("Log2 Fold Change (", pos_label, " / ", neg_label, ")"),
+    y = "Variable Importance (Impurity)"
+  )
+
+# Plot A: all features labeled
+p_imp_lfc_all <- base_lfc_plot +
+  ggrepel::geom_text_repel(
+    aes(label = feature_clean),
+    size = 2.5, max.overlaps = Inf, segment.color = "grey50",
+    segment.size = 0.3, segment.alpha = 0.5,
+    min.segment.length = 0, force = 2
+  ) +
+  labs(
+    title = "Feature Importance vs. Log2 Fold Change (All Labeled)",
+    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+                      " | ", params$timepoint, " | LFC ", params$lfc)
+  )
+
+print(p_imp_lfc_all)
+
+ggsave(here("plots", paste0("rf_directionality_importance_vs_lfc_all_", suffix, ".pdf")),
+       plot = p_imp_lfc_all, width = 10, height = 8)
+
+# Plot B: only top features by importance or |log2FC|
+top_by_importance <- lfc_data %>% slice_max(importance, n = 10)
+top_by_abs_lfc    <- lfc_data %>% slice_max(abs(log2fc), n = 10)
+label_data_top    <- bind_rows(top_by_importance, top_by_abs_lfc) %>%
+  distinct(feature, .keep_all = TRUE)
+
+p_imp_lfc_top <- base_lfc_plot +
+  ggrepel::geom_text_repel(
+    data = label_data_top,
+    aes(label = feature_clean),
+    size = 3, max.overlaps = Inf, segment.color = "grey50",
+    segment.size = 0.3, segment.alpha = 0.5,
+    min.segment.length = 0, force = 2
+  ) +
+  labs(
+    title = "Feature Importance vs. Log2 Fold Change (Top Features)",
+    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+                      " | ", params$timepoint, " | LFC ", params$lfc)
+  )
+
+print(p_imp_lfc_top)
+
+ggsave(here("plots", paste0("rf_directionality_importance_vs_lfc_top_", suffix, ".pdf")),
+       plot = p_imp_lfc_top, width = 10, height = 8)
+```
+
+## 5. Category-Level Summary
 
 ```{r plot_category_summary, fig.width=10, fig.height=6}
 category_dir <- directionality %>%
@@ -308,7 +383,7 @@ p_cat <- ggplot(category_long,
                 aes(x = reorder(category, count, sum), y = count, fill = dir)) +
   geom_col(position = "dodge") +
   scale_fill_manual(
-    values = c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#D55E00"),
+    values = c("Higher in promotes" = "#009E73", "Lower in promotes" = "#D55E00"),
     name = "Direction"
   ) +
   coord_flip() +
