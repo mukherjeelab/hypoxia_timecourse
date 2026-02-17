@@ -4,12 +4,13 @@ author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
 params:
-  condition: "hypoxia"
+  condition: "normoxia"
   gene: "3d"
   direction: "promotes"
   timepoint: "1hr"
   lfc: "0.5"
-  feature_set: "targeted"
+  feature_set: "clip_split"
+  clip_mode: "aggregate"
 editor_options:
   chunk_output_type: console
 ---
@@ -30,17 +31,24 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     direction = "promotes",
     timepoint = "1hr",
     lfc       = "0.5",
-    feature_set = "targeted" #targeted or combined
+    feature_set = "clip_split", #targeted, combined, structure, or clip_split
+    clip_mode   = "aggregate" # "individual", "aggregate", or "both"
   )
 }
 
 # Derived file paths and labels from params
 geneset_csv <- paste0(params$condition, "_", params$gene, "_", params$direction,
                       "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
-feature_matrix_rds <- paste0("feature_matrix_", params$timepoint, "_combined.rds")
+feature_matrix_rds <- if (params$feature_set == "clip_split") {
+  paste0("feature_matrix_", params$timepoint, "_clip_split.rds")
+} else if (params$feature_set == "structure") {
+  paste0("feature_matrix_", params$timepoint, "_structure.rds")
+} else {
+  paste0("feature_matrix_", params$timepoint, "_combined.rds")
+}
 suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
                  params$condition, "_", params$timepoint, "_lfc", params$lfc,
-                 "_", params$feature_set, "_no_boruta")
+                 "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
 pos_label <- params$direction
 neg_label <- paste0("does_not_", sub("s$", "", params$direction))
 gene_label <- paste0("eIF", params$gene)
@@ -68,7 +76,8 @@ Binary classification without Boruta feature selection: does a gene's mRNA seque
 | `direction` | `"promotes"`, `"inhibits"` | Direction of TE regulation |
 | `timepoint` | `"1hr"`, `"4hr"`, `"24hr"` | Hypoxia timepoint |
 | `lfc` | `"0.5"`, `"1"` | Log2 fold change threshold for gene set |
-| `feature_set` | `"targeted"`, `"combined"` | `"targeted"` = combined minus k-mers & RBP motifs (biological + lengths + GC + ORFquant + literature signatures); `"combined"` = all features |
+| `feature_set` | `"targeted"`, `"combined"`, `"structure"`, `"clip_split"` | `"targeted"` = combined minus k-mers & RBP motifs (biological + lengths + GC + ORFquant + literature signatures); `"combined"` = all features; `"structure"` = targeted + RNA secondary structure features (RNAplfold accessibility, RNAfold MFE, dot-bracket parsing); `"clip_split"` = structure + split CLIP aggregate into eIF3 vs cap-binding counts |
+| `clip_mode` | `"individual"`, `"aggregate"`, `"both"` | Which CLIP features to use: `"individual"` = per-dataset regional binary features (~21 cols: 5utr/cds/3utr × 7 datasets); `"aggregate"` = single numeric count of datasets with any binding evidence (0-7); `"both"` = all CLIP features together |
 
 # Setup
 
@@ -143,8 +152,21 @@ id_cols <- unique(c(id_cols, id_pattern_cols))
 feature_cols <- setdiff(colnames(model_genes), id_cols)
 cat("Initial feature count (all combined):", length(feature_cols), "\n")
 
+# ---- CLIP feature mode ----
+if (params$clip_mode == "aggregate") {
+  aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count")
+  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+  feature_cols <- setdiff(feature_cols, regional_clip)
+  cat("CLIP mode: aggregate — using aggregate CLIP counts only, dropped", length(regional_clip), "regional features\n")
+} else if (params$clip_mode == "individual") {
+  feature_cols <- setdiff(feature_cols, c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count"))
+  cat("CLIP mode: individual — using regional binary features, dropped aggregate CLIP counts\n")
+} else {
+  cat("CLIP mode: both — using all CLIP features\n")
+}
+
 # If targeted: remove k-mer and RBP motif columns
-if (params$feature_set == "targeted") {
+if (params$feature_set %in% c("targeted", "structure", "clip_split")) {
   kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
   excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
   feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
@@ -479,6 +501,7 @@ ggsave(here("plots", paste0("rf_classification_feature_importance_custom_", suff
 importance_df <- importance_df %>%
   mutate(
     category = case_when(
+      str_detect(feature, "^struct_")                          ~ "RNA Structure",
       str_detect(feature, "^orfquant_")                       ~ "ORFquant",
       str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
       str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
@@ -582,7 +605,8 @@ cat("  Gene:", paste0("eIF", params$gene), "\n")
 cat("  Direction:", params$direction, "\n")
 cat("  Timepoint:", params$timepoint, "\n")
 cat("  LFC threshold:", params$lfc, "\n")
-cat("  Feature set:", params$feature_set, "(no Boruta selection)\n\n")
+cat("  Feature set:", params$feature_set, "(no Boruta selection)\n")
+cat("  CLIP mode:", params$clip_mode, "\n\n")
 
 cat("Classes:\n")
 cat("  Positive (", pos_label, "):", sum(model_data$eif3d_target == pos_label), "\n")
