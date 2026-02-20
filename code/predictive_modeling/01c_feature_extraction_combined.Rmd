@@ -30,13 +30,15 @@ This analysis builds the full feature matrix by combining:
 | **6-mer Frequencies** | 6-mers in 5'UTR | 4,096 |
 | **RBP Motif Scores** | RBNS + CISBP-RNA PWMs across 5'UTR/CDS/3'UTR | ~900 |
 | **eIF3 CLIP Binding** | Regional (5utr/cds/3utr) × 7 conditions | ~21 |
+| **eIF3 CLIP Evidence Count** | Number of CLIP datasets with any binding (0-7) | 1 |
 | **4E Resistance** | Continuous LFC (4e_resistance_score_lfc) | 1 |
 | **DAP5 KD (Weber 2022)** | Continuous negated LFC (dap5_promoted_score_weber_lfc) | 1 |
 | **DAP5 Polysome (GSE115142)** | Continuous LFC (dap5_promoted_score_polysome_lfc) | 1 |
 | **eIF4E-IP Baseline (Teleman)** | Continuous LFC (eif4e_ip_vehicle_lfc) | 1 |
-| **eIF4E-IP 4E Inhibition (Teleman)** | Continuous LFC (eif4e_ip_4e_inhib_lfc) | 1 |
+| **eIF4E-IP Inhibitor Only (Teleman)** | Continuous LFC (eif4e_ip_inhibitor_only_lfc) | 1 |
+| **eIF4E-IP Inhib vs Vehicle (Teleman)** | Continuous LFC (eif4e_ip_inhib_vs_vehicle_lfc) | 1 |
 | **Literature Translation Signatures** | Binary membership in 25 published gene sets | 25 |
-| **Total predictors** | | **~6,333** |
+| **Total predictors** | | **~6,334** |
 
 # Load Libraries
 
@@ -333,6 +335,27 @@ if (length(all_zero_cols) > 0) {
 
 cat("CLIP features retained:", ncol(clip_features) - 1, "features\n")
 cat("Genes with CLIP data:", nrow(clip_features), "\n")
+
+# Compute aggregate CLIP evidence count from scorecard_update (exclude d_only)
+clip_update <- read_csv("/Users/katematlin/github/mpra_preliminary/scorecard_update.csv") %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+clip_count_conditions <- setdiff(colnames(clip_update), c("gene_id", "symbol", "log2FoldChange", "padj", "condition", "lee_parclip_d_only", "set", "gene_id_clean", "bound_by_one", "resistant_4E_inhib"))
+
+clip_evidence <- clip_update %>%
+  dplyr::select(gene_id_clean, all_of(clip_count_conditions)) %>%
+  dplyr::mutate(clip_evidence_count = rowSums(
+    across(all_of(clip_count_conditions), ~as.integer(tolower(.) != "not bound")),
+    na.rm = TRUE
+  ))
+
+clip_evidence %>% dplyr::select(gene_id_clean, all_of(clip_count_conditions), clip_evidence_count)
+
+clip_features <- clip_features %>%
+  dplyr::left_join(clip_evidence %>% dplyr::select(gene_id_clean, clip_evidence_count), by = "gene_id_clean")
+
+cat("CLIP evidence count range:", range(clip_features$clip_evidence_count), "\n")
 ```
 
 # 4E Resistance Features
@@ -354,7 +377,7 @@ cat("Genes with 4E resistance score:", nrow(teleman_features), "\n")
 
 ```{r eif4e_ip_features}
 # eIF4E-IP vehicle (baseline binding)
-eif4e_ip_vehicle <- read_csv("/Users/katematlin/github/mpra_preliminary/res_ip_vehicle.csv") %>%
+eif4e_ip_vehicle <- read_csv("/Users/katematlin/github/mpra_preliminary/res_eif4e_ip_vehicle.csv") %>%
   dplyr::filter(!is.na(symbol)) %>%
   dplyr::group_by(symbol) %>%
   dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
@@ -365,17 +388,29 @@ eif4e_ip_vehicle_features <- eif4e_ip_vehicle %>%
 
 cat("Genes with eIF4E-IP vehicle LFC:", nrow(eif4e_ip_vehicle_features), "\n")
 
-# eIF4E-IP 4E inhibition
-eif4e_ip_4e_inhib <- read_csv("/Users/katematlin/github/mpra_preliminary/res_ip_4E.csv") %>%
+# eIF4E-IP inhibitor only (binding under 4E inhibition)
+eif4e_ip_inhib_only <- read_csv("/Users/katematlin/github/mpra_preliminary/res_eif4e_ip_inhibitor_only.csv") %>%
   dplyr::filter(!is.na(symbol)) %>%
   dplyr::group_by(symbol) %>%
   dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
   dplyr::ungroup()
 
-eif4e_ip_4e_inhib_features <- eif4e_ip_4e_inhib %>%
-  dplyr::transmute(symbol = symbol, eif4e_ip_4e_inhib_lfc = log2FoldChange)
+eif4e_ip_inhib_only_features <- eif4e_ip_inhib_only %>%
+  dplyr::transmute(symbol = symbol, eif4e_ip_inhibitor_only_lfc = log2FoldChange)
 
-cat("Genes with eIF4E-IP 4E inhibition LFC:", nrow(eif4e_ip_4e_inhib_features), "\n")
+cat("Genes with eIF4E-IP inhibitor-only LFC:", nrow(eif4e_ip_inhib_only_features), "\n")
+
+# eIF4E-IP inhib vs vehicle (interaction / delta)
+eif4e_ip_inhib_vs_vehicle <- read_csv("/Users/katematlin/github/mpra_preliminary/res_eif4e_ip_inhib_vs_vehicle.csv") %>%
+  dplyr::filter(!is.na(symbol)) %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+eif4e_ip_inhib_vs_vehicle_features <- eif4e_ip_inhib_vs_vehicle %>%
+  dplyr::transmute(symbol = symbol, eif4e_ip_inhib_vs_vehicle_lfc = log2FoldChange)
+
+cat("Genes with eIF4E-IP inhib vs vehicle LFC:", nrow(eif4e_ip_inhib_vs_vehicle_features), "\n")
 ```
 
 # DAP5 KD Features (Weber 2022)
@@ -493,8 +528,10 @@ feature_matrix <- most_abundant_tx %>%
   left_join(dap5_polysome_features, by = "symbol") %>%
   # Add eIF4E-IP vehicle LFC (by symbol)
   left_join(eif4e_ip_vehicle_features, by = "symbol") %>%
-  # Add eIF4E-IP 4E inhibition LFC (by symbol)
-  left_join(eif4e_ip_4e_inhib_features, by = "symbol") %>%
+  # Add eIF4E-IP inhibitor-only LFC (by symbol)
+  left_join(eif4e_ip_inhib_only_features, by = "symbol") %>%
+  # Add eIF4E-IP inhib vs vehicle LFC (by symbol)
+  left_join(eif4e_ip_inhib_vs_vehicle_features, by = "symbol") %>%
   # Add literature translation signatures (by symbol)
   left_join(lit_sigs_wide, by = "symbol")
 
@@ -604,8 +641,11 @@ print(summary(feature_matrix$dap5_promoted_score_polysome_lfc))
 cat("\neIF4E-IP vehicle LFC summary:\n")
 print(summary(feature_matrix$eif4e_ip_vehicle_lfc))
 
-cat("\neIF4E-IP 4E inhibition LFC summary:\n")
-print(summary(feature_matrix$eif4e_ip_4e_inhib_lfc))
+cat("\neIF4E-IP inhibitor-only LFC summary:\n")
+print(summary(feature_matrix$eif4e_ip_inhibitor_only_lfc))
+
+cat("\neIF4E-IP inhib vs vehicle LFC summary:\n")
+print(summary(feature_matrix$eif4e_ip_inhib_vs_vehicle_lfc))
 
 # Region length and GC summaries
 cat("\n5' UTR length:\n")
@@ -654,7 +694,7 @@ cat("  - CLIP binding:", sum(str_detect(names(feature_matrix), "^clip_")), "feat
 cat("  - 4E resistance: 1 feature (4e_resistance_score_lfc)\n")
 cat("  - DAP5 KD (Weber): 1 feature (dap5_promoted_score_weber_lfc)\n")
 cat("  - DAP5 polysome: 1 feature (dap5_promoted_score_polysome_lfc)\n")
-cat("  - eIF4E-IP (Teleman): 2 features (eif4e_ip_vehicle_lfc, eif4e_ip_4e_inhib_lfc)\n")
+cat("  - eIF4E-IP (Teleman): 3 features (eif4e_ip_vehicle_lfc, eif4e_ip_inhibitor_only_lfc, eif4e_ip_inhib_vs_vehicle_lfc)\n")
 cat("  - Literature translation signatures:", sum(str_detect(names(feature_matrix), "^lit_")), "features\n")
 ```
 

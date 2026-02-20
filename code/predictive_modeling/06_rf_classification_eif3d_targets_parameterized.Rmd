@@ -1,5 +1,5 @@
 ---
-title: "`r paste0('Random Forest Classification (No Boruta): eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
+title: "`r paste0('Random Forest Classification: eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
@@ -9,8 +9,8 @@ params:
   direction: "promotes"
   timepoint: "1hr"
   lfc: "0.5"
-  feature_set: "clip_split"
-  clip_mode: "aggregate"
+  feature_set: "combined"
+  clip_mode: "individual"
 editor_options:
   chunk_output_type: console
 ---
@@ -31,7 +31,7 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     direction = "promotes",
     timepoint = "1hr",
     lfc       = "0.5",
-    feature_set = "clip_split", #targeted, combined, structure, or clip_split
+    feature_set = "combined", #targeted or combined
     clip_mode   = "aggregate" # "individual", "aggregate", or "both"
   )
 }
@@ -39,16 +39,10 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
 # Derived file paths and labels from params
 geneset_csv <- paste0(params$condition, "_", params$gene, "_", params$direction,
                       "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
-feature_matrix_rds <- if (params$feature_set == "clip_split") {
-  paste0("feature_matrix_", params$timepoint, "_clip_split.rds")
-} else if (params$feature_set == "structure") {
-  paste0("feature_matrix_", params$timepoint, "_structure.rds")
-} else {
-  paste0("feature_matrix_", params$timepoint, "_combined.rds")
-}
+feature_matrix_rds <- paste0("feature_matrix_", params$timepoint, "_", params$feature_set, ".rds")
 suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
                  params$condition, "_", params$timepoint, "_lfc", params$lfc,
-                 "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
+                 "_", params$feature_set, "_clip", params$clip_mode)
 pos_label <- params$direction
 neg_label <- paste0("does_not_", sub("s$", "", params$direction))
 gene_label <- paste0("eIF", params$gene)
@@ -62,7 +56,7 @@ cat("Negative label:", neg_label, "\n")
 
 # Overview
 
-Binary classification without Boruta feature selection: does a gene's mRNA sequence predict whether `r gene_label` `r params$direction` its translation?
+Binary classification: does a gene's mRNA sequence predict whether `r gene_label` `r params$direction` its translation?
 
 - **Positive class ("`r pos_label`")**: Genes from `` `r geneset_csv` ``
 - **Negative class ("`r neg_label`")**: Genes from `negative_control_genes.csv` (not regulated by `r gene_label` in any condition/timepoint)
@@ -76,7 +70,7 @@ Binary classification without Boruta feature selection: does a gene's mRNA seque
 | `direction` | `"promotes"`, `"inhibits"` | Direction of TE regulation |
 | `timepoint` | `"1hr"`, `"4hr"`, `"24hr"` | Hypoxia timepoint |
 | `lfc` | `"0.5"`, `"1"` | Log2 fold change threshold for gene set |
-| `feature_set` | `"targeted"`, `"combined"`, `"structure"`, `"clip_split"` | `"targeted"` = combined minus k-mers & RBP motifs (biological + lengths + GC + ORFquant + literature signatures); `"combined"` = all features; `"structure"` = targeted + RNA secondary structure features (RNAplfold accessibility, RNAfold MFE, dot-bracket parsing); `"clip_split"` = structure + split CLIP aggregate into eIF3 vs cap-binding counts |
+| `feature_set` | `"targeted"`, `"combined"` | Feature matrix to use: `"targeted"` = biological features only (CLIP, 4E, DAP5; ~36 features from 01b); `"combined"` = biological + UTR lengths + GC + k-mers + RBP motifs (~6,324 features from 01c) |
 | `clip_mode` | `"individual"`, `"aggregate"`, `"both"` | Which CLIP features to use: `"individual"` = per-dataset regional binary features (~21 cols: 5utr/cds/3utr × 7 datasets); `"aggregate"` = single numeric count of datasets with any binding evidence (0-7); `"both"` = all CLIP features together |
 
 # Setup
@@ -88,6 +82,9 @@ library(ranger)
 library(caret)
 library(pROC)
 library(cowplot)
+library(Boruta)
+# library(treeshap)
+# library(shapviz)
 
 ```
 
@@ -139,45 +136,341 @@ cat("Imbalance ratio (neg:pos):",
 
 # Preprocessing
 
-## Filter Features (No Boruta)
+## Remove Near-Zero Variance Features
 
-```{r filter_features}
-# Identify feature columns (exclude ID/target cols) — same logic as 06
+```{r}
+
+# Identify feature columns (same as before)
 id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
              "transcript_id", "transcript_id_clean", "transcript_id_raw",
              "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+
 all_cols <- colnames(model_genes)
 id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
 id_cols <- unique(c(id_cols, id_pattern_cols))
+
 feature_cols <- setdiff(colnames(model_genes), id_cols)
-cat("Initial feature count (all combined):", length(feature_cols), "\n")
+cat("Initial feature count:", length(feature_cols), "\n")
 
 # ---- CLIP feature mode ----
 if (params$clip_mode == "aggregate") {
-  aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
-                           "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
-                           "clip_lee_glu_vs_cm_enrichment")
-  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & feature_cols != "clip_evidence_count"]
   feature_cols <- setdiff(feature_cols, regional_clip)
-  cat("CLIP mode: aggregate — using aggregate CLIP counts only, dropped", length(regional_clip), "regional features\n")
+  cat("CLIP mode: aggregate — using clip_evidence_count only, dropped", length(regional_clip), "regional features\n")
 } else if (params$clip_mode == "individual") {
-  feature_cols <- setdiff(feature_cols, c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
-                                          "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
-                                          "clip_lee_glu_vs_cm_enrichment"))
-  cat("CLIP mode: individual — using regional binary features, dropped aggregate CLIP counts\n")
+  feature_cols <- setdiff(feature_cols, "clip_evidence_count")
+  cat("CLIP mode: individual — using regional binary features, dropped clip_evidence_count\n")
 } else {
   cat("CLIP mode: both — using all CLIP features\n")
 }
 
-# If targeted: remove k-mer and RBP motif columns
-if (params$feature_set %in% c("targeted", "structure", "clip_split")) {
-  kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
-  excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
-  feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
-  cat("Targeted mode: removed", length(excluded), "k-mer/motif columns\n")
-}
-cat("Feature count after filtering:", length(feature_cols), "\n")
+# ---- Boruta feature selection ----
+set.seed(9)
+
+boruta_res <- Boruta(
+  x = model_genes[, feature_cols],
+  y = as.factor(model_genes$eif3d_target),  # classification
+  doTrace = 2
+)
+
+# Resolve tentative features
+boruta_res <- TentativeRoughFix(boruta_res)
+
+# Keep confirmed features only
+selected_features <- getSelectedAttributes(boruta_res, withTentative = TRUE)
+
+cat("Selected features after Boruta:", length(selected_features), "\n")
+
+# Update feature set for RF
+feature_cols <- selected_features
+
+
+# Dynamic width based on number of features (3 shadow attrs + confirmed/rejected)
+n_boruta_attrs <- length(boruta_res$finalDecision) + 3  # +3 for shadow min/mean/max
+boruta_plot_width <- max(10, n_boruta_attrs * 0.35)
+
+pdf(here("plots", paste0("rf_boruta_importance_", suffix, ".pdf")),
+    width = boruta_plot_width, height = 7)
+par(mar = c(10, 4, 4, 2))  # extra bottom margin for rotated labels
+plot(boruta_res, las = 2, cex.axis = 0.7)
+dev.off()
+
+# Also display inline
+plot(boruta_res, las = 2, cex.axis = 0.7)
+
+# ggsave(here("plots/barutafeats.pdf"), width=8, height=9)
+
+attStats(boruta_res) %>%
+  arrange(desc(meanImp))
 ```
+
+```{r boruta_diagnostics, fig.width=10, fig.height=8}
+# ---- A. Category-level summary table ----
+boruta_stats <- attStats(boruta_res) %>%
+  tibble::rownames_to_column("feature") %>%
+  mutate(
+    category = case_when(
+      str_detect(feature, "^orfquant_")                       ~ "ORFquant",
+      str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
+      str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
+      str_detect(feature, "^cds_4mer_")                       ~ "CDS 4-mers",
+      str_detect(feature, "^rbns_|^cisbp_")                   ~ "RBP Motifs",
+      str_detect(feature, "^clip_")                           ~ "CLIP Binding",
+      str_detect(feature, "^lit_")                            ~ "Literature Signatures",
+      str_detect(feature, "length|Length")                     ~ "Region Lengths",
+      str_detect(feature, "_gc$|^gc3$")                       ~ "GC Content",
+      str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_")  ~ "4E / DAP5",
+      TRUE                                                    ~ "Other"
+    )
+  )
+
+category_boruta_summary <- boruta_stats %>%
+  group_by(category) %>%
+  summarise(
+    n_total     = n(),
+    n_confirmed = sum(decision == "Confirmed"),
+    n_rejected  = sum(decision == "Rejected"),
+    n_tentative = sum(decision == "Tentative"),
+    pct_confirmed = round(100 * n_confirmed / n_total, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_confirmed))
+
+cat("\n=== Boruta decisions by feature category ===\n")
+print(as.data.frame(category_boruta_summary), row.names = FALSE)
+
+# ---- B. Detailed biological feature table ----
+shadow_max_imp <- boruta_stats %>%
+  filter(str_detect(feature, "^shadow")) %>%
+  pull(meanImp) %>%
+  max(na.rm = TRUE)
+
+bio_patterns <- "^orfquant_|^clip_|^4e_|^dap5_|^eif4e_ip|^lit_"
+
+bio_features <- boruta_stats %>%
+  filter(str_detect(feature, bio_patterns)) %>%
+  mutate(
+    shadow_max_threshold = shadow_max_imp,
+    margin = meanImp - shadow_max_imp,
+    narrow_reject = decision == "Rejected" & margin > -1
+  ) %>%
+  arrange(desc(meanImp))
+
+cat("\n=== Biological feature detail (shadow max threshold =",
+    round(shadow_max_imp, 3), ") ===\n")
+print(as.data.frame(bio_features %>%
+  dplyr::select(feature, decision, meanImp, normHits, shadow_max_threshold,
+         margin, narrow_reject)), row.names = FALSE)
+
+# ---- C. Dot plot visualization ----
+if (nrow(bio_features) > 0) {
+  shadow_stats <- boruta_stats %>%
+    filter(str_detect(feature, "^shadow")) %>%
+    summarise(
+      shadow_min = min(meanImp, na.rm = TRUE),
+      shadow_mean = mean(meanImp, na.rm = TRUE),
+      shadow_max = max(meanImp, na.rm = TRUE)
+    )
+
+  p_bio <- ggplot(bio_features,
+                  aes(x = meanImp,
+                      y = reorder(feature, meanImp),
+                      color = decision)) +
+    geom_point(size = 3) +
+    geom_vline(xintercept = shadow_stats$shadow_min,
+               linetype = "dotted", color = "grey50") +
+    geom_vline(xintercept = shadow_stats$shadow_mean,
+               linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = shadow_stats$shadow_max,
+               linetype = "solid", color = "grey30") +
+    scale_color_manual(values = c("Confirmed" = "forestgreen",
+                                  "Rejected"  = "firebrick",
+                                  "Tentative" = "goldenrod")) +
+    labs(
+      title = paste0("Boruta: biological features vs shadow threshold (", suffix, ")"),
+      x = "Mean Importance",
+      y = NULL,
+      color = "Decision"
+    ) +
+    annotate("text", x = shadow_stats$shadow_max, y = 0.5,
+             label = "shadow max", hjust = -0.1, size = 3, color = "grey30") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8))
+
+  print(p_bio)
+
+  ggsave(here("plots", paste0("rf_boruta_bio_features_", suffix, ".pdf")),
+         plot = p_bio, width = 10, height = max(4, nrow(bio_features) * 0.35))
+}
+```
+
+```{r boruta_shap, fig.width=10, fig.height=max(6, length(feature_cols) * 0.35)}
+# # ---- SHAP directionality (Boruta-selected features) ----
+# set.seed(9)
+
+# # Balanced class weights (same logic as train_rf chunk)
+# shap_counts <- table(model_genes$eif3d_target)
+# n_shap <- nrow(model_genes)
+# shap_weight_pos <- n_shap / (2 * shap_counts[pos_label])
+# shap_weight_neg <- n_shap / (2 * shap_counts[neg_label])
+# shap_case_weights <- ifelse(model_genes$eif3d_target == pos_label,
+#                             shap_weight_pos, shap_weight_neg)
+
+# # Train temporary ranger on Boruta-selected features
+# rf_boruta_shap <- ranger(
+#   formula = eif3d_target ~ .,
+#   data = model_genes %>% dplyr::select(eif3d_target, all_of(feature_cols)),
+#   num.trees = 500,
+#   probability = TRUE,
+#   case.weights = shap_case_weights,
+#   seed = 9
+# )
+
+# # Convert to treeshap format
+# unified_model <- ranger.unify(rf_boruta_shap,
+#                               model_genes %>% dplyr::select(all_of(feature_cols)))
+
+# # Compute SHAP values (subsample if large)
+# shap_data <- model_genes %>% dplyr::select(all_of(feature_cols))
+# if (nrow(shap_data) > 500) {
+#   shap_idx <- sample(nrow(shap_data), 500)
+#   shap_data <- shap_data[shap_idx, ]
+# }
+
+# shap_res <- treeshap(unified_model, shap_data)
+
+# # Build shapviz object
+# sv <- shapviz(shap_res)
+
+# # Beeswarm plot (directionality)
+# p_shap_bee <- sv_importance(sv, kind = "beeswarm", max_display = 30L) +
+#   theme_cowplot() +
+#   labs(title = paste0("SHAP Feature Directionality: Boruta-Selected Features"),
+#        subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+#                          " | ", params$timepoint))
+
+# print(p_shap_bee)
+
+# ggsave(here("plots", paste0("rf_boruta_shap_beeswarm_", suffix, ".pdf")),
+#        plot = p_shap_bee, width = 10,
+#        height = max(6, length(feature_cols) * 0.35))
+
+# # Bar plot (mean |SHAP|)
+# p_shap_bar <- sv_importance(sv, kind = "bar", max_display = 30L) +
+#   theme_cowplot() +
+#   labs(title = paste0("SHAP Feature Importance: Boruta-Selected Features"),
+#        subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+#                          " | ", params$timepoint))
+
+# print(p_shap_bar)
+
+# ggsave(here("plots", paste0("rf_boruta_shap_importance_", suffix, ".pdf")),
+#        plot = p_shap_bar, width = 10,
+#        height = max(6, length(feature_cols) * 0.35))
+
+# # Export SHAP summary
+# shap_summary <- data.frame(
+#   feature = colnames(shap_res$shaps),
+#   mean_abs_shap = colMeans(abs(shap_res$shaps)),
+#   mean_shap = colMeans(shap_res$shaps)
+# ) %>% arrange(desc(mean_abs_shap))
+
+# write_csv(shap_summary, here("output", "predictive_modeling",
+#                               paste0("rf_boruta_shap_summary_", suffix, ".csv")))
+
+# cat("SHAP summary (positive mean_shap = feature pushes toward", pos_label, "class):\n")
+# print(shap_summary)
+```
+
+```{r correlated_feature_selection, fig.width=10, fig.height=8}
+boruta_feats <- getSelectedAttributes(boruta_res, withTentative = TRUE)
+
+cor_mat <- cor(
+  model_genes[, boruta_feats],
+  use = "pairwise.complete.obs"
+)
+
+hc <- hclust(as.dist(1 - abs(cor_mat)))
+
+# Cut tree at correlation threshold of 0.7 (i.e., distance = 0.3)
+clusters <- cutree(hc, h = 0.3)
+
+boruta_stats <- attStats(boruta_res)
+
+cluster_df <- boruta_stats %>%
+  rownames_to_column("feature") %>%
+  filter(feature %in% boruta_feats) %>%
+  mutate(cluster = clusters[feature]) %>%
+  arrange(cluster, desc(meanImp))
+
+# Show all clusters with >1 member (i.e., correlated groups)
+multi_member <- cluster_df %>%
+  group_by(cluster) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+cat("=== Correlated feature clusters (|r| >= 0.7) ===\n\n")
+if (nrow(multi_member) > 0) {
+  for (cl in unique(multi_member$cluster)) {
+    members <- multi_member %>% filter(cluster == cl)
+    cat("Cluster", cl, "(", nrow(members), "features ):\n")
+    for (j in seq_len(nrow(members))) {
+      cat("  ", members$feature[j],
+          "  (Boruta meanImp =", round(members$meanImp[j], 2), ")\n")
+    }
+    # Show pairwise correlations within this cluster
+    cl_feats <- members$feature
+    if (length(cl_feats) > 1) {
+      cat("  Pairwise correlations:\n")
+      for (a in 1:(length(cl_feats) - 1)) {
+        for (b in (a + 1):length(cl_feats)) {
+          cat("    ", cl_feats[a], " <-> ", cl_feats[b], ": ",
+              round(cor_mat[cl_feats[a], cl_feats[b]], 3), "\n")
+        }
+      }
+    }
+    cat("\n")
+  }
+} else {
+  cat("No correlated clusters found — all Boruta features are independent.\n\n")
+}
+
+# Singletons (uncorrelated features — automatically kept)
+singletons <- cluster_df %>%
+  group_by(cluster) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+cat("=== Uncorrelated features (automatically kept):", nrow(singletons), "===\n")
+print(singletons %>% dplyr::select(feature, meanImp) %>% arrange(desc(meanImp)))
+```
+
+Review the correlated clusters above and choose which feature to keep from each.
+Edit the `selected` vector below — one feature per correlated cluster.
+
+```{r choose_representatives}
+# ---- EDIT THIS: pick one feature per correlated cluster ----
+# Default: highest Boruta importance per cluster
+selected_from_clusters <- cluster_df %>%
+  group_by(cluster) %>%
+  slice_max(meanImp, n = 1) %>%
+  ungroup() %>%
+  pull(feature)
+
+# To override, uncomment and replace specific features:
+# Example: swap out "utr5_length" for "log2_utr5_length" in cluster 3
+# selected_from_clusters[selected_from_clusters == "utr5_length"] <- "log2_utr5_length"
+
+feature_cols <- selected_from_clusters
+cat("Final feature count:", length(feature_cols), "\n")
+cat("Final features:\n")
+cat(paste(" ", feature_cols), sep = "\n")
+```
+
+
+
+
+
 
 ## Median-Impute Missing Values
 
@@ -227,14 +520,27 @@ print(table(test_data$eif3d_target))
 # Train Random Forest
 
 ```{r train_rf}
-# Classes are already balanced (neg sampled to match pos count), so no case weights needed.
+# Class weights (inverse frequency)
+class_counts <- table(train_data$eif3d_target)
+n_train <- nrow(train_data)
+weight_pos <- n_train / (2 * class_counts[pos_label])
+weight_neg <- n_train / (2 * class_counts[neg_label])
+
+case_weights <- ifelse(train_data$eif3d_target == pos_label,
+                       weight_pos, weight_neg)
+
+cat("Class weights —", pos_label, ":", round(weight_pos, 2),
+    ",", neg_label, ":", round(weight_neg, 2), "\n")
+
+# Train
 set.seed(9)
 rf_model <- ranger(
-  x = train_data[, feature_cols],
-  y = train_data$eif3d_target,
+  formula = eif3d_target ~ .,
+  data = train_data %>% dplyr::select(eif3d_target, all_of(feature_cols)),
   num.trees = 500,
   importance = "impurity",
   probability = TRUE,
+  case.weights = case_weights,
   seed = 9
 )
 
@@ -247,7 +553,7 @@ print(rf_model)
 
 ```{r roc_curve, fig.width=8, fig.height=6}
 # Predictions
-pred_probs <- predict(rf_model, test_data[, feature_cols])$predictions
+pred_probs <- predict(rf_model, test_data %>% dplyr::select(all_of(feature_cols)))$predictions
 pred_pos_prob <- pred_probs[, pos_label]
 actual <- test_data$eif3d_target
 
@@ -359,17 +665,27 @@ cv_results <- lapply(seq_along(folds), function(i) {
   train_cv <- model_data[-test_idx, ]
   test_cv <- model_data[test_idx, ]
 
-  # Train (classes already balanced, no case weights needed)
+  # Class weights for this fold
+  fold_counts <- table(train_cv$eif3d_target)
+  n_fold <- nrow(train_cv)
+  fold_weights <- ifelse(
+    train_cv$eif3d_target == pos_label,
+    n_fold / (2 * fold_counts[pos_label]),
+    n_fold / (2 * fold_counts[neg_label])
+  )
+
+  # Train
   rf_cv <- ranger(
-    x = train_cv[, feature_cols],
-    y = train_cv$eif3d_target,
+    formula = eif3d_target ~ .,
+    data = train_cv %>% dplyr::select(eif3d_target, all_of(feature_cols)),
     num.trees = 500,
     probability = TRUE,
+    case.weights = fold_weights,
     seed = 9
   )
 
   # Predict
-  pred_probs_cv <- predict(rf_cv, test_cv[, feature_cols])$predictions[, pos_label]
+  pred_probs_cv <- predict(rf_cv, test_cv %>% dplyr::select(all_of(feature_cols)))$predictions[, pos_label]
 
   # ROC + Youden threshold
   roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv,
@@ -453,17 +769,16 @@ print(p_importance)
 ggsave(here("plots", paste0("rf_classification_feature_importance_", suffix, ".pdf")),
        plot = p_importance, width = 10, height = 10)
 
-# All-features bar plot (cap at top 60 to avoid oversized PDFs)
-importance_all_plot <- importance_df %>% head(40)
-all_height <- max(6, nrow(importance_all_plot) * 0.35)
+# All-features bar plot
+all_height <- max(6, nrow(importance_df) * 0.35)
 
-p_importance_all <- importance_all_plot %>%
+p_importance_all <- importance_df %>%
   ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
   geom_bar(stat = "identity", fill = "#E69F00") +
   coord_flip() +
   theme_cowplot() +
   labs(
-    title = paste0("Top ", nrow(importance_all_plot), " Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    title = paste0("All Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
     subtitle = "Variable Importance (Impurity)",
     x = "",
     y = "Variable Importance"
@@ -474,10 +789,9 @@ print(p_importance_all)
 ggsave(here("plots", paste0("rf_classification_feature_importance_all_", suffix, ".pdf")),
        plot = p_importance_all, width = 10, height = all_height)
 
-# Custom-features-only bar plot (exclude k-mer and RBP motif features, cap at top 60)
+# Custom-features-only bar plot (exclude k-mer and RBP motif features)
 importance_custom <- importance_df %>%
-  filter(!str_detect(feature, "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbp_|^rbns_|^cisbp_")) %>%
-  head(40)
+  filter(!str_detect(feature, "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbp_|^rbns_|^cisbp_"))
 
 custom_height <- max(6, nrow(importance_custom) * 0.35)
 
@@ -505,7 +819,6 @@ ggsave(here("plots", paste0("rf_classification_feature_importance_custom_", suff
 importance_df <- importance_df %>%
   mutate(
     category = case_when(
-      str_detect(feature, "^struct_")                          ~ "RNA Structure",
       str_detect(feature, "^orfquant_")                       ~ "ORFquant",
       str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
       str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
@@ -609,7 +922,7 @@ cat("  Gene:", paste0("eIF", params$gene), "\n")
 cat("  Direction:", params$direction, "\n")
 cat("  Timepoint:", params$timepoint, "\n")
 cat("  LFC threshold:", params$lfc, "\n")
-cat("  Feature set:", params$feature_set, "(no Boruta selection)\n")
+cat("  Feature set:", params$feature_set, "\n")
 cat("  CLIP mode:", params$clip_mode, "\n\n")
 
 cat("Classes:\n")
@@ -635,17 +948,21 @@ for (i in 1:5) {
   cat("  ", i, ". ", importance_df$feature[i], " (", round(importance_df$importance[i], 2), ")\n", sep = "")
 }
 
+# cat("\nTop 5 Features by SHAP (directional):\n")
+# for (i in 1:min(5, nrow(shap_summary))) {
+#   direction <- if (shap_summary$mean_shap[i] > 0) paste0("-> ", pos_label) else paste0("-> ", neg_label)
+#   cat("  ", i, ". ", shap_summary$feature[i],
+#       " (|SHAP| = ", round(shap_summary$mean_abs_shap[i], 4),
+#       ", ", direction, ")\n", sep = "")
+# }
 cat("========================================\n")
 ```
 
 # Final Feature Importance Plot
 
-```{r final_importance_plot, fig.width=8, fig.height=max(4, min(40, length(feature_cols)) * 0.35)}
-# Lollipop plot of top features (cap at 40)
-importance_final_plot <- importance_df %>% head(40)
-final_height <- max(4, nrow(importance_final_plot) * 0.35)
-
-p_final_importance <- importance_final_plot %>%
+```{r final_importance_plot, fig.width=8, fig.height=max(4, length(feature_cols) * 0.35)}
+# Lollipop plot of all selected features
+p_final_importance <- importance_df %>%
   ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
   geom_segment(aes(xend = reorder(feature_clean, importance), y = 0, yend = importance),
                color = "grey60", linewidth = 0.6) +
@@ -664,7 +981,7 @@ print(p_final_importance)
 
 ggsave(here("plots", paste0("rf_final_importance_", suffix, ".pdf")),
        plot = p_final_importance, width = 8,
-       height = final_height)
+       height = max(4, length(feature_cols) * 0.35))
 ```
 
 # Session Info
@@ -672,3 +989,5 @@ ggsave(here("plots", paste0("rf_final_importance_", suffix, ".pdf")),
 ```{r session_info}
 sessionInfo()
 ```
+
+

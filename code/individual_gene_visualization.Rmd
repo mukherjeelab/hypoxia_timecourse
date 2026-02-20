@@ -52,7 +52,7 @@ gene_symbols <- gene_anno %>%
   dplyr::select(gene_id, symbol, type) %>%
   arrange(gene_id, desc(type == "protein_coding")) %>%
   group_by(gene_id) %>%
-  slice(1) %>%
+  dplyr::slice(1) %>%
   ungroup() %>%
   dplyr::select(gene_id, symbol)
 
@@ -616,17 +616,136 @@ ggsave(
 )
 ```
 
+## Identify Housekeeping Genes for Western Blots
+
+Find genes with stable RNA and Ribo levels across the hypoxic timecourse (sictrl only) — candidates for western blot loading controls.
+
+```{r load_translation_categories}
+# Load translation categories (separate RNA/Ribo LFC and padj per timepoint)
+tc_1hr <- read_csv(here("output", "translation_categories_1hr.csv"))
+tc_4hr <- read_csv(here("output", "translation_categories_4hr.csv"))
+tc_24hr <- read_csv(here("output", "translation_categories_24hr.csv"))
+
+cat("Translation categories loaded:\n")
+cat("  1hr:", nrow(tc_1hr), "genes\n")
+cat("  4hr:", nrow(tc_4hr), "genes\n")
+cat("  24hr:", nrow(tc_24hr), "genes\n")
+```
+
+```{r find_housekeeping_genes}
+# Merge all timepoints
+stable <- tc_1hr %>%
+  dplyr::select(gene_id,
+                rna_lfc_1hr = rna_lfc, ribo_lfc_1hr = ribo_lfc,
+                rna_padj_1hr = rna_padj, ribo_padj_1hr = ribo_padj) %>%
+  inner_join(
+    tc_4hr %>%
+      dplyr::select(gene_id,
+                    rna_lfc_4hr = rna_lfc, ribo_lfc_4hr = ribo_lfc,
+                    rna_padj_4hr = rna_padj, ribo_padj_4hr = ribo_padj),
+    by = "gene_id"
+  ) %>%
+  inner_join(
+    tc_24hr %>%
+      dplyr::select(gene_id,
+                    rna_lfc_24hr = rna_lfc, ribo_lfc_24hr = ribo_lfc,
+                    rna_padj_24hr = rna_padj, ribo_padj_24hr = ribo_padj),
+    by = "gene_id"
+  )
+
+# Criteria: not significant (padj > 0.1) at all timepoints for both RNA and Ribo,
+# AND small absolute LFC (< 0.25) at every timepoint
+stable <- stable %>%
+  filter(
+    # Not significant at any timepoint for RNA
+    rna_padj_1hr > 0.1, rna_padj_4hr > 0.1, rna_padj_24hr > 0.1,
+    # Not significant at any timepoint for Ribo
+    ribo_padj_1hr > 0.1, ribo_padj_4hr > 0.1, ribo_padj_24hr > 0.1,
+    # Small fold changes everywhere
+    abs(rna_lfc_1hr) < 0.25, abs(rna_lfc_4hr) < 0.25, abs(rna_lfc_24hr) < 0.25,
+    abs(ribo_lfc_1hr) < 0.25, abs(ribo_lfc_4hr) < 0.25, abs(ribo_lfc_24hr) < 0.25
+  )
+
+cat("Genes stable in RNA & Ribo across all timepoints:", nrow(stable), "\n")
+
+# Add gene symbols and baseMean for ranking
+stable <- stable %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  # Compute max absolute LFC across all measurements as a stability score
+  mutate(
+    max_abs_rna_lfc = pmax(abs(rna_lfc_1hr), abs(rna_lfc_4hr), abs(rna_lfc_24hr)),
+    max_abs_ribo_lfc = pmax(abs(ribo_lfc_1hr), abs(ribo_lfc_4hr), abs(ribo_lfc_24hr)),
+    max_abs_lfc = pmax(max_abs_rna_lfc, max_abs_ribo_lfc)
+  ) %>%
+  arrange(max_abs_lfc)
+
+# Show top candidates
+cat("\nTop 30 housekeeping gene candidates (sorted by max |LFC| across all):\n\n")
+stable %>%
+  head(30) %>%
+  dplyr::select(symbol, gene_id,
+                rna_lfc_1hr, rna_lfc_4hr, rna_lfc_24hr,
+                ribo_lfc_1hr, ribo_lfc_4hr, ribo_lfc_24hr,
+                max_abs_lfc) %>%
+  print(n = 30)
+```
+
+```{r filter_common_westerns}
+# Flag well-known western blot housekeeping genes if they appear in the stable set
+common_hk <- c("ACTB", "GAPDH", "TUBA1A", "TUBA1B", "TUBB", "TUBB4B",
+               "HSP90AB1", "HSP90AA1", "HSPA8", "VCP", "VINC", "VCL",
+               "LMNA", "LMNB1", "RPS6", "RPS3", "RPL7", "RPL13A",
+               "PPIA", "B2M", "SDHA", "YWHAZ", "UBC", "HMBS", "TBP")
+
+cat("Common western housekeeping genes in stable set:\n")
+stable %>%
+  filter(symbol %in% common_hk) %>%
+  dplyr::select(symbol, rna_lfc_1hr, rna_lfc_4hr, rna_lfc_24hr,
+                ribo_lfc_1hr, ribo_lfc_4hr, ribo_lfc_24hr,
+                max_abs_lfc) %>%
+  print(n = Inf)
+
+cat("\nCommon housekeeping genes NOT in stable set:\n")
+cat(setdiff(common_hk, stable$symbol), sep = ", ")
+cat("\n")
+```
+
+```{r visualize_top_housekeeping, fig.width=10, fig.height=10}
+# Visualize the top candidate
+top_hk <- stable$symbol[1]
+
+top_hk <- "MMP9"
+cat("Visualizing top candidate:", top_hk, "\n")
+
+hk_plots <- visualize_gene(
+  gene_input = top_hk,
+  counts_1hr = counts_1hr,
+  counts_4hr = counts_4hr,
+  counts_24hr = counts_24hr,
+  gene_symbols = gene_symbols,
+  log_transform = TRUE
+)
+
+print(hk_plots$rna_ribo)
+print(hk_plots$te)
+```
+
 ## Example: Visualize Multiple Genes
 
 ```{r example_multiple_genes, eval=FALSE}
 # List of genes of interest
+# genes_of_interest <- c(
+#   "VEGFA",    # Classic hypoxia gene
+#   "HIF1A",    # Hypoxia master regulator
+#   "LDHA",     # Glycolysis gene
+#   "BNIP3",    # HIF target
+#   "EIF3D",    # Translation factor of interest
+#   "EIF3E"     # Translation factor of interest
+# )
+
+
 genes_of_interest <- c(
-  "VEGFA",    # Classic hypoxia gene
-  "HIF1A",    # Hypoxia master regulator
-  "LDHA",     # Glycolysis gene
-  "BNIP3",    # HIF target
-  "EIF3D",    # Translation factor of interest
-  "EIF3E"     # Translation factor of interest
+  "EIF2AK4"
 )
 
 # Generate all plots

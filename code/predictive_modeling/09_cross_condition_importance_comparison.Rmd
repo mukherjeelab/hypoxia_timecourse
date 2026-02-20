@@ -1,0 +1,262 @@
+---
+title: "`r paste0('Cross-Condition Variable Importance Comparison: Hypoxia vs Normoxia (', params$feature_set, ', clip_', params$clip_mode, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  gene: "3d"
+  direction: "promotes"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set: "targeted"
+  clip_mode: "aggregate"
+  source_model: "no_boruta"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# Defaults for interactive use (overwritten by YAML params when knitting)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    gene      = "3d",
+    direction = "promotes",
+    timepoint = "1hr",
+    lfc       = "0.5",
+    feature_set = "structure", #targeted, combined, or structure
+    clip_mode   = "aggregate", # "individual", "aggregate", or "both"
+    source_model = "no_boruta" # "no_boruta" (07) or "boruta" (06)
+  )
+}
+
+# Build suffixes for each condition
+make_suffix <- function(condition) {
+  base <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 condition, "_", params$timepoint, "_lfc", params$lfc,
+                 "_", params$feature_set, "_clip", params$clip_mode)
+  if (params$source_model == "no_boruta") {
+    paste0(base, "_no_boruta")
+  } else {
+    base
+  }
+}
+
+suffix_hyp <- make_suffix("hypoxia")
+suffix_nor <- make_suffix("normoxia")
+gene_label <- paste0("eIF", params$gene)
+subtitle_label <- paste0(gene_label, " ", params$direction, " | ", params$timepoint,
+                         " | LFC ", params$lfc, " | ", params$feature_set,
+                         " | clip", params$clip_mode, " | ", params$source_model)
+
+cat("Hypoxia suffix:", suffix_hyp, "\n")
+cat("Normoxia suffix:", suffix_nor, "\n")
+```
+
+# Overview
+
+Compare RF variable importance between hypoxia and normoxia for `r gene_label` `r params$direction` (`r params$timepoint`, lfc`r params$lfc`, `r params$feature_set`, clip`r params$clip_mode`, `r params$source_model`). Each condition was analyzed independently via 07/08; this notebook loads both sets of results and visualizes the differences.
+
+Raw impurity-based importance is not comparable across independently trained forests (different sample sizes, class distributions, total impurity). We normalize each model's importance to **proportions** (sum to 1) before comparing.
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+```
+
+# Load Data
+
+```{r load_data}
+# Directionality CSVs (from 08)
+dir_hyp <- read_csv(here("output", "predictive_modeling",
+  paste0("rf_feature_directionality_", suffix_hyp, ".csv")))
+dir_nor <- read_csv(here("output", "predictive_modeling",
+  paste0("rf_feature_directionality_", suffix_nor, ".csv")))
+
+cat("Hypoxia features:", nrow(dir_hyp), "\n")
+cat("Normoxia features:", nrow(dir_nor), "\n")
+
+# Importance CSVs (from 07) — these have feature_clean and category
+imp_hyp <- read_csv(here("output", "predictive_modeling",
+  paste0("rf_classification_importance_", suffix_hyp, ".csv")))
+imp_nor <- read_csv(here("output", "predictive_modeling",
+  paste0("rf_classification_importance_", suffix_nor, ".csv")))
+
+# Build feature_clean lookup from both importance files (union in case feature sets differ slightly)
+feature_lookup <- bind_rows(
+  imp_hyp %>% select(feature, feature_clean, category),
+  imp_nor %>% select(feature, feature_clean, category)
+) %>%
+  distinct(feature, .keep_all = TRUE)
+
+cat("Unique features in lookup:", nrow(feature_lookup), "\n")
+```
+
+# Join Conditions
+
+```{r join_data}
+# Normalize importance to proportions within each model so that
+# values are on a common scale (raw impurity importance is not
+# comparable across independently trained forests).
+dir_hyp <- dir_hyp %>% mutate(importance = importance / sum(importance))
+dir_nor <- dir_nor %>% mutate(importance = importance / sum(importance))
+
+cat("Hypoxia importance sums to:", sum(dir_hyp$importance), "\n")
+cat("Normoxia importance sums to:", sum(dir_nor$importance), "\n")
+
+# Inner join directionality tables on feature
+joined <- inner_join(
+  dir_hyp %>% select(feature, importance_hyp = importance, correlation_hyp = correlation,
+                     direction_hyp = direction, diff_hyp = diff,
+                     wilcox_p_adj_hyp = wilcox_p_adj),
+  dir_nor %>% select(feature, importance_nor = importance, correlation_nor = correlation,
+                     direction_nor = direction, diff_nor = diff,
+                     wilcox_p_adj_nor = wilcox_p_adj),
+  by = "feature"
+)
+
+# Add feature_clean and category from lookup
+joined <- joined %>%
+  left_join(feature_lookup, by = "feature")
+
+# Compute delta importance (hypoxia minus normoxia)
+joined <- joined %>%
+  mutate(
+    delta_importance = importance_hyp - importance_nor,
+    delta_sign = ifelse(delta_importance >= 0, "Higher in Hypoxia", "Higher in Normoxia")
+  ) %>%
+  arrange(desc(importance_hyp + importance_nor))
+
+cat("Features in joined table:", nrow(joined), "\n")
+cat("Features only in hypoxia:", sum(!dir_hyp$feature %in% dir_nor$feature), "\n")
+cat("Features only in normoxia:", sum(!dir_nor$feature %in% dir_hyp$feature), "\n")
+```
+
+# Plots
+
+## 1. Scatter Plot: Hypoxia vs Normoxia Importance
+
+```{r scatter_plot, fig.width=10, fig.height=9}
+# Label top features by combined importance
+top_n_label <- min(15, nrow(joined))
+label_data <- joined %>% head(top_n_label)
+
+p_scatter <- ggplot(joined, aes(x = importance_hyp, y = importance_nor)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_point(aes(color = category), size = 3, alpha = 0.7) +
+  ggrepel::geom_text_repel(
+    data = label_data,
+    aes(label = feature_clean),
+    size = 3, max.overlaps = 20, segment.color = "grey50"
+  ) +
+  theme_cowplot() +
+  labs(
+    title = "Variable Importance: Hypoxia vs Normoxia",
+    subtitle = subtitle_label,
+    x = "Relative Importance (Hypoxia)",
+    y = "Relative Importance (Normoxia)",
+    color = "Category"
+  )
+
+print(p_scatter)
+
+ggsave(here("plots", paste0("rf_importance_comparison_scatter_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_scatter, width = 10, height = 9)
+```
+
+## 2. Dumbbell Plot: Paired Importance by Condition
+
+```{r dumbbell_plot, fig.width=10, fig.height=10}
+# Top features by max importance across conditions
+dumbbell_data <- joined %>%
+  mutate(max_importance = pmax(importance_hyp, importance_nor)) %>%
+  arrange(desc(max_importance)) %>%
+  head(30) %>%
+  mutate(feature_clean = fct_reorder(feature_clean, max_importance))
+
+p_dumbbell <- ggplot(dumbbell_data) +
+  geom_segment(aes(x = importance_hyp, xend = importance_nor,
+                   y = feature_clean, yend = feature_clean),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(aes(x = importance_hyp, y = feature_clean, color = "Hypoxia"), size = 3) +
+  geom_point(aes(x = importance_nor, y = feature_clean, color = "Normoxia"), size = 3) +
+  scale_color_manual(
+    values = c("Hypoxia" = "#D55E00", "Normoxia" = "#0072B2"),
+    name = "Condition"
+  ) +
+  theme_cowplot() +
+  labs(
+    title = "Top 30 Features: Paired Importance by Condition",
+    subtitle = subtitle_label,
+    x = "Relative Importance (Proportion)",
+    y = ""
+  )
+
+print(p_dumbbell)
+
+ggsave(here("plots", paste0("rf_importance_comparison_dumbbell_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_dumbbell, width = 10, height = 10)
+```
+
+## 3. Delta Importance Bar Plot
+
+```{r delta_bar_plot, fig.width=10, fig.height=10}
+delta_data <- joined %>%
+  arrange(desc(abs(delta_importance))) %>%
+  head(30) %>%
+  mutate(feature_clean = fct_reorder(feature_clean, delta_importance))
+
+p_delta <- ggplot(delta_data, aes(x = feature_clean, y = delta_importance, fill = delta_sign)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("Higher in Hypoxia" = "#009E73", "Higher in Normoxia" = "#D55E00"),
+    name = ""
+  ) +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = "Delta Importance: Hypoxia minus Normoxia",
+    subtitle = subtitle_label,
+    x = "",
+    y = "Delta Relative Importance (Hypoxia - Normoxia)"
+  )
+
+print(p_delta)
+
+ggsave(here("plots", paste0("rf_importance_comparison_delta_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_delta, width = 10, height = 10)
+```
+
+# Export
+
+```{r export}
+output_dir <- here("output", "predictive_modeling")
+
+export_df <- joined %>%
+  select(feature, feature_clean, category,
+         importance_hyp, importance_nor, delta_importance,
+         correlation_hyp, correlation_nor,
+         direction_hyp, direction_nor,
+         diff_hyp, diff_nor,
+         wilcox_p_adj_hyp, wilcox_p_adj_nor)
+
+write_csv(export_df, file.path(output_dir,
+  paste0("rf_importance_comparison_", suffix_hyp, "_vs_", suffix_nor, ".csv")))
+
+cat("Exported:", nrow(export_df), "features\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
