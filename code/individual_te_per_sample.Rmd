@@ -1,0 +1,422 @@
+---
+title: "Condition-Level Translation Efficiency (Single DESeq2 Run)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+# Overview
+
+This notebook calculates **condition-level TE** — one log2(ribo/rna) value per gene per
+group — using a single DESeq2 run on all samples together. Groups are defined as every
+combination of condition × treatment × timepoint × library. Replicates within each group
+estimate the variance; the contrast always extracts ribo vs rna within a given context.
+
+Spike-in size factors are used to normalize across libraries.
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(ashr)
+library(ggplot2)
+library(cowplot)
+```
+
+```{r load_functions}
+source(here("code/functions.R"))
+```
+
+---
+
+# 1. Load Data
+
+```{r load_counts}
+allCounts <- read_csv(here("output", "human_allCounts_raw.csv"),
+                      show_col_types = FALSE) %>%
+  column_to_rownames("gene_id")
+
+spikein <- read_csv(here("output", "dros_spikeInCounts_raw.csv"),
+                    show_col_types = FALSE) %>%
+  column_to_rownames("gene_id")
+
+metadata <- read_csv(here("output", "metadata_clean.csv"),
+                     show_col_types = FALSE)
+
+cat("allCounts:", dim(allCounts), "\n")
+cat("spikein:", dim(spikein), "\n")
+cat("metadata:", nrow(metadata), "samples\n")
+```
+
+```{r load_gene_anno}
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                      col_names = c("gene_id", "symbol", "type", "organism", "source"),
+                      show_col_types = FALSE)
+
+gene_symbols <- gene_anno %>%
+  dplyr::select(gene_id, symbol) %>%
+  arrange(gene_id) %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+
+cat("Gene symbols loaded:", nrow(gene_symbols), "unique genes\n")
+```
+
+---
+
+# 2. Spike-In Selection
+
+Select top 500 spike-in genes by total expression for size factor estimation.
+
+```{r select_spikes}
+top500_ids <- spikein %>%
+  rowSums() %>%
+  sort(decreasing = TRUE) %>%
+  head(500) %>%
+  names()
+
+cat("Using", length(top500_ids), "spike-in control genes\n")
+```
+
+---
+
+# 3. Build DESeq2 Object
+
+## 3.1 Combine counts and build group factor
+
+```{r build_metadata}
+# Align spike-in columns to allCounts
+spikein_aligned <- spikein[, colnames(allCounts), drop = FALSE]
+
+combined_counts <- rbind(allCounts, spikein_aligned)
+spike_idx <- which(rownames(combined_counts) %in% top500_ids)
+
+cat("Combined count matrix:", dim(combined_counts), "\n")
+cat("Spike-in row indices:", length(spike_idx), "\n")
+
+# Build group factor: condition_treatment_hours_library
+# Coerce hours to character to avoid numeric formatting issues
+metadata_dds <- metadata %>%
+  mutate(group = paste(condition, treatment, as.character(hours), library, sep = "_")) %>%
+  column_to_rownames("sample_name")
+
+# Verify colnames match rownames
+stopifnot(all(colnames(combined_counts) %in% rownames(metadata_dds)))
+metadata_dds <- metadata_dds[colnames(combined_counts), ]
+
+cat("\nGroup levels in data:\n")
+print(sort(unique(metadata_dds$group)))
+cat("\nTotal groups:", length(unique(metadata_dds$group)), "\n")
+```
+
+## 3.2 Create DESeq2 dataset, estimate size factors, remove spike-ins
+
+```{r build_dds}
+dds <- DESeqDataSetFromMatrix(
+  countData = round(combined_counts),
+  colData   = metadata_dds,
+  design    = ~ group
+)
+
+# Spike-in size factors
+dds <- estimateSizeFactors(dds, controlGenes = spike_idx)
+
+cat("\nSize factors (first 10 samples):\n")
+print(round(head(sizeFactors(dds), 10), 3))
+
+# Remove spike-ins AFTER size factor estimation
+dds <- dds[!grepl("^FBgn", rownames(dds)), ]
+cat("\nGenes remaining after spike-in removal:", nrow(dds), "\n")
+```
+
+## 3.3 Run DESeq2
+
+This may take several minutes with all samples.
+
+```{r run_deseq, cache=TRUE}
+dds <- DESeq(dds)
+cat("DESeq2 complete.\n")
+cat("Result names (first 6):\n")
+print(head(resultsNames(dds), 6))
+```
+
+---
+
+# 4. Extract TE Contrasts
+
+For every combination of condition × treatment × timepoint, compare ribo vs rna to get TE.
+
+```{r define_groups}
+conditions  <- c("normoxia", "hypoxia")
+treatments  <- c("sictrl", "si3e", "si3d")
+timepoints  <- c(1, 4, 24)
+
+# All expected group levels
+expected_groups <- expand.grid(
+  condition = conditions,
+  treatment = treatments,
+  hours     = timepoints,
+  library   = c("ribo", "rna"),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(group = paste(condition, treatment, as.character(hours), library, sep = "_")) %>%
+  pull(group)
+
+available_groups <- levels(dds$group)
+missing_groups   <- setdiff(expected_groups, available_groups)
+
+if (length(missing_groups) > 0) {
+  cat("WARNING: The following expected groups are missing from the model:\n")
+  print(missing_groups)
+} else {
+  cat("All expected group levels are present in the model.\n")
+}
+```
+
+```{r extract_te, cache=TRUE}
+te_results <- map_dfr(timepoints, function(hr) {
+  map_dfr(treatments, function(trt) {
+    map_dfr(conditions, function(cond) {
+      ribo_grp <- paste(cond, trt, as.character(hr), "ribo", sep = "_")
+      rna_grp  <- paste(cond, trt, as.character(hr), "rna",  sep = "_")
+
+      # Skip if either group is missing
+      if (!ribo_grp %in% available_groups || !rna_grp %in% available_groups) {
+        message("Skipping missing group: ", ribo_grp, " or ", rna_grp)
+        return(NULL)
+      }
+
+      message("Extracting TE: ", ribo_grp, " vs ", rna_grp)
+
+      res_raw <- results(dds,
+                         contrast = c("group", ribo_grp, rna_grp),
+                         independentFiltering = FALSE)
+
+      res_shrunk <- lfcShrink(dds,
+                              contrast = c("group", ribo_grp, rna_grp),
+                              res      = res_raw,
+                              type     = "ashr")
+
+      as.data.frame(res_shrunk) %>%
+        rownames_to_column("gene_id") %>%
+        mutate(condition = cond, treatment = trt, hours = hr)
+    })
+  })
+})
+
+cat("\nTE results dimensions:", dim(te_results), "\n")
+cat("Unique condition × treatment × hours combinations:\n")
+print(te_results %>% distinct(condition, treatment, hours) %>% arrange(condition, treatment, hours))
+```
+
+---
+
+# 5. Join Gene Symbols and Save
+
+```{r join_symbols}
+te_results_anno <- te_results %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  dplyr::select(gene_id, symbol, condition, treatment, hours,
+                log2FoldChange, lfcSE, pvalue, padj, baseMean)
+
+cat("Final table dimensions:", dim(te_results_anno), "\n")
+```
+
+```{r save_output}
+write_csv(te_results_anno, here("output", "condition_level_te.csv"))
+cat("Saved: output/condition_level_te.csv\n")
+```
+
+---
+
+# 6. Sanity Check Plots
+
+## Check 1: Model structure
+
+```{r check_model_structure}
+cat("Group levels in DESeq2 model:\n")
+grp_levels <- levels(dds$group)
+print(grp_levels)
+cat("\nTotal:", length(grp_levels), "groups (expected 36 = 2 conditions × 3 treatments × 3 timepoints × 2 libraries)\n")
+
+cat("\nSize factors summary:\n")
+sf_df <- data.frame(
+  sample     = names(sizeFactors(dds)),
+  size_factor = sizeFactors(dds)
+) %>%
+  left_join(metadata %>% dplyr::select(sample_name, library),
+            by = c("sample" = "sample_name"))
+
+ggplot(sf_df, aes(x = library, y = size_factor, color = library)) +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.7) +
+  scale_color_manual(values = c("rna" = "steelblue", "ribo" = "tomato")) +
+  labs(title = "Spike-in size factors by library type",
+       y = "Size factor", x = "Library") +
+  theme_cowplot(12) +
+  theme(legend.position = "none")
+```
+
+## Check 2: Global TE distribution (sictrl)
+
+Hypoxia sictrl should show globally suppressed TE compared to normoxia sictrl.
+
+```{r check_te_distribution}
+te_sictrl <- te_results_anno %>%
+  filter(treatment == "sictrl", !is.na(log2FoldChange))
+
+# Median TE per condition × timepoint
+te_medians <- te_sictrl %>%
+  group_by(condition, hours) %>%
+  summarise(median_te = median(log2FoldChange, na.rm = TRUE), .groups = "drop")
+
+cat("Median TE by condition and timepoint (sictrl):\n")
+print(te_medians)
+
+ggplot(te_sictrl, aes(x = log2FoldChange, color = condition)) +
+  geom_density() +
+  facet_wrap(~ hours, labeller = label_both) +
+  scale_color_manual(values = c("normoxia" = "steelblue", "hypoxia" = "tomato")) +
+  xlim(-5, 5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "TE distribution: sictrl, normoxia vs hypoxia",
+       x = "log2 TE (ribo / rna)", y = "Density") +
+  theme_cowplot(12)
+```
+
+## Check 3: ATF4 sanity check
+
+ATF4 TE should be elevated in hypoxia vs normoxia (especially 1hr and 4hr sictrl) — a known translational responder.
+
+```{r check_atf4}
+atf4_te <- te_results_anno %>%
+  filter(symbol == "ATF4")
+
+cat("ATF4 TE results:\n")
+print(atf4_te %>%
+        dplyr::select(condition, treatment, hours, log2FoldChange, padj) %>%
+        arrange(treatment, hours, condition))
+
+ggplot(atf4_te, aes(x = factor(hours), y = log2FoldChange,
+                    fill = condition, group = condition)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  facet_wrap(~ treatment) +
+  scale_fill_manual(values = c("normoxia" = "steelblue", "hypoxia" = "tomato")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "ATF4 Translation Efficiency",
+       x = "Hours", y = "log2 TE (ribo / rna)") +
+  theme_cowplot(12)
+```
+
+## Check 4: Correlation with per-sample TE
+
+Cross-validate DESeq2 group-level TE against the mean of per-sample TE values from `complete_te_list_all_*hr.csv`.
+
+```{r check_correlation}
+# Load existing per-sample TE tables and extract TE columns only
+load_persample_te <- function(hr) {
+  fname <- here("output", paste0("complete_te_list_all_", hr, "hr.csv"))
+  df <- read_csv(fname, show_col_types = FALSE)
+
+  # TE columns are labeled like: normoxia_sictrl_1_a_TE_NM2025_XXXX
+  te_cols <- grep("_TE_", colnames(df), value = TRUE)
+
+  df %>%
+    dplyr::select(gene_id, all_of(te_cols)) %>%
+    pivot_longer(cols = all_of(te_cols),
+                 names_to  = "sample_label",
+                 values_to = "per_sample_te") %>%
+    # Parse condition, treatment, hours from sample label
+    # Format: condition_treatment_hours_rep_TE_id
+    mutate(
+      parts     = str_split(sample_label, "_"),
+      condition = map_chr(parts, 1),
+      treatment = map_chr(parts, 2),
+      hours     = as.numeric(map_chr(parts, 3))
+    ) %>%
+    dplyr::select(gene_id, condition, treatment, hours, per_sample_te)
+}
+
+persample_te <- map_dfr(c(1, 4, 24), load_persample_te)
+
+# Average per-sample TE per gene × condition × treatment × hours
+mean_persample_te <- persample_te %>%
+  group_by(gene_id, condition, treatment, hours) %>%
+  summarise(mean_per_sample_te = mean(per_sample_te, na.rm = TRUE), .groups = "drop")
+
+# Join with DESeq2 group-level TE
+te_compare <- te_results_anno %>%
+  dplyr::select(gene_id, condition, treatment, hours, deseq2_te = log2FoldChange) %>%
+  inner_join(mean_persample_te, by = c("gene_id", "condition", "treatment", "hours")) %>%
+  filter(!is.na(deseq2_te), !is.na(mean_per_sample_te))
+
+cat("Genes available for cross-validation:", nrow(te_compare), "\n")
+
+# Correlation per condition × treatment × hours
+corr_summary <- te_compare %>%
+  group_by(condition, treatment, hours) %>%
+  summarise(r = cor(mean_per_sample_te, deseq2_te, use = "complete.obs"),
+            n = n(),
+            .groups = "drop")
+
+cat("\nCorrelation between per-sample mean TE and DESeq2 group TE:\n")
+print(corr_summary %>% arrange(condition, treatment, hours))
+
+# Scatter for sictrl 1hr
+corr_1hr_sictrl <- te_compare %>%
+  filter(treatment == "sictrl", hours == 1)
+
+r_val <- round(cor(corr_1hr_sictrl$mean_per_sample_te,
+                   corr_1hr_sictrl$deseq2_te,
+                   use = "complete.obs"), 3)
+
+ggplot(corr_1hr_sictrl,
+       aes(x = mean_per_sample_te, y = deseq2_te, color = condition)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("normoxia" = "steelblue", "hypoxia" = "tomato")) +
+  xlim(-6, 6) + ylim(-6, 6) +
+  labs(title = paste0("Cross-validation: per-sample TE vs DESeq2 TE (sictrl, 1hr)\nr = ", r_val),
+       x     = "Mean per-sample TE (log2 ribo/rna)",
+       y     = "DESeq2 group-level TE (log2FC)") +
+  theme_cowplot(12)
+```
+
+## Check 5: Knockdown validation
+
+Verify that siRNA knockdowns behave as expected at the TE level.
+
+```{r check_knockdowns}
+kd_genes <- te_results_anno %>%
+  filter(symbol %in% c("EIF3E", "EIF3D"))
+
+cat("EIF3E and EIF3D TE across conditions:\n")
+print(kd_genes %>%
+        dplyr::select(symbol, condition, treatment, hours, log2FoldChange, padj) %>%
+        arrange(symbol, treatment, hours, condition))
+
+ggplot(kd_genes, aes(x = factor(hours), y = log2FoldChange,
+                     color = condition, shape = treatment, group = interaction(condition, treatment))) +
+  geom_point(size = 3, position = position_dodge(0.4)) +
+  geom_line(position = position_dodge(0.4), alpha = 0.5) +
+  facet_wrap(~ symbol) +
+  scale_color_manual(values = c("normoxia" = "steelblue", "hypoxia" = "tomato")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "EIF3D / EIF3E Translation Efficiency (knockdown validation)",
+       x = "Hours", y = "log2 TE (ribo / rna)") +
+  theme_cowplot(12)
+```
+
+---
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
