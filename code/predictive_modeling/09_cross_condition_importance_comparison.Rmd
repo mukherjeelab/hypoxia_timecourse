@@ -8,7 +8,7 @@ params:
   direction: "promotes"
   timepoint: "1hr"
   lfc: "0.5"
-  feature_set: "targeted"
+  feature_set: "te_lfc"
   clip_mode: "aggregate"
   source_model: "no_boruta"
 editor_options:
@@ -30,7 +30,7 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     direction = "promotes",
     timepoint = "1hr",
     lfc       = "0.5",
-    feature_set = "structure", #targeted, combined, or structure
+    feature_set = "te_lfc", #targeted, combined, structure, clip_split, or te_lfc
     clip_mode   = "aggregate", # "individual", "aggregate", or "both"
     source_model = "no_boruta" # "no_boruta" (07) or "boruta" (06)
   )
@@ -71,6 +71,7 @@ Raw impurity-based importance is not comparable across independently trained for
 library(tidyverse)
 library(here)
 library(cowplot)
+library(ggpubr)
 ```
 
 # Load Data
@@ -236,6 +237,74 @@ ggsave(here("plots", paste0("rf_importance_comparison_delta_", suffix_hyp, "_vs_
        plot = p_delta, width = 10, height = 10)
 ```
 
+## 4. Signed-Importance Lollipop by Condition (Top 30)
+
+```{r plot_lollipop, fig.width=10, fig.height=10}
+category_colors <- c(
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1",
+  "Translation in hypoxia"  = "#E07030"
+)
+
+make_lollipop <- function(data, cond_label) {
+  imp_col  <- if (cond_label == "hypoxia") "importance_hyp"  else "importance_nor"
+  corr_col <- if (cond_label == "hypoxia") "correlation_hyp" else "correlation_nor"
+
+  lollipop_data <- data %>%
+    filter(!is.na(.data[[corr_col]])) %>%
+    mutate(
+      importance        = .data[[imp_col]],
+      correlation       = .data[[corr_col]],
+      signed_importance = importance * sign(correlation),
+      broad_category = case_when(
+        category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+        category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+        category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+        category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+        TRUE                                                     ~ "Intrinsic mRNA features"
+      ),
+      broad_category = factor(broad_category, levels = c(
+        "Intrinsic mRNA features", "eIF3 binding evidence",
+        "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+      ))
+    ) %>%
+    arrange(desc(importance)) %>%
+    head(30) %>%
+    mutate(feature_clean = fct_reorder(feature_clean, signed_importance))
+
+  ggdotchart(
+    lollipop_data,
+    x        = "feature_clean",
+    y        = "signed_importance",
+    color    = "broad_category",
+    palette  = category_colors,
+    sorting  = "none",
+    add      = "segments",
+    rotate   = TRUE,
+    dot.size = 4,
+    xlab     = "",
+    ylab     = "Signed Importance (positive = higher in promotes)",
+    title    = paste0("Top 30 Features: Signed Importance (", tools::toTitleCase(cond_label), ")"),
+    subtitle = subtitle_label
+  ) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    theme(legend.title = element_blank())
+}
+
+p_lollipop_hyp <- make_lollipop(joined, "hypoxia")
+p_lollipop_nor <- make_lollipop(joined, "normoxia")
+
+print(p_lollipop_hyp)
+print(p_lollipop_nor)
+
+ggsave(here("plots", paste0("rf_directionality_lollipop_", suffix_hyp, ".pdf")),
+       plot = p_lollipop_hyp, width = 10, height = 10)
+ggsave(here("plots", paste0("rf_directionality_lollipop_", suffix_nor, ".pdf")),
+       plot = p_lollipop_nor, width = 10, height = 10)
+```
+
 # Export
 
 ```{r export}
@@ -253,6 +322,48 @@ write_csv(export_df, file.path(output_dir,
   paste0("rf_importance_comparison_", suffix_hyp, "_vs_", suffix_nor, ".csv")))
 
 cat("Exported:", nrow(export_df), "features\n")
+```
+
+# Gene Set Overlap: Hypoxia vs Normoxia Promotes
+
+```{r venn_genesets, fig.width=6, fig.height=5}
+library(ggVennDiagram)
+
+norm_genes <- read_csv(
+  here("output", "genesets",
+       paste0("normoxia_", params$gene, "_", params$direction,
+              "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")),
+  show_col_types = FALSE
+) %>% pull(db_gene_symbol)
+
+hyp_genes <- read_csv(
+  here("output", "genesets",
+       paste0("hypoxia_", params$gene, "_", params$direction,
+              "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")),
+  show_col_types = FALSE
+) %>% pull(db_gene_symbol)
+
+cat("Normoxia promotes:", length(norm_genes), "genes\n")
+cat("Hypoxia promotes:", length(hyp_genes), "genes\n")
+cat("Shared:", length(intersect(norm_genes, hyp_genes)), "genes\n")
+
+venn_sets <- list(
+  "Normoxia\npromotes" = norm_genes,
+  "Hypoxia\npromotes"  = hyp_genes
+)
+
+p_venn <- ggVennDiagram(venn_sets, label_alpha = 0,
+                        set_color = c("#D55E00", "#009E73")) +
+  scale_fill_gradient(low = "white", high = "white") +
+  labs(title = paste0("eIF", params$gene, " ", params$direction,
+                      " gene set overlap\n",
+                      params$timepoint, ", lfc", params$lfc)) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+
+print(p_venn)
+
+ggsave(here("plots", paste0("venn_geneset_overlap_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_venn, width = 11, height = 10)
 ```
 
 # Session Info

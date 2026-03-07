@@ -1,0 +1,381 @@
+---
+title: "TE Distribution: Promotes-3D Geneset vs Control"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+## Overview
+
+This notebook visualizes where genes in the "promotes eIF3d in hypoxia" geneset
+fall within the global TE distribution at hypoxia 1hr. We compare the
+promotes-3d set against a matched-size control set derived from genes
+non-regulated in all 6 si3d vs sictrl comparisons.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+set.seed(42)
+```
+
+---
+
+## 1. Load TE data
+
+```{r load-te}
+te_all <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE)
+
+te_hypoxia_1hr <- te_all %>%
+  filter(condition == "hypoxia", treatment == "sictrl", hours == 1) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+message("Genes in hypoxia sictrl 1hr TE data: ", nrow(te_hypoxia_1hr))
+message("Genes with valid log2FoldChange: ", sum(!is.na(te_hypoxia_1hr$log2FoldChange)))
+```
+
+---
+
+## 2. Define genesets
+
+### Promotes-3D set
+
+```{r load-promotes}
+promotes_genes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+
+number_promotes <- nrow(promotes_genes)
+
+message("Promotes-3d geneset size: ", nrow(promotes_genes))
+message("Columns: ", paste(names(promotes_genes), collapse = ", "))
+```
+
+### Control pool from translation_categories
+
+```{r control-pool}
+tc_conditions <- c("normoxia_1hr", "normoxia_4hr", "normoxia_24hr",
+                   "hypoxia_1hr",  "hypoxia_4hr",  "hypoxia_24hr")
+
+tc_all <- map(tc_conditions, ~read_csv(
+  here("output", paste0("translation_categories_si3d_vs_sictrl_", .x, ".csv")),
+  show_col_types = FALSE
+))
+
+# Genes passing non-regulated criteria in each comparison
+nonreg_per_file <- map(tc_all, ~.x %>%
+  filter(abs(te_lfc) < 0.5, te_padj > 0.5) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  pull(ensembl_gene))
+
+# Keep only genes that pass in ALL 6 comparisons
+control_pool_ids <- Reduce(intersect, nonreg_per_file)
+message("Non-regulated pool (all 6 comparisons): ", length(control_pool_ids), " genes")
+```
+
+```{r control-filter}
+# Filter to genes present in TE data, with valid values, excluding promotes set
+control_pool <- te_hypoxia_1hr %>%
+  filter(
+    ensembl_gene %in% control_pool_ids,
+    !ensembl_gene %in% promotes_genes$ensembl_gene,
+    !is.na(log2FoldChange)
+  )
+
+message("Control pool after TE data filter: ", nrow(control_pool), " genes")
+
+# How many promotes genes have valid TE at hypoxia 1hr?
+n_promotes <- te_hypoxia_1hr %>%
+  filter(ensembl_gene %in% promotes_genes$ensembl_gene, !is.na(log2FoldChange)) %>%
+  nrow()
+message("Promotes genes with valid TE: ", n_promotes)
+```
+
+```{r control-sample}
+# Check if pool is large enough; relax criteria if needed
+if (nrow(control_pool) < n_promotes) {
+  message("Pool too small (", nrow(control_pool), " < ", n_promotes,
+          "). Relaxing to |te_lfc| < 0.5 only (dropping te_padj filter).")
+
+  nonreg_relaxed <- map(tc_all, ~.x %>%
+    filter(abs(te_lfc) < 0.5) %>%
+    mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+    pull(ensembl_gene))
+
+  control_pool_ids_relaxed <- Reduce(intersect, nonreg_relaxed)
+  message("Relaxed non-regulated pool (all 6 comparisons): ",
+          length(control_pool_ids_relaxed), " genes")
+
+  control_pool <- te_hypoxia_1hr %>%
+    filter(
+      ensembl_gene %in% control_pool_ids_relaxed,
+      !ensembl_gene %in% promotes_genes$ensembl_gene,
+      !is.na(log2FoldChange)
+    )
+  message("Relaxed control pool after TE data filter: ", nrow(control_pool), " genes")
+}
+
+control_sample <- control_pool %>% slice_sample(n = n_promotes)
+message("Control sample size: ", nrow(control_sample))
+```
+
+---
+
+## 3. Verification checks
+
+```{r verification}
+# 1. Sizes match
+stopifnot(nrow(control_sample) == n_promotes)
+message("CHECK 1 PASSED: control_sample (", nrow(control_sample),
+        ") == n_promotes (", n_promotes, ")")
+
+# 2. No overlap between promotes and control
+overlap <- intersect(promotes_genes$ensembl_gene, control_sample$ensembl_gene)
+stopifnot(length(overlap) == 0)
+message("CHECK 2 PASSED: No gene overlap between promotes and control sets")
+```
+
+---
+
+## 4. Annotate TE data by group
+
+```{r annotate}
+te_annotated <- te_hypoxia_1hr %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_genes$ensembl_gene ~ "promotes_3d",
+    ensembl_gene %in% control_sample$ensembl_gene ~ "control",
+    TRUE                                           ~ "other"
+  )) %>%
+  filter(!is.na(log2FoldChange))
+
+message("Group counts:")
+# print(count(te_annotated, group))
+```
+
+---
+
+## 5. Visualizations
+
+### Plot 1 — Density overlay
+
+```{r plot-density, fig.width=8, fig.height=5}
+# Prepare foreground data (non-background groups)
+te_fg <- te_annotated %>%
+  filter(group != "other") %>%
+  mutate(group = factor(group, levels = c("promotes_3d", "control")))
+
+group_colors <- c(promotes_3d = "#2a9d8f", control = "#e76f51")
+group_labels <- c(promotes_3d = paste0("Promotes-3D (n=", n_promotes, ")"),
+                  control     = paste0("Control (n=", nrow(control_sample), ")"))
+
+ggplot() +
+  # Background: all genes
+  geom_density(
+    data = te_annotated,
+    aes(x = log2FoldChange),
+    fill = "grey80", color = "grey60", alpha = 0.6
+  ) +
+  # Foreground: promotes and control
+  geom_density(
+    data = te_fg,
+    aes(x = log2FoldChange, color = group, fill = group),
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  scale_fill_manual(values  = group_colors, labels = group_labels) +
+  labs(
+    title    = "TE distribution: promotes-3D vs control (hypoxia, sictrl, 1hr)",
+    subtitle = paste0("Background = all genes with valid TE (n=", nrow(te_annotated), ")"),
+    x        = "Absolute TE (ribo vs rna)",
+    y        = "Density",
+    color    = NULL,
+    fill     = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+### Plot 2 — Empirical CDF
+
+```{r plot-ecdf, fig.width=8, fig.height=5}
+# Include all three groups for ECDF
+te_ecdf <- te_annotated %>%
+  mutate(group = factor(group, levels = c("promotes_3d", "control", "other")))
+
+ecdf_colors <- c(promotes_3d = "#e76f51", control = "#2a9d8f", other = "grey60")
+ecdf_labels <- c(
+  promotes_3d = paste0("Promotes-3D (n=", n_promotes, ")"),
+  control     = paste0("Control (n=", nrow(control_sample), ")"),
+  other       = paste0("All other genes (n=", sum(te_annotated$group == "other"), ")")
+)
+
+ggplot(te_ecdf, aes(x = log2FoldChange, color = group)) +
+  stat_ecdf(linewidth = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = ecdf_colors, labels = ecdf_labels) +
+  labs(
+    title    = "ECDF of TE: promotes-3D vs control (hypoxia, sictrl, 1hr)",
+    x        = "Absolute TE (ribo vs rna)",
+    y        = "Cumulative proportion",
+    color    = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top")+
+  xlim(-4.5,2.5)
+
+ggsave(here("output/3d_vs_sictrl_hyp.pdf"), width=5, height=4)
+ ```
+
+### Plot 3 — Summary statistics table
+
+```{r summary-stats}
+summary_stats <- te_annotated %>%
+  group_by(group) %>%
+  summarise(
+    n          = n(),
+    median_TE  = round(median(log2FoldChange), 3),
+    IQR_TE     = round(IQR(log2FoldChange), 3),
+    pct_TE_pos = round(100 * mean(log2FoldChange > 0), 1),
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(group == "promotes_3d"), desc(group == "control"))
+
+knitr::kable(
+  summary_stats,
+  col.names = c("Group", "n", "Median TE", "IQR", "% TE > 0"),
+  caption   = "Summary statistics per group (hypoxia sictrl 1hr)"
+)
+```
+
+---
+
+## 6. Absolute TE in normoxia sictrl 1hr
+
+Are promotes-3D genes already distinctively translated at baseline, before any
+hypoxia or knockdown? Here we use the ribo/rna ratio within normoxia sictrl 1hr
+as an absolute TE measure.
+
+### Filter normoxia sictrl 1hr
+
+```{r norm-filter}
+te_normoxia_1hr <- te_all %>%
+  filter(condition == "normoxia", treatment == "sictrl", hours == 1) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+message("Genes in normoxia sictrl 1hr TE data: ", nrow(te_normoxia_1hr))
+message("Genes with valid log2FoldChange: ", sum(!is.na(te_normoxia_1hr$log2FoldChange)))
+```
+
+### Annotate by group
+
+```{r norm-annotate}
+te_norm_annotated <- te_normoxia_1hr %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_genes$ensembl_gene ~ "promotes_3d",
+    ensembl_gene %in% control_sample$ensembl_gene ~ "control",
+    TRUE                                           ~ "other"
+  )) %>%
+  filter(!is.na(log2FoldChange))
+
+message("promotes_3d in normoxia data: ",
+        sum(te_norm_annotated$group == "promotes_3d"))
+message("control in normoxia data: ",
+        sum(te_norm_annotated$group == "control"))
+```
+
+### Plot 1 — Density overlay
+
+```{r norm-density, fig.width=8, fig.height=5}
+te_norm_fg <- te_norm_annotated %>%
+  filter(group != "other") %>%
+  mutate(group = factor(group, levels = c("promotes_3d", "control")))
+
+norm_group_colors <- c(promotes_3d = "#2a9d8f", control = "#e76f51")
+norm_group_labels <- c(
+  promotes_3d = paste0("Promotes-3D (n=", sum(te_norm_annotated$group == "promotes_3d"), ")"),
+  control     = paste0("Control (n=", sum(te_norm_annotated$group == "control"), ")")
+)
+
+ggplot() +
+  geom_density(
+    data = te_norm_annotated,
+    aes(x = log2FoldChange),
+    fill = "grey80", color = "grey60", alpha = 0.6
+  ) +
+  geom_density(
+    data = te_norm_fg,
+    aes(x = log2FoldChange, color = group, fill = group),
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = norm_group_colors, labels = norm_group_labels) +
+  scale_fill_manual(values  = norm_group_colors, labels = norm_group_labels) +
+  coord_cartesian(xlim = c(-4.5, 2.5)) +
+  labs(
+    title    = "TE distribution: promotes-3D vs control (normoxia, sictrl, 1hr)",
+    subtitle = paste0("Background = all genes with valid TE (n=", nrow(te_norm_annotated), ")"),
+    x        = "Absolute TE (ribo vs rna)",
+    y        = "Density",
+    color    = NULL,
+    fill     = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+### Plot 2 — ECDF
+
+```{r norm-ecdf, fig.width=8, fig.height=5}
+te_norm_ecdf <- te_norm_annotated %>%
+  mutate(group = factor(group, levels = c("promotes_3d", "control", "other")))
+
+norm_ecdf_colors <- c(promotes_3d = "#e76f51", control = "#2a9d8f", other = "grey60")
+norm_ecdf_labels <- c(
+  promotes_3d = paste0("Promotes-3D (n=", sum(te_norm_annotated$group == "promotes_3d"), ")"),
+  control     = paste0("Control (n=", sum(te_norm_annotated$group == "control"), ")"),
+  other       = paste0("All other genes (n=", sum(te_norm_annotated$group == "other"), ")")
+)
+
+ggplot(te_norm_ecdf, aes(x = log2FoldChange, color = group)) +
+  stat_ecdf(linewidth = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = norm_ecdf_colors, labels = norm_ecdf_labels) +
+  labs(
+    title    = "ECDF of TE: promotes-3D vs control (normoxia, sictrl, 1hr)",
+    x        = "Absolute TE (ribo vs rna)",
+    y        = "Cumulative proportion",
+    color    = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top") +
+  xlim(-4.5, 2.5)
+
+ggsave(here("output/3d_vs_sictrl_norm.pdf"), width = 5, height = 4)
+```
+
+### Plot 3 — Summary statistics table
+
+```{r norm-summary-stats}
+norm_summary_stats <- te_norm_annotated %>%
+  group_by(group) %>%
+  summarise(
+    n          = n(),
+    median_TE  = round(median(log2FoldChange), 3),
+    IQR_TE     = round(IQR(log2FoldChange), 3),
+    pct_TE_pos = round(100 * mean(log2FoldChange > 0), 1),
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(group == "promotes_3d"), desc(group == "control"))
+
+knitr::kable(
+  norm_summary_stats,
+  col.names = c("Group", "n", "Median TE", "IQR", "% TE > 0"),
+  caption   = "Summary statistics per group (normoxia sictrl 1hr)"
+)
+```
+
+

@@ -143,8 +143,7 @@ This may take several minutes with all samples.
 ```{r run_deseq, cache=TRUE}
 dds <- DESeq(dds)
 cat("DESeq2 complete.\n")
-cat("Result names (first 6):\n")
-print(head(resultsNames(dds), 6))
+print(head(resultsNames(dds)))
 ```
 
 ---
@@ -180,36 +179,67 @@ if (length(missing_groups) > 0) {
 }
 ```
 
-```{r extract_te, cache=TRUE}
-te_results <- map_dfr(timepoints, function(hr) {
-  map_dfr(treatments, function(trt) {
-    map_dfr(conditions, function(cond) {
-      ribo_grp <- paste(cond, trt, as.character(hr), "ribo", sep = "_")
-      rna_grp  <- paste(cond, trt, as.character(hr), "rna",  sep = "_")
+```{r extract_te}
+# Build a table of every contrast we want to extract:
+# one row per condition × treatment × timepoint combination.
+# For each row, the contrast is ribo vs rna within that group context.
+contrast_grid <- expand.grid(
+  condition = conditions,
+  treatment = treatments,
+  hours     = timepoints,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    ribo_grp = paste(condition, treatment, as.character(hours), "ribo", sep = "_"),
+    rna_grp  = paste(condition, treatment, as.character(hours), "rna",  sep = "_"),
+    # Flag rows where a group is absent from the DESeq2 model (e.g. missing replicate)
+    skip     = !ribo_grp %in% available_groups | !rna_grp %in% available_groups
+  )
 
-      # Skip if either group is missing
-      if (!ribo_grp %in% available_groups || !rna_grp %in% available_groups) {
-        message("Skipping missing group: ", ribo_grp, " or ", rna_grp)
-        return(NULL)
-      }
+cat("Contrasts to extract:", nrow(contrast_grid), "\n")
+if (any(contrast_grid$skip)) {
+  cat("Skipping (group missing from model):\n")
+  print(contrast_grid %>% filter(skip) %>% dplyr::select(condition, treatment, hours, ribo_grp, rna_grp))
+}
 
-      message("Extracting TE: ", ribo_grp, " vs ", rna_grp)
+# Iterate over each contrast row and collect results into a list
+results_list <- vector("list", nrow(contrast_grid))
 
-      res_raw <- results(dds,
-                         contrast = c("group", ribo_grp, rna_grp),
-                         independentFiltering = FALSE)
+for (i in seq_len(nrow(contrast_grid))) {
+  row <- contrast_grid[i, ]
 
-      res_shrunk <- lfcShrink(dds,
-                              contrast = c("group", ribo_grp, rna_grp),
-                              res      = res_raw,
-                              type     = "ashr")
+  if (row$skip) next
 
-      as.data.frame(res_shrunk) %>%
-        rownames_to_column("gene_id") %>%
-        mutate(condition = cond, treatment = trt, hours = hr)
-    })
-  })
-})
+  message("Extracting TE [", i, "/", nrow(contrast_grid), "]: ",
+          row$ribo_grp, " vs ", row$rna_grp)
+
+  # Step 1: get raw DESeq2 results for this ribo-vs-rna contrast
+  res_raw <- results(dds,
+                     contrast = c("group", row$ribo_grp, row$rna_grp),
+                     independentFiltering = FALSE)
+
+  # Step 2: apply ashr LFC shrinkage
+  # apeglm cannot be used here because it requires a single named model coefficient
+  # (e.g. from resultsNames(dds)), and fits a penalised GLM around that one term.
+  # Our contrasts are arbitrary linear combinations of group levels — c("group", ribo, rna) —
+  # which are not directly represented as named coefficients in the model.
+  # ashr works from the distribution of observed LFCs and their standard errors,
+  # so it can shrink any contrast without needing a named coefficient.
+  res_shrunk <- lfcShrink(dds,
+                          contrast = c("group", row$ribo_grp, row$rna_grp),
+                          res      = res_raw,
+                          type     = "ashr")
+
+  # Step 3: convert to data frame and attach the group labels
+  results_list[[i]] <- as.data.frame(res_shrunk) %>%
+    rownames_to_column("gene_id") %>%
+    mutate(condition = row$condition,
+           treatment = row$treatment,
+           hours     = row$hours)
+}
+
+# Combine all per-contrast results into one long data frame
+te_results <- bind_rows(results_list)
 
 cat("\nTE results dimensions:", dim(te_results), "\n")
 cat("Unique condition × treatment × hours combinations:\n")
@@ -338,9 +368,10 @@ load_persample_te <- function(hr) {
       parts     = str_split(sample_label, "_"),
       condition = map_chr(parts, 1),
       treatment = map_chr(parts, 2),
-      hours     = as.numeric(map_chr(parts, 3))
+      hours     = as.numeric(map_chr(parts, 3)),
+      rep       = map_chr(parts, 4)
     ) %>%
-    dplyr::select(gene_id, condition, treatment, hours, per_sample_te)
+    dplyr::select(gene_id, condition, treatment, hours, rep, per_sample_te)
 }
 
 persample_te <- map_dfr(c(1, 4, 24), load_persample_te)
@@ -368,24 +399,106 @@ corr_summary <- te_compare %>%
 cat("\nCorrelation between per-sample mean TE and DESeq2 group TE:\n")
 print(corr_summary %>% arrange(condition, treatment, hours))
 
-# Scatter for sictrl 1hr
-corr_1hr_sictrl <- te_compare %>%
-  filter(treatment == "sictrl", hours == 1)
+# Per-replicate TE vs DESeq2 group TE, faceted by timepoint × condition × treatment
+te_compare_reps <- persample_te %>%
+  inner_join(
+    te_results_anno %>% dplyr::select(gene_id, condition, treatment, hours,
+                                       deseq2_te = log2FoldChange),
+    by = c("gene_id", "condition", "treatment", "hours")
+  ) %>%
+  filter(!is.na(per_sample_te), !is.na(deseq2_te))
 
-r_val <- round(cor(corr_1hr_sictrl$mean_per_sample_te,
-                   corr_1hr_sictrl$deseq2_te,
-                   use = "complete.obs"), 3)
+r_labels <- te_compare %>%
+  group_by(condition, treatment, hours) %>%
+  summarise(r = round(cor(mean_per_sample_te, deseq2_te, use = "complete.obs"), 3),
+            .groups = "drop") %>%
+  mutate(label = paste0("r = ", r),
+         mean_per_sample_te = 5.5, deseq2_te = -4.5)
 
-ggplot(corr_1hr_sictrl,
-       aes(x = mean_per_sample_te, y = deseq2_te, color = condition)) +
-  geom_point(alpha = 0.3, size = 0.8) +
+ggplot(te_compare, aes(x = mean_per_sample_te, y = deseq2_te)) +
+  geom_point(alpha = 0.2, size = 0.4, color = "steelblue") +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
-  scale_color_manual(values = c("normoxia" = "steelblue", "hypoxia" = "tomato")) +
+  geom_text(data = r_labels, aes(label = label), hjust = 1, vjust = 0, size = 2.5) +
+  facet_grid(hours ~ condition + treatment, labeller = label_value) +
   xlim(-6, 6) + ylim(-6, 6) +
-  labs(title = paste0("Cross-validation: per-sample TE vs DESeq2 TE (sictrl, 1hr)\nr = ", r_val),
-       x     = "Mean per-sample TE (log2 ribo/rna)",
-       y     = "DESeq2 group-level TE (log2FC)") +
-  theme_cowplot(12)
+  labs(x = "Mean per-replicate TE (log2 ribo/rna)",
+       y = "DESeq2 group TE (log2FC)") +
+  theme_cowplot(9) +
+  theme(strip.text = element_text(size = 7))
+
+# Per-replicate scatter for sictrl 1hr normoxia
+rep_norm_1hr <- te_compare_reps %>%
+  filter(treatment == "sictrl", condition == "normoxia", hours == 1)
+
+r_labels_norm <- rep_norm_1hr %>%
+  group_by(rep) %>%
+  summarise(r = round(cor(per_sample_te, deseq2_te, use = "complete.obs"), 3), .groups = "drop") %>%
+  mutate(label = paste0("r = ", r), per_sample_te = 5.5, deseq2_te = -4.5)
+
+ggplot(rep_norm_1hr, aes(x = per_sample_te, y = deseq2_te)) +
+  geom_point(alpha = 0.3, size = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(data = r_labels_norm, aes(label = label), hjust = 1, vjust = 0, size = 3) +
+  facet_wrap(~ rep, nrow = 1) +
+  xlim(-6, 6) + ylim(-6, 6) +
+  labs(title = "sictrl normoxia 1hr — per replicate",
+       x = "Per-replicate TE (log2 ribo/rna)",
+       y = "DESeq2 group TE (log2FC)") +
+  theme_cowplot(11)
+
+rep_norm_1hr %>%
+  pivot_longer(cols = c(per_sample_te, deseq2_te),
+               names_to = "source", values_to = "te") %>%
+  mutate(source = recode(source,
+                         per_sample_te = "Per-replicate TE",
+                         deseq2_te     = "DESeq2 group TE")) %>%
+  ggplot(aes(x = te, fill = source, color = source)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ rep, nrow = 1) +
+  xlim(-6, 6) +
+  scale_fill_manual(values = c("Per-replicate TE" = "steelblue", "DESeq2 group TE" = "grey40")) +
+  scale_color_manual(values = c("Per-replicate TE" = "steelblue", "DESeq2 group TE" = "grey40")) +
+  labs(title = "sictrl normoxia 1hr — TE distributions per replicate",
+       x = "TE (log2)", y = "Density", fill = NULL, color = NULL) +
+  theme_cowplot(11) +
+  theme(legend.position = "bottom")
+
+# Per-replicate scatter for sictrl 1hr hypoxia
+rep_hyp_1hr <- te_compare_reps %>%
+  filter(treatment == "sictrl", condition == "hypoxia", hours == 1)
+
+r_labels_hyp <- rep_hyp_1hr %>%
+  group_by(rep) %>%
+  summarise(r = round(cor(per_sample_te, deseq2_te, use = "complete.obs"), 3), .groups = "drop") %>%
+  mutate(label = paste0("r = ", r), per_sample_te = 5.5, deseq2_te = -4.5)
+
+ggplot(rep_hyp_1hr, aes(x = per_sample_te, y = deseq2_te)) +
+  geom_point(alpha = 0.3, size = 0.6, color = "tomato") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(data = r_labels_hyp, aes(label = label), hjust = 1, vjust = 0, size = 3) +
+  facet_wrap(~ rep, nrow = 1) +
+  xlim(-6, 6) + ylim(-6, 6) +
+  labs(title = "sictrl hypoxia 1hr — per replicate",
+       x = "Per-replicate TE (log2 ribo/rna)",
+       y = "DESeq2 group TE (log2FC)") +
+  theme_cowplot(11)
+
+rep_hyp_1hr %>%
+  pivot_longer(cols = c(per_sample_te, deseq2_te),
+               names_to = "source", values_to = "te") %>%
+  mutate(source = recode(source,
+                         per_sample_te = "Per-replicate TE",
+                         deseq2_te     = "DESeq2 group TE")) %>%
+  ggplot(aes(x = te, fill = source, color = source)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ rep, nrow = 1) +
+  xlim(-6, 6) +
+  scale_fill_manual(values = c("Per-replicate TE" = "tomato", "DESeq2 group TE" = "grey40")) +
+  scale_color_manual(values = c("Per-replicate TE" = "tomato", "DESeq2 group TE" = "grey40")) +
+  labs(title = "sictrl hypoxia 1hr — TE distributions per replicate",
+       x = "TE (log2)", y = "Density", fill = NULL, color = NULL) +
+  theme_cowplot(11) +
+  theme(legend.position = "bottom")
 ```
 
 ## Check 5: Knockdown validation

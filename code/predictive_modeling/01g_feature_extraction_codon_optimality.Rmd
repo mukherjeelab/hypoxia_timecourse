@@ -1,0 +1,428 @@
+---
+title: "Codon Optimality Feature Extraction (CAI, tAI, CSC)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This notebook adds three mechanistically distinct codon optimality features to the
+`te_lfc` feature matrix, producing `feature_matrix_codon_optimality.rds`.
+
+| Feature | Tool | Description |
+|---------|------|-------------|
+| `cai` | coRdon (Bioconductor) | Codon Adaptive Index — codon usage vs. ribosomal protein reference |
+| `tai` | coRdon (Bioconductor) | tRNA Adaptation Index — anticodon supply from GtRNAdb hg38 tRNA GCN |
+| `csc` | iCodon (Diez et al. 2022) | Codon Stabilisation Coefficient — codon-level mRNA stability weights |
+
+All three are CDS-level, length-normalized, and orthogonal to `gc3`.
+
+**Prerequisites before knitting:**
+- `output/predictive_modeling/feature_matrix_te_lfc.rds` (from 01f)
+- `accessories/human/txdb.gencode49.sqlite` (GENCODE v49)
+- `accessories/human/human_trna_gcn.csv` — 64-row table from GtRNAdb (hg38);
+  columns: `anticodon` (string, e.g. "AAA"), `gcn` (integer gene copy number)
+- R packages: `coRdon` (Bioconductor), `iCodon` (CRAN/GitHub)
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(coRdon)
+library(iCodon)
+```
+
+# Load Feature Matrix
+
+```{r load_feature_matrix}
+te_lfc_matrix <- readRDS(here("output", "predictive_modeling", "feature_matrix_te_lfc.rds"))
+cat("Loaded te_lfc matrix:", nrow(te_lfc_matrix), "genes x", ncol(te_lfc_matrix), "columns\n")
+
+keep_tx <- te_lfc_matrix$transcript_id_clean
+cat("Target transcripts:", length(keep_tx), "\n")
+cat("Example IDs:", head(keep_tx, 3), "\n")
+```
+
+# Load TxDb and Genome
+
+```{r load_txdb}
+txdb  <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+cat("Loaded TxDb and BSgenome\n")
+```
+
+# Extract CDS Sequences
+
+```{r extract_cds}
+# Extract CDS for all transcripts
+cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_sequences_all <- extractTranscriptSeqs(genome, cds)
+cat("Total CDS sequences in TxDb:", length(cds_sequences_all), "\n")
+
+# Strip version numbers from TxDb transcript IDs to match feature matrix
+cds_names_clean <- sub("\\..*", "", names(cds_sequences_all))
+
+# Filter to transcripts present in the feature matrix
+keep_idx <- cds_names_clean %in% keep_tx
+cds_sequences <- cds_sequences_all[keep_idx]
+names(cds_sequences) <- cds_names_clean[keep_idx]
+cat("After filtering to feature matrix transcripts:", length(cds_sequences), "\n")
+
+# coRdon requires CDS lengths divisible by 3
+valid_length <- width(cds_sequences) %% 3 == 0
+n_invalid <- sum(!valid_length)
+if (n_invalid > 0) {
+  cat("Removing", n_invalid, "sequences with length not divisible by 3\n")
+}
+cds_sequences <- cds_sequences[valid_length]
+cat("Final CDS sequences for codon scoring:", length(cds_sequences), "\n")
+cat("Example names:", head(names(cds_sequences), 3), "\n")
+```
+
+# Build Codon Table
+
+```{r codon_table}
+ct <- codonTable(cds_sequences)
+cat("codonTable built:", nrow(codonCounts(ct)), "sequences\n")
+```
+
+# CAI — Codon Adaptive Index
+
+Reference set: ribosomal protein genes (RPL*/RPS*), the standard practice for
+computing relative adaptiveness weights in human cells.
+
+Implements Sharp & Li (1987) directly using coRdon's `codonCounts()`:
+
+1. Sum raw codon counts across ribosomal reference genes
+2. Per synonymous family: w_i = RSCU_i / max(RSCU_j), capped at 1
+3. Per gene: CAI = geometric mean of w_i^count_i, excluding stop codons
+
+This guarantees CAI ∈ [0, 1] regardless of reference set composition.
+
+```{r cai}
+# Identify ribosomal protein transcripts
+ribo_tx <- te_lfc_matrix %>%
+  filter(str_detect(symbol, "^RPL|^RPS")) %>%
+  pull(transcript_id_clean)
+
+ribo_subset <- names(cds_sequences) %in% ribo_tx
+cat("Ribosomal protein transcripts in reference set:", sum(ribo_subset), "\n")
+cat("  (out of", length(ribo_subset), "total sequences)\n")
+
+# Raw codon counts (n_seqs × 64 codons) from coRdon
+counts_mat <- codonCounts(ct)          # rows = sequences, cols = codons
+cat("Codon count matrix:", nrow(counts_mat), "×", ncol(counts_mat), "\n")
+
+# Aggregate counts across ribosomal reference genes
+ref_counts <- colSums(counts_mat[ribo_subset, , drop = FALSE])
+
+# Build relative adaptiveness (w) from standard genetic code
+# Biostrings::getGeneticCode returns named char vector codon → amino acid
+gen_code <- Biostrings::getGeneticCode("SGC0")  # standard code
+
+# For each synonymous family, w_i = RSCU_i / max(RSCU_j), capped at [0,1]
+stop_codons <- names(gen_code[gen_code == "*"])
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+
+w <- setNames(rep(NA_real_, length(gen_code)), names(gen_code))
+w[stop_codons] <- 0  # stop codons excluded
+
+for (aa in names(aa_to_codons)) {
+  codons <- aa_to_codons[[aa]]
+  counts <- ref_counts[codons]
+  total  <- sum(counts)
+
+  if (total == 0) {
+    # No reference observations: treat as uniform (w = 1 for all)
+    w[codons] <- 1
+    next
+  }
+
+  n_syn  <- length(codons)
+  # RSCU_i = count_i / (total / n_synonymous)
+  rscu   <- counts / (total / n_syn)
+  max_r  <- max(rscu)
+
+  if (max_r == 0) {
+    w[codons] <- 0
+  } else {
+    w[codons] <- pmin(rscu / max_r, 1)  # cap at 1
+  }
+}
+
+cat("w values: min =", round(min(w, na.rm = TRUE), 4),
+    " max =", round(max(w, na.rm = TRUE), 4), "\n")
+
+# Compute CAI for each gene as geometric mean of w^count
+# log(CAI) = sum_i( count_i * log(w_i) ) / sum_i(count_i), over sense codons
+compute_cai_gene <- function(gene_counts, w_vals) {
+  # Exclude stops and zero-w codons (singletons like Met/Trp have w=1 so they don't inflate)
+  use <- sense_codons[!is.na(w_vals[sense_codons]) & w_vals[sense_codons] > 0]
+  c_use <- gene_counts[use]
+  w_use <- w_vals[use]
+  n_total <- sum(c_use)
+  if (n_total == 0) return(NA_real_)
+  exp(sum(c_use * log(w_use)) / n_total)
+}
+
+cai_scores <- apply(counts_mat, 1, compute_cai_gene, w_vals = w)
+names(cai_scores) <- names(cds_sequences)
+
+cat("\nCAI summary (Sharp & Li 1987, ribosomal reference):\n")
+print(summary(cai_scores))
+stopifnot("CAI must be in [0,1]" = all(cai_scores <= 1 + 1e-9, na.rm = TRUE))
+cat("Range check passed: all CAI ≤ 1\n")
+```
+
+# tAI — tRNA Adaptation Index
+
+Implements dos Reis et al. (2004) tAI directly using:
+- `codonCounts(ct)` from coRdon (defined in the CAI chunk)
+- `accessories/human/human_trna_gcn.csv`: GtRNAdb hg38 high-confidence anticodon GCN
+  (Sudmant et al. 2014, tRNAscan-SE counts; suppressor/SeC anticodons excluded)
+
+Eukaryotic wobble rules (sking = 0, dos Reis 2004):
+- A at anticodon position 34 → Inosine in mature tRNA; s = 0 for I:U, I:C, I:A
+- G at position 34: s = 0 (G:C WC), s = 0.41 (G:U wobble)
+- C or T at position 34: perfect WC only (s = 0)
+
+Amino-acid filtering ensures anticodon-codon contributions stay within synonymous families.
+
+```{r tai}
+trna_gcn <- read_csv(here("accessories", "human", "human_trna_gcn.csv"),
+                     comment = "#")
+cat("tRNA GCN table:", nrow(trna_gcn), "rows\n")
+cat("Anticodons:", paste(trna_gcn$anticodon, collapse = ", "), "\n")
+
+# Decode which codons each anticodon recognizes and with what wobble penalty
+# anticodon 5'->3' DNA: X1=wobble pos (34), X2, X3
+# codon 5'->3': Y1 (WC with X3), Y2 (WC with X2), Y3 (wobble with X1)
+decode_anticodon <- function(ac) {
+  x1 <- substr(ac, 1, 1)
+  x2 <- substr(ac, 2, 2)
+  x3 <- substr(ac, 3, 3)
+  wc <- c(A = "T", T = "A", G = "C", C = "G")
+  y1 <- unname(wc[x3])
+  y2 <- unname(wc[x2])
+  if (x1 == "A") {          # A → Inosine; I:U(T), I:C, I:A all s=0
+    y3  <- c("T", "C", "A")
+    svs <- c(0, 0, 0)
+  } else if (x1 == "G") {   # G:C WC s=0; G:U(T) wobble s=0.41
+    y3  <- c("C", "T")
+    svs <- c(0, 0.41)
+  } else if (x1 == "C") {   # C:G WC only
+    y3  <- "G"
+    svs <- 0
+  } else {                   # T(=U):A WC only
+    y3  <- "A"
+    svs <- 0
+  }
+  data.frame(codon = paste0(y1, y2, y3), s = svs, stringsAsFactors = FALSE)
+}
+
+# gen_code and sense_codons defined in CAI chunk above; reuse here
+aa_of_codon <- setNames(as.character(gen_code), names(gen_code))
+
+# Accumulate ws(codon) = sum_anticodons (1-s) * GCN, filtered to same amino acid
+ws_tai <- setNames(rep(0, length(gen_code)), names(gen_code))
+
+for (i in seq_len(nrow(trna_gcn))) {
+  ac  <- trna_gcn$anticodon[i]
+  aa  <- trna_gcn$amino_acid[i]   # 1-letter IUPAC, matches gen_code values
+  gcn <- trna_gcn$gcn[i]
+
+  decoded <- decode_anticodon(ac)
+  for (j in seq_len(nrow(decoded))) {
+    codon <- decoded$codon[j]
+    s_val <- decoded$s[j]
+    # Only credit sense codons encoding the same amino acid as this tRNA
+    if (!is.na(aa_of_codon[codon]) && aa_of_codon[codon] == aa) {
+      ws_tai[codon] <- ws_tai[codon] + (1 - s_val) * gcn
+    }
+  }
+}
+
+cat("Sense codons with ws=0:", sum(ws_tai[sense_codons] == 0), "\n")
+cat("ws range:", round(range(ws_tai[sense_codons]), 3), "\n")
+
+# Normalize: w(codon) = ws / max(ws) across all sense codons
+w_tai <- ws_tai / max(ws_tai[sense_codons])
+cat("w_tai range:", round(range(w_tai[sense_codons]), 4), "\n")
+
+# tAI for each gene = geometric mean of w_i^count_i (log scale, sense codons only)
+compute_tai_gene <- function(gene_counts, w_vals) {
+  use     <- sense_codons[!is.na(w_vals[sense_codons]) & w_vals[sense_codons] > 0]
+  c_use   <- gene_counts[use]
+  w_use   <- w_vals[use]
+  n_total <- sum(c_use)
+  if (n_total == 0) return(NA_real_)
+  exp(sum(c_use * log(w_use)) / n_total)
+}
+
+tai_scores <- apply(counts_mat, 1, compute_tai_gene, w_vals = w_tai)
+names(tai_scores) <- names(cds_sequences)
+
+cat("\ntAI summary (dos Reis 2004, eukaryotic wobble):\n")
+print(summary(tai_scores))
+stopifnot("tAI must be in [0,1]" = all(tai_scores <= 1 + 1e-9, na.rm = TRUE))
+cat("Range check passed: all tAI ≤ 1\n")
+```
+
+# CSC — Codon Stabilisation Coefficient
+
+`iCodon::predict_stability()` is a function factory: call it with `"human"` to
+get a predictor, then apply that predictor to a character vector of CDS sequences.
+It returns mRNA stability scores derived from human CSC weights (Diez et al. 2022,
+*Scientific Reports*). No external file needed.
+
+```{r csc}
+# Build human-specific predictor
+predict_human <- iCodon::predict_stability("human")
+
+# iCodon requires unique sequences — deduplicate, score, then map back by content
+cds_char <- as.character(cds_sequences)
+cat("Total sequences:", length(cds_char), "\n")
+
+unique_seqs <- unique(cds_char)
+cat("Unique sequences:", length(unique_seqs), "\n")
+cat("Duplicates removed:", length(cds_char) - length(unique_seqs), "\n")
+
+# Score unique sequences
+unique_scores <- predict_human(unique_seqs)
+names(unique_scores) <- unique_seqs   # key by sequence content
+
+# Map back to all transcripts (duplicates get the same score)
+csc_scores <- unique_scores[cds_char]
+names(csc_scores) <- names(cds_sequences)
+
+cat("CSC summary (iCodon human stability prediction):\n")
+print(summary(csc_scores))
+cat("Expected range: unbounded (higher = more stable codon usage)\n")
+```
+
+# Create Score Table
+
+```{r create_score_table}
+codon_scores <- tibble(
+  transcript_id_clean = names(cds_sequences),
+  cai = cai_scores,
+  tai = tai_scores,
+  csc = csc_scores
+)
+
+cat("Score table:", nrow(codon_scores), "rows\n")
+cat("Non-NA: cai =", sum(!is.na(codon_scores$cai)),
+    ", tai =", sum(!is.na(codon_scores$tai)),
+    ", csc =", sum(!is.na(codon_scores$csc)), "\n")
+```
+
+# Join to Feature Matrix
+
+```{r join_matrix}
+codon_matrix <- te_lfc_matrix %>%
+  left_join(codon_scores, by = "transcript_id_clean")
+
+cat("Matrix after join:", nrow(codon_matrix), "genes x", ncol(codon_matrix), "columns\n")
+cat("New columns:", ncol(codon_matrix) - ncol(te_lfc_matrix), "\n")
+cat("Row count matches original:", nrow(codon_matrix) == nrow(te_lfc_matrix), "\n")
+```
+
+# Quality Control
+
+```{r quality_control}
+new_features <- c("cai", "tai", "csc")
+
+cat("Non-NA counts for codon optimality features:\n")
+for (col in new_features) {
+  n_nonNA <- sum(!is.na(codon_matrix[[col]]))
+  cat(" ", col, ":", n_nonNA, "non-NA /", nrow(codon_matrix),
+      sprintf("(%.1f%%)\n", 100 * n_nonNA / nrow(codon_matrix)))
+}
+
+cat("\nValue ranges:\n")
+for (col in new_features) {
+  r <- range(codon_matrix[[col]], na.rm = TRUE)
+  cat(" ", col, ": [", round(r[1], 4), ",", round(r[2], 4), "]\n")
+}
+
+cat("\nSummaries:\n")
+for (col in new_features) {
+  cat("\n", col, ":\n", sep = "")
+  print(summary(codon_matrix[[col]]))
+}
+
+# Sanity checks
+stopifnot(
+  "CAI values must be in [0, 1]" = all(codon_matrix$cai >= 0 & codon_matrix$cai <= 1, na.rm = TRUE),
+  "tAI values must be in [0, 1]" = all(codon_matrix$tai >= 0 & codon_matrix$tai <= 1, na.rm = TRUE)
+)
+cat("\nSanity checks passed: CAI and tAI in [0, 1]\n")
+```
+
+# Correlation Among Codon Optimality Features
+
+```{r feature_correlations}
+# Correlations with each other and with gc3 proxy
+cor_features <- c("cai", "tai", "csc", "gc3")
+cor_data <- codon_matrix %>%
+  dplyr::select(all_of(cor_features)) %>%
+  drop_na()
+
+cat("Pairwise Pearson correlations (n =", nrow(cor_data), ")\n")
+print(round(cor(cor_data), 3))
+```
+
+# Export
+
+```{r export}
+dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(codon_matrix,
+        here("output", "predictive_modeling", "feature_matrix_codon_optimality.rds"))
+cat("Exported: output/predictive_modeling/feature_matrix_codon_optimality.rds\n")
+
+write_csv(codon_matrix,
+          here("output", "predictive_modeling", "feature_matrix_codon_optimality.csv"))
+cat("Exported: output/predictive_modeling/feature_matrix_codon_optimality.csv\n")
+
+cat("\nFinal matrix:", nrow(codon_matrix), "genes x", ncol(codon_matrix), "columns\n")
+cat("New features:", paste(new_features, collapse = ", "), "\n")
+```
+
+# Feature Catalog
+
+```{r feature_catalog}
+codon_catalog <- tribble(
+  ~feature, ~category,          ~source,                                                     ~type,    ~units,                       ~region, ~description,
+
+  "cai",    "Codon Optimality", "coRdon (Bioconductor) + RPL/RPS ribosomal protein ref set", "numeric", "0–1",                        "CDS",   "Codon Adaptive Index (CAI); measures translation efficiency from codon usage relative to highly expressed ribosomal protein genes (RPL*/RPS*); 1 = fully optimal codon usage; computed with coRdon::CAI()",
+
+  "tai",    "Codon Optimality", "coRdon (Bioconductor) + GtRNAdb hg38 tRNA gene copy numbers", "numeric", "0–1",                      "CDS",   "tRNA Adaptation Index (tAI); measures codon-anticodon adaptation using human tRNA gene copy numbers from GtRNAdb (hg38), with wobble base pairing weights; higher = better tRNA supply match; computed with coRdon::tAI()",
+
+  "csc",    "Codon Optimality", "iCodon R package (Diez et al. 2022, Sci Rep)",               "numeric", "unbounded (higher = stable)", "CDS",  "CSC-based mRNA stability prediction; computed with iCodon::predict_stability('human'); derived from human codon stabilization coefficient (CSC) weights; higher = more stable codon usage"
+)
+
+cat("Feature catalog rows:", nrow(codon_catalog), "\n")
+print(codon_catalog %>% dplyr::select(feature, category, units))
+
+write_csv(codon_catalog,
+          here("output", "predictive_modeling", "feature_catalog_codon_optimality.csv"))
+cat("\nExported: output/predictive_modeling/feature_catalog_codon_optimality.csv\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

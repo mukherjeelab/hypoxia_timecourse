@@ -19,7 +19,7 @@ library(DESeq2)
 
 This analysis examines whether DAP5-dependent genes (from polysome profiling data, GSE115142) show differential hypoxic response compared to other genes. DAP5 (eIF4G2) is an alternative translation initiation factor that can promote cap-independent translation.
 
-We use DESeq2 with an interaction model to identify genes with significantly different translation efficiency (TE) between DAP5 overexpression and control conditions.
+We use DESeq2 with an interaction model to identify genes with significantly different translation efficiency (TE) between DAP5 shRNA knockdown and non-silencing (NS) control conditions.
 
 ## Load Polysome Data
 
@@ -29,6 +29,7 @@ We use DESeq2 with an interaction model to identify genes with significantly dif
 polysome_raw <- read_tsv(
   here("accessories", "GSE115142_quant.featurecounts.counts.rev.cleaned.trDap5_alternative.txt"),
   col_names = TRUE,
+  col_types = paste0("c", strrep("d", 14)),
   show_col_types = FALSE
 )
 
@@ -38,6 +39,41 @@ colnames(polysome_raw)[1] <- "symbol"
 cat("Polysome data dimensions:", nrow(polysome_raw), "genes x", ncol(polysome_raw), "columns\n")
 cat("\nColumn names:\n")
 print(colnames(polysome_raw))
+```
+
+## Fix Excel-Corrupted Gene Symbols
+
+Excel auto-converts gene symbols that resemble dates (e.g. MARCH1 → Mar-1, SEPT1 → Sep-1).
+Detect and restore them before any downstream steps.
+
+```{r fix_excel_symbols}
+# Known Excel date-to-gene mappings (Mon-N format)
+# MARCH family: Mar-1 .. Mar-12  -> MARCH1 .. MARCH12
+# SEPT family:  Sep-1 .. Sep-15  -> SEPT1  .. SEPT15
+# DEC family:   Dec-1, Dec-2     -> DEC1, DEC2
+
+excel_symbol_map <- c(
+  setNames(paste0("MARCH", 1:12), paste0(1:12, "-Mar")),
+  setNames(paste0("SEPT",  1:15), paste0(1:15, "-Sep")),
+  setNames(paste0("DEC",   1:2),  paste0(1:2,  "-Dec"))
+)
+
+# Detect any corrupted symbols present in the data
+corrupted <- polysome_raw[["symbol"]][polysome_raw[["symbol"]] %in% names(excel_symbol_map)]
+cat("Corrupted symbols detected:", length(corrupted), "\n")
+if (length(corrupted) > 0) {
+  cat("  Found:", paste(sort(corrupted), collapse = ", "), "\n")
+  cat("  Fixed:", paste(excel_symbol_map[sort(corrupted)], collapse = ", "), "\n")
+}
+
+# Apply fix
+polysome_raw[["symbol"]] <- ifelse(
+  polysome_raw[["symbol"]] %in% names(excel_symbol_map),
+  excel_symbol_map[polysome_raw[["symbol"]]],
+  polysome_raw[["symbol"]]
+)
+
+cat("\nSymbol column class after fix:", class(polysome_raw[["symbol"]]), "\n")
 
 # Check library sizes
 lib_sizes <- colSums(polysome_raw %>% select(where(is.numeric)), na.rm = TRUE)
@@ -65,11 +101,21 @@ count_cols <- c("TR_R4_Dap5_HD", "TR_R4_Dap5_T",
                 "TR_R11_NS_HD", "TR_R11_NS_T",
                 "TR_R3_NS_HD", "TR_R3_NS_T")
 
+# Check for duplicate gene symbols (base R to avoid S4Vectors dispatch on %in%)
+sym_vec <- polysome_raw[["symbol"]]
+dup_syms <- unique(sym_vec[duplicated(sym_vec)])
+cat("Duplicate symbols found:", length(dup_syms), "\n")
+if (length(dup_syms) > 0) {
+  cat("\nDuplicated entries:\n")
+  dup_rows <- polysome_raw[sym_vec %in% dup_syms, c("symbol", count_cols)]
+  print(dup_rows[order(dup_rows[["symbol"]]), ])
+}
+
 # Aggregate duplicate gene symbols by summing counts
 polysome_aggregated <- polysome_raw %>%
-  select(symbol, all_of(count_cols)) %>%
+  dplyr::select(symbol, all_of(count_cols)) %>%
   group_by(symbol) %>%
-  summarise(across(everything(), sum)) %>%
+  summarise(across(all_of(count_cols), sum)) %>%
   ungroup()
 
 count_matrix <- polysome_aggregated %>%
@@ -85,8 +131,9 @@ sample_info <- data.frame(
   row.names = count_cols
 )
 
-# Set factor levels (NS as reference for condition, T as reference for fraction)
-sample_info$condition <- factor(sample_info$condition, levels = c("NS", "DAP5"))
+# Set factor levels (DAP5 shKD as reference for condition so results are NS/control vs KD,
+# i.e. positive log2FC = higher in control = DAP5-Promoted; T as reference for fraction)
+sample_info$condition <- factor(sample_info$condition, levels = c("DAP5", "NS"))
 sample_info$fraction <- factor(sample_info$fraction, levels = c("T", "HD"))
 
 cat("Sample metadata:\n")
@@ -110,8 +157,8 @@ cat("\nGenes after filtering:", nrow(dds), "\n")
 dds <- DESeq(dds)
 
 # Get results for the interaction term (differential TE)
-# This tests: is the HD/T ratio different between DAP5 and NS?
-res_interaction <- results(dds, name = "conditionDAP5.fractionHD")
+# Comparison: NS control vs DAP5 shKD (positive log2FC = higher TE in control = DAP5-Promoted)
+res_interaction <- results(dds, name = "conditionNS.fractionHD")
 
 # Convert to data frame and add gene symbols
 deseq_results <- as.data.frame(res_interaction) %>%
@@ -123,6 +170,91 @@ summary(res_interaction)
 
 cat("\nTop genes by adjusted p-value:\n")
 head(deseq_results, 10)
+```
+
+## Validation: Known DAP5-Sensitive and Insensitive Genes
+
+Check that DESeq2 results recapitulate known biology from de la Parra et al. 2018:
+sensitive genes should have positive log2FC (TE higher in control than KD);
+moderately sensitive genes should have intermediate log2FC;
+insensitive genes should cluster near zero.
+
+```{r validate_known_genes, fig.width=7, fig.height=5}
+# Gene groups from de la Parra et al. 2018
+sensitive_genes <- c(
+  "ETS1", "OSMR", "MYCL", "ITGAV", "TP53BP1", "MMP1"
+)
+moderate_genes <- c(
+  "EGFR", "SERPINE2"
+)
+insensitive_genes <- c(
+  "LMNA", "HNRNPD", "GAPDH"
+)
+
+# Display labels for plot
+gene_labels <- c(
+  ETS1 = "ETS1", OSMR = "OSMR", MYCL = "L-Myc",
+  ITGAV = "ITGaV", TP53BP1 = "p53-BP1", MMP1 = "MMP1",
+  EGFR = "EGFR", SERPINE2 = "SERPINE2",
+  LMNA = "Lamin A", HNRNPD = "AUF1", GAPDH = "GAPDH"
+)
+
+validation_genes <- c(sensitive_genes, moderate_genes, insensitive_genes)
+
+validation_df <- deseq_results %>%
+  filter(symbol %in% validation_genes) %>%
+  mutate(
+    group = case_when(
+      symbol %in% sensitive_genes   ~ "Sensitive",
+      symbol %in% moderate_genes    ~ "Moderately sensitive",
+      symbol %in% insensitive_genes ~ "Not sensitive"
+    ),
+    group = factor(group, levels = c("Sensitive", "Moderately sensitive", "Not sensitive")),
+    label = gene_labels[symbol],
+    label = factor(label, levels = gene_labels[rev(validation_genes)])
+  )
+
+cat("Validation gene results:\n")
+validation_df %>%
+  select(symbol, label, log2FoldChange, lfcSE, padj, group) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  print()
+
+# Bar plot
+p_validation <- ggplot(validation_df,
+    aes(x = log2FoldChange, y = label, fill = group)) +
+  geom_col() +
+  geom_errorbarh(aes(xmin = log2FoldChange - lfcSE,
+                     xmax = log2FoldChange + lfcSE),
+                 height = 0.3, linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_text(aes(label = ifelse(is.na(padj), "NA",
+                               ifelse(padj < 0.001, "<0.001", round(padj, 3))),
+                x = log2FoldChange + ifelse(log2FoldChange >= 0, 0.05, -0.05)),
+            hjust = ifelse(validation_df$log2FoldChange >= 0, 0, 1),
+            size = 3.5, color = "gray20") +
+  scale_fill_manual(
+    values = c("Sensitive"           = "#D55E00",
+               "Moderately sensitive" = "#E69F00",
+               "Not sensitive"        = "#808080"),
+    name = NULL
+  ) +
+  labs(
+    title = "TE Change: NS Control vs DAP5 shKD",
+    subtitle = "Positive log2FC = higher in control = DAP5-Promoted",
+    x = "log2FC (NS control / DAP5 shKD)",
+    y = NULL
+  ) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+print(p_validation)
+
+ggsave(
+  here("plots", "validation_dap5_known_genes.pdf"),
+  plot = p_validation,
+  width = 7, height = 5
+)
 ```
 
 ## Define DAP5-Dependent Gene Sets
@@ -188,7 +320,7 @@ p_volcano <- ggplot(deseq_classified, aes(x = log2FoldChange, y = -log10(padj), 
   labs(
     title = "DAP5 Effect on Translation Efficiency",
     subtitle = paste0("DESeq2 interaction term (padj < ", padj_threshold, ", |log2FC| > ", log2fc_threshold, ")"),
-    x = "log2 Fold Change (DAP5 effect on TE)",
+    x = "log2 Fold Change (TE: NS control / DAP5 shKD)\nright = higher in control = DAP5-Promoted",
     y = "-log10(adjusted p-value)"
   ) +
   theme_cowplot() +
@@ -604,6 +736,128 @@ print(table(geneset_strict_df$dap5_status))
 # Export stricter gene sets
 write_csv(geneset_strict_df, here("output", "genesets", "dap5_polysome_genesets_lfc1.csv"))
 cat("\nStricter gene sets exported to: output/genesets/dap5_polysome_genesets_lfc1.csv\n")
+```
+
+## eIF3d Promotes Gene Set: DAP5 Polysome Score Distribution
+
+### Load gene sets
+
+```{r load_eif3d_genesets}
+norm_promotes_1hr <- read_csv(here("output", "genesets", "normoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                              show_col_types = FALSE) %>%
+  pull(db_gene_symbol)
+
+hyp_promotes_1hr  <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                              show_col_types = FALSE) %>%
+  pull(db_gene_symbol)
+
+cat("Normoxia promotes-3d (1hr, lfc>0.5):", length(norm_promotes_1hr), "genes\n")
+cat("Hypoxia promotes-3d (1hr, lfc>0.5):", length(hyp_promotes_1hr), "genes\n")
+```
+
+### Helper function (mirrors teleman_comparison.Rmd ip_density_plot)
+
+```{r dap5_density_fn}
+dap5_density_plot <- function(dap5_data, gene_syms, cat_label, color, title_str, outfile) {
+  plot_data <- dap5_data %>%
+    filter(!is.na(log2FoldChange)) %>%
+    mutate(category = ifelse(symbol %in% gene_syms, cat_label, "All other genes"))
+
+  target_lfc <- plot_data %>% filter(category == cat_label) %>% pull(log2FoldChange)
+  other_lfc  <- plot_data %>% filter(category == "All other genes") %>% pull(log2FoldChange)
+
+  ks_result <- suppressWarnings(ks.test(target_lfc, other_lfc))
+
+  plot_data <- plot_data %>%
+    mutate(category_labeled = ifelse(
+      category == cat_label,
+      sprintf("%s (n=%d)", cat_label, length(target_lfc)),
+      sprintf("All other genes (n=%d)", length(other_lfc))
+    ))
+
+  color_vals <- setNames(
+    c(color, "grey50"),
+    c(sprintf("%s (n=%d)", cat_label, length(target_lfc)),
+      sprintf("All other genes (n=%d)", length(other_lfc)))
+  )
+
+  p <- ggplot(plot_data, aes(x = log2FoldChange, color = category_labeled)) +
+    geom_density(linewidth = 1) +
+    scale_color_manual(values = color_vals) +
+    labs(
+      title    = title_str,
+      subtitle = sprintf("KS test p-value = %.2e", ks_result$p.value),
+      x        = "log2FC (TE: NS control / DAP5 shKD)\nright = higher in control = DAP5-Promoted",
+      y        = "Density",
+      color    = NULL
+    ) +
+    theme_cowplot() +
+    theme(legend.position = "top")
+
+  print(p)
+  ggsave(here("plots", outfile), width = 8, height = 6)
+  cat(title_str, "- KS p:", ks_result$p.value, "\n")
+}
+```
+
+### Normoxia promotes-3d (1hr, lfc>0.5)
+
+```{r dap5_density_norm, fig.width=8, fig.height=6}
+dap5_density_plot(
+  deseq_results,
+  norm_promotes_1hr,
+  "Upregulated by eIF3d normoxia (1hr, lfc>0.5)",
+  "#E69F00",
+  "1hr normoxia: DAP5 Polysome Score (LFC > 0.5)",
+  "dap5_polysome_density_3d_norm_1hr_lfc05.pdf"
+)
+```
+
+### Hypoxia promotes-3d (1hr, lfc>0.5)
+
+```{r dap5_density_hyp, fig.width=8, fig.height=6}
+dap5_density_plot(
+  deseq_results,
+  hyp_promotes_1hr,
+  "Upregulated by eIF3d hypoxia (1hr, lfc>0.5)",
+  "#E69F00",
+  "1hr hypoxia: DAP5 Polysome Score (LFC > 0.5)",
+  "dap5_polysome_density_3d_hyp_1hr_lfc05.pdf"
+)
+```
+
+## Venn Diagram: eIF3d Promotes vs DAP5 Gene Sets
+
+```{r venn_eif3d_dap5, fig.width=12, fig.height=5}
+library(ggVennDiagram)
+
+venn_norm <- list(
+  "eIF3d promotes\nnormoxia (1hr)" = norm_promotes_1hr,
+  "DAP5-promoted"                  = dap5_promoted_genes,
+  "DAP5-inhibited"                 = dap5_inhibited_genes
+)
+
+venn_hyp <- list(
+  "eIF3d promotes\nhypoxia (1hr)" = hyp_promotes_1hr,
+  "DAP5-promoted"                 = dap5_promoted_genes,
+  "DAP5-inhibited"                = dap5_inhibited_genes
+)
+
+p_venn_norm <- ggVennDiagram(venn_norm, label_alpha = 0, set_color = c("#D55E00", "grey40", "grey40")) +
+  scale_fill_gradient(low = "white", high = "grey80") +
+  labs(title = "Normoxia eIF3d promotes vs DAP5 sets") +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+
+p_venn_hyp <- ggVennDiagram(venn_hyp, label_alpha = 0, set_color = c("#009E73", "grey40", "grey40")) +
+  scale_fill_gradient(low = "white", high = "grey80") +
+  labs(title = "Hypoxia eIF3d promotes vs DAP5 sets") +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+
+p_venn_combined <- plot_grid(p_venn_norm, p_venn_hyp, nrow = 1, labels = c("A", "B"))
+print(p_venn_combined)
+
+ggsave(here("plots", "venn_eif3d_dap5_genesets.pdf"),
+       plot = p_venn_combined, width = 12, height = 5)
 ```
 
 ## Session Info
