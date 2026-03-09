@@ -1,5 +1,5 @@
 ---
-title: "Codon Optimality Feature Extraction (CAI, tAI, CSC)"
+title: "Codon Optimality Feature Extraction (CAI, tAI, CSC, FOP)"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
@@ -13,7 +13,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # Overview
 
-This notebook adds three mechanistically distinct codon optimality features to the
+This notebook adds four mechanistically distinct codon optimality features to the
 `te_lfc` feature matrix, producing `feature_matrix_codon_optimality.rds`.
 
 | Feature | Tool | Description |
@@ -21,8 +21,12 @@ This notebook adds three mechanistically distinct codon optimality features to t
 | `cai` | coRdon (Bioconductor) | Codon Adaptive Index — codon usage vs. ribosomal protein reference |
 | `tai` | coRdon (Bioconductor) | tRNA Adaptation Index — anticodon supply from GtRNAdb hg38 tRNA GCN |
 | `csc` | iCodon (Diez et al. 2022) | Codon Stabilisation Coefficient — codon-level mRNA stability weights |
+| `fop` | Custom (coRdon counts) | Frequency of Optimal Codons — fraction of sense codons matching the most-used synonymous codon in the top 10% TE genes |
 
-All three are CDS-level, length-normalized, and orthogonal to `gc3`.
+All four are CDS-level, length-normalized, and orthogonal to `gc3`.
+
+**Additional prerequisite for FOP:**
+- `output/condition_level_te.csv` — per-gene TE values used to define the top 10% reference set (sictrl normoxia)
 
 **Prerequisites before knitting:**
 - `output/predictive_modeling/feature_matrix_te_lfc.rds` (from 01f)
@@ -311,6 +315,73 @@ print(summary(csc_scores))
 cat("Expected range: unbounded (higher = more stable codon usage)\n")
 ```
 
+# FOP — Frequency of Optimal Codons
+
+FOP measures what fraction of a gene's sense codons are the "optimal" synonymous
+codon for each amino acid, where optimal = the most-used codon among a reference
+set of highly-translated genes.
+
+Reference set: top 10% of genes by mean TE in sictrl normoxia (from
+`output/condition_level_te.csv`). Top 10% is stricter than the common 20%
+threshold, anchoring optimal codon definitions to genes the cell most robustly
+translates.
+
+```{r fop_reference}
+te_condition <- read_csv(here("output", "condition_level_te.csv"))
+
+# Filter to sictrl normoxia, average log2FoldChange (TE) across timepoints per gene
+te_ranked <- te_condition %>%
+  filter(condition == "normoxia", treatment == "sictrl") %>%
+  group_by(gene_id) %>%
+  summarise(mean_te = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mean_te)) %>%
+  arrange(desc(mean_te))
+
+top10_cutoff <- ceiling(nrow(te_ranked) * 0.10)
+top10_genes  <- te_ranked$gene_id[seq_len(top10_cutoff)]
+top10_clean  <- sub("\\..*", "", top10_genes)  # strip version numbers
+
+cat("Total genes with TE data:", nrow(te_ranked), "\n")
+cat("Top 10% reference set size:", length(top10_clean), "\n")
+```
+
+```{r fop}
+# Map top10 genes to transcripts present in the codon matrix
+# te_lfc_matrix has transcript_id_clean; gene_id column links to TE data
+gene_id_clean <- sub("\\..*", "", te_lfc_matrix$gene_id)
+ref_tx <- te_lfc_matrix$transcript_id_clean[gene_id_clean %in% top10_clean]
+ref_tx <- ref_tx[ref_tx %in% rownames(counts_mat)]  # restrict to codon matrix rows
+
+cat("Reference transcripts in codon matrix:", length(ref_tx), "\n")
+
+# Aggregate codon counts across reference transcripts
+ref_counts_fop <- colSums(counts_mat[ref_tx, , drop = FALSE])
+
+# For each synonymous family, find the codon with the highest count → optimal codon
+# aa_to_codons built in cai chunk: list of AA -> sense codon vector
+optimal_codons <- sapply(aa_to_codons, function(codons) {
+  codons[which.max(ref_counts_fop[codons])]
+})
+optimal_codon_vec <- unname(optimal_codons)  # character vector of 20 optimal codons
+
+cat("Optimal codons defined from top 10% TE reference:\n")
+print(sort(optimal_codon_vec))
+
+# FOP per transcript: sum(optimal codon counts) / sum(all sense codon counts)
+stop_codons_fop <- names(gen_code[gen_code == "*"])
+sense_cols      <- setdiff(colnames(counts_mat), stop_codons_fop)
+
+sense_counts_fop <- rowSums(counts_mat[, sense_cols, drop = FALSE])
+opti_counts_fop  <- rowSums(counts_mat[, optimal_codon_vec, drop = FALSE])
+fop_scores       <- opti_counts_fop / sense_counts_fop
+fop_scores[sense_counts_fop == 0] <- NA
+names(fop_scores) <- names(cds_sequences)
+
+cat("\nFOP summary (top 10% TE reference, sictrl normoxia):\n")
+print(summary(fop_scores))
+cat("Expected range: [0, 1] (higher = more optimal codon usage)\n")
+```
+
 # Create Score Table
 
 ```{r create_score_table}
@@ -318,13 +389,15 @@ codon_scores <- tibble(
   transcript_id_clean = names(cds_sequences),
   cai = cai_scores,
   tai = tai_scores,
-  csc = csc_scores
+  csc = csc_scores,
+  fop = fop_scores
 )
 
 cat("Score table:", nrow(codon_scores), "rows\n")
 cat("Non-NA: cai =", sum(!is.na(codon_scores$cai)),
     ", tai =", sum(!is.na(codon_scores$tai)),
-    ", csc =", sum(!is.na(codon_scores$csc)), "\n")
+    ", csc =", sum(!is.na(codon_scores$csc)),
+    ", fop =", sum(!is.na(codon_scores$fop)), "\n")
 ```
 
 # Join to Feature Matrix
@@ -341,7 +414,7 @@ cat("Row count matches original:", nrow(codon_matrix) == nrow(te_lfc_matrix), "\
 # Quality Control
 
 ```{r quality_control}
-new_features <- c("cai", "tai", "csc")
+new_features <- c("cai", "tai", "csc", "fop")
 
 cat("Non-NA counts for codon optimality features:\n")
 for (col in new_features) {
@@ -365,16 +438,17 @@ for (col in new_features) {
 # Sanity checks
 stopifnot(
   "CAI values must be in [0, 1]" = all(codon_matrix$cai >= 0 & codon_matrix$cai <= 1, na.rm = TRUE),
-  "tAI values must be in [0, 1]" = all(codon_matrix$tai >= 0 & codon_matrix$tai <= 1, na.rm = TRUE)
+  "tAI values must be in [0, 1]" = all(codon_matrix$tai >= 0 & codon_matrix$tai <= 1, na.rm = TRUE),
+  "FOP values must be in [0, 1]" = all(codon_matrix$fop >= 0 & codon_matrix$fop <= 1, na.rm = TRUE)
 )
-cat("\nSanity checks passed: CAI and tAI in [0, 1]\n")
+cat("\nSanity checks passed: CAI, tAI, and FOP in [0, 1]\n")
 ```
 
 # Correlation Among Codon Optimality Features
 
 ```{r feature_correlations}
 # Correlations with each other and with gc3 proxy
-cor_features <- c("cai", "tai", "csc", "gc3")
+cor_features <- c("cai", "tai", "csc", "fop", "gc3")
 cor_data <- codon_matrix %>%
   dplyr::select(all_of(cor_features)) %>%
   drop_na()
@@ -410,7 +484,9 @@ codon_catalog <- tribble(
 
   "tai",    "Codon Optimality", "coRdon (Bioconductor) + GtRNAdb hg38 tRNA gene copy numbers", "numeric", "0–1",                      "CDS",   "tRNA Adaptation Index (tAI); measures codon-anticodon adaptation using human tRNA gene copy numbers from GtRNAdb (hg38), with wobble base pairing weights; higher = better tRNA supply match; computed with coRdon::tAI()",
 
-  "csc",    "Codon Optimality", "iCodon R package (Diez et al. 2022, Sci Rep)",               "numeric", "unbounded (higher = stable)", "CDS",  "CSC-based mRNA stability prediction; computed with iCodon::predict_stability('human'); derived from human codon stabilization coefficient (CSC) weights; higher = more stable codon usage"
+  "csc",    "Codon Optimality", "iCodon R package (Diez et al. 2022, Sci Rep)",               "numeric", "unbounded (higher = stable)", "CDS",  "CSC-based mRNA stability prediction; computed with iCodon::predict_stability('human'); derived from human codon stabilization coefficient (CSC) weights; higher = more stable codon usage",
+
+  "fop",    "Codon Optimality", "Custom (top 10% TE genes, sictrl normoxia)",                  "numeric", "0–1 (proportion of optimal codons)", "CDS", "Frequency of Optimal Codons: fraction of sense codons that are the most-used synonymous codon in the top 10% most-translated sictrl normoxia genes; optimal codons determined from condition_level_te.csv; higher = more optimal codon usage"
 )
 
 cat("Feature catalog rows:", nrow(codon_catalog), "\n")

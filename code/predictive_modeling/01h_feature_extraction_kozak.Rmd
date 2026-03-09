@@ -1,0 +1,336 @@
+---
+title: "Kozak Context Feature Extraction"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This notebook adds Kozak context features to the `feature_matrix_codon_optimality.rds`
+matrix, producing `feature_matrix_kozak.rds`.
+
+Kozak context scores the nucleotide sequence flanking the AUG start codon: positions
+−6 to +4 (10 nt total). Stronger Kozak context correlates with higher translation
+efficiency at the initiation level, orthogonal to elongation-level features (CAI, tAI,
+CSC, FOP from 01g).
+
+| Feature | Type | Description |
+|---------|------|-------------|
+| `kozak_score` | integer 0–3 | Ordinal: 0=unknown, 1=moderate, 2=strong, 3=optimal |
+| `kozak_optimal` | integer 0/1 | Binary: 1 if optimal Kozak context |
+| `kozak_pwm_score` | numeric | Continuous PWM log-odds score (Kozak 1987 frequencies) |
+
+**Window definition:** last 6 nt of 5'UTR + first 4 nt of CDS (ATG + position +4).
+Transcripts with 5'UTR < 6 nt or no annotated 5'UTR → `NA`.
+
+**Prerequisites before knitting:**
+- `output/predictive_modeling/feature_matrix_codon_optimality.rds` (from 01g)
+- `accessories/human/txdb.gencode49.sqlite` (GENCODE v49)
+- R packages: tidyverse, here, GenomicFeatures, BSgenome.Hsapiens.UCSC.hg38
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+# BSgenome loaded below only if sequence cache is absent
+```
+
+# Load Feature Matrix
+
+```{r load_feature_matrix}
+kozak_input <- readRDS(here("output", "predictive_modeling", "feature_matrix_codon_optimality.rds"))
+cat("Loaded codon optimality matrix:", nrow(kozak_input), "genes x", ncol(kozak_input), "columns\n")
+
+keep_tx <- kozak_input$transcript_id_clean
+cat("Target transcripts:", length(keep_tx), "\n")
+cat("Example IDs:", head(keep_tx, 3), "\n")
+```
+
+# Load TxDb and Genome
+
+```{r load_txdb}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cat("Loaded TxDb\n")
+```
+
+# Extract 5'UTR and CDS Sequences
+
+Results are cached to `output/predictive_modeling/precomputed_kozak_sequences.rds`
+so that re-knitting skips the slow `extractTranscriptSeqs()` step.
+
+```{r extract_utr5}
+cache_path <- here("output", "predictive_modeling", "precomputed_kozak_sequences.rds")
+
+if (file.exists(cache_path)) {
+  cached <- readRDS(cache_path)
+  utr5_seq <- cached$utr5_seq
+  cds_seq  <- cached$cds_seq
+  cat("Loaded sequences from cache\n")
+} else {
+  cat("Cache not found — extracting sequences from genome (slow, ~5–10 min)\n")
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  genome <- BSgenome.Hsapiens.UCSC.hg38
+
+  utr5 <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+  cds  <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+  utr5_sequences <- extractTranscriptSeqs(genome, utr5) %>% as.data.frame()
+  utr5_seq <- utr5_sequences %>%
+    rownames_to_column("transcript_id_raw") %>%
+    mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+    dplyr::rename("utr5_sequence" = "x") %>%
+    dplyr::select(transcript_id_clean, utr5_sequence)
+
+  cds_sequences <- extractTranscriptSeqs(genome, cds) %>% as.data.frame()
+  cds_seq <- cds_sequences %>%
+    rownames_to_column("transcript_id_raw") %>%
+    mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+    dplyr::rename("cds_sequence" = "x") %>%
+    dplyr::select(transcript_id_clean, cds_sequence)
+
+  saveRDS(list(utr5_seq = utr5_seq, cds_seq = cds_seq), cache_path)
+  cat("Saved sequence cache to:", cache_path, "\n")
+}
+
+# Filter to target transcripts
+utr5_seq <- utr5_seq %>% filter(transcript_id_clean %in% keep_tx)
+cds_seq  <- cds_seq  %>% filter(transcript_id_clean %in% keep_tx)
+
+cat("5' UTR sequences:", nrow(utr5_seq), "\n")
+cat("CDS sequences:   ", nrow(cds_seq), "\n")
+```
+
+# Build Kozak Window
+
+```{r kozak_window}
+# Join sequences for transcripts with both 5'UTR and CDS annotations
+seq_joined <- inner_join(utr5_seq, cds_seq, by = "transcript_id_clean")
+
+# Kozak window = last 6 nt of 5'UTR + first 4 nt of CDS
+seq_joined <- seq_joined %>%
+  mutate(
+    utr5_len     = nchar(utr5_sequence),
+    utr5_tail    = str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),  # last ≤6 nt
+    cds_head     = str_sub(cds_sequence, 1, 4),                               # first 4 nt (ATG + +4)
+    kozak_window = paste0(utr5_tail, cds_head)
+  )
+
+cat("Transcripts with Kozak window:", nrow(seq_joined), "\n")
+cat("Window length distribution:\n")
+print(table(nchar(seq_joined$kozak_window)))
+```
+
+# Score Kozak Context
+
+Kozak category definitions from Kozak (1987), with anchored regex patterns:
+- **Optimal**: GCCACC or GCCGCC immediately before ATG, and G at +4 (e.g., GCCACCATGG)
+- **Strong**: A or G at position −3, G at position +4
+- **Moderate**: A or G at −3 with non-G at +4, OR C or T at −3 with G at +4
+- **Unknown**: none of the above (or window < 10 nt → `NA`)
+
+```{r kozak_score}
+match_kozak <- function(seq) {
+  if (nchar(seq) < 10) return("unknown_short")   # insufficient context → NA later
+  if (grepl("^(GCCACC|GCCGCC)ATGG$", seq)) return("optimal")
+  if (grepl("^...[AG]..ATGG$", seq))        return("strong")
+  if (grepl("^...[AG]..ATG[ACT]$", seq))    return("moderate")   # A/G at -3, not G at +4
+  if (grepl("^...[CT]..ATGG$", seq))        return("moderate")   # C/T at -3, G at +4
+  return("unknown")
+}
+
+score_map <- c(unknown = 0L, moderate = 1L, strong = 2L, optimal = 3L, unknown_short = NA_integer_)
+
+seq_scored <- seq_joined %>%
+  mutate(
+    kozak_category = sapply(kozak_window, match_kozak),
+    kozak_score    = unname(score_map[kozak_category]),
+    kozak_optimal  = as.integer(kozak_score == 3L),
+    kozak_category = if_else(kozak_category == "unknown_short", NA_character_, kozak_category)
+  )
+
+cat("Kozak category distribution:\n")
+print(table(seq_scored$kozak_category, useNA = "ifany"))
+cat("\nKozak score summary:\n")
+print(summary(seq_scored$kozak_score))
+```
+
+# Score Kozak Context — PWM Log-odds
+
+Position-specific nucleotide frequencies from Kozak (1987) Table 1 (699 vertebrate
+mRNAs). Positions scored: −6, −5, −4, −3, −2, −1, +4 (string indices 1–6 and 10
+in the 10-nt window). ATG (+1/+2/+3) is invariant and excluded.
+
+Score per position: log2(f_observed / 0.25), where 0.25 is the uniform background.
+Final score = sum across 7 positions. Higher = stronger Kozak context.
+
+```{r kozak_pwm_score}
+# Kozak (1987) Table 1: nucleotide frequencies at each variable position
+# Rows = positions (-6 to -1, +4); Cols = A, C, G, T
+kozak_pwm <- matrix(
+  c(
+    0.23, 0.22, 0.27, 0.28,  # pos -6 (string index 1)
+    0.25, 0.28, 0.23, 0.24,  # pos -5 (string index 2)
+    0.21, 0.34, 0.23, 0.22,  # pos -4 (string index 3)
+    0.71, 0.09, 0.13, 0.07,  # pos -3 (string index 4) — most informative
+    0.27, 0.28, 0.19, 0.26,  # pos -2 (string index 5)
+    0.25, 0.39, 0.15, 0.21,  # pos -1 (string index 6)
+    0.17, 0.12, 0.54, 0.17   # pos +4 (string index 10)
+  ),
+  nrow = 7, ncol = 4, byrow = TRUE,
+  dimnames = list(
+    c("m6", "m5", "m4", "m3", "m2", "m1", "p4"),
+    c("A", "C", "G", "T")
+  )
+)
+
+# Log-odds: log2(f / background), pseudocount 0.001 to avoid log(0)
+pseudocount <- 0.001
+log_odds <- log2((kozak_pwm + pseudocount) / 0.25)
+
+cat("PWM log-odds range: [", round(min(log_odds), 3), ",", round(max(log_odds), 3), "]\n")
+cat("Most informative position (-3): A =", round(log_odds["m3", "A"], 3),
+    ", T =", round(log_odds["m3", "T"], 3), "\n")
+
+# Score each window: extract nucleotides at indices 1-6 and 10, sum log-odds
+pos_indices <- c(1, 2, 3, 4, 5, 6, 10)
+pos_names   <- c("m6", "m5", "m4", "m3", "m2", "m1", "p4")
+
+score_pwm <- function(seq) {
+  if (nchar(seq) < 10) return(NA_real_)
+  nts <- strsplit(seq, "")[[1]]
+  s <- 0
+  for (i in seq_along(pos_indices)) {
+    nt <- nts[pos_indices[i]]
+    if (!nt %in% c("A", "C", "G", "T")) return(NA_real_)
+    s <- s + log_odds[pos_names[i], nt]
+  }
+  s
+}
+
+seq_scored <- seq_scored %>%
+  mutate(kozak_pwm_score = sapply(kozak_window, score_pwm))
+
+cat("kozak_pwm_score summary:\n")
+print(summary(seq_scored$kozak_pwm_score))
+```
+
+# Create Kozak Score Table
+
+```{r create_kozak_table}
+kozak_scores <- seq_scored %>%
+  dplyr::select(transcript_id_clean, kozak_score, kozak_optimal, kozak_pwm_score)
+
+cat("Score table:", nrow(kozak_scores), "rows\n")
+cat("Non-NA: kozak_score =", sum(!is.na(kozak_scores$kozak_score)),
+    ", kozak_pwm_score =", sum(!is.na(kozak_scores$kozak_pwm_score)), "\n")
+```
+
+# Join to Feature Matrix
+
+```{r join_matrix}
+kozak_matrix <- kozak_input %>%
+  left_join(kozak_scores, by = "transcript_id_clean")
+
+cat("Matrix after join:", nrow(kozak_matrix), "genes x", ncol(kozak_matrix), "columns\n")
+cat("New columns:", ncol(kozak_matrix) - ncol(kozak_input), "\n")
+cat("Row count matches original:", nrow(kozak_matrix) == nrow(kozak_input), "\n")
+```
+
+# Quality Control
+
+```{r quality_control}
+cat("Kozak score distribution:\n")
+print(table(kozak_matrix$kozak_score, useNA = "ifany"))
+
+# Range check: all scores must be in 0–3
+stopifnot(
+  "kozak_score values outside [0, 3]" = all(na.omit(kozak_matrix$kozak_score) %in% 0:3)
+)
+cat("Range check passed: all kozak_score in {0, 1, 2, 3}\n")
+
+# NA rate: expected ~20–40% from transcripts without annotated 5'UTRs or short UTRs
+na_rate <- mean(is.na(kozak_matrix$kozak_score)) * 100
+cat("NA rate:", round(na_rate, 1), "% (expected ~20–40%)\n")
+
+# Optimal rate
+opt_rate <- mean(kozak_matrix$kozak_optimal, na.rm = TRUE) * 100
+cat("Optimal rate:", round(opt_rate, 1), "% (expected ~10–25%)\n")
+
+cat("\nkozak_optimal distribution:\n")
+print(table(kozak_matrix$kozak_optimal, useNA = "ifany"))
+
+cat("\nkozak_pwm_score summary:\n")
+print(summary(kozak_matrix$kozak_pwm_score))
+
+# PWM score should be higher in higher ordinal tiers
+cat("\nMean PWM score by ordinal tier (should increase 0→3):\n")
+print(kozak_matrix %>%
+  filter(!is.na(kozak_score)) %>%
+  group_by(kozak_score) %>%
+  summarise(mean_pwm = round(mean(kozak_pwm_score, na.rm = TRUE), 3), n = n()))
+```
+
+# Export
+
+```{r export}
+dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(kozak_matrix,
+        here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
+cat("Exported: output/predictive_modeling/feature_matrix_kozak.rds\n")
+
+write_csv(kozak_matrix,
+          here("output", "predictive_modeling", "feature_matrix_kozak.csv"))
+cat("Exported: output/predictive_modeling/feature_matrix_kozak.csv\n")
+
+cat("\nFinal matrix:", nrow(kozak_matrix), "genes x", ncol(kozak_matrix), "columns\n")
+cat("New features: kozak_score, kozak_optimal, kozak_pwm_score\n")
+```
+
+# Feature Catalog
+
+```{r feature_catalog}
+kozak_catalog <- tribble(
+  ~feature, ~category, ~source, ~type, ~units, ~region, ~description,
+
+  "kozak_score", "Translation Initiation",
+  "Custom (GENCODE v49 5'UTR + CDS coordinates, Kozak 1987 consensus)",
+  "integer", "0–3 ordinal (0=unknown, 1=moderate, 2=strong, 3=optimal)",
+  "5'UTR/CDS junction (positions −6 to +4)",
+  "Kozak context score for the annotated start codon. Derived from the 10-nt window flanking AUG (last 6 nt of 5'UTR + first 4 nt of CDS). Optimal: GCCACC/GCCGCC+ATGG; Strong: A/G at −3 and G at +4; Moderate: A/G at −3 or G at +4 (not both); Unknown: none of the above or <6 nt 5'UTR context.",
+
+  "kozak_optimal", "Translation Initiation",
+  "Custom (derived from kozak_score)",
+  "integer", "0/1 (binary)",
+  "5'UTR/CDS junction",
+  "Binary indicator for optimal Kozak context (kozak_score == 3). Optimal context defined as GCCACC or GCCGCC immediately preceding ATG with G at position +4.",
+
+  "kozak_pwm_score", "Translation Initiation",
+  "Custom (Kozak 1987 Table 1 nucleotide frequencies, 699 vertebrate mRNAs)",
+  "numeric", "unbounded log-odds sum (higher = stronger context)",
+  "5'UTR/CDS junction (positions −6 to +4)",
+  "Continuous Kozak context score: sum of position-specific log2(f/0.25) log-odds across 7 variable positions (−6 to −1 and +4; ATG fixed and excluded). Frequencies from Kozak (1987) Table 1. More informative than the ordinal kozak_score as it captures graded sequence variation within tiers."
+)
+
+cat("Feature catalog rows:", nrow(kozak_catalog), "\n")
+print(kozak_catalog %>% dplyr::select(feature, category, units))
+
+write_csv(kozak_catalog,
+          here("output", "predictive_modeling", "feature_catalog_kozak.csv"))
+cat("\nExported: output/predictive_modeling/feature_catalog_kozak.csv\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
