@@ -1,0 +1,695 @@
+---
+title: "eIF3d/e RNA signatures in patient survival data (METABRIC & TCGA)"
+author: "Kate"
+date: "2026-03-15"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+RNA signatures derived from DESeq2 (si3e/si3d vs sictrl) and applied to METABRIC
+and TCGA breast cancer patient datasets to generate survival curves.
+
+Signatures:
+- Normoxia: 1hr + 4hr timepoints combined, design = ~timepoint + treatment
+- Hypoxia: 1hr only, design = ~treatment
+
+Sign convention: levels = c("siX", "sictrl") → result is sictrl_vs_siX
+  Positive LFC = higher in sictrl = eIF3e/3d PROMOTES this gene
+  up_genes (LFC > 1) = eIF3e/3d-promoted genes
+  down_genes (LFC < -1) = eIF3e/3d-suppressed genes
+  total_z_score = mean(up) - mean(down) → high score = high eIF3 activity
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(survminer)
+library(survival)
+library(ggprism)
+library(readxl)
+```
+
+```{r colors}
+theme_set(theme_prism())
+
+si3e_col <- "#56B4E9"
+si3d_col <- "#E69F00"
+```
+
+---
+
+# Load data
+
+```{r gene_info}
+geneInfo <- read_tsv(
+  here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
+  col_names = FALSE
+) %>%
+  filter(!str_detect(X3, "pre_"))
+
+colnames(geneInfo) <- c("gene_id", "symbol", "biotype", "species", "version")
+
+gene_symbol <- geneInfo %>%
+  dplyr::select(gene_id, symbol) %>%
+  distinct(gene_id, .keep_all = TRUE)
+```
+
+```{r raw_counts}
+metadata <- read_csv(here("output", "metadata_clean.csv"))
+
+raw_counts <- read_csv(here("counts", "raw_filtered_allCounts.csv")) %>%
+  column_to_rownames("gene_id")
+
+# All RNA columns
+rna_mat <- as.matrix(raw_counts[, grep("_rna_", colnames(raw_counts))])
+```
+
+```{r spikein}
+cts_dros <- read_csv(here("output", "dros_spikeInCounts_raw.csv")) %>%
+  column_to_rownames("gene_id")
+
+# Remove outlier sample
+cts_dros <- cts_dros[, !grepl("0107", colnames(cts_dros))]
+
+# Top 500 expressed Drosophila spike-in genes
+top500_ids <- cts_dros %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  mutate(total = rowSums(across(-gene_id), na.rm = TRUE)) %>%
+  slice_max(total, n = 500, with_ties = FALSE) %>%
+  pull(gene_id)
+
+spikein <- cts_dros[top500_ids, , drop = FALSE] %>% round(., 0)
+```
+
+---
+
+# Generate RNA signatures via DESeq2
+
+## Helper: run DESeq2 and return full results joined with gene symbols
+
+```{r deseq_helper}
+# run_deseq: mirrors deFunction spike-in normalization from functions.R
+# 1. Appends spike-in rows to count matrix
+# 2. Estimates size factors using spike-in controlGenes
+# 3. Removes spike-ins, preserves size factors, then runs DESeq2
+run_deseq <- function(count_mat, sample_info, design_formula, result_coef) {
+  sample_info <- sample_info[match(colnames(count_mat), sample_info$sample_name), ]
+  rownames(sample_info) <- sample_info$sample_name
+
+  # Match spike-in columns to the count matrix samples
+  spike_sub <- spikein[, colnames(count_mat), drop = FALSE]
+
+  # Combine human counts + spike-ins
+  counts_combined <- rbind(round(count_mat, 0), round(spike_sub, 0))
+  spike_indices   <- which(rownames(counts_combined) %in% top500_ids)
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts_combined,
+    colData   = sample_info,
+    design    = design_formula
+  )
+
+  # Estimate size factors using spike-ins as control genes
+  dds <- estimateSizeFactors(dds, controlGenes = spike_indices)
+  message("Size factors estimated using ", length(spike_indices), " spike-in genes")
+
+  # Remove spike-ins but preserve size factors
+  sf <- sizeFactors(dds)
+  dds <- dds[-spike_indices, ]
+  sizeFactors(dds) <- sf
+
+  dds <- DESeq(dds)
+  message("Result names: ", paste(resultsNames(dds), collapse = ", "))
+
+  res <- results(dds, name = result_coef, cooksCutoff = FALSE, independentFiltering = FALSE)
+  lfcShrink(dds = dds, coef = result_coef, res = res, type = "apeglm") %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    inner_join(gene_symbol, ., by = "gene_id")
+}
+```
+
+## si3e Normoxia (1hr + 4hr combined, ~timepoint + treatment)
+
+```{r sig_3e_norm}
+norm_3e_info <- metadata %>%
+  filter(library == "rna", condition == "normoxia",
+         treatment %in% c("sictrl", "si3e"), hours %in% c(1, 4)) %>%
+  mutate(
+    treatment = factor(treatment, levels = c("si3e", "sictrl")),
+    timepoint = factor(hours)
+  )
+
+norm_3e_mat <- rna_mat[, norm_3e_info$sample_name]
+
+res_3e_norm <- run_deseq(
+  norm_3e_mat, norm_3e_info,
+  design_formula = ~ timepoint + treatment,
+  result_coef    = "treatment_sictrl_vs_si3e"
+)
+
+# Confirm direction: EIF3E should be positive (more in sictrl than si3e KD)
+res_3e_norm %>% filter(symbol == "EIF3E") %>% dplyr::select(symbol, log2FoldChange, padj)
+```
+
+```{r sig_3e_norm_split}
+sig_3e_norm <- res_3e_norm %>% filter(padj < 0.05)
+cat("Total significant genes (3e normoxia):", nrow(sig_3e_norm), "\n")
+
+up_3e_norm   <- sig_3e_norm %>% filter(log2FoldChange >  1) %>% pull(symbol)
+down_3e_norm <- sig_3e_norm %>% filter(log2FoldChange < -1) %>% pull(symbol)
+cat("LFC1  — Up:", length(up_3e_norm), "  Down:", length(down_3e_norm), "\n")
+
+up_3e_norm_lfc15   <- sig_3e_norm %>% filter(log2FoldChange >  1.5) %>% pull(symbol)
+down_3e_norm_lfc15 <- sig_3e_norm %>% filter(log2FoldChange < -1.5) %>% pull(symbol)
+cat("LFC1.5 — Up:", length(up_3e_norm_lfc15), "  Down:", length(down_3e_norm_lfc15), "\n")
+```
+
+## si3d Normoxia (1hr + 4hr combined, ~timepoint + treatment)
+
+```{r sig_3d_norm}
+norm_3d_info <- metadata %>%
+  filter(library == "rna", condition == "normoxia",
+         treatment %in% c("sictrl", "si3d"), hours %in% c(1, 4)) %>%
+  mutate(
+    treatment = factor(treatment, levels = c("si3d", "sictrl")),
+    timepoint = factor(hours)
+  )
+
+norm_3d_mat <- rna_mat[, norm_3d_info$sample_name]
+
+res_3d_norm <- run_deseq(
+  norm_3d_mat, norm_3d_info,
+  design_formula = ~ timepoint + treatment,
+  result_coef    = "treatment_sictrl_vs_si3d"
+)
+
+res_3d_norm %>% filter(symbol == "EIF3D") %>% dplyr::select(symbol, log2FoldChange, padj)
+```
+
+```{r sig_3d_norm_split}
+sig_3d_norm <- res_3d_norm %>% filter(padj < 0.05)
+cat("Total significant genes (3d normoxia):", nrow(sig_3d_norm), "\n")
+
+up_3d_norm   <- sig_3d_norm %>% filter(log2FoldChange >  1) %>% pull(symbol)
+down_3d_norm <- sig_3d_norm %>% filter(log2FoldChange < -1) %>% pull(symbol)
+cat("LFC1  — Up:", length(up_3d_norm), "  Down:", length(down_3d_norm), "\n")
+
+up_3d_norm_lfc15   <- sig_3d_norm %>% filter(log2FoldChange >  1.5) %>% pull(symbol)
+down_3d_norm_lfc15 <- sig_3d_norm %>% filter(log2FoldChange < -1.5) %>% pull(symbol)
+cat("LFC1.5 — Up:", length(up_3d_norm_lfc15), "  Down:", length(down_3d_norm_lfc15), "\n")
+```
+
+## si3e Hypoxia 1hr (~treatment)
+
+```{r sig_3e_hyp}
+hyp_3e_info <- metadata %>%
+  filter(library == "rna", condition == "hypoxia",
+         treatment %in% c("sictrl", "si3e"), hours == 1) %>%
+  mutate(treatment = factor(treatment, levels = c("si3e", "sictrl")))
+
+hyp_3e_mat <- rna_mat[, hyp_3e_info$sample_name]
+
+res_3e_hyp <- run_deseq(
+  hyp_3e_mat, hyp_3e_info,
+  design_formula = ~ treatment,
+  result_coef    = "treatment_sictrl_vs_si3e"
+)
+
+res_3e_hyp %>% filter(symbol == "EIF3E") %>% dplyr::select(symbol, log2FoldChange, padj)
+```
+
+```{r sig_3e_hyp_split}
+sig_3e_hyp <- res_3e_hyp %>% filter(padj < 0.05)
+cat("Total significant genes (3e hypoxia 1hr):", nrow(sig_3e_hyp), "\n")
+
+up_3e_hyp   <- sig_3e_hyp %>% filter(log2FoldChange >  1) %>% pull(symbol)
+down_3e_hyp <- sig_3e_hyp %>% filter(log2FoldChange < -1) %>% pull(symbol)
+cat("LFC1  — Up:", length(up_3e_hyp), "  Down:", length(down_3e_hyp), "\n")
+
+up_3e_hyp_lfc15   <- sig_3e_hyp %>% filter(log2FoldChange >  1.5) %>% pull(symbol)
+down_3e_hyp_lfc15 <- sig_3e_hyp %>% filter(log2FoldChange < -1.5) %>% pull(symbol)
+cat("LFC1.5 — Up:", length(up_3e_hyp_lfc15), "  Down:", length(down_3e_hyp_lfc15), "\n")
+
+write_csv(sig_3e_hyp %>% filter(abs(log2FoldChange) > 1),
+          here("output", "rna_sig_3e_hypoxia_1hr_lfc1.csv"))
+```
+
+## si3d Hypoxia 1hr (~treatment)
+
+```{r sig_3d_hyp}
+hyp_3d_info <- metadata %>%
+  filter(library == "rna", condition == "hypoxia",
+         treatment %in% c("sictrl", "si3d"), hours == 1) %>%
+  mutate(treatment = factor(treatment, levels = c("si3d", "sictrl")))
+
+hyp_3d_mat <- rna_mat[, hyp_3d_info$sample_name]
+
+res_3d_hyp <- run_deseq(
+  hyp_3d_mat, hyp_3d_info,
+  design_formula = ~ treatment,
+  result_coef    = "treatment_sictrl_vs_si3d"
+)
+
+res_3d_hyp %>% filter(symbol == "EIF3D") %>% dplyr::select(symbol, log2FoldChange, padj)
+```
+
+```{r sig_3d_hyp_split}
+sig_3d_hyp <- res_3d_hyp %>% filter(padj < 0.05)
+cat("Total significant genes (3d hypoxia 1hr):", nrow(sig_3d_hyp), "\n")
+
+up_3d_hyp   <- sig_3d_hyp %>% filter(log2FoldChange >  1) %>% pull(symbol)
+down_3d_hyp <- sig_3d_hyp %>% filter(log2FoldChange < -1) %>% pull(symbol)
+cat("LFC1  — Up:", length(up_3d_hyp), "  Down:", length(down_3d_hyp), "\n")
+
+up_3d_hyp_lfc15   <- sig_3d_hyp %>% filter(log2FoldChange >  1.5) %>% pull(symbol)
+down_3d_hyp_lfc15 <- sig_3d_hyp %>% filter(log2FoldChange < -1.5) %>% pull(symbol)
+cat("LFC1.5 — Up:", length(up_3d_hyp_lfc15), "  Down:", length(down_3d_hyp_lfc15), "\n")
+
+write_csv(sig_3d_hyp %>% filter(abs(log2FoldChange) > 1),
+          here("output", "rna_sig_3d_hypoxia_1hr_lfc1.csv"))
+```
+
+---
+
+# METABRIC survival analysis
+
+METABRIC: Nature 2012 and Nat Commun 2016, downloaded from cBioPortal.
+
+```{r metabric_load, cache=TRUE}
+cbioportal_path <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia/cbioportal_data"
+
+zscores_mb <- read.table(
+  file.path(cbioportal_path, "brca_metabric/data_mrna_illumina_microarray_zscores_ref_diploid_samples.txt"),
+  sep = "\t", header = TRUE
+)
+
+# Deduplicate genes by averaging — rowsum() is much faster than summarise(across())
+tmp_mb  <- zscores_mb %>% dplyr::select(-Entrez_Gene_Id)
+mat_mb  <- as.matrix(tmp_mb[, -1])   # numeric columns only
+genes_mb <- tmp_mb$Hugo_Symbol
+rs_mb   <- rowsum(mat_mb, group = genes_mb, na.rm = TRUE)
+n_mb    <- table(genes_mb)
+merged_zscores_mb <- as.data.frame(rs_mb / as.vector(n_mb[rownames(rs_mb)]))
+```
+
+```{r metabric_clin}
+clin_mb <- read_excel(
+  file.path(cbioportal_path, "brca_metabric/data_clinical_patient_edit.xlsx")
+)
+clin_mb$OS_MONTHS <- as.numeric(clin_mb$OS_MONTHS)
+clin_mb$OS_STATUS[which(clin_mb$OS_STATUS == "1:DECEASED" & clin_mb$OS_MONTHS > 120)] <- "0:LIVING"
+clin_mb$OS_STATUS <- clin_mb$OS_STATUS == "1:DECEASED"
+clin_mb$OS_YEARS  <- clin_mb$OS_MONTHS / 12
+clin_mb$OS_YEARS[which(clin_mb$OS_YEARS >= 10)] <- 10
+```
+
+```{r compute_zscore_fn}
+# Compute composite z-score for a signature in an expression matrix (genes x patients)
+compute_sig_zscores <- function(expr_mat, up_genes, down_genes, sig_all_genes) {
+  # Filter matrix to signature genes present in data
+  expr_sub <- expr_mat[rownames(expr_mat) %in% sig_all_genes, , drop = FALSE]
+
+  zdf <- data.frame(
+    patient      = colnames(expr_sub),
+    up_z_score   = NA_real_,
+    down_z_score = NA_real_
+  )
+  for (i in seq_len(nrow(zdf))) {
+    up_present   <- intersect(up_genes,   rownames(expr_sub))
+    down_present <- intersect(down_genes, rownames(expr_sub))
+    zdf$up_z_score[i]   <- mean(expr_sub[up_present,   i], na.rm = TRUE)
+    zdf$down_z_score[i] <- mean(expr_sub[down_present, i], na.rm = TRUE)
+  }
+  zdf %>%
+    mutate(total_z_score = up_z_score - down_z_score)
+}
+
+# Assign quartiles and clean patient IDs for METABRIC
+assign_quartiles_mb <- function(zdf) {
+  qbreaks <- quantile(zdf$total_z_score, probs = seq(0, 1, 0.25), na.rm = TRUE)
+  zdf$quantile <- cut(zdf$total_z_score, breaks = qbreaks, include.lowest = TRUE, labels = FALSE)
+  zdf$patient  <- sub("-[^-]*$", "", zdf$patient)
+  zdf$patient  <- gsub("\\.", "-", zdf$patient)
+  zdf
+}
+
+# Assign quartiles and clean patient IDs for TCGA
+assign_quartiles_tcga <- function(zdf) {
+  qbreaks <- quantile(zdf$total_z_score, probs = seq(0, 1, 0.25), na.rm = TRUE)
+  zdf$quantile <- cut(zdf$total_z_score, breaks = qbreaks, include.lowest = TRUE, labels = FALSE)
+  zdf$patient  <- gsub("\\.", "-", as.character(zdf$patient))
+  zdf$patient  <- sub("-[^-]*$", "", zdf$patient)
+  zdf
+}
+```
+
+```{r surv_plot_fn}
+# Plot survival curve comparing Q1 vs Q4 and return HR / p-value
+plot_surv <- function(clin_df, zscores_df, label_low, label_high, color_high,
+                      title = "", save_name = NULL, save_path = here("plots")) {
+
+  merged <- left_join(clin_df, zscores_df, by = c("PATIENT_ID" = "patient")) %>%
+    filter(!is.na(quantile)) %>%
+    filter(quantile %in% c(1, 4))
+
+  fit    <- survfit(Surv(OS_YEARS, OS_STATUS) ~ quantile, data = merged)
+  coxfit <- coxph(Surv(OS_YEARS, OS_STATUS) ~ quantile, data = merged)
+  s      <- summary(coxfit)
+
+  hr   <- round(s$coefficients[1, "exp(coef)"], 2)
+  pval <- format.pval(s$coefficients[1, "Pr(>|z|)"], digits = 2, eps = 0.001)
+
+  colors <- grDevices::colorRampPalette(c("grey", color_high))(2)
+
+  p <- ggsurvplot(
+    fit,
+    data         = merged,
+    size         = 1,
+    palette      = colors,
+    legend.labs  = c(label_low, label_high),
+    break.time.by = 1,
+    ylab         = "Overall Survival",
+    xlab         = "Time in years",
+    xlim         = c(0, 10),
+    font.x       = 20,
+    font.y       = 20,
+    font.tickslab = 16,
+    font.legend  = 16,
+    conf.int     = FALSE,
+    pval         = FALSE,
+    risk.table   = FALSE,
+    ggtheme      = theme_prism()
+  )
+
+  final_plot <- p$plot +
+    annotate("text", x = 3, y = 0.2,
+             label = paste0("HR = ", hr, "\np = ", pval),
+             size = 6, color = "black") +
+    ggtitle(title)
+
+  print(final_plot)
+
+  if (!is.null(save_name)) {
+    ggsave(save_name, path = save_path, width = 8, height = 6)
+  }
+
+  invisible(list(hr = hr, pval = pval, n = nrow(merged)))
+}
+```
+
+## METABRIC: eIF3e normoxia signature
+
+```{r mb_3e_norm}
+zdf_3e_norm_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3e_norm, down_3e_norm, sig_3e_norm$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3e_norm_mb,
+  label_low  = "Low 3e (normoxia)",
+  label_high = "High 3e (normoxia)",
+  color_high = si3e_col,
+  title      = "METABRIC: si3e normoxia LFC1",
+  save_name  = "mb_3e_norm_lfc1_surv.pdf"
+)
+```
+
+```{r mb_3e_norm_lfc15}
+zdf_3e_norm_lfc15_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3e_norm_lfc15, down_3e_norm_lfc15, sig_3e_norm$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3e_norm_lfc15_mb,
+  label_low  = "Low 3e (normoxia)",
+  label_high = "High 3e (normoxia)",
+  color_high = si3e_col,
+  title      = "METABRIC: si3e normoxia LFC1.5",
+  save_name  = "mb_3e_norm_lfc15_surv.pdf"
+)
+```
+
+## METABRIC: eIF3d normoxia signature
+
+```{r mb_3d_norm}
+zdf_3d_norm_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3d_norm, down_3d_norm, sig_3d_norm$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3d_norm_mb,
+  label_low  = "Low 3d (normoxia)",
+  label_high = "High 3d (normoxia)",
+  color_high = si3d_col,
+  title      = "METABRIC: si3d normoxia LFC1",
+  save_name  = "mb_3d_norm_lfc1_surv.pdf"
+)
+```
+
+```{r mb_3d_norm_lfc15}
+zdf_3d_norm_lfc15_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3d_norm_lfc15, down_3d_norm_lfc15, sig_3d_norm$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3d_norm_lfc15_mb,
+  label_low  = "Low 3d (normoxia)",
+  label_high = "High 3d (normoxia)",
+  color_high = si3d_col,
+  title      = "METABRIC: si3d normoxia LFC1.5",
+  save_name  = "mb_3d_norm_lfc15_surv.pdf"
+)
+```
+
+## METABRIC: eIF3e hypoxia 1hr signature
+
+```{r mb_3e_hyp}
+zdf_3e_hyp_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3e_hyp, down_3e_hyp, sig_3e_hyp$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3e_hyp_mb,
+  label_low  = "Low 3e (hypoxia)",
+  label_high = "High 3e (hypoxia)",
+  color_high = si3e_col,
+  title      = "METABRIC: si3e hypoxia 1hr LFC1",
+  save_name  = "mb_3e_hyp_lfc1_surv.pdf"
+)
+```
+
+```{r mb_3e_hyp_lfc15}
+zdf_3e_hyp_lfc15_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3e_hyp_lfc15, down_3e_hyp_lfc15, sig_3e_hyp$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3e_hyp_lfc15_mb,
+  label_low  = "Low 3e (hypoxia)",
+  label_high = "High 3e (hypoxia)",
+  color_high = si3e_col,
+  title      = "METABRIC: si3e hypoxia 1hr LFC1.5",
+  save_name  = "mb_3e_hyp_lfc15_surv.pdf"
+)
+```
+
+## METABRIC: eIF3d hypoxia 1hr signature
+
+```{r mb_3d_hyp}
+zdf_3d_hyp_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3d_hyp, down_3d_hyp, sig_3d_hyp$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3d_hyp_mb,
+  label_low  = "Low 3d (hypoxia)",
+  label_high = "High 3d (hypoxia)",
+  color_high = si3d_col,
+  title      = "METABRIC: si3d hypoxia 1hr LFC1",
+  save_name  = "mb_3d_hyp_lfc1_surv.pdf"
+)
+```
+
+```{r mb_3d_hyp_lfc15}
+zdf_3d_hyp_lfc15_mb <- compute_sig_zscores(
+  merged_zscores_mb, up_3d_hyp_lfc15, down_3d_hyp_lfc15, sig_3d_hyp$symbol
+) %>% assign_quartiles_mb()
+
+plot_surv(
+  clin_mb, zdf_3d_hyp_lfc15_mb,
+  label_low  = "Low 3d (hypoxia)",
+  label_high = "High 3d (hypoxia)",
+  color_high = si3d_col,
+  title      = "METABRIC: si3d hypoxia 1hr LFC1.5",
+  save_name  = "mb_3d_hyp_lfc15_surv.pdf"
+)
+```
+
+---
+
+# TCGA survival analysis
+
+TCGA Firehose Legacy, downloaded from cBioPortal (1,108 samples).
+
+```{r tcga_load, cache=TRUE}
+zscores_tcga <- read.table(
+  file.path(cbioportal_path, "brca_tcga/tcga_data_mrna_seq_v2_rsem_zscores_ref_diploid_samples.txt"),
+  sep = "\t", header = TRUE
+)
+
+tmp_tcga  <- zscores_tcga %>% dplyr::select(-Entrez_Gene_Id)
+mat_tcga  <- as.matrix(tmp_tcga[, -1])
+genes_tcga <- tmp_tcga$Hugo_Symbol
+rs_tcga   <- rowsum(mat_tcga, group = genes_tcga, na.rm = TRUE)
+n_tcga    <- table(genes_tcga)
+merged_zscores_tcga <- as.data.frame(rs_tcga / as.vector(n_tcga[rownames(rs_tcga)]))
+```
+
+```{r tcga_clin}
+clin_tcga <- read_excel(
+  file.path(cbioportal_path, "brca_tcga/new_tcga_clinical.xlsx")
+) %>%
+  dplyr::select(OS_STATUS, OS_MONTHS, PATIENT_ID) %>%
+  filter(OS_MONTHS != "[Not Available]", OS_MONTHS > 0) %>%
+  mutate(OS_MONTHS = as.numeric(OS_MONTHS))
+
+clin_tcga$OS_STATUS[which(clin_tcga$OS_STATUS == "1:DECEASED" & clin_tcga$OS_MONTHS > 120)] <- "0:LIVING"
+clin_tcga$OS_STATUS <- clin_tcga$OS_STATUS == "1:DECEASED"
+clin_tcga$OS_YEARS  <- clin_tcga$OS_MONTHS / 12
+clin_tcga$OS_YEARS[which(clin_tcga$OS_YEARS >= 10)] <- 10
+```
+
+## TCGA: eIF3e normoxia signature
+
+```{r tcga_3e_norm}
+zdf_3e_norm_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3e_norm, down_3e_norm, sig_3e_norm$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3e_norm_tcga,
+  label_low  = "Low 3e (normoxia)",
+  label_high = "High 3e (normoxia)",
+  color_high = si3e_col,
+  title      = "TCGA: si3e normoxia LFC1",
+  save_name  = "tcga_3e_norm_lfc1_surv.pdf"
+)
+```
+
+```{r tcga_3e_norm_lfc15}
+zdf_3e_norm_lfc15_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3e_norm_lfc15, down_3e_norm_lfc15, sig_3e_norm$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3e_norm_lfc15_tcga,
+  label_low  = "Low 3e (normoxia)",
+  label_high = "High 3e (normoxia)",
+  color_high = si3e_col,
+  title      = "TCGA: si3e normoxia LFC1.5",
+  save_name  = "tcga_3e_norm_lfc15_surv.pdf"
+)
+```
+
+## TCGA: eIF3d normoxia signature
+
+```{r tcga_3d_norm}
+zdf_3d_norm_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3d_norm, down_3d_norm, sig_3d_norm$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3d_norm_tcga,
+  label_low  = "Low 3d (normoxia)",
+  label_high = "High 3d (normoxia)",
+  color_high = si3d_col,
+  title      = "TCGA: si3d normoxia LFC1",
+  save_name  = "tcga_3d_norm_lfc1_surv.pdf"
+)
+```
+
+```{r tcga_3d_norm_lfc15}
+zdf_3d_norm_lfc15_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3d_norm_lfc15, down_3d_norm_lfc15, sig_3d_norm$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3d_norm_lfc15_tcga,
+  label_low  = "Low 3d (normoxia)",
+  label_high = "High 3d (normoxia)",
+  color_high = si3d_col,
+  title      = "TCGA: si3d normoxia LFC1.5",
+  save_name  = "tcga_3d_norm_lfc15_surv.pdf"
+)
+```
+
+## TCGA: eIF3e hypoxia 1hr signature
+
+```{r tcga_3e_hyp}
+zdf_3e_hyp_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3e_hyp, down_3e_hyp, sig_3e_hyp$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3e_hyp_tcga,
+  label_low  = "Low 3e (hypoxia)",
+  label_high = "High 3e (hypoxia)",
+  color_high = si3e_col,
+  title      = "TCGA: si3e hypoxia 1hr LFC1",
+  save_name  = "tcga_3e_hyp_lfc1_surv.pdf"
+)
+```
+
+```{r tcga_3e_hyp_lfc15}
+zdf_3e_hyp_lfc15_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3e_hyp_lfc15, down_3e_hyp_lfc15, sig_3e_hyp$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3e_hyp_lfc15_tcga,
+  label_low  = "Low 3e (hypoxia)",
+  label_high = "High 3e (hypoxia)",
+  color_high = si3e_col,
+  title      = "TCGA: si3e hypoxia 1hr LFC1.5",
+  save_name  = "tcga_3e_hyp_lfc15_surv.pdf"
+)
+```
+
+## TCGA: eIF3d hypoxia 1hr signature
+
+```{r tcga_3d_hyp}
+zdf_3d_hyp_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3d_hyp, down_3d_hyp, sig_3d_hyp$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3d_hyp_tcga,
+  label_low  = "Low 3d (hypoxia)",
+  label_high = "High 3d (hypoxia)",
+  color_high = si3d_col,
+  title      = "TCGA: si3d hypoxia 1hr LFC1",
+  save_name  = "tcga_3d_hyp_lfc1_surv.pdf"
+)
+```
+
+```{r tcga_3d_hyp_lfc15}
+zdf_3d_hyp_lfc15_tcga <- compute_sig_zscores(
+  merged_zscores_tcga, up_3d_hyp_lfc15, down_3d_hyp_lfc15, sig_3d_hyp$symbol
+) %>% assign_quartiles_tcga()
+
+plot_surv(
+  clin_tcga, zdf_3d_hyp_lfc15_tcga,
+  label_low  = "Low 3d (hypoxia)",
+  label_high = "High 3d (hypoxia)",
+  color_high = si3d_col,
+  title      = "TCGA: si3d hypoxia 1hr LFC1.5",
+  save_name  = "tcga_3d_hyp_lfc15_surv.pdf"
+)
+```
