@@ -1,0 +1,583 @@
+---
+title: "18 — FOP Reference Comparison"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+After fixing the `coRdon::codonCounts()` NULL rownames bug in `01g`, the correct
+top-10% TE reference for FOP gives T-ending optimal codons. This reverses the FOP
+association: eIF3d hypoxia-promoted genes now score *lower* FOP than expected.
+
+This notebook systematically compares three biologically motivated FOP reference
+definitions to understand which, if any, correctly captures the codon preference
+relevant to eIF3d-promoted translation.
+
+| Reference | Filter | Aggregation |
+|-----------|--------|-------------|
+| **FOP_1** | normoxia, sictrl, 1+4+24 hr | mean TE per gene → top 10% |
+| **FOP_2** | normoxia, sictrl, 1+4 hr | mean TE per gene → top 10% |
+| **FOP_3** | hypoxia, sictrl, 1 hr | single timepoint → top 10% |
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(coRdon)
+library(ggVennDiagram)
+library(iCodon)
+```
+
+# Load Feature Matrix and CDS Sequences
+
+```{r load_data}
+feature_matrix <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
+keep_tx <- feature_matrix$transcript_id_clean
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+# Compute Codon Counts Matrix
+
+```{r codon_counts}
+# Build counts matrix once; set rownames explicitly (critical fix from 01g)
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+
+# Genetic code helpers
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+stop_codons  <- names(gen_code[gen_code == "*"])
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts ×", ncol(counts_mat0), "codons\n")
+```
+
+# FOP Scoring Function
+
+```{r compute_fop}
+compute_fop <- function(counts_mat, optimal_codon_vec, stop_codons) {
+  sense_cols <- setdiff(colnames(counts_mat), stop_codons)
+  sense_tot  <- rowSums(counts_mat[, sense_cols, drop = FALSE])
+  opti_tot   <- rowSums(counts_mat[, optimal_codon_vec, drop = FALSE])
+  fop        <- opti_tot / sense_tot
+  fop[sense_tot == 0] <- NA
+  fop
+}
+```
+
+# Define FOP References and Score Transcripts
+
+```{r load_te}
+te_condition  <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE)
+gene_id_clean <- sub("\\..*", "", feature_matrix$gene_id)
+```
+
+## FOP_1: normoxia, sictrl, all timepoints
+
+```{r fop1}
+te_ranked_1 <- te_condition %>%
+  filter(condition == "normoxia", treatment == "sictrl") %>%
+  group_by(gene_id) %>%
+  summarise(mean_te = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mean_te)) %>%
+  arrange(desc(mean_te))
+
+top10_clean_1 <- sub("\\..*", "", te_ranked_1$gene_id[seq_len(ceiling(nrow(te_ranked_1) * 0.10))])
+ref_tx_1 <- feature_matrix$transcript_id_clean[gene_id_clean %in% top10_clean_1]
+ref_tx_1 <- ref_tx_1[ref_tx_1 %in% rownames(counts_mat0)]
+cat("FOP_1 reference transcripts:", length(ref_tx_1), "\n")
+
+ref_counts_1     <- colSums(counts_mat0[ref_tx_1, , drop = FALSE])
+optimal_codons_1 <- sapply(aa_to_codons, function(codons) codons[which.max(ref_counts_1[codons])])
+cat("FOP_1 optimal codons:", paste(sort(unname(optimal_codons_1)), collapse = " "), "\n")
+
+fop_vec1 <- compute_fop(counts_mat0, unname(optimal_codons_1), stop_codons)
+```
+
+## FOP_2: normoxia, sictrl, 1+4 hr only
+
+```{r fop2}
+te_ranked_2 <- te_condition %>%
+  filter(condition == "normoxia", treatment == "sictrl", hours %in% c(1, 4)) %>%
+  group_by(gene_id) %>%
+  summarise(mean_te = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mean_te)) %>%
+  arrange(desc(mean_te))
+
+top10_clean_2 <- sub("\\..*", "", te_ranked_2$gene_id[seq_len(ceiling(nrow(te_ranked_2) * 0.10))])
+ref_tx_2 <- feature_matrix$transcript_id_clean[gene_id_clean %in% top10_clean_2]
+ref_tx_2 <- ref_tx_2[ref_tx_2 %in% rownames(counts_mat0)]
+cat("FOP_2 reference transcripts:", length(ref_tx_2), "\n")
+
+ref_counts_2     <- colSums(counts_mat0[ref_tx_2, , drop = FALSE])
+optimal_codons_2 <- sapply(aa_to_codons, function(codons) codons[which.max(ref_counts_2[codons])])
+cat("FOP_2 optimal codons:", paste(sort(unname(optimal_codons_2)), collapse = " "), "\n")
+
+fop_vec2 <- compute_fop(counts_mat0, unname(optimal_codons_2), stop_codons)
+```
+
+## FOP_3: hypoxia, sictrl, 1 hr
+
+```{r fop3}
+te_ranked_3 <- te_condition %>%
+  filter(condition == "hypoxia", treatment == "sictrl", hours == 1) %>%
+  group_by(gene_id) %>%
+  summarise(mean_te = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mean_te)) %>%
+  arrange(desc(mean_te))
+
+top10_clean_3 <- sub("\\..*", "", te_ranked_3$gene_id[seq_len(ceiling(nrow(te_ranked_3) * 0.10))])
+ref_tx_3 <- feature_matrix$transcript_id_clean[gene_id_clean %in% top10_clean_3]
+ref_tx_3 <- ref_tx_3[ref_tx_3 %in% rownames(counts_mat0)]
+cat("FOP_3 reference transcripts:", length(ref_tx_3), "\n")
+
+ref_counts_3     <- colSums(counts_mat0[ref_tx_3, , drop = FALSE])
+optimal_codons_3 <- sapply(aa_to_codons, function(codons) codons[which.max(ref_counts_3[codons])])
+cat("FOP_3 optimal codons:", paste(sort(unname(optimal_codons_3)), collapse = " "), "\n")
+
+fop_vec3 <- compute_fop(counts_mat0, unname(optimal_codons_3), stop_codons)
+```
+
+# Optimal Codon Overlap Across References
+
+```{r venn_optimal_codons, fig.width=5, fig.height=4}
+venn_list <- list(
+  FOP_1 = unname(optimal_codons_1),
+  FOP_2 = unname(optimal_codons_2),
+  FOP_3 = unname(optimal_codons_3)
+)
+
+p_venn <- ggVennDiagram(venn_list, label_alpha = 0) +
+  scale_fill_gradient(low = "white", high = "#E69F00") +
+  labs(title = "Overlap of optimal codons across FOP references") +
+  theme(legend.position = "none")
+p_venn
+ggsave(here("plots", "fop_reference_optimal_codon_venn.pdf"), p_venn, width = 5, height = 4)
+```
+
+# Collapse to Gene Level
+
+```{r gene_level}
+tx_scores <- tibble(
+  transcript_id_clean = names(cds_frame0),
+  fop1 = fop_vec1,
+  fop2 = fop_vec2,
+  fop3 = fop_vec3
+) %>%
+  left_join(
+    feature_matrix %>% dplyr::select(transcript_id_clean, gene_id, symbol),
+    by = "transcript_id_clean"
+  ) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  group_by(ensembl_gene, symbol) %>%
+  summarise(
+    fop1 = mean(fop1, na.rm = TRUE),
+    fop2 = mean(fop2, na.rm = TRUE),
+    fop3 = mean(fop3, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Gene-level rows:", nrow(tx_scores), "\n")
+```
+
+# Load Gene Sets
+
+```{r gene_sets}
+promotes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+promotes_ids <- promotes$ensembl_gene
+cat("Promotes genes:", length(promotes_ids), "\n")
+
+neg_pool <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  filter(!ensembl_gene %in% promotes_ids)   # exclude any overlap before sampling
+cat("Neg pool after removing promotes overlap:", nrow(neg_pool), "\n")
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene, size = length(promotes_ids), replace = FALSE)
+cat("Negative control genes (size-matched):", length(neg_ctrl_ids), "\n")
+cat("Overlap (should be 0):", length(intersect(promotes_ids, neg_ctrl_ids)), "\n")
+```
+
+# Density Plots
+
+```{r fop1_plot, fig.width=5, fig.height=4}
+bg1   <- tx_scores %>% filter(!is.na(fop1))
+fg_p1 <- bg1 %>% filter(ensembl_gene %in% promotes_ids)
+fg_n1 <- bg1 %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks1   <- ks.test(fg_p1$fop1, bg1 %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(fop1))
+cat("FOP_1 — promotes n =", nrow(fg_p1), "| neg ctrl n =", nrow(fg_n1),
+    "| KS p =", formatC(ks1$p.value, format = "e", digits = 2), "\n")
+
+p1 <- ggplot() +
+  geom_density(data = bg1,   aes(x = fop1), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p1, aes(x = fop1), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n1, aes(x = fop1), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks1$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg1), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p1), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n1), ")"), size = 3.5, color = "#000000") +
+  labs(title = "FOP_1: normoxia/sictrl all hours", x = "FOP", y = "Density") +
+  theme_classic(base_size = 13)
+p1
+ggsave(here("plots", "fop_ref1_normoxia_all_hours.pdf"), p1, width = 5, height = 4)
+```
+
+```{r fop2_plot, fig.width=5, fig.height=4}
+bg2   <- tx_scores %>% filter(!is.na(fop2))
+fg_p2 <- bg2 %>% filter(ensembl_gene %in% promotes_ids)
+fg_n2 <- bg2 %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks2   <- ks.test(fg_p2$fop2, bg2 %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(fop2))
+cat("FOP_2 — promotes n =", nrow(fg_p2), "| neg ctrl n =", nrow(fg_n2),
+    "| KS p =", formatC(ks2$p.value, format = "e", digits = 2), "\n")
+
+p2 <- ggplot() +
+  geom_density(data = bg2,   aes(x = fop2), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p2, aes(x = fop2), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n2, aes(x = fop2), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks2$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg2), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p2), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n2), ")"), size = 3.5, color = "#000000") +
+  labs(title = "FOP_2: normoxia/sictrl 1+4 hr", x = "FOP", y = "Density") +
+  theme_classic(base_size = 13)
+p2
+ggsave(here("plots", "fop_ref2_normoxia_1and4hr.pdf"), p2, width = 5, height = 4)
+```
+
+```{r fop3_plot, fig.width=5, fig.height=4}
+bg3   <- tx_scores %>% filter(!is.na(fop3))
+fg_p3 <- bg3 %>% filter(ensembl_gene %in% promotes_ids)
+fg_n3 <- bg3 %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks3   <- ks.test(fg_p3$fop3, bg3 %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(fop3))
+cat("FOP_3 — promotes n =", nrow(fg_p3), "| neg ctrl n =", nrow(fg_n3),
+    "| KS p =", formatC(ks3$p.value, format = "e", digits = 2), "\n")
+
+p3 <- ggplot() +
+  geom_density(data = bg3,   aes(x = fop3), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p3, aes(x = fop3), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n3, aes(x = fop3), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks3$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg3), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p3), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n3), ")"), size = 3.5, color = "#000000") +
+  labs(title = "FOP_3: hypoxia/sictrl 1 hr", x = "FOP", y = "Density") +
+  theme_classic(base_size = 13)
+p3
+ggsave(here("plots", "fop_ref3_hypoxia_1hr.pdf"), p3, width = 5, height = 4)
+```
+
+# Codon Usage by Group
+
+```{r codon_usage_groups}
+tx_to_gene <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_to_gene, by = "transcript_id_clean")
+
+promotes_tx  <- tx_gene_df %>% filter(ensembl_gene %in% promotes_ids) %>% pull(transcript_id_clean)
+neg_ctrl_tx  <- tx_gene_df %>% filter(ensembl_gene %in% neg_ctrl_ids) %>% pull(transcript_id_clean)
+
+promotes_counts <- colSums(counts_mat0[promotes_tx,  , drop = FALSE])
+neg_ctrl_counts <- colSums(counts_mat0[neg_ctrl_tx,  , drop = FALSE])
+cat("Promotes transcripts:", length(promotes_tx), "| Neg ctrl transcripts:", length(neg_ctrl_tx), "\n")
+```
+
+```{r codon_diff}
+codon_diff_df <- imap_dfr(aa_to_codons, function(codons, aa) {
+  p <- promotes_counts[codons];  p_prop <- p / sum(p)
+  n <- neg_ctrl_counts[codons];  n_prop <- n / sum(n)
+  tibble(amino_acid = aa, codon = codons,
+         promotes_prop = p_prop, neg_ctrl_prop = n_prop,
+         delta = p_prop - n_prop)
+})
+
+cat("Top 10 codons by |delta| (promotes - neg_ctrl within-AA proportion):\n")
+print(codon_diff_df %>% arrange(desc(abs(delta))) %>% head(10))
+```
+
+```{r codon_diff_plot, fig.width=10, fig.height=8}
+multi_aa <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+
+plot_df <- codon_diff_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta >= 0, "promotes", "neg_ctrl"),
+    codon     = reorder(codon, delta)
+  )
+
+p_codon <- ggplot(plot_df, aes(x = codon, y = delta, fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c(promotes = "#E69F00", neg_ctrl = "#000000"),
+                    guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title = "Differential codon usage: eIF3d promotes vs negative control",
+    x = "Codon", y = "Δ within-AA proportion (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        strip.text = element_text(face = "bold"))
+p_codon
+ggsave(here("plots", "fop_codon_usage_diff_by_aa.pdf"), p_codon, width = 10, height = 8)
+```
+
+```{r frame_shifted_counts}
+# Reuse the shift_frame approach from notebook 17
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)
+  new_len  <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+
+cds_frame1 <- shift_frame(cds_frame0, 1)
+cds_frame2 <- shift_frame(cds_frame0, 2)
+
+make_counts <- function(seqs) {
+  ct  <- codonTable(seqs)
+  mat <- codonCounts(ct)
+  rownames(mat) <- names(seqs)
+  mat
+}
+
+counts_mat1 <- make_counts(cds_frame1)
+counts_mat2 <- make_counts(cds_frame2)
+
+# Subset to same promotes/neg_ctrl transcripts (must be in rownames)
+p1 <- promotes_tx[promotes_tx %in% rownames(counts_mat1)]
+n1 <- neg_ctrl_tx[neg_ctrl_tx %in% rownames(counts_mat1)]
+p2 <- promotes_tx[promotes_tx %in% rownames(counts_mat2)]
+n2 <- neg_ctrl_tx[neg_ctrl_tx %in% rownames(counts_mat2)]
+
+promotes_counts1 <- colSums(counts_mat1[p1, , drop = FALSE])
+neg_ctrl_counts1 <- colSums(counts_mat1[n1, , drop = FALSE])
+promotes_counts2 <- colSums(counts_mat2[p2, , drop = FALSE])
+neg_ctrl_counts2 <- colSums(counts_mat2[n2, , drop = FALSE])
+
+cat("Frame 1 — promotes:", length(p1), "| neg ctrl:", length(n1), "\n")
+cat("Frame 2 — promotes:", length(p2), "| neg ctrl:", length(n2), "\n")
+```
+
+```{r codon_diff_frame_plot, fig.width=12, fig.height=9}
+compute_delta <- function(prom_counts, neg_counts, frame_label) {
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    p <- prom_counts[codons]; p_prop <- p / sum(p)
+    n <- neg_counts[codons];  n_prop <- n / sum(n)
+    tibble(amino_acid = aa, codon = codons,
+           delta = p_prop - n_prop, frame = frame_label)
+  })
+}
+
+frame_diff_df <- bind_rows(
+  codon_diff_df %>% mutate(frame = "Frame 0 (coding)"),
+  compute_delta(promotes_counts1, neg_ctrl_counts1, "Frame 1 (control)"),
+  compute_delta(promotes_counts2, neg_ctrl_counts2, "Frame 2 (control)")
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    frame    = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+# Order codons by frame 0 delta for consistent x-axis
+codon_order <- codon_diff_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  arrange(amino_acid, delta) %>%
+  pull(codon)
+frame_diff_df <- frame_diff_df %>%
+  mutate(codon = factor(codon, levels = codon_order))
+
+# Per-transcript Wilcoxon test for each frame × codon
+# Compares promotes vs neg_ctrl within-AA proportions at single-transcript resolution
+per_tx_sig <- function(counts_mat, promotes_tx, neg_ctrl_tx, aa_to_codons, frame_label) {
+  p_tx <- promotes_tx[promotes_tx %in% rownames(counts_mat)]
+  n_tx <- neg_ctrl_tx[neg_ctrl_tx %in% rownames(counts_mat)]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    if (length(codons) < 2) return(NULL)
+    sub_p <- counts_mat[p_tx, codons, drop = FALSE]
+    sub_n <- counts_mat[n_tx, codons, drop = FALSE]
+    rs_p  <- rowSums(sub_p)
+    rs_n  <- rowSums(sub_n)
+    map_dfr(codons, function(codon) {
+      props_p <- sub_p[rs_p > 0, codon] / rs_p[rs_p > 0]
+      props_n <- sub_n[rs_n > 0, codon] / rs_n[rs_n > 0]
+      if (length(props_p) < 3 || length(props_n) < 3) {
+        return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_, frame = frame_label))
+      }
+      wt <- wilcox.test(props_p, props_n, exact = FALSE)
+      tibble(amino_acid = aa, codon = codon, p_val = wt$p.value, frame = frame_label)
+    })
+  })
+}
+
+sig_df <- bind_rows(
+  per_tx_sig(counts_mat0, promotes_tx, neg_ctrl_tx, aa_to_codons, "Frame 0 (coding)"),
+  per_tx_sig(counts_mat1, promotes_tx, neg_ctrl_tx, aa_to_codons, "Frame 1 (control)"),
+  per_tx_sig(counts_mat2, promotes_tx, neg_ctrl_tx, aa_to_codons, "Frame 2 (control)")
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    q_val = p.adjust(p_val, method = "BH"),
+    sig   = !is.na(q_val) & q_val < 0.05,
+    frame = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+# Classify frame 0 significance relative to controls:
+#   ✦ = frame 0 significant, neither control significant (clean codon signal)
+#   · = frame 0 significant, at least one control also significant (composition may confound)
+#   "" = frame 0 not significant
+f0_sig    <- sig_df %>% filter(frame == "Frame 0 (coding)")    %>% dplyr::select(amino_acid, codon, f0_sig = sig)
+ctrl_sig  <- sig_df %>% filter(frame != "Frame 0 (coding)")    %>%
+  group_by(amino_acid, codon) %>% summarise(any_ctrl_sig = any(sig), .groups = "drop")
+
+f0_labels <- f0_sig %>%
+  left_join(ctrl_sig, by = c("amino_acid", "codon")) %>%
+  mutate(sig_label = case_when(
+    f0_sig & !any_ctrl_sig ~ "\u2726",   # ✦ clean codon signal
+    f0_sig &  any_ctrl_sig ~ "\u00b7",   # · composition may confound
+    TRUE                   ~ ""
+  )) %>%
+  dplyr::select(amino_acid, codon, sig_label) %>%
+  mutate(frame = factor("Frame 0 (coding)", levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)")))
+
+frame_diff_df <- frame_diff_df %>%
+  left_join(f0_labels, by = c("amino_acid", "codon", "frame")) %>%
+  mutate(
+    sig_label = replace_na(sig_label, ""),
+    codon     = factor(codon, levels = codon_order),
+    star_y    = ifelse(delta >= 0, delta + 0.012, delta - 0.012)
+  )
+
+p_frames <- ggplot(frame_diff_df, aes(x = codon, y = delta, fill = frame)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(
+    aes(y = star_y, label = sig_label, group = frame),
+    position = position_dodge(width = 0.8),
+    size = 3.5, vjust = 0.5
+  ) +
+  scale_fill_manual(
+    values = c("Frame 0 (coding)" = "#E69F00",
+               "Frame 1 (control)" = "#999999",
+               "Frame 2 (control)" = "#CCCCCC")
+  ) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Differential codon usage by reading frame: frame 0 vs. frameshift controls",
+    subtitle = "Frames 1 & 2 control for nucleotide composition; persistent frame-0 signal = true codon preference\n\u2726 frame 0 significant, controls not (clean codon signal)  \u00b7 frame 0 significant but controls also significant (composition may confound)  [q < 0.05, BH-adjusted Wilcoxon]",
+    x = "Codon", y = "Δ within-AA proportion (promotes − neg ctrl)",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text   = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_frames
+ggsave(here("plots", "fop_codon_diff_by_frame.pdf"), p_frames, width = 12, height = 9)
+```
+
+# Codon Usage Delta vs. CSC Weights
+
+```{r csc_per_codon}
+predict_human <- iCodon::predict_stability("human")
+
+# All sense codons from aa_to_codons
+all_sense_codons <- unlist(aa_to_codons, use.names = FALSE)
+
+# CSC weight = predict_human on a homopolymer codon sequence (mean of identical weights = that weight)
+codon_csc_weights <- sapply(all_sense_codons, function(cod) {
+  predict_human(paste(rep(cod, 20), collapse = ""))
+})
+
+codon_csc_df <- tibble(codon = names(codon_csc_weights), csc_weight = codon_csc_weights)
+cat("Per-codon CSC weights (first 6):\n"); print(head(codon_csc_df))
+```
+
+```{r codon_diff_csc_plot, fig.width=6, fig.height=5}
+scatter_df <- codon_diff_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_csc_df, by = "codon")
+
+r_val <- cor(scatter_df$csc_weight, scatter_df$delta, use = "complete.obs")
+
+p_csc <- ggplot(scatter_df, aes(x = csc_weight, y = delta, color = amino_acid, label = codon)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey40", linewidth = 0.7,
+              aes(group = 1)) +
+  ggrepel::geom_text_repel(size = 2.5, max.overlaps = 20, show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.3) +
+  labs(
+    title = "Codon usage shift vs. CSC weight",
+    subtitle = sprintf("Pearson r = %.2f (promotes − neg ctrl within-AA proportion)", r_val),
+    x = "Per-codon CSC weight (iCodon, human)",
+    y = "Δ within-AA proportion (promotes − neg ctrl)",
+    color = "Amino acid"
+  ) +
+  theme_classic(base_size = 12)
+p_csc
+ggsave(here("plots", "fop_codon_csc_scatter.pdf"), p_csc, width = 6, height = 5)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
