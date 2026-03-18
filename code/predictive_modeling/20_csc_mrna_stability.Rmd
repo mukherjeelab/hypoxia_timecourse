@@ -1,0 +1,416 @@
+---
+title: "Notebook 20: CSC-Derived mRNA Stability for eIF3d-Promoted Genes"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This notebook computes CSC (Codon Stabilization Coefficient)-based mRNA stability scores
+from CDS sequences for eIF3d-promoted genes in hypoxia (1 hr) and a size-matched negative
+control set, then produces a density plot comparing the distributions.
+
+**Gene sets:**
+
+- **Promotes**: genes whose translation is promoted by eIF3d in hypoxia at 1hr
+  (`te_lfc > 0.5`, `te_padj < 0.05`; source: `output/genesets/hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`)
+- **Negative control**: genes not regulated by eIF3d in any condition/timepoint
+  (`|te_lfc| < 0.5` AND `te_padj > 0.3` across all 4 comparisons), size-matched to promotes
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(iCodon)
+```
+
+```{r load_gene_groups}
+promotes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"))
+promotes_ids <- promotes$ensembl_gene
+
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv")) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  filter(!ensembl_gene %in% promotes_ids)
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene, size = length(promotes_ids), replace = FALSE)
+
+cat("Promotes genes:", length(promotes_ids), "\n")
+cat("Neg ctrl genes (size-matched):", length(neg_ctrl_ids), "\n")
+```
+
+```{r load_txdb_and_genome}
+most_abundant_tx <- readRDS(here("output", "predictive_modeling", "precomputed_most_abundant_tx.rds"))
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+```
+
+```{r extract_cds}
+keep_tx <- most_abundant_tx$transcript_id_clean
+
+cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_sequences_all <- extractTranscriptSeqs(genome, cds)
+cds_names_clean   <- sub("\\..*", "", names(cds_sequences_all))
+
+names(cds_sequences_all) <- cds_names_clean
+cds_sequences <- cds_sequences_all[cds_names_clean %in% keep_tx]
+
+valid_length  <- width(cds_sequences) %% 3 == 0
+cds_sequences <- cds_sequences[valid_length]
+cat("CDS sequences for scoring:", length(cds_sequences), "\n")
+```
+
+```{r compute_csc}
+predict_human <- iCodon::predict_stability("human")
+
+cds_char    <- as.character(cds_sequences)
+unique_seqs <- unique(cds_char)
+cat("Unique sequences:", length(unique_seqs), "\n")
+
+unique_scores        <- predict_human(unique_seqs)
+names(unique_scores) <- unique_seqs
+
+csc_scores        <- unique_scores[cds_char]
+names(csc_scores) <- names(cds_sequences)
+
+cat("CSC summary:\n")
+print(summary(csc_scores))
+
+inspect_df <- tibble(
+  transcript_id_clean = names(csc_scores),
+  csc                 = as.numeric(csc_scores),
+  cds_sequence        = cds_char
+) %>%
+  left_join(most_abundant_tx %>% dplyr::select(transcript_id_clean, symbol), by = "transcript_id_clean")
+
+cat("\nLowest CSC (least stable):\n")
+print(slice_min(inspect_df, csc, n = 6) %>% dplyr::select(symbol, csc, cds_sequence))
+
+cat("\nHighest CSC (most stable):\n")
+print(slice_max(inspect_df, csc, n = 6) %>% dplyr::select(symbol, csc, cds_sequence))
+```
+
+```{r build_table}
+tx_gene <- most_abundant_tx %>%
+  transmute(
+    transcript_id_clean = as.character(unlist(transcript_id_clean)),
+    ensembl_gene        = as.character(unlist(gene_id_clean))
+  )
+
+csc_table <- tibble(
+  transcript_id_clean = names(csc_scores),
+  csc                 = as.numeric(csc_scores)
+) %>%
+  left_join(tx_gene, by = "transcript_id_clean") %>%
+  mutate(
+    group = case_when(
+      ensembl_gene %in% promotes_ids  ~ "eIF3d hypoxia promotes",
+      ensembl_gene %in% neg_ctrl_ids  ~ "Negative control",
+      TRUE                            ~ "All other genes"
+    )
+  )
+
+cat("Rows:", nrow(csc_table), "\n")
+
+csc_table |> group_by(group) |> 
+  summarise(n())
+
+scored_genes <- csc_table %>% filter(!is.na(ensembl_gene)) %>% pull(ensembl_gene) %>% unique()
+
+promotes_missing <- setdiff(promotes_ids, scored_genes)
+neg_ctrl_missing <- setdiff(neg_ctrl_ids, scored_genes)
+
+cat("\nPromotes genes missing CSC:", length(promotes_missing), "of", length(promotes_ids), "\n")
+cat("Neg ctrl genes missing CSC:", length(neg_ctrl_missing), "of", length(neg_ctrl_ids), "\n")
+
+# Are the missing ones absent from most_abundant_tx, or absent from TxDb CDS?
+in_tx <- promotes_missing %in% tx_gene$ensembl_gene
+cat("  Promotes missing: in most_abundant_tx but no CDS:", sum(in_tx),
+    "| not in most_abundant_tx:", sum(!in_tx), "\n")
+```
+
+```{r save_rds}
+saveRDS(csc_table, here("output", "predictive_modeling", "csc_mrna_stability_eif3d_hypoxia_1hr.rds"))
+cat("Saved RDS\n")
+```
+
+```{r density_plot}
+set_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",   # Okabe-Ito orange
+  "Negative control"       = "black"
+)
+
+bg_df <- csc_table %>% filter(group == "All other genes")
+fg_df <- csc_table %>% filter(group != "All other genes")
+
+median_lines <- fg_df %>%
+  group_by(group) %>%
+  summarise(med = median(csc, na.rm = TRUE), .groups = "drop")
+
+p_csc <- ggplot() +
+  geom_density(
+    data = bg_df,
+    aes(x = csc),
+    color = NA, fill = "grey80", alpha = 0.6
+  ) +
+  geom_density(
+    data = fg_df,
+    aes(x = csc, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_vline(
+    data = median_lines,
+    aes(xintercept = med, color = group),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  scale_color_manual(values = set_colors) +
+  scale_fill_manual(values  = set_colors) +
+  labs(
+    title    = "CSC-derived mRNA stability: eIF3d-promoted genes (hypoxia 1hr)",
+    subtitle = "Grey = all other genes; dashed = median",
+    x = "CSC (iCodon, human)", y = "Density",
+    color = NULL, fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position  = "top",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold")
+  )
+
+p_csc
+ggsave(here("plots", "csc_mrna_stability_eif3d_hypoxia_1hr.pdf"),
+       p_csc, width = 6, height = 5)
+cat("Saved: plots/csc_mrna_stability_eif3d_hypoxia_1hr.pdf\n")
+```
+
+```{r wilcoxon_test}
+promotes_csc <- csc_table %>% filter(group == "eIF3d hypoxia promotes") %>% pull(csc)
+neg_ctrl_csc <- csc_table %>% filter(group == "Negative control")       %>% pull(csc)
+
+wt <- wilcox.test(promotes_csc, neg_ctrl_csc, alternative = "two.sided")
+
+```
+
+## Validation: iCodon CSC vs ORFeome mRNA Half-Life (Narula et al.)
+
+```{r load_narula_s2}
+narula_s2 <- read_csv(
+  here("accessories", "csc_data", "narula_rna",
+       "supp_073239.119_Supplemental_Table_S2.csv"),
+  skip = 7, show_col_types = FALSE
+) %>%
+  dplyr::select(gene_symbol = Gene.Name, orfeome_halflife = `Pool 1 and 4`) %>%
+  filter(!is.na(gene_symbol), !is.na(orfeome_halflife))
+
+cat("Narula ORFeome genes with half-life data:", nrow(narula_s2), "\n")
+```
+
+```{r match_icodon_orfeome}
+# Add symbol to csc_table (most_abundant_tx already in env)
+csc_with_symbol <- csc_table %>%
+  left_join(
+    most_abundant_tx %>% transmute(
+      transcript_id_clean = as.character(unlist(transcript_id_clean)),
+      symbol = as.character(unlist(symbol))
+    ),
+    by = "transcript_id_clean"
+  )
+
+# Filter to promotes group, join with Narula
+scatter_df <- csc_with_symbol %>%
+  # filter(group == "eIF3d hypoxia promotes", !is.na(csc)) %>%
+  inner_join(narula_s2, by = c("symbol" = "gene_symbol"))
+
+cat("Genes matched (promotes × Narula):", nrow(scatter_df), "\n")
+```
+
+```{r scatter_icodon_vs_orfeome}
+fit <- lm(orfeome_halflife ~ csc, data = scatter_df)
+r   <- sign(coef(fit)[["csc"]]) * sqrt(summary(fit)$r.squared)
+
+p_scatter <- ggplot(scatter_df, aes(x = csc, y = orfeome_halflife)) +
+  geom_point(alpha = 0.6, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r, 3)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "iCodon CSC vs ORFeome mRNA half-life",
+    subtitle = "ORFeome from Narula et al. Pool 1 & 4",
+    x = "iCodon CSC (computational)",
+    y = "ORFeome mRNA half-life (hours)"
+  ) +
+  theme_bw(base_size = 12)
+
+p_scatter
+ggsave(here("plots", "icodon_vs_orfeome_halflife_promotes.pdf"),
+       p_scatter, width = 6, height = 5)
+cat("r =", round(r, 4), "\n")
+cat("Saved: plots/icodon_vs_orfeome_halflife_promotes.pdf\n")
+```
+
+if i remove the one outlier
+
+```{r}
+scatter_df_no_out <- scatter_df |> 
+  filter(orfeome_halflife < 1500)
+
+
+
+fit <- lm(orfeome_halflife ~ csc, data = scatter_df_no_out)
+r   <- sign(coef(fit)[["csc"]]) * sqrt(summary(fit)$r.squared)
+
+p_scatter <- ggplot(scatter_df_no_out, aes(x = csc, y = orfeome_halflife, color=group)) +
+  geom_point(alpha = 0.6, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r, 3)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "iCodon CSC vs ORFeome mRNA half-life",
+    subtitle = "ORFeome from Narula et al. Pool 1 & 4",
+    x = "iCodon CSC (computational)",
+    y = "ORFeome mRNA half-life (hours)"
+  ) +
+  theme_bw(base_size = 12)
+
+p_scatter
+ggsave(here("plots", "icodon_vs_orfeome_halflife_promotes_no_outlier.pdf"),
+       p_scatter, width = 6, height = 5)
+cat("r =", round(r, 4), "\n")
+cat("Saved: plots/icodon_vs_orfeome_halflife_promotes.pdf\n")
+```
+
+## Endogenous mRNA half-life validation (Narula et al. Table S1)
+
+```{r load_narula_s1}
+narula_s1 <- read_csv(
+  here("accessories", "csc_data", "narula_rna",
+       "supp_073239.119_Supplemental_Table_S1.csv"),
+  skip = 9, show_col_types = FALSE
+) %>%
+  dplyr::select(
+    gene_symbol   = Gene.Name,
+    halflife_cl14 = `Cell lines 1 and 4`,
+    halflife_cl23 = `Cell lines 2 and 3`,
+    halflife_cl56 = `Cell lines 5 and 6`
+  ) %>%
+  filter(!is.na(gene_symbol)) %>%
+  mutate(
+    mean_halflife = rowMeans(cbind(halflife_cl14, halflife_cl23, halflife_cl56), na.rm = TRUE)
+  ) %>%
+  filter(is.finite(mean_halflife))
+
+cat("Narula endogenous genes with half-life data:", nrow(narula_s1), "\n")
+```
+
+```{r match_icodon_endogenous}
+scatter_s1_df <- csc_with_symbol %>%
+  inner_join(narula_s1, by = c("symbol" = "gene_symbol"))
+
+cat("Genes matched (all × Narula S1):", nrow(scatter_s1_df), "\n")
+```
+
+```{r scatter_icodon_vs_endogenous}
+fit_s1 <- lm(mean_halflife ~ csc, data = scatter_s1_df)
+r_s1   <- sign(coef(fit_s1)[["csc"]]) * sqrt(summary(fit_s1)$r.squared)
+
+p_scatter_s1 <- ggplot(scatter_s1_df, aes(x = csc, y = mean_halflife)) +
+  geom_point(alpha = 0.4, color = "black", size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r_s1, 3)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "iCodon CSC vs mean endogenous mRNA half-life",
+    subtitle = "Endogenous from Narula et al. Table S1 (mean across cell line pairs)",
+    x = "iCodon CSC (computational)",
+    y = "Endogenous mRNA half-life (hours)"
+  ) +
+  theme_bw(base_size = 12)
+
+p_scatter_s1
+ggsave(here("plots", "icodon_vs_endogenous_halflife.pdf"),
+       p_scatter_s1, width = 6, height = 5)
+cat("r =", round(r_s1, 4), "\n")
+cat("Saved: plots/icodon_vs_endogenous_halflife.pdf\n")
+```
+
+without outliers (mean_halflife < 100 h)
+
+```{r scatter_icodon_vs_endogenous_no_outlier}
+scatter_s1_no_out <- scatter_s1_df %>%
+  filter(mean_halflife < 100)
+
+fit_s1b <- lm(mean_halflife ~ csc, data = scatter_s1_no_out)
+r_s1b   <- sign(coef(fit_s1b)[["csc"]]) * sqrt(summary(fit_s1b)$r.squared)
+
+p_scatter_s1b <- ggplot(scatter_s1_no_out, aes(x = csc, y = mean_halflife)) +
+  geom_point(alpha = 0.4, color = "black", size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r_s1b, 3)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "iCodon CSC vs mean endogenous mRNA half-life (no outliers)",
+    subtitle = "Endogenous from Narula et al. Table S1 (half-life < 100 h)",
+    x = "iCodon CSC (computational)",
+    y = "Endogenous mRNA half-life (hours)"
+  ) +
+  theme_bw(base_size = 12)
+
+p_scatter_s1b
+ggsave(here("plots", "icodon_vs_endogenous_halflife_no_outlier.pdf"),
+       p_scatter_s1b, width = 6, height = 5)
+cat("r =", round(r_s1b, 4), "\n")
+cat("Saved: plots/icodon_vs_endogenous_halflife_no_outlier.pdf\n")
+```
+
+### Per cell-line-pair analysis
+
+```{r scatter_icodon_vs_endogenous_per_cl}
+cl_vars <- c(
+  "Cell lines 1 and 4" = "halflife_cl14",
+  "Cell lines 2 and 3" = "halflife_cl23",
+  "Cell lines 5 and 6" = "halflife_cl56"
+)
+
+for (cl_label in names(cl_vars)) {
+  cl_col <- cl_vars[[cl_label]]
+  cl_tag <- gsub(" ", "", cl_col)  # e.g. "halflife_cl14"
+
+  df_cl <- scatter_s1_df %>%
+    filter(!is.na(.data[[cl_col]]), is.finite(.data[[cl_col]]),
+           .data[[cl_col]] < 100)
+
+  fit_cl <- lm(reformulate("csc", cl_col), data = df_cl)
+  r_cl   <- sign(coef(fit_cl)[["csc"]]) * sqrt(summary(fit_cl)$r.squared)
+
+  p_cl <- ggplot(df_cl, aes(x = csc, y = .data[[cl_col]])) +
+    geom_point(alpha = 0.4, color = "black", size = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+    annotate("text", x = Inf, y = Inf,
+             label = paste0("r = ", round(r_cl, 3)),
+             hjust = 1.1, vjust = 1.5, size = 4) +
+    labs(
+      title    = paste0("iCodon CSC vs endogenous mRNA half-life\n(", cl_label, ")"),
+      subtitle = "Narula et al. Table S1 (half-life < 100 h)",
+      x = "iCodon CSC (computational)",
+      y = "Endogenous mRNA half-life (hours)"
+    ) +
+    theme_bw(base_size = 12)
+
+  out_file <- paste0("plots/icodon_vs_endogenous_halflife_", cl_tag, ".pdf")
+  ggsave(here(out_file), p_cl, width = 6, height = 5)
+  cat(cl_label, "— n =", nrow(df_cl), "| r =", round(r_cl, 4),
+      "| Saved:", out_file, "\n")
+  print(p_cl)
+}
+```
+
