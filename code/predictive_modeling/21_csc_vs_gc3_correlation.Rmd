@@ -1,0 +1,264 @@
+---
+title: "Notebook 21: CSC vs GC3 Correlation per mRNA"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This notebook examines the correlation between CSC (Codon Stabilization Coefficient,
+from iCodon) and GC3 (GC content at the third codon position) across all mRNAs in
+the feature matrix. Both are CDS-level features.
+
+GC3 is expected to correlate with CSC because GC-ending codons tend to have higher
+CSC weights in human cells. This notebook quantifies the relationship and checks
+whether it differs across eIF3d gene groups.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+## Load feature matrix
+
+```{r load_features}
+features <- readRDS(here("output", "predictive_modeling", "feature_matrix_codon_optimality.rds"))
+
+features <- features %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+cat("Rows:", nrow(features), "\n")
+cat("Columns:", ncol(features), "\n")
+cat("CSC non-NA:", sum(!is.na(features$csc)), "\n")
+cat("GC3 non-NA:", sum(!is.na(features$gc3)), "\n")
+```
+
+## Collapse to gene level
+
+The feature matrix is transcript-level; collapse to one value per gene using the
+mean.
+
+```{r gene_level}
+gene_df <- features %>%
+  group_by(ensembl_gene, symbol) %>%
+  summarise(
+    csc = mean(csc, na.rm = TRUE),
+    gc3 = mean(gc3, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(csc), !is.na(gc3))
+
+cat("Genes with both CSC and GC3:", nrow(gene_df), "\n")
+cat("CSC range:", round(range(gene_df$csc), 3), "\n")
+cat("GC3 range:", round(range(gene_df$gc3), 3), "\n")
+```
+
+## Global CSC vs GC3 scatter
+
+```{r scatter_all, fig.width=5.5, fig.height=4.5}
+fit_all <- lm(csc ~ gc3, data = gene_df)
+r_all   <- sign(coef(fit_all)[["gc3"]]) * sqrt(summary(fit_all)$r.squared)
+
+p_all <- ggplot(gene_df, aes(x = gc3, y = csc)) +
+  geom_point(alpha = 0.2, size = 0.6, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r_all, 3),
+                          "\nn = ", nrow(gene_df)),
+           hjust = 1.1, vjust = 1.5, size = 3.5) +
+  labs(
+    title    = "CSC vs GC3 — all genes",
+    subtitle = "Gene-level means; feature_matrix_codon_optimality",
+    x = "GC3 (GC content at 3rd codon position)",
+    y = "CSC (iCodon mRNA stability score)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_all
+ggsave(here("plots", "csc_vs_gc3_all_genes.pdf"), p_all, width = 5.5, height = 4.5)
+cat("r =", round(r_all, 4), "\n")
+cat("Saved: plots/csc_vs_gc3_all_genes.pdf\n")
+```
+
+## Annotate eIF3d gene groups
+
+Negative control genes are size-matched to the promotes set using the same
+`set.seed(9)` and filtering approach as the RF model (notebook 7): restrict both
+pools to genes present in `gene_df`, then sample without replacement.
+
+```{r load_gene_groups}
+# eIF3d hypoxia promotes (1 hr, lfc > 0.5)
+hyp_promotes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+
+# Full negative control pool
+neg_ctrl_pool <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+# Restrict both to genes present in gene_df (i.e. have CSC and GC3)
+promotes_in_df  <- hyp_promotes   %>% filter(ensembl_gene %in% gene_df$ensembl_gene)
+neg_pool_in_df  <- neg_ctrl_pool  %>% filter(ensembl_gene %in% gene_df$ensembl_gene)
+
+# Size-match neg ctrl to promotes (set.seed(9) matches notebook 7 / RF model)
+set.seed(9)
+n_match      <- min(nrow(promotes_in_df), nrow(neg_pool_in_df))
+neg_ctrl_ids <- sample(neg_pool_in_df$ensembl_gene, size = n_match, replace = FALSE)
+
+cat("Promotes in gene_df:", nrow(promotes_in_df), "\n")
+cat("Neg ctrl (size-matched, set.seed(9)):", length(neg_ctrl_ids), "\n")
+
+gene_df <- gene_df %>%
+  mutate(
+    group = case_when(
+      ensembl_gene %in% promotes_in_df$ensembl_gene ~ "eIF3d hypoxia promotes",
+      ensembl_gene %in% neg_ctrl_ids                 ~ "Negative control",
+      TRUE                                            ~ "All other genes"
+    ),
+    group = factor(group, levels = c(
+      "eIF3d hypoxia promotes", "Negative control", "All other genes"
+    ))
+  )
+
+cat("Group counts:\n")
+print(table(gene_df$group))
+```
+
+## Scatter colored by gene group (faceted)
+
+```{r scatter_groups, fig.width=9, fig.height=4}
+group_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "black",
+  "All other genes"        = "grey70"
+)
+
+# Per-facet n and r labels
+facet_labels <- gene_df %>%
+  group_by(group) %>%
+  summarise(
+    n = n(),
+    r = {
+      fit <- lm(csc ~ gc3, data = pick(everything()))
+      sign(coef(fit)[["gc3"]]) * sqrt(summary(fit)$r.squared)
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0("n = ", n, "\nr = ", round(r, 3)))
+
+# bg without group column so it shows in all facets
+bg_all <- gene_df %>% dplyr::select(-group)
+
+p_groups <- ggplot(gene_df, aes(x = gc3, y = csc)) +
+  geom_point(data = bg_all,
+             alpha = 0.1, size = 0.4, color = "grey70") +
+  geom_point(aes(color = group), alpha = 0.5, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "black",
+              linewidth = 0.7, linetype = "dashed") +
+  geom_text(
+    data = facet_labels,
+    aes(label = label),
+    x = Inf, y = -Inf, hjust = 1.05, vjust = -0.3,
+    size = 3, inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  facet_wrap(~group) +
+  labs(
+    title = "CSC vs GC3 by eIF3d gene group",
+    x = "GC3 (GC content at 3rd codon position)",
+    y = "CSC (iCodon mRNA stability score)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+p_groups
+ggsave(here("plots", "csc_vs_gc3_by_group.pdf"), p_groups, width = 9, height = 4)
+cat("Saved: plots/csc_vs_gc3_by_group.pdf\n")
+print(facet_labels)
+```
+
+## Per-group correlations
+
+```{r per_group_correlations}
+cat("Per-group Pearson r (CSC ~ GC3):\n")
+print(facet_labels %>% dplyr::select(group, n, r))
+```
+
+## Residual distribution by group
+
+Residuals from the global CSC ~ GC3 regression. If eIF3d-promoted genes have higher
+CSC than expected from GC3 alone, their residuals will be positive.
+
+```{r residuals, fig.width=5.5, fig.height=4}
+gene_df <- gene_df %>%
+  mutate(csc_resid = residuals(lm(csc ~ gc3, data = gene_df)))
+
+resid_medians <- gene_df %>%
+  filter(group != "All other genes") %>%
+  group_by(group) %>%
+  summarise(med = median(csc_resid, na.rm = TRUE), .groups = "drop")
+
+p_resid <- ggplot() +
+  geom_density(
+    data = gene_df %>% filter(group == "All other genes"),
+    aes(x = csc_resid),
+    fill = NA, color = "grey60", linewidth = 0.9
+  ) +
+  geom_density(
+    data = gene_df %>% filter(group != "All other genes"),
+    aes(x = csc_resid, color = group),
+    fill = NA, linewidth = 0.9
+  ) +
+  geom_vline(
+    data = resid_medians,
+    aes(xintercept = med, color = group),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  scale_color_manual(
+    values = c("eIF3d hypoxia promotes" = "#E69F00",
+               "Negative control"       = "black"),
+    name = NULL
+  ) +
+  labs(
+    title    = "CSC residuals after GC3 regression",
+    subtitle = "Grey = all other genes; dashed = group median",
+    x = "CSC residual (observed − predicted from GC3)",
+    y = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_resid
+
+# Wilcoxon test: promotes vs negative control residuals
+promotes_resid  <- gene_df %>% filter(group == "eIF3d hypoxia promotes") %>% pull(csc_resid)
+neg_ctrl_resid  <- gene_df %>% filter(group == "Negative control")       %>% pull(csc_resid)
+
+wt <- wilcox.test(promotes_resid, neg_ctrl_resid, alternative = "two.sided")
+cat("Wilcoxon test (promotes vs neg ctrl residuals):\n")
+cat("  W =", wt$statistic, ", p =", formatC(wt$p.value, format = "e", digits = 2), "\n")
+cat("  Promotes median residual:", round(median(promotes_resid, na.rm = TRUE), 4), "\n")
+cat("  Neg ctrl median residual:", round(median(neg_ctrl_resid, na.rm = TRUE), 4), "\n")
+
+ggsave(here("plots", "csc_resid_gc3_by_group.pdf"), p_resid, width = 5.5, height = 4)
+cat("Saved: plots/csc_resid_gc3_by_group.pdf\n")
+```
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

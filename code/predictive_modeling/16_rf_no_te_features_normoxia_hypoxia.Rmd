@@ -1,0 +1,630 @@
+---
+title: "RF Classification Without TE Features: eIF3d Normoxia vs Hypoxia"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Binary classification: can mRNA sequence features (without translational efficiency measurements) discriminate eIF3d-promoted translation targets from negative controls?
+
+This notebook removes all TE features (`indiv_te_*`, `delta_te_*`) and runs RF classification on both normoxia and hypoxia conditions. Feature set: `feature_matrix_kozak.rds` (Kozak + codon optimality + CLIP aggregate + RNA structure + literature signatures; k-mers excluded).
+
+**Motivation:** Tests whether sequence- and CLIP-based features alone carry predictive signal, independent of ribosome profiling TE measurements.
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+library(cowplot)
+```
+
+# Fixed Parameters
+
+```{r params}
+gene        <- "3d"
+direction   <- "promotes"
+timepoint   <- "1and4hr"
+lfc_thresh  <- 0.5
+conditions  <- c("normoxia", "hypoxia")
+
+pos_label  <- direction
+neg_label  <- paste0("does_not_", sub("s$", "", direction))
+gene_label <- paste0("eIF", gene)
+
+cat("Positive label:", pos_label, "\n")
+cat("Negative label:", neg_label, "\n")
+cat("Conditions:", paste(conditions, collapse = ", "), "\n")
+```
+
+# Load Data
+
+```{r load_data}
+# Feature matrix
+features_raw <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
+cat("Feature matrix:", nrow(features_raw), "genes x", ncol(features_raw), "columns\n")
+
+# Fix any list columns (per MEMORY.md: clip_eif3_count may be a list column)
+for (col in names(features_raw)) {
+  if (is.list(features_raw[[col]])) {
+    features_raw[[col]] <- as.integer(unlist(features_raw[[col]]))
+    cat("Coerced list column to integer:", col, "\n")
+  }
+}
+
+# Negative controls
+negative_control_genes <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv")
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+cat("Negative control genes:", nrow(negative_control_genes), "\n")
+```
+
+# Feature Column Selection (TE Features Excluded)
+
+```{r feature_cols}
+# Exclude ID / label columns
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+all_cols        <- colnames(features_raw)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols         <- unique(c(id_cols, id_pattern_cols))
+feature_cols    <- setdiff(all_cols, id_cols)
+cat("Initial feature count:", length(feature_cols), "\n")
+
+# ---- DROP TE FEATURES (key change vs notebook 07) ----
+te_cols      <- feature_cols[str_detect(feature_cols, "^indiv_te_|^delta_te_")]
+feature_cols <- setdiff(feature_cols, te_cols)
+cat("Dropped", length(te_cols), "TE columns:\n ")
+cat(paste(te_cols, collapse = "\n  "), "\n")
+
+# CLIP mode: aggregate — keep counts/LFCs, drop per-region binary cols
+aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                         "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                         "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment")
+regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") &
+                                !(feature_cols %in% aggregate_clip_cols)]
+feature_cols  <- setdiff(feature_cols, regional_clip)
+cat("CLIP aggregate mode: dropped", length(regional_clip), "regional CLIP features\n")
+
+# Drop k-mer and RBP motif columns (too many, low interpretability)
+kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+excluded_kmer <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
+feature_cols  <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+cat("Dropped", length(excluded_kmer), "k-mer/motif columns\n")
+
+# Drop circular eIF4E features (avoids target-label leakage in fair comparison)
+circular_regex    <- "^4e_resistance|^eif4e_ip"
+circular_lit_exact <- c(
+  "lit_eIF4E_activated_translation",
+  "lit_phospho_eIF4E_activated_translation",
+  "lit_phospho_eIF4E_suppressed_translation",
+  "lit_translation_is_sensitive_to_4E_inhibition",
+  "lit_translation_is_resistant_to_4E_inhibition"
+)
+circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) |
+                                feature_cols %in% circular_lit_exact]
+if (length(circular_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, circular_cols)
+  cat("Dropped", length(circular_cols), "circular eIF4E features\n")
+}
+
+cat("\nFinal feature count (no TE):", length(feature_cols), "\n")
+```
+
+# Helper Functions
+
+```{r helpers}
+impute_with_medians <- function(df, medians, cols) {
+  for (col in cols) {
+    df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  }
+  df
+}
+```
+
+# Per-Condition Analysis
+
+```{r run_conditions, fig.width=8, fig.height=6}
+results_list <- list()
+
+for (cond in conditions) {
+  cat("\n\n========================================\n")
+  cat("CONDITION:", toupper(cond), "\n")
+  cat("========================================\n\n")
+
+  # ---- Load positive genes ----
+  if (cond == "normoxia") {
+    geneset_csv <- paste0("translation_categories_si", gene,
+                          "_vs_sictrl_normoxia_", timepoint, ".csv")
+    positive_genes <- read_csv(here("output", geneset_csv)) %>%
+      filter(te_lfc > lfc_thresh, te_padj < 0.05) %>%
+      mutate(ensembl_gene = sub("\\..*", "", gene_id))
+    cat("Loaded:", geneset_csv, "\n")
+  } else {
+    # No pre-combined 1and4hr file for hypoxia — union of 1hr + 4hr
+    hyp_1hr <- read_csv(here("output", paste0(
+      "translation_categories_si", gene, "_vs_sictrl_hypoxia_1hr.csv"
+    ))) %>%
+      filter(te_lfc > lfc_thresh, te_padj < 0.05) %>%
+      mutate(ensembl_gene = sub("\\..*", "", gene_id))
+    hyp_4hr <- read_csv(here("output", paste0(
+      "translation_categories_si", gene, "_vs_sictrl_hypoxia_4hr.csv"
+    ))) %>%
+      filter(te_lfc > lfc_thresh, te_padj < 0.05) %>%
+      mutate(ensembl_gene = sub("\\..*", "", gene_id))
+    positive_genes <- bind_rows(hyp_1hr, hyp_4hr) %>%
+      distinct(ensembl_gene, .keep_all = TRUE)
+    cat("Hypoxia: union of 1hr (", nrow(hyp_1hr), ") + 4hr (", nrow(hyp_4hr),
+        ") = ", nrow(positive_genes), " unique genes\n", sep = "")
+  }
+  cat("Positive genes:", nrow(positive_genes), "\n")
+
+  # ---- Label genes ----
+  set.seed(9)
+  features <- features_raw
+
+  pos_in_features <- positive_genes %>%
+    filter(ensembl_gene %in% features$gene_id_clean)
+  neg_in_features <- negative_control_genes %>%
+    filter(gene_id_clean %in% features$gene_id_clean)
+
+  number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+  cat("Positive in feature matrix:", nrow(pos_in_features), "\n")
+  cat("Negative available:", nrow(neg_in_features), "| sampling:", number_to_match, "\n")
+
+  features <- features %>%
+    mutate(eif3d_target = case_when(
+      gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+      gene_id_clean %in% sample(neg_in_features$gene_id_clean, number_to_match) ~ neg_label,
+      TRUE ~ NA_character_
+    ))
+
+  model_genes <- features %>%
+    filter(!is.na(eif3d_target)) %>%
+    mutate(eif3d_target = factor(eif3d_target, levels = c(neg_label, pos_label)))
+
+  cat("Positive (", pos_label, "):", sum(model_genes$eif3d_target == pos_label), "\n")
+  cat("Negative (", neg_label, "):", sum(model_genes$eif3d_target == neg_label), "\n")
+
+  # ---- Prepare model data ----
+  model_data <- model_genes %>%
+    dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols))
+
+  cat("Model data:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+
+  # ---- Train/test split ----
+  set.seed(9)
+  train_idx  <- createDataPartition(model_data$eif3d_target, p = 0.8, list = FALSE)
+  train_data <- model_data[train_idx, ]
+  test_data  <- model_data[-train_idx, ]
+
+  cat("Train:", nrow(train_data), "| Test:", nrow(test_data), "\n")
+
+  # Compute medians from training set; apply to both splits
+  train_medians <- train_data %>%
+    dplyr::select(all_of(feature_cols)) %>%
+    summarise(across(everything(), ~ median(., na.rm = TRUE)))
+
+  train_data <- impute_with_medians(train_data, train_medians, feature_cols)
+  test_data  <- impute_with_medians(test_data,  train_medians, feature_cols)
+
+  cat("Remaining NAs — train:", sum(is.na(train_data[, feature_cols])),
+      "| test:", sum(is.na(test_data[, feature_cols])), "\n")
+
+  # ---- Train Random Forest ----
+  cat("Training Random Forest (500 trees)...\n")
+  rf_model <- ranger(
+    x          = train_data[, feature_cols],
+    y          = train_data$eif3d_target,
+    num.trees  = 500,
+    importance = "impurity",
+    probability = TRUE,
+    seed       = 9
+  )
+  cat("OOB prediction error:", round(rf_model$prediction.error, 4), "\n")
+
+  # ---- Test set evaluation ----
+  pred_probs    <- predict(rf_model, test_data[, feature_cols])$predictions
+  pred_pos_prob <- pred_probs[, pos_label]
+  actual        <- test_data$eif3d_target
+
+  # ROC + AUC
+  roc_obj   <- roc(response = actual, predictor = pred_pos_prob,
+                   levels = c(neg_label, pos_label), direction = "<")
+  auc_value <- auc(roc_obj)
+  ci_auc    <- ci.auc(roc_obj, method = "bootstrap", boot.n = 1000)
+
+  # Youden threshold from OOB
+  oob_probs     <- rf_model$predictions[, pos_label]
+  roc_oob       <- roc(response = train_data$eif3d_target, predictor = oob_probs,
+                       levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+  coords_youden <- coords(roc_oob, "best",
+                          ret = c("threshold", "sensitivity", "specificity"),
+                          best.method = "youden")
+  if (nrow(coords_youden) > 1) coords_youden <- coords_youden[1, ]
+  optimal_threshold <- coords_youden$threshold
+
+  cat("AUC:", round(auc_value, 4),
+      "[", round(ci_auc[1], 4), "-", round(ci_auc[3], 4), "]\n")
+  cat("Youden threshold (OOB):", round(optimal_threshold, 4), "\n")
+
+  # Confusion matrix
+  pred_class <- factor(
+    ifelse(pred_pos_prob >= optimal_threshold, pos_label, neg_label),
+    levels = c(neg_label, pos_label)
+  )
+  cm                <- confusionMatrix(pred_class, actual, positive = pos_label)
+  balanced_accuracy <- cm$byClass["Balanced Accuracy"]
+  sensitivity_val   <- cm$byClass["Sensitivity"]
+  specificity_val   <- cm$byClass["Specificity"]
+  precision_val     <- cm$byClass["Precision"]
+  f1_val            <- cm$byClass["F1"]
+
+  cat("Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+  cat("Sensitivity:", round(sensitivity_val, 4), "| Specificity:", round(specificity_val, 4), "\n")
+
+  # ---- ROC plot ----
+  roc_df <- data.frame(sensitivity = roc_obj$sensitivities,
+                       specificity = roc_obj$specificities)
+  p_roc <- ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
+    geom_line(color = "#0072B2", linewidth = 1.2) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+    geom_point(aes(x = 1 - coords_youden$specificity, y = coords_youden$sensitivity),
+               color = "red", size = 3) +
+    annotate("text",
+             x = 1 - coords_youden$specificity + 0.05,
+             y = coords_youden$sensitivity,
+             label = paste0("Youden\n(", round(optimal_threshold, 3), ")"),
+             color = "red", size = 3, hjust = 0) +
+    theme_cowplot() +
+    labs(
+      title    = paste0("ROC: ", gene_label, " Targets (",
+                        tools::toTitleCase(cond), ", No TE Features)"),
+      subtitle = paste0("AUC = ", round(auc_value, 3),
+                        " [", round(ci_auc[1], 3), "-", round(ci_auc[3], 3), "]"),
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    ) +
+    coord_equal()
+  print(p_roc)
+  ggsave(here("plots", paste0("rf_no_te_roc_", cond, ".pdf")),
+         plot = p_roc, width = 8, height = 6)
+
+  # ---- Confusion matrix plot ----
+  cm_table          <- as.data.frame(cm$table)
+  colnames(cm_table) <- c("Predicted", "Actual", "Freq")
+  p_cm <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 1) +
+    geom_text(aes(label = Freq), size = 8, fontface = "bold") +
+    scale_fill_gradient(low = "white", high = "#0072B2") +
+    theme_cowplot() +
+    labs(
+      title    = paste0("Confusion Matrix (",
+                        tools::toTitleCase(cond), ", No TE Features)"),
+      subtitle = paste0("Balanced Acc = ", round(balanced_accuracy, 3),
+                        " | F1 = ", round(f1_val, 3))
+    ) +
+    theme(legend.position = "none")
+  print(p_cm)
+  ggsave(here("plots", paste0("rf_no_te_confusion_matrix_", cond, ".pdf")),
+         plot = p_cm, width = 6, height = 5)
+
+  # ---- Feature importance ----
+  importance_df <- data.frame(
+    feature    = names(rf_model$variable.importance),
+    importance = rf_model$variable.importance
+  ) %>%
+    arrange(desc(importance)) %>%
+    mutate(
+      feature_clean = feature %>%
+        str_replace("^log2_", "log2 ") %>%
+        str_replace("_length$", " length") %>%
+        str_replace("_gc$", " GC%"),
+      category = case_when(
+        str_detect(feature, "^struct_")                         ~ "RNA Structure",
+        str_detect(feature, "^orfquant_")                      ~ "ORFquant",
+        str_detect(feature, "^clip_")                          ~ "CLIP Binding",
+        str_detect(feature, "^lit_")                           ~ "Literature Signatures",
+        str_detect(feature, "length|Length")                   ~ "Region Lengths",
+        str_detect(feature, "_gc$|^gc3$")                      ~ "GC Content",
+        str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_") ~ "4E / DAP5",
+        str_detect(feature, "^cai$|^tai$|^csc$")              ~ "Codon Optimality",
+        str_detect(feature, "^kozak")                          ~ "Kozak",
+        TRUE                                                   ~ "Other"
+      )
+    )
+
+  p_importance <- importance_df %>%
+    head(30) %>%
+    ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+    geom_segment(aes(xend = reorder(feature_clean, importance),
+                     y = 0, yend = importance),
+                 color = "grey60", linewidth = 0.6) +
+    geom_point(size = 3, color = "#0072B2") +
+    coord_flip() +
+    theme_cowplot() +
+    labs(
+      title    = paste0("Top 30 Features: ", gene_label,
+                        " (", tools::toTitleCase(cond), ", No TE Features)"),
+      subtitle = paste0("AUC = ", round(auc_value, 3)),
+      x = "",
+      y = "Variable Importance (Impurity)"
+    )
+  print(p_importance)
+  ggsave(here("plots", paste0("rf_no_te_feature_importance_", cond, ".pdf")),
+         plot = p_importance, width = 10, height = 10)
+
+  # ---- 5-fold CV ----
+  cat("\nRunning 5-fold CV...\n")
+  set.seed(9)
+  folds <- createFolds(train_data$eif3d_target, k = 5, list = TRUE)
+
+  cv_results <- lapply(seq_along(folds), function(i) {
+    cat("  Fold", i, "...\n")
+    test_idx_cv <- folds[[i]]
+    train_cv    <- train_data[-test_idx_cv, ]
+    test_cv     <- train_data[test_idx_cv, ]
+
+    cv_medians <- train_cv %>%
+      dplyr::select(all_of(feature_cols)) %>%
+      summarise(across(everything(), ~ median(., na.rm = TRUE)))
+    train_cv <- impute_with_medians(train_cv, cv_medians, feature_cols)
+    test_cv  <- impute_with_medians(test_cv,  cv_medians, feature_cols)
+
+    rf_cv <- ranger(
+      x          = train_cv[, feature_cols],
+      y          = train_cv$eif3d_target,
+      num.trees  = 500,
+      probability = TRUE,
+      seed       = 9
+    )
+
+    oob_probs_cv <- rf_cv$predictions[, pos_label]
+    roc_oob_cv   <- roc(train_cv$eif3d_target, oob_probs_cv,
+                        levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+    coords_cv    <- coords(roc_oob_cv, "best",
+                           ret = c("threshold", "sensitivity", "specificity"),
+                           best.method = "youden")
+    if (nrow(coords_cv) > 1) coords_cv <- coords_cv[1, ]
+
+    pred_probs_cv <- predict(rf_cv, test_cv[, feature_cols])$predictions[, pos_label]
+    roc_cv <- roc(test_cv$eif3d_target, pred_probs_cv,
+                  levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+    pred_class_cv <- factor(
+      ifelse(pred_probs_cv >= coords_cv$threshold, pos_label, neg_label),
+      levels = c(neg_label, pos_label)
+    )
+    cm_cv <- confusionMatrix(pred_class_cv, test_cv$eif3d_target, positive = pos_label)
+
+    data.frame(
+      fold              = i,
+      AUC               = as.numeric(auc(roc_cv)),
+      Balanced_Accuracy = cm_cv$byClass["Balanced Accuracy"],
+      Sensitivity       = cm_cv$byClass["Sensitivity"],
+      Specificity       = cm_cv$byClass["Specificity"],
+      F1                = cm_cv$byClass["F1"]
+    )
+  })
+
+  cv_df <- bind_rows(cv_results)
+  rownames(cv_df) <- NULL
+  cat("\n5-Fold CV Results:\n")
+  print(cv_df)
+  cat("CV AUC:", round(mean(cv_df$AUC), 4), "+/-", round(sd(cv_df$AUC), 4), "\n")
+  cat("CV Balanced Acc:", round(mean(cv_df$Balanced_Accuracy), 4),
+      "+/-", round(sd(cv_df$Balanced_Accuracy), 4), "\n")
+
+  # ---- Permutation test ----
+  cat("\nRunning permutation test (n = 100)...\n")
+  set.seed(42)
+  perm_aucs <- numeric(100)
+  for (i in seq_len(100)) {
+    if (i %% 20 == 0) cat("  Permutation", i, "/ 100\n")
+    perm_data                <- model_data
+    perm_data$eif3d_target   <- sample(perm_data$eif3d_target)
+    perm_train <- impute_with_medians(perm_data[train_idx, ],  train_medians, feature_cols)
+    perm_test  <- impute_with_medians(perm_data[-train_idx, ], train_medians, feature_cols)
+    rf_perm    <- ranger(x = perm_train[, feature_cols], y = perm_train$eif3d_target,
+                         num.trees = 500, probability = TRUE, seed = i)
+    perm_probs <- predict(rf_perm, perm_test[, feature_cols])$predictions[, pos_label]
+    roc_perm   <- roc(perm_test$eif3d_target, perm_probs,
+                      levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+    perm_aucs[i] <- as.numeric(auc(roc_perm))
+  }
+  perm_pvalue <- mean(perm_aucs >= as.numeric(auc_value))
+  cat("Permutation p-value:", perm_pvalue, "\n")
+
+  p_perm <- ggplot(data.frame(auc = perm_aucs), aes(x = auc)) +
+    geom_histogram(bins = 30, fill = "grey70", color = "white") +
+    geom_vline(xintercept = as.numeric(auc_value), color = "#E69F00", linewidth = 1.2) +
+    geom_vline(xintercept = 0.5, color = "grey40", linetype = "dashed") +
+    annotate("text", x = as.numeric(auc_value), y = Inf,
+             label = paste0("Real AUC\n", round(auc_value, 3)),
+             vjust = 2, hjust = -0.1, color = "#E69F00", size = 3.5) +
+    theme_cowplot() +
+    labs(
+      title    = paste0("Permutation Test (", tools::toTitleCase(cond), ", No TE Features)"),
+      subtitle = paste0("n=100 permutations | p = ", perm_pvalue),
+      x = "AUC (shuffled labels)",
+      y = "Count"
+    )
+  print(p_perm)
+  ggsave(here("plots", paste0("rf_no_te_permutation_", cond, ".pdf")),
+         plot = p_perm, width = 8, height = 5)
+
+  # ---- Feature category summary ----
+  category_summary <- importance_df %>%
+    group_by(category) %>%
+    summarise(
+      n_features       = n(),
+      total_importance = sum(importance),
+      mean_importance  = mean(importance),
+      top_feature      = feature[which.max(importance)],
+      .groups          = "drop"
+    ) %>%
+    arrange(desc(total_importance))
+
+  cat("\nImportance by category (", cond, "):\n", sep = "")
+  print(category_summary %>% dplyr::select(category, n_features, total_importance, top_feature))
+
+  # ---- Store results ----
+  results_list[[cond]] <- list(
+    auc              = as.numeric(auc_value),
+    auc_ci_lower     = as.numeric(ci_auc[1]),
+    auc_ci_upper     = as.numeric(ci_auc[3]),
+    balanced_accuracy = as.numeric(balanced_accuracy),
+    sensitivity      = as.numeric(sensitivity_val),
+    specificity      = as.numeric(specificity_val),
+    precision        = as.numeric(precision_val),
+    f1               = as.numeric(f1_val),
+    perm_pvalue      = perm_pvalue,
+    n_pos            = sum(model_genes$eif3d_target == pos_label),
+    n_neg            = sum(model_genes$eif3d_target == neg_label),
+    cv_auc_mean      = mean(cv_df$AUC),
+    cv_auc_sd        = sd(cv_df$AUC),
+    cv_bal_acc_mean  = mean(cv_df$Balanced_Accuracy),
+    cv_bal_acc_sd    = sd(cv_df$Balanced_Accuracy),
+    importance_df    = importance_df,
+    category_summary = category_summary,
+    perm_aucs        = perm_aucs,
+    p_roc            = p_roc,
+    p_cm             = p_cm,
+    p_importance     = p_importance,
+    p_perm           = p_perm
+  )
+}
+```
+
+# Summary: Normoxia vs Hypoxia
+
+```{r summary_table}
+summary_df <- bind_rows(lapply(conditions, function(cond) {
+  r <- results_list[[cond]]
+  data.frame(
+    Condition         = tools::toTitleCase(cond),
+    N_Pos             = r$n_pos,
+    N_Neg             = r$n_neg,
+    AUC               = round(r$auc, 3),
+    AUC_95CI          = paste0("[", round(r$auc_ci_lower, 3), ", ",
+                                round(r$auc_ci_upper, 3), "]"),
+    Balanced_Accuracy = round(r$balanced_accuracy, 3),
+    Sensitivity       = round(r$sensitivity, 3),
+    Specificity       = round(r$specificity, 3),
+    Precision         = round(r$precision, 3),
+    F1                = round(r$f1, 3),
+    CV_AUC            = paste0(round(r$cv_auc_mean, 3), " ± ",
+                                round(r$cv_auc_sd, 3)),
+    CV_BalAcc         = paste0(round(r$cv_bal_acc_mean, 3), " ± ",
+                                round(r$cv_bal_acc_sd, 3)),
+    Perm_Pvalue       = r$perm_pvalue
+  )
+}))
+
+cat("============================================================\n")
+cat("eIF3d Classification WITHOUT TE Features\n")
+cat("Feature set: kozak (Kozak + codon optimality + CLIP aggregate +\n")
+cat("             RNA structure + literature signatures; k-mers excluded)\n")
+cat("TE features excluded: indiv_te_* (6) + delta_te_* (3) = 9 columns\n")
+cat("============================================================\n\n")
+print(summary_df)
+```
+
+# Side-by-Side: Top Features
+
+```{r side_by_side_importance, fig.width=14, fig.height=10}
+# Combine importance from both conditions for visual comparison
+importance_combined <- bind_rows(
+  results_list[["normoxia"]]$importance_df %>%
+    head(20) %>%
+    mutate(condition = "Normoxia"),
+  results_list[["hypoxia"]]$importance_df %>%
+    head(20) %>%
+    mutate(condition = "Hypoxia")
+)
+
+# Side-by-side faceted lollipop
+p_compare <- importance_combined %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_segment(aes(xend = reorder(feature_clean, importance),
+                   y = 0, yend = importance),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(size = 3, color = "#0072B2") +
+  coord_flip() +
+  facet_wrap(~ condition, scales = "free") +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Top 20 Features: ", gene_label, " Classification (No TE Features)"),
+    subtitle = "Normoxia vs Hypoxia | kozak feature set | CLIP aggregate mode",
+    x = "",
+    y = "Variable Importance (Impurity)"
+  )
+print(p_compare)
+ggsave(here("plots", "rf_no_te_feature_importance_comparison.pdf"),
+       plot = p_compare, width = 14, height = 10)
+```
+
+# Category Totals: Normoxia vs Hypoxia
+
+```{r category_comparison, fig.width=12, fig.height=6}
+cat_combined <- bind_rows(
+  results_list[["normoxia"]]$category_summary %>% mutate(condition = "Normoxia"),
+  results_list[["hypoxia"]]$category_summary  %>% mutate(condition = "Hypoxia")
+)
+
+p_cat <- ggplot(cat_combined,
+                aes(x = reorder(category, total_importance),
+                    y = total_importance, fill = condition)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c(Normoxia = "#0072B2", Hypoxia = "#E69F00")) +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Feature Importance by Category: No TE Features"),
+    subtitle = paste0(gene_label, " — Normoxia vs Hypoxia"),
+    x = "", y = "Total Variable Importance", fill = NULL
+  )
+print(p_cat)
+ggsave(here("plots", "rf_no_te_importance_by_category_comparison.pdf"),
+       plot = p_cat, width = 12, height = 6)
+```
+
+# Export Results
+
+```{r export}
+output_dir <- here("output", "predictive_modeling")
+
+# Summary table
+write_csv(summary_df, file.path(output_dir, "rf_no_te_features_summary.csv"))
+cat("Saved: rf_no_te_features_summary.csv\n")
+
+# Per-condition exports
+for (cond in conditions) {
+  r <- results_list[[cond]]
+  write_csv(r$importance_df,
+            file.path(output_dir, paste0("rf_no_te_importance_", cond, ".csv")))
+  write_csv(data.frame(perm_auc = r$perm_aucs),
+            file.path(output_dir, paste0("rf_no_te_permutation_aucs_", cond, ".csv")))
+  write_csv(r$category_summary,
+            file.path(output_dir, paste0("rf_no_te_category_summary_", cond, ".csv")))
+  cat("Saved:", cond, "— importance, permutation AUCs, category summary\n")
+}
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

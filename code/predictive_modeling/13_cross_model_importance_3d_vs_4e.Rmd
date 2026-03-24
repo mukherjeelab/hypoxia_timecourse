@@ -1,0 +1,318 @@
+---
+title: "`r paste0('Cross-Model Feature Importance: eIF3d vs eIF4E (', params$feature_set, ', clip=', params$clip_mode, ', lfc', params$lfc, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_set: "kozak"
+  clip_mode: "aggregate"
+  lfc: "0.5"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# Defaults for interactive use (overwritten by YAML params when knitting)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    feature_set = "kozak",
+    clip_mode   = "aggregate",
+    lfc         = "0.5"
+  )
+}
+
+# Match notebook 07's convention: paste0("eif3", gene, ...) where gene="3d" → "eif33d"
+suffix_3d <- paste0("eif3", "3d", "_promotes_normoxia_1and4hr_lfc", params$lfc,
+                    "_", params$feature_set, "_clip", params$clip_mode,
+                    "_no_boruta_no4e")
+
+suffix_4e <- paste0("eif4e_promotes_", params$feature_set,
+                    "_clip", params$clip_mode, "_no_boruta")
+
+# Directionality suffix for eIF3d: base model without _no4e
+# (correlations are feature-level, unaffected by which features were excluded from the model)
+suffix_3d_dir <- paste0("eif3", "3d", "_promotes_normoxia_1and4hr_lfc", params$lfc,
+                        "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
+
+subtitle_label <- paste0("eIF3d (normoxia, 1+4hr, lfc", params$lfc,
+                         ") vs eIF4E | ", params$feature_set,
+                         " | clip=", params$clip_mode)
+
+cat("eIF3d suffix:", suffix_3d, "\n")
+cat("eIF4E suffix:", suffix_4e, "\n")
+```
+
+# Overview
+
+Compare RF variable importance between the eIF3d (normoxia, 1+4hr) model and the eIF4E model to ask: **do the same mRNA sequence features predict eIF3d-promoted translation AND eIF4E-promoted translation, or are different feature classes responsible?**
+
+Both models use an identical feature universe: the circular eIF4E features (`4e_resistance`, `eif4e_ip`, `lit_eIF4E_*`) are excluded from the eIF3d model (via `exclude_4e_features = TRUE` in notebook 07) to enable a fair comparison.
+
+Raw impurity-based importance is not comparable across independently trained forests. We normalize each model's importance to **relative proportions** (sum to 1) before comparing.
+
+**Prerequisites:**
+- `output/predictive_modeling/rf_classification_importance_{suffix_3d}.csv` — from notebook 07 with `exclude_4e_features = TRUE`
+- `output/predictive_modeling/rf_classification_importance_{suffix_4e}.csv` — from notebook 09
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+library(ggrepel)
+```
+
+# Load Data
+
+```{r load_data}
+imp_3d <- read_csv(here("output", "predictive_modeling",
+                        paste0("rf_classification_importance_", suffix_3d, ".csv")))
+imp_4e <- read_csv(here("output", "predictive_modeling",
+                        paste0("rf_classification_importance_", suffix_4e, ".csv")))
+
+cat("eIF3d features:", nrow(imp_3d), "\n")
+cat("eIF4E features:", nrow(imp_4e), "\n")
+
+# Directionality: correlation = point-biserial between feature value and class label
+# Positive = higher in "promotes" class, negative = lower
+dir_3d <- read_csv(here("output", "predictive_modeling",
+                        paste0("rf_feature_directionality_", suffix_3d_dir, ".csv"))) %>%
+  select(feature, correlation_3d = correlation)
+dir_4e <- read_csv(here("output", "predictive_modeling",
+                        paste0("rf_feature_directionality_", suffix_4e, ".csv"))) %>%
+  select(feature, correlation_4e = correlation)
+
+cat("eIF3d directionality features:", nrow(dir_3d), "\n")
+cat("eIF4E directionality features:", nrow(dir_4e), "\n")
+```
+
+# Normalize and Join
+
+```{r join_data}
+# Normalize to relative importance (proportions summing to 1)
+imp_3d <- imp_3d %>% mutate(rel_importance = importance / sum(importance))
+imp_4e <- imp_4e %>% mutate(rel_importance = importance / sum(importance))
+
+cat("eIF3d importance sums to:", sum(imp_3d$rel_importance), "\n")
+cat("eIF4E importance sums to:", sum(imp_4e$rel_importance), "\n")
+
+# Inner join on feature (features present in both models)
+joined <- inner_join(
+  imp_3d %>% select(feature, feature_clean, category, rel_importance_3d = rel_importance),
+  imp_4e %>% select(feature, rel_importance_4e = rel_importance),
+  by = "feature"
+) %>%
+  mutate(
+    delta = rel_importance_3d - rel_importance_4e,
+    total = rel_importance_3d + rel_importance_4e,
+    delta_sign = ifelse(delta >= 0, "Higher in eIF3d", "Higher in eIF4E")
+  ) %>%
+  arrange(desc(total))
+
+# Add directionality (correlation with class label) to joined table
+joined <- joined %>%
+  left_join(dir_3d, by = "feature") %>%
+  left_join(dir_4e, by = "feature") %>%
+  mutate(
+    signed_3d = rel_importance_3d * sign(correlation_3d),
+    signed_4e = rel_importance_4e * sign(correlation_4e),
+    broad_category = case_when(
+      category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+      category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+      category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+      category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+      TRUE                                                     ~ "Intrinsic mRNA features"
+    ),
+    broad_category = factor(broad_category, levels = c(
+      "Intrinsic mRNA features", "eIF3 binding evidence",
+      "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+    ))
+  )
+
+cat("Features in both models (inner join):", nrow(joined), "\n")
+cat("Features only in eIF3d model:", sum(!imp_3d$feature %in% imp_4e$feature), "\n")
+cat("Features only in eIF4E model:", sum(!imp_4e$feature %in% imp_3d$feature), "\n")
+cat("Features with direction in both models:", sum(!is.na(joined$signed_3d) & !is.na(joined$signed_4e)), "\n")
+```
+
+# Plots
+
+## 1. Scatter Plot: eIF3d vs eIF4E Importance
+
+```{r scatter_plot, fig.width=10, fig.height=9}
+label_data <- joined %>%
+  arrange(desc(total)) %>%
+  head(15)
+
+axis_max <- max(joined$rel_importance_3d, joined$rel_importance_4e) * 1.05
+
+p_scatter <- ggplot(joined, aes(x = rel_importance_4e, y = rel_importance_3d)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_point(aes(color = category), size = 3, alpha = 0.7) +
+  geom_text_repel(data = label_data, aes(label = feature_clean),
+                  size = 3, max.overlaps = 20, segment.color = "grey50") +
+  coord_fixed(xlim = c(0, axis_max), ylim = c(0, axis_max)) +
+  theme_cowplot() +
+  labs(
+    title = "Feature Importance: eIF3d vs eIF4E Models",
+    subtitle = subtitle_label,
+    x = "Relative Importance (eIF4E model)",
+    y = "Relative Importance (eIF3d normoxia 1+4hr model)",
+    color = "Category"
+  )
+
+print(p_scatter)
+
+ggsave(here("plots", paste0("rf_importance_comparison_scatter_", suffix_3d, "_vs_", suffix_4e, ".pdf")),
+       plot = p_scatter, width = 10, height = 9)
+```
+
+## 2. Signed Importance Scatter: Direction + Importance in One View
+
+```{r signed_scatter, fig.width=10, fig.height=9}
+category_colors <- c(
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1",
+  "Translation in hypoxia"  = "#E07030"
+)
+
+signed_data <- joined %>% filter(!is.na(signed_3d), !is.na(signed_4e))
+
+x_min <- -0.18; x_max <- 0.12   # eIF4E (x-axis)
+y_min <- -0.1;  y_max <- 0.1    # eIF3d (y-axis)
+
+label_signed <- signed_data %>%
+  mutate(abs_total = abs(signed_3d) + abs(signed_4e)) %>%
+  arrange(desc(abs_total)) %>%
+  head(20)
+
+p_signed <- ggplot(signed_data, aes(x = signed_4e, y = signed_3d)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey70", linewidth = 0.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_abline(intercept = 0, slope = -1, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = broad_category), size = 3, alpha = 0.7) +
+  scale_color_manual(values = category_colors, name = "Category") +
+  geom_text_repel(data = label_signed, aes(label = feature_clean),
+                  size = 4.5, max.overlaps = Inf, segment.color = "grey50") +
+  annotate("text", x = x_min * 0.97, y = y_max * 0.97,
+           label = "Higher in eIF3d\nLower in eIF4E",
+           hjust = 0, vjust = 1, size = 4, color = "grey45") +
+  annotate("text", x = x_max * 0.97, y = y_max * 0.97,
+           label = "Higher in both",
+           hjust = 1, vjust = 1, size = 4, color = "grey45") +
+  annotate("text", x = x_min * 0.97, y = y_min * 0.97,
+           label = "Lower in both",
+           hjust = 0, vjust = 0, size = 4, color = "grey45") +
+  annotate("text", x = x_max * 0.97, y = y_min * 0.97,
+           label = "Lower in eIF3d\nHigher in eIF4E",
+           hjust = 1, vjust = 0, size = 4, color = "grey45") +
+  coord_fixed(xlim = c(x_min, x_max), ylim = c(y_min, y_max)) +
+  theme_cowplot(font_size = 14) +
+  labs(
+    title = "Signed Feature Importance: eIF3d vs eIF4E Models",
+    subtitle = paste0(subtitle_label, "  |  axis = importance × direction (+= higher in promotes)"),
+    x = "Signed Importance (eIF4E model)",
+    y = "Signed Importance (eIF3d normoxia 1+4hr model)"
+  )
+
+print(p_signed)
+
+ggsave(here("plots", paste0("rf_importance_comparison_signed_", suffix_3d, "_vs_", suffix_4e, ".pdf")),
+       plot = p_signed, width = 10, height = 9)
+```
+
+## 3. Dumbbell Plot: Paired Importance by Model
+
+```{r dumbbell_plot, fig.width=10, fig.height=10}
+dumbbell_data <- joined %>%
+  mutate(max_importance = pmax(rel_importance_3d, rel_importance_4e)) %>%
+  arrange(desc(max_importance)) %>%
+  head(30) %>%
+  mutate(feature_clean = fct_reorder(feature_clean, max_importance))
+
+p_dumbbell <- ggplot(dumbbell_data) +
+  geom_segment(aes(x = rel_importance_3d, xend = rel_importance_4e,
+                   y = feature_clean, yend = feature_clean),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(aes(x = rel_importance_3d, y = feature_clean, color = "eIF3d"), size = 3) +
+  geom_point(aes(x = rel_importance_4e, y = feature_clean, color = "eIF4E"), size = 3) +
+  scale_color_manual(
+    values = c("eIF3d" = "#D55E00", "eIF4E" = "#0072B2"),
+    name = "Model"
+  ) +
+  theme_cowplot() +
+  labs(
+    title = "Top 30 Features: Paired Importance by Model",
+    subtitle = subtitle_label,
+    x = "Relative Importance (Proportion)",
+    y = ""
+  )
+
+print(p_dumbbell)
+
+ggsave(here("plots", paste0("rf_importance_comparison_dumbbell_", suffix_3d, "_vs_", suffix_4e, ".pdf")),
+       plot = p_dumbbell, width = 10, height = 10)
+```
+
+## 4. Delta Importance Bar Plot
+
+```{r delta_bar_plot, fig.width=10, fig.height=10}
+delta_data <- joined %>%
+  arrange(desc(abs(delta))) %>%
+  head(30) %>%
+  mutate(feature_clean = fct_reorder(feature_clean, delta))
+
+p_delta <- ggplot(delta_data, aes(x = feature_clean, y = delta, fill = delta_sign)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("Higher in eIF3d" = "#D55E00", "Higher in eIF4E" = "#0072B2"),
+    name = ""
+  ) +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = "Delta Importance: eIF3d minus eIF4E",
+    subtitle = subtitle_label,
+    x = "",
+    y = "Delta Relative Importance (eIF3d - eIF4E)"
+  )
+
+print(p_delta)
+
+ggsave(here("plots", paste0("rf_importance_comparison_delta_", suffix_3d, "_vs_", suffix_4e, ".pdf")),
+       plot = p_delta, width = 10, height = 10)
+```
+
+# Export
+
+```{r export}
+output_dir <- here("output", "predictive_modeling")
+
+export_df <- joined %>%
+  select(feature, feature_clean, category,
+         rel_importance_3d, rel_importance_4e, delta, total, delta_sign,
+         correlation_3d, correlation_4e, signed_3d, signed_4e)
+
+write_csv(export_df, file.path(output_dir,
+  paste0("rf_importance_comparison_", suffix_3d, "_vs_", suffix_4e, ".csv")))
+
+cat("Exported:", nrow(export_df), "features to\n")
+cat(" ", file.path(output_dir, paste0("rf_importance_comparison_", suffix_3d, "_vs_", suffix_4e, ".csv")), "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

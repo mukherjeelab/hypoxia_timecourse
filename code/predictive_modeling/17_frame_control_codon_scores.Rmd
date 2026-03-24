@@ -1,0 +1,602 @@
+---
+title: "Codon Score Frame Controls (CAI, tAI, CSC, FOP)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Negative control: compute CAI, tAI, CSC, and FOP for reading frames 0, 1, and 2.
+Frame 0 is the canonical CDS; frames 1 and 2 are out-of-frame shifts (drop first
+1 or 2 nt, trim trailing nt to restore divisibility by 3).
+
+Reference weights (CAI relative adaptiveness, tAI w-values, FOP optimal codons) are
+derived from frame 0 reference genes and held fixed across frames. If codon optimality
+scores reflect real biology, frame 0 should score higher than frames 1/2.
+
+Visualized for eIF3d hypoxia-promoted genes (1 hr, lfc > 0.5).
+
+**Prerequisites:**
+- `output/predictive_modeling/feature_matrix_kozak.rds` (from 01h)
+- `output/genesets/hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`
+- `output/condition_level_te.csv`
+- `accessories/human/txdb.gencode49.sqlite`
+- `accessories/human/human_trna_gcn.csv`
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(coRdon)
+library(iCodon)
+library(ggridges)
+library(ggh4x)
+```
+
+# Load Feature Matrix and CDS Sequences
+
+```{r load_data}
+te_lfc_matrix <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
+keep_tx <- te_lfc_matrix$transcript_id_clean
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all        <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all   <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx    <- cds_names_clean %in% keep_tx
+cds_frame0  <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+# Require frame 0 to be divisible by 3 (same filter as 01g)
+valid <- width(cds_frame0) %% 3 == 0
+cds_frame0 <- cds_frame0[valid]
+cat("Frame 0 sequences:", length(cds_frame0), "\n")
+```
+
+# Build Per-Frame CDS
+
+Shift by 1 or 2 nt, then trim trailing nt so length is still divisible by 3.
+
+```{r build_frames}
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)   # drop first `shift` nt
+  new_len  <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+
+cds_frame1 <- shift_frame(cds_frame0, 1)
+cds_frame2 <- shift_frame(cds_frame0, 2)
+
+# Verify all divisible by 3
+stopifnot(all(width(cds_frame1) %% 3 == 0),
+          all(width(cds_frame2) %% 3 == 0))
+
+cat("Frame 1 sequences:", length(cds_frame1), "\n")
+cat("Frame 2 sequences:", length(cds_frame2), "\n")
+```
+
+# Build Reference Weights from Frame 0
+
+Reference weights are computed once from frame 0 and applied across all frames.
+This is the correct design: optimal codons and relative adaptiveness are defined
+biologically, not by the frame being tested.
+
+```{r ref_weights}
+# Standard genetic code
+gen_code    <- Biostrings::getGeneticCode("SGC0")
+stop_codons <- names(gen_code[gen_code == "*"])
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+
+# Frame 0 codon counts (used to derive reference weights)
+# coRdon::codonCounts() returns NULL rownames by default; set them explicitly
+# so the FOP reference filter correctly matches transcripts (mirrors 01g fix).
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+
+# --- CAI weights (ribosomal protein reference) ---
+ribo_tx     <- te_lfc_matrix %>%
+  filter(str_detect(symbol, "^RPL|^RPS")) %>%
+  pull(transcript_id_clean)
+ribo_subset <- names(cds_frame0) %in% ribo_tx
+cat("Ribosomal reference transcripts:", sum(ribo_subset), "\n")
+
+ref_counts_ribo <- colSums(counts_mat0[ribo_subset, , drop = FALSE])
+
+w_cai <- setNames(rep(NA_real_, length(gen_code)), names(gen_code))
+w_cai[stop_codons] <- 0
+
+for (aa in names(aa_to_codons)) {
+  codons <- aa_to_codons[[aa]]
+  counts <- ref_counts_ribo[codons]
+  total  <- sum(counts)
+  n_syn  <- length(codons)
+  if (total == 0) { w_cai[codons] <- 1; next }
+  rscu <- counts / (total / n_syn)
+  max_r <- max(rscu)
+  w_cai[codons] <- if (max_r == 0) 0 else pmin(rscu / max_r, 1)
+}
+
+# --- tAI weights (GtRNAdb hg38) ---
+trna_gcn <- read_csv(here("accessories", "human", "human_trna_gcn.csv"), comment = "#")
+
+decode_anticodon <- function(ac) {
+  x1 <- substr(ac, 1, 1); x2 <- substr(ac, 2, 2); x3 <- substr(ac, 3, 3)
+  wc <- c(A = "T", T = "A", G = "C", C = "G")
+  y1 <- unname(wc[x3]); y2 <- unname(wc[x2])
+  if (x1 == "A") {
+    y3 <- c("T", "C", "A"); svs <- c(0, 0, 0)
+  } else if (x1 == "G") {
+    y3 <- c("C", "T"); svs <- c(0, 0.41)
+  } else if (x1 == "C") {
+    y3 <- "G"; svs <- 0
+  } else {
+    y3 <- "A"; svs <- 0
+  }
+  data.frame(codon = paste0(y1, y2, y3), s = svs, stringsAsFactors = FALSE)
+}
+
+aa_of_codon <- setNames(as.character(gen_code), names(gen_code))
+ws_tai <- setNames(rep(0, length(gen_code)), names(gen_code))
+
+for (i in seq_len(nrow(trna_gcn))) {
+  ac  <- trna_gcn$anticodon[i]
+  aa  <- trna_gcn$amino_acid[i]
+  gcn <- trna_gcn$gcn[i]
+  decoded <- decode_anticodon(ac)
+  for (j in seq_len(nrow(decoded))) {
+    codon <- decoded$codon[j]; s_val <- decoded$s[j]
+    if (!is.na(aa_of_codon[codon]) && aa_of_codon[codon] == aa)
+      ws_tai[codon] <- ws_tai[codon] + (1 - s_val) * gcn
+  }
+}
+w_tai <- ws_tai / max(ws_tai[sense_codons])
+
+# --- FOP optimal codons (top 10% TE genes, sictrl normoxia) ---
+te_condition <- read_csv(here("output", "condition_level_te.csv"))
+te_ranked <- te_condition %>%
+  filter(condition == "normoxia", treatment == "sictrl") %>%
+  group_by(gene_id) %>%
+  summarise(mean_te = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mean_te)) %>%
+  arrange(desc(mean_te))
+
+top10_cutoff <- ceiling(nrow(te_ranked) * 0.10)
+top10_clean  <- sub("\\..*", "", te_ranked$gene_id[seq_len(top10_cutoff)])
+gene_id_clean <- sub("\\..*", "", te_lfc_matrix$gene_id)
+ref_tx_fop    <- te_lfc_matrix$transcript_id_clean[gene_id_clean %in% top10_clean]
+ref_tx_fop    <- ref_tx_fop[ref_tx_fop %in% rownames(counts_mat0)]
+
+ref_counts_fop    <- colSums(counts_mat0[ref_tx_fop, , drop = FALSE])
+optimal_codons    <- sapply(aa_to_codons, function(codons) codons[which.max(ref_counts_fop[codons])])
+optimal_codon_vec <- unname(optimal_codons)
+
+cat("FOP reference transcripts:", length(ref_tx_fop), "\n")
+cat("Optimal codons:", paste(sort(optimal_codon_vec), collapse = " "), "\n")
+```
+
+# Score Helper Functions
+
+```{r score_helpers}
+compute_cai <- function(counts_mat, w_vals, sense_codons) {
+  use <- sense_codons[!is.na(w_vals[sense_codons]) & w_vals[sense_codons] > 0]
+  apply(counts_mat, 1, function(g) {
+    c_use <- g[use]; w_use <- w_vals[use]
+    n <- sum(c_use)
+    if (n == 0) return(NA_real_)
+    exp(sum(c_use * log(w_use)) / n)
+  })
+}
+
+compute_tai <- function(counts_mat, w_vals, sense_codons) {
+  use <- sense_codons[!is.na(w_vals[sense_codons]) & w_vals[sense_codons] > 0]
+  apply(counts_mat, 1, function(g) {
+    c_use <- g[use]; w_use <- w_vals[use]
+    n <- sum(c_use)
+    if (n == 0) return(NA_real_)
+    exp(sum(c_use * log(w_use)) / n)
+  })
+}
+
+compute_fop <- function(counts_mat, optimal_codon_vec, stop_codons) {
+  sense_cols <- setdiff(colnames(counts_mat), stop_codons)
+  sense_tot  <- rowSums(counts_mat[, sense_cols, drop = FALSE])
+  opti_tot   <- rowSums(counts_mat[, optimal_codon_vec, drop = FALSE])
+  fop <- opti_tot / sense_tot
+  fop[sense_tot == 0] <- NA
+  fop
+}
+
+compute_csc <- function(seqs) {
+  predict_human <- iCodon::predict_stability("human")
+  cds_char <- as.character(seqs)
+  unique_seqs <- unique(cds_char)
+  unique_scores <- predict_human(unique_seqs)
+  names(unique_scores) <- unique_seqs
+  scores <- unique_scores[cds_char]
+  names(scores) <- names(seqs)
+  scores
+}
+```
+
+# Compute Scores for All Three Frames
+
+```{r score_frames}
+frames <- list(
+  frame0 = cds_frame0,
+  frame1 = cds_frame1,
+  frame2 = cds_frame2
+)
+
+score_list <- map(names(frames), function(fname) {
+  seqs <- frames[[fname]]
+  ct   <- codonTable(seqs)
+  cm   <- codonCounts(ct)
+  rownames(cm) <- names(seqs)
+
+  cat("\nScoring", fname, "...\n")
+  tibble(
+    transcript_id_clean = names(seqs),
+    frame = fname,
+    cai   = compute_cai(cm, w_cai, sense_codons),
+    tai   = compute_tai(cm, w_tai, sense_codons),
+    csc   = compute_csc(seqs),
+    fop   = compute_fop(cm, optimal_codon_vec, stop_codons)
+  )
+})
+
+scores_all <- bind_rows(score_list)
+scores_all$frame <- factor(scores_all$frame, levels = c("frame0", "frame1", "frame2"))
+
+cat("\nTotal rows:", nrow(scores_all), "\n")
+print(scores_all %>% group_by(frame) %>% summarise(
+  cai_med = round(median(cai, na.rm = TRUE), 3),
+  tai_med = round(median(tai, na.rm = TRUE), 3),
+  csc_med = round(median(csc, na.rm = TRUE), 3),
+  fop_med = round(median(fop, na.rm = TRUE), 3)
+))
+```
+
+# Validate Frame 0 FOP Against Pre-Computed Values
+
+Cross-check: frame 0 FOP computed here should match the `fop` column in
+`feature_matrix_codon_optimality.rds` (from 01g). Any systematic discrepancy
+would indicate a computation error.
+
+```{r validate_scores}
+codon_matrix <- readRDS(here("output", "predictive_modeling", "feature_matrix_codon_optimality.rds"))
+
+precomputed <- codon_matrix %>%
+  dplyr::select(transcript_id_clean, cai_01g = cai, tai_01g = tai,
+                csc_01g = csc, fop_01g = fop)
+
+frame0_scores <- scores_all %>%
+  filter(frame == "frame0") %>%
+  dplyr::select(transcript_id_clean, cai_17 = cai, tai_17 = tai,
+                csc_17 = csc, fop_17 = fop)
+
+score_compare <- inner_join(precomputed, frame0_scores, by = "transcript_id_clean")
+cat("Transcripts compared:", nrow(score_compare), "\n\n")
+
+for (sc in c("cai", "tai", "csc", "fop")) {
+  x <- score_compare[[paste0(sc, "_01g")]]
+  y <- score_compare[[paste0(sc, "_17")]]
+  r   <- round(cor(x, y, use = "complete.obs"), 4)
+  mad <- round(mean(abs(x - y), na.rm = TRUE), 6)
+  cat(sc, "— Pearson r:", r, "| mean abs diff:", mad, "\n")
+}
+```
+
+# Load Gene Sets
+
+Replicates the exact positive and negative sets from the 07 RF model
+(hypoxia, 1hr, LFC 0.5, set.seed(9)):
+- Positive: genes in feature matrix from `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`
+- Negative: `negative_control_genes.csv` filtered to feature matrix, then randomly
+  subsampled to match positive set size with set.seed(9)
+
+Note: scores are restricted to the representative transcript per gene
+(the one used in the feature matrix) to match model inputs exactly.
+
+```{r load_gene_sets}
+# Annotate transcripts with gene metadata
+# Use only the representative transcript per gene (one row per gene in feature matrix)
+tx_to_gene <- te_lfc_matrix %>%
+  dplyr::select(transcript_id_clean, symbol, gene_id) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+# Positive: eIF3d hypoxia promotes, 1hr
+# geneset CSV is pre-filtered; matches 07 params$timepoint = "1hr"
+hyp_promotes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+features_gene_ids <- sub("\\..*", "", te_lfc_matrix$gene_id)
+
+pos_in_features <- hyp_promotes %>%
+  filter(ensembl_gene %in% features_gene_ids)
+cat("Positive genes in feature matrix:", nrow(pos_in_features), "\n")
+
+# Negative: replicate 07 model sampling exactly (set.seed(9))
+neg_controls <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+neg_in_features <- neg_controls %>%
+  filter(gene_id_clean %in% features_gene_ids)
+cat("Negative control genes in feature matrix:", nrow(neg_in_features), "\n")
+
+number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+set.seed(9)
+neg_sampled_ids <- sample(neg_in_features$gene_id_clean, number_to_match)
+cat("Negative controls sampled (matched to positive set):", length(neg_sampled_ids), "\n")
+
+hyp_ids <- pos_in_features$ensembl_gene
+neg_ids <- neg_sampled_ids
+
+# tx_to_gene already has one row per representative transcript (from feature matrix)
+# so this join gives one score row per gene per frame
+plot_scores <- scores_all %>%
+  inner_join(tx_to_gene, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% hyp_ids | gene_id_clean %in% neg_ids) %>%
+  mutate(gene_set = case_when(
+    gene_id_clean %in% hyp_ids ~ "eIF3d hypoxia promotes",
+    gene_id_clean %in% neg_ids ~ "Negative control"
+  ))
+
+# Sanity check: no gene should appear in both sets
+overlap_check <- intersect(hyp_ids, neg_ids)
+cat("Gene IDs in both sets (should be 0):", length(overlap_check), "\n")
+
+cat("\nRows per gene set (all frames):\n")
+print(count(plot_scores, gene_set, frame))
+```
+
+# Prepare Plot Data
+
+```{r prep_plot}
+score_labels <- c(
+  cai = "CAI (Codon Adaptive Index)",
+  tai = "tAI (tRNA Adaptation Index)",
+  csc = "CSC (Codon Stabilisation Coef.)",
+  fop = "FOP (Frequency of Optimal Codons)"
+)
+
+set_colors   <- c("eIF3d hypoxia promotes" = "#E69F00", "Negative control" = "#000000")
+frame_labels <- c(frame0 = "Frame 0 (canonical)", frame1 = "Frame +1", frame2 = "Frame +2")
+
+# Foreground: pos/neg sets only
+plot_long <- plot_scores %>%
+  pivot_longer(cols = c(cai, tai, csc, fop), names_to = "score", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    score    = factor(score, levels = names(score_labels)),
+    frame    = factor(frame, levels = c("frame0", "frame1", "frame2")),
+    gene_set = factor(gene_set, levels = c("Negative control", "eIF3d hypoxia promotes"))
+  )
+
+# Background: all representative transcripts with scores
+plot_long_all <- scores_all %>%
+  inner_join(tx_to_gene, by = "transcript_id_clean") %>%
+  pivot_longer(cols = c(cai, tai, csc, fop), names_to = "score", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    score = factor(score, levels = names(score_labels)),
+    frame = factor(frame, levels = c("frame0", "frame1", "frame2"))
+  )
+```
+
+# Compute Statistics: Positive vs Negative per Frame × Score
+
+```{r stats}
+stat_results <- plot_long %>%
+  group_by(score, frame) %>%
+  group_modify(~ {
+    pos <- .x %>% filter(gene_set == "eIF3d hypoxia promotes") %>% pull(value)
+    neg <- .x %>% filter(gene_set == "Negative control")       %>% pull(value)
+    wt  <- wilcox.test(pos, neg, exact = FALSE)
+    tibble(
+      n_pos      = length(pos),
+      n_neg      = length(neg),
+      median_pos = round(median(pos, na.rm = TRUE), 4),
+      median_neg = round(median(neg, na.rm = TRUE), 4),
+      p_value    = wt$p.value,
+      p_label    = case_when(
+        wt$p.value < 0.001 ~ "***",
+        wt$p.value < 0.01  ~ "**",
+        wt$p.value < 0.05  ~ "*",
+        TRUE               ~ "ns"
+      )
+    )
+  }) %>%
+  ungroup()
+
+stat_results <- stat_results %>%
+  mutate(direction = case_when(
+    median_pos > median_neg ~ "promotes > neg_ctrl",
+    median_pos < median_neg ~ "promotes < neg_ctrl",
+    TRUE                    ~ "equal"
+  ))
+
+print(stat_results %>% dplyr::select(score, frame, median_pos, median_neg, direction, p_value, p_label))
+```
+
+# Visualize: Boxplots — Positive vs Negative, Faceted by Frame × Score
+
+```{r boxplots, fig.width=12, fig.height=8}
+# Join p-value labels for annotation
+# Position label at top of each panel
+annot_df <- plot_long %>%
+  group_by(score, frame) %>%
+  summarise(y_pos = max(value, na.rm = TRUE) * 1.05, .groups = "drop") %>%
+  left_join(stat_results %>% dplyr::select(score, frame, p_label), by = c("score", "frame")) %>%
+  mutate(gene_set = factor("eIF3d hypoxia promotes",
+                           levels = c("Negative control", "eIF3d hypoxia promotes")))
+
+p_box <- ggplot(plot_long, aes(x = gene_set, y = value, color = gene_set, fill = gene_set)) +
+  geom_boxplot(alpha = 0.2, outlier.size = 0.4, linewidth = 0.7, width = 0.6) +
+  geom_text(
+    data = annot_df,
+    aes(x = 1.5, y = y_pos, label = p_label),
+    inherit.aes = FALSE, size = 4, fontface = "bold"
+  ) +
+  ggh4x::facet_grid2(frame ~ score,
+                     scales = "free_y", independent = "y",
+                     labeller = labeller(score = score_labels, frame = frame_labels)) +
+  scale_x_discrete(labels = c("Neg ctrl", "Promotes")) +
+  scale_color_manual(values = set_colors) +
+  scale_fill_manual(values = set_colors) +
+  labs(
+    title    = "Codon optimality: eIF3d hypoxia promotes vs negative controls",
+    subtitle = "Rows = reading frame; *** p<0.001, ** p<0.01, * p<0.05, ns = not significant (Wilcoxon)",
+    x = NULL, y = "Score"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position  = "none",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 30, hjust = 1)
+  )
+
+p_box
+
+ggsave(here("plots", "frame_control_codon_scores_boxplot.pdf"),
+       p_box, width = 12, height = 8)
+cat("Saved: plots/frame_control_codon_scores_boxplot.pdf\n")
+```
+
+# Visualize: Density Plots — Grey background + colored overlays, Faceted by Frame × Score
+
+```{r density_plots, fig.width=12, fig.height=8}
+# Median lines per gene_set × score × frame for vertical reference
+median_lines <- plot_long %>%
+  group_by(gene_set, score, frame) %>%
+  summarise(med = median(value, na.rm = TRUE), .groups = "drop")
+
+p_density <- ggplot() +
+  # Grey background: all expressed genes
+  geom_density(
+    data = plot_long_all,
+    aes(x = value, group = frame),
+    color = NA, fill = "grey80", alpha = 0.6
+  ) +
+  # Colored overlays: negative control (black) and promotes (orange)
+  geom_density(
+    data = plot_long,
+    aes(x = value, color = gene_set, fill = gene_set),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  # Vertical median lines
+  geom_vline(
+    data = median_lines,
+    aes(xintercept = med, color = gene_set),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  ggh4x::facet_grid2(frame ~ score,
+                     scales = "free", independent = "y",
+                     labeller = labeller(score = score_labels, frame = frame_labels)) +
+  scale_color_manual(
+    values = set_colors,
+    labels = c("Negative control", "eIF3d hypoxia promotes")
+  ) +
+  scale_fill_manual(
+    values = set_colors,
+    labels = c("Negative control", "eIF3d hypoxia promotes")
+  ) +
+  labs(
+    title    = "Codon optimality: eIF3d hypoxia promotes vs negative controls",
+    subtitle = "Grey = all expressed genes; Rows = reading frame; Frame 0 = canonical CDS, frames +1/+2 = shifted controls",
+    x = "Score", y = "Density",
+    color = NULL, fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position  = "top",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold")
+  )
+
+p_density
+
+ggsave(here("plots", "frame_control_codon_scores_density.pdf"),
+       p_density, width = 12, height = 8)
+cat("Saved: plots/frame_control_codon_scores_density.pdf\n")
+```
+
+## CSC by Frame (standalone)
+
+```{r csc_frame_plot, fig.width=5, fig.height=7}
+csc_long     <- plot_long     %>% filter(score == "csc")
+csc_long_all <- plot_long_all %>% filter(score == "csc")
+
+median_lines_csc <- csc_long %>%
+  group_by(gene_set, frame) %>%
+  summarise(med = median(value, na.rm = TRUE), .groups = "drop")
+
+p_csc_frames <- ggplot() +
+  geom_density(
+    data = csc_long_all,
+    aes(x = value, group = frame),
+    color = NA, fill = "grey80", alpha = 0.6
+  ) +
+  geom_density(
+    data = csc_long,
+    aes(x = value, color = gene_set, fill = gene_set),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_vline(
+    data = median_lines_csc,
+    aes(xintercept = med, color = gene_set),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  facet_wrap(~ frame, nrow = 3,
+             labeller = labeller(frame = frame_labels)) +
+  scale_color_manual(values = set_colors) +
+  scale_fill_manual(values  = set_colors) +
+  labs(
+    title    = "CSC by reading frame",
+    subtitle = "Grey = all genes; frame 0 = canonical CDS, +1/+2 = frameshift controls",
+    x = "CSC (Codon Stabilisation Coefficient)", y = "Density",
+    color = NULL, fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position  = "top",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold")
+  )
+
+p_csc_frames
+ggsave(here("plots", "frame_control_csc_density.pdf"),
+       p_csc_frames, width = 5, height = 7)
+cat("Saved: plots/frame_control_csc_density.pdf\n")
+```
+
+# Statistical Summary Table
+
+```{r stats_print}
+print(stat_results)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

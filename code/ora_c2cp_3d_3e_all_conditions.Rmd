@@ -1,0 +1,737 @@
+---
+title: "ORA: C2 Canonical Pathways — si3d and si3e, all conditions"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+Over-representation analysis (ORA) using MSigDB C2 Canonical Pathways (C2:CP) for genes
+with significant translational efficiency (TE) changes:
+
+- **Promoted**: TE LFC > 0.5, te_padj < 0.05
+- **Repressed**: TE LFC < −0.5, te_padj < 0.05
+
+**Factors:** si3d, si3e
+**Conditions:** Normoxia 1+4hr (time-regressed), Hypoxia 1hr, 4hr, 24hr
+
+```{r load_libraries}
+library(here)
+library(tidyverse)
+library(clusterProfiler)
+library(msigdbr)
+library(writexl)
+library(enrichplot)
+library(pheatmap)
+
+cat("Libraries loaded\n")
+```
+
+# Load C2 Canonical Pathway Gene Sets
+
+```{r load_c2cp}
+c2_cp_sets <- msigdbr(species = "Homo sapiens", category = "C2") %>%
+  filter(grepl("^CP", gs_subcat))
+
+c2_cp_term2gene <- c2_cp_sets %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("C2:CP pathways loaded:", length(unique(c2_cp_term2gene$gs_name)), "\n")
+```
+
+# Load Input Files
+
+```{r load_data}
+# si3d files
+si3d_norm <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"))
+si3d_hyp1 <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"))
+si3d_hyp4 <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"))
+si3d_hyp24 <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv"))
+
+# si3e files
+si3e_norm <- read_csv(here("output", "te_si3e_vs_sictrl_normoxia_1and4hr.csv"))
+si3e_hyp1 <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv"))
+si3e_hyp4 <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_hypoxia_4hr.csv"))
+si3e_hyp24 <- read_csv(here("output", "translation_categories_si3e_vs_sictrl_hypoxia_24hr.csv"))
+
+cat("All input files loaded\n")
+
+# Summarize gene counts
+for (nm in c("si3d_norm", "si3d_hyp1", "si3d_hyp4", "si3d_hyp24",
+             "si3e_norm", "si3e_hyp1", "si3e_hyp4", "si3e_hyp24")) {
+  df <- get(nm)
+  cat(nm, "- rows:", nrow(df),
+      "| promoted:", sum(df$te_lfc > 0.5 & df$te_padj < 0.05, na.rm = TRUE),
+      "| repressed:", sum(df$te_lfc < -0.5 & df$te_padj < 0.05, na.rm = TRUE), "\n")
+}
+```
+
+# ORA Function
+
+```{r ora_function}
+run_ora <- function(df, direction, term2gene, label) {
+  bg <- df %>% filter(!is.na(symbol)) %>% pull(symbol)
+  genes <- if (direction == "promoted") {
+    df %>% filter(te_lfc > 0.5, te_padj < 0.05, !is.na(symbol)) %>% pull(symbol)
+  } else {
+    df %>% filter(te_lfc < -0.5, te_padj < 0.05, !is.na(symbol)) %>% pull(symbol)
+  }
+  cat(label, direction, "- genes:", length(genes), "| background:", length(bg), "\n")
+  if (length(genes) < 5) {
+    cat("  Too few genes, skipping\n")
+    return(NULL)
+  }
+  enricher(
+    gene = genes,
+    universe = bg,
+    TERM2GENE = term2gene,
+    pAdjustMethod = "fdr",
+    pvalueCutoff = 1,
+    qvalueCutoff = 1,
+    minGSSize = 10,
+    maxGSSize = 500
+  )
+}
+
+extract_results <- function(ora_res, label) {
+  if (is.null(ora_res) || nrow(ora_res@result) == 0) {
+    cat("  No results for:", label, "\n")
+    return(NULL)
+  }
+  ora_res@result %>%
+    dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count, geneID) %>%
+    mutate(
+      gene_ratio_num = sapply(strsplit(GeneRatio, "/"), function(x) as.integer(x[1]) / as.integer(x[2])),
+      bg_ratio_num   = sapply(strsplit(BgRatio,   "/"), function(x) as.integer(x[1]) / as.integer(x[2])),
+      fold_enrichment = round(gene_ratio_num / bg_ratio_num, 4),
+      pvalue = round(pvalue, 6),
+      p.adjust = round(p.adjust, 6)
+    ) %>%
+    dplyr::select(-gene_ratio_num, -bg_ratio_num) %>%
+    arrange(p.adjust)
+}
+```
+
+# Run ORA — si3d
+
+## si3d Normoxia 1+4hr
+
+```{r ora_si3d_norm}
+ora_si3d_norm_prom <- run_ora(si3d_norm, "promoted",  c2_cp_term2gene, "si3d_normoxia")
+ora_si3d_norm_repr <- run_ora(si3d_norm, "repressed", c2_cp_term2gene, "si3d_normoxia")
+
+res_si3d_norm_prom <- extract_results(ora_si3d_norm_prom, "si3d_norm_promoted")
+res_si3d_norm_repr <- extract_results(ora_si3d_norm_repr, "si3d_norm_repressed")
+
+cat("si3d normoxia promoted - significant:", if (!is.null(res_si3d_norm_prom)) sum(res_si3d_norm_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d normoxia repressed - significant:", if (!is.null(res_si3d_norm_repr)) sum(res_si3d_norm_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## si3d Hypoxia 1hr
+
+```{r ora_si3d_hyp1}
+ora_si3d_hyp1_prom <- run_ora(si3d_hyp1, "promoted",  c2_cp_term2gene, "si3d_hyp1hr")
+ora_si3d_hyp1_repr <- run_ora(si3d_hyp1, "repressed", c2_cp_term2gene, "si3d_hyp1hr")
+
+res_si3d_hyp1_prom <- extract_results(ora_si3d_hyp1_prom, "si3d_hyp1_promoted")
+res_si3d_hyp1_repr <- extract_results(ora_si3d_hyp1_repr, "si3d_hyp1_repressed")
+
+cat("si3d hyp 1hr promoted - significant:", if (!is.null(res_si3d_hyp1_prom)) sum(res_si3d_hyp1_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d hyp 1hr repressed - significant:", if (!is.null(res_si3d_hyp1_repr)) sum(res_si3d_hyp1_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## si3d Hypoxia 4hr
+
+```{r ora_si3d_hyp4}
+ora_si3d_hyp4_prom <- run_ora(si3d_hyp4, "promoted",  c2_cp_term2gene, "si3d_hyp4hr")
+ora_si3d_hyp4_repr <- run_ora(si3d_hyp4, "repressed", c2_cp_term2gene, "si3d_hyp4hr")
+
+res_si3d_hyp4_prom <- extract_results(ora_si3d_hyp4_prom, "si3d_hyp4_promoted")
+res_si3d_hyp4_repr <- extract_results(ora_si3d_hyp4_repr, "si3d_hyp4_repressed")
+
+cat("si3d hyp 4hr promoted - significant:", if (!is.null(res_si3d_hyp4_prom)) sum(res_si3d_hyp4_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d hyp 4hr repressed - significant:", if (!is.null(res_si3d_hyp4_repr)) sum(res_si3d_hyp4_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## si3d Hypoxia 24hr
+
+```{r ora_si3d_hyp24}
+ora_si3d_hyp24_prom <- run_ora(si3d_hyp24, "promoted",  c2_cp_term2gene, "si3d_hyp24hr")
+ora_si3d_hyp24_repr <- run_ora(si3d_hyp24, "repressed", c2_cp_term2gene, "si3d_hyp24hr")
+
+res_si3d_hyp24_prom <- extract_results(ora_si3d_hyp24_prom, "si3d_hyp24_promoted")
+res_si3d_hyp24_repr <- extract_results(ora_si3d_hyp24_repr, "si3d_hyp24_repressed")
+
+cat("si3d hyp 24hr promoted - significant:", if (!is.null(res_si3d_hyp24_prom)) sum(res_si3d_hyp24_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d hyp 24hr repressed - significant:", if (!is.null(res_si3d_hyp24_repr)) sum(res_si3d_hyp24_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+# Run ORA — si3e
+
+## si3e Normoxia 1+4hr
+
+```{r ora_si3e_norm}
+ora_si3e_norm_prom <- run_ora(si3e_norm, "promoted",  c2_cp_term2gene, "si3e_normoxia")
+ora_si3e_norm_repr <- run_ora(si3e_norm, "repressed", c2_cp_term2gene, "si3e_normoxia")
+
+res_si3e_norm_prom <- extract_results(ora_si3e_norm_prom, "si3e_norm_promoted")
+res_si3e_norm_repr <- extract_results(ora_si3e_norm_repr, "si3e_norm_repressed")
+
+cat("si3e normoxia promoted - significant:", if (!is.null(res_si3e_norm_prom)) sum(res_si3e_norm_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e normoxia repressed - significant:", if (!is.null(res_si3e_norm_repr)) sum(res_si3e_norm_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## si3e Hypoxia 1hr
+
+```{r ora_si3e_hyp1}
+ora_si3e_hyp1_prom <- run_ora(si3e_hyp1, "promoted",  c2_cp_term2gene, "si3e_hyp1hr")
+ora_si3e_hyp1_repr <- run_ora(si3e_hyp1, "repressed", c2_cp_term2gene, "si3e_hyp1hr")
+
+res_si3e_hyp1_prom <- extract_results(ora_si3e_hyp1_prom, "si3e_hyp1_promoted")
+res_si3e_hyp1_repr <- extract_results(ora_si3e_hyp1_repr, "si3e_hyp1_repressed")
+
+cat("si3e hyp 1hr promoted - significant:", if (!is.null(res_si3e_hyp1_prom)) sum(res_si3e_hyp1_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e hyp 1hr repressed - significant:", if (!is.null(res_si3e_hyp1_repr)) sum(res_si3e_hyp1_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## si3e Hypoxia 4hr
+
+```{r ora_si3e_hyp4}
+ora_si3e_hyp4_prom <- run_ora(si3e_hyp4, "promoted",  c2_cp_term2gene, "si3e_hyp4hr")
+ora_si3e_hyp4_repr <- run_ora(si3e_hyp4, "repressed", c2_cp_term2gene, "si3e_hyp4hr")
+
+res_si3e_hyp4_prom <- extract_results(ora_si3e_hyp4_prom, "si3e_hyp4_promoted")
+res_si3e_hyp4_repr <- extract_results(ora_si3e_hyp4_repr, "si3e_hyp4_repressed")
+
+cat("si3e hyp 4hr promoted - significant:", if (!is.null(res_si3e_hyp4_prom)) sum(res_si3e_hyp4_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e hyp 4hr repressed - significant:", if (!is.null(res_si3e_hyp4_repr)) sum(res_si3e_hyp4_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## si3e Hypoxia 24hr
+
+```{r ora_si3e_hyp24}
+ora_si3e_hyp24_prom <- run_ora(si3e_hyp24, "promoted",  c2_cp_term2gene, "si3e_hyp24hr")
+ora_si3e_hyp24_repr <- run_ora(si3e_hyp24, "repressed", c2_cp_term2gene, "si3e_hyp24hr")
+
+res_si3e_hyp24_prom <- extract_results(ora_si3e_hyp24_prom, "si3e_hyp24_promoted")
+res_si3e_hyp24_repr <- extract_results(ora_si3e_hyp24_repr, "si3e_hyp24_repressed")
+
+cat("si3e hyp 24hr promoted - significant:", if (!is.null(res_si3e_hyp24_prom)) sum(res_si3e_hyp24_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e hyp 24hr repressed - significant:", if (!is.null(res_si3e_hyp24_repr)) sum(res_si3e_hyp24_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+# Dotplots
+
+```{r plot_function}
+make_dotplot <- function(ora_res, label, direction, outfile) {
+  if (is.null(ora_res)) {
+    cat("No results for:", label, direction, "\n")
+    return(invisible(NULL))
+  }
+  sig <- ora_res@result %>% filter(p.adjust < 0.05)
+  if (nrow(sig) == 0) {
+    cat("No significant pathways (p.adjust < 0.05) for:", label, direction, "\n")
+    return(invisible(NULL))
+  }
+  cat("Plotting", nrow(sig), "significant pathways for:", label, direction, "\n")
+  p <- dotplot(ora_res, showCategory = nrow(sig)) +
+    ggtitle(paste(label, direction))
+  pdf(outfile, width = 10, height = max(4, nrow(sig) * 0.35 + 2))
+  print(p)
+  dev.off()
+  cat("Saved:", outfile, "\n")
+  p
+}
+```
+
+## si3d Plots
+
+```{r plot_si3d_norm}
+make_dotplot(ora_si3d_norm_prom, "si3d_normoxia", "promoted",
+             here("plots", "ora_c2cp_si3d_normoxia_promoted.pdf"))
+make_dotplot(ora_si3d_norm_repr, "si3d_normoxia", "repressed",
+             here("plots", "ora_c2cp_si3d_normoxia_repressed.pdf"))
+```
+
+```{r plot_si3d_hyp1}
+make_dotplot(ora_si3d_hyp1_prom, "si3d_hyp1hr", "promoted",
+             here("plots", "ora_c2cp_si3d_hyp1hr_promoted.pdf"))
+make_dotplot(ora_si3d_hyp1_repr, "si3d_hyp1hr", "repressed",
+             here("plots", "ora_c2cp_si3d_hyp1hr_repressed.pdf"))
+```
+
+```{r plot_si3d_hyp4}
+make_dotplot(ora_si3d_hyp4_prom, "si3d_hyp4hr", "promoted",
+             here("plots", "ora_c2cp_si3d_hyp4hr_promoted.pdf"))
+make_dotplot(ora_si3d_hyp4_repr, "si3d_hyp4hr", "repressed",
+             here("plots", "ora_c2cp_si3d_hyp4hr_repressed.pdf"))
+```
+
+```{r plot_si3d_hyp24}
+make_dotplot(ora_si3d_hyp24_prom, "si3d_hyp24hr", "promoted",
+             here("plots", "ora_c2cp_si3d_hyp24hr_promoted.pdf"))
+make_dotplot(ora_si3d_hyp24_repr, "si3d_hyp24hr", "repressed",
+             here("plots", "ora_c2cp_si3d_hyp24hr_repressed.pdf"))
+```
+
+## si3e Plots
+
+```{r plot_si3e_norm}
+make_dotplot(ora_si3e_norm_prom, "si3e_normoxia", "promoted",
+             here("plots", "ora_c2cp_si3e_normoxia_promoted.pdf"))
+make_dotplot(ora_si3e_norm_repr, "si3e_normoxia", "repressed",
+             here("plots", "ora_c2cp_si3e_normoxia_repressed.pdf"))
+```
+
+```{r plot_si3e_hyp1}
+make_dotplot(ora_si3e_hyp1_prom, "si3e_hyp1hr", "promoted",
+             here("plots", "ora_c2cp_si3e_hyp1hr_promoted.pdf"))
+make_dotplot(ora_si3e_hyp1_repr, "si3e_hyp1hr", "repressed",
+             here("plots", "ora_c2cp_si3e_hyp1hr_repressed.pdf"))
+```
+
+```{r plot_si3e_hyp4}
+make_dotplot(ora_si3e_hyp4_prom, "si3e_hyp4hr", "promoted",
+             here("plots", "ora_c2cp_si3e_hyp4hr_promoted.pdf"))
+make_dotplot(ora_si3e_hyp4_repr, "si3e_hyp4hr", "repressed",
+             here("plots", "ora_c2cp_si3e_hyp4hr_repressed.pdf"))
+```
+
+```{r plot_si3e_hyp24}
+make_dotplot(ora_si3e_hyp24_prom, "si3e_hyp24hr", "promoted",
+             here("plots", "ora_c2cp_si3e_hyp24hr_promoted.pdf"))
+make_dotplot(ora_si3e_hyp24_repr, "si3e_hyp24hr", "repressed",
+             here("plots", "ora_c2cp_si3e_hyp24hr_repressed.pdf"))
+```
+
+# Export to Excel
+
+```{r export_xlsx}
+# Helper to get significant results or empty df for a sheet
+sig_or_empty <- function(res) {
+  empty <- data.frame(
+    ID = character(), GeneRatio = character(), BgRatio = character(),
+    pvalue = numeric(), p.adjust = numeric(), Count = integer(),
+    geneID = character(), fold_enrichment = numeric(),
+    stringsAsFactors = FALSE
+  )
+  if (is.null(res)) return(empty)
+  out <- res %>% filter(p.adjust < 0.05)
+  if (nrow(out) == 0) return(empty)
+  out %>% dplyr::select(ID, GeneRatio, BgRatio, pvalue, p.adjust, Count, geneID, fold_enrichment)
+}
+
+sheets <- list(
+  si3d_normoxia_promoted  = sig_or_empty(res_si3d_norm_prom),
+  si3d_normoxia_repressed = sig_or_empty(res_si3d_norm_repr),
+  si3d_hyp_1hr_promoted   = sig_or_empty(res_si3d_hyp1_prom),
+  si3d_hyp_1hr_repressed  = sig_or_empty(res_si3d_hyp1_repr),
+  si3d_hyp_4hr_promoted   = sig_or_empty(res_si3d_hyp4_prom),
+  si3d_hyp_4hr_repressed  = sig_or_empty(res_si3d_hyp4_repr),
+  si3d_hyp_24hr_promoted  = sig_or_empty(res_si3d_hyp24_prom),
+  si3d_hyp_24hr_repressed = sig_or_empty(res_si3d_hyp24_repr),
+  si3e_normoxia_promoted  = sig_or_empty(res_si3e_norm_prom),
+  si3e_normoxia_repressed = sig_or_empty(res_si3e_norm_repr),
+  si3e_hyp_1hr_promoted   = sig_or_empty(res_si3e_hyp1_prom),
+  si3e_hyp_1hr_repressed  = sig_or_empty(res_si3e_hyp1_repr),
+  si3e_hyp_4hr_promoted   = sig_or_empty(res_si3e_hyp4_prom),
+  si3e_hyp_4hr_repressed  = sig_or_empty(res_si3e_hyp4_repr),
+  si3e_hyp_24hr_promoted  = sig_or_empty(res_si3e_hyp24_prom),
+  si3e_hyp_24hr_repressed = sig_or_empty(res_si3e_hyp24_repr)
+)
+
+write_xlsx(sheets, here("output", "ora_c2cp_3d_3e_all_conditions.xlsx"))
+cat("Saved: output/ora_c2cp_3d_3e_all_conditions.xlsx\n")
+cat("Sheets:", paste(names(sheets), collapse = ", "), "\n")
+
+# Summary of significant results per sheet
+cat("\nSignificant pathways per condition:\n")
+for (nm in names(sheets)) {
+  cat(sprintf("  %-35s: %d\n", nm, nrow(sheets[[nm]])))
+}
+```
+
+# Heatmaps
+
+Cross-condition heatmaps colored by signed fold-enrichment (promoted = positive, repressed = negative).
+
+```{r heatmap_helpers}
+# Combine promoted/repressed ORA results for one condition into a signed df.
+# If a pathway appears in both, keep the row with the lower p.adjust.
+build_signed_ora_df <- function(res_prom, res_repr, cond_label) {
+  rows <- list()
+  if (!is.null(res_prom) && nrow(res_prom) > 0)
+    rows[["prom"]] <- res_prom %>% mutate(signed_fe = fold_enrichment, direction = "promoted")
+  if (!is.null(res_repr) && nrow(res_repr) > 0)
+    rows[["repr"]] <- res_repr %>% mutate(signed_fe = -fold_enrichment, direction = "repressed")
+  if (length(rows) == 0) return(NULL)
+  bind_rows(rows) %>%
+    group_by(ID) %>%
+    slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(condition = cond_label) %>%
+    dplyr::select(ID, signed_fe, p.adjust, condition)
+}
+
+# Build and save a pheatmap for one factor (si3d or si3e).
+make_ora_heatmap <- function(cond_list, factor_label, outfile) {
+  combined <- bind_rows(cond_list)
+  if (is.null(combined) || nrow(combined) == 0) {
+    cat("No data for:", factor_label, "\n")
+    return(invisible(NULL))
+  }
+
+  sig_pathways <- combined %>% filter(p.adjust < 0.05) %>% pull(ID) %>% unique()
+  if (length(sig_pathways) == 0) {
+    cat("No significant pathways for:", factor_label, "\n")
+    return(invisible(NULL))
+  }
+  cat(factor_label, "- significant pathways:", length(sig_pathways), "\n")
+
+  col_order <- c("Normoxia", "Hyp 1hr", "Hyp 4hr", "Hyp 24hr")
+
+  # Wide matrix — signed fold_enrichment; 0 for untested/non-significant cells
+  wide <- combined %>%
+    filter(ID %in% sig_pathways) %>%
+    dplyr::select(ID, signed_fe, condition) %>%
+    pivot_wider(names_from = condition, values_from = signed_fe, values_fill = 0) %>%
+    column_to_rownames("ID")
+  for (cn in col_order) if (!cn %in% colnames(wide)) wide[[cn]] <- 0
+  wide <- wide[, col_order, drop = FALSE]
+
+  # Significance matrix — asterisk where p.adjust < 0.05
+  sig_mat <- combined %>%
+    filter(ID %in% sig_pathways) %>%
+    mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+    dplyr::select(ID, sig, condition) %>%
+    pivot_wider(names_from = condition, values_from = sig, values_fill = "") %>%
+    column_to_rownames("ID")
+  for (cn in col_order) if (!cn %in% colnames(sig_mat)) sig_mat[[cn]] <- ""
+  sig_mat <- sig_mat[rownames(wide), col_order, drop = FALSE]
+
+  max_abs <- max(abs(wide), na.rm = TRUE)
+  max_abs <- max(max_abs, 1)
+
+  p <- pheatmap(
+    wide,
+    cluster_rows    = TRUE,
+    cluster_cols    = FALSE,
+    scale           = "none",
+    color           = colorRampPalette(c("blue", "white", "red"))(100),
+    breaks          = seq(-max_abs, max_abs, length.out = 101),
+    display_numbers = sig_mat,
+    number_color    = "black",
+    fontsize_number = 12,
+    main            = paste0("C2:CP ORA \u2014 ", factor_label,
+                             "\n(signed fold-enrichment; * = p.adjust < 0.05)"),
+    fontsize_row    = 7,
+    fontsize_col    = 10,
+    cellwidth       = 40,
+    cellheight      = 12
+  )
+
+  pdf(outfile, width = 14, height = max(4, length(sig_pathways) * 0.18 + 3))
+  print(p)
+  dev.off()
+  cat("Saved:", outfile, "\n")
+  p
+}
+
+# Heatmap for a single direction (promoted or repressed).
+# res_list: named list of 4 extract_results() dfs (one per condition).
+# Colors by fold_enrichment on a white-to-red scale (all values positive).
+make_ora_heatmap_dir <- function(res_list, factor_label, direction_label, outfile) {
+  combined <- bind_rows(
+    lapply(names(res_list), function(cond) {
+      res <- res_list[[cond]]
+      if (is.null(res) || nrow(res) == 0) return(NULL)
+      res %>% mutate(condition = cond) %>%
+        dplyr::select(ID, fold_enrichment, p.adjust, condition)
+    })
+  )
+  if (is.null(combined) || nrow(combined) == 0) {
+    cat("No data for:", factor_label, direction_label, "\n")
+    return(invisible(NULL))
+  }
+
+  sig_pathways <- combined %>% filter(p.adjust < 0.05) %>% pull(ID) %>% unique()
+  if (length(sig_pathways) == 0) {
+    cat("No significant pathways for:", factor_label, direction_label, "\n")
+    return(invisible(NULL))
+  }
+  cat(factor_label, direction_label, "- significant pathways:", length(sig_pathways), "\n")
+
+  col_order <- c("Normoxia", "Hyp 1hr", "Hyp 4hr", "Hyp 24hr")
+
+  wide <- combined %>%
+    filter(ID %in% sig_pathways) %>%
+    dplyr::select(ID, fold_enrichment, condition) %>%
+    pivot_wider(names_from = condition, values_from = fold_enrichment, values_fill = 0) %>%
+    column_to_rownames("ID")
+  for (cn in col_order) if (!cn %in% colnames(wide)) wide[[cn]] <- 0
+  wide <- wide[, col_order, drop = FALSE]
+
+  sig_mat <- combined %>%
+    filter(ID %in% sig_pathways) %>%
+    mutate(sig = ifelse(p.adjust < 0.05, "*", "")) %>%
+    dplyr::select(ID, sig, condition) %>%
+    pivot_wider(names_from = condition, values_from = sig, values_fill = "") %>%
+    column_to_rownames("ID")
+  for (cn in col_order) if (!cn %in% colnames(sig_mat)) sig_mat[[cn]] <- ""
+  sig_mat <- sig_mat[rownames(wide), col_order, drop = FALSE]
+
+  max_fe <- max(wide, na.rm = TRUE)
+  max_fe <- max(max_fe, 1)
+
+  p <- pheatmap(
+    wide,
+    cluster_rows    = TRUE,
+    cluster_cols    = FALSE,
+    scale           = "none",
+    color           = colorRampPalette(c("white", "red"))(100),
+    breaks          = seq(0, max_fe, length.out = 101),
+    display_numbers = sig_mat,
+    number_color    = "black",
+    fontsize_number = 12,
+    main            = paste0("ORA \u2014 ", factor_label, " (", direction_label, ")",
+                             "\n(fold-enrichment; * = p.adjust < 0.05)"),
+    fontsize_row    = 7,
+    fontsize_col    = 10,
+    cellwidth       = 40,
+    cellheight      = 12
+  )
+
+  pdf(outfile, width = 14, height = max(4, length(sig_pathways) * 0.18 + 3))
+  print(p)
+  dev.off()
+  cat("Saved:", outfile, "\n")
+  p
+}
+```
+
+## si3d Heatmap
+
+```{r heatmap_si3d}
+si3d_cond_list <- list(
+  "Normoxia" = build_signed_ora_df(res_si3d_norm_prom,  res_si3d_norm_repr,  "Normoxia"),
+  "Hyp 1hr"  = build_signed_ora_df(res_si3d_hyp1_prom,  res_si3d_hyp1_repr,  "Hyp 1hr"),
+  "Hyp 4hr"  = build_signed_ora_df(res_si3d_hyp4_prom,  res_si3d_hyp4_repr,  "Hyp 4hr"),
+  "Hyp 24hr" = build_signed_ora_df(res_si3d_hyp24_prom, res_si3d_hyp24_repr, "Hyp 24hr")
+)
+make_ora_heatmap(si3d_cond_list, "si3d", here("plots", "ora_c2cp_si3d_heatmap.pdf"))
+```
+
+## si3e Heatmap
+
+```{r heatmap_si3e}
+si3e_cond_list <- list(
+  "Normoxia" = build_signed_ora_df(res_si3e_norm_prom,  res_si3e_norm_repr,  "Normoxia"),
+  "Hyp 1hr"  = build_signed_ora_df(res_si3e_hyp1_prom,  res_si3e_hyp1_repr,  "Hyp 1hr"),
+  "Hyp 4hr"  = build_signed_ora_df(res_si3e_hyp4_prom,  res_si3e_hyp4_repr,  "Hyp 4hr"),
+  "Hyp 24hr" = build_signed_ora_df(res_si3e_hyp24_prom, res_si3e_hyp24_repr, "Hyp 24hr")
+)
+make_ora_heatmap(si3e_cond_list, "si3e", here("plots", "ora_c2cp_si3e_heatmap.pdf"))
+```
+
+## C2:CP Directional Heatmaps
+
+Separate heatmaps per direction (fold-enrichment, white–red scale).
+
+```{r heatmap_c2cp_si3d_dir}
+make_ora_heatmap_dir(
+  list("Normoxia" = res_si3d_norm_prom, "Hyp 1hr" = res_si3d_hyp1_prom,
+       "Hyp 4hr"  = res_si3d_hyp4_prom, "Hyp 24hr" = res_si3d_hyp24_prom),
+  "si3d C2:CP", "promoted",
+  here("plots", "ora_c2cp_si3d_promoted_heatmap.pdf"))
+
+make_ora_heatmap_dir(
+  list("Normoxia" = res_si3d_norm_repr, "Hyp 1hr" = res_si3d_hyp1_repr,
+       "Hyp 4hr"  = res_si3d_hyp4_repr, "Hyp 24hr" = res_si3d_hyp24_repr),
+  "si3d C2:CP", "repressed",
+  here("plots", "ora_c2cp_si3d_repressed_heatmap.pdf"))
+```
+
+```{r heatmap_c2cp_si3e_dir}
+make_ora_heatmap_dir(
+  list("Normoxia" = res_si3e_norm_prom, "Hyp 1hr" = res_si3e_hyp1_prom,
+       "Hyp 4hr"  = res_si3e_hyp4_prom, "Hyp 24hr" = res_si3e_hyp24_prom),
+  "si3e C2:CP", "promoted",
+  here("plots", "ora_c2cp_si3e_promoted_heatmap.pdf"))
+
+make_ora_heatmap_dir(
+  list("Normoxia" = res_si3e_norm_repr, "Hyp 1hr" = res_si3e_hyp1_repr,
+       "Hyp 4hr"  = res_si3e_hyp4_repr, "Hyp 24hr" = res_si3e_hyp24_repr),
+  "si3e C2:CP", "repressed",
+  here("plots", "ora_c2cp_si3e_repressed_heatmap.pdf"))
+```
+
+# KEGG ORA
+
+## Load KEGG Gene Sets
+
+```{r load_kegg}
+# MSigDB renamed KEGG subcategory in v7.2+ (CP:KEGG_LEGACY); use grepl to catch any version
+cat("C2:CP subcategories available:", paste(unique(c2_cp_sets$gs_subcat), collapse = ", "), "\n")
+
+kegg_term2gene <- c2_cp_sets %>%
+  filter(grepl("KEGG", gs_subcat, ignore.case = TRUE)) %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat("KEGG pathways loaded:", length(unique(kegg_term2gene$gs_name)), "\n")
+if (nrow(kegg_term2gene) == 0) stop("No KEGG pathways found — check gs_subcat names above")
+```
+
+## Run ORA — si3d KEGG
+
+```{r kegg_ora_si3d_norm}
+kegg_ora_si3d_norm_prom <- run_ora(si3d_norm, "promoted",  kegg_term2gene, "si3d_normoxia_kegg")
+kegg_ora_si3d_norm_repr <- run_ora(si3d_norm, "repressed", kegg_term2gene, "si3d_normoxia_kegg")
+
+kegg_res_si3d_norm_prom <- extract_results(kegg_ora_si3d_norm_prom, "si3d_norm_promoted_kegg")
+kegg_res_si3d_norm_repr <- extract_results(kegg_ora_si3d_norm_repr, "si3d_norm_repressed_kegg")
+
+cat("si3d normoxia promoted - significant:", if (!is.null(kegg_res_si3d_norm_prom)) sum(kegg_res_si3d_norm_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d normoxia repressed - significant:", if (!is.null(kegg_res_si3d_norm_repr)) sum(kegg_res_si3d_norm_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+```{r kegg_ora_si3d_hyp1}
+kegg_ora_si3d_hyp1_prom <- run_ora(si3d_hyp1, "promoted",  kegg_term2gene, "si3d_hyp1hr_kegg")
+kegg_ora_si3d_hyp1_repr <- run_ora(si3d_hyp1, "repressed", kegg_term2gene, "si3d_hyp1hr_kegg")
+
+kegg_res_si3d_hyp1_prom <- extract_results(kegg_ora_si3d_hyp1_prom, "si3d_hyp1_promoted_kegg")
+kegg_res_si3d_hyp1_repr <- extract_results(kegg_ora_si3d_hyp1_repr, "si3d_hyp1_repressed_kegg")
+
+cat("si3d hyp 1hr promoted - significant:", if (!is.null(kegg_res_si3d_hyp1_prom)) sum(kegg_res_si3d_hyp1_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d hyp 1hr repressed - significant:", if (!is.null(kegg_res_si3d_hyp1_repr)) sum(kegg_res_si3d_hyp1_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+```{r kegg_ora_si3d_hyp4}
+kegg_ora_si3d_hyp4_prom <- run_ora(si3d_hyp4, "promoted",  kegg_term2gene, "si3d_hyp4hr_kegg")
+kegg_ora_si3d_hyp4_repr <- run_ora(si3d_hyp4, "repressed", kegg_term2gene, "si3d_hyp4hr_kegg")
+
+kegg_res_si3d_hyp4_prom <- extract_results(kegg_ora_si3d_hyp4_prom, "si3d_hyp4_promoted_kegg")
+kegg_res_si3d_hyp4_repr <- extract_results(kegg_ora_si3d_hyp4_repr, "si3d_hyp4_repressed_kegg")
+
+cat("si3d hyp 4hr promoted - significant:", if (!is.null(kegg_res_si3d_hyp4_prom)) sum(kegg_res_si3d_hyp4_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d hyp 4hr repressed - significant:", if (!is.null(kegg_res_si3d_hyp4_repr)) sum(kegg_res_si3d_hyp4_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+```{r kegg_ora_si3d_hyp24}
+kegg_ora_si3d_hyp24_prom <- run_ora(si3d_hyp24, "promoted",  kegg_term2gene, "si3d_hyp24hr_kegg")
+kegg_ora_si3d_hyp24_repr <- run_ora(si3d_hyp24, "repressed", kegg_term2gene, "si3d_hyp24hr_kegg")
+
+kegg_res_si3d_hyp24_prom <- extract_results(kegg_ora_si3d_hyp24_prom, "si3d_hyp24_promoted_kegg")
+kegg_res_si3d_hyp24_repr <- extract_results(kegg_ora_si3d_hyp24_repr, "si3d_hyp24_repressed_kegg")
+
+cat("si3d hyp 24hr promoted - significant:", if (!is.null(kegg_res_si3d_hyp24_prom)) sum(kegg_res_si3d_hyp24_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3d hyp 24hr repressed - significant:", if (!is.null(kegg_res_si3d_hyp24_repr)) sum(kegg_res_si3d_hyp24_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## Run ORA — si3e KEGG
+
+```{r kegg_ora_si3e_norm}
+kegg_ora_si3e_norm_prom <- run_ora(si3e_norm, "promoted",  kegg_term2gene, "si3e_normoxia_kegg")
+kegg_ora_si3e_norm_repr <- run_ora(si3e_norm, "repressed", kegg_term2gene, "si3e_normoxia_kegg")
+
+kegg_res_si3e_norm_prom <- extract_results(kegg_ora_si3e_norm_prom, "si3e_norm_promoted_kegg")
+kegg_res_si3e_norm_repr <- extract_results(kegg_ora_si3e_norm_repr, "si3e_norm_repressed_kegg")
+
+cat("si3e normoxia promoted - significant:", if (!is.null(kegg_res_si3e_norm_prom)) sum(kegg_res_si3e_norm_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e normoxia repressed - significant:", if (!is.null(kegg_res_si3e_norm_repr)) sum(kegg_res_si3e_norm_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+```{r kegg_ora_si3e_hyp1}
+kegg_ora_si3e_hyp1_prom <- run_ora(si3e_hyp1, "promoted",  kegg_term2gene, "si3e_hyp1hr_kegg")
+kegg_ora_si3e_hyp1_repr <- run_ora(si3e_hyp1, "repressed", kegg_term2gene, "si3e_hyp1hr_kegg")
+
+kegg_res_si3e_hyp1_prom <- extract_results(kegg_ora_si3e_hyp1_prom, "si3e_hyp1_promoted_kegg")
+kegg_res_si3e_hyp1_repr <- extract_results(kegg_ora_si3e_hyp1_repr, "si3e_hyp1_repressed_kegg")
+
+cat("si3e hyp 1hr promoted - significant:", if (!is.null(kegg_res_si3e_hyp1_prom)) sum(kegg_res_si3e_hyp1_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e hyp 1hr repressed - significant:", if (!is.null(kegg_res_si3e_hyp1_repr)) sum(kegg_res_si3e_hyp1_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+```{r kegg_ora_si3e_hyp4}
+kegg_ora_si3e_hyp4_prom <- run_ora(si3e_hyp4, "promoted",  kegg_term2gene, "si3e_hyp4hr_kegg")
+kegg_ora_si3e_hyp4_repr <- run_ora(si3e_hyp4, "repressed", kegg_term2gene, "si3e_hyp4hr_kegg")
+
+kegg_res_si3e_hyp4_prom <- extract_results(kegg_ora_si3e_hyp4_prom, "si3e_hyp4_promoted_kegg")
+kegg_res_si3e_hyp4_repr <- extract_results(kegg_ora_si3e_hyp4_repr, "si3e_hyp4_repressed_kegg")
+
+cat("si3e hyp 4hr promoted - significant:", if (!is.null(kegg_res_si3e_hyp4_prom)) sum(kegg_res_si3e_hyp4_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e hyp 4hr repressed - significant:", if (!is.null(kegg_res_si3e_hyp4_repr)) sum(kegg_res_si3e_hyp4_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+```{r kegg_ora_si3e_hyp24}
+kegg_ora_si3e_hyp24_prom <- run_ora(si3e_hyp24, "promoted",  kegg_term2gene, "si3e_hyp24hr_kegg")
+kegg_ora_si3e_hyp24_repr <- run_ora(si3e_hyp24, "repressed", kegg_term2gene, "si3e_hyp24hr_kegg")
+
+kegg_res_si3e_hyp24_prom <- extract_results(kegg_ora_si3e_hyp24_prom, "si3e_hyp24_promoted_kegg")
+kegg_res_si3e_hyp24_repr <- extract_results(kegg_ora_si3e_hyp24_repr, "si3e_hyp24_repressed_kegg")
+
+cat("si3e hyp 24hr promoted - significant:", if (!is.null(kegg_res_si3e_hyp24_prom)) sum(kegg_res_si3e_hyp24_prom$p.adjust < 0.05) else 0, "\n")
+cat("si3e hyp 24hr repressed - significant:", if (!is.null(kegg_res_si3e_hyp24_repr)) sum(kegg_res_si3e_hyp24_repr$p.adjust < 0.05) else 0, "\n")
+```
+
+## KEGG Heatmaps
+
+```{r kegg_heatmap_si3d}
+kegg_si3d_cond_list <- list(
+  "Normoxia" = build_signed_ora_df(kegg_res_si3d_norm_prom,  kegg_res_si3d_norm_repr,  "Normoxia"),
+  "Hyp 1hr"  = build_signed_ora_df(kegg_res_si3d_hyp1_prom,  kegg_res_si3d_hyp1_repr,  "Hyp 1hr"),
+  "Hyp 4hr"  = build_signed_ora_df(kegg_res_si3d_hyp4_prom,  kegg_res_si3d_hyp4_repr,  "Hyp 4hr"),
+  "Hyp 24hr" = build_signed_ora_df(kegg_res_si3d_hyp24_prom, kegg_res_si3d_hyp24_repr, "Hyp 24hr")
+)
+make_ora_heatmap(kegg_si3d_cond_list, "si3d (KEGG)", here("plots", "ora_kegg_si3d_heatmap.pdf"))
+```
+
+```{r kegg_heatmap_si3e}
+kegg_si3e_cond_list <- list(
+  "Normoxia" = build_signed_ora_df(kegg_res_si3e_norm_prom,  kegg_res_si3e_norm_repr,  "Normoxia"),
+  "Hyp 1hr"  = build_signed_ora_df(kegg_res_si3e_hyp1_prom,  kegg_res_si3e_hyp1_repr,  "Hyp 1hr"),
+  "Hyp 4hr"  = build_signed_ora_df(kegg_res_si3e_hyp4_prom,  kegg_res_si3e_hyp4_repr,  "Hyp 4hr"),
+  "Hyp 24hr" = build_signed_ora_df(kegg_res_si3e_hyp24_prom, kegg_res_si3e_hyp24_repr, "Hyp 24hr")
+)
+make_ora_heatmap(kegg_si3e_cond_list, "si3e (KEGG)", here("plots", "ora_kegg_si3e_heatmap.pdf"))
+```
+
+## KEGG Directional Heatmaps
+
+```{r kegg_heatmap_si3d_dir}
+make_ora_heatmap_dir(
+  list("Normoxia" = kegg_res_si3d_norm_prom, "Hyp 1hr" = kegg_res_si3d_hyp1_prom,
+       "Hyp 4hr"  = kegg_res_si3d_hyp4_prom, "Hyp 24hr" = kegg_res_si3d_hyp24_prom),
+  "si3d KEGG", "promoted",
+  here("plots", "ora_kegg_si3d_promoted_heatmap.pdf"))
+
+make_ora_heatmap_dir(
+  list("Normoxia" = kegg_res_si3d_norm_repr, "Hyp 1hr" = kegg_res_si3d_hyp1_repr,
+       "Hyp 4hr"  = kegg_res_si3d_hyp4_repr, "Hyp 24hr" = kegg_res_si3d_hyp24_repr),
+  "si3d KEGG", "repressed",
+  here("plots", "ora_kegg_si3d_repressed_heatmap.pdf"))
+```
+
+```{r kegg_heatmap_si3e_dir}
+make_ora_heatmap_dir(
+  list("Normoxia" = kegg_res_si3e_norm_prom, "Hyp 1hr" = kegg_res_si3e_hyp1_prom,
+       "Hyp 4hr"  = kegg_res_si3e_hyp4_prom, "Hyp 24hr" = kegg_res_si3e_hyp24_prom),
+  "si3e KEGG", "promoted",
+  here("plots", "ora_kegg_si3e_promoted_heatmap.pdf"))
+
+make_ora_heatmap_dir(
+  list("Normoxia" = kegg_res_si3e_norm_repr, "Hyp 1hr" = kegg_res_si3e_hyp1_repr,
+       "Hyp 4hr"  = kegg_res_si3e_hyp4_repr, "Hyp 24hr" = kegg_res_si3e_hyp24_repr),
+  "si3e KEGG", "repressed",
+  here("plots", "ora_kegg_si3e_repressed_heatmap.pdf"))
+```
+
+```{r}
+
+```

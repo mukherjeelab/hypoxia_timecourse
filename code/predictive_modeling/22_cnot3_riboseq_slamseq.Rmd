@@ -1,0 +1,898 @@
+---
+title: "Notebook 22: CNOT3 Selective Riboseq and SLAM-seq Analysis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This notebook analyzes two datasets from Zhu et al. ("Specific tRNAs promote mRNA decay by
+recruiting the CCR4-NOT complex to translating ribosomes"):
+
+- **GSE268324**: Selective ribosome profiling — CNOT3-IP vs Input footprints at codon
+  resolution. Used to compute per-gene CNOT3 enrichment and to reproduce Figure 1F
+  (per-codon enrichment by ribosomal site).
+- **GSE268322**: SLAM-seq with sgCNOT3 or sgNT knockdown across 0–12h chase. Used to
+  estimate mRNA half-lives per condition and compute log2(sgCNOT3/sgNT) stabilization ratio.
+
+eIF3d-promoted genes (hypoxia 1hr, `te_lfc > 0.5`, `te_padj < 0.05`) are overlaid on both
+distributions to ask whether 3d-promoted mRNAs are also CNOT3 targets.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+---
+
+## Section 1: Gene groups
+
+```{r load_gene_groups}
+promotes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+promotes_ids <- promotes$ensembl_gene
+
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  filter(!ensembl_gene %in% promotes_ids)
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene, size = length(promotes_ids), replace = FALSE)
+
+cat("Promotes genes:", length(promotes_ids), "\n")
+cat("Neg ctrl genes (size-matched):", length(neg_ctrl_ids), "\n")
+```
+
+---
+
+## Section 2: CNOT3 Selective Riboseq Enrichment
+
+### 2a: Per-gene enrichment score
+
+```{r load_riboseq}
+ribo_raw <- read_xlsx(
+  here("accessories", "csc_data", "zhu_slamseq",
+       "GSE268324_CNOT3_selective_ribosome_profiling_All_footprints.xlsx"),
+  sheet = "Footprints"
+) %>%
+  mutate(across(c(Gene_ID, Gene_Name, Transcript_ID,
+                   A_site_codon, P_site_codon, E_site_codon,
+                   A_site_aa, P_site_aa, E_site_aa), as.character))
+cat("Riboseq rows:", nrow(ribo_raw), "\n")
+cat("Riboseq cols:", paste(colnames(ribo_raw), collapse = ", "), "\n")
+```
+
+```{r riboseq_per_gene}
+ribo_gene <- ribo_raw %>%
+  group_by(Gene_ID, Gene_Name) %>%
+  summarise(
+    n_positions        = n(),
+    min_fdr            = min(FDR, na.rm = TRUE),          # most significant position per gene
+    mean_neg_log10_fdr = mean(-log10(FDR + 1e-300), na.rm = TRUE),
+    n_sig              = sum(FDR < 0.01, na.rm = TRUE),
+    frac_sig           = n_sig / n_positions,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ensembl_gene       = str_remove(Gene_ID, "\\..*"),
+    neg_log10_min_fdr  = -log10(min_fdr + 1e-300)        # plot axis: higher = more enriched
+  )
+
+cat("Genes in riboseq data:", nrow(ribo_gene), "\n")
+cat("Summary of -log10(min FDR):\n")
+print(summary(ribo_gene$neg_log10_min_fdr))
+```
+
+```{r riboseq_annotate_groups}
+ribo_gene <- ribo_gene %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids  ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids  ~ "Negative control",
+    TRUE                             ~ "All other genes"
+  ))
+
+ribo_gene %>% count(group)
+```
+
+```{r riboseq_density_plot}
+set_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "black"
+)
+
+bg_ribo <- ribo_gene %>% filter(group == "All other genes")
+fg_ribo <- ribo_gene %>% filter(group != "All other genes")
+
+median_ribo <- fg_ribo %>%
+  group_by(group) %>%
+  summarise(med = median(neg_log10_min_fdr, na.rm = TRUE), .groups = "drop")
+
+p_ribo <- ggplot() +
+  geom_density(
+    data = bg_ribo,
+    aes(x = neg_log10_min_fdr),
+    color = NA, fill = "grey80", alpha = 0.6
+  ) +
+  geom_density(
+    data = fg_ribo %>% filter(group == "Negative control"),
+    aes(x = neg_log10_min_fdr, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_density(
+    data = fg_ribo %>% filter(group == "eIF3d hypoxia promotes"),
+    aes(x = neg_log10_min_fdr, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_vline(
+    data = median_ribo,
+    aes(xintercept = med, color = group),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  scale_color_manual(values = set_colors) +
+  scale_fill_manual(values  = set_colors) +
+  labs(
+    title    = "CNOT3 riboseq enrichment: eIF3d-promoted genes (hypoxia 1hr)",
+    subtitle = "Lead: -log10(min FDR) per gene; secondary: frac. positions with FDR < 0.01 (paper threshold)\nGrey = all other genes; dashed = median",
+    x = "-log10(min FDR)", y = "Density",
+    color = NULL, fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")+
+  xlim(0,10)
+
+p_ribo
+ggsave(here("plots", "22_cnot3_riboseq_enrichment_by_group.pdf"),
+       p_ribo, width = 6, height = 5)
+cat("Saved: plots/22_cnot3_riboseq_enrichment_by_group.pdf\n")
+```
+
+```{r riboseq_wilcoxon}
+promotes_ribo <- ribo_gene %>% filter(group == "eIF3d hypoxia promotes") %>% pull(neg_log10_min_fdr)
+neg_ribo      <- ribo_gene %>% filter(group == "Negative control")       %>% pull(neg_log10_min_fdr)
+
+wt_ribo <- wilcox.test(promotes_ribo, neg_ribo, alternative = "two.sided")
+cat("Wilcoxon promotes vs neg ctrl (-log10 min FDR):\n")
+cat("  W =", wt_ribo$statistic, ", p =", signif(wt_ribo$p.value, 3), "\n")
+cat("  Median promotes:", round(median(promotes_ribo, na.rm = TRUE), 3), "\n")
+cat("  Median neg ctrl:", round(median(neg_ribo, na.rm = TRUE), 3), "\n")
+```
+
+### 2b: Codon-level validation — reproduce Figure 1F
+
+Per-codon mean IP/Input enrichment at each ribosomal site. CGG and CGA should be the top
+P-site enriched codons with flat enrichment at A and E sites.
+
+```{r riboseq_codon_enrichment}
+ribo_codon <- ribo_raw %>%
+  filter((`Input-1` + `Input-2`) > 0) %>%   # avoid division-by-zero (zero-input rows exist)
+  mutate(enrichment = (`CNOT3-IP-1` + `CNOT3-IP-2`) / (`Input-1` + `Input-2`)) %>%
+  pivot_longer(
+    cols      = c(P_site_codon, A_site_codon, E_site_codon),
+    names_to  = "site",
+    values_to = "codon"
+  ) %>%
+  mutate(site = str_remove(site, "_codon")) %>%
+  group_by(site, codon) %>%
+  summarise(mean_enrichment = mean(enrichment, na.rm = TRUE), .groups = "drop")
+
+cat("Codons per site:\n")
+print(ribo_codon %>% count(site))
+```
+
+```{r riboseq_codon_dot_plot}
+# Order codons by P-site enrichment
+p_site_order <- ribo_codon %>%
+  filter(site == "P_site") %>%
+  arrange(desc(mean_enrichment)) %>%
+  pull(codon)
+
+ribo_codon_plot <- ribo_codon %>%
+  mutate(
+    codon = factor(codon, levels = p_site_order),
+    site  = factor(site, levels = c("E_site", "P_site", "A_site"))
+  )
+
+# Highlight CNOT3-recruiting codons
+highlight_codons <- c("CGG", "CGA", "AGG")
+
+p_codon <- ggplot(ribo_codon_plot, aes(x = codon, y = mean_enrichment)) +
+  geom_point(aes(color = codon %in% highlight_codons), size = 1.2, alpha = 0.7) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "#E69F00"),
+                     labels = c("Other", "CGG/CGA/AGG"),
+                     name   = NULL) +
+  facet_wrap(~ site, ncol = 1) +
+  labs(
+    title    = "Mean CNOT3 IP/Input enrichment per codon per ribosomal site",
+    subtitle = "Reproduces Figure 1F; codons ordered by P-site enrichment",
+    x = "Codon", y = "Mean CNOT3-IP / Input"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5),
+    legend.position  = "top",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold")
+  )
+
+p_codon
+ggsave(here("plots", "22_cnot3_codon_enrichment_by_site.pdf"),
+       p_codon, width = 14, height = 8)
+cat("Saved: plots/22_cnot3_codon_enrichment_by_site.pdf\n")
+
+# Report top P-site codons
+cat("\nTop 10 P-site enriched codons:\n")
+print(ribo_codon %>% filter(site == "P_site") %>%
+        arrange(desc(mean_enrichment)) %>% head(10))
+```
+
+---
+
+## Section 3: SLAM-seq Half-life Estimation (sgNT vs sgCNOT3)
+
+```{r load_slamseq}
+slam_raw <- read_xlsx(
+  here("accessories", "csc_data", "zhu_slamseq",
+       "GSE268322_CNOT3_SLAM-seq_to_C_convertion_ratio.xlsx"),
+  sheet = "CNOT3_SLAM-seq"
+) %>%
+  dplyr::select(Gene_Name, Gene_ID, where(is.numeric)) %>%
+  mutate(across(c(Gene_Name, Gene_ID), as.character))
+
+cat("SLAM-seq genes:", nrow(slam_raw), "\n")
+cat("SLAM-seq columns:", ncol(slam_raw), "\n")
+```
+
+```{r slamseq_reshape}
+slam_long <- slam_raw %>%
+  pivot_longer(
+    cols      = -c(Gene_Name, Gene_ID),
+    names_to  = "col",
+    values_to = "conversion"
+  ) %>%
+  filter(!is.na(conversion)) %>%
+  mutate(
+    condition = if_else(str_detect(col, "sgCNOT3"), "sgCNOT3", "sgNT"),
+    timepoint = as.numeric(str_extract(col, "(?<=chase_)\\d+(?=h)"))
+  ) %>%
+  filter(!is.na(timepoint))
+
+cat("Long-format rows:", nrow(slam_long), "\n")
+cat("Timepoints found:", paste(sort(unique(slam_long$timepoint)), collapse = ", "), "h\n")
+cat("Conditions:", paste(unique(slam_long$condition), collapse = ", "), "\n")
+```
+
+average replicates to get. mean conversion reates
+```{r slamseq_average_reps}
+slam_mean <- slam_long %>%
+  group_by(Gene_Name, Gene_ID, condition, timepoint) %>%
+  summarise(mean_conv = mean(conversion, na.rm = TRUE), .groups = "drop")
+```
+
+remove timepoint 0 = 0 to get rid of anything that doesn't have c to t conversions 
+```{r slamseq_normalize_t0}
+t0 <- slam_mean %>%
+  filter(timepoint == 0) %>%
+  dplyr::rename(conv_t0 = mean_conv) %>%
+  dplyr::select(-timepoint)
+
+n_before <- n_distinct(slam_mean$Gene_ID)
+
+slam_norm <- slam_mean %>%
+  filter(timepoint > 0) %>%
+  left_join(t0, by = c("Gene_Name", "Gene_ID", "condition")) %>%
+  mutate(fraction_remaining = mean_conv / conv_t0) %>%
+  filter(is.finite(fraction_remaining), fraction_remaining > 0)
+
+# Note on t=0 normalization: each condition normalizes to its own t=0 baseline.
+# This is correct if both sgNT and sgCNOT3 are measured after the same 4sU pulse.
+# If CNOT3 KD alters baseline C-to-T conversion rates at t=0, this normalization
+# could partially mask real stability differences.
+
+n_after <- n_distinct(slam_norm$Gene_ID)
+cat("Genes before t=0 normalization:", n_before, "\n")
+cat("Genes after  t=0 normalization:", n_after,  "\n")
+cat("Genes lost (low/noisy t=0):", n_before - n_after, "\n")
+```
+
+```{r slamseq_fit_halflives}
+fit_halflife <- function(df) {
+  fit <- tryCatch(
+    lm(log(fraction_remaining) ~ timepoint, data = df),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NA_real_)
+  lambda <- -coef(fit)[["timepoint"]]
+  if (is.na(lambda) || lambda <= 0) return(NA_real_)
+  log(2) / lambda
+}
+
+halflife_df <- slam_norm %>%
+  group_by(Gene_Name, Gene_ID, condition) %>%
+  group_modify(~ tibble(halflife = fit_halflife(.x))) %>%
+  ungroup()
+
+cat("Total gene × condition rows:", nrow(halflife_df), "\n")
+cat("NA half-lives (fit failed or lambda <= 0):",
+    sum(is.na(halflife_df$halflife)), "\n")
+```
+
+```{r slamseq_filter_unreliable}
+# Exclude genes with halflife > 100h (near-zero lambda = unreliable flat decay)
+halflife_filt <- halflife_df %>%
+  filter(!is.na(halflife), halflife <= 100)
+
+n_excluded <- sum(!is.na(halflife_df$halflife) & halflife_df$halflife > 100)
+cat("Excluded halflife > 100h:", n_excluded, "\n")
+cat("Surviving gene × condition rows:", nrow(halflife_filt), "\n")
+
+cat("\nSurviving counts per condition:\n")
+print(halflife_filt %>% count(condition))
+```
+
+```{r slamseq_pivot_wide}
+halflife_wide <- halflife_filt %>%
+  pivot_wider(names_from = condition, values_from = halflife,
+              names_glue = "{condition}_halflife",
+              values_fn  = mean) %>%
+  mutate(
+    log2_ratio    = log2(sgCNOT3_halflife / sgNT_halflife),
+    delta_halflife = sgCNOT3_halflife - sgNT_halflife
+  ) %>%
+  mutate(ensembl_gene = str_remove(Gene_ID, "\\..*"))
+
+n_both <- sum(!is.na(halflife_wide$sgNT_halflife) & !is.na(halflife_wide$sgCNOT3_halflife))
+n_nt_only    <- sum(!is.na(halflife_wide$sgNT_halflife)    & is.na(halflife_wide$sgCNOT3_halflife))
+n_cnot3_only <- sum(is.na(halflife_wide$sgNT_halflife)     & !is.na(halflife_wide$sgCNOT3_halflife))
+
+cat("Genes with BOTH half-lives (available for log2_ratio):", n_both, "\n")
+cat("Genes with sgNT only:", n_nt_only, "\n")
+cat("Genes with sgCNOT3 only:", n_cnot3_only, "\n")
+```
+
+```{r slamseq_annotate_groups}
+halflife_wide <- halflife_wide %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                            ~ "All other genes"
+  ))
+
+cat("\nGenes per group (log2_ratio available):\n")
+print(halflife_wide %>% filter(!is.na(log2_ratio)) %>% count(group))
+```
+
+### Headline plot: log2(sgCNOT3/sgNT) half-life ratio by group
+
+A positive log2_ratio means the mRNA is stabilized when CNOT3 is knocked down — i.e., CNOT3
+normally promotes its decay. If 3d-promoted genes are genuine CNOT3 targets, they should
+shift rightward.
+
+```{r slamseq_log2ratio_plot}
+ratio_df <- halflife_wide %>% filter(!is.na(log2_ratio))
+
+bg_ratio <- ratio_df %>% filter(group == "All other genes")
+fg_ratio <- ratio_df %>% filter(group != "All other genes")
+
+median_ratio <- fg_ratio %>%
+  group_by(group) %>%
+  summarise(med = median(log2_ratio, na.rm = TRUE), .groups = "drop")
+
+p_ratio <- ggplot() +
+  geom_density(
+    data = bg_ratio,
+    aes(x = log2_ratio),
+    color = NA, fill = "grey80", alpha = 0.6
+  ) +
+  geom_density(
+    data = fg_ratio %>% filter(group == "Negative control"),
+    aes(x = log2_ratio, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_density(
+    data = fg_ratio %>% filter(group == "eIF3d hypoxia promotes"),
+    aes(x = log2_ratio, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  geom_vline(
+    data = median_ratio,
+    aes(xintercept = med, color = group),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  scale_color_manual(values = set_colors) +
+  scale_fill_manual(values  = set_colors) +
+  labs(
+    title    = "mRNA stabilization upon CNOT3 KD: eIF3d-promoted genes (hypoxia 1hr)",
+    subtitle = "log2(sgCNOT3 half-life / sgNT half-life); positive = stabilized upon KD\nGrey = all other genes; dashed = median",
+    x = "log2(sgCNOT3 / sgNT) half-life ratio", y = "Density",
+    color = NULL, fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")+
+  xlim(-3,3.5)
+
+p_ratio
+ggsave(here("plots", "22_slamseq_halflife_log2ratio_by_group.pdf"),
+       p_ratio, width = 6, height = 5)
+cat("Saved: plots/22_slamseq_halflife_log2ratio_by_group.pdf\n")
+```
+
+```{r slamseq_log2ratio_wilcoxon}
+promotes_ratio <- ratio_df %>% filter(group == "eIF3d hypoxia promotes") %>% pull(log2_ratio)
+neg_ratio      <- ratio_df %>% filter(group == "Negative control")       %>% pull(log2_ratio)
+
+wt_ratio <- wilcox.test(promotes_ratio, neg_ratio, alternative = "two.sided")
+cat("Wilcoxon log2_ratio (promotes vs neg ctrl):\n")
+cat("  W =", wt_ratio$statistic, ", p =", signif(wt_ratio$p.value, 3), "\n")
+cat("  Median promotes:", round(median(promotes_ratio, na.rm = TRUE), 3), "\n")
+cat("  Median neg ctrl:", round(median(neg_ratio, na.rm = TRUE), 3), "\n")
+```
+
+### Baseline sgNT half-life by group
+
+```{r slamseq_sgnt_halflife_plot}
+nt_df <- halflife_wide %>% filter(!is.na(sgNT_halflife))
+
+bg_nt <- nt_df %>% filter(group == "All other genes")
+fg_nt <- nt_df %>% filter(group != "All other genes")
+
+median_nt <- fg_nt %>%
+  group_by(group) %>%
+  summarise(med = median(sgNT_halflife, na.rm = TRUE), .groups = "drop")
+
+p_nt <- ggplot() +
+  geom_density(
+    data = bg_nt,
+    aes(x = sgNT_halflife),
+    color = NA, fill = "grey80", alpha = 0.6
+  ) +
+  geom_density(
+    data = fg_nt %>% filter(group == "Negative control"),
+    aes(x = sgNT_halflife, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_density(
+    data = fg_nt %>% filter(group == "eIF3d hypoxia promotes"),
+    aes(x = sgNT_halflife, color = group, fill = group),
+    alpha = 0.25, linewidth = 0.8
+  ) +
+  geom_vline(
+    data = median_nt,
+    aes(xintercept = med, color = group),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  scale_color_manual(values = set_colors) +
+  scale_fill_manual(values  = set_colors) +
+  labs(
+    title    = "Baseline mRNA half-life (sgNT): eIF3d-promoted genes (hypoxia 1hr)",
+    subtitle = "Half-lives estimated from SLAM-seq exponential decay fit (≤ 100h)\nGrey = all other genes; dashed = median",
+    x = "sgNT mRNA half-life (hours)", y = "Density",
+    color = NULL, fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")+
+  coord_cartesian(xlim = c(0, 45))
+
+p_nt
+ggsave(here("plots", "22_slamseq_halflife_sgNT_by_group.pdf"),
+       p_nt, width = 6, height = 5)
+cat("Saved: plots/22_slamseq_halflife_sgNT_by_group.pdf\n")
+```
+
+```{r slamseq_sgnt_wilcoxon}
+promotes_nt <- nt_df %>% filter(group == "eIF3d hypoxia promotes") %>% pull(sgNT_halflife)
+neg_nt      <- nt_df %>% filter(group == "Negative control")       %>% pull(sgNT_halflife)
+
+wt_nt <- wilcox.test(promotes_nt, neg_nt, alternative = "two.sided")
+cat("Wilcoxon sgNT halflife (promotes vs neg ctrl):\n")
+cat("  W =", wt_nt$statistic, ", p =", signif(wt_nt$p.value, 3), "\n")
+cat("  Median promotes:", round(median(promotes_nt, na.rm = TRUE), 2), "h\n")
+cat("  Median neg ctrl:", round(median(neg_nt, na.rm = TRUE), 2), "h\n")
+```
+
+---
+
+## Section 4: Validation
+
+### 4a: MRPL/MRPS positive control (paper panels E/F)
+
+Mitochondrial ribosomal protein genes (MRPL/MRPS) are positive controls for CNOT3-mediated
+decay in the paper. They should show positive log2_ratio (stabilized upon CNOT3 KD).
+
+```{r mrp_sanity_check}
+mrp_genes <- halflife_wide %>%
+  dplyr::filter(str_detect(Gene_Name, "^MRPL|^MRPS"), !is.na(log2_ratio)) %>%
+  dplyr::arrange(desc(log2_ratio))
+
+cat("MRPL/MRPS genes with both half-lives:", nrow(mrp_genes), "\n")
+cat("Fraction with positive log2_ratio:",
+    round(mean(mrp_genes$log2_ratio > 0, na.rm = TRUE), 3), "\n")
+cat("Median log2_ratio:", round(median(mrp_genes$log2_ratio, na.rm = TRUE), 3), "\n\n")
+print(mrp_genes %>% dplyr::select(Gene_Name, sgNT_halflife, sgCNOT3_halflife, log2_ratio))
+```
+
+### 4b: CGG/CGA/AGG codon frequency score → CDF plot (reproduce paper panel A)
+
+Genes enriched in CGG, CGA, and AGG codons (decoded by CNOT3-recruiting tRNAs) should show
+higher log2(sgCNOT3/sgNT) half-life ratio (more stabilized upon CNOT3 KD).
+
+```{r load_cds_sequences}
+most_abundant_tx <- readRDS(here("output", "predictive_modeling",
+                                  "precomputed_most_abundant_tx.rds"))
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+keep_tx <- as.character(unlist(most_abundant_tx$transcript_id_clean))
+
+cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_sequences_all <- extractTranscriptSeqs(genome, cds)
+cds_names_clean   <- sub("\\..*", "", names(cds_sequences_all))
+names(cds_sequences_all) <- cds_names_clean
+
+cds_sequences <- cds_sequences_all[cds_names_clean %in% keep_tx]
+valid_length  <- width(cds_sequences) %% 3 == 0
+cds_sequences <- cds_sequences[valid_length]
+cat("CDS sequences for codon scoring:", length(cds_sequences), "\n")
+```
+
+```{r compute_codon_score}
+# Extract P-site enrichment weights for CGG, CGA, AGG from section 2b ribo_codon object.
+psite_weights <- ribo_codon %>%
+  filter(site == "P_site", codon %in% c("CGG", "CGA", "AGG")) %>%
+  select(codon, weight = mean_enrichment)
+
+cat("P-site enrichment weights:\n")
+print(psite_weights)
+
+weight_vec <- setNames(psite_weights$weight, psite_weights$codon)
+
+# Negative control codons (CGC/AGA/CGU) — decoded by different tRNAs, not CNOT3-recruiting.
+# Scored unweighted (equal weight of 1) since we have no enrichment prior for these.
+neg_ctrl_codons <- c("CGC", "AGA", "CGU")
+
+score_cds <- function(seq_char) {
+  n_codons <- nchar(seq_char) / 3
+  if (n_codons < 10) return(c(weighted_score = NA_real_, neg_ctrl_score = NA_real_))
+  starts <- seq(1, nchar(seq_char) - 2, by = 3)
+  codons <- substring(seq_char, starts, starts + 2)
+  # Weighted CGG/CGA/AGG score:
+  #   (CGG_count × CGG_enrichment + CGA_count × CGA_enrichment + AGG_count × AGG_enrichment)
+  #   / total_codon_count
+  ws <- sum(weight_vec[codons], na.rm = TRUE) / n_codons
+  # Unweighted CGC/AGA/CGU score: frequency per codon
+  ns <- sum(codons %in% neg_ctrl_codons) / n_codons
+  c(weighted_score = ws, neg_ctrl_score = ns)
+}
+
+cds_char <- as.character(cds_sequences)
+score_mat <- vapply(cds_char, score_cds, numeric(2))  # 2 × n_sequences matrix
+
+# Map transcript → gene
+tx_gene <- most_abundant_tx %>%
+  transmute(
+    transcript_id_clean = as.character(unlist(transcript_id_clean)),
+    ensembl_gene        = as.character(unlist(gene_id_clean)),
+    symbol              = as.character(unlist(symbol))
+  )
+
+codon_score_df <- tibble(
+  transcript_id_clean = names(cds_sequences),
+  weighted_score      = score_mat["weighted_score", ],
+  neg_ctrl_score      = score_mat["neg_ctrl_score", ]
+) %>%
+  left_join(tx_gene, by = "transcript_id_clean") %>%
+  filter(!is.na(ensembl_gene), !is.na(weighted_score))
+
+# Note: codon frequency is computed from the most-abundant transcript per gene;
+# riboseq data is already collapsed to gene level — this is standard practice.
+
+cat("Genes with codon score:", nrow(codon_score_df), "\n")
+cat("Summary of weighted CGG/CGA/AGG score:\n")
+print(summary(codon_score_df$weighted_score))
+cat("Summary of CGC/AGA/CGU score:\n")
+print(summary(codon_score_df$neg_ctrl_score))
+```
+
+```{r codon_cdf_plot}
+# Join codon scores with SLAM-seq log2_ratio
+codon_ratio_df <- codon_score_df %>%
+  inner_join(halflife_wide %>% dplyr::select(ensembl_gene, log2_ratio),
+             by = "ensembl_gene") %>%
+  filter(!is.na(log2_ratio), !is.na(weighted_score))
+
+cat("Genes with codon scores and log2_ratio:", nrow(codon_ratio_df), "\n")
+
+n_group <- min(1000, floor(nrow(codon_ratio_df) / 3))
+
+# Top 1000 by weighted CGG/CGA/AGG score (CNOT3-recruiting codons)
+top_cnot3 <- codon_ratio_df %>%
+  slice_max(weighted_score, n = n_group) %>%
+  pull(ensembl_gene)
+
+# Top 1000 by CGC/AGA/CGU frequency, excluding any gene already in the CGG/CGA/AGG top set
+top_neg_ctrl <- codon_ratio_df %>%
+  filter(!ensembl_gene %in% top_cnot3) %>%
+  slice_max(neg_ctrl_score, n = n_group) %>%
+  pull(ensembl_gene)
+
+cat("Top CGG/CGA/AGG set:", length(top_cnot3), "genes\n")
+cat("Top CGC/AGA/CGU set:", length(top_neg_ctrl), "genes (non-overlapping)\n")
+
+codon_cdf_df <- codon_ratio_df %>%
+  mutate(codon_group = case_when(
+    ensembl_gene %in% top_cnot3    ~ "Top 1000: CGG/CGA/AGG\n(CNOT3-recruiting)",
+    ensembl_gene %in% top_neg_ctrl ~ "Top 1000: CGC/AGA/CGU\n(negative control)",
+    TRUE                            ~ "All other genes"
+  ))
+
+cat("\nGroup sizes:\n")
+print(codon_cdf_df %>% count(codon_group))
+
+cdf_colors <- c(
+  "Top 1000: CGG/CGA/AGG\n(CNOT3-recruiting)"  = "#E69F00",
+  "Top 1000: CGC/AGA/CGU\n(negative control)"  = "#56B4E9",
+  "All other genes"                              = "grey60"
+)
+
+p_cdf <- ggplot(codon_cdf_df, aes(x = log2_ratio, color = codon_group)) +
+  stat_ecdf(linewidth = 0.9) +
+  scale_color_manual(values = cdf_colors) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  labs(
+    title    = "mRNA stabilization upon CNOT3 KD by codon content",
+    subtitle = paste0("Three groups (n = ", n_group, " each for codon sets); reproduces Figure 2A\n",
+                      "CGG/CGA/AGG weighted by P-site enrichment; rightward shift = stabilized upon KD"),
+    x = "log2(sgCNOT3 / sgNT) half-life ratio", y = "Empirical CDF",
+    color = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+
+p_cdf
+ggsave(here("plots", "22_codon_cdf_log2ratio.pdf"),
+       p_cdf, width = 6.5, height = 5)
+cat("Saved: plots/22_codon_cdf_log2ratio.pdf\n")
+
+# Wilcoxon tests
+cnot3_ratio   <- codon_cdf_df %>% filter(codon_group == "Top 1000: CGG/CGA/AGG\n(CNOT3-recruiting)") %>% pull(log2_ratio)
+negctrl_ratio <- codon_cdf_df %>% filter(codon_group == "Top 1000: CGC/AGA/CGU\n(negative control)") %>% pull(log2_ratio)
+other_ratio   <- codon_cdf_df %>% filter(codon_group == "All other genes") %>% pull(log2_ratio)
+
+wt1 <- wilcox.test(cnot3_ratio, negctrl_ratio, alternative = "two.sided")
+wt2 <- wilcox.test(cnot3_ratio, other_ratio,   alternative = "two.sided")
+
+cat("\nWilcoxon CGG/CGA/AGG vs CGC/AGA/CGU: W =", wt1$statistic,
+    ", p =", signif(wt1$p.value, 3), "\n")
+cat("  Median CGG/CGA/AGG:", round(median(cnot3_ratio,   na.rm = TRUE), 3), "\n")
+cat("  Median CGC/AGA/CGU:", round(median(negctrl_ratio, na.rm = TRUE), 3), "\n")
+cat("\nWilcoxon CGG/CGA/AGG vs all other: W =", wt2$statistic,
+    ", p =", signif(wt2$p.value, 3), "\n")
+```
+
+### 4c: CNOT3-dependent codon stability score
+
+For each sense codon, compute the Spearman correlation between its per-gene CDS frequency
+and the log2(sgCNOT3/sgNT) half-life ratio. A positive score means that codon's presence
+predicts stabilization upon CNOT3 KD — i.e., it is a CNOT3-sensitivity codon. CGG, CGA, and
+AGG should rank near the top if the analysis is working correctly.
+
+```{r cnot3_codon_stability_scores}
+stop_codons <- c("TAA", "TAG", "TGA")
+
+# Build per-gene codon frequency table in long format.
+# Reuses cds_char and cds_sequences names from section 4b.
+codon_freq_long <- tibble(
+  transcript_id_clean = names(cds_sequences),
+  seq                 = cds_char
+) %>%
+  left_join(codon_score_df %>% dplyr::select(transcript_id_clean, ensembl_gene),
+            by = "transcript_id_clean") %>%
+  filter(!is.na(ensembl_gene)) %>%
+  mutate(
+    n_codons = nchar(seq) / 3,
+    codons   = map2(seq, n_codons, function(s, n) {
+      starts <- seq(1, nchar(s) - 2, by = 3)
+      substring(s, starts, starts + 2)
+    })
+  ) %>%
+  dplyr::select(-seq) %>%
+  unnest(codons) %>%
+  filter(!codons %in% stop_codons) %>%
+  count(ensembl_gene, n_codons, codons, name = "codon_count") %>%
+  mutate(freq = codon_count / n_codons) %>%
+  dplyr::select(ensembl_gene, codons, freq)
+
+cat("Codon-gene frequency rows:", nrow(codon_freq_long), "\n")
+cat("Unique sense codons observed:", n_distinct(codon_freq_long$codons), "\n")
+# Note: CDS sequences are in DNA notation, so CGU (RNA) appears as CGT in this frequency
+# table. All codon lookups below use DNA notation consistently (e.g. CGT not CGU).
+```
+
+```{r cnot3_codon_spearman}
+# Spearman correlation: per-codon frequency vs log2_ratio across genes
+codon_spearman <- codon_freq_long %>%
+  left_join(halflife_wide %>% dplyr::select(ensembl_gene, log2_ratio),
+            by = "ensembl_gene") %>%
+  filter(!is.na(log2_ratio)) %>%
+  group_by(codons) %>%
+  summarise(
+    spearman_r = cor(freq, log2_ratio, method = "spearman", use = "complete.obs"),
+    n_genes    = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(spearman_r)) %>%
+  mutate(rank = row_number())
+
+cat("Codons scored:", nrow(codon_spearman), "\n\n")
+
+# Report ranks of positive-control codons
+cat("Ranks of CNOT3-recruiting codons:\n")
+print(codon_spearman %>% filter(codons %in% c("CGG", "CGA", "AGG")) %>%
+        dplyr::select(codons, rank, spearman_r))
+
+cat("\nRanks of negative-control codons:\n")
+print(codon_spearman %>% filter(codons %in% c("CGC", "AGA", "CGT")) %>%
+        dplyr::select(codons, rank, spearman_r))
+```
+
+```{r cnot3_codon_stability_plot}
+# Codon → amino acid lookup via Biostrings GENETIC_CODE (RNA notation → convert U to T)
+codon_aa <- tibble(
+  rna_codon = names(GENETIC_CODE),
+  aa        = as.character(GENETIC_CODE)
+) %>%
+  mutate(codon = str_replace_all(rna_codon, "U", "T")) %>%
+  filter(!aa %in% c("*")) %>%          # drop stop codons
+  dplyr::select(codon, aa)
+
+# N/K/I/Y/M/F/T codons expected near-zero or negative per paper
+nkiymft_codons <- c(
+  "AAC", "AAT",                    # N (Asn)
+  "AAA", "AAG",                    # K (Lys)
+  "ATC", "ATT", "ATA",             # I (Ile)
+  "TAC", "TAT",                    # Y (Tyr)
+  "ATG",                           # M (Met)
+  "TTC", "TTT",                    # F (Phe)
+  "ACC", "ACT", "ACA", "ACG"       # T (Thr)
+)
+
+codon_plot_df <- codon_spearman %>%
+  left_join(codon_aa, by = c("codons" = "codon")) %>%
+  mutate(
+    codon_class = case_when(
+      codons %in% c("CGG", "CGA", "AGG")  ~ "CGG/CGA/AGG (CNOT3-recruiting)",
+      codons %in% c("CGC", "AGA", "CGT")  ~ "CGC/AGA/CGU (negative control)",
+      codons %in% nkiymft_codons           ~ "N/K/I/Y/M/F/T (expected ~0)",
+      TRUE                                  ~ "Other"
+    ),
+    codon_class = factor(codon_class, levels = c(
+      "CGG/CGA/AGG (CNOT3-recruiting)",
+      "CGC/AGA/CGU (negative control)",
+      "N/K/I/Y/M/F/T (expected ~0)",
+      "Other"
+    )),
+    codon_label = if_else(
+      codons %in% c("CGG", "CGA", "AGG", "CGC", "AGA", "CGT"),
+      codons, NA_character_
+    )
+  )
+
+class_colors <- c(
+  "CGG/CGA/AGG (CNOT3-recruiting)"  = "#E69F00",
+  "CGC/AGA/CGU (negative control)"  = "#56B4E9",
+  "N/K/I/Y/M/F/T (expected ~0)"     = "#009E73",
+  "Other"                             = "grey70"
+)
+
+p_codon_scores <- ggplot(codon_plot_df,
+                         aes(x = rank, y = spearman_r, color = codon_class)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    aes(label = codon_label),
+    size = 3, fontface = "bold", show.legend = FALSE,
+    max.overlaps = 20, box.padding = 0.4
+  ) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50, 61)) +
+  labs(
+    title    = "CNOT3-dependent codon stability score",
+    subtitle = "Spearman r(codon frequency, log2 sgCNOT3/sgNT half-life) across genes\nPositive = codon presence predicts stabilization upon CNOT3 KD",
+    x = "Rank (1 = most positive)", y = "Spearman r"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+
+p_codon_scores
+ggsave(here("plots", "22_cnot3_codon_stability_scores.pdf"),
+       p_codon_scores, width = 7, height = 5)
+cat("Saved: plots/22_cnot3_codon_stability_scores.pdf\n")
+```
+
+---
+
+## Section 5: Save outputs
+
+```{r save_outputs}
+saveRDS(ribo_gene,      here("output", "predictive_modeling", "cnot3_riboseq_enrichment.rds"))
+saveRDS(halflife_wide,  here("output", "predictive_modeling", "cnot3_slamseq_halflives.rds"))
+saveRDS(codon_spearman, here("output", "predictive_modeling", "cnot3_codon_stability_scores.rds"))
+
+cat("Saved:\n")
+cat("  output/predictive_modeling/cnot3_riboseq_enrichment.rds\n")
+cat("  output/predictive_modeling/cnot3_slamseq_halflives.rds\n")
+cat("  output/predictive_modeling/cnot3_codon_stability_scores.rds\n")
+```
+
+---
+
+## Section 6: Add CNOT3 features to feature matrix
+
+Prepares per-gene CNOT3 metrics and left-joins them to the most recent feature matrix
+(`feature_matrix_kozak.rds`), saving the result as `feature_matrix_cnot3.rds`.
+
+**Features added (all gene-level, NA for genes not covered by the Zhu datasets):**
+- `cnot3_ribo_enrichment` — `-log10(min FDR)` from selective riboseq: most significant CNOT3-bound ribosome position per gene
+- `cnot3_slamseq_sgNT_halflife` — mRNA half-life in sgNT control (hours, ≤ 100h)
+- `cnot3_slamseq_log2_ratio` — `log2(sgCNOT3 / sgNT)` half-life: positive = CNOT3 normally promotes decay
+- `cnot3_weighted_codon_score` — per-gene sum of (CGG/CGA/AGG codon counts × empirical P-site enrichment weights) / total codons
+
+```{r build_cnot3_feature_table}
+# Assemble one row per gene with versionless Ensembl ID as join key
+cnot3_features <- ribo_gene %>%
+  dplyr::select(ensembl_gene, cnot3_ribo_enrichment = neg_log10_min_fdr) %>%
+  full_join(
+    halflife_wide %>%
+      dplyr::select(ensembl_gene,
+                    cnot3_slamseq_sgNT_halflife = sgNT_halflife,
+                    cnot3_slamseq_log2_ratio    = log2_ratio),
+    by = "ensembl_gene"
+  ) %>%
+  full_join(
+    codon_score_df %>%
+      dplyr::select(ensembl_gene, cnot3_weighted_codon_score = weighted_score),
+    by = "ensembl_gene"
+  )
+
+cat("CNOT3 feature table:", nrow(cnot3_features), "genes\n")
+cat("Genes with riboseq enrichment:", sum(!is.na(cnot3_features$cnot3_ribo_enrichment)), "\n")
+cat("Genes with SLAM-seq halflife: ", sum(!is.na(cnot3_features$cnot3_slamseq_sgNT_halflife)), "\n")
+cat("Genes with SLAM-seq ratio:    ", sum(!is.na(cnot3_features$cnot3_slamseq_log2_ratio)), "\n")
+cat("Genes with codon score:       ", sum(!is.na(cnot3_features$cnot3_weighted_codon_score)), "\n")
+```
+
+```{r join_to_feature_matrix}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
+
+cat("Feature matrix loaded:", nrow(fm), "genes ×", ncol(fm), "columns\n")
+
+# Join on versionless Ensembl ID; feature matrix uses gene_id_clean
+fm_cnot3 <- fm %>%
+  left_join(cnot3_features, by = c("gene_id_clean" = "ensembl_gene"))
+
+cat("After join:", nrow(fm_cnot3), "genes ×", ncol(fm_cnot3), "columns\n")
+cat("New columns added:", ncol(fm_cnot3) - ncol(fm), "\n")
+
+cat("\nCoverage within feature matrix genes:\n")
+cat("  cnot3_ribo_enrichment:      ",
+    sum(!is.na(fm_cnot3$cnot3_ribo_enrichment)), "/", nrow(fm_cnot3), "\n")
+cat("  cnot3_slamseq_sgNT_halflife:",
+    sum(!is.na(fm_cnot3$cnot3_slamseq_sgNT_halflife)), "/", nrow(fm_cnot3), "\n")
+cat("  cnot3_slamseq_log2_ratio:   ",
+    sum(!is.na(fm_cnot3$cnot3_slamseq_log2_ratio)), "/", nrow(fm_cnot3), "\n")
+cat("  cnot3_weighted_codon_score: ",
+    sum(!is.na(fm_cnot3$cnot3_weighted_codon_score)), "/", nrow(fm_cnot3), "\n")
+
+saveRDS(fm_cnot3, here("output", "predictive_modeling", "feature_matrix_cnot3.rds"))
+cat("\nSaved: output/predictive_modeling/feature_matrix_cnot3.rds\n")
+```

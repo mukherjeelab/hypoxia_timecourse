@@ -1,0 +1,1038 @@
+---
+title: "`r paste0('Random Forest Classification: eIF4E Target Prediction (', params$feature_set, ', clip=', params$clip_mode, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_set: "kozak"
+  clip_mode: "aggregate"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# Defaults for interactive use (overwritten by YAML params when knitting)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    feature_set = "kozak", # "te_lfc", "codon_optimality", or "kozak"
+    clip_mode   = "aggregate"         # "individual", "aggregate", or "both"
+  )
+}
+
+feature_matrix_rds <- switch(params$feature_set,
+  "te_lfc"           = "feature_matrix_te_lfc.rds",
+  "codon_optimality" = "feature_matrix_codon_optimality.rds",
+  "kozak"            = "feature_matrix_kozak.rds",
+  "targeted"         = "feature_matrix_te_lfc.rds",
+  stop("feature_set '", params$feature_set, "' is not supported in this notebook")
+)
+
+suffix    <- paste0("eif4e_promotes_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
+pos_label <- "promotes_eif4e"
+neg_label <- "does_not_promote_eif4e"
+gene_label <- "eIF4E"
+
+cat("Feature matrix:", feature_matrix_rds, "\n")
+cat("Output suffix:", suffix, "\n")
+cat("Positive label:", pos_label, "\n")
+cat("Negative label:", neg_label, "\n")
+```
+
+# Overview
+
+Binary classification without Boruta feature selection: does a gene's mRNA sequence predict whether it depends on eIF4E for translation?
+
+Training data come from the Teleman riboseq dataset (4E-BP1 overexpression vs. vehicle). 4E-BP1 sequesters eIF4E, so genes that go **down** when 4E-BP1 is overexpressed are **eIF4E-dependent** (positive class).
+
+- **Positive class (`"promotes_eif4e"`)**: Genes with `log2FoldChange < -1` AND `padj < 0.05` in the Teleman dataset — translation is reduced when eIF4E is inhibited, i.e. eIF4E **promotes** their translation (~716 genes).
+- **Negative class (`"does_not_promote_eif4e"`)**: Genes unaffected by eIF4E status (`|LFC| < 0.1` AND `padj > 0.5`) — neutral controls that serve as the reference (~2,140 genes, downsampled to match positive class).
+
+**Note on circular features**: The following are excluded to prevent data leakage — they directly measure eIF4E dependence and would circularly predict the training labels: `4e_resistance` scores, `eif4e_ip` binding features, `lit_eIF4E_activated_translation`, `lit_phospho_eIF4E_*`, `lit_translation_is_sensitive_to_4E_inhibition`, and `lit_translation_is_resistant_to_4E_inhibition`.
+
+## Parameters
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `feature_set` | `"te_lfc"`, `"codon_optimality"`, `"kozak"` | Which feature matrix to use |
+| `clip_mode` | `"individual"`, `"aggregate"`, `"both"` | Which CLIP features to use: `"individual"` = per-dataset regional binary features; `"aggregate"` = single numeric count of datasets with binding evidence (0–7); `"both"` = all CLIP features |
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+library(cowplot)
+library(ggpubr)
+```
+
+# Load Data
+
+```{r load_data}
+# Feature matrix
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+# Teleman riboseq: 4E-BP1 overexpression vs vehicle
+# LFC = log2(4E-BP1 OE / vehicle)
+# Negative LFC = less translation when eIF4E is inhibited = eIF4E-dependent
+teleman_data <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv")
+cat("Teleman dataset:", nrow(teleman_data), "genes\n")
+
+# Positive class: eIF4E-sensitive genes (go DOWN when eIF4E is inhibited)
+positive_genes <- teleman_data %>%
+  filter(log2FoldChange < -1, padj < 0.05) %>%
+  mutate(ensembl_gene = gene_id)  # already clean (no version suffix)
+cat("Positive genes (LFC < -1, padj < 0.05):", nrow(positive_genes), "\n")
+
+# Negative class: genes unaffected by eIF4E status (middle of distribution)
+negative_control_genes <- teleman_data %>%
+  filter(abs(log2FoldChange) < 0.1, padj > 0.5) %>%
+  mutate(gene_id_clean = gene_id)
+cat("Negative control genes (|LFC| < 0.1, padj > 0.5):", nrow(negative_control_genes), "\n")
+```
+
+# Sanity Checks
+
+```{r sanity_checks}
+# GLO1: known eIF4E-sensitive gene — should be IN positive set (LFC ≈ -1.29, padj ≈ 8.5e-5)
+glo1 <- teleman_data %>% filter(symbol == "GLO1")
+cat("GLO1:\n")
+print(glo1 %>% dplyr::select(symbol, log2FoldChange, padj))
+cat("GLO1 in positive set:", glo1$gene_id %in% positive_genes$ensembl_gene, "\n\n")
+
+# CDKN2B: known eIF4E-resistant gene — should NOT be in positive set (LFC ≈ +2.48, padj ≈ 8.7e-6)
+cdkn2b <- teleman_data %>% filter(symbol == "CDKN2B")
+cat("CDKN2B:\n")
+print(cdkn2b %>% dplyr::select(symbol, log2FoldChange, padj))
+cat("CDKN2B in positive set:", cdkn2b$gene_id %in% positive_genes$ensembl_gene, "\n")
+```
+
+# Create Binary Target
+
+```{r create_target}
+set.seed(9)
+
+# Only consider genes present in the feature matrix
+pos_in_features <- positive_genes %>%
+  filter(ensembl_gene %in% features$gene_id_clean)
+cat("Positive genes in feature matrix:", nrow(pos_in_features), "\n")
+
+neg_in_features <- negative_control_genes %>%
+  filter(gene_id_clean %in% features$gene_id_clean)
+cat("Negative control genes in feature matrix:", nrow(neg_in_features), "\n")
+
+number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+
+# Label genes
+features <- features %>%
+  mutate(eif4e_target = case_when(
+    gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+    gene_id_clean %in% sample(neg_in_features$gene_id_clean, number_to_match) ~ neg_label,
+    TRUE ~ NA_character_
+  ))
+
+# Keep only labeled genes
+model_genes <- features %>%
+  filter(!is.na(eif4e_target)) %>%
+  mutate(eif4e_target = factor(eif4e_target, levels = c(neg_label, pos_label)))
+
+nrow(model_genes)
+
+cat("Positive (", pos_label, "):", sum(model_genes$eif4e_target == pos_label), "\n")
+cat("Negative (", neg_label, "):", sum(model_genes$eif4e_target == neg_label), "\n")
+cat("Total:", nrow(model_genes), "\n")
+cat("Imbalance ratio (neg:pos):",
+    round(sum(model_genes$eif4e_target == neg_label) /
+          sum(model_genes$eif4e_target == pos_label), 1), ":1\n")
+```
+
+# Preprocessing
+
+## Filter Features (No Boruta)
+
+```{r filter_features}
+# Identify feature columns (exclude ID/target cols)
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif4e_target")
+all_cols <- colnames(model_genes)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols <- unique(c(id_cols, id_pattern_cols))
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count (all combined):", length(feature_cols), "\n")
+
+# ---- CLIP feature mode ----
+if (params$clip_mode == "aggregate") {
+  aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                           "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                           "clip_lee_glu_vs_cm_enrichment")
+  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+  feature_cols <- setdiff(feature_cols, regional_clip)
+  cat("CLIP mode: aggregate — using aggregate CLIP counts only, dropped", length(regional_clip), "regional features\n")
+} else if (params$clip_mode == "individual") {
+  feature_cols <- setdiff(feature_cols, c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                                          "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                                          "clip_lee_glu_vs_cm_enrichment"))
+  cat("CLIP mode: individual — using regional binary features, dropped aggregate CLIP counts\n")
+} else {
+  cat("CLIP mode: both — using all CLIP features\n")
+}
+
+# If targeted/codon_optimality/kozak/te_lfc: remove k-mer and RBP motif columns
+if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality", "kozak")) {
+  kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+  excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
+  feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+  cat("Targeted mode: removed", length(excluded), "k-mer/motif columns\n")
+}
+
+# ---- Remove circular features ----
+# These features directly measure eIF4E dependence and would circularly predict
+# the training labels (which are themselves derived from eIF4E inhibition data):
+#   - 4e_resistance*: eIF4E-resistance scores
+#   - eif4e_ip*: eIF4E immunoprecipitation / cap-binding data
+#   - lit_eIF4E_*: literature signatures for eIF4E-activated translation
+#   - lit_phospho_eIF4E_*: phospho-eIF4E signatures
+#   - lit_translation_is_sensitive_to_4E_inhibition
+#   - lit_translation_is_resistant_to_4E_inhibition
+circular_regex <- "^4e_resistance|^eif4e_ip"
+circular_lit_exact <- c(
+  "lit_eIF4E_activated_translation",
+  "lit_phospho_eIF4E_activated_translation",
+  "lit_phospho_eIF4E_suppressed_translation",
+  "lit_translation_is_sensitive_to_4E_inhibition",
+  "lit_translation_is_resistant_to_4E_inhibition"
+)
+circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) | feature_cols %in% circular_lit_exact]
+if (length(circular_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, circular_cols)
+  cat("Removed", length(circular_cols), "circular features:\n")
+  cat(paste(" ", circular_cols, collapse = "\n"), "\n")
+} else {
+  cat("No circular 4E features found in this feature set\n")
+}
+
+cat("Feature count after filtering:", length(feature_cols), "\n")
+```
+
+## Median-Impute Missing Values
+
+```{r impute_missing}
+missing_counts <- model_genes %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+cat("Features with missing values:", nrow(missing_counts), "\n")
+if (nrow(missing_counts) > 0) print(missing_counts)
+cat("(Imputation deferred to after train/test split — medians computed from training set only)\n")
+```
+
+# Prepare Modeling Data
+
+```{r prepare_data}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, eif4e_target, all_of(feature_cols))
+
+cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+cat("\nClass distribution:\n")
+print(table(model_data$eif4e_target))
+```
+
+# Train/Test Split
+
+```{r train_test_split}
+set.seed(9)
+
+train_idx <- createDataPartition(model_data$eif4e_target, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data <- model_data[-train_idx, ]
+
+cat("Training set:", nrow(train_data), "\n")
+print(table(train_data$eif4e_target))
+cat("\nTest set:", nrow(test_data), "\n")
+print(table(test_data$eif4e_target))
+
+# Compute medians from training set only, then apply to both splits
+train_medians <- train_data %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~median(., na.rm = TRUE)))
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) {
+    df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  }
+  df
+}
+
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+
+cat("\nRemaining NAs in train:", sum(is.na(train_data[, feature_cols])), "\n")
+cat("Remaining NAs in test:", sum(is.na(test_data[, feature_cols])), "\n")
+```
+
+# Train Random Forest
+
+```{r train_rf}
+# Classes are already balanced (neg sampled to match pos count), so no case weights needed.
+set.seed(9)
+rf_model <- ranger(
+  x = train_data[, feature_cols],
+  y = train_data$eif4e_target,
+  num.trees = 500,
+  importance = "impurity",
+  probability = TRUE,
+  seed = 9
+)
+
+print(rf_model)
+```
+
+# Evaluate on Test Set
+
+## ROC Curve and AUC
+
+```{r roc_curve, fig.width=8, fig.height=6}
+# Predictions
+pred_probs <- predict(rf_model, test_data[, feature_cols])$predictions
+pred_pos_prob <- pred_probs[, pos_label]
+actual <- test_data$eif4e_target
+
+# ROC on test set (threshold-free AUC)
+roc_obj <- roc(response = actual, predictor = pred_pos_prob,
+               levels = c(neg_label, pos_label), direction = "<")
+auc_value <- auc(roc_obj)
+cat("AUC:", round(auc_value, 4), "\n")
+
+# Bootstrap 95% CI on AUC (pROC built-in)
+ci_auc <- ci.auc(roc_obj, method = "bootstrap", boot.n = 1000)
+cat("AUC 95% CI (bootstrap):", round(ci_auc[1], 4), "-", round(ci_auc[3], 4), "\n")
+
+# Youden threshold from OOB predictions on training set (avoids test set snooping)
+oob_probs <- rf_model$predictions[, pos_label]
+roc_oob <- roc(response = train_data$eif4e_target, predictor = oob_probs,
+               levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+coords_youden <- coords(roc_oob, "best", ret = c("threshold", "sensitivity", "specificity"),
+                        best.method = "youden")
+if (nrow(coords_youden) > 1) coords_youden <- coords_youden[1, ]  # take first if ties
+optimal_threshold <- coords_youden$threshold
+
+cat("Youden threshold (from training OOB):", round(optimal_threshold, 4), "\n")
+cat("  OOB Sensitivity:", round(coords_youden$sensitivity, 3), "\n")
+cat("  OOB Specificity:", round(coords_youden$specificity, 3), "\n")
+
+# Plot
+roc_df <- data.frame(sensitivity = roc_obj$sensitivities,
+                     specificity = roc_obj$specificities)
+
+p_roc <- ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "#0072B2", linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = 1 - coords_youden$specificity, y = coords_youden$sensitivity),
+             color = "red", size = 3) +
+  annotate("text", x = 1 - coords_youden$specificity + 0.05, y = coords_youden$sensitivity,
+           label = paste0("Youden\n(", round(optimal_threshold, 3), ")"),
+           color = "red", size = 3, hjust = 0) +
+  theme_cowplot() +
+  labs(
+    title = paste0("ROC Curve: ", gene_label, " Target Classification"),
+    subtitle = paste0("AUC = ", round(auc_value, 3),
+                      " [", round(ci_auc[1], 3), "-", round(ci_auc[3], 3), "]",
+                      " | Threshold = ", round(optimal_threshold, 3)),
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  coord_equal()
+
+print(p_roc)
+
+ggsave(here("plots", paste0("rf_classification_roc_", suffix, ".pdf")),
+       plot = p_roc, width = 8, height = 6)
+```
+
+## Confusion Matrix
+
+```{r confusion_matrix}
+pred_class <- factor(
+  ifelse(pred_pos_prob >= optimal_threshold, pos_label, neg_label),
+  levels = c(neg_label, pos_label)
+)
+
+cm <- confusionMatrix(pred_class, actual, positive = pos_label)
+print(cm)
+
+# Extract metrics
+accuracy <- cm$overall["Accuracy"]
+balanced_accuracy <- cm$byClass["Balanced Accuracy"]
+sensitivity <- cm$byClass["Sensitivity"]
+specificity <- cm$byClass["Specificity"]
+precision <- cm$byClass["Precision"]
+f1 <- cm$byClass["F1"]
+
+cat("\nKey Metrics (Youden Threshold):\n")
+cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
+cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("  Sensitivity:", round(sensitivity, 4), "\n")
+cat("  Specificity:", round(specificity, 4), "\n")
+cat("  Precision:", round(precision, 4), "\n")
+cat("  F1:", round(f1, 4), "\n")
+```
+
+## Confusion Matrix Plot
+
+```{r confusion_matrix_plot, fig.width=6, fig.height=5}
+cm_table <- as.data.frame(cm$table)
+colnames(cm_table) <- c("Predicted", "Actual", "Freq")
+
+p_cm <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#0072B2") +
+  theme_cowplot() +
+  labs(
+    title = "Confusion Matrix",
+    subtitle = paste0("Balanced Acc = ", round(balanced_accuracy, 3),
+                      ", F1 = ", round(f1, 3))
+  ) +
+  theme(legend.position = "none")
+
+print(p_cm)
+
+ggsave(here("plots", paste0("rf_classification_confusion_matrix_", suffix, ".pdf")),
+       plot = p_cm, width = 6, height = 5)
+```
+
+# 5-Fold Stratified Cross-Validation
+
+```{r cross_validation}
+set.seed(9)
+folds <- createFolds(train_data$eif4e_target, k = 5, list = TRUE)
+
+cv_results <- lapply(seq_along(folds), function(i) {
+  cat("Fold", i, "...\n")
+
+  test_idx <- folds[[i]]
+  train_cv <- train_data[-test_idx, ]
+  test_cv <- train_data[test_idx, ]
+
+  # Impute using this fold's training data medians only
+  cv_medians <- train_cv %>%
+    dplyr::select(all_of(feature_cols)) %>%
+    summarise(across(everything(), ~median(., na.rm = TRUE)))
+  train_cv <- impute_with_medians(train_cv, cv_medians)
+  test_cv  <- impute_with_medians(test_cv,  cv_medians)
+
+  # Train (classes already balanced, no case weights needed)
+  rf_cv <- ranger(
+    x = train_cv[, feature_cols],
+    y = train_cv$eif4e_target,
+    num.trees = 500,
+    probability = TRUE,
+    seed = 9
+  )
+
+  # Youden threshold from OOB predictions on this fold's training data
+  oob_probs_cv <- rf_cv$predictions[, pos_label]
+  roc_oob_cv <- roc(response = train_cv$eif4e_target, predictor = oob_probs_cv,
+                    levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+  coords_cv <- coords(roc_oob_cv, "best", ret = c("threshold", "sensitivity", "specificity"),
+                      best.method = "youden")
+  if (nrow(coords_cv) > 1) coords_cv <- coords_cv[1, ]  # take first if ties
+
+  # Predict on held-out fold
+  pred_probs_cv <- predict(rf_cv, test_cv[, feature_cols])$predictions[, pos_label]
+
+  # ROC on test fold (for AUC)
+  roc_cv <- roc(test_cv$eif4e_target, pred_probs_cv,
+                levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+
+  pred_class_cv <- factor(
+    ifelse(pred_probs_cv >= coords_cv$threshold, pos_label, neg_label),
+    levels = c(neg_label, pos_label)
+  )
+  cm_cv <- confusionMatrix(pred_class_cv, test_cv$eif4e_target, positive = pos_label)
+
+  data.frame(
+    fold = i,
+    Threshold = coords_cv$threshold,
+    AUC = as.numeric(auc(roc_cv)),
+    Balanced_Accuracy = cm_cv$byClass["Balanced Accuracy"],
+    Sensitivity = cm_cv$byClass["Sensitivity"],
+    Specificity = cm_cv$byClass["Specificity"],
+    Precision = cm_cv$byClass["Precision"],
+    F1 = cm_cv$byClass["F1"]
+  )
+})
+
+cv_results_df <- bind_rows(cv_results)
+rownames(cv_results_df) <- NULL
+
+cat("\n5-Fold CV Results:\n")
+print(cv_results_df)
+
+cat("\nMean +/- SD:\n")
+for (metric in c("AUC", "Balanced_Accuracy", "Sensitivity", "Specificity", "Precision", "F1")) {
+  vals <- cv_results_df[[metric]]
+  cat(metric, ":", round(mean(vals, na.rm = TRUE), 4), "+/-",
+      round(sd(vals, na.rm = TRUE), 4), "\n")
+}
+```
+
+# Permutation Test
+
+```{r permutation_test, fig.width=8, fig.height=5}
+set.seed(42)
+n_perm <- 100
+perm_aucs <- numeric(n_perm)
+
+for (i in seq_len(n_perm)) {
+  if (i %% 10 == 0) cat("Permutation", i, "/", n_perm, "\n")
+  perm_data <- model_data
+  perm_data$eif4e_target <- sample(perm_data$eif4e_target)
+  perm_train <- impute_with_medians(perm_data[train_idx, ], train_medians)
+  perm_test  <- impute_with_medians(perm_data[-train_idx, ], train_medians)
+  rf_perm <- ranger(x = perm_train[, feature_cols], y = perm_train$eif4e_target,
+                    num.trees = 500, probability = TRUE, seed = i)
+  perm_probs <- predict(rf_perm, perm_test[, feature_cols])$predictions[, pos_label]
+  roc_perm <- roc(perm_test$eif4e_target, perm_probs,
+                  levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+  perm_aucs[i] <- as.numeric(auc(roc_perm))
+}
+
+perm_pvalue <- mean(perm_aucs >= as.numeric(auc_value))
+cat("Permutation p-value:", perm_pvalue, "\n")
+
+p_perm <- ggplot(data.frame(auc = perm_aucs), aes(x = auc)) +
+  geom_histogram(bins = 30, fill = "grey70", color = "white") +
+  geom_vline(xintercept = as.numeric(auc_value), color = "#E69F00", linewidth = 1.2) +
+  geom_vline(xintercept = 0.5, color = "grey40", linetype = "dashed") +
+  annotate("text", x = as.numeric(auc_value), y = Inf,
+           label = paste0("Real AUC\n", round(auc_value, 3)),
+           vjust = 2, hjust = -0.1, color = "#E69F00", size = 3.5) +
+  theme_cowplot() +
+  labs(title = "Permutation Test: Null AUC Distribution",
+       subtitle = paste0("n=", n_perm, " permutations | p = ", perm_pvalue),
+       x = "AUC (shuffled labels)", y = "Count")
+
+print(p_perm)
+
+ggsave(here("plots", paste0("rf_classification_permutation_test_", suffix, ".pdf")),
+       plot = p_perm, width = 8, height = 5)
+```
+
+# Calibration Plot
+
+```{r calibration_plot, fig.width=6, fig.height=6}
+cal_df <- data.frame(
+  pred = pred_pos_prob,
+  actual = as.numeric(actual == pos_label)
+)
+cal_df$bin <- cut(cal_df$pred, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+cal_summary <- cal_df %>%
+  group_by(bin) %>%
+  summarise(mean_pred = mean(pred), fraction_pos = mean(actual), n = n(), .groups = "drop") %>%
+  filter(!is.na(bin))
+
+p_cal <- ggplot(cal_summary, aes(x = mean_pred, y = fraction_pos)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_point(aes(size = n), color = "#0072B2") +
+  geom_line(color = "#0072B2") +
+  scale_size_continuous(name = "n in bin") +
+  xlim(0, 1) + ylim(0, 1) +
+  theme_cowplot() +
+  labs(title = "Calibration Plot",
+       subtitle = paste0(gene_label, " target classifier — test set"),
+       x = "Mean Predicted Probability", y = "Observed Fraction Positive")
+
+print(p_cal)
+
+ggsave(here("plots", paste0("rf_classification_calibration_", suffix, ".pdf")),
+       plot = p_cal, width = 6, height = 6)
+```
+
+# Learning Curve
+
+```{r learning_curve, fig.width=8, fig.height=5}
+set.seed(9)
+lc_fracs <- seq(0.1, 1.0, by = 0.1)
+
+lc_results <- lapply(lc_fracs, function(frac) {
+  if (frac < 1.0) {
+    idx <- createDataPartition(train_data$eif4e_target, p = frac, list = FALSE)
+    sub_train <- train_data[idx, ]
+  } else {
+    sub_train <- train_data
+  }
+  rf_lc <- ranger(x = sub_train[, feature_cols], y = sub_train$eif4e_target,
+                  num.trees = 200, probability = TRUE, seed = 9)
+  oob_probs_lc <- rf_lc$predictions[, pos_label]
+  roc_train_lc <- roc(sub_train$eif4e_target, oob_probs_lc,
+                      levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+  test_probs_lc <- predict(rf_lc, test_data[, feature_cols])$predictions[, pos_label]
+  roc_test_lc <- roc(test_data$eif4e_target, test_probs_lc,
+                     levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+  data.frame(frac = frac, n_train = nrow(sub_train),
+             train_oob_auc = as.numeric(auc(roc_train_lc)),
+             test_auc = as.numeric(auc(roc_test_lc)))
+})
+
+lc_df <- bind_rows(lc_results)
+
+p_lc <- lc_df %>%
+  pivot_longer(c(train_oob_auc, test_auc), names_to = "set", values_to = "auc") %>%
+  mutate(set = recode(set, train_oob_auc = "Train (OOB)", test_auc = "Test")) %>%
+  ggplot(aes(x = n_train, y = auc, color = set, group = set)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Train (OOB)" = "#E69F00", "Test" = "#0072B2")) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  theme_cowplot() +
+  labs(title = "Learning Curve", subtitle = paste0(gene_label, " target classifier"),
+       x = "Training Set Size", y = "AUC", color = NULL)
+
+print(p_lc)
+
+ggsave(here("plots", paste0("rf_classification_learning_curve_", suffix, ".pdf")),
+       plot = p_lc, width = 8, height = 5)
+```
+
+# Feature Importance
+
+```{r feature_importance, fig.width=10, fig.height=10}
+
+importance_df <- data.frame(
+  feature = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
+) %>%
+  arrange(desc(importance))
+
+# Clean names for plotting
+importance_df <- importance_df %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_", "CDS 4mer: ") %>%
+      str_replace("^rbp_", "RBP: ") %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%")
+  )
+
+cat("Top 30 Features:\n")
+print(importance_df %>% head(30) %>% dplyr::select(feature, importance))
+
+# Bar plot
+p_importance <- importance_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Top 30 Features: ", gene_label, " Target Classification"),
+    subtitle = "Variable Importance (Impurity)",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance)
+
+ggsave(here("plots", paste0("rf_classification_feature_importance_", suffix, ".pdf")),
+       plot = p_importance, width = 10, height = 10)
+
+# All-features bar plot (cap at top 40)
+importance_all_plot <- importance_df %>% head(40)
+all_height <- max(6, nrow(importance_all_plot) * 0.35)
+
+p_importance_all <- importance_all_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Top ", nrow(importance_all_plot), " Features: ", gene_label, " Target Classification"),
+    subtitle = "Variable Importance (Impurity)",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance_all)
+
+ggsave(here("plots", paste0("rf_classification_feature_importance_all_", suffix, ".pdf")),
+       plot = p_importance_all, width = 10, height = all_height)
+
+# Custom-features-only bar plot (exclude k-mer and RBP motif features, cap at top 40)
+importance_custom <- importance_df %>%
+  filter(!str_detect(feature, "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbp_|^rbns_|^cisbp_")) %>%
+  head(40)
+
+custom_height <- max(6, nrow(importance_custom) * 0.35)
+
+p_importance_custom <- importance_custom %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Custom Features: ", gene_label, " Target Classification"),
+    subtitle = "Variable Importance (Impurity) — CLIP, 4E/DAP5, Signatures, Lengths, GC",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance_custom)
+
+ggsave(here("plots", paste0("rf_classification_feature_importance_custom_", suffix, ".pdf")),
+       plot = p_importance_custom, width = 10, height = custom_height)
+```
+
+## Feature Category Summary
+
+```{r feature_categories, fig.width=10, fig.height=6}
+importance_df <- importance_df %>%
+  mutate(
+    category = case_when(
+      str_detect(feature, "^struct_")                          ~ "RNA Structure",
+      str_detect(feature, "^orfquant_")                       ~ "ORFquant",
+      str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
+      str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
+      str_detect(feature, "^cds_4mer_")                       ~ "CDS 4-mers",
+      str_detect(feature, "^rbns_|^cisbp_")                   ~ "RBP Motifs",
+      str_detect(feature, "^clip_")                           ~ "CLIP Binding",
+      str_detect(feature, "^lit_")                            ~ "Literature Signatures",
+      str_detect(feature, "length|Length")                     ~ "Region Lengths",
+      str_detect(feature, "_gc$|^gc3$")                       ~ "GC Content",
+      str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_")  ~ "4E / DAP5",
+      str_detect(feature, "^indiv_te_|^delta_te_")            ~ "Translational Efficiency",
+      str_detect(feature, "^cai$|^tai$|^csc$")               ~ "Codon Optimality",
+      TRUE                                                    ~ "Other"
+    )
+  )
+
+category_summary <- importance_df %>%
+  group_by(category) %>%
+  summarise(
+    n_features = n(),
+    total_importance = sum(importance),
+    mean_importance = mean(importance),
+    top_feature = feature[which.max(importance)],
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_importance))
+
+cat("\nImportance by Category:\n")
+print(category_summary)
+
+p_category <- ggplot(category_summary,
+                     aes(x = reorder(category, total_importance), y = total_importance)) +
+  geom_bar(stat = "identity", fill = "#56B4E9") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Feature Importance by Category: ", gene_label, " Target Classification"),
+    x = "",
+    y = "Total Variable Importance"
+  )
+
+print(p_category)
+
+ggsave(here("plots", paste0("rf_classification_importance_by_category_", suffix, ".pdf")),
+       plot = p_category, width = 10, height = 6)
+```
+
+# Export Results
+
+```{r export_results}
+output_dir <- here("output", "predictive_modeling")
+
+# Model
+saveRDS(rf_model, file.path(output_dir, paste0("rf_classifier_", suffix, ".rds")))
+
+# Feature importance
+write_csv(importance_df, file.path(output_dir, paste0("rf_classification_importance_", suffix, ".csv")))
+
+# Performance summary
+n_pos_total <- sum(model_genes$eif4e_target == pos_label)
+n_neg_total <- sum(model_genes$eif4e_target == neg_label)
+
+performance_df <- data.frame(
+  Metric = c("AUC", "Accuracy", "Balanced_Accuracy", "Sensitivity",
+             "Specificity", "Precision", "F1", "N_pos", "N_neg",
+             "AUC_CI_lower", "AUC_CI_upper", "permutation_pvalue"),
+  Test_Set = c(as.numeric(auc_value), accuracy, balanced_accuracy,
+               sensitivity, specificity, precision, f1,
+               n_pos_total, n_neg_total,
+               as.numeric(ci_auc[1]), as.numeric(ci_auc[3]), perm_pvalue),
+  CV_Mean = c(mean(cv_results_df$AUC), NA, mean(cv_results_df$Balanced_Accuracy),
+              mean(cv_results_df$Sensitivity), mean(cv_results_df$Specificity),
+              mean(cv_results_df$Precision, na.rm = TRUE),
+              mean(cv_results_df$F1, na.rm = TRUE), NA, NA, NA, NA, NA),
+  CV_SD = c(sd(cv_results_df$AUC), NA, sd(cv_results_df$Balanced_Accuracy),
+            sd(cv_results_df$Sensitivity), sd(cv_results_df$Specificity),
+            sd(cv_results_df$Precision, na.rm = TRUE),
+            sd(cv_results_df$F1, na.rm = TRUE), NA, NA, NA, NA, NA)
+)
+write_csv(performance_df, file.path(output_dir, paste0("rf_classification_performance_", suffix, ".csv")))
+
+# CV results
+write_csv(cv_results_df, file.path(output_dir, paste0("rf_classification_cv_results_", suffix, ".csv")))
+
+# Predictions
+predictions_export <- data.frame(
+  gene_id = test_data$gene_id_clean,
+  symbol = test_data$symbol,
+  actual = actual,
+  predicted = pred_class,
+  prob_pos = pred_pos_prob,
+  prob_neg = pred_probs[, neg_label]
+)
+write_csv(predictions_export, file.path(output_dir, paste0("rf_classification_predictions_", suffix, ".csv")))
+
+# Permutation AUCs
+write_csv(data.frame(perm_auc = perm_aucs),
+          file.path(output_dir, paste0("rf_classification_permutation_aucs_", suffix, ".csv")))
+
+# Learning curve
+write_csv(lc_df, file.path(output_dir, paste0("rf_classification_learning_curve_", suffix, ".csv")))
+
+cat("Exported: model RDS, importance CSV, performance CSV, CV results CSV, predictions CSV, permutation AUCs CSV, learning curve CSV\n")
+```
+
+# Summary
+
+```{r summary}
+cat("========================================\n")
+cat("CLASSIFICATION SUMMARY: eIF4E TARGETS\n")
+cat("========================================\n\n")
+
+cat("Parameters:\n")
+cat("  Feature set:", params$feature_set, "(no Boruta selection)\n")
+cat("  CLIP mode:", params$clip_mode, "\n\n")
+
+cat("Training data: Teleman riboseq (4E-BP1 OE vs vehicle)\n")
+cat("  Positive (", pos_label, ") = LFC < -1, padj < 0.05 (eIF4E-dependent)\n")
+cat("  Negative (", neg_label, ") = |LFC| < 0.1, padj > 0.5 (unaffected)\n\n")
+
+cat("Classes:\n")
+cat("  Positive (", pos_label, "):", sum(model_data$eif4e_target == pos_label), "\n")
+cat("  Negative (", neg_label, "):", sum(model_data$eif4e_target == neg_label), "\n")
+cat("  Features:", length(feature_cols), "\n\n")
+
+cat("Test Set Performance (Youden threshold =", round(optimal_threshold, 4), "):\n")
+cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
+cat("  AUC 95% CI (bootstrap):", round(ci_auc[1], 4), "-", round(ci_auc[3], 4), "\n")
+cat("  Permutation p-value:", perm_pvalue, "(n=100)\n")
+cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
+cat("  Sensitivity:", round(sensitivity, 4), "\n")
+cat("  Specificity:", round(specificity, 4), "\n")
+cat("  Precision:", round(precision, 4), "\n")
+cat("  F1:", round(f1, 4), "\n\n")
+
+cat("5-Fold CV:\n")
+cat("  AUC:", round(mean(cv_results_df$AUC), 4), "+/-", round(sd(cv_results_df$AUC), 4), "\n")
+cat("  Balanced Accuracy:", round(mean(cv_results_df$Balanced_Accuracy), 4), "+/-",
+    round(sd(cv_results_df$Balanced_Accuracy), 4), "\n\n")
+
+cat("Top 5 Features:\n")
+for (i in 1:5) {
+  cat("  ", i, ". ", importance_df$feature[i], " (", round(importance_df$importance[i], 2), ")\n", sep = "")
+}
+
+cat("========================================\n")
+```
+
+# Final Feature Importance Plot
+
+```{r final_importance_plot, fig.width=8, fig.height=max(4, min(40, length(feature_cols)) * 0.35)}
+# Lollipop plot of top features (cap at 40)
+importance_final_plot <- importance_df %>% head(40)
+final_height <- max(4, nrow(importance_final_plot) * 0.35)
+
+p_final_importance <- importance_final_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_segment(aes(xend = reorder(feature_clean, importance), y = 0, yend = importance),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(size = 3, color = "#0072B2") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Feature Importance: ", gene_label, " Target Classification"),
+    subtitle = paste0(params$feature_set, " | AUC = ", round(as.numeric(auc_value), 3)),
+    x = "",
+    y = "Variable Importance (Impurity)"
+  )
+
+print(p_final_importance)
+
+ggsave(here("plots", paste0("rf_final_importance_", suffix, ".pdf")),
+       plot = p_final_importance, width = 8,
+       height = final_height)
+```
+
+# Feature Directionality
+
+For each feature, computes point-biserial correlations and Wilcoxon rank-sum tests to determine whether the feature is higher or lower in the `promotes_eif4e` class, then renders signed-importance lollipop plots colored by feature category.
+
+## Compute Directionality
+
+```{r compute_directionality}
+# Binary numeric target: 0 = does_not_promote_eif4e, 1 = promotes_eif4e
+target_numeric <- as.numeric(model_genes$eif4e_target) - 1
+
+directionality <- importance_df %>%
+  rowwise() %>%
+  mutate(
+    mean_promotes         = mean(model_genes[[feature]][target_numeric == 1], na.rm = TRUE),
+    mean_does_not_promote = mean(model_genes[[feature]][target_numeric == 0], na.rm = TRUE),
+    diff = mean_promotes - mean_does_not_promote,
+    correlation = tryCatch(
+      cor(model_genes[[feature]], target_numeric, use = "complete.obs"),
+      error = function(e) NA_real_
+    ),
+    wilcox_p = tryCatch({
+      wt <- wilcox.test(model_genes[[feature]][target_numeric == 1],
+                        model_genes[[feature]][target_numeric == 0])
+      wt$p.value
+    }, error = function(e) NA_real_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    wilcox_p_adj = p.adjust(wilcox_p, method = "BH"),
+    direction = case_when(
+      is.na(correlation) ~ NA_character_,
+      correlation >= 0   ~ "Higher in promotes",
+      TRUE               ~ "Lower in promotes"
+    )
+  ) %>%
+  arrange(desc(importance))
+
+cat("Directionality computed for", nrow(directionality), "features\n")
+cat("Higher in promotes:", sum(directionality$direction == "Higher in promotes", na.rm = TRUE), "\n")
+cat("Lower in promotes:", sum(directionality$direction == "Lower in promotes", na.rm = TRUE), "\n")
+cat("Significant (Wilcox BH p < 0.05):", sum(directionality$wilcox_p_adj < 0.05, na.rm = TRUE), "\n")
+```
+
+## Lollipop: Top 30 Features
+
+```{r plot_lollipop, fig.width=10, fig.height=10}
+category_colors <- c(
+  "Intrinsic mRNA features"  = "#3D9C60",
+  "eIF3/cap CLIP binding"    = "#E6A817",
+  "DAP5 regulation"          = "#D668C6",
+  "Literature signatures"    = "#4A7FC1",
+  "Translational efficiency" = "#E07030"
+)
+
+make_broad_category <- function(df) {
+  df %>%
+    mutate(
+      broad_category = case_when(
+        category == "4E / DAP5"               ~ "DAP5 regulation",
+        category == "CLIP Binding"             ~ "eIF3/cap CLIP binding",
+        category == "Literature Signatures"    ~ "Literature signatures",
+        category == "Translational Efficiency" ~ "Translational efficiency",
+        TRUE                                   ~ "Intrinsic mRNA features"
+      ),
+      broad_category = factor(broad_category, levels = names(category_colors)),
+      signed_importance = importance * sign(correlation),
+      feature_clean = fct_reorder(feature_clean, signed_importance)
+    )
+}
+
+lollipop_data <- directionality %>%
+  filter(!is.na(correlation)) %>%
+  head(30) %>%
+  make_broad_category()
+
+p_lollipop <- ggdotchart(
+  lollipop_data,
+  x        = "feature_clean",
+  y        = "signed_importance",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 4,
+  xlab     = "",
+  ylab     = "Signed Importance (positive = higher in promotes_eif4e)",
+  title    = "Top 30 Features: Signed Importance + Directionality",
+  subtitle = paste0(gene_label, " | ", params$feature_set, " | AUC = ", round(as.numeric(auc_value), 3))
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_lollipop)
+
+ggsave(here("plots", paste0("rf_directionality_lollipop_", suffix, ".pdf")),
+       plot = p_lollipop, width = 10, height = 10)
+```
+
+## Lollipop: All Features
+
+```{r plot_lollipop_all, fig.width=10, fig.height=ceiling(nrow(directionality %>% filter(!is.na(correlation))) * 0.28)}
+lollipop_all_data <- directionality %>%
+  filter(!is.na(correlation)) %>%
+  make_broad_category()
+
+plot_height_all <- max(10, nrow(lollipop_all_data) * 0.28)
+
+p_lollipop_all <- ggdotchart(
+  lollipop_all_data,
+  x        = "feature_clean",
+  y        = "signed_importance",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 3,
+  xlab     = "",
+  ylab     = "Signed Importance (positive = higher in promotes_eif4e)",
+  title    = paste0("All Features: Signed Importance (n = ", nrow(lollipop_all_data), ")"),
+  subtitle = paste0(gene_label, " | ", params$feature_set, " | AUC = ", round(as.numeric(auc_value), 3))
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_lollipop_all)
+
+ggsave(here("plots", paste0("rf_directionality_lollipop_all_", suffix, ".pdf")),
+       plot = p_lollipop_all, width = 10, height = plot_height_all)
+```
+
+## Export Directionality Table
+
+```{r export_directionality}
+export_dir_df <- directionality %>%
+  dplyr::select(feature, feature_clean, category, mean_promotes, mean_does_not_promote,
+                diff, correlation, wilcox_p, wilcox_p_adj, importance, direction)
+
+write_csv(export_dir_df,
+          here("output", "predictive_modeling",
+               paste0("rf_feature_directionality_", suffix, ".csv")))
+
+cat("Exported: rf_feature_directionality_", suffix, ".csv\n")
+cat("  Rows:", nrow(export_dir_df), "\n")
+cat("  Significant (BH p < 0.05):", sum(export_dir_df$wilcox_p_adj < 0.05, na.rm = TRUE), "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

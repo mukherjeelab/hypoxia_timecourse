@@ -16,7 +16,7 @@ dap5_new <- read_csv(
   show_col_types = FALSE
 ) %>%
   filter(!is.na(symbol)) %>%
-  select(symbol, new_lfc = log2FoldChange) %>%
+  dplyr::select(symbol, new_lfc = log2FoldChange) %>%
   distinct(symbol, .keep_all = TRUE)
 
 cat("Loaded updated DAP5 results:", nrow(dap5_new), "genes\n")
@@ -74,7 +74,7 @@ for (t in targets) {
   fm <- fm %>%
     left_join(dap5_new, by = "symbol") %>%
     mutate(!!t$col := ifelse(!is.na(new_lfc), new_lfc, .data[[t$col]])) %>%
-    select(-new_lfc)
+    dplyr::select(-new_lfc)
 
   new_median <- round(median(fm[[t$col]], na.rm = TRUE), 3)
 

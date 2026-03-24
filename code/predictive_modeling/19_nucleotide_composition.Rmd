@@ -1,0 +1,361 @@
+---
+title: "19 — Nucleotide Composition"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Compare CDS, 5' UTR, and 3' UTR nucleotide composition (A, C, G, T proportions and
+GC content) across three groups: eIF3d hypoxia-promoted genes (1 hr, lfc > 0.5),
+size-matched negative controls, and all expressed genes (background).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+# Load Feature Matrix and Sequences
+
+```{r load_data}
+feature_matrix <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
+keep_tx <- feature_matrix$transcript_id_clean
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# CDS
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+keep_idx        <- cds_names_clean %in% keep_tx
+cds_frame0      <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+valid           <- width(cds_frame0) %% 3 == 0
+cds_frame0      <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+
+# 5' UTR
+utr5_all         <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr5_seqs_all    <- extractTranscriptSeqs(genome, utr5_all)
+utr5_names_clean <- sub("\\..*", "", names(utr5_seqs_all))
+keep_idx5        <- utr5_names_clean %in% keep_tx
+utr5_seqs        <- utr5_seqs_all[keep_idx5]
+names(utr5_seqs) <- utr5_names_clean[keep_idx5]
+cat("5' UTR sequences:", length(utr5_seqs), "\n")
+
+# 3' UTR
+utr3_all         <- threeUTRsByTranscript(txdb, use.names = TRUE)
+utr3_seqs_all    <- extractTranscriptSeqs(genome, utr3_all)
+utr3_names_clean <- sub("\\..*", "", names(utr3_seqs_all))
+keep_idx3        <- utr3_names_clean %in% keep_tx
+utr3_seqs        <- utr3_seqs_all[keep_idx3]
+names(utr3_seqs) <- utr3_names_clean[keep_idx3]
+cat("3' UTR sequences:", length(utr3_seqs), "\n")
+```
+
+# Compute Nucleotide Composition
+
+```{r nucleotide_composition}
+compute_nuc_scores <- function(seqs, label) {
+  lf <- Biostrings::letterFrequency(seqs, letters = c("A", "C", "G", "T"), as.prob = TRUE)
+  tb <- tibble(
+    transcript_id_clean = names(seqs),
+    A  = lf[, "A"],
+    C  = lf[, "C"],
+    G  = lf[, "G"],
+    T  = lf[, "T"],
+    GC = lf[, "G"] + lf[, "C"]
+  )
+  row_sums <- tb$A + tb$C + tb$G + tb$T
+  cat(label, "row sum check (min, max):",
+      round(min(row_sums), 6), round(max(row_sums), 6), "\n")
+  tb
+}
+
+nuc_cds  <- compute_nuc_scores(cds_frame0, "CDS")
+nuc_utr5 <- compute_nuc_scores(utr5_seqs,  "5' UTR")
+nuc_utr3 <- compute_nuc_scores(utr3_seqs,  "3' UTR")
+```
+
+# Collapse to Gene Level
+
+```{r gene_level}
+collapse_to_gene <- function(nuc_scores) {
+  nuc_scores %>%
+    left_join(
+      feature_matrix %>% dplyr::select(transcript_id_clean, gene_id, symbol),
+      by = "transcript_id_clean"
+    ) %>%
+    mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+    group_by(ensembl_gene, symbol) %>%
+    summarise(
+      A  = mean(A,  na.rm = TRUE),
+      C  = mean(C,  na.rm = TRUE),
+      G  = mean(G,  na.rm = TRUE),
+      T  = mean(T,  na.rm = TRUE),
+      GC = mean(GC, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+gene_cds  <- collapse_to_gene(nuc_cds)
+gene_utr5 <- collapse_to_gene(nuc_utr5)
+gene_utr3 <- collapse_to_gene(nuc_utr3)
+cat("CDS gene-level rows:",    nrow(gene_cds),  "\n")
+cat("5' UTR gene-level rows:", nrow(gene_utr5), "\n")
+cat("3' UTR gene-level rows:", nrow(gene_utr3), "\n")
+
+# Cross-check: GC from nucleotide frequencies vs pre-computed cds_gc in feature_matrix
+gc_check <- gene_cds %>%
+  left_join(
+    feature_matrix %>%
+      mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+      group_by(ensembl_gene) %>%
+      summarise(cds_gc_ref = mean(cds_gc, na.rm = TRUE), .groups = "drop"),
+    by = "ensembl_gene"
+  )
+cat("CDS GC correlation with feature_matrix cds_gc:",
+    round(cor(gc_check$GC, gc_check$cds_gc_ref, use = "complete.obs"), 4), "\n")
+```
+
+# Load Gene Sets
+
+```{r gene_sets}
+promotes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+promotes_ids <- promotes$ensembl_gene
+cat("Promotes genes:", length(promotes_ids), "\n")
+
+neg_pool <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  filter(!ensembl_gene %in% promotes_ids)
+cat("Neg pool after removing promotes overlap:", nrow(neg_pool), "\n")
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene, size = length(promotes_ids), replace = FALSE)
+cat("Negative control genes (size-matched):", length(neg_ctrl_ids), "\n")
+cat("Overlap (should be 0):", length(intersect(promotes_ids, neg_ctrl_ids)), "\n")
+```
+
+# CDS Density Plots
+
+## GC Content
+
+```{r cds_gc_plot, fig.width=5, fig.height=4}
+bg    <- gene_cds %>% filter(!is.na(GC))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$GC, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(GC))
+cat("CDS GC — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+cds_gc_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = GC), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = GC), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = GC), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "CDS GC content", x = "GC proportion", y = "Density") +
+  theme_classic(base_size = 13)
+cds_gc_plot
+ggsave(here("plots", "nucleotide_gc_content.pdf"), cds_gc_plot, width = 5, height = 4)
+```
+
+## A Frequency
+
+```{r cds_a_plot, fig.width=5, fig.height=4}
+bg    <- gene_cds %>% filter(!is.na(A))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$A, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(A))
+cat("CDS A — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+cds_a_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = A), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = A), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = A), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "CDS adenine (A) frequency", x = "A proportion", y = "Density") +
+  theme_classic(base_size = 13)
+cds_a_plot
+ggsave(here("plots", "nucleotide_a_freq.pdf"), cds_a_plot, width = 5, height = 4)
+```
+
+## C Frequency
+
+```{r cds_c_plot, fig.width=5, fig.height=4}
+bg    <- gene_cds %>% filter(!is.na(C))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$C, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(C))
+cat("CDS C — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+cds_c_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = C), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = C), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = C), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "CDS cytosine (C) frequency", x = "C proportion", y = "Density") +
+  theme_classic(base_size = 13)
+cds_c_plot
+ggsave(here("plots", "nucleotide_c_freq.pdf"), cds_c_plot, width = 5, height = 4)
+```
+
+## G Frequency
+
+```{r cds_g_plot, fig.width=5, fig.height=4}
+bg    <- gene_cds %>% filter(!is.na(G))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$G, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(G))
+cat("CDS G — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+cds_g_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = G), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = G), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = G), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "CDS guanine (G) frequency", x = "G proportion", y = "Density") +
+  theme_classic(base_size = 13)
+cds_g_plot
+ggsave(here("plots", "nucleotide_g_freq.pdf"), cds_g_plot, width = 5, height = 4)
+```
+
+## T Frequency
+
+```{r cds_t_plot, fig.width=5, fig.height=4}
+bg    <- gene_cds %>% filter(!is.na(T))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$T, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(T))
+cat("CDS T — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+cds_t_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = T), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = T), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = T), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "CDS thymine (T) frequency", x = "T proportion", y = "Density") +
+  theme_classic(base_size = 13)
+cds_t_plot
+ggsave(here("plots", "nucleotide_t_freq.pdf"), cds_t_plot, width = 5, height = 4)
+```
+
+# 5' UTR Density Plots
+
+## GC Content
+
+```{r utr5_gc_plot, fig.width=5, fig.height=4}
+bg    <- gene_utr5 %>% filter(!is.na(GC))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$GC, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(GC))
+cat("5'UTR GC — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+utr5_gc_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = GC), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = GC), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = GC), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "5' UTR GC content", x = "GC proportion", y = "Density") +
+  theme_classic(base_size = 13)
+utr5_gc_plot
+ggsave(here("plots", "utr5_nucleotide_gc_content.pdf"), utr5_gc_plot, width = 5, height = 4)
+```
+
+
+# 3' UTR Density Plots
+
+## GC Content
+
+```{r utr3_gc_plot, fig.width=5, fig.height=4}
+bg    <- gene_utr3 %>% filter(!is.na(GC))
+fg_p  <- bg %>% filter(ensembl_gene %in% promotes_ids)
+fg_n  <- bg %>% filter(ensembl_gene %in% neg_ctrl_ids)
+ks    <- ks.test(fg_p$GC, bg %>% filter(!ensembl_gene %in% promotes_ids) %>% pull(GC))
+cat("3'UTR GC — promotes n =", nrow(fg_p), "| neg ctrl n =", nrow(fg_n),
+    "| KS p =", formatC(ks$p.value, format = "e", digits = 2), "\n")
+
+utr3_gc_plot <- ggplot() +
+  geom_density(data = bg,   aes(x = GC), color = "grey60",  fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_p, aes(x = GC), color = "#E69F00", fill = NA, linewidth = 0.9) +
+  geom_density(data = fg_n, aes(x = GC), color = "#000000", fill = NA, linewidth = 0.9) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)), size = 3.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+           label = paste0("All genes (n = ", nrow(bg), ")"), size = 3.5, color = "grey50") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+           label = paste0("eIF3d hypoxia promotes (n = ", nrow(fg_p), ")"), size = 3.5, color = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+           label = paste0("Negative control (n = ", nrow(fg_n), ")"), size = 3.5, color = "#000000") +
+  labs(title = "3' UTR GC content", x = "GC proportion", y = "Density") +
+  theme_classic(base_size = 13)
+utr3_gc_plot
+ggsave(here("plots", "utr3_nucleotide_gc_content.pdf"), utr3_gc_plot, width = 5, height = 4)
+```
+

@@ -414,3 +414,245 @@ for (cl_label in names(cl_vars)) {
 }
 ```
 
+## Validation: iCodon CSC vs Zhu SLAMseq mRNA Half-Life (Zhu et al. Science 2024)
+
+```{r load_zhu_slamseq}
+library(readxl)
+
+zhu_raw <- read_xlsx(
+  here("accessories", "csc_data", "zhu_slamseq",
+       "GSE268322_CNOT3_SLAM-seq_to_C_convertion_ratio.xlsx"),
+  sheet = "CNOT3_SLAM-seq"
+)
+
+# Select gene columns + sgNT control columns only
+sgnt_cols <- grep("sgNT", colnames(zhu_raw), value = TRUE)
+zhu_ctrl <- zhu_raw %>%
+  dplyr::select(gene_symbol = Gene_Name, gene_id = Gene_ID, all_of(sgnt_cols))
+
+cat("Genes in Zhu SLAMseq:", nrow(zhu_ctrl), "\n")
+cat("Control timepoint columns:", length(sgnt_cols), "\n")
+```
+
+```{r compute_zhu_halflives}
+# Parse timepoint (hours) from column names like "sgNT-chase_0h_rep1_SLAM1"
+parse_hours <- function(col) {
+  as.numeric(sub(".*chase_(\\d+)h_.*", "\\1", col))
+}
+
+# Pivot to long format, compute mean ratio per gene per timepoint
+zhu_long <- zhu_ctrl %>%
+  pivot_longer(cols = all_of(sgnt_cols), names_to = "col_name", values_to = "tc_ratio") %>%
+  mutate(timepoint = parse_hours(col_name)) %>%
+  filter(!is.na(tc_ratio)) %>%
+  group_by(gene_symbol, gene_id, timepoint) %>%
+  summarise(mean_ratio = mean(tc_ratio, na.rm = TRUE), .groups = "drop")
+
+# Normalize each gene to its t=0 value, then fit exponential decay
+fit_halflife <- function(df) {
+  t0_ratio <- df$mean_ratio[df$timepoint == 0]
+  if (length(t0_ratio) == 0 || is.na(t0_ratio) || t0_ratio <= 0) return(NA_real_)
+
+  df_norm <- df %>%
+    mutate(fraction_remaining = mean_ratio / t0_ratio) %>%
+    filter(timepoint > 0, fraction_remaining > 0, is.finite(fraction_remaining))
+
+  if (nrow(df_norm) < 3) return(NA_real_)
+
+  fit <- tryCatch(
+    nls(
+      fraction_remaining ~ exp(-lambda * timepoint),
+      data    = df_norm,
+      start   = list(lambda = 0.1),
+      algorithm = "port",
+      lower   = list(lambda = 1e-6),
+      upper   = list(lambda = 10),
+      control = nls.control(maxiter = 200, warnOnly = TRUE)
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(NA_real_)
+  lambda_hat <- coef(fit)[["lambda"]]
+  if (!is.finite(lambda_hat) || lambda_hat <= 0) return(NA_real_)
+  log(2) / lambda_hat
+}
+
+zhu_halflives_raw <- zhu_long %>%
+  group_by(gene_symbol, gene_id) %>%
+  group_modify(~ tibble(halflife_zhu = fit_halflife(.x))) %>%
+  ungroup()
+
+zhu_halflife <- zhu_halflives_raw %>%
+  filter(!is.na(halflife_zhu), is.finite(halflife_zhu), halflife_zhu > 0)
+
+cat("Genes with fitted half-life:", nrow(zhu_halflife), "\n")
+cat("Half-life summary (hours):\n")
+print(summary(zhu_halflife$halflife_zhu))
+```
+
+```{r scatter_icodon_vs_zhu}
+# Join CSC scores (with symbol) with Zhu half-lives
+zhu_scatter_df <- csc_with_symbol %>%
+  inner_join(zhu_halflife, by = c("symbol" = "gene_symbol"))
+
+cat("Genes matched (CSC × Zhu):", nrow(zhu_scatter_df), "\n")
+
+fit_zhu <- lm(halflife_zhu ~ csc, data = zhu_scatter_df)
+r_zhu   <- sign(coef(fit_zhu)[["csc"]]) * sqrt(summary(fit_zhu)$r.squared)
+
+p_zhu <- ggplot(zhu_scatter_df, aes(x = csc, y = halflife_zhu)) +
+  geom_point(alpha = 0.3, size = 0.8, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r_zhu, 3)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "iCodon CSC vs. Zhu SLAMseq mRNA half-life",
+    subtitle = "Control (sgNT) conditions, Zhu et al. Science 2024",
+    x        = "CSC (iCodon)",
+    y        = "mRNA half-life (hours)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_zhu
+ggsave(here("plots", "icodon_vs_zhu_slamseq_halflife.pdf"), p_zhu, width = 6, height = 5)
+cat("r =", round(r_zhu, 4), "\n")
+cat("Saved: plots/icodon_vs_zhu_slamseq_halflife.pdf\n")
+```
+
+```{r scatter_icodon_vs_zhu_no_outlier}
+# IQR-based upper cutoff
+q3   <- quantile(zhu_scatter_df$halflife_zhu, 0.75)
+iqr  <- IQR(zhu_scatter_df$halflife_zhu)
+cutoff <- q3 + 3 * iqr
+
+zhu_scatter_no_out <- zhu_scatter_df %>%
+  filter(halflife_zhu < cutoff)
+
+fit_zhu_b <- lm(halflife_zhu ~ csc, data = zhu_scatter_no_out)
+r_zhu_b   <- sign(coef(fit_zhu_b)[["csc"]]) * sqrt(summary(fit_zhu_b)$r.squared)
+
+p_zhu_b <- ggplot(zhu_scatter_no_out, aes(x = csc, y = halflife_zhu)) +
+  geom_point(alpha = 0.3, size = 0.8, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r_zhu_b, 3)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "iCodon CSC vs. Zhu SLAMseq mRNA half-life (no outliers)",
+    subtitle = paste0("Control (sgNT), Zhu et al. 2024; half-life < ", round(cutoff, 1), " h"),
+    x        = "CSC (iCodon)",
+    y        = "mRNA half-life (hours)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_zhu_b
+ggsave(here("plots", "icodon_vs_zhu_slamseq_halflife_no_outlier.pdf"), p_zhu_b, width = 6, height = 5)
+cat("r =", round(r_zhu_b, 4), "\n")
+cat("Cutoff:", round(cutoff, 1), "h | n =", nrow(zhu_scatter_no_out), "\n")
+cat("Saved: plots/icodon_vs_zhu_slamseq_halflife_no_outlier.pdf\n")
+```
+
+## Kate CSC — Per-Codon Arithmetic Mean vs iCodon predict_stability()
+
+The iCodon `predict_stability()` score is the output of a trained elastic-net model
+using codon counts, sequence length, and cell-type context. Here we compute a simpler,
+fully transparent "Kate CSC": the arithmetic mean of per-codon `human_optimality` weights
+across every codon position in the CDS. Because these per-codon weights are signed
+(both positive and negative), an arithmetic mean is used rather than a geometric mean.
+
+This correlation shows how much of the iCodon model's predictions are captured by
+the raw per-codon CSC values alone, without any length or context adjustments.
+
+```{r kate_csc_weights}
+# Load per-codon CSC weights from iCodon (64 codons × optimality score)
+w_vec <- setNames(iCodon::human_optimality$optimality,
+                  iCodon::human_optimality$codon)
+
+cat("Per-codon weights loaded:", length(w_vec), "codons\n")
+cat("Range:", round(range(w_vec), 4), "\n")
+cat("Head:\n")
+print(head(sort(w_vec)))
+print(tail(sort(w_vec)))
+```
+
+```{r compute_kate_csc}
+compute_kate_csc <- function(seq_char, w_vec) {
+  n        <- nchar(seq_char)
+  n_codons <- n %/% 3
+  if (n_codons == 0) return(NA_real_)
+  starts <- seq(1,        n_codons * 3 - 2, by = 3)
+  ends   <- seq(3,        n_codons * 3,     by = 3)
+  codons  <- substring(seq_char, starts, ends)
+  weights <- w_vec[codons]   # NA for any unrecognised codon (e.g. stop codons)
+  mean(weights, na.rm = TRUE)
+}
+
+# cds_sequences is the filtered DNAStringSet already in the environment
+cds_char <- as.character(cds_sequences)
+kate_csc  <- vapply(cds_char, compute_kate_csc, numeric(1), w_vec = w_vec)
+names(kate_csc) <- names(cds_sequences)
+
+cat("Kate CSC summary:\n")
+print(summary(kate_csc))
+cat("Non-NA:", sum(!is.na(kate_csc)), "of", length(kate_csc), "\n")
+```
+
+```{r compare_csc_table}
+# Build comparison table: Kate CSC vs iCodon csc_scores per transcript
+compare_df <- tibble(
+  transcript_id_clean = names(kate_csc),
+  kate_csc            = kate_csc,
+  icodon_csc          = as.numeric(csc_scores[names(kate_csc)])
+) %>%
+  left_join(
+    most_abundant_tx %>% transmute(
+      transcript_id_clean = as.character(unlist(transcript_id_clean)),
+      ensembl_gene        = as.character(unlist(gene_id_clean)),
+      symbol              = as.character(unlist(symbol))
+    ),
+    by = "transcript_id_clean"
+  ) %>%
+  filter(!is.na(kate_csc), !is.na(icodon_csc)) %>%
+  mutate(group = if_else(ensembl_gene %in% promotes_ids,
+                         "eIF3d hypoxia promotes", "All other genes"))
+
+cat("Genes in comparison:", nrow(compare_df), "\n")
+cat("Promotes with both scores:", sum(compare_df$group == "eIF3d hypoxia promotes"), "\n")
+```
+
+```{r scatter_kate_vs_icodon}
+fit_k <- lm(icodon_csc ~ kate_csc, data = compare_df)
+r_k   <- sign(coef(fit_k)[["kate_csc"]]) * sqrt(summary(fit_k)$r.squared)
+
+promotes_df <- compare_df %>% filter(group == "eIF3d hypoxia promotes")
+other_df    <- compare_df %>% filter(group == "All other genes")
+
+p_kate <- ggplot() +
+  geom_point(data = other_df,
+             aes(x = kate_csc, y = icodon_csc),
+             alpha = 0.2, size = 0.6, color = "grey60") +
+  geom_point(data = promotes_df,
+             aes(x = kate_csc, y = icodon_csc),
+             alpha = 0.7, size = 1, color = "#E69F00") +
+  geom_smooth(data = compare_df,
+              aes(x = kate_csc, y = icodon_csc),
+              method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("r = ", round(r_k, 3), "\nn = ", nrow(compare_df)),
+           hjust = 1.1, vjust = 1.5, size = 4) +
+  labs(
+    title    = "Kate CSC vs iCodon predict_stability()",
+    subtitle = "Orange = eIF3d hypoxia promotes; Kate CSC = arithmetic mean of per-codon human_optimality",
+    x = "Kate CSC (arithmetic mean of per-codon weights)",
+    y = "iCodon CSC (predict_stability decay rate)"
+  ) +
+  theme_bw(base_size = 12)
+
+p_kate
+ggsave(here("plots", "kate_csc_vs_icodon_csc.pdf"), p_kate, width = 6, height = 5)
+cat("r =", round(r_k, 4), "\n")
+cat("Saved: plots/kate_csc_vs_icodon_csc.pdf\n")
+```
+
