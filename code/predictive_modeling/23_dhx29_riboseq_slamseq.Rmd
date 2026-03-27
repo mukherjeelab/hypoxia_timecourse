@@ -238,6 +238,54 @@ if (nrow(tasor_rank) > 0) {
 }
 ```
 
+```{r verify_codon_extraction}
+# Verify that codon extraction here matches the method used in nb20 (Kate CSC).
+#
+# nb23 method: starts <- seq(1, nchar(seq) - 2, by = 3); substring(seq, starts, starts + 2)
+# nb20 method: starts <- seq(1, n_codons*3 - 2, by = 3); ends <- seq(3, n_codons*3, by = 3)
+#              substring(seq, starts, ends)
+#
+# These are algebraically identical when nchar(seq) = n_codons * 3 (guaranteed by valid_length
+# filter), but we confirm empirically on the promotes transcripts.
+
+promotes_tx <- dhx29_occupancy %>%
+  filter(ensembl_gene %in% promotes_ids) %>%
+  pull(transcript_id_clean)
+
+cat("Promotes transcripts to check:", length(promotes_tx), "\n")
+
+mismatches <- vapply(promotes_tx, function(tx) {
+  seq_char <- cds_char[tx]
+  if (is.na(seq_char)) return(FALSE)
+  n_codons <- nchar(seq_char) %/% 3
+
+  # nb23 extraction
+  starts_23 <- seq(1, nchar(seq_char) - 2, by = 3)
+  codons_23 <- substring(seq_char, starts_23, starts_23 + 2)
+
+  # nb20 Kate CSC extraction
+  starts_20 <- seq(1, n_codons * 3 - 2, by = 3)
+  ends_20   <- seq(3, n_codons * 3,     by = 3)
+  codons_20 <- substring(seq_char, starts_20, ends_20)
+
+  !identical(codons_23, codons_20)
+}, logical(1))
+
+cat("Transcripts with mismatched codon extraction:", sum(mismatches), "\n")
+if (sum(mismatches) == 0) {
+  cat("PASS: codon extraction is identical between nb23 and nb20 methods for all promotes genes.\n")
+} else {
+  cat("FAIL: mismatches found in transcripts:\n")
+  print(promotes_tx[mismatches])
+}
+
+# Also check transcript overlap: same promotes genes selected in both notebooks?
+# cds_sequences is the filtered DNAStringSet from the same TxDb pull used throughout
+cat("\nPromotes transcripts present in nb23 occupancy:", length(promotes_tx), "\n")
+cat("Of those, also in cds_sequences (same TxDb pull):", sum(promotes_tx %in% names(cds_sequences)), "\n")
+cat("Only in nb23 (not in cds_sequences):", sum(!promotes_tx %in% names(cds_sequences)), "\n")
+```
+
 ### 2b: Validation — reproduce Figure 4D
 
 Dot plot of all 61 sense codons ranked by CES, colored by AU3 (ending in A/T) vs GC3
@@ -625,8 +673,8 @@ cdf_df <- occ_logfc %>%
 cdf_colors <- c(
   "All other genes" = "grey60"
 )
-cdf_colors[paste0("Top ", n_group, ": high DHX29\n(AU3-rich)")]    <- "#E69F00"
-cdf_colors[paste0("Bottom ", n_group, ": low DHX29\n(GC3-rich)")] <- "#56B4E9"
+cdf_colors[paste0("Top ", n_group, ": high DHX29\n(AU3-rich)")]    <- "green"
+cdf_colors[paste0("Bottom ", n_group, ": low DHX29\n(GC3-rich)")] <- "blue"
 
 p_cdf <- ggplot(cdf_df, aes(x = logFC, color = occ_group)) +
   stat_ecdf(linewidth = 0.9) +
@@ -640,7 +688,8 @@ p_cdf <- ggplot(cdf_df, aes(x = logFC, color = occ_group)) +
     color = NULL
   ) +
   theme_bw(base_size = 12) +
-  theme(legend.position = "top")
+  theme(legend.position = "top")+
+  xlim(-0.5,0.5)
 
 p_cdf
 ggsave(here("plots", "23_dhx29_occupancy_cdf_log2ratio.pdf"),
@@ -772,7 +821,196 @@ cat("Saved: plots/23_dhx29_codon_stability_scores.pdf\n")
 
 ---
 
-## Section 5: Save outputs
+## Section 5: CSC-stratified CDF of DHX29 logFC
+
+Do genes with non-optimal codons (low CSC) get the most stabilized upon DHX29 KO?
+Three CDF plots test this: ORFeome CSC quintiles, iCodon CSC quintiles, and eIF3d gene groups.
+Requires `orfeome_csc_weights.rds` and `icodon_csc_per_gene.rds` from notebook 20.
+
+```{r load_csc_weights}
+orfeome_wts_path <- here("output", "predictive_modeling", "orfeome_csc_weights.rds")
+icodon_path      <- here("output", "predictive_modeling", "icodon_csc_per_gene.rds")
+
+if (!file.exists(orfeome_wts_path) || !file.exists(icodon_path)) {
+  stop("Required RDS files not found — knit notebook 20 to generate:\n  ",
+       orfeome_wts_path, "\n  ", icodon_path)
+}
+
+orfeome_csc_weights <- readRDS(orfeome_wts_path)
+icodon_per_gene     <- readRDS(icodon_path)
+
+cat("ORFeome CSC weights loaded:", length(orfeome_csc_weights), "codons\n")
+cat("iCodon per-gene scores loaded:", nrow(icodon_per_gene), "genes\n")
+```
+
+```{r compute_orfeome_per_gene}
+# Apply ORFeome CSC weights to each gene's CDS codon frequencies.
+# Same pattern as compute_occupancy in Section 2a, but weights can be negative.
+# Divide by length(codons) after stop codon removal (corrects denominator vs n_codons).
+compute_csc_score <- function(seq_char, weight_vec) {
+  n_codons <- nchar(seq_char) %/% 3
+  if (n_codons < 10) return(NA_real_)
+  starts <- seq(1, nchar(seq_char) - 2, by = 3)
+  codons <- substring(seq_char, starts, starts + 2)
+  codons <- codons[!codons %in% c("TAA", "TAG", "TGA")]
+  if (length(codons) == 0) return(NA_real_)
+  sum(weight_vec[codons], na.rm = TRUE) / length(codons)
+}
+
+orfeome_scores_raw <- vapply(cds_char, compute_csc_score, numeric(1),
+                             weight_vec = orfeome_csc_weights)
+names(orfeome_scores_raw) <- names(cds_sequences)
+
+orfeome_per_gene <- tibble(
+  transcript_id_clean = names(orfeome_scores_raw),
+  orfeome_csc_score   = orfeome_scores_raw
+) %>%
+  left_join(tx_gene, by = "transcript_id_clean") %>%
+  filter(!is.na(ensembl_gene), !is.na(orfeome_csc_score))
+
+cat("Genes with ORFeome CSC score:", nrow(orfeome_per_gene), "\n")
+cat("Summary:\n")
+print(summary(orfeome_per_gene$orfeome_csc_score))
+```
+
+```{r ecdf_plot_helper}
+# Shared helper: ECDF of logFC stratified by CSC quintiles.
+# Q1 = lowest CSC (most AU3, non-optimal); Q5 = highest CSC (most GC3, optimal).
+# Expected: Q1 shifts right (most stabilized upon DHX29 KO).
+plot_ecdf_quintiles <- function(plot_df, score_col, title, subtitle, file_name,
+                                xlim_range = c(-3, 3)) {
+  plot_df <- plot_df %>%
+    filter(!is.na(.data[[score_col]]), !is.na(logFC)) %>%
+    mutate(quintile = factor(ntile(.data[[score_col]], 5),
+                             labels = paste0("Q", 1:5)))
+
+  n_labels <- plot_df %>%
+    group_by(quintile) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label = paste0(quintile, " (n=", n, ")"))
+
+  # RdBu: Q1 (low CSC, AU3-rich) = warm red; Q5 (high CSC, GC3-rich) = cool blue
+  pal <- RColorBrewer::brewer.pal(5, "RdBu")
+
+  p <- ggplot(plot_df, aes(x = logFC, color = quintile)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.5) +
+    scale_color_manual(
+      values = pal,
+      labels = n_labels$label[match(levels(plot_df$quintile), n_labels$quintile)],
+      name   = "CSC quintile"
+    ) +
+    coord_cartesian(xlim = xlim_range) +
+    labs(title = title, subtitle = subtitle,
+         x = "logFC (DHX29-KO / Control half-life)", y = "Empirical CDF") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "right")
+
+  p
+  ggsave(here("plots", file_name), p, width = 7, height = 5)
+  cat("Saved:", file_name, "\n")
+
+  q1 <- plot_df %>% filter(quintile == "Q1") %>% pull(logFC)
+  q5 <- plot_df %>% filter(quintile == "Q5") %>% pull(logFC)
+  wt <- wilcox.test(q1, q5, alternative = "two.sided")
+  cat("Wilcoxon Q1 vs Q5: W =", wt$statistic,
+      ", p =", formatC(wt$p.value, format = "e", digits = 2),
+      "| median Q1:", round(median(q1, na.rm = TRUE), 3),
+      "| median Q5:", round(median(q5, na.rm = TRUE), 3), "\n")
+  invisible(p)
+}
+```
+
+### 5a: ORFeome CSC quintiles → DHX29 logFC
+
+```{r plot_orfeome_csc_cdf}
+orfeome_logfc <- orfeome_per_gene %>%
+  inner_join(halflife_wide %>% dplyr::select(ensembl_gene, logFC),
+             by = "ensembl_gene")
+
+cat("Genes in ORFeome CSC × DHX29 logFC join:", nrow(orfeome_logfc), "\n")
+
+plot_ecdf_quintiles(
+  orfeome_logfc, score_col = "orfeome_csc_score",
+  title     = "ORFeome CSC quintiles vs DHX29-KO logFC",
+  subtitle  = "ORFeome CSC = Spearman r(codon freq, Narula half-life); logFC = log2(KO/Ctrl)",
+  file_name = "23_orfeome_csc_cdf_dhx29_logfc.pdf"
+)
+```
+
+### 5b: iCodon CSC quintiles → DHX29 logFC
+
+```{r plot_icodon_csc_cdf}
+icodon_logfc <- icodon_per_gene %>%
+  inner_join(halflife_wide %>% dplyr::select(ensembl_gene, logFC),
+             by = "ensembl_gene")
+
+cat("Genes in iCodon CSC × DHX29 logFC join:", nrow(icodon_logfc), "\n")
+
+plot_ecdf_quintiles(
+  icodon_logfc, score_col = "csc",
+  title     = "iCodon CSC quintiles vs DHX29-KO logFC",
+  subtitle  = "iCodon CSC from predict_stability('human'); logFC = log2(KO/Ctrl)",
+  file_name = "23_icodon_csc_cdf_dhx29_logfc.pdf"
+)
+```
+
+### 5c: eIF3d gene groups → DHX29 logFC
+
+```{r plot_gene_group_cdf}
+# halflife_wide already has group column (annotated in Section 3)
+grp_logfc <- halflife_wide %>% filter(!is.na(logFC))
+
+bg_grp <- grp_logfc %>% filter(group == "All other genes")
+fg_grp <- grp_logfc %>% filter(group != "All other genes")
+
+grp_medians <- fg_grp %>%
+  group_by(group) %>%
+  summarise(med = median(logFC, na.rm = TRUE), n = n(), .groups = "drop")
+
+grp_colors <- c("eIF3d hypoxia promotes" = "#E69F00", "Negative control" = "black")
+
+grp_labels <- fg_grp %>%
+  group_by(group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+label_vec <- setNames(grp_labels$label, grp_labels$group)
+
+p_grp <- ggplot() +
+  stat_ecdf(data = bg_grp, aes(x = logFC),
+            color = "grey80", linewidth = 0.7) +
+  stat_ecdf(data = fg_grp %>% filter(group == "Negative control"),
+            aes(x = logFC, color = group), linewidth = 0.8) +
+  stat_ecdf(data = fg_grp %>% filter(group == "eIF3d hypoxia promotes"),
+            aes(x = logFC, color = group), linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  geom_vline(data = grp_medians,
+             aes(xintercept = med, color = group),
+             linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = grp_colors, labels = label_vec, name = NULL) +
+  coord_cartesian(xlim = c(-3, 3)) +
+  labs(title    = "eIF3d gene groups vs DHX29-KO logFC",
+       subtitle = "Grey = all other genes; dashed = group median; logFC = log2(KO/Ctrl half-life)",
+       x = "logFC (DHX29-KO / Control half-life)", y = "Empirical CDF") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+
+p_grp
+ggsave(here("plots", "23_gene_group_cdf_dhx29_logfc.pdf"), p_grp, width = 7, height = 5)
+cat("Saved: plots/23_gene_group_cdf_dhx29_logfc.pdf\n")
+
+promotes_logfc <- fg_grp %>% filter(group == "eIF3d hypoxia promotes") %>% pull(logFC)
+negctrl_logfc  <- fg_grp %>% filter(group == "Negative control")       %>% pull(logFC)
+wt_grp <- wilcox.test(promotes_logfc, negctrl_logfc, alternative = "two.sided")
+cat("Wilcoxon promotes vs neg ctrl: W =", wt_grp$statistic,
+    ", p =", formatC(wt_grp$p.value, format = "e", digits = 2),
+    "| median promotes:", round(median(promotes_logfc, na.rm = TRUE), 3),
+    "| median neg ctrl:", round(median(negctrl_logfc,  na.rm = TRUE), 3), "\n")
+```
+
+---
+
+## Section 6: Save outputs
 
 ```{r save_outputs}
 saveRDS(dhx29_occupancy,    here("output", "predictive_modeling", "dhx29_riboseq_occupancy.rds"))
@@ -787,7 +1025,7 @@ cat("  output/predictive_modeling/dhx29_codon_stability_scores.rds\n")
 
 ---
 
-## Section 6: Add DHX29 features to feature matrix
+## Section 7: Add DHX29 features to feature matrix
 
 ```{r build_dhx29_feature_table}
 dhx29_features <- dhx29_occupancy %>%
@@ -832,4 +1070,8 @@ cat("  dhx29_slamseq_logFC:        ",
 
 saveRDS(fm_dhx29, here("output", "predictive_modeling", "feature_matrix_dhx29.rds"))
 cat("\nSaved: output/predictive_modeling/feature_matrix_dhx29.rds\n")
+```
+
+```{r}
+
 ```

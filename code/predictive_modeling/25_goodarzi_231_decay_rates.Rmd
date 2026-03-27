@@ -1,0 +1,244 @@
+---
+title: "Notebook 25: Goodarzi MDA-MB-231 mRNA Stability Analysis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+C-to-T conversion rates from SLAM-seq in MDA-MB-231 and other BRCA cell lines
+(Karner et al. 2026, GSE301426). Used as a proxy for transcription/turnover rate.
+
+**Data file pre-read summary:**
+
+- 10,994 genes; row IDs are gene symbols and lncRNA names
+- MDA-MB-231 replicates: columns `MDA-MB-231-1` and `MDA-MB-231-2`
+- Values: C-to-T ratios in (0, 1]; no zeros; ~10-15% NAs per column
+- log2 transform gives all-negative values (mean C/T ≈ 0.03 → log2 ≈ −5)
+
+---
+
+## Section 1: Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(ggplot2)
+```
+
+```{r gene_groups}
+# eIF3d-promoted genes (hypoxia 1hr, TE lfc > 0.5)
+promotes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+promotes_ids <- promotes$ensembl_gene
+
+# Negative control pool (size-matched, set.seed(9))
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  filter(!ensembl_gene %in% promotes_ids)
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene, size = length(promotes_ids), replace = FALSE)
+
+cat("Promotes genes:", length(promotes_ids), "\n")
+cat("Neg ctrl genes (size-matched):", length(neg_ctrl_ids), "\n")
+```
+
+---
+
+## Section 2: Load and process MDA-MB-231 C-to-T ratios
+
+```{r load_slam}
+slam_raw <- read_tsv(
+  here("accessories", "csc_data", "karner_231_slamseq",
+       "GSE301426_BRCA_SLAM_CTratio_gs_counts.txt"),
+  show_col_types = FALSE
+) %>%
+  dplyr::rename(gene_symbol = `...1`) %>%
+  mutate(gene_symbol = as.character(gene_symbol))
+
+cat("Total rows loaded:", nrow(slam_raw), "\n")
+cat("Columns:", paste(colnames(slam_raw), collapse = ", "), "\n")
+```
+
+```{r select_231}
+# Select MDA-MB-231 replicates and compute mean C-to-T ratio.
+# na.rm = FALSE: require both replicates to be non-NA (conservative).
+slam_231 <- slam_raw %>%
+  dplyr::select(gene_symbol, `MDA-MB-231-1`, `MDA-MB-231-2`) %>%
+  mutate(
+    mean_ct = rowMeans(cbind(`MDA-MB-231-1`, `MDA-MB-231-2`), na.rm = FALSE)
+  )
+
+cat("Rows with NA in either replicate:",
+    sum(is.na(slam_231$`MDA-MB-231-1`) | is.na(slam_231$`MDA-MB-231-2`)), "\n")
+
+slam_231 <- slam_231 %>% filter(!is.na(mean_ct))
+cat("Rows after NA filter:", nrow(slam_231), "\n")
+```
+
+```{r map_gene_ids}
+# Map gene symbol → Ensembl gene ID via most_abundant_tx.
+# lncRNAs with RP*/LINC names will not map — expected and documented.
+most_abundant_tx <- readRDS(
+  here("output", "predictive_modeling", "precomputed_most_abundant_tx.rds")
+) %>%
+  mutate(
+    symbol       = as.character(unlist(symbol)),
+    ensembl_gene = as.character(unlist(gene_id_clean))
+  ) %>%
+  dplyr::select(symbol, ensembl_gene) %>%
+  distinct(symbol, .keep_all = TRUE)   # one Ensembl ID per symbol
+
+slam_mapped <- slam_231 %>%
+  left_join(most_abundant_tx, by = c("gene_symbol" = "symbol")) %>%
+  filter(!is.na(ensembl_gene))
+
+cat("Genes mapping to Ensembl ID:", nrow(slam_mapped), "/", nrow(slam_231),
+    "(", round(100 * nrow(slam_mapped) / nrow(slam_231), 1), "%)\n")
+cat("Unmapped (lncRNAs/aliases):", nrow(slam_231) - nrow(slam_mapped), "\n")
+```
+
+```{r transform_annotate}
+# log2 transform: values in (0,1] → log2_ct in (-∞, 0]
+# Higher log2_ct (less negative) = higher C-to-T ratio = more nascent RNA
+slam_mapped <- slam_mapped %>%
+  mutate(log2_ct = log2(mean_ct))
+
+cat("log2_ct range:", round(min(slam_mapped$log2_ct), 2),
+    "to", round(max(slam_mapped$log2_ct), 2), "\n")
+
+# Annotate gene groups
+slam_mapped <- slam_mapped %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                            ~ "All other genes"
+  ))
+
+cat("\nGene counts per group:\n")
+print(slam_mapped %>% count(group))
+```
+
+---
+
+## Section 3: Density plot
+
+```{r density_plot}
+n_promotes <- sum(slam_mapped$group == "eIF3d hypoxia promotes")
+n_negctrl  <- sum(slam_mapped$group == "Negative control")
+
+bg     <- slam_mapped %>% filter(group == "All other genes")
+fg_neg <- slam_mapped %>% filter(group == "Negative control")
+fg_pro <- slam_mapped %>% filter(group == "eIF3d hypoxia promotes")
+
+grp_medians <- slam_mapped %>%
+  filter(group != "All other genes") %>%
+  group_by(group) %>%
+  summarise(med = median(log2_ct, na.rm = TRUE), .groups = "drop")
+
+grp_colors <- c("eIF3d hypoxia promotes" = "#E69F00", "Negative control" = "black")
+grp_labels <- c(
+  "eIF3d hypoxia promotes" = paste0("eIF3d hypoxia promotes (n=", n_promotes, ")"),
+  "Negative control"       = paste0("Negative control (n=",       n_negctrl,  ")")
+)
+
+p <- ggplot() +
+  geom_density(data = bg,     aes(x = log2_ct),
+               fill = "grey80", color = NA, alpha = 0.6) +
+  geom_density(data = fg_neg, aes(x = log2_ct),
+               fill = NA, color = "black", linewidth = 0.8) +
+  geom_density(data = fg_pro, aes(x = log2_ct),
+               fill = NA, color = "#E69F00", linewidth = 0.8) +
+  geom_vline(data = grp_medians, aes(xintercept = med, color = group),
+             linetype = "dashed", linewidth = 0.7, show.legend = FALSE) +
+  # Dummy lines for legend with n labels
+  geom_line(data = data.frame(x = NA_real_, y = NA_real_, group = "eIF3d hypoxia promotes"),
+            aes(x = x, y = y, color = group), linewidth = 0.8, key_glyph = "path") +
+  geom_line(data = data.frame(x = NA_real_, y = NA_real_, group = "Negative control"),
+            aes(x = x, y = y, color = group), linewidth = 0.8, key_glyph = "path") +
+  scale_color_manual(values = grp_colors, labels = grp_labels, name = NULL) +
+  labs(
+    title    = "MDA-MB-231 C-to-T conversion rate\n(transcription rate proxy, NOT normalized to expression)",
+    subtitle = "Higher values = more nascent RNA = higher transcription/turnover; from Karner et al. 2026 (GSE301426)",
+    x        = "log2(C-to-T conversion ratio) — proxy for transcription rate, not decay rate",
+    y        = "Density"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+
+p
+ggsave(here("plots", "25_goodarzi_231_ct_ratio_by_group.pdf"), p, width = 6, height = 5)
+cat("Saved: plots/25_goodarzi_231_ct_ratio_by_group.pdf\n")
+
+# Wilcoxon test
+wt <- wilcox.test(fg_pro$log2_ct, fg_neg$log2_ct, alternative = "two.sided")
+cat("Wilcoxon promotes vs neg ctrl: W =", wt$statistic,
+    ", p =", formatC(wt$p.value, format = "e", digits = 2),
+    "| median promotes:", round(median(fg_pro$log2_ct, na.rm = TRUE), 3),
+    "| median neg ctrl:", round(median(fg_neg$log2_ct, na.rm = TRUE), 3), "\n")
+```
+
+```{r positive_controls}
+# Positive controls: MYC (high transcription rate) and ACTB (housekeeping reference).
+# Both should be locatable in the distribution; MYC expected to be relatively high (right-shifted).
+pos_ctrl_genes <- c("MYC", "ACTB")
+
+pos_ctrl_df <- slam_mapped %>%
+  filter(gene_symbol %in% pos_ctrl_genes) %>%
+  dplyr::select(gene_symbol, mean_ct, log2_ct)
+
+cat("Positive control gene values:\n")
+print(pos_ctrl_df)
+
+if (nrow(pos_ctrl_df) == 0) {
+  cat("WARNING: neither MYC nor ACTB found in slam_mapped — check gene_symbol column.\n")
+} else {
+  # Overlay on density: vertical lines + labels
+  p_ctrl <- p +
+    geom_vline(data = pos_ctrl_df,
+               aes(xintercept = log2_ct),
+               color = "firebrick", linetype = "solid", linewidth = 0.8) +
+    geom_label(data = pos_ctrl_df,
+               aes(x = log2_ct, y = 0, label = gene_symbol),
+               color = "firebrick", fill = "white", size = 3.5,
+               vjust = -0.3, hjust = 0.5, label.size = 0.3) +
+    labs(title = "MDA-MB-231 C-to-T conversion rate — positive controls highlighted",
+         subtitle = "Red lines = MYC and ACTB; from Karner et al. 2026 (GSE301426)")
+
+  p_ctrl
+  ggsave(here("plots", "25_goodarzi_231_ct_ratio_positive_controls.pdf"),
+         p_ctrl, width = 6, height = 5)
+  cat("Saved: plots/25_goodarzi_231_ct_ratio_positive_controls.pdf\n")
+
+  # Report percentile rank of each control gene
+  cat("\nPercentile rank of positive controls (among all mapped genes):\n")
+  for (i in seq_len(nrow(pos_ctrl_df))) {
+    gene  <- pos_ctrl_df$gene_symbol[i]
+    val   <- pos_ctrl_df$log2_ct[i]
+    pctile <- mean(slam_mapped$log2_ct <= val, na.rm = TRUE) * 100
+    cat(" ", gene, ": log2_ct =", round(val, 3),
+        "| percentile =", round(pctile, 1), "%\n")
+  }
+}
+```
+
+---
+
+## Section 4: Save output
+
+```{r save_output}
+ct_out <- slam_mapped %>%
+  dplyr::select(ensembl_gene, symbol = gene_symbol, mean_ct, log2_ct, group)
+
+saveRDS(ct_out, here("output", "predictive_modeling", "goodarzi_231_ct_ratios.rds"))
+cat("Saved: output/predictive_modeling/goodarzi_231_ct_ratios.rds\n")
+cat("Rows saved:", nrow(ct_out), "\n")
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```
