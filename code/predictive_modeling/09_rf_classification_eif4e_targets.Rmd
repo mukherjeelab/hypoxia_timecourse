@@ -6,6 +6,8 @@ output: html_document
 params:
   feature_set: "kozak"
   clip_mode: "aggregate"
+  pos_geneset_csv: ""
+  neg_geneset_csv: ""
 editor_options:
   chunk_output_type: console
 ---
@@ -19,25 +21,55 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 ```{r derived_values}
 # Defaults for interactive use (overwritten by YAML params when knitting)
+# --- COMMON ANALYSIS SETUPS ---
+#
+# Standard eIF4E target analysis (Teleman riboseq pos/neg):
+#   feature_set="external_stability", clip_mode="aggregate",
+#   pos_geneset_csv="", neg_geneset_csv=""
+#
+# eIF3d-promoted vs eIF3e-promoted at 1hr hypoxia:
+#   feature_set="external_stability", clip_mode="aggregate",
+#   pos_geneset_csv="hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
+#   neg_geneset_csv="hypoxia_3e_promotes_TE_1hr_lfc0.5.csv"
+#   Note: eIF4E circular features are NOT removed for custom geneset runs
+#         (they are informative features, not circular, for 3d vs 3e)
+#
 if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
-    feature_set = "kozak", # "te_lfc", "codon_optimality", or "kozak"
-    clip_mode   = "aggregate"         # "individual", "aggregate", or "both"
+    feature_set    = "external_stability", # "external_stability" | "kozak" | "te_lfc" | "codon_optimality"
+    clip_mode      = "aggregate",          # "aggregate" | "individual" | "both"
+    pos_geneset_csv = "",                  # "" = use Teleman eIF4E data (default)
+                                           # "filename.csv" = load from output/genesets/
+    neg_geneset_csv = ""                   # "" = use Teleman neutral genes (default)
+                                           # "filename.csv" = load from output/genesets/
   )
 }
 
 feature_matrix_rds <- switch(params$feature_set,
-  "te_lfc"           = "feature_matrix_te_lfc.rds",
-  "codon_optimality" = "feature_matrix_codon_optimality.rds",
-  "kozak"            = "feature_matrix_kozak.rds",
-  "targeted"         = "feature_matrix_te_lfc.rds",
+  "te_lfc"             = "feature_matrix_te_lfc.rds",
+  "codon_optimality"   = "feature_matrix_codon_optimality.rds",
+  "kozak"              = "feature_matrix_kozak.rds",
+  "targeted"           = "feature_matrix_te_lfc.rds",
+  "external_stability" = "feature_matrix_external_stability.rds",
   stop("feature_set '", params$feature_set, "' is not supported in this notebook")
 )
 
-suffix    <- paste0("eif4e_promotes_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
-pos_label <- "promotes_eif4e"
-neg_label <- "does_not_promote_eif4e"
-gene_label <- "eIF4E"
+using_custom_genesets <- params$pos_geneset_csv != ""
+
+if (using_custom_genesets) {
+  pos_name  <- tools::file_path_sans_ext(params$pos_geneset_csv)
+  neg_name  <- tools::file_path_sans_ext(params$neg_geneset_csv)
+  suffix    <- paste0(pos_name, "_vs_", neg_name, "_", params$feature_set,
+                      "_clip", params$clip_mode, "_no_boruta")
+  pos_label <- pos_name
+  neg_label <- neg_name
+  gene_label <- "custom"
+} else {
+  suffix    <- paste0("eif4e_promotes_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
+  pos_label <- "promotes_eif4e"
+  neg_label <- "does_not_promote_eif4e"
+  gene_label <- "eIF4E"
+}
 
 cat("Feature matrix:", feature_matrix_rds, "\n")
 cat("Output suffix:", suffix, "\n")
@@ -82,39 +114,58 @@ library(ggpubr)
 features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
 cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
 
-# Teleman riboseq: 4E-BP1 overexpression vs vehicle
-# LFC = log2(4E-BP1 OE / vehicle)
-# Negative LFC = less translation when eIF4E is inhibited = eIF4E-dependent
-teleman_data <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv")
-cat("Teleman dataset:", nrow(teleman_data), "genes\n")
+if (using_custom_genesets) {
+  # Custom gene sets from output/genesets/
+  positive_genes <- read_csv(here("output", "genesets", params$pos_geneset_csv),
+                             show_col_types = FALSE) %>%
+    rename(ensembl_gene = ensembl_gene)  # already has ensembl_gene column
+  cat("Positive genes (", params$pos_geneset_csv, "):", nrow(positive_genes), "\n")
 
-# Positive class: eIF4E-sensitive genes (go DOWN when eIF4E is inhibited)
-positive_genes <- teleman_data %>%
-  filter(log2FoldChange < -1, padj < 0.05) %>%
-  mutate(ensembl_gene = gene_id)  # already clean (no version suffix)
-cat("Positive genes (LFC < -1, padj < 0.05):", nrow(positive_genes), "\n")
+  negative_control_genes <- read_csv(here("output", "genesets", params$neg_geneset_csv),
+                                     show_col_types = FALSE) %>%
+    rename(gene_id_clean = ensembl_gene)
+  cat("Negative genes (", params$neg_geneset_csv, "):", nrow(negative_control_genes), "\n")
+} else {
+  # Teleman riboseq: 4E-BP1 overexpression vs vehicle
+  # LFC = log2(4E-BP1 OE / vehicle)
+  # Negative LFC = less translation when eIF4E is inhibited = eIF4E-dependent
+  teleman_data <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv")
+  cat("Teleman dataset:", nrow(teleman_data), "genes\n")
 
-# Negative class: genes unaffected by eIF4E status (middle of distribution)
-negative_control_genes <- teleman_data %>%
-  filter(abs(log2FoldChange) < 0.1, padj > 0.5) %>%
-  mutate(gene_id_clean = gene_id)
-cat("Negative control genes (|LFC| < 0.1, padj > 0.5):", nrow(negative_control_genes), "\n")
+  # Positive class: eIF4E-sensitive genes (go DOWN when eIF4E is inhibited)
+  positive_genes <- teleman_data %>%
+    filter(log2FoldChange < -1, padj < 0.05) %>%
+    mutate(ensembl_gene = gene_id)  # already clean (no version suffix)
+  cat("Positive genes (LFC < -1, padj < 0.05):", nrow(positive_genes), "\n")
+
+  # Negative class: genes unaffected by eIF4E status (middle of distribution)
+  negative_control_genes <- teleman_data %>%
+    filter(abs(log2FoldChange) < 0.1, padj > 0.5) %>%
+    mutate(gene_id_clean = gene_id)
+  cat("Negative control genes (|LFC| < 0.1, padj > 0.5):", nrow(negative_control_genes), "\n")
+}
 ```
 
 # Sanity Checks
 
 ```{r sanity_checks}
-# GLO1: known eIF4E-sensitive gene — should be IN positive set (LFC ≈ -1.29, padj ≈ 8.5e-5)
-glo1 <- teleman_data %>% filter(symbol == "GLO1")
-cat("GLO1:\n")
-print(glo1 %>% dplyr::select(symbol, log2FoldChange, padj))
-cat("GLO1 in positive set:", glo1$gene_id %in% positive_genes$ensembl_gene, "\n\n")
+if (!using_custom_genesets) {
+  # GLO1: known eIF4E-sensitive gene — should be IN positive set (LFC ≈ -1.29, padj ≈ 8.5e-5)
+  glo1 <- teleman_data %>% filter(symbol == "GLO1")
+  cat("GLO1:\n")
+  print(glo1 %>% dplyr::select(symbol, log2FoldChange, padj))
+  cat("GLO1 in positive set:", glo1$gene_id %in% positive_genes$ensembl_gene, "\n\n")
 
-# CDKN2B: known eIF4E-resistant gene — should NOT be in positive set (LFC ≈ +2.48, padj ≈ 8.7e-6)
-cdkn2b <- teleman_data %>% filter(symbol == "CDKN2B")
-cat("CDKN2B:\n")
-print(cdkn2b %>% dplyr::select(symbol, log2FoldChange, padj))
-cat("CDKN2B in positive set:", cdkn2b$gene_id %in% positive_genes$ensembl_gene, "\n")
+  # CDKN2B: known eIF4E-resistant gene — should NOT be in positive set (LFC ≈ +2.48, padj ≈ 8.7e-6)
+  cdkn2b <- teleman_data %>% filter(symbol == "CDKN2B")
+  cat("CDKN2B:\n")
+  print(cdkn2b %>% dplyr::select(symbol, log2FoldChange, padj))
+  cat("CDKN2B in positive set:", cdkn2b$gene_id %in% positive_genes$ensembl_gene, "\n")
+} else {
+  cat("Custom gene sets — skipping eIF4E sanity checks\n")
+  cat("Positive set:", params$pos_geneset_csv, "(", nrow(positive_genes), "genes )\n")
+  cat("Negative set:", params$neg_geneset_csv, "(", nrow(negative_control_genes), "genes )\n")
+}
 ```
 
 # Create Binary Target
@@ -197,29 +248,29 @@ if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "
 }
 
 # ---- Remove circular features ----
-# These features directly measure eIF4E dependence and would circularly predict
-# the training labels (which are themselves derived from eIF4E inhibition data):
-#   - 4e_resistance*: eIF4E-resistance scores
-#   - eif4e_ip*: eIF4E immunoprecipitation / cap-binding data
-#   - lit_eIF4E_*: literature signatures for eIF4E-activated translation
-#   - lit_phospho_eIF4E_*: phospho-eIF4E signatures
-#   - lit_translation_is_sensitive_to_4E_inhibition
-#   - lit_translation_is_resistant_to_4E_inhibition
-circular_regex <- "^4e_resistance|^eif4e_ip"
-circular_lit_exact <- c(
-  "lit_eIF4E_activated_translation",
-  "lit_phospho_eIF4E_activated_translation",
-  "lit_phospho_eIF4E_suppressed_translation",
-  "lit_translation_is_sensitive_to_4E_inhibition",
-  "lit_translation_is_resistant_to_4E_inhibition"
-)
-circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) | feature_cols %in% circular_lit_exact]
-if (length(circular_cols) > 0) {
-  feature_cols <- setdiff(feature_cols, circular_cols)
-  cat("Removed", length(circular_cols), "circular features:\n")
-  cat(paste(" ", circular_cols, collapse = "\n"), "\n")
+# Only applies when using Teleman eIF4E labels — these features directly measure
+# eIF4E dependence and would circularly predict those training labels.
+# When using custom gene sets (e.g. 3d vs 3e), eIF4E features are NOT circular
+# and are kept as informative predictors.
+if (!using_custom_genesets) {
+  circular_regex <- "^4e_resistance|^eif4e_ip"
+  circular_lit_exact <- c(
+    "lit_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_suppressed_translation",
+    "lit_translation_is_sensitive_to_4E_inhibition",
+    "lit_translation_is_resistant_to_4E_inhibition"
+  )
+  circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) | feature_cols %in% circular_lit_exact]
+  if (length(circular_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, circular_cols)
+    cat("Removed", length(circular_cols), "circular features:\n")
+    cat(paste(" ", circular_cols, collapse = "\n"), "\n")
+  } else {
+    cat("No circular 4E features found in this feature set\n")
+  }
 } else {
-  cat("No circular 4E features found in this feature set\n")
+  cat("Custom gene sets: skipping circular feature removal (eIF4E features are informative here)\n")
 }
 
 cat("Feature count after filtering:", length(feature_cols), "\n")
@@ -1019,8 +1070,9 @@ ggsave(here("plots", paste0("rf_directionality_lollipop_all_", suffix, ".pdf")),
 
 ```{r export_directionality}
 export_dir_df <- directionality %>%
+  mutate(signed_importance = importance * sign(correlation)) %>%
   dplyr::select(feature, feature_clean, category, mean_promotes, mean_does_not_promote,
-                diff, correlation, wilcox_p, wilcox_p_adj, importance, direction)
+                diff, correlation, wilcox_p, wilcox_p_adj, importance, signed_importance, direction)
 
 write_csv(export_dir_df,
           here("output", "predictive_modeling",

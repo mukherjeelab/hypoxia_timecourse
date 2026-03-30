@@ -1,0 +1,534 @@
+---
+title: "Notebook 26: eIF3d Reporter Candidate Prioritization"
+output: html_document
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(pheatmap)
+library(ggrepel)
+```
+
+# Overview
+
+Prioritizes eIF3d-promoted mRNAs (1hr hypoxia, standard analysis) as reporter candidates.
+
+**Approach**: For each eIF3d-promoted gene, compute a composite score based on the top features from the RF model (both positive and negative signed importance). Genes that are on the "right side" of the most discriminating features — high on positive features, low on negative features — rank highest.
+
+Data used:
+- `rf_classification_directionality_eif33d_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv`
+- `feature_matrix_external_stability.rds`
+- `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`
+- `rf_classification_predictions_eif33d_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv`
+
+# Section 1: Load Feature Importance
+
+```{r load-importance}
+dir_path <- here("output", "predictive_modeling")
+
+directionality <- read_csv(
+  file.path(dir_path,
+    "rf_classification_directionality_eif33d_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv"),
+  show_col_types = FALSE
+)
+
+cat("Total features:", nrow(directionality), "\n")
+cat("Features with positive signed importance:", sum(directionality$signed_importance > 0), "\n")
+cat("Features with negative signed importance:", sum(directionality$signed_importance < 0), "\n")
+
+# Top features by absolute signed importance
+top_features <- directionality %>%
+  arrange(desc(abs(signed_importance))) %>%
+  slice_head(n = 20)
+
+cat("\nTop 20 features by |signed_importance|:\n")
+top_features %>%
+  dplyr::select(feature, feature_clean, category, signed_importance, direction) %>%
+  print(n = 20)
+```
+
+# Section 2: Load Feature Matrix and Filter to eIF3d Gene Set
+
+```{r load-features}
+# Load feature matrix
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Feature matrix:", nrow(fm), "rows x", ncol(fm), "cols\n")
+
+# Load eIF3d gene set
+gs_3d <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                   show_col_types = FALSE)
+cat("3d-promoted genes in gene set:", nrow(gs_3d), "\n")
+
+# Load TE LFC from source
+te_data <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\..*")) %>%
+  dplyr::select(gene_id_clean, symbol, te_lfc, te_padj)
+
+# Filter feature matrix to eIF3d-promoted genes
+eif3d_ids <- gs_3d$ensembl_gene
+fm_3d <- fm %>%
+  filter(gene_id_clean %in% eif3d_ids) %>%
+  # coerce any list columns that will be needed
+  mutate(clip_eif3_count = as.integer(unlist(clip_eif3_count)))
+
+# Join TE LFC from si3d source (feature matrix has its own te_lfc; use source explicitly)
+fm_3d <- fm_3d %>%
+  left_join(te_data %>% dplyr::select(gene_id_clean, te_lfc_3d = te_lfc, te_padj_3d = te_padj),
+            by = "gene_id_clean")
+
+cat("eIF3d-promoted genes in feature matrix:", nrow(fm_3d), "\n")
+```
+
+# Section 3: Compute Composite Feature Score
+
+```{r composite-score}
+# Identify which top features are present as columns in the feature matrix
+top_feat_names <- top_features$feature
+available_feats <- top_feat_names[top_feat_names %in% names(fm_3d)]
+missing_feats   <- setdiff(top_feat_names, names(fm_3d))
+
+cat("Top features available in matrix:", length(available_feats), "/", length(top_feat_names), "\n")
+if (length(missing_feats) > 0) cat("Missing:", paste(missing_feats, collapse = ", "), "\n")
+
+# Get signed importance for available features
+feat_weights <- top_features %>%
+  filter(feature %in% available_feats) %>%
+  dplyr::select(feature, signed_importance)
+
+# Extract feature values for eIF3d genes, scale each to [0,1] within the gene set
+feat_mat <- fm_3d %>%
+  dplyr::select(gene_id_clean, all_of(available_feats)) %>%
+  mutate(across(all_of(available_feats), as.numeric))
+
+feat_scaled <- feat_mat %>%
+  mutate(across(all_of(available_feats), ~ {
+    r <- range(.x, na.rm = TRUE)
+    if (diff(r) == 0) return(rep(0.5, length(.x)))
+    (.x - r[1]) / diff(r)
+  }))
+
+# For negative features (signed_importance < 0), invert scaled value
+# so that "on the right side" always contributes positively
+neg_feats <- feat_weights %>% filter(signed_importance < 0) %>% pull(feature)
+pos_feats <- feat_weights %>% filter(signed_importance > 0) %>% pull(feature)
+
+feat_aligned <- feat_scaled %>%
+  mutate(across(all_of(neg_feats), ~ 1 - .x))
+
+# Composite score = sum(|signed_importance| * aligned_scaled_value)
+weights_vec <- setNames(abs(feat_weights$signed_importance), feat_weights$feature)
+
+composite <- feat_aligned %>%
+  dplyr::select(gene_id_clean, all_of(available_feats)) %>%
+  pivot_longer(-gene_id_clean, names_to = "feature", values_to = "aligned_val") %>%
+  left_join(feat_weights, by = "feature") %>%
+  mutate(contribution = abs(signed_importance) * aligned_val) %>%
+  group_by(gene_id_clean) %>%
+  summarise(composite_score = sum(contribution, na.rm = TRUE), .groups = "drop")
+
+cat("\nComposite score range:", round(range(composite$composite_score), 1), "\n")
+```
+
+# Section 4: Join Annotations and RF Predictions
+
+```{r join-annotations}
+# RF predictions (test-set genes only)
+preds <- read_csv(
+  file.path(dir_path,
+    "rf_classification_predictions_eif33d_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv"),
+  show_col_types = FALSE
+) %>%
+  dplyr::select(gene_id, prob_pos) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+# Build ranked table
+ranked <- fm_3d %>%
+  dplyr::select(gene_id_clean, symbol, utr5_length, utr3_length, cds_length,
+                clip_eif3_count, csc, cai, te_lfc_3d) %>%
+  left_join(composite, by = "gene_id_clean") %>%
+  left_join(preds %>% dplyr::select(gene_id_clean, prob_pos), by = "gene_id_clean") %>%
+  arrange(desc(composite_score)) %>%
+  mutate(rank = row_number())
+
+cat("Ranked candidates:", nrow(ranked), "\n")
+cat("Genes with RF prob_pos:", sum(!is.na(ranked$prob_pos)), "\n")
+```
+
+# Section 5: Ranked Candidate Table
+
+```{r ranked-table}
+cat("=== Top 30 eIF3d Reporter Candidates ===\n\n")
+
+ranked %>%
+  slice_head(n = 30) %>%
+  dplyr::select(rank, symbol, te_lfc_3d, composite_score, prob_pos,
+                clip_eif3_count, utr5_length, utr3_length, csc) %>%
+  mutate(
+    te_lfc_3d      = round(te_lfc_3d, 2),
+    composite_score = round(composite_score, 1),
+    prob_pos       = round(prob_pos, 3),
+    csc            = round(csc, 3),
+    utr5_flag      = if_else(utr5_length > 500, "LONG", "")
+  ) %>%
+  print(n = 30)
+
+# Flag long 5'UTRs in full set
+cat("\nGenes with 5'UTR > 500 nt in top 30:", sum(ranked$utr5_length[1:30] > 500, na.rm = TRUE), "\n")
+```
+
+# Section 6: Feature Heatmap — Top Candidates x Top Features
+
+```{r heatmap, fig.width=12, fig.height=10}
+n_candidates <- 30
+
+# Scaled values (0-1) for heatmap — use the raw aligned (not inverted) for display
+# so the heatmap shows actual feature value direction (easier to interpret)
+heatmap_genes <- ranked %>% slice_head(n = n_candidates) %>% pull(gene_id_clean)
+heatmap_symbols <- ranked %>% slice_head(n = n_candidates) %>% pull(symbol)
+
+# Use aligned scaled values: invert "Lower in 3d" columns so that
+# dark (high value) = more eIF3d-like across ALL columns, matching the composite score
+heatmap_mat <- feat_aligned %>%   # feat_aligned already has Lower-in-3d cols inverted
+  filter(gene_id_clean %in% heatmap_genes) %>%
+  dplyr::select(gene_id_clean, all_of(available_feats))
+
+# Order rows by composite score (already ordered)
+heatmap_mat <- heatmap_mat[match(heatmap_genes, heatmap_mat$gene_id_clean), ]
+rownames_vec <- heatmap_symbols
+
+mat <- heatmap_mat %>%
+  dplyr::select(-gene_id_clean) %>%
+  as.matrix()
+rownames(mat) <- rownames_vec
+
+# Column labels: use feature_clean names; order Higher-in-3d left, Lower-in-3d right
+feat_clean_map <- top_features %>%
+  filter(feature %in% available_feats) %>%
+  dplyr::select(feature, feature_clean, signed_importance) %>%
+  arrange(desc(signed_importance > 0), desc(abs(signed_importance)))
+# ^ positives first (desc of TRUE > FALSE), within each group sorted by |importance|
+
+# Reorder matrix columns to match
+mat <- mat[, feat_clean_map$feature, drop = FALSE]
+colnames(mat) <- feat_clean_map$feature_clean
+
+# Annotation: TE LFC and CLIP binding
+ann_row <- ranked %>%
+  slice_head(n = n_candidates) %>%
+  dplyr::select(symbol, te_lfc_3d, clip_eif3_count) %>%
+  mutate(
+    te_lfc_3d       = round(te_lfc_3d, 2),
+    clip_eif3_count = as.integer(clip_eif3_count)
+  ) %>%
+  column_to_rownames("symbol")
+
+# Annotation: feature direction
+ann_col <- feat_clean_map %>%
+  mutate(direction = if_else(signed_importance > 0, "Higher in 3d", "Lower in 3d")) %>%
+  dplyr::select(feature_clean, direction) %>%
+  column_to_rownames("feature_clean")
+
+# Cell color: scaled value within the eIF3d gene set
+# 0 = lowest value among eIF3d-promoted genes, 1 = highest
+# For "Higher in 3d" features: dark = good (gene has high value)
+# For "Lower in 3d" features: dark = gene has HIGH raw value (i.e. opposite of favorable)
+# The composite score already accounts for direction; heatmap shows raw scaled values
+
+p_heatmap <- pheatmap(
+  mat,
+  annotation_row    = ann_row,
+  annotation_col    = ann_col,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  color             = colorRampPalette(c("white", "#E69F00"))(50),
+  annotation_colors = list(
+    direction       = c("Higher in 3d" = "#0072B2", "Lower in 3d" = "#D55E00"),
+    clip_eif3_count = colorRampPalette(c("white", "#009E73"))(10),
+    te_lfc_3d       = colorRampPalette(c("white", "#CC0000"))(10)
+  ),
+  fontsize      = 12,
+  fontsize_row  = 11,
+  fontsize_col  = 11,
+  legend_labels = c("0\n(least eIF3d-like)", "0.5", "1\n(most eIF3d-like)"),
+  legend_breaks = c(0, 0.5, 1),
+  main          = "Top 30 eIF3d candidates: aligned feature scores (dark = more eIF3d-like)\nLeft: Higher in 3d-promoted | Right: Lower in 3d-promoted (inverted so dark = low raw value)"
+)
+
+ggsave(here("output/26_reporter_candidates_heatmap.pdf"), p_heatmap,
+       width = 12, height = 10)
+```
+
+# Section 7: Scatter Plot — Composite Score vs TE LFC
+
+```{r scatter, fig.width=9, fig.height=7}
+label_n <- 25
+
+plot_df <- ranked %>%
+  mutate(
+    has_clip    = clip_eif3_count > 0,
+    label_text  = if_else(rank <= label_n, symbol, NA_character_)
+  )
+
+ggplot(plot_df, aes(x = composite_score, y = te_lfc_3d)) +
+  geom_point(data = filter(plot_df, !has_clip),
+             color = "grey70", alpha = 0.6, size = 2) +
+  geom_point(data = filter(plot_df, has_clip),
+             aes(size = clip_eif3_count), color = "#009E73", alpha = 0.8) +
+  geom_text_repel(
+    aes(label = label_text),
+    size = 3, max.overlaps = 25,
+    show.legend = FALSE
+  ) +
+  scale_size_continuous(name = "eIF3 CLIP reads", range = c(2, 6)) +
+  labs(
+    x        = "Composite feature score",
+    y        = "TE LFC (si3d / sictrl, 1hr hypoxia)",
+    title    = "eIF3d reporter candidates",
+    subtitle = "Green = eIF3 CLIP binding evidence; top 25 labeled"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right")
+
+ggsave(here("output/26_reporter_candidates_scatter.pdf"), width = 9, height = 7)
+```
+
+# Section 8: Practical Cloning Summary
+
+```{r cloning-summary}
+cat("=== Reporter Candidate Summary ===\n\n")
+
+cat("Top 20 candidates — cloning feasibility:\n")
+ranked %>%
+  slice_head(n = 20) %>%
+  mutate(
+    utr5_flag   = case_when(utr5_length <= 200  ~ "short (<=200)",
+                            utr5_length <= 500  ~ "medium (201-500)",
+                            TRUE                ~ "long (>500)"),
+    clip_flag   = if_else(clip_eif3_count > 0, "CLIP+", "no CLIP"),
+    prob_flag   = case_when(is.na(prob_pos)   ~ "not in test set",
+                            prob_pos >= 0.7   ~ paste0("high RF (", round(prob_pos, 2), ")"),
+                            prob_pos >= 0.5   ~ paste0("mid RF (", round(prob_pos, 2), ")"),
+                            TRUE              ~ paste0("low RF (", round(prob_pos, 2), ")"))
+  ) %>%
+  dplyr::select(rank, symbol, te_lfc_3d, composite_score, utr5_length, utr5_flag, clip_flag, prob_flag) %>%
+  mutate(te_lfc_3d = round(te_lfc_3d, 2), composite_score = round(composite_score, 1)) %>%
+  print(n = 20)
+
+cat("\n\nTop CLIP+ candidates (eIF3 direct binding evidence):\n")
+ranked %>%
+  filter(clip_eif3_count > 0) %>%
+  slice_head(n = 10) %>%
+  dplyr::select(rank, symbol, te_lfc_3d, composite_score, clip_eif3_count, utr5_length, prob_pos) %>%
+  mutate(te_lfc_3d = round(te_lfc_3d, 2), composite_score = round(composite_score, 1)) %>%
+  print(n = 10)
+```
+
+# Section 9: Export
+
+```{r export}
+write_csv(ranked,
+          here("output", "26_eif3d_reporter_candidates_ranked.csv"))
+cat("Exported:", nrow(ranked), "genes to output/26_eif3d_reporter_candidates_ranked.csv\n")
+```
+
+# Section 10: Individual Gene Queries
+
+Queries specific candidate genes across:
+- **Hypoxia response**: TE change (hypoxia vs normoxia sictrl) at 1hr, 4hr, 24hr
+- **eIF3d effect**: si3d vs sictrl in normoxia (time-regressed, alltimepoints) and each hypoxic timepoint
+- **eIF3e effect**: si3e vs sictrl in normoxia (alltimepoints) and each hypoxic timepoint
+
+Also shows spike-in normalized RNA/Ribo/TE plots from the raw count data.
+
+```{r gene-query-setup}
+library(cowplot)
+library(ggprism)
+
+# Source visualization functions from individual_gene_visualization.Rmd
+source(here("code", "functions.R"))
+
+# Load spike-in normalized counts
+counts_1hr  <- read_csv(here("output", "allCountsNorm_all_1hr_SPIKE.csv"),  show_col_types = FALSE)
+counts_4hr  <- read_csv(here("output", "allCountsNorm_all_4hr_SPIKE.csv"),  show_col_types = FALSE)
+counts_24hr <- read_csv(here("output", "allCountsNorm_all_24hr_SPIKE.csv"), show_col_types = FALSE)
+
+# Load gene annotation for symbol lookup
+gene_anno_raw <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                           col_names = c("gene_id", "symbol", "type", "organism", "source"),
+                           show_col_types = FALSE)
+gene_symbols_anno <- gene_anno_raw %>%
+  dplyr::select(gene_id, symbol, type) %>%
+  mutate(is_pc = (type == "protein_coding")) %>%
+  arrange(gene_id, desc(is_pc)) %>%
+  dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::select(gene_id, symbol)
+
+cat("Counts loaded: 1hr", ncol(counts_1hr)-1, "samples |",
+    "4hr", ncol(counts_4hr)-1, "| 24hr", ncol(counts_24hr)-1, "\n")
+```
+
+```{r gene-query-comparisons}
+# Define all comparisons to query
+# group: "Hypoxia response", "eIF3d effect", "eIF3e effect"
+comparison_files <- tribble(
+  ~label,                         ~group,              ~file,
+  "Hyp vs Norm 1hr",              "Hypoxia response",  "translation_categories_1hr.csv",
+  "Hyp vs Norm 4hr",              "Hypoxia response",  "translation_categories_4hr.csv",
+  "Hyp vs Norm 24hr",             "Hypoxia response",  "translation_categories_24hr.csv",
+  "si3d Norm 1+4hr",              "eIF3d effect",      "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "si3d Hyp 1hr",                 "eIF3d effect",      "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "si3d Hyp 4hr",                 "eIF3d effect",      "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv",
+  "si3d Hyp 24hr",                "eIF3d effect",      "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv",
+  "si3e Norm 1+4hr",              "eIF3e effect",      "te_si3e_vs_sictrl_normoxia_1and4hr.csv",
+  "si3e Hyp 1hr",                 "eIF3e effect",      "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv",
+  "si3e Hyp 4hr",                 "eIF3e effect",      "translation_categories_si3e_vs_sictrl_hypoxia_4hr.csv",
+  "si3e Hyp 24hr",                "eIF3e effect",      "translation_categories_si3e_vs_sictrl_hypoxia_24hr.csv"
+) %>%
+  mutate(
+    label = factor(label, levels = label),  # preserve display order
+    group = factor(group, levels = c("Hypoxia response", "eIF3d effect", "eIF3e effect"))
+  )
+
+# Load all comparison files once
+load_comparison <- function(fname) {
+  path <- here("output", fname)
+  df <- read_csv(path, show_col_types = FALSE) %>%
+    mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+  # Add symbol if not present
+  if (!"symbol" %in% names(df)) {
+    df <- df %>% left_join(gene_anno_raw %>% dplyr::select(gene_id, symbol) %>%
+                             mutate(gene_id_clean = str_remove(gene_id, "\\..*")) %>%
+                             dplyr::select(gene_id_clean, symbol) %>% distinct(),
+                           by = "gene_id_clean")
+  }
+  df
+}
+
+comparison_data <- comparison_files %>%
+  mutate(data = map(file, load_comparison))
+
+cat("Loaded", nrow(comparison_files), "comparison files\n")
+```
+
+```{r gene-query-function}
+#' Query specific genes across all comparisons
+#' @param query_genes Character vector of gene symbols
+query_genes_all <- function(query_genes) {
+  comparison_data %>%
+    mutate(
+      gene_rows = map(data, function(df) {
+        df %>%
+          filter(symbol %in% query_genes) %>%
+          dplyr::select(symbol, te_lfc, te_padj,
+                        any_of(c("rna_lfc", "ribo_lfc", "rna_padj", "ribo_padj", "category")))
+      })
+    ) %>%
+    dplyr::select(label, group, gene_rows) %>%
+    unnest(gene_rows) %>%
+    mutate(sig_label = "")
+}
+```
+
+```{r gene-query-candidates}
+# ---- Query genes here ----
+query_genes <- c("TXN", "BIRC2", "MCTS1")
+# --------------------------
+
+gene_results <- query_genes_all(query_genes)
+
+cat("Results:\n")
+gene_results %>%
+  dplyr::select(symbol, group, label, te_lfc, te_padj) %>%
+  mutate(te_lfc = round(te_lfc, 3), te_padj = signif(te_padj, 3)) %>%
+  arrange(symbol, group, label) %>%
+  print(n = Inf)
+```
+
+```{r gene-query-plot, fig.width=11, fig.height=5}
+# Group colors
+group_colors <- c(
+  "Hypoxia response" = "#D55E00",
+  "eIF3d effect"     = "#E69F00",
+  "eIF3e effect"     = "#56B4E9"
+)
+
+for (gene in query_genes) {
+  plot_df <- gene_results %>%
+    filter(symbol == gene) %>%
+    mutate(label = factor(label, levels = levels(comparison_files$label)))
+
+  p <- ggplot(plot_df, aes(x = te_lfc, y = label, color = group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_segment(aes(x = 0, xend = te_lfc, y = label, yend = label),
+                 linewidth = 0.7) +
+    geom_point(aes(shape = te_padj < 0.05), size = 3) +
+    scale_color_manual(values = group_colors, name = NULL) +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                       labels = c("TRUE" = "padj < 0.05", "FALSE" = "ns"),
+                       name = NULL) +
+    facet_wrap(~ group, scales = "free_y", ncol = 3) +
+    labs(
+      x     = "TE LFC",
+      y     = NULL,
+      title = paste0(gene, " — TE changes across conditions")
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top", strip.background = element_blank())
+
+  print(p)
+  ggsave(here(paste0("output/26_gene_query_", gene, "_te_lfc.pdf")), p,
+         width = 11, height = 5)
+}
+```
+
+```{r gene-query-visualization, fig.width=14, fig.height=5}
+# Parse sample names helper (mirrors individual_gene_visualization.Rmd)
+parse_sample_names <- function(col_names) {
+  tibble(sample_name = col_names) %>%
+    separate(sample_name,
+             into = c("condition", "treatment", "timepoint", "replicate", "library", "sample_id"),
+             sep = "_", remove = FALSE, extra = "merge") %>%
+    mutate(
+      timepoint = paste0(timepoint, "hr"),
+      condition = factor(condition, levels = c("normoxia", "hypoxia")),
+      treatment = factor(treatment, levels = c("sictrl", "si3e", "si3d")),
+      library   = factor(library,   levels = c("rna", "ribo"))
+    )
+}
+
+for (gene in query_genes) {
+  cat("\n--- Visualizing:", gene, "---\n")
+  tryCatch({
+    plots <- visualize_gene(
+      gene_input   = gene,
+      counts_1hr   = counts_1hr,
+      counts_4hr   = counts_4hr,
+      counts_24hr  = counts_24hr,
+      gene_symbols = gene_symbols_anno,
+      log_transform = TRUE
+    )
+
+    combined <- plot_grid(plots$rna_ribo, plots$te, ncol = 1,
+                          align = "v", axis = "lr", rel_heights = c(1, 1))
+    print(combined)
+
+    ggsave(here(paste0("output/26_gene_query_", gene, "_counts_te.pdf")),
+           combined, width = 14, height = 10)
+  }, error = function(e) warning("Failed for ", gene, ": ", e$message))
+}
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

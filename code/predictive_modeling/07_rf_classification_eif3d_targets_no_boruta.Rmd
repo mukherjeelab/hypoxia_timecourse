@@ -13,6 +13,7 @@ params:
   clip_mode: "aggregate"
   exclude_4e_features: false
   exclude_own_te_features: true
+  neg_geneset_csv: ""
 editor_options:
   chunk_output_type: console
 ---
@@ -26,17 +27,66 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 ```{r derived_values}
 # Defaults for interactive use (overwritten by YAML params when knitting)
+#
+# --- COMMON ANALYSIS SETUPS ---
+#
+# Standard eIF3d target analysis (3d-promoted vs never-regulated background):
+#   condition="hypoxia", gene="3d", direction="promotes", timepoint="1hr",
+#   lfc="0.5", feature_set="external_stability", neg_geneset_csv=""
+#   → automatically uses negative_control_genes.csv (never regulated by si3d)
+#
+# Standard eIF3e target analysis (3e-promoted vs never-regulated background):
+#   condition="hypoxia", gene="3e", direction="promotes", timepoint="1hr",
+#   lfc="0.5", feature_set="external_stability", neg_geneset_csv=""
+#   → automatically uses negative_control_genes_si3e.csv (never regulated by si3e)
+#   → run nb02b first to generate that file if it doesn't exist
+#
+# eIF3e-specific genes vs never-regulated background (3e-only vs si3e neg control):
+#   condition="hypoxia", gene="3e", direction="promotes", timepoint="1hr_not3d",
+#   lfc="0.5", feature_set="external_stability", exclude_own_te_features=TRUE, neg_geneset_csv=""
+#   Positive set = hypoxia_3e_promotes_TE_1hr_not3d_lfc0.5.csv (built from timepoint + lfc)
+#   Negative set = negative_control_genes_si3e.csv (auto-selected because gene="3e")
+#
+# eIF3d-specific vs eIF3e-specific contrast (3d-only vs 3e-only at 1hr hypoxia):
+#   Run nb24 Section 12 first to generate the gene set CSVs, then use:
+#   condition="hypoxia", gene="3d", direction="promotes", timepoint="1hr_not3e",
+#   lfc="0.5", feature_set="external_stability", exclude_own_te_features=TRUE,
+#   neg_geneset_csv="hypoxia_3e_promotes_TE_1hr_not3d_lfc0.5.csv"
+#   Positive set = hypoxia_3d_promotes_TE_1hr_not3e_lfc0.5.csv (built from timepoint + lfc)
+#   Negative set = hypoxia_3e_promotes_TE_1hr_not3d_lfc0.5.csv (loaded via neg_geneset_csv)
+#
 if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
-    condition = "hypoxia",
-    gene      = "3d",
-    direction = "promotes",
-    timepoint = "hypoxia_specific", # "1hr", "4hr", "24hr", "alltimepoints", or "1and4hr" or "normoxia_specific" (1+4hr) or "hypoxia_specific" (1 hr)
-    lfc       = "0.5",
-    feature_set = "external_stability", #targeted, combined, structure, clip_split, te_lfc, codon_optimality, or kozak or external_stability
-    clip_mode   = "aggregate", # "individual", "aggregate", or "both"
-    exclude_4e_features = FALSE,
-    exclude_own_te_features = TRUE
+    condition = "hypoxia",        # "hypoxia" | "normoxia"
+    gene      = "3d",             # "3d" | "3e"
+    direction = "promotes",       # "promotes" | "inhibits"
+    timepoint = "1hr",            # "1hr" | "4hr" | "24hr" | "1and4hr" | "alltimepoints" |"1hr_not3e"
+                                  # | "normoxia_specific" | "hypoxia_specific" | any custom string
+                                  # Used to build positive geneset filename:
+                                  #   {condition}_{gene}_{direction}_TE_{timepoint}_lfc{lfc}.csv
+                                  # Note: "alltimepoints" / "1and4hr" load from output/ (full DESeq2 csv);
+                                  #       all others load from output/genesets/ (pre-filtered csv)
+    lfc       = "0.5",            # LFC threshold string used in geneset filename: "0.5" | "1" | etc.
+    feature_set = "external_stability", # "external_stability" — mRNA stability features (not timepoint-specific)
+                                        # "targeted"          — biological + lengths + GC + ORFquant + lit sigs
+                                        # "combined"          — all features (baseline)
+                                        # "structure"         — targeted + RNA secondary structure
+                                        # "clip_split"        — structure + split CLIP (eIF3 vs cap-binding)
+                                        # "te_lfc"            — clip_split + sictrl TE LFCs + delta TE
+                                        # "codon_optimality"  — te_lfc + CAI, tAI, CSC scores
+                                        # "kozak"             — Kozak-focused features
+                                        # "cnot3"             — CNOT3-focused features
+    clip_mode   = "aggregate",    # "aggregate"  — single count of datasets with binding evidence (recommended)
+                                  # "individual" — per-dataset regional binary features (~21 cols)
+                                  # "both"       — all CLIP features combined
+    exclude_4e_features     = FALSE, # TRUE = remove eIF4E circular features
+    exclude_own_te_features = TRUE,  # TRUE = remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
+                                     #        recommended when pos/neg sets are defined by TE changes
+    neg_geneset_csv = ""             # "" = use default negative_control_genes.csv (genes never regulated
+                                     #      by eIF3 in any condition/timepoint — standard background)
+                                     # "filename.csv" = load custom negative set from output/genesets/
+                                     #      use for contrastive analyses, e.g. 3d-specific vs 3e-specific:
+                                     #      "hypoxia_3e_promotes_TE_1hr_not3d_lfc0.5.csv"
   )
 }
 
@@ -129,10 +179,30 @@ if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
 }
 cat("Positive genes:", nrow(positive_genes), "\n")
 
-# Negative class: genes not regulated by eIF3d in any condition
-negative_control_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv")) %>%
-  mutate(gene_id_clean = sub("\\..*", "", gene_id))
-cat("Negative control genes:", nrow(negative_control_genes), "\n")
+# Negative class
+# Priority: explicit neg_geneset_csv > gene-matched default > si3d default
+if (params$neg_geneset_csv != "") {
+  # Custom negative set (e.g. for contrastive 3d-vs-3e analysis)
+  negative_control_genes <- read_csv(
+    here("output", "genesets", params$neg_geneset_csv),
+    show_col_types = FALSE
+  ) %>%
+    rename(gene_id_clean = ensembl_gene)
+} else {
+  # Gene-matched default: use si3e negative control when gene="3e" (generated by nb02b),
+  # otherwise use si3d negative control (generated by nb02)
+  neg_csv <- if (params$gene == "3e") {
+    "negative_control_genes_si3e.csv"
+  } else {
+    "negative_control_genes.csv"
+  }
+  negative_control_genes <- read_csv(
+    here("output", "predictive_modeling", neg_csv),
+    show_col_types = FALSE
+  ) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id))
+}
+cat("Negative genes:", nrow(negative_control_genes), "\n")
 ```
 
 # Create Binary Target
@@ -551,6 +621,9 @@ for (metric in c("AUC", "Balanced_Accuracy", "Sensitivity", "Specificity", "Prec
 
 # ggsave(here("plots", paste0("rf_classification_permutation_test_", suffix, ".pdf")),
 #        plot = p_perm, width = 8, height = 5)
+
+# Set NA if permutation test was not run (code above is commented out)
+if (!exists("perm_pvalue")) perm_pvalue <- NA
 ```
 
 # Calibration Plot
@@ -873,6 +946,12 @@ saveRDS(rf_model, file.path(output_dir, paste0("rf_classifier_", suffix, ".rds")
 # Feature importance
 write_csv(importance_df, file.path(output_dir, paste0("rf_classification_importance_", suffix, ".csv")))
 
+# Signed importance / directionality (needed for cross-analysis comparison plots)
+directionality_export <- directionality %>%
+  mutate(signed_importance = importance * sign(correlation))
+write_csv(directionality_export,
+          file.path(output_dir, paste0("rf_classification_directionality_", suffix, ".csv")))
+
 # Performance summary
 n_pos_total <- sum(model_genes$eif3d_target == pos_label)
 n_neg_total <- sum(model_genes$eif3d_target == neg_label)
@@ -944,7 +1023,7 @@ cat("  Features:", length(feature_cols), "\n\n")
 cat("Test Set Performance (Youden threshold =", round(optimal_threshold, 4), "):\n")
 cat("  AUC:", round(as.numeric(auc_value), 4), "\n")
 cat("  AUC 95% CI (bootstrap):", round(ci_auc[1], 4), "-", round(ci_auc[3], 4), "\n")
-cat("  Permutation p-value:", perm_pvalue, "(n=100)\n")
+cat("  Permutation p-value:", ifelse(is.na(perm_pvalue), "not run", perm_pvalue), "\n")
 cat("  Balanced Accuracy:", round(balanced_accuracy, 4), "\n")
 cat("  Sensitivity:", round(sensitivity, 4), "\n")
 cat("  Specificity:", round(specificity, 4), "\n")

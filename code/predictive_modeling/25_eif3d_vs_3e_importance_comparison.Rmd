@@ -1,0 +1,243 @@
+---
+title: "Notebook 25: eIF3d vs eIF3e Feature Importance Comparison"
+output: html_document
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+# Overview
+
+Compares signed feature importance across four nb07 RF analyses at 1hr hypoxia:
+
+- **3d standard**: 3d-promoted vs si3d neg control (`1hr`, `external_stability`, `noOwnTE`)
+- **3e standard**: 3e-promoted vs si3e neg control (`1hr`, `external_stability`, `noOwnTE`)
+- **3d specific**: 3d-only (not 3e) vs si3d neg control (`1hr_not3e`, `external_stability`, `noOwnTE`)
+- **3e specific**: 3e-only (not 3d) vs si3e neg control (`1hr_not3d`, `external_stability`, `noOwnTE`)
+
+Re-run nb07 for each analysis to regenerate the directionality CSVs, then re-run this notebook.
+
+# Load Directionality Files
+
+```{r load-directionality}
+dir_path <- here("output", "predictive_modeling")
+
+load_dir <- function(fname, label) {
+  path <- file.path(dir_path, fname)
+  if (!file.exists(path)) {
+    message("File not found (run nb07 first): ", fname)
+    return(NULL)
+  }
+  read_csv(path, show_col_types = FALSE) %>% mutate(analysis = label)
+}
+
+d_3d_std <- load_dir(
+  "rf_classification_directionality_eif33d_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv",
+  "3d standard"
+)
+d_3e_std <- load_dir(
+  "rf_classification_directionality_eif33e_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv",
+  "3e standard"
+)
+d_3d_sp <- load_dir(
+  "rf_classification_directionality_eif33d_promotes_hypoxia_1hr_not3e_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv",
+  "3d specific (not 3e)"
+)
+d_3e_sp <- load_dir(
+  "rf_classification_directionality_eif33e_promotes_hypoxia_1hr_not3d_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.csv",
+  "3e specific (not 3d)"
+)
+
+all_dir <- bind_rows(d_3d_std, d_3e_std, d_3d_sp, d_3e_sp)
+cat("Analyses loaded:", paste(unique(all_dir$analysis), collapse = ", "), "\n")
+cat("Total rows:", nrow(all_dir), "\n")
+```
+
+# Comparison Plots
+
+```{r comparison-helper}
+make_comparison_plot <- function(analyses, top_n = 30, title = NULL) {
+  df <- all_dir %>% filter(analysis %in% analyses)
+
+  top_feats <- df %>%
+    group_by(analysis) %>%
+    arrange(desc(abs(signed_importance))) %>%
+    slice_head(n = top_n) %>%
+    ungroup() %>%
+    pull(feature) %>% unique()
+
+  plot_df <- df %>%
+    filter(feature %in% top_feats) %>%
+    group_by(feature) %>%
+    mutate(max_abs = max(abs(signed_importance), na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(
+      feature_clean = fct_reorder(feature_clean, max_abs),
+      analysis      = factor(analysis, levels = analyses)
+    )
+
+  ggplot(plot_df, aes(x = signed_importance, y = feature_clean, color = analysis)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_segment(aes(x = 0, xend = signed_importance,
+                     y = feature_clean, yend = feature_clean),
+                 position = position_dodge(width = 0.6), linewidth = 0.5, alpha = 0.6) +
+    geom_point(position = position_dodge(width = 0.6), size = 2.5) +
+    scale_color_manual(values = c("3d standard"          = "#E69F00",
+                                  "3e standard"          = "#56B4E9",
+                                  "3d specific (not 3e)" = "#E69F00",
+                                  "3e specific (not 3d)" = "#56B4E9")) +
+    labs(x = "Signed Importance (positive = higher in promotes)", y = NULL,
+         color = NULL, title = title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+}
+```
+
+## Plot 1: Specific analyses — 3d-only vs 3e-only
+
+```{r plot-specific, fig.width=12, fig.height=8}
+if (!is.null(d_3d_sp) && !is.null(d_3e_sp)) {
+  p_sp <- make_comparison_plot(
+    c("3d specific (not 3e)", "3e specific (not 3d)"),
+    title = "eIF3d vs eIF3e: specific analyses (3d-only vs 3e-only, vs neg control, 1hr hypoxia)"
+  )
+  print(p_sp)
+  ggsave(here("output/25_importance_comparison_specific.pdf"), p_sp, width = 12, height = 8)
+}
+```
+
+## Plot 1b: Quadrant scatter — 3d-specific vs 3e-specific signed importance
+
+```{r plot-specific-quadrant, fig.width=7, fig.height=7}
+if (!is.null(d_3d_sp) && !is.null(d_3e_sp)) {
+  quad_df <- d_3d_sp %>%
+    dplyr::select(feature, feature_clean, category, signed_importance) %>%
+    rename(si_3d = signed_importance) %>%
+    inner_join(
+      d_3e_sp %>% dplyr::select(feature, signed_importance) %>% rename(si_3e = signed_importance),
+      by = "feature"
+    ) %>%
+    mutate(
+      broad_category = case_when(
+        str_detect(feature, "^dap5_")                          ~ "Sensitivity to DAP5",
+        category == "4E / DAP5"                                ~ "Sensitivity to eIF4E",
+        category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+        TRUE                                                   ~ "Intrinsic mRNA features"
+      )
+    )
+
+  axis_lim <- max(abs(c(quad_df$si_3d, quad_df$si_3e)), na.rm = TRUE) * 1.05
+
+  p_quad <- ggplot(quad_df, aes(x = si_3d, y = si_3e,
+                                color = broad_category, label = feature_clean)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_point(alpha = 0.7, size = 2) +
+    ggrepel::geom_text_repel(
+      data = filter(quad_df, abs(si_3d) > quantile(abs(si_3d), 0.75, na.rm = TRUE) |
+                               abs(si_3e) > quantile(abs(si_3e), 0.75, na.rm = TRUE)),
+      size = 3, max.overlaps = 20, show.legend = FALSE
+    ) +
+    scale_color_manual(values = c(
+      "Intrinsic mRNA features" = "#009E73",
+      "eIF3 binding evidence"   = "#E69F00",
+      "Sensitivity to eIF4E"    = "#56B4E9",
+      "Sensitivity to DAP5"     = "#CC79A7"
+    )) +
+    coord_fixed(xlim = c(-axis_lim, axis_lim), ylim = c(-axis_lim, axis_lim)) +
+    labs(
+      x     = "Signed Importance — eIF3d specific (not 3e)",
+      y     = "Signed Importance — eIF3e specific (not 3d)",
+      color = NULL,
+      title = "Feature importance: eIF3d-specific vs eIF3e-specific",
+      subtitle = "Top-right = important for both | left = 3d-specific | top = 3e-specific"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  print(p_quad)
+  ggsave(here("output/25_importance_quadrant_specific.pdf"), p_quad, width = 7, height = 7)
+
+  # Version 2: grey out features that agree between 3d and 3e (top-right / bottom-left)
+  # Highlight only features that diverge: top-left (3e > 0, 3d < 0) and bottom-right (3d > 0, 3e < 0)
+  quad_df2 <- quad_df %>%
+    mutate(
+      diverges = (si_3d > 0 & si_3e < 0) | (si_3d < 0 & si_3e > 0),
+      label_text = if_else(diverges, feature_clean, NA_character_)
+    )
+
+  p_quad2 <- ggplot(quad_df2, aes(x = si_3d, y = si_3e)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_point(data = filter(quad_df2, !diverges),
+               color = "grey80", alpha = 0.5, size = 2) +
+    geom_point(data = filter(quad_df2, diverges),
+               aes(color = broad_category), alpha = 0.8, size = 2.5) +
+    ggrepel::geom_text_repel(
+      aes(label = label_text),
+      data = filter(quad_df2, !is.na(label_text)),
+      size = 3, max.overlaps = 20, show.legend = FALSE
+    ) +
+    scale_color_manual(values = c(
+      "Intrinsic mRNA features" = "#009E73",
+      "eIF3 binding evidence"   = "#E69F00",
+      "Sensitivity to eIF4E"    = "#56B4E9",
+      "Sensitivity to DAP5"     = "#CC79A7"
+    )) +
+    coord_fixed(xlim = c(-axis_lim, axis_lim), ylim = c(-axis_lim, axis_lim)) +
+    labs(
+      x     = "Signed Importance — eIF3d specific (not 3e)",
+      y     = "Signed Importance — eIF3e specific (not 3d)",
+      color = NULL,
+      title = "Feature importance: divergent features highlighted",
+      subtitle = "Grey = agree between 3d & 3e | Colored = diverge"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  print(p_quad2)
+  ggsave(here("output/25_importance_quadrant_specific_divergent.pdf"), p_quad2, width = 7, height = 7)
+}
+```
+
+## Plot 2: Standard analyses — 3d vs 3e
+
+```{r plot-standard, fig.width=12, fig.height=8}
+if (!is.null(d_3d_std) && !is.null(d_3e_std)) {
+  p_std <- make_comparison_plot(
+    c("3d standard", "3e standard"),
+    title = "eIF3d vs eIF3e: standard analyses (vs si3d/si3e neg control, 1hr hypoxia)"
+  )
+  print(p_std)
+  ggsave(here("output/25_importance_comparison_standard.pdf"), p_std, width = 12, height = 8)
+}
+```
+
+## Plot 3: All four analyses
+
+```{r plot-all-four, fig.width=14, fig.height=9}
+if (nrow(all_dir) > 0) {
+  p_all <- make_comparison_plot(
+    c("3d standard", "3e standard", "3d specific (not 3e)", "3e specific (not 3d)"),
+    top_n = 25,
+    title = "All four analyses: eIF3d vs eIF3e, standard and specific (1hr hypoxia)"
+  )
+  print(p_all)
+  ggsave(here("output/25_importance_comparison_all_four.pdf"), p_all, width = 14, height = 9)
+}
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
