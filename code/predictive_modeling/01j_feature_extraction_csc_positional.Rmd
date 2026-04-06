@@ -1,0 +1,511 @@
+---
+title: "Positional CSC Feature Extraction — extends external_stability matrix (first 75 codons + CDS quarters)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Adds five positional CSC (Codon Stabilisation Coefficient) features to the
+`external_stability` feature matrix, producing `feature_matrix_csc_positional.rds`.
+
+| Feature | Description |
+|---------|-------------|
+| `csc_first75` | CSC of first 225 nt (75 codons); NA if CDS < 225 nt |
+| `csc_q1` | CSC of first 25% of CDS (codon-aligned) |
+| `csc_q2` | CSC of 25–50% of CDS |
+| `csc_q3` | CSC of 50–75% of CDS |
+| `csc_q4` | CSC of last 25% of CDS |
+
+All scoring uses `iCodon::predict_stability("human")` — the exact same function
+used for the full-CDS `csc` column in 01g. Quarter boundaries are codon-aligned
+using `floor(n_codons × 0.25/0.5/0.75) × 3` nt.
+
+Reads `feature_matrix_external_stability.rds`, appends the five positional CSC columns,
+and writes back to the same file — so `feature_set = "external_stability"` in nb07
+automatically includes these features.
+
+**Prerequisites:**
+- `output/predictive_modeling/feature_matrix_external_stability.rds` (from 01i)
+- `accessories/human/txdb.gencode49.sqlite` (GENCODE v49)
+- R packages: `GenomicFeatures`, `BSgenome.Hsapiens.UCSC.hg38`, `iCodon`
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(iCodon)
+```
+
+---
+
+# Section 1: Load Feature Matrix and Extract CDS Sequences
+
+```{r load_feature_matrix}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+cat("Feature matrix loaded:", nrow(feature_matrix), "genes x", ncol(feature_matrix), "columns\n")
+
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Target transcripts:", length(keep_tx), "\n")
+cat("Example IDs:", head(keep_tx, 3), "\n")
+```
+
+```{r load_txdb}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+cat("TxDb and genome loaded\n")
+```
+
+```{r extract_cds}
+# Extract all CDS sequences from TxDb (same pattern as 01g)
+cds_all      <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all <- extractTranscriptSeqs(genome, cds_all)
+cat("Total CDS sequences in TxDb:", length(cds_seqs_all), "\n")
+
+# Strip version suffixes to match feature matrix transcript_id_clean
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+# Filter to transcripts present in feature matrix
+keep_idx    <- cds_names_clean %in% keep_tx
+cds_sequences <- cds_seqs_all[keep_idx]
+names(cds_sequences) <- cds_names_clean[keep_idx]
+cat("After filtering to feature matrix transcripts:", length(cds_sequences), "\n")
+
+# Remove sequences with length not divisible by 3 (as in 01g)
+valid_length <- width(cds_sequences) %% 3 == 0
+n_invalid    <- sum(!valid_length)
+if (n_invalid > 0) {
+  cat("Removing", n_invalid, "sequences with length not divisible by 3\n")
+}
+cds_sequences <- cds_sequences[valid_length]
+cat("Final CDS sequences for scoring:", length(cds_sequences), "\n")
+
+# CDS length distribution
+cat("\nCDS length summary:\n")
+print(summary(as.integer(width(cds_sequences))))
+
+# Count short CDSs that will yield NA for csc_first75
+n_short    <- sum(width(cds_sequences) < 225)
+n_long     <- sum(width(cds_sequences) >= 225)
+cat("\nCDS < 225 nt (< 75 codons) — csc_first75 will be NA:", n_short,
+    sprintf("(%.1f%%)\n", 100 * n_short / length(cds_sequences)))
+cat("CDS >= 225 nt — csc_first75 will be scored:", n_long, "\n")
+```
+
+---
+
+# Section 2: Build iCodon Predictor
+
+```{r build_predictor}
+# Build human-specific CSC predictor once; reuse for all five scoring steps
+predict_human <- iCodon::predict_stability("human")
+cat("Human CSC predictor ready\n")
+```
+
+---
+
+# Section 3: Compute `csc_first75`
+
+```{r csc_first75}
+# Separate long (>= 225 nt) CDSs from short ones
+long_idx  <- width(cds_sequences) >= 225
+long_seqs <- cds_sequences[long_idx]
+cat("Long CDSs (>= 225 nt):", length(long_seqs), "\n")
+
+# Extract first 225 nt (75 codons) as character strings
+seq_75_char <- as.character(subseq(long_seqs, 1, 225))
+
+# Deduplicate → score → restore names (exact 01g pattern)
+unique_75  <- unique(seq_75_char)
+cat("Unique 75-codon sequences:", length(unique_75), "\n")
+
+scores_75        <- predict_human(unique_75)
+names(scores_75) <- unique_75                          # key by sequence content
+
+csc_first75_long        <- scores_75[seq_75_char]
+names(csc_first75_long) <- names(long_seqs)            # restore transcript names
+
+# Build full-length vector (NA for short CDSs)
+csc_first75 <- rep(NA_real_, length(cds_sequences))
+names(csc_first75) <- names(cds_sequences)
+csc_first75[names(long_seqs)] <- csc_first75_long
+
+cat("\ncsc_first75 summary:\n")
+print(summary(csc_first75))
+cat("Non-NA:", sum(!is.na(csc_first75)), "/", length(csc_first75), "\n")
+```
+
+---
+
+# Section 4: Compute Quarter CSC (`csc_q1`–`csc_q4`)
+
+```{r quarter_boundaries}
+# Codon-aligned boundaries (floor to nearest codon, in nucleotides, 1-based)
+n_codons <- as.integer(width(cds_sequences) / 3)
+
+b1 <- pmax(floor(n_codons * 0.25) * 3L, 3L)          # end of Q1 (>= 1 codon)
+b2 <- pmax(floor(n_codons * 0.50) * 3L, b1 + 3L)     # end of Q2
+b3 <- pmax(floor(n_codons * 0.75) * 3L, b2 + 3L)     # end of Q3
+b4 <- as.integer(width(cds_sequences))                 # end of Q4 (= full CDS)
+
+cat("Example boundary sets (first 5 transcripts):\n")
+cat(sprintf("  n_codons=%d  Q1=[1,%d]  Q2=[%d,%d]  Q3=[%d,%d]  Q4=[%d,%d]\n",
+            n_codons[1], b1[1], b1[1]+1L, b2[1], b2[1]+1L, b3[1], b3[1]+1L, b4[1]))
+cat(sprintf("  n_codons=%d  Q1=[1,%d]  Q2=[%d,%d]  Q3=[%d,%d]  Q4=[%d,%d]\n",
+            n_codons[2], b1[2], b1[2]+1L, b2[2], b2[2]+1L, b3[2], b3[2]+1L, b4[2]))
+```
+
+```{r score_segment_helper}
+# Helper: extract one CDS segment per transcript, deduplicate, score, restore names
+# Follows exact 01g scoring pattern.
+score_segment <- function(seqs, starts, ends, predictor) {
+  seg_len <- ends - starts + 1L
+  valid   <- seg_len >= 3L          # require >= 1 complete codon
+  result  <- rep(NA_real_, length(seqs))
+  names(result) <- names(seqs)
+
+  if (!any(valid)) return(result)
+
+  seg_seqs <- as.character(subseq(seqs[valid], starts[valid], ends[valid]))
+
+  unique_segs    <- unique(seg_seqs)
+  unique_scores  <- predictor(unique_segs)
+  names(unique_scores) <- unique_segs           # key by sequence content
+  seg_scores           <- unique_scores[seg_seqs]
+  names(seg_scores)    <- names(seqs)[valid]    # restore transcript names
+
+  result[names(seqs)[valid]] <- seg_scores
+  result
+}
+```
+
+```{r compute_quarters}
+cat("Computing Q1 (0–25%)...\n")
+csc_q1 <- score_segment(cds_sequences, rep(1L, length(cds_sequences)), b1,     predict_human)
+
+cat("Computing Q2 (25–50%)...\n")
+csc_q2 <- score_segment(cds_sequences, b1 + 1L,                        b2,     predict_human)
+
+cat("Computing Q3 (50–75%)...\n")
+csc_q3 <- score_segment(cds_sequences, b2 + 1L,                        b3,     predict_human)
+
+cat("Computing Q4 (75–100%)...\n")
+csc_q4 <- score_segment(cds_sequences, b3 + 1L,                        b4,     predict_human)
+
+cat("\nQuarter CSC summaries:\n")
+cat("Q1:\n"); print(summary(csc_q1))
+cat("Q2:\n"); print(summary(csc_q2))
+cat("Q3:\n"); print(summary(csc_q3))
+cat("Q4:\n"); print(summary(csc_q4))
+
+cat("\nNon-NA counts:\n")
+cat(" csc_q1:", sum(!is.na(csc_q1)), "/", length(csc_q1), "\n")
+cat(" csc_q2:", sum(!is.na(csc_q2)), "/", length(csc_q2), "\n")
+cat(" csc_q3:", sum(!is.na(csc_q3)), "/", length(csc_q3), "\n")
+cat(" csc_q4:", sum(!is.na(csc_q4)), "/", length(csc_q4), "\n")
+```
+
+---
+
+# Section 5: Join to Feature Matrix
+
+```{r build_score_table}
+score_tbl <- tibble(
+  transcript_id_clean = names(cds_sequences),
+  csc_first75         = csc_first75,
+  csc_q1              = csc_q1,
+  csc_q2              = csc_q2,
+  csc_q3              = csc_q3,
+  csc_q4              = csc_q4
+)
+
+cat("Score table:", nrow(score_tbl), "rows x", ncol(score_tbl), "cols\n")
+cat("Transcripts in score table not in feature matrix:",
+    sum(!score_tbl$transcript_id_clean %in% feature_matrix$transcript_id_clean), "\n")
+```
+
+```{r join_matrix}
+fm_new <- feature_matrix %>%
+  left_join(score_tbl, by = "transcript_id_clean")
+
+cat("Matrix after join:", nrow(fm_new), "genes x", ncol(fm_new), "columns\n")
+cat("New columns added:", ncol(fm_new) - ncol(feature_matrix), "\n")
+cat("Row count unchanged:", nrow(fm_new) == nrow(feature_matrix), "\n")
+```
+
+---
+
+# Section 6: Quality Control
+
+```{r qc_coverage}
+new_features <- c("csc_first75", "csc_q1", "csc_q2", "csc_q3", "csc_q4")
+
+cat("Non-NA coverage for new features:\n")
+for (col in new_features) {
+  n_nonNA <- sum(!is.na(fm_new[[col]]))
+  cat(sprintf("  %-12s : %d / %d (%.1f%%)\n",
+              col, n_nonNA, nrow(fm_new),
+              100 * n_nonNA / nrow(fm_new)))
+}
+
+cat("\nValue ranges:\n")
+for (col in new_features) {
+  r <- range(fm_new[[col]], na.rm = TRUE)
+  cat(sprintf("  %-12s : [%.4f, %.4f]\n", col, r[1], r[2]))
+}
+```
+
+```{r qc_correlations}
+# Pairwise correlations among all CSC features (full-CDS + 5 positional)
+cor_cols <- c("csc", new_features)
+cor_data <- fm_new %>%
+  dplyr::select(all_of(cor_cols)) %>%
+  drop_na()
+
+cat("Pairwise Pearson correlations (n =", nrow(cor_data), "):\n")
+print(round(cor(cor_data), 3))
+```
+
+```{r qc_density, fig.width=10, fig.height=5}
+plot_df <- fm_new %>%
+  dplyr::select(transcript_id_clean, all_of(cor_cols)) %>%
+  pivot_longer(all_of(cor_cols), names_to = "feature", values_to = "csc_value") %>%
+  filter(!is.na(csc_value)) %>%
+  mutate(feature = factor(feature, levels = cor_cols))
+
+ggplot(plot_df, aes(x = csc_value, color = feature, fill = feature)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x        = "CSC score",
+    y        = "Density",
+    title    = "Distribution of positional CSC features",
+    subtitle = "Full CDS + first-75-codon + 4 quarters",
+    color    = NULL, fill = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave(here("output/01j_csc_positional_density.pdf"), width = 10, height = 5)
+```
+
+```{r qc_sanity}
+# Sanity check: csc_first75 NA exactly for genes with CDS < 225 nt
+short_tx <- names(cds_sequences)[width(cds_sequences) < 225]
+n_short_na <- sum(is.na(fm_new$csc_first75[fm_new$transcript_id_clean %in% short_tx]))
+cat("Short-CDS genes correctly NA in csc_first75:", n_short_na, "/", length(short_tx), "\n")
+```
+
+---
+
+# Export
+
+```{r export}
+# Write back to feature_matrix_external_stability.rds so that nb07
+# feature_set = "external_stability" automatically includes positional CSC.
+saveRDS(fm_new,
+        here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Exported: output/predictive_modeling/feature_matrix_external_stability.rds\n")
+cat("Final matrix:", nrow(fm_new), "genes x", ncol(fm_new), "columns\n")
+cat("New features added:", paste(new_features, collapse = ", "), "\n")
+```
+
+---
+
+# Section 7: Distribution Plots by Gene Group
+
+Compares all 6 CSC features across three groups:
+- **eIF3d hypoxia promotes** — hypoxia 1hr, LFC > 0.5 (`#E69F00`)
+- **Negative control** — size-matched to positive set with `set.seed(9)` (`grey40`)
+- **All other genes** — remaining genes in feature matrix (`grey80`)
+
+Mirrors the gene set sampling used in the nb07 RF model.
+
+```{r load_genesets}
+library(ggrepel)
+
+# Positive: eIF3d hypoxia promotes 1hr LFC 0.5
+hyp_promotes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+
+# Negative control pool (never regulated by si3d in any condition)
+neg_controls <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+# Gene IDs in the feature matrix (versionless)
+fm_gene_ids <- sub("\\..*", "", fm_new$gene_id)
+
+pos_ids  <- hyp_promotes$ensembl_gene[hyp_promotes$ensembl_gene %in% fm_gene_ids]
+neg_pool <- neg_controls$gene_id_clean[neg_controls$gene_id_clean %in% fm_gene_ids]
+
+cat("Positive genes in feature matrix:", length(pos_ids), "\n")
+cat("Negative control pool in feature matrix:", length(neg_pool), "\n")
+
+# Size-match neg ctrl to positive set (replicates nb07 sampling exactly)
+set.seed(9)
+neg_ids <- sample(neg_pool, min(length(pos_ids), length(neg_pool)))
+cat("Negative controls sampled (size-matched):", length(neg_ids), "\n")
+```
+
+```{r assign_groups}
+group_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "grey40",
+  "All other genes"        = "grey80"
+)
+
+all_csc_feats <- c("csc", "csc_first75", "csc_q1", "csc_q2", "csc_q3", "csc_q4")
+
+grp_df <- fm_new %>%
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    group = case_when(
+      gene_id_clean %in% pos_ids ~ "eIF3d hypoxia promotes",
+      gene_id_clean %in% neg_ids ~ "Negative control",
+      TRUE                       ~ "All other genes"
+    ),
+    group = factor(group, levels = c("eIF3d hypoxia promotes",
+                                     "Negative control",
+                                     "All other genes"))
+  ) %>%
+  dplyr::select(gene_id_clean, symbol, group, all_of(all_csc_feats))
+
+cat("\nGroup sizes:\n")
+print(table(grp_df$group))
+```
+
+```{r wilcoxon_stats}
+# Wilcoxon tests: eIF3d vs Neg ctrl, eIF3d vs All other, for each feature
+wx_results <- map_dfr(all_csc_feats, function(feat) {
+  eif3d <- grp_df %>% filter(group == "eIF3d hypoxia promotes") %>% pull(!!feat) %>% na.omit()
+  neg   <- grp_df %>% filter(group == "Negative control")       %>% pull(!!feat) %>% na.omit()
+  other <- grp_df %>% filter(group == "All other genes")         %>% pull(!!feat) %>% na.omit()
+
+  wx_neg   <- wilcox.test(eif3d, neg,   alternative = "two.sided")
+  wx_other <- wilcox.test(eif3d, other, alternative = "two.sided")
+
+  tibble(
+    feature             = feat,
+    n_eif3d             = length(eif3d),
+    n_neg               = length(neg),
+    n_other             = length(other),
+    median_eif3d        = round(median(eif3d), 4),
+    median_neg          = round(median(neg),   4),
+    median_other        = round(median(other), 4),
+    p_eif3d_vs_neg      = wx_neg$p.value,
+    p_eif3d_vs_other    = wx_other$p.value
+  )
+})
+
+cat("=== Wilcoxon test results (eIF3d vs each background) ===\n")
+print(wx_results %>% mutate(across(starts_with("p_"), ~ formatC(.x, format = "e", digits = 2))))
+```
+
+```{r facet_density, fig.width=12, fig.height=7}
+feat_labels <- c(
+  csc        = "CSC (full CDS)",
+  csc_first75 = "CSC (first 75 codons)",
+  csc_q1     = "CSC (Q1: 0–25%)",
+  csc_q2     = "CSC (Q2: 25–50%)",
+  csc_q3     = "CSC (Q3: 50–75%)",
+  csc_q4     = "CSC (Q4: 75–100%)"
+)
+
+density_df <- grp_df %>%
+  pivot_longer(all_of(all_csc_feats), names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    feature = factor(feature, levels = all_csc_feats, labels = feat_labels[all_csc_feats])
+  )
+
+# Plot All other genes first (grey background), then neg ctrl, then eIF3d on top
+density_ordered <- density_df %>%
+  arrange(match(group, c("All other genes", "Negative control", "eIF3d hypoxia promotes")))
+
+ggplot(density_ordered, aes(x = value, color = group, fill = group)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(
+    data = density_df %>%
+      group_by(feature, group) %>%
+      summarise(med = median(value, na.rm = TRUE), .groups = "drop"),
+    aes(xintercept = med, color = group),
+    linetype = "dashed", linewidth = 0.5
+  ) +
+  facet_wrap(~feature, scales = "free", ncol = 3) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  scale_fill_manual(values  = group_colors, name = NULL) +
+  labs(
+    x        = "CSC score",
+    y        = "Density",
+    title    = "Positional CSC distributions by gene group",
+    subtitle = "Negative control size-matched to eIF3d set (set.seed(9)) | dashed = group median"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        strip.background = element_blank(),
+        strip.text       = element_text(size = 11))
+
+ggsave(here("output/01j_csc_positional_by_group_facet.pdf"), width = 12, height = 7)
+```
+
+```{r individual_plots, fig.width=6, fig.height=4.5}
+# Individual plot per feature with Wilcoxon p-value annotations
+for (feat in all_csc_feats) {
+  feat_lab <- feat_labels[feat]
+  wx_row   <- wx_results %>% filter(feature == feat)
+
+  p <- ggplot(
+    density_df %>% filter(feature == feat_labels[feat]),
+    aes(x = value, color = group, fill = group)
+  ) +
+    geom_density(alpha = 0.15, linewidth = 0.8) +
+    scale_color_manual(values = group_colors, name = NULL) +
+    scale_fill_manual(values  = group_colors, name = NULL) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.3, size = 3.2,
+             label = sprintf(
+               "eIF3d (n=%d)  med=%.3f\nNeg ctrl (n=%d)  med=%.3f  p=%s\nAll other (n=%d)  med=%.3f  p=%s",
+               wx_row$n_eif3d, wx_row$median_eif3d,
+               wx_row$n_neg,   wx_row$median_neg,
+               formatC(wx_row$p_eif3d_vs_neg,   format = "e", digits = 1),
+               wx_row$n_other, wx_row$median_other,
+               formatC(wx_row$p_eif3d_vs_other, format = "e", digits = 1)
+             )) +
+    labs(
+      x        = "CSC score",
+      y        = "Density",
+      title    = feat_lab,
+      subtitle = "eIF3d hypoxia 1hr LFC > 0.5 | neg ctrl size-matched set.seed(9)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+
+  print(p)
+  ggsave(here(paste0("output/01j_", feat, "_by_group.pdf")), p, width = 6, height = 4.5)
+}
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

@@ -8,6 +8,7 @@ params:
   clip_mode: "aggregate"
   pos_geneset_csv: ""
   neg_geneset_csv: ""
+  exclude_own_te_features: true
 editor_options:
   chunk_output_type: console
 ---
@@ -40,8 +41,10 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     clip_mode      = "aggregate",          # "aggregate" | "individual" | "both"
     pos_geneset_csv = "",                  # "" = use Teleman eIF4E data (default)
                                            # "filename.csv" = load from output/genesets/
-    neg_geneset_csv = ""                   # "" = use Teleman neutral genes (default)
+    neg_geneset_csv = "",                  # "" = use Teleman neutral genes (default)
                                            # "filename.csv" = load from output/genesets/
+    exclude_own_te_features = TRUE         # TRUE = remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
+                                           #        recommended when running eIF4E model to avoid eIF3d-specific signal
   )
 }
 
@@ -239,8 +242,8 @@ if (params$clip_mode == "aggregate") {
   cat("CLIP mode: both — using all CLIP features\n")
 }
 
-# If targeted/codon_optimality/kozak/te_lfc: remove k-mer and RBP motif columns
-if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality", "kozak")) {
+# If targeted/codon_optimality/kozak/te_lfc/external_stability: remove k-mer and RBP motif columns
+if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality", "kozak", "cnot3", "external_stability")) {
   kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
   excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
   feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
@@ -271,6 +274,14 @@ if (!using_custom_genesets) {
   }
 } else {
   cat("Custom gene sets: skipping circular feature removal (eIF4E features are informative here)\n")
+}
+
+# ---- Remove own-data TE features ----
+if (isTRUE(params$exclude_own_te_features)) {
+  te_pattern  <- "^indiv_te_|^delta_te_|^sig_"
+  te_cols     <- feature_cols[str_detect(feature_cols, te_pattern)]
+  feature_cols <- setdiff(feature_cols, te_cols)
+  cat("Removed", length(te_cols), "own-data TE features\n")
 }
 
 cat("Feature count after filtering:", length(feature_cols), "\n")
@@ -545,119 +556,121 @@ for (metric in c("AUC", "Balanced_Accuracy", "Sensitivity", "Specificity", "Prec
 # Permutation Test
 
 ```{r permutation_test, fig.width=8, fig.height=5}
-set.seed(42)
-n_perm <- 100
-perm_aucs <- numeric(n_perm)
+# set.seed(42)
+# n_perm <- 100
+# perm_aucs <- numeric(n_perm)
 
-for (i in seq_len(n_perm)) {
-  if (i %% 10 == 0) cat("Permutation", i, "/", n_perm, "\n")
-  perm_data <- model_data
-  perm_data$eif4e_target <- sample(perm_data$eif4e_target)
-  perm_train <- impute_with_medians(perm_data[train_idx, ], train_medians)
-  perm_test  <- impute_with_medians(perm_data[-train_idx, ], train_medians)
-  rf_perm <- ranger(x = perm_train[, feature_cols], y = perm_train$eif4e_target,
-                    num.trees = 500, probability = TRUE, seed = i)
-  perm_probs <- predict(rf_perm, perm_test[, feature_cols])$predictions[, pos_label]
-  roc_perm <- roc(perm_test$eif4e_target, perm_probs,
-                  levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
-  perm_aucs[i] <- as.numeric(auc(roc_perm))
-}
+# for (i in seq_len(n_perm)) {
+#   if (i %% 10 == 0) cat("Permutation", i, "/", n_perm, "\n")
+#   perm_data <- model_data
+#   perm_data$eif4e_target <- sample(perm_data$eif4e_target)
+#   perm_train <- impute_with_medians(perm_data[train_idx, ], train_medians)
+#   perm_test  <- impute_with_medians(perm_data[-train_idx, ], train_medians)
+#   rf_perm <- ranger(x = perm_train[, feature_cols], y = perm_train$eif4e_target,
+#                     num.trees = 500, probability = TRUE, seed = i)
+#   perm_probs <- predict(rf_perm, perm_test[, feature_cols])$predictions[, pos_label]
+#   roc_perm <- roc(perm_test$eif4e_target, perm_probs,
+#                   levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+#   perm_aucs[i] <- as.numeric(auc(roc_perm))
+# }
 
-perm_pvalue <- mean(perm_aucs >= as.numeric(auc_value))
-cat("Permutation p-value:", perm_pvalue, "\n")
+# perm_pvalue <- mean(perm_aucs >= as.numeric(auc_value))
+# cat("Permutation p-value:", perm_pvalue, "\n")
 
-p_perm <- ggplot(data.frame(auc = perm_aucs), aes(x = auc)) +
-  geom_histogram(bins = 30, fill = "grey70", color = "white") +
-  geom_vline(xintercept = as.numeric(auc_value), color = "#E69F00", linewidth = 1.2) +
-  geom_vline(xintercept = 0.5, color = "grey40", linetype = "dashed") +
-  annotate("text", x = as.numeric(auc_value), y = Inf,
-           label = paste0("Real AUC\n", round(auc_value, 3)),
-           vjust = 2, hjust = -0.1, color = "#E69F00", size = 3.5) +
-  theme_cowplot() +
-  labs(title = "Permutation Test: Null AUC Distribution",
-       subtitle = paste0("n=", n_perm, " permutations | p = ", perm_pvalue),
-       x = "AUC (shuffled labels)", y = "Count")
+# p_perm <- ggplot(data.frame(auc = perm_aucs), aes(x = auc)) +
+#   geom_histogram(bins = 30, fill = "grey70", color = "white") +
+#   geom_vline(xintercept = as.numeric(auc_value), color = "#E69F00", linewidth = 1.2) +
+#   geom_vline(xintercept = 0.5, color = "grey40", linetype = "dashed") +
+#   annotate("text", x = as.numeric(auc_value), y = Inf,
+#            label = paste0("Real AUC\n", round(auc_value, 3)),
+#            vjust = 2, hjust = -0.1, color = "#E69F00", size = 3.5) +
+#   theme_cowplot() +
+#   labs(title = "Permutation Test: Null AUC Distribution",
+#        subtitle = paste0("n=", n_perm, " permutations | p = ", perm_pvalue),
+#        x = "AUC (shuffled labels)", y = "Count")
 
-print(p_perm)
+# print(p_perm)
 
-ggsave(here("plots", paste0("rf_classification_permutation_test_", suffix, ".pdf")),
-       plot = p_perm, width = 8, height = 5)
+# ggsave(here("plots", paste0("rf_classification_permutation_test_", suffix, ".pdf")),
+#        plot = p_perm, width = 8, height = 5)
+
+if (!exists("perm_pvalue")) perm_pvalue <- NA
 ```
 
 # Calibration Plot
 
 ```{r calibration_plot, fig.width=6, fig.height=6}
-cal_df <- data.frame(
-  pred = pred_pos_prob,
-  actual = as.numeric(actual == pos_label)
-)
-cal_df$bin <- cut(cal_df$pred, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
-cal_summary <- cal_df %>%
-  group_by(bin) %>%
-  summarise(mean_pred = mean(pred), fraction_pos = mean(actual), n = n(), .groups = "drop") %>%
-  filter(!is.na(bin))
+# cal_df <- data.frame(
+#   pred = pred_pos_prob,
+#   actual = as.numeric(actual == pos_label)
+# )
+# cal_df$bin <- cut(cal_df$pred, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+# cal_summary <- cal_df %>%
+#   group_by(bin) %>%
+#   summarise(mean_pred = mean(pred), fraction_pos = mean(actual), n = n(), .groups = "drop") %>%
+#   filter(!is.na(bin))
 
-p_cal <- ggplot(cal_summary, aes(x = mean_pred, y = fraction_pos)) +
-  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
-  geom_point(aes(size = n), color = "#0072B2") +
-  geom_line(color = "#0072B2") +
-  scale_size_continuous(name = "n in bin") +
-  xlim(0, 1) + ylim(0, 1) +
-  theme_cowplot() +
-  labs(title = "Calibration Plot",
-       subtitle = paste0(gene_label, " target classifier — test set"),
-       x = "Mean Predicted Probability", y = "Observed Fraction Positive")
+# p_cal <- ggplot(cal_summary, aes(x = mean_pred, y = fraction_pos)) +
+#   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+#   geom_point(aes(size = n), color = "#0072B2") +
+#   geom_line(color = "#0072B2") +
+#   scale_size_continuous(name = "n in bin") +
+#   xlim(0, 1) + ylim(0, 1) +
+#   theme_cowplot() +
+#   labs(title = "Calibration Plot",
+#        subtitle = paste0(gene_label, " target classifier — test set"),
+#        x = "Mean Predicted Probability", y = "Observed Fraction Positive")
 
-print(p_cal)
+# print(p_cal)
 
-ggsave(here("plots", paste0("rf_classification_calibration_", suffix, ".pdf")),
-       plot = p_cal, width = 6, height = 6)
+# ggsave(here("plots", paste0("rf_classification_calibration_", suffix, ".pdf")),
+#        plot = p_cal, width = 6, height = 6)
 ```
 
 # Learning Curve
 
 ```{r learning_curve, fig.width=8, fig.height=5}
-set.seed(9)
-lc_fracs <- seq(0.1, 1.0, by = 0.1)
+# set.seed(9)
+# lc_fracs <- seq(0.1, 1.0, by = 0.1)
 
-lc_results <- lapply(lc_fracs, function(frac) {
-  if (frac < 1.0) {
-    idx <- createDataPartition(train_data$eif4e_target, p = frac, list = FALSE)
-    sub_train <- train_data[idx, ]
-  } else {
-    sub_train <- train_data
-  }
-  rf_lc <- ranger(x = sub_train[, feature_cols], y = sub_train$eif4e_target,
-                  num.trees = 200, probability = TRUE, seed = 9)
-  oob_probs_lc <- rf_lc$predictions[, pos_label]
-  roc_train_lc <- roc(sub_train$eif4e_target, oob_probs_lc,
-                      levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
-  test_probs_lc <- predict(rf_lc, test_data[, feature_cols])$predictions[, pos_label]
-  roc_test_lc <- roc(test_data$eif4e_target, test_probs_lc,
-                     levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
-  data.frame(frac = frac, n_train = nrow(sub_train),
-             train_oob_auc = as.numeric(auc(roc_train_lc)),
-             test_auc = as.numeric(auc(roc_test_lc)))
-})
+# lc_results <- lapply(lc_fracs, function(frac) {
+#   if (frac < 1.0) {
+#     idx <- createDataPartition(train_data$eif4e_target, p = frac, list = FALSE)
+#     sub_train <- train_data[idx, ]
+#   } else {
+#     sub_train <- train_data
+#   }
+#   rf_lc <- ranger(x = sub_train[, feature_cols], y = sub_train$eif4e_target,
+#                   num.trees = 200, probability = TRUE, seed = 9)
+#   oob_probs_lc <- rf_lc$predictions[, pos_label]
+#   roc_train_lc <- roc(sub_train$eif4e_target, oob_probs_lc,
+#                       levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+#   test_probs_lc <- predict(rf_lc, test_data[, feature_cols])$predictions[, pos_label]
+#   roc_test_lc <- roc(test_data$eif4e_target, test_probs_lc,
+#                      levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+#   data.frame(frac = frac, n_train = nrow(sub_train),
+#              train_oob_auc = as.numeric(auc(roc_train_lc)),
+#              test_auc = as.numeric(auc(roc_test_lc)))
+# })
 
-lc_df <- bind_rows(lc_results)
+# lc_df <- bind_rows(lc_results)
 
-p_lc <- lc_df %>%
-  pivot_longer(c(train_oob_auc, test_auc), names_to = "set", values_to = "auc") %>%
-  mutate(set = recode(set, train_oob_auc = "Train (OOB)", test_auc = "Test")) %>%
-  ggplot(aes(x = n_train, y = auc, color = set, group = set)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 2.5) +
-  scale_color_manual(values = c("Train (OOB)" = "#E69F00", "Test" = "#0072B2")) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
-  theme_cowplot() +
-  labs(title = "Learning Curve", subtitle = paste0(gene_label, " target classifier"),
-       x = "Training Set Size", y = "AUC", color = NULL)
+# p_lc <- lc_df %>%
+#   pivot_longer(c(train_oob_auc, test_auc), names_to = "set", values_to = "auc") %>%
+#   mutate(set = recode(set, train_oob_auc = "Train (OOB)", test_auc = "Test")) %>%
+#   ggplot(aes(x = n_train, y = auc, color = set, group = set)) +
+#   geom_line(linewidth = 1) +
+#   geom_point(size = 2.5) +
+#   scale_color_manual(values = c("Train (OOB)" = "#E69F00", "Test" = "#0072B2")) +
+#   geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+#   theme_cowplot() +
+#   labs(title = "Learning Curve", subtitle = paste0(gene_label, " target classifier"),
+#        x = "Training Set Size", y = "AUC", color = NULL)
 
-print(p_lc)
+# print(p_lc)
 
-ggsave(here("plots", paste0("rf_classification_learning_curve_", suffix, ".pdf")),
-       plot = p_lc, width = 8, height = 5)
+# ggsave(here("plots", paste0("rf_classification_learning_curve_", suffix, ".pdf")),
+#        plot = p_lc, width = 8, height = 5)
 ```
 
 # Feature Importance
@@ -854,13 +867,13 @@ predictions_export <- data.frame(
 write_csv(predictions_export, file.path(output_dir, paste0("rf_classification_predictions_", suffix, ".csv")))
 
 # Permutation AUCs
-write_csv(data.frame(perm_auc = perm_aucs),
-          file.path(output_dir, paste0("rf_classification_permutation_aucs_", suffix, ".csv")))
+# write_csv(data.frame(perm_auc = perm_aucs),
+#           file.path(output_dir, paste0("rf_classification_permutation_aucs_", suffix, ".csv")))
 
 # Learning curve
-write_csv(lc_df, file.path(output_dir, paste0("rf_classification_learning_curve_", suffix, ".csv")))
+# write_csv(lc_df, file.path(output_dir, paste0("rf_classification_learning_curve_", suffix, ".csv")))
 
-cat("Exported: model RDS, importance CSV, performance CSV, CV results CSV, predictions CSV, permutation AUCs CSV, learning curve CSV\n")
+cat("Exported: model RDS, importance CSV, performance CSV, CV results CSV, predictions CSV\n")
 ```
 
 # Summary
@@ -981,22 +994,20 @@ cat("Significant (Wilcox BH p < 0.05):", sum(directionality$wilcox_p_adj < 0.05,
 
 ```{r plot_lollipop, fig.width=10, fig.height=10}
 category_colors <- c(
-  "Intrinsic mRNA features"  = "#3D9C60",
-  "eIF3/cap CLIP binding"    = "#E6A817",
-  "DAP5 regulation"          = "#D668C6",
-  "Literature signatures"    = "#4A7FC1",
-  "Translational efficiency" = "#E07030"
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1"
 )
 
 make_broad_category <- function(df) {
   df %>%
     mutate(
       broad_category = case_when(
-        category == "4E / DAP5"               ~ "DAP5 regulation",
-        category == "CLIP Binding"             ~ "eIF3/cap CLIP binding",
-        category == "Literature Signatures"    ~ "Literature signatures",
-        category == "Translational Efficiency" ~ "Translational efficiency",
-        TRUE                                   ~ "Intrinsic mRNA features"
+        category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+        category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+        category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+        TRUE                                                     ~ "Intrinsic mRNA features"
       ),
       broad_category = factor(broad_category, levels = names(category_colors)),
       signed_importance = importance * sign(correlation),
@@ -1020,9 +1031,9 @@ p_lollipop <- ggdotchart(
   rotate   = TRUE,
   dot.size = 4,
   xlab     = "",
-  ylab     = "Signed Importance (positive = higher in promotes_eif4e)",
-  title    = "Top 30 Features: Signed Importance + Directionality",
-  subtitle = paste0(gene_label, " | ", params$feature_set, " | AUC = ", round(as.numeric(auc_value), 3))
+  ylab     = "Signed Importance (positive = higher in promotes)",
+  title    = "Top 30 Features: Signed Importance",
+  subtitle = paste0(gene_label, " | Teleman RiboSeq | LFC -1")
 ) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
   theme(legend.title = element_blank())
@@ -1053,9 +1064,9 @@ p_lollipop_all <- ggdotchart(
   rotate   = TRUE,
   dot.size = 3,
   xlab     = "",
-  ylab     = "Signed Importance (positive = higher in promotes_eif4e)",
+  ylab     = "Signed Importance (positive = higher in promotes)",
   title    = paste0("All Features: Signed Importance (n = ", nrow(lollipop_all_data), ")"),
-  subtitle = paste0(gene_label, " | ", params$feature_set, " | AUC = ", round(as.numeric(auc_value), 3))
+  subtitle = paste0(gene_label, " | Teleman RiboSeq | LFC -1")
 ) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
   theme(legend.title = element_blank())

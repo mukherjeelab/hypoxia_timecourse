@@ -1,0 +1,323 @@
+---
+title: "RNA Secondary Structure Feature Extraction — CDS & 3'UTR (RNAplfold only)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Extends the RNA secondary structure feature set to the **CDS** and **3'UTR** using
+RNAplfold accessibility features only. Also removes the 5'UTR RNAfold features
+(MFE, ensemble, dot-bracket) that were added in `01d`.
+
+Reads `feature_matrix_external_stability.rds`, drops 5'UTR RNAfold columns, appends
+CDS and 3'UTR RNAplfold features, and writes back to the same file.
+
+## Features Added (6 per region)
+
+| Feature | Description |
+|---|---|
+| `struct_accessibility_start_proximal_cds` | Mean unpaired prob, positions 1–30 (start codon context) |
+| `struct_accessibility_stop_proximal_cds` | Mean unpaired prob, last 30 nt (stop codon context) |
+| `struct_accessibility_cds_mean` | Mean unpaired prob, full CDS |
+| `struct_accessibility_cds_min` | Minimum unpaired prob |
+| `struct_accessibility_cds_sd` | SD of unpaired prob |
+| `struct_num_structured_regions_cds` | Count of positions with 30-nt accessibility < 0.2 |
+
+3'UTR features use the same set with `_utr3` suffix; positional windows are
+`struct_accessibility_stop_proximal_utr3` (positions 1–30, proximal to stop codon)
+and `struct_accessibility_distal_utr3` (last 30 nt).
+
+## Features Removed (7)
+
+5'UTR RNAfold features dropped from model:
+`struct_mfe_utr5`, `struct_mfe_per_nt_utr5`, `struct_ensemble_free_energy`,
+`struct_ensemble_diversity`, `struct_frac_paired_utr5`, `struct_num_hairpins_utr5`,
+`struct_longest_stem_utr5`
+
+## Workflow
+
+**Section 1** generates FASTAs locally for cluster submission (run once).
+**Section 2** parses CDS RNAplfold output (run when CDS job is complete).
+**Section 3** parses 3'UTR RNAplfold output — skipped automatically if files not yet present.
+**Section 4** joins features, drops RNAfold columns, and exports.
+
+## Prerequisites
+
+RNAplfold output transferred from cluster to:
+- `accessories/plfold_output/rnaplfold_output/cds_rnaplfold_output/` (_lunp files)
+- `accessories/plfold_output/rnaplfold_output/utr3_rnaplfold_output/` (_lunp files, when ready)
+
+Cluster commands (bodhi: `/beevol/home/matlinka/timecourse/viennarna/`):
+```
+sbatch cluster_scripts/viennarna/02b_run_rnaplfold_cds_utr3.bsub
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+```
+
+---
+
+# Section 1: Extract Sequences and Write FASTAs for Cluster
+
+```{r load_feature_matrix}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+cat("Feature matrix loaded:", nrow(feature_matrix), "genes x", ncol(feature_matrix), "columns\n")
+
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Target transcripts:", length(keep_tx), "\n")
+```
+
+```{r load_txdb}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+cat("TxDb and genome loaded\n")
+```
+
+```{r extract_cds_sequences}
+cds_all      <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all <- extractTranscriptSeqs(genome, cds_all)
+cat("Total CDS sequences in TxDb:", length(cds_seqs_all), "\n")
+
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+keep_idx        <- cds_names_clean %in% keep_tx
+cds_seqs        <- cds_seqs_all[keep_idx]
+names(cds_seqs) <- cds_names_clean[keep_idx]
+cat("CDS sequences matching feature matrix:", length(cds_seqs), "\n")
+
+cat("\nCDS length summary:\n")
+print(summary(as.integer(width(cds_seqs))))
+```
+
+```{r extract_utr3_sequences}
+utr3_all      <- threeUTRsByTranscript(txdb, use.names = TRUE)
+utr3_seqs_all <- extractTranscriptSeqs(genome, utr3_all)
+cat("Total 3'UTR sequences in TxDb:", length(utr3_seqs_all), "\n")
+
+utr3_names_clean <- sub("\\..*", "", names(utr3_seqs_all))
+keep_idx_utr3    <- utr3_names_clean %in% keep_tx
+utr3_seqs        <- utr3_seqs_all[keep_idx_utr3]
+names(utr3_seqs) <- utr3_names_clean[keep_idx_utr3]
+cat("3'UTR sequences matching feature matrix:", length(utr3_seqs), "\n")
+
+n_no_utr3 <- sum(!keep_tx %in% names(utr3_seqs))
+cat("Transcripts without annotated 3'UTR:", n_no_utr3,
+    sprintf("(%.1f%%)\n", 100 * n_no_utr3 / length(keep_tx)))
+```
+
+```{r write_fastas}
+dir.create(here("accessories", "plfold_output", "cds"),  showWarnings = FALSE, recursive = TRUE)
+dir.create(here("accessories", "plfold_output", "utr3"), showWarnings = FALSE, recursive = TRUE)
+
+cds_fa_path <- here("accessories", "plfold_output", "cds", "sequences.fa")
+writeXStringSet(cds_seqs, filepath = cds_fa_path)
+cat("Written:", cds_fa_path, "(", length(cds_seqs), "sequences)\n")
+
+utr3_fa_path <- here("accessories", "plfold_output", "utr3", "sequences.fa")
+writeXStringSet(utr3_seqs, filepath = utr3_fa_path)
+cat("Written:", utr3_fa_path, "(", length(utr3_seqs), "sequences)\n")
+```
+
+---
+
+# Parsing Function
+
+```{r define_parser}
+parse_lunp <- function(filepath) {
+  lines      <- readLines(filepath)
+  header_end <- max(which(str_starts(lines, "#")))
+  data_lines <- lines[(header_end + 1):length(lines)]
+  data_lines <- data_lines[nzchar(trimws(data_lines))]
+
+  if (length(data_lines) == 0) return(NULL)
+
+  df     <- read.table(text = data_lines, header = FALSE, sep = "\t", fill = TRUE)
+  n_cols <- ncol(df)
+
+  result <- data.frame(
+    position          = df[[1]],
+    unpaired_prob_1nt = df[[2]]
+  )
+
+  result$unpaired_prob_30nt <- if (n_cols >= 31) df[[31]] else df[[n_cols]]
+
+  return(result)
+}
+```
+
+---
+
+# Section 2: Parse RNAplfold — CDS
+
+```{r parse_plfold_cds}
+plfold_dir_cds <- here("accessories", "plfold_output", "rnaplfold_output", "cds_rnaplfold_output")
+stopifnot("CDS RNAplfold output not found" = dir.exists(plfold_dir_cds))
+
+plfold_files_cds <- list.files(plfold_dir_cds, pattern = "_lunp$", full.names = TRUE)
+cat("CDS RNAplfold _lunp files found:", length(plfold_files_cds), "\n")
+
+plfold_cds_features <- lapply(plfold_files_cds, function(f) {
+  tx_id  <- sub("_lunp$", "", basename(f))
+  parsed <- parse_lunp(f)
+  if (is.null(parsed)) return(NULL)
+
+  seq_len    <- nrow(parsed)
+  cap_range  <- 1:min(30, seq_len)
+  stop_range <- max(1, seq_len - 29):seq_len
+
+  acc_vals <- parsed$unpaired_prob_1nt
+  acc_vals[is.na(acc_vals)] <- 0
+
+  acc_30nt       <- parsed$unpaired_prob_30nt
+  acc_30nt[is.na(acc_30nt)] <- 0
+  num_structured <- sum(acc_30nt < 0.2, na.rm = TRUE)
+
+  tibble(
+    transcript_id_clean                     = tx_id,
+    struct_accessibility_start_proximal_cds = mean(acc_vals[cap_range],  na.rm = TRUE),
+    struct_accessibility_stop_proximal_cds  = mean(acc_vals[stop_range], na.rm = TRUE),
+    struct_accessibility_cds_mean           = mean(acc_vals, na.rm = TRUE),
+    struct_accessibility_cds_min            = min(acc_vals,  na.rm = TRUE),
+    struct_accessibility_cds_sd             = sd(acc_vals,   na.rm = TRUE),
+    struct_num_structured_regions_cds       = num_structured
+  )
+})
+
+plfold_cds_df <- bind_rows(plfold_cds_features)
+cat("CDS features computed for", nrow(plfold_cds_df), "transcripts\n")
+
+cat("\nAccessibility mean (CDS):\n")
+print(summary(plfold_cds_df$struct_accessibility_cds_mean))
+```
+
+---
+
+# Section 3: Parse RNAplfold — 3'UTR
+
+```{r parse_plfold_utr3}
+plfold_dir_utr3   <- here("accessories", "plfold_output", "rnaplfold_output", "utr3_rnaplfold_output")
+plfold_files_utr3 <- if (dir.exists(plfold_dir_utr3)) {
+  list.files(plfold_dir_utr3, pattern = "_lunp$", full.names = TRUE)
+} else {
+  character(0)
+}
+
+if (length(plfold_files_utr3) == 0) {
+  cat("3'UTR RNAplfold output not yet available — skipping.\n")
+  plfold_utr3_df <- NULL
+} else {
+  cat("3'UTR RNAplfold _lunp files found:", length(plfold_files_utr3), "\n")
+
+  plfold_utr3_features <- lapply(plfold_files_utr3, function(f) {
+    tx_id  <- sub("_lunp$", "", basename(f))
+    parsed <- parse_lunp(f)
+    if (is.null(parsed)) return(NULL)
+
+    seq_len    <- nrow(parsed)
+    stop_range <- 1:min(30, seq_len)
+    dist_range <- max(1, seq_len - 29):seq_len
+
+    acc_vals <- parsed$unpaired_prob_1nt
+    acc_vals[is.na(acc_vals)] <- 0
+
+    acc_30nt       <- parsed$unpaired_prob_30nt
+    acc_30nt[is.na(acc_30nt)] <- 0
+    num_structured <- sum(acc_30nt < 0.2, na.rm = TRUE)
+
+    tibble(
+      transcript_id_clean                     = tx_id,
+      struct_accessibility_stop_proximal_utr3 = mean(acc_vals[stop_range], na.rm = TRUE),
+      struct_accessibility_distal_utr3        = mean(acc_vals[dist_range], na.rm = TRUE),
+      struct_accessibility_utr3_mean          = mean(acc_vals, na.rm = TRUE),
+      struct_accessibility_utr3_min           = min(acc_vals,  na.rm = TRUE),
+      struct_accessibility_utr3_sd            = sd(acc_vals,   na.rm = TRUE),
+      struct_num_structured_regions_utr3      = num_structured
+    )
+  })
+
+  plfold_utr3_df <- bind_rows(plfold_utr3_features)
+  cat("3'UTR features computed for", nrow(plfold_utr3_df), "transcripts\n")
+
+  cat("\nAccessibility mean (3'UTR):\n")
+  print(summary(plfold_utr3_df$struct_accessibility_utr3_mean))
+}
+```
+
+---
+
+# Section 4: Join to Feature Matrix and Export
+
+```{r drop_rnafold_cols}
+# Remove 5'UTR RNAfold features (dropped from model)
+utr5_rnafold_cols <- c(
+  "struct_mfe_utr5", "struct_mfe_per_nt_utr5", "struct_ensemble_free_energy",
+  "struct_ensemble_diversity", "struct_frac_paired_utr5",
+  "struct_num_hairpins_utr5", "struct_longest_stem_utr5"
+)
+cols_to_drop <- intersect(utr5_rnafold_cols, names(feature_matrix))
+cat("Dropping", length(cols_to_drop), "5'UTR RNAfold columns:", paste(cols_to_drop, collapse = ", "), "\n")
+
+fm_new <- feature_matrix %>% dplyr::select(-all_of(cols_to_drop))
+```
+
+```{r join_cds}
+cds_cols <- names(plfold_cds_df)[names(plfold_cds_df) != "transcript_id_clean"]
+
+fm_new <- fm_new %>%
+  left_join(plfold_cds_df, by = "transcript_id_clean") %>%
+  mutate(across(all_of(cds_cols), ~replace_na(., 0)))
+
+n_with_cds <- sum(feature_matrix$transcript_id_clean %in% plfold_cds_df$transcript_id_clean)
+cat("CDS structure coverage:", n_with_cds, "/", nrow(feature_matrix), "\n")
+cat("CDS features added:", length(cds_cols), "\n")
+```
+
+```{r join_utr3}
+if (!is.null(plfold_utr3_df)) {
+  utr3_cols <- names(plfold_utr3_df)[names(plfold_utr3_df) != "transcript_id_clean"]
+
+  fm_new <- fm_new %>%
+    left_join(plfold_utr3_df, by = "transcript_id_clean") %>%
+    mutate(across(all_of(utr3_cols), ~replace_na(., 0)))
+
+  n_with_utr3 <- sum(feature_matrix$transcript_id_clean %in% plfold_utr3_df$transcript_id_clean)
+  cat("3'UTR structure coverage:", n_with_utr3, "/", nrow(feature_matrix), "\n")
+  cat("3'UTR features added:", length(utr3_cols), "\n")
+} else {
+  cat("3'UTR features not yet added — re-run after cluster job completes.\n")
+}
+```
+
+```{r export}
+cat("\nFinal matrix:", nrow(fm_new), "genes x", ncol(fm_new), "columns\n")
+cat("(was:", nrow(feature_matrix), "x", ncol(feature_matrix), ")\n")
+
+saveRDS(fm_new, here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Saved: output/predictive_modeling/feature_matrix_external_stability.rds\n")
+```
+
+---
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

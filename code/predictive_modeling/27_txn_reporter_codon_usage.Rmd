@@ -1,0 +1,394 @@
+---
+title: "Notebook 27: TXN Reporter — Codon & Amino Acid Usage"
+output: html_document
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(iCodon)
+```
+
+# Overview
+
+Analyzes codon and amino acid composition of the TXN coding sequence (most abundant
+transcript, consistent with the RF feature extraction pipeline) in the context of
+eIF3d-mediated translational regulation.
+
+# Configuration
+
+```{r config}
+# --- Change this to analyze a different gene ---
+query_gene <- "TXN"
+# -----------------------------------------------
+```
+
+# Section 1: Extract CDS for Most Abundant Transcript
+
+```{r load-transcript}
+# Load precomputed most-abundant transcript mapping (same as used in feature extraction)
+most_abundant_tx <- readRDS(
+  here("output", "predictive_modeling", "precomputed_most_abundant_tx.rds")
+)
+
+tx_row <- most_abundant_tx %>% filter(symbol == query_gene)
+if (nrow(tx_row) == 0) stop("Gene not found in most_abundant_tx: ", query_gene)
+
+tx_id_clean <- tx_row$transcript_id_clean
+gene_id     <- tx_row$gene_id_clean
+
+cat("Gene:         ", query_gene, "\n")
+cat("Gene ID:      ", gene_id, "\n")
+cat("Transcript:   ", tx_id_clean, "\n")
+cat("Total abundance (sum TPM):", round(tx_row$total_abundance, 1), "\n")
+```
+
+```{r extract-cds}
+# Load TxDb and genome (same as 01_feature_extraction.Rmd)
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# Extract all CDS by transcript
+cds_all <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+# Match TXN transcript (strip version from TxDb IDs)
+cds_names_clean <- str_remove(names(cds_all), "\\..*")
+tx_match        <- which(cds_names_clean == tx_id_clean)
+
+if (length(tx_match) == 0) stop("Transcript not found in TxDb: ", tx_id_clean)
+cat("Matched TxDb entry:", names(cds_all)[tx_match], "\n")
+
+# Extract CDS sequence
+cds_seq <- extractTranscriptSeqs(genome, cds_all[tx_match])[[1]]
+
+cds_len     <- length(cds_seq)
+n_codons    <- cds_len / 3
+
+cat("\nCDS length:  ", cds_len, "nt\n")
+cat("Codons:      ", floor(n_codons), "(includes stop)\n")
+cat("Divisible by 3:", cds_len %% 3 == 0, "\n")
+if (cds_len %% 3 != 0) warning("CDS length not divisible by 3!")
+
+cat("\nCDS sequence (first 60 nt):", as.character(subseq(cds_seq, 1, min(60, cds_len))), "...\n")
+```
+
+# Section 2: Amino Acid Composition
+
+```{r translate}
+# Translate CDS
+aa_seq    <- translate(cds_seq)
+aa_string <- as.character(aa_seq)[[1]]          # force to plain string
+aa_chars  <- strsplit(aa_string, "")[[1]]
+aa_chars  <- aa_chars[aa_chars != "*"]
+
+cat("Protein length:", length(aa_chars), "aa (excl. stop)\n")
+cat("Sequence:", aa_string, "\n")
+
+aa_counts <- tibble(aa = aa_chars) %>%
+  dplyr::count(aa, name = "count") %>%
+  mutate(pct = round(100 * count / sum(count), 1))
+
+# Biochemical property groupings
+aa_properties <- c(
+  # Nonpolar/hydrophobic
+  A = "Nonpolar", V = "Nonpolar", I = "Nonpolar", L = "Nonpolar",
+  M = "Nonpolar", F = "Nonpolar", W = "Nonpolar", P = "Nonpolar",
+  # Polar uncharged
+  G = "Polar",    S = "Polar",    T = "Polar",     C = "Polar",
+  Y = "Polar",    N = "Polar",    Q = "Polar",
+  # Positively charged
+  K = "Positive", R = "Positive", H = "Positive",
+  # Negatively charged
+  D = "Negative", E = "Negative"
+)
+
+property_colors <- c(
+  Nonpolar = "grey60",
+  Polar    = "#009E73",
+  Positive = "#0072B2",
+  Negative = "#D55E00"
+)
+
+aa_counts <- aa_counts %>%
+  mutate(
+    property = aa_properties[aa],
+    aa = fct_reorder(aa, count, .desc = TRUE)
+  )
+
+cat("\nAmino acid composition:\n")
+aa_counts %>% arrange(desc(count)) %>% print(n = 20)
+```
+
+```{r aa-plot, fig.width=9, fig.height=5}
+ggplot(aa_counts, aes(x = aa, y = count, fill = property)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.4, size = 3) +
+  scale_fill_manual(values = property_colors, name = "Property") +
+  labs(
+    x     = "Amino acid",
+    y     = "Count",
+    title = paste0(query_gene, " — Amino acid composition"),
+    subtitle = paste0(length(aa_chars), " residues (", cds_len, " nt CDS, most abundant transcript: ", tx_id_clean, ")")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave(here(paste0("output/27_", query_gene, "_aa_composition.pdf")), width = 9, height = 5)
+```
+
+# Section 3: Codon Usage Table
+
+```{r codon-usage}
+# Build codon table for TXN
+cds_ss  <- DNAStringSet(cds_seq)
+names(cds_ss) <- query_gene
+ct_txn  <- codonTable(cds_ss)
+counts_64 <- codonCounts(ct_txn)[1, ]  # named vector: codon -> count
+
+# Standard genetic code: codon -> amino acid
+gc <- getGeneticCode("SGC0")   # standard code, DNA codons
+
+# Build codon usage data frame
+codon_df <- tibble(
+  codon = names(counts_64),
+  count = as.integer(counts_64)
+) %>%
+  mutate(
+    aa = gc[codon],
+    aa = if_else(aa == "*", "Stop", aa)
+  ) %>%
+  filter(aa != "Stop") %>%
+  group_by(aa) %>%
+  mutate(
+    pct_within_aa = round(100 * count / sum(count), 1),
+    is_dominant   = count == max(count) & count > 0
+  ) %>%
+  ungroup() %>%
+  arrange(aa, desc(count))
+
+cat("Codon usage table for", query_gene, ":\n")
+codon_df %>% filter(count > 0) %>% print(n = 60)
+```
+
+```{r codon-usage-plot, fig.width=11, fig.height=9}
+# Heatmap-style: amino acid on y, codons on x, fill = pct within AA
+# Only show AAs that appear in TXN
+used_aas <- codon_df %>% filter(count > 0) %>% pull(aa) %>% unique()
+
+plot_df <- codon_df %>%
+  filter(aa %in% used_aas) %>%
+  mutate(
+    aa = factor(aa),
+    label = if_else(count > 0, as.character(count), "")
+  )
+
+ggplot(plot_df, aes(x = codon, y = fct_rev(aa), fill = pct_within_aa)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = label), size = 2.8) +
+  geom_tile(data = filter(plot_df, is_dominant & count > 0),
+            color = "#E69F00", fill = NA, linewidth = 1.1) +
+  scale_fill_gradient(low = "white", high = "#0072B2",
+                      name = "% within AA", na.value = "grey95") +
+  labs(
+    x     = "Codon",
+    y     = "Amino acid",
+    title = paste0(query_gene, " — Codon usage (% within synonymous family)"),
+    subtitle = "Orange border = most-used codon per AA in TXN; numbers = raw counts"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, family = "mono", size = 8),
+    panel.grid   = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(here(paste0("output/27_", query_gene, "_codon_usage_heatmap.pdf")), width = 11, height = 9)
+```
+
+# Section 4: Position-Specific Codon Optimality (tAI)
+
+```{r tai-weights}
+# Build per-codon tAI weights using the exact same logic as 01g
+trna_gcn <- read_csv(here("accessories", "human", "human_trna_gcn.csv"),
+                     comment = "#", show_col_types = FALSE)
+cat("tRNA GCN table:", nrow(trna_gcn), "rows\n")
+
+# All 64 codons
+all_codons  <- names(getGeneticCode("SGC0"))
+sense_codons <- all_codons[getGeneticCode("SGC0") != "*"]
+
+# Decode anticodon → codons recognized + wobble penalties (eukaryotic rules)
+decode_anticodon <- function(ac) {
+  x1 <- substr(ac, 1, 1); x2 <- substr(ac, 2, 2); x3 <- substr(ac, 3, 3)
+  wc <- c(A = "T", T = "A", G = "C", C = "G")
+  y1 <- wc[x3]; y2 <- wc[x2]
+  if (x1 == "A") {
+    y3 <- c("T", "C", "A"); svs <- c(0, 0, 0)
+  } else if (x1 == "G") {
+    y3 <- c("C", "T");      svs <- c(0, 0.41)
+  } else if (x1 == "C") {
+    y3 <- "G";              svs <- 0
+  } else {  # T
+    y3 <- "A";              svs <- 0
+  }
+  data.frame(codon = paste0(y1, y2, y3), s = svs, stringsAsFactors = FALSE)
+}
+
+ws_tai <- setNames(rep(0, 64), all_codons)
+
+for (i in seq_len(nrow(trna_gcn))) {
+  ac  <- trna_gcn$anticodon[i]
+  aa  <- trna_gcn$amino_acid[i]
+  gcn <- trna_gcn$gcn[i]
+  decoded <- decode_anticodon(ac)
+  for (j in seq_len(nrow(decoded))) {
+    codon <- decoded$codon[j]; s_val <- decoded$s[j]
+    if (!codon %in% all_codons) next
+    if (getGeneticCode("SGC0")[codon] != aa) next
+    ws_tai[codon] <- ws_tai[codon] + (1 - s_val) * gcn
+  }
+}
+
+w_tai <- ws_tai / max(ws_tai[sense_codons])
+cat("w_tai built. Range:", round(range(w_tai[sense_codons]), 4), "\n")
+```
+
+```{r positional-tai, fig.width=10, fig.height=5}
+# Split CDS into codons (exclude stop)
+cds_char   <- as.character(cds_seq)
+codon_pos  <- seq(1, cds_len - 2, by = 3)
+codons_vec <- sapply(codon_pos, function(i) substr(cds_char, i, i + 2))
+codons_vec <- codons_vec[codons_vec %in% sense_codons]  # drop stop if any
+
+positional_df <- tibble(
+  position = seq_along(codons_vec),
+  codon    = codons_vec,
+  tai_w    = w_tai[codons_vec],
+  aa       = gc[codons_vec]
+)
+
+cat("Codons analyzed:", nrow(positional_df), "\n")
+cat("Mean tAI weight:", round(mean(positional_df$tai_w, na.rm = TRUE), 4), "\n")
+
+ggplot(positional_df, aes(x = position, y = tai_w)) +
+  geom_point(alpha = 0.4, size = 1.5, color = "grey50") +
+  geom_smooth(method = "loess", span = 0.2, se = TRUE,
+              color = "#0072B2", fill = "#0072B2", alpha = 0.15, linewidth = 1) +
+  geom_hline(yintercept = mean(positional_df$tai_w, na.rm = TRUE),
+             linetype = "dashed", color = "grey40") +
+  annotate("text", x = nrow(positional_df) * 0.98,
+           y = mean(positional_df$tai_w, na.rm = TRUE) + 0.02,
+           label = paste0("mean = ", round(mean(positional_df$tai_w, na.rm = TRUE), 3)),
+           hjust = 1, size = 3.5, color = "grey40") +
+  scale_x_continuous(
+    breaks = c(1, round(nrow(positional_df) / 2), nrow(positional_df)),
+    labels = c("5' start", "mid", "3' end")
+  ) +
+  labs(
+    x     = "Codon position",
+    y     = "tAI weight",
+    title = paste0(query_gene, " — Position-specific tAI weights"),
+    subtitle = "Each point = one codon; blue line = loess smooth (span 0.2); dashed = CDS mean"
+  ) +
+  theme_classic(base_size = 12)
+
+ggsave(here(paste0("output/27_", query_gene, "_positional_tai.pdf")), width = 10, height = 5)
+```
+
+# Section 5: Genome-Wide Context (TXN vs Background)
+
+```{r load-background}
+# Load feature matrix with CAI, tAI, CSC, FOP
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Feature matrix:", nrow(fm), "genes\n")
+
+# Load eIF3d-promoted gene set
+gs_3d <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                   show_col_types = FALSE)
+
+# TXN gene ID
+txn_gene_id <- gene_id  # from Section 1
+
+# Annotate
+score_df <- fm %>%
+  dplyr::select(gene_id_clean, symbol, cai, tai, csc, fop) %>%
+  mutate(
+    group = case_when(
+      gene_id_clean %in% gs_3d$ensembl_gene ~ "eIF3d promoted",
+      TRUE                                  ~ "All other genes"
+    ),
+    is_txn = gene_id_clean == txn_gene_id
+  )
+
+txn_scores <- score_df %>% filter(is_txn)
+cat("\n", query_gene, "scores:\n")
+txn_scores %>% dplyr::select(symbol, cai, tai, csc, fop) %>%
+  mutate(across(c(cai, tai, csc, fop), ~ round(.x, 4))) %>%
+  print()
+
+# Percentile of TXN within eIF3d-promoted genes
+eif3d_scores <- score_df %>% filter(group == "eIF3d promoted")
+cat("\nPercentile of", query_gene, "within eIF3d-promoted genes:\n")
+for (s in c("cai", "tai", "csc", "fop")) {
+  pct <- round(100 * mean(eif3d_scores[[s]] <= txn_scores[[s]][1], na.rm = TRUE), 1)
+  cat(sprintf("  %-4s: %.1f%%\n", s, pct))
+}
+```
+
+```{r context-density-plots, fig.width=11, fig.height=9}
+scores_long <- score_df %>%
+  filter(!is_txn) %>%
+  pivot_longer(c(cai, tai, csc, fop), names_to = "score", values_to = "value")
+
+txn_long <- txn_scores %>%
+  pivot_longer(c(cai, tai, csc, fop), names_to = "score", values_to = "value")
+
+score_labels <- c(
+  cai = "CAI — Codon Adaptive Index",
+  tai = "tAI — tRNA Adaptation Index",
+  csc = "CSC — Codon Stabilisation Coefficient",
+  fop = "FOP — Frequency of Optimal Codons"
+)
+
+ggplot(scores_long, aes(x = value, color = group, fill = group)) +
+  geom_density(alpha = 0.2, linewidth = 0.7) +
+  geom_vline(data = txn_long,
+             aes(xintercept = value),
+             color = "#CC79A7", linewidth = 1.2, linetype = "solid") +
+  geom_text(data = txn_long,
+            aes(x = value, y = Inf, label = paste0(" ", query_gene)),
+            color = "#CC79A7", angle = 90, hjust = 1.2, vjust = -0.3,
+            size = 3.5, inherit.aes = FALSE) +
+  scale_color_manual(values = c("All other genes" = "grey50", "eIF3d promoted" = "#E69F00"),
+                     name = NULL) +
+  scale_fill_manual(values  = c("All other genes" = "grey50", "eIF3d promoted" = "#E69F00"),
+                    name = NULL) +
+  facet_wrap(~ score, scales = "free", labeller = labeller(score = score_labels)) +
+  labs(
+    x     = "Score",
+    y     = "Density",
+    title = paste0(query_gene, " codon optimality scores in genome-wide context"),
+    subtitle = "Orange = eIF3d-promoted (1hr hypoxia, LFC>0.5) | Pink line = TXN"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", strip.background = element_blank())
+
+ggsave(here(paste0("output/27_", query_gene, "_codon_scores_context.pdf")), width = 11, height = 9)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
