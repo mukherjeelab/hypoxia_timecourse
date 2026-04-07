@@ -1,0 +1,770 @@
+---
+title: "`r paste0('Random Forest Regression: TE LFC Prediction (', tools::toTitleCase(params$condition), ', ', params$timepoint, ', ', params$feature_set, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  timepoint: "1hr"
+  feature_set: "external_stability"
+  clip_mode: "aggregate"
+  exclude_4e_features: false
+  exclude_own_te_features: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# Defaults for interactive use (overwritten by YAML params when knitting)
+#
+# Predict continuous TE LFC (si3d vs sictrl) from mRNA sequence features.
+# All genes in the feature matrix with non-NA te_lfc are used as the training set.
+#
+# --- COMMON SETUPS ---
+#
+# eIF3d hypoxia 1hr with external stability features:
+#   condition="hypoxia", timepoint="1hr", feature_set="external_stability"
+#
+# eIF3d normoxia with clip_split features:
+#   condition="normoxia", timepoint="normoxia", feature_set="clip_split"
+#
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    condition   = "hypoxia",             # "hypoxia" | "normoxia"
+    timepoint   = "1hr",                 # "1hr" | "4hr" | "24hr" | "normoxia" | etc.
+                                         # Used to select timepoint-specific feature matrices
+                                         # (clip_split, structure) and output file naming
+    feature_set = "external_stability",  # "external_stability" — mRNA stability features
+                                         # "targeted"          — biological + lengths + GC + ORFquant + lit sigs
+                                         # "combined"          — all features (baseline)
+                                         # "structure"         — targeted + RNA secondary structure
+                                         # "clip_split"        — structure + split CLIP (eIF3 vs cap-binding)
+                                         # "te_lfc"            — clip_split + sictrl TE LFCs + delta TE
+                                         # "codon_optimality"  — te_lfc + CAI, tAI, CSC scores
+                                         # "kozak"             — Kozak-focused features
+                                         # "cnot3"             — CNOT3-focused features
+    clip_mode   = "aggregate",           # "aggregate" | "individual" | "both"
+    exclude_4e_features     = FALSE,     # TRUE = remove eIF4E circular features
+    exclude_own_te_features = TRUE       # TRUE = remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
+                                         # recommended: these are correlated with the outcome
+  )
+}
+
+# Feature matrix selection (same logic as nb07)
+feature_matrix_rds <- if (params$feature_set == "te_lfc") {
+  "feature_matrix_te_lfc.rds"
+} else if (params$feature_set == "codon_optimality") {
+  "feature_matrix_codon_optimality.rds"
+} else if (params$feature_set == "kozak") {
+  "feature_matrix_kozak.rds"
+} else if (params$feature_set == "cnot3") {
+  "feature_matrix_cnot3.rds"
+} else if (params$feature_set == "external_stability") {
+  "feature_matrix_external_stability.rds"
+} else if (params$feature_set == "clip_split") {
+  paste0("feature_matrix_", params$timepoint, "_clip_split.rds")
+} else if (params$feature_set == "structure") {
+  paste0("feature_matrix_", params$timepoint, "_structure.rds")
+} else {
+  paste0("feature_matrix_", params$timepoint, "_combined.rds")
+}
+
+# Outcome CSV: si3d vs sictrl TE LFC for all genes (positive = promoted by eIF3d)
+te_lfc_csv <- paste0("translation_categories_si3d_vs_sictrl_",
+                     params$condition, "_", params$timepoint, ".csv")
+
+suffix <- paste0(params$condition, "_", params$timepoint,
+                 "_", params$feature_set, "_clip", params$clip_mode, "_regression",
+                 if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
+                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
+
+cat("Feature matrix:", feature_matrix_rds, "\n")
+cat("Outcome CSV:", te_lfc_csv, "\n")
+cat("Output suffix:", suffix, "\n")
+```
+
+# Overview
+
+Random forest regression predicting **continuous TE LFC** (si3d vs sictrl; positive = promoted by eIF3d) from mRNA sequence features. The outcome is loaded from the full `translation_categories_si3d_vs_sictrl_{condition}_{timepoint}.csv` (all genes, no LFC threshold), then joined to the feature matrix. The feature matrix's own `te_lfc` column (hypoxia vs normoxia response) is excluded from features. No class balancing.
+
+## Parameters
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `condition` | `"hypoxia"`, `"normoxia"` | Experimental condition (used for output naming) |
+| `timepoint` | `"1hr"`, `"4hr"`, `"normoxia"`, etc. | Timepoint; used to select timepoint-specific feature matrices and for output naming |
+| `feature_set` | `"external_stability"`, `"targeted"`, `"combined"`, `"structure"`, `"clip_split"`, `"te_lfc"`, `"codon_optimality"` | Feature matrix to use |
+| `clip_mode` | `"aggregate"`, `"individual"`, `"both"` | Which CLIP features to include |
+| `exclude_4e_features` | `TRUE`/`FALSE` | Remove eIF4E circular features |
+| `exclude_own_te_features` | `TRUE`/`FALSE` | Remove own-data TE features (`indiv_te_*`, `delta_te_*`, `sig_*`) — recommended since these correlate with outcome |
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(cowplot)
+library(ggpubr)
+```
+
+# Load Data
+
+```{r load_data}
+# Feature matrix — drop te_lfc/te_padj/te_lfc_bin (hypoxia vs normoxia columns, not the outcome)
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds)) %>%
+  dplyr::select(-any_of(c("te_lfc", "te_padj", "te_lfc_bin")))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+# Outcome: si3d vs sictrl TE LFC for all genes (positive = promoted by eIF3d)
+te_lfc_data <- read_csv(here("output", te_lfc_csv), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::select(gene_id_clean, outcome = te_lfc, outcome_padj = te_padj)
+
+cat("Outcome file:", nrow(te_lfc_data), "genes\n")
+cat("Genes with non-NA outcome:", sum(!is.na(te_lfc_data$outcome)), "\n")
+```
+
+# Define Outcome Variable
+
+```{r create_outcome}
+# Join si3d vs sictrl TE LFC onto feature matrix; keep all genes with both feature data and outcome
+model_genes <- features %>%
+  inner_join(te_lfc_data, by = "gene_id_clean") %>%
+  filter(!is.na(outcome))
+
+cat("Genes in model (feature matrix ∩ outcome data):", nrow(model_genes), "\n")
+cat("Outcome (TE LFC, si3d vs sictrl) summary:\n")
+print(summary(model_genes$outcome))
+
+# Sanity check: promoted and decreased by eIF3d (LFC > 0.5 or < -0.5, padj < 0.05)
+n_promoted  <- sum(model_genes$outcome >  0.5 & model_genes$outcome_padj < 0.05, na.rm = TRUE)
+n_decreased <- sum(model_genes$outcome < -0.5 & model_genes$outcome_padj < 0.05, na.rm = TRUE)
+n_total     <- nrow(model_genes)
+cat("\nSanity check:\n")
+cat("  Promoted by eIF3d  (LFC >  0.5, padj < 0.05):", n_promoted,  "/", n_total,
+    sprintf("(%.1f%%)\n", 100 * n_promoted  / n_total))
+cat("  Decreased by eIF3d (LFC < -0.5, padj < 0.05):", n_decreased, "/", n_total,
+    sprintf("(%.1f%%)\n", 100 * n_decreased / n_total))
+```
+
+# Preprocessing
+
+## Filter Features
+
+```{r filter_features}
+# Identify feature columns (exclude ID/metadata/outcome cols)
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "outcome", "outcome_padj", "te_lfc", "te_padj", "te_lfc_bin",
+             "eif3d_target", "category")
+all_cols <- colnames(model_genes)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols <- unique(c(id_cols, id_pattern_cols))
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count (all combined):", length(feature_cols), "\n")
+
+# ---- CLIP feature mode ----
+if (params$clip_mode == "aggregate") {
+  aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                           "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                           "clip_lee_glu_vs_cm_enrichment")
+  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+  feature_cols <- setdiff(feature_cols, regional_clip)
+  cat("CLIP mode: aggregate — using aggregate CLIP counts only, dropped", length(regional_clip), "regional features\n")
+} else if (params$clip_mode == "individual") {
+  feature_cols <- setdiff(feature_cols, c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                                          "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                                          "clip_lee_glu_vs_cm_enrichment"))
+  cat("CLIP mode: individual — using regional binary features, dropped aggregate CLIP counts\n")
+} else {
+  cat("CLIP mode: both — using all CLIP features\n")
+}
+
+# Remove k-mer and RBP motif columns (same as nb07 targeted mode logic)
+if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality", "kozak", "cnot3", "external_stability")) {
+  kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+  excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
+  feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+  cat("Targeted mode: removed", length(excluded), "k-mer/motif columns\n")
+}
+
+# Optionally remove circular eIF4E features
+if (isTRUE(params$exclude_4e_features)) {
+  circular_regex <- "^4e_resistance|^eif4e_ip"
+  circular_lit_exact <- c(
+    "lit_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_suppressed_translation",
+    "lit_translation_is_sensitive_to_4E_inhibition",
+    "lit_translation_is_resistant_to_4E_inhibition"
+  )
+  circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) |
+                                feature_cols %in% circular_lit_exact]
+  if (length(circular_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, circular_cols)
+    cat("Removed", length(circular_cols), "circular eIF4E features\n")
+  }
+}
+
+# Optionally remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
+if (isTRUE(params$exclude_own_te_features)) {
+  own_te_cols <- feature_cols[str_detect(feature_cols, "^indiv_te_|^delta_te_|^sig_")]
+  if (length(own_te_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, own_te_cols)
+    cat("Removed", length(own_te_cols),
+        "own-data TE features (indiv_te_*, delta_te_*, sig_*)\n")
+  }
+}
+
+# Drop features with < 50% non-NA values — sparse features inflate impurity importance
+# via median imputation creating a spurious split between real vs imputed values
+sparsity_threshold <- 0.5
+sparse_cols <- feature_cols[
+  sapply(feature_cols, function(f) mean(!is.na(model_genes[[f]])) < sparsity_threshold)
+]
+if (length(sparse_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, sparse_cols)
+  cat("Removed", length(sparse_cols), "features with <",
+      sparsity_threshold * 100, "% non-NA values:\n")
+  cat(paste(" ", sparse_cols, collapse = "\n"), "\n")
+}
+
+cat("Feature count after filtering:", length(feature_cols), "\n")
+```
+
+## Median-Impute Missing Values
+
+```{r impute_missing}
+missing_counts <- model_genes %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+cat("Features with missing values:", nrow(missing_counts), "\n")
+if (nrow(missing_counts) > 0) print(missing_counts)
+cat("(Imputation deferred to after train/test split — medians computed from training set only)\n")
+```
+
+# Prepare Modeling Data
+
+```{r prepare_data}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, outcome, all_of(feature_cols))
+
+cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+cat("\nOutcome distribution:\n")
+print(summary(model_data$outcome))
+```
+
+# Train/Test Split
+
+```{r train_test_split}
+set.seed(9)
+
+# createDataPartition bins continuous outcomes for approximately balanced splits
+train_idx <- createDataPartition(model_data$outcome, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+
+cat("Training set:", nrow(train_data), "\n")
+cat("Test set:", nrow(test_data), "\n")
+
+# Compute medians from training set only, then apply to both splits (prevents data leakage)
+train_medians <- train_data %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~median(., na.rm = TRUE)))
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) {
+    df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  }
+  df
+}
+
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+
+cat("\nRemaining NAs in train:", sum(is.na(train_data[, feature_cols])), "\n")
+cat("Remaining NAs in test:", sum(is.na(test_data[, feature_cols])), "\n")
+```
+
+# Train Random Forest
+
+```{r train_rf}
+set.seed(9)
+rf_model <- ranger(
+  x         = train_data[, feature_cols],
+  y         = train_data$outcome,
+  num.trees = 500,
+  importance = "impurity",
+  seed      = 9
+)
+
+print(rf_model)
+cat("OOB R²:", round(rf_model$r.squared, 4), "\n")
+```
+
+# Evaluate on Test Set
+
+```{r test_set_evaluation, fig.width=7, fig.height=6}
+pred_test <- predict(rf_model, test_data[, feature_cols])$predictions
+actual    <- test_data$outcome
+
+# Regression metrics
+r2_test   <- cor(pred_test, actual)^2
+rmse_test <- sqrt(mean((pred_test - actual)^2))
+pearson_r <- cor(pred_test, actual, method = "pearson")
+spearman_r <- cor(pred_test, actual, method = "spearman")
+
+cat("Test Set Metrics:\n")
+cat("  R²:       ", round(r2_test,    4), "\n")
+cat("  RMSE:     ", round(rmse_test,  4), "\n")
+cat("  Pearson r:", round(pearson_r,  4), "\n")
+cat("  Spearman ρ:", round(spearman_r, 4), "\n")
+
+# Scatter plot: predicted vs observed
+scatter_df <- data.frame(
+  actual    = actual,
+  predicted = pred_test,
+  symbol    = test_data$symbol
+)
+
+p_scatter <- ggplot(scatter_df, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.4, size = 1.5, color = "#0072B2") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E69F00", linewidth = 0.8) +
+  theme_cowplot() +
+  labs(
+    title    = paste0("RF Regression: Predicted vs Observed TE LFC"),
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | R² = ", round(r2_test, 3),
+                      " | Pearson r = ", round(pearson_r, 3),
+                      " | Spearman ρ = ", round(spearman_r, 3)),
+    x = "Observed TE LFC (positive = promoted by eIF3d)",
+    y = "Predicted TE LFC (positive = promoted by eIF3d)"
+  )
+
+print(p_scatter)
+
+ggsave(here("plots", paste0("rf_regression_scatter_", suffix, ".pdf")),
+       plot = p_scatter, width = 7, height = 6)
+```
+
+# 5-Fold Cross-Validation (Training Set Only)
+
+```{r cross_validation}
+set.seed(9)
+# Standard folds on continuous outcome — test set is never touched
+folds <- createFolds(train_data$outcome, k = 5, list = TRUE)
+
+cv_results <- lapply(seq_along(folds), function(i) {
+  cat("Fold", i, "...\n")
+
+  test_idx <- folds[[i]]
+  train_cv <- train_data[-test_idx, ]
+  val_cv   <- train_data[test_idx, ]
+
+  # Impute using this fold's training data medians only
+  cv_medians <- train_cv %>%
+    dplyr::select(all_of(feature_cols)) %>%
+    summarise(across(everything(), ~median(., na.rm = TRUE)))
+  train_cv <- impute_with_medians(train_cv, cv_medians)
+  val_cv   <- impute_with_medians(val_cv,   cv_medians)
+
+  rf_cv <- ranger(
+    x         = train_cv[, feature_cols],
+    y         = train_cv$outcome,
+    num.trees = 500,
+    seed      = 9
+  )
+
+  pred_cv  <- predict(rf_cv, val_cv[, feature_cols])$predictions
+  actual_cv <- val_cv$outcome
+
+  data.frame(
+    fold     = i,
+    R2       = cor(pred_cv, actual_cv)^2,
+    RMSE     = sqrt(mean((pred_cv - actual_cv)^2)),
+    Pearson  = cor(pred_cv, actual_cv, method = "pearson"),
+    Spearman = cor(pred_cv, actual_cv, method = "spearman")
+  )
+})
+
+cv_results_df <- bind_rows(cv_results)
+rownames(cv_results_df) <- NULL
+
+cat("\n5-Fold CV Results:\n")
+print(cv_results_df)
+
+cat("\nMean +/- SD:\n")
+for (metric in c("R2", "RMSE", "Pearson", "Spearman")) {
+  vals <- cv_results_df[[metric]]
+  cat(metric, ":", round(mean(vals, na.rm = TRUE), 4), "+/-",
+      round(sd(vals, na.rm = TRUE), 4), "\n")
+}
+```
+
+# Feature Importance
+
+```{r feature_importance, fig.width=10, fig.height=10}
+importance_df <- data.frame(
+  feature    = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
+) %>%
+  arrange(desc(importance))
+
+# Clean names for plotting
+importance_df <- importance_df %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_", "CDS 4mer: ") %>%
+      str_replace("^rbp_", "RBP: ") %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%")
+  )
+
+cat("Top 30 Features:\n")
+print(importance_df %>% head(30) %>% dplyr::select(feature, importance))
+
+p_importance <- importance_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Top 30 Features: TE LFC Regression (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Impurity)",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance)
+
+ggsave(here("plots", paste0("rf_regression_feature_importance_", suffix, ".pdf")),
+       plot = p_importance, width = 10, height = 10)
+
+# Top 40
+importance_all_plot <- importance_df %>% head(40)
+all_height <- max(6, nrow(importance_all_plot) * 0.35)
+
+p_importance_all <- importance_all_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Top ", nrow(importance_all_plot), " Features: TE LFC Regression (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Impurity)",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance_all)
+
+ggsave(here("plots", paste0("rf_regression_feature_importance_all_", suffix, ".pdf")),
+       plot = p_importance_all, width = 10, height = all_height)
+
+# Custom (non-k-mer/motif) features
+importance_custom <- importance_df %>%
+  filter(!str_detect(feature, "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbp_|^rbns_|^cisbp_")) %>%
+  head(40)
+
+custom_height <- max(6, nrow(importance_custom) * 0.35)
+
+p_importance_custom <- importance_custom %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Custom Features: TE LFC Regression (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Impurity) — CLIP, 4E/DAP5, Signatures, Lengths, GC",
+    x = "",
+    y = "Variable Importance"
+  )
+
+print(p_importance_custom)
+
+ggsave(here("plots", paste0("rf_regression_feature_importance_custom_", suffix, ".pdf")),
+       plot = p_importance_custom, width = 10, height = custom_height)
+```
+
+## Feature Category Summary
+
+```{r feature_categories, fig.width=10, fig.height=6}
+importance_df <- importance_df %>%
+  mutate(
+    category = case_when(
+      str_detect(feature, "^struct_")                          ~ "RNA Structure",
+      str_detect(feature, "^orfquant_")                       ~ "ORFquant",
+      str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
+      str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
+      str_detect(feature, "^cds_4mer_")                       ~ "CDS 4-mers",
+      str_detect(feature, "^rbns_|^cisbp_")                   ~ "RBP Motifs",
+      str_detect(feature, "^clip_")                           ~ "CLIP Binding",
+      str_detect(feature, "^lit_")                            ~ "Literature Signatures",
+      str_detect(feature, "length|Length")                     ~ "Region Lengths",
+      str_detect(feature, "_gc$|^gc3$")                       ~ "GC Content",
+      str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_")  ~ "4E / DAP5",
+      str_detect(feature, "^indiv_te_|^delta_te_")            ~ "Translational Efficiency",
+      str_detect(feature, "^cai$|^tai$|^csc$")               ~ "Codon Optimality",
+      TRUE                                                    ~ "Other"
+    )
+  )
+
+category_summary <- importance_df %>%
+  group_by(category) %>%
+  summarise(
+    n_features       = n(),
+    total_importance = sum(importance),
+    mean_importance  = mean(importance),
+    top_feature      = feature[which.max(importance)],
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_importance))
+
+cat("\nImportance by Category:\n")
+print(category_summary)
+
+p_category <- ggplot(category_summary,
+                     aes(x = reorder(category, total_importance), y = total_importance)) +
+  geom_bar(stat = "identity", fill = "#56B4E9") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Feature Importance by Category (", tools::toTitleCase(params$condition), ")"),
+    x = "",
+    y = "Total Variable Importance"
+  )
+
+print(p_category)
+
+ggsave(here("plots", paste0("rf_regression_importance_by_category_", suffix, ".pdf")),
+       plot = p_category, width = 10, height = 6)
+```
+
+## Directionality & Signed-Importance Lollipop
+
+```{r compute_directionality}
+# Correlation computed on train_data (post-imputation) so all genes contribute.
+# Sparse features like CLIP LFCs have NAs replaced with median, which attenuates
+# their correlation toward zero but ensures they appear in the lollipop.
+directionality <- importance_df %>%
+  rowwise() %>%
+  mutate(
+    correlation = tryCatch(
+      cor(train_data[[feature]], train_data$outcome, use = "complete.obs"),
+      error = function(e) NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    direction = case_when(
+      is.na(correlation) ~ NA_character_,
+      correlation > 0    ~ "Positively correlated with TE LFC",
+      TRUE               ~ "Negatively correlated with TE LFC"
+    )
+  ) %>%
+  arrange(desc(importance))
+
+cat("Directionality computed for", nrow(directionality), "features\n")
+cat("Positively correlated:", sum(directionality$direction == "Positively correlated with TE LFC", na.rm = TRUE), "\n")
+cat("Negatively correlated:", sum(directionality$direction == "Negatively correlated with TE LFC", na.rm = TRUE), "\n")
+
+# Diagnostic: show top 10 features by importance and flag any with NA correlation
+cat("\nTop 10 features by importance (NA correlation = excluded from lollipop):\n")
+directionality %>%
+  head(10) %>%
+  mutate(
+    n_non_na = sapply(feature, function(f) sum(!is.na(train_data[[f]]))),
+    is_list  = sapply(feature, function(f) is.list(train_data[[f]]))
+  ) %>%
+  dplyr::select(feature, importance, correlation, n_non_na, is_list) %>%
+  print()
+```
+
+```{r plot_lollipop, fig.width=10, fig.height=10}
+lollipop_data <- directionality %>%
+  filter(!is.na(correlation)) %>%
+  head(30) %>%
+  mutate(
+    signed_importance = importance * sign(correlation),
+    broad_category = case_when(
+      category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+      category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+      category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+      category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+      TRUE                                                     ~ "Intrinsic mRNA features"
+    ),
+    broad_category = factor(broad_category, levels = c(
+      "Intrinsic mRNA features", "eIF3 binding evidence",
+      "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+    )),
+    feature_clean = fct_reorder(feature_clean, signed_importance)
+  )
+
+category_colors <- c(
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1",
+  "Translation in hypoxia"  = "#E07030"
+)
+
+p_lollipop <- ggdotchart(
+  lollipop_data,
+  x        = "feature_clean",
+  y        = "signed_importance",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 4,
+  xlab     = "",
+  ylab     = "Signed Importance (positive = positively correlated with TE LFC)",
+  title    = "Top 30 Features: Signed Importance",
+  subtitle = paste0("TE LFC regression | ", tools::toTitleCase(params$condition),
+                    " | ", params$timepoint)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_lollipop)
+ggsave(here("plots", paste0("rf_regression_directionality_lollipop_", suffix, ".pdf")),
+       plot = p_lollipop, width = 10, height = 10)
+```
+
+# Export Results
+
+```{r export_results}
+output_dir <- here("output", "predictive_modeling")
+
+# Model
+saveRDS(rf_model, file.path(output_dir, paste0("rf_regression_", suffix, ".rds")))
+
+# Feature importance
+write_csv(importance_df, file.path(output_dir, paste0("rf_regression_importance_", suffix, ".csv")))
+
+# Signed importance / directionality
+directionality_export <- directionality %>%
+  mutate(signed_importance = importance * sign(correlation))
+write_csv(directionality_export,
+          file.path(output_dir, paste0("rf_regression_directionality_", suffix, ".csv")))
+
+# Performance summary
+performance_df <- data.frame(
+  Metric   = c("R2", "RMSE", "Pearson_r", "Spearman_rho", "N_genes", "N_features"),
+  Test_Set = c(r2_test, rmse_test, pearson_r, spearman_r, nrow(test_data), length(feature_cols)),
+  CV_Mean  = c(mean(cv_results_df$R2), mean(cv_results_df$RMSE),
+               mean(cv_results_df$Pearson), mean(cv_results_df$Spearman), NA, NA),
+  CV_SD    = c(sd(cv_results_df$R2), sd(cv_results_df$RMSE),
+               sd(cv_results_df$Pearson), sd(cv_results_df$Spearman), NA, NA)
+)
+write_csv(performance_df,
+          file.path(output_dir, paste0("rf_regression_performance_", suffix, ".csv")))
+
+# CV results
+write_csv(cv_results_df,
+          file.path(output_dir, paste0("rf_regression_cv_results_", suffix, ".csv")))
+
+# Test set predictions
+predictions_export <- data.frame(
+  gene_id   = test_data$gene_id_clean,
+  symbol    = test_data$symbol,
+  actual    = actual,
+  predicted = pred_test,
+  residual  = actual - pred_test
+)
+write_csv(predictions_export,
+          file.path(output_dir, paste0("rf_regression_predictions_", suffix, ".csv")))
+
+cat("Exported: model RDS, importance CSV, directionality CSV, performance CSV, CV results CSV, predictions CSV\n")
+```
+
+# Summary
+
+```{r summary}
+cat("========================================\n")
+cat(paste0("REGRESSION SUMMARY (", tools::toTitleCase(params$condition), ")\n"))
+cat("========================================\n\n")
+
+cat("Parameters:\n")
+cat("  Condition:", params$condition, "\n")
+cat("  Timepoint:", params$timepoint, "\n")
+cat("  Feature set:", params$feature_set, "\n")
+cat("  CLIP mode:", params$clip_mode, "\n\n")
+
+cat("Dataset:\n")
+cat("  Genes:", nrow(model_data), "\n")
+cat("  Features:", length(feature_cols), "\n\n")
+
+cat("OOB R² (training):", round(rf_model$r.squared, 4), "\n\n")
+
+cat("Test Set Performance:\n")
+cat("  R²:        ", round(r2_test,    4), "\n")
+cat("  RMSE:      ", round(rmse_test,  4), "\n")
+cat("  Pearson r: ", round(pearson_r,  4), "\n")
+cat("  Spearman ρ:", round(spearman_r, 4), "\n\n")
+
+cat("5-Fold CV (training set only):\n")
+cat("  R²:", round(mean(cv_results_df$R2), 4), "+/-", round(sd(cv_results_df$R2), 4), "\n")
+cat("  RMSE:", round(mean(cv_results_df$RMSE), 4), "+/-", round(sd(cv_results_df$RMSE), 4), "\n")
+cat("  Pearson r:", round(mean(cv_results_df$Pearson), 4), "+/-", round(sd(cv_results_df$Pearson), 4), "\n\n")
+
+cat("Top 5 Features:\n")
+for (i in 1:5) {
+  cat("  ", i, ". ", importance_df$feature[i], " (", round(importance_df$importance[i], 2), ")\n", sep = "")
+}
+
+cat("========================================\n")
+```
+
+# Final Feature Importance Plot
+
+```{r final_importance_plot, fig.width=8, fig.height=max(4, min(40, length(feature_cols)) * 0.35)}
+importance_final_plot <- importance_df %>% head(40)
+final_height <- max(4, nrow(importance_final_plot) * 0.35)
+
+p_final_importance <- importance_final_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_segment(aes(xend = reorder(feature_clean, importance), y = 0, yend = importance),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(size = 3, color = "#0072B2") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = "Feature Importance: TE LFC Regression",
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | R² = ", round(r2_test, 3),
+                      " | Pearson r = ", round(pearson_r, 3)),
+    x = "",
+    y = "Variable Importance (Impurity)"
+  )
+
+print(p_final_importance)
+
+ggsave(here("plots", paste0("rf_regression_final_importance_", suffix, ".pdf")),
+       plot = p_final_importance, width = 8,
+       height = final_height)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
