@@ -1,9 +1,10 @@
 ---
-title: "`r paste0('Random Forest Regression: TE LFC Prediction (', tools::toTitleCase(params$condition), ', ', params$timepoint, ', ', params$feature_set, ')')`"
+title: "`r paste0('Random Forest Regression: TE LFC Prediction (eIF3', params$gene, ', ', tools::toTitleCase(params$condition), ', ', params$timepoint, ', ', params$feature_set, ')')`"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
 params:
+  gene: "3d"
   condition: "hypoxia"
   timepoint: "1hr"
   feature_set: "external_stability"
@@ -37,8 +38,9 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 #
 if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
+    gene        = "3d",                  # "3d" | "3e"
     condition   = "hypoxia",             # "hypoxia" | "normoxia"
-    timepoint   = "1hr",                 # "1hr" | "4hr" | "24hr" | "normoxia" | etc.
+    timepoint   = "1hr",                 # "1hr" | "4hr" | "24hr" | "1and4hr" | etc.
                                          # Used to select timepoint-specific feature matrices
                                          # (clip_split, structure) and output file naming
     feature_set = "external_stability",  # "external_stability" — mRNA stability features
@@ -76,11 +78,19 @@ feature_matrix_rds <- if (params$feature_set == "te_lfc") {
   paste0("feature_matrix_", params$timepoint, "_combined.rds")
 }
 
-# Outcome CSV: si3d vs sictrl TE LFC for all genes (positive = promoted by eIF3d)
-te_lfc_csv <- paste0("translation_categories_si3d_vs_sictrl_",
-                     params$condition, "_", params$timepoint, ".csv")
+# Outcome CSV: siGENE vs sictrl TE LFC for all genes (positive = promoted by eIF3d/e)
+# Special case: si3e normoxia 1and4hr only has TE results (no RNA/ribo/categories),
+# so load the TE-only file (same te_lfc / te_padj columns, just a different prefix)
+te_lfc_csv <- if (params$gene == "3e" && params$timepoint == "1and4hr") {
+  paste0("te_si3e_vs_sictrl_", params$condition, "_", params$timepoint, ".csv")
+} else {
+  paste0("translation_categories_si", params$gene, "_vs_sictrl_",
+         params$condition, "_", params$timepoint, ".csv")
+}
 
-suffix <- paste0(params$condition, "_", params$timepoint,
+gene_label <- paste0("eIF", params$gene)  # "eIF3d" or "eIF3e"
+
+suffix <- paste0("eif", params$gene, "_", params$condition, "_", params$timepoint,
                  "_", params$feature_set, "_clip", params$clip_mode, "_regression",
                  if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
                  if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
@@ -92,14 +102,15 @@ cat("Output suffix:", suffix, "\n")
 
 # Overview
 
-Random forest regression predicting **continuous TE LFC** (si3d vs sictrl; positive = promoted by eIF3d) from mRNA sequence features. The outcome is loaded from the full `translation_categories_si3d_vs_sictrl_{condition}_{timepoint}.csv` (all genes, no LFC threshold), then joined to the feature matrix. The feature matrix's own `te_lfc` column (hypoxia vs normoxia response) is excluded from features. No class balancing.
+Random forest regression predicting **continuous TE LFC** (siGENE vs sictrl; positive = promoted by eIF3d/e) from mRNA sequence features. The outcome is loaded from the full `translation_categories_siGENE_vs_sictrl_{condition}_{timepoint}.csv` (all genes, no LFC threshold), then joined to the feature matrix. The feature matrix's own `te_lfc` column (hypoxia vs normoxia response) is excluded from features. No class balancing.
 
 ## Parameters
 
 | Parameter | Values | Description |
 |-----------|--------|-------------|
+| `gene` | `"3d"`, `"3e"` | Which eIF3 subunit knockdown to model (selects outcome CSV) |
 | `condition` | `"hypoxia"`, `"normoxia"` | Experimental condition (used for output naming) |
-| `timepoint` | `"1hr"`, `"4hr"`, `"normoxia"`, etc. | Timepoint; used to select timepoint-specific feature matrices and for output naming |
+| `timepoint` | `"1hr"`, `"4hr"`, `"1and4hr"`, etc. | Timepoint; used to select timepoint-specific feature matrices and for output naming |
 | `feature_set` | `"external_stability"`, `"targeted"`, `"combined"`, `"structure"`, `"clip_split"`, `"te_lfc"`, `"codon_optimality"` | Feature matrix to use |
 | `clip_mode` | `"aggregate"`, `"individual"`, `"both"` | Which CLIP features to include |
 | `exclude_4e_features` | `TRUE`/`FALSE` | Remove eIF4E circular features |
@@ -124,7 +135,7 @@ features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds)) %
   dplyr::select(-any_of(c("te_lfc", "te_padj", "te_lfc_bin")))
 cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
 
-# Outcome: si3d vs sictrl TE LFC for all genes (positive = promoted by eIF3d)
+# Outcome: siGENE vs sictrl TE LFC for all genes (positive = promoted by eIF3d/e)
 te_lfc_data <- read_csv(here("output", te_lfc_csv), show_col_types = FALSE) %>%
   mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
   dplyr::select(gene_id_clean, outcome = te_lfc, outcome_padj = te_padj)
@@ -145,14 +156,14 @@ cat("Genes in model (feature matrix ∩ outcome data):", nrow(model_genes), "\n"
 cat("Outcome (TE LFC, si3d vs sictrl) summary:\n")
 print(summary(model_genes$outcome))
 
-# Sanity check: promoted and decreased by eIF3d (LFC > 0.5 or < -0.5, padj < 0.05)
+# Sanity check: promoted and decreased by eIF3d/e (LFC > 0.5 or < -0.5, padj < 0.05)
 n_promoted  <- sum(model_genes$outcome >  0.5 & model_genes$outcome_padj < 0.05, na.rm = TRUE)
 n_decreased <- sum(model_genes$outcome < -0.5 & model_genes$outcome_padj < 0.05, na.rm = TRUE)
 n_total     <- nrow(model_genes)
 cat("\nSanity check:\n")
-cat("  Promoted by eIF3d  (LFC >  0.5, padj < 0.05):", n_promoted,  "/", n_total,
+cat("  Promoted by", gene_label, " (LFC >  0.5, padj < 0.05):", n_promoted,  "/", n_total,
     sprintf("(%.1f%%)\n", 100 * n_promoted  / n_total))
-cat("  Decreased by eIF3d (LFC < -0.5, padj < 0.05):", n_decreased, "/", n_total,
+cat("  Decreased by", gene_label, "(LFC < -0.5, padj < 0.05):", n_decreased, "/", n_total,
     sprintf("(%.1f%%)\n", 100 * n_decreased / n_total))
 ```
 
@@ -260,7 +271,7 @@ cat("(Imputation deferred to after train/test split — medians computed from tr
 
 ```{r prepare_data}
 model_data <- model_genes %>%
-  dplyr::select(gene_id_clean, symbol, outcome, all_of(feature_cols))
+  dplyr::select(gene_id_clean, symbol, outcome, outcome_padj, all_of(feature_cols))
 
 cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
 cat("\nOutcome distribution:\n")
@@ -344,21 +355,103 @@ p_scatter <- ggplot(scatter_df, aes(x = actual, y = predicted)) +
   geom_point(alpha = 0.4, size = 1.5, color = "#0072B2") +
   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
   geom_smooth(method = "lm", se = TRUE, color = "#E69F00", linewidth = 0.8) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5, size = 3.5,
+           label = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                          "\nR\u00b2 = ", round(r2_test, 3),
+                          "  |  Pearson r = ", round(pearson_r, 3),
+                          "  |  Spearman rho = ", round(spearman_r, 3))) +
   theme_cowplot() +
   labs(
-    title    = paste0("RF Regression: Predicted vs Observed TE LFC"),
-    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
-                      " | R² = ", round(r2_test, 3),
-                      " | Pearson r = ", round(pearson_r, 3),
-                      " | Spearman ρ = ", round(spearman_r, 3)),
-    x = "Observed TE LFC (positive = promoted by eIF3d)",
-    y = "Predicted TE LFC (positive = promoted by eIF3d)"
+    title = "RF Regression: Predicted vs Observed TE LFC",
+    x = paste0("Observed TE LFC (positive = promoted by ", gene_label, ")"),
+    y = paste0("Predicted TE LFC (positive = promoted by ", gene_label, ")")
   )
 
 print(p_scatter)
 
 ggsave(here("plots", paste0("rf_regression_scatter_", suffix, ".pdf")),
-       plot = p_scatter, width = 7, height = 6)
+       plot = p_scatter, width = 9, height = 6)
+```
+
+# Ranking Evaluation
+
+Spearman ρ > Pearson r suggests the model captures gene rank order better than absolute TE LFC magnitude — a common pattern for random forests, which predict group means and compress the prediction scale. Two analyses test this directly.
+
+## Rank Regression
+
+Refit the same RF on percentile-ranked outcome. If R² improves substantially vs the raw LFC model, the model is genuinely better in rank space.
+
+```{r rank_regression}
+# Rank outcome within training set; map test set via training ECDF (no leakage)
+train_data$outcome_rank <- rank(train_data$outcome, ties.method = "average") / nrow(train_data)
+ecdf_train              <- ecdf(train_data$outcome)
+test_data$outcome_rank  <- ecdf_train(test_data$outcome)
+
+rf_rank <- ranger(
+  x          = train_data[, feature_cols],
+  y          = train_data$outcome_rank,
+  num.trees  = 500,
+  importance = "impurity",
+  seed       = 9
+)
+
+pred_rank    <- predict(rf_rank, test_data[, feature_cols])$predictions
+actual_rank  <- test_data$outcome_rank
+
+r2_rank       <- cor(pred_rank, actual_rank)^2
+spearman_rank <- cor(pred_rank, actual_rank, method = "spearman")
+
+cat("Rank Regression Test Set Metrics:\n")
+cat("  R² (on ranks):   ", round(r2_rank,      4), "\n")
+cat("  Spearman rho:    ", round(spearman_rank, 4), "\n")
+cat("\nComparison to raw LFC model:\n")
+cat("  Raw LFC R²:      ", round(r2_test,    4), "\n")
+cat("  Raw LFC Spearman:", round(spearman_r, 4), "\n")
+```
+
+## Precision @ K
+
+Rank all test-set genes by predicted TE LFC (descending) and compute the fraction of top-K genes that are truly promoted (outcome > 0.5, padj < 0.05). A good ranking model should substantially exceed the random baseline, especially at low K.
+
+```{r precision_at_k, fig.width=7, fig.height=5}
+is_promoted   <- !is.na(test_data$outcome_padj) &
+                 test_data$outcome      >  0.5 &
+                 test_data$outcome_padj <  0.05
+baseline_rate <- mean(is_promoted, na.rm = TRUE)
+
+prec_df <- data.frame(pred = pred_test, promoted = is_promoted) %>%
+  arrange(desc(pred)) %>%
+  mutate(
+    k         = row_number(),
+    precision = cumsum(promoted) / k
+  )
+
+p_preck <- ggplot(prec_df, aes(x = k, y = precision)) +
+  geom_line(color = "#0072B2", linewidth = 0.9) +
+  geom_hline(yintercept = baseline_rate, linetype = "dashed", color = "grey50") +
+  annotate("text", x = min(800, max(prec_df$k)) * 0.55,
+           y = baseline_rate + 0.015,
+           label = paste0("Random baseline (", round(baseline_rate * 100, 1), "%)"),
+           color = "grey40", size = 3.5, hjust = 0) +
+  scale_x_continuous(breaks = c(50, 100, 200, 500, 1000)) +
+  coord_cartesian(xlim = c(0, min(1000, nrow(prec_df)))) +
+  theme_cowplot() +
+  labs(
+    title    = "Precision @ K: Ranking Model Recovery of Promoted Genes",
+    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition), " | ", params$timepoint),
+    x        = "Top K genes (ranked by predicted TE LFC)",
+    y        = paste0("Precision (fraction promoted by ", gene_label, ")")
+  )
+
+print(p_preck)
+ggsave(here("plots", paste0("rf_regression_precision_at_k_", suffix, ".pdf")),
+       plot = p_preck, width = 7, height = 5)
+
+cat("Precision @ K (baseline:", round(baseline_rate * 100, 1), "%):\n")
+for (k_val in c(50, 100, 200, 500)) {
+  p <- prec_df$precision[min(k_val, nrow(prec_df))]
+  cat(sprintf("  @%4d: %.1f%%\n", k_val, p * 100))
+}
 ```
 
 # 5-Fold Cross-Validation (Training Set Only)
@@ -649,6 +742,287 @@ ggsave(here("plots", paste0("rf_regression_directionality_lollipop_", suffix, ".
        plot = p_lollipop, width = 10, height = 10)
 ```
 
+# Ranking Feature Importance
+
+The standard impurity importance (above) reflects which features reduce MSE on TE LFC prediction. Since the model is better at ranking than predicting absolute values, the two analyses below ask a more relevant question: **which features drive the model's ranking performance?**
+
+## Option 1: Rank Regression Importance
+
+`rf_rank` was trained directly on percentile-ranked outcome, so its impurity importance reflects which features drive rank separation — not LFC magnitude prediction.
+
+```{r rank_importance, fig.width=10, fig.height=10}
+rank_imp_df <- data.frame(
+  feature    = names(rf_rank$variable.importance),
+  importance = rf_rank$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_", "CDS 4mer: ") %>%
+      str_replace("^rbp_", "RBP: ") %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%")
+  )
+
+cat("Top 20 features by rank regression importance:\n")
+print(rank_imp_df %>% head(20) %>% dplyr::select(feature, importance))
+
+p_rank_imp <- rank_imp_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#009E73") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = "Top 30 Features: Rank Regression Importance",
+    subtitle = paste0("Variable Importance (Impurity on ranked outcome) | ",
+                      tools::toTitleCase(params$condition), " | ", params$timepoint),
+    x = "",
+    y = "Variable Importance (rank model)"
+  )
+
+print(p_rank_imp)
+ggsave(here("plots", paste0("rf_regression_rank_importance_", suffix, ".pdf")),
+       plot = p_rank_imp, width = 10, height = 10)
+```
+
+```{r rank_importance_lollipop, fig.width=10, fig.height=10}
+# Reuse directionality signs from LFC model (rank is monotone transform of LFC,
+# so correlation signs are the same)
+rank_lollipop_data <- rank_imp_df %>%
+  left_join(directionality %>% dplyr::select(feature, correlation, category),
+            by = "feature") %>%
+  filter(!is.na(correlation)) %>%
+  head(30) %>%
+  mutate(
+    broad_category = case_when(
+      category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+      category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+      category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+      category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+      TRUE                                                     ~ "Intrinsic mRNA features"
+    ),
+    broad_category    = factor(broad_category, levels = c(
+      "Intrinsic mRNA features", "eIF3 binding evidence",
+      "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+    )),
+    signed_importance = importance * sign(correlation),
+    feature_clean     = fct_reorder(feature_clean, signed_importance)
+  )
+
+p_rank_lollipop <- ggdotchart(
+  rank_lollipop_data,
+  x        = "feature_clean",
+  y        = "signed_importance",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 4,
+  xlab     = "",
+  ylab     = "Signed Importance (positive = positively correlated with TE LFC)",
+  title    = "Top 30 Features: Rank Regression Signed Importance",
+  subtitle = paste0("Rank model | ", tools::toTitleCase(params$condition),
+                    " | ", params$timepoint)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_rank_lollipop)
+ggsave(here("plots", paste0("rf_regression_rank_lollipop_", suffix, ".pdf")),
+       plot = p_rank_lollipop, width = 10, height = 10)
+```
+
+## Option 2: Permutation Spearman Importance
+
+For each feature, permute its values in the test set, re-predict with `rf_model`, and measure the drop in Spearman ρ. Features causing the largest drop are most critical to the model's ranking performance.
+
+```{r permutation_spearman_importance}
+cat("Computing permutation Spearman importance over", length(feature_cols), "features...\n")
+set.seed(9)
+
+perm_results <- lapply(feature_cols, function(feat) {
+  test_permuted        <- test_data
+  test_permuted[[feat]] <- sample(test_permuted[[feat]])
+  pred_perm            <- predict(rf_model, test_permuted[, feature_cols])$predictions
+  spearman_perm        <- cor(pred_perm, test_data$outcome, method = "spearman")
+  data.frame(
+    feature           = feat,
+    spearman_drop     = spearman_r - spearman_perm,
+    spearman_permuted = spearman_perm
+  )
+})
+
+perm_df <- bind_rows(perm_results) %>%
+  arrange(desc(spearman_drop)) %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_", "CDS 4mer: ") %>%
+      str_replace("^rbp_", "RBP: ") %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%")
+  )
+
+cat("Baseline Spearman rho:", round(spearman_r, 4), "\n\n")
+cat("Top 20 features by Spearman drop:\n")
+print(perm_df %>% head(20) %>%
+        dplyr::select(feature, spearman_drop, spearman_permuted) %>%
+        mutate(across(where(is.numeric), ~round(., 4))))
+```
+
+```{r permutation_spearman_plot, fig.width=10, fig.height=10}
+p_perm <- perm_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, spearman_drop), y = spearman_drop)) +
+  geom_bar(stat = "identity", fill = "#CC79A7") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = "Top 30 Features: Permutation Spearman Importance",
+    subtitle = paste0("Drop in Spearman rho when feature is permuted | ",
+                      tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | Baseline rho = ", round(spearman_r, 3)),
+    x = "",
+    y = "Spearman rho drop (higher = more important for ranking)"
+  )
+
+print(p_perm)
+ggsave(here("plots", paste0("rf_regression_perm_spearman_", suffix, ".pdf")),
+       plot = p_perm, width = 10, height = 10)
+```
+
+```{r permutation_spearman_lollipop, fig.width=10, fig.height=10}
+perm_lollipop_data <- perm_df %>%
+  left_join(directionality %>% dplyr::select(feature, correlation, category),
+            by = "feature") %>%
+  filter(!is.na(correlation)) %>%
+  head(30) %>%
+  mutate(
+    broad_category = case_when(
+      category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+      category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+      category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+      category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+      TRUE                                                     ~ "Intrinsic mRNA features"
+    ),
+    broad_category = factor(broad_category, levels = c(
+      "Intrinsic mRNA features", "eIF3 binding evidence",
+      "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+    )),
+    signed_drop   = spearman_drop * sign(correlation),
+    feature_clean = fct_reorder(feature_clean, signed_drop)
+  )
+
+p_perm_lollipop <- ggdotchart(
+  perm_lollipop_data,
+  x        = "feature_clean",
+  y        = "signed_drop",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 4,
+  xlab     = "",
+  ylab     = "Signed Spearman drop (positive = positively correlated with TE LFC)",
+  title    = "Top 30 Features: Permutation Spearman Signed Importance",
+  subtitle = paste0("Permutation on test set | ", tools::toTitleCase(params$condition),
+                    " | ", params$timepoint)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_perm_lollipop)
+ggsave(here("plots", paste0("rf_regression_perm_spearman_lollipop_", suffix, ".pdf")),
+       plot = p_perm_lollipop, width = 10, height = 10)
+```
+
+## Importance Rank Correlation Across Methods
+
+How consistent are the three importance measures at identifying the same top features?
+
+```{r importance_comparison}
+comparison_df <- importance_df %>%
+  dplyr::select(feature, lfc_importance = importance) %>%
+  left_join(rank_imp_df %>% dplyr::select(feature, rank_importance = importance), by = "feature") %>%
+  left_join(perm_df     %>% dplyr::select(feature, spearman_drop),               by = "feature") %>%
+  mutate(
+    rank_lfc_imp  = rank(-lfc_importance),
+    rank_rank_imp = rank(-rank_importance),
+    rank_perm     = rank(-spearman_drop)
+  )
+
+cat("Rank correlation between importance methods:\n")
+cat("  LFC impurity vs Rank impurity:    ",
+    round(cor(comparison_df$rank_lfc_imp, comparison_df$rank_rank_imp,
+              method = "spearman", use = "complete.obs"), 3), "\n")
+cat("  LFC impurity vs Permutation Spearman:",
+    round(cor(comparison_df$rank_lfc_imp, comparison_df$rank_perm,
+              method = "spearman", use = "complete.obs"), 3), "\n")
+cat("  Rank impurity vs Permutation Spearman:",
+    round(cor(comparison_df$rank_rank_imp, comparison_df$rank_perm,
+              method = "spearman", use = "complete.obs"), 3), "\n")
+
+# Features that are top-20 in permutation Spearman but not in LFC impurity
+perm_top20 <- perm_df$feature[1:20]
+lfc_top20  <- importance_df$feature[1:20]
+cat("\nIn permutation top 20 but NOT in LFC impurity top 20:\n")
+print(setdiff(perm_top20, lfc_top20))
+cat("\nIn LFC impurity top 20 but NOT in permutation top 20:\n")
+print(setdiff(lfc_top20, perm_top20))
+```
+
+```{r importance_scatter, fig.width=8, fig.height=7}
+# Normalize both axes to 0-1 for comparability
+scatter_df <- comparison_df %>%
+  mutate(
+    lfc_imp_scaled  = lfc_importance / max(lfc_importance,  na.rm = TRUE),
+    perm_drop_scaled = spearman_drop  / max(spearman_drop,   na.rm = TRUE),
+    feature_clean   = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_",  "CDS 4mer: ")   %>%
+      str_replace("^rbp_",       "RBP: ")         %>%
+      str_replace("^log2_",      "log2 ")         %>%
+      str_replace("_length$",    " length")        %>%
+      str_replace("_gc$",        " GC%")
+  )
+
+# Label features in the top 15 of either axis
+label_df <- scatter_df %>%
+  filter(rank(-lfc_imp_scaled) <= 15 | rank(-perm_drop_scaled) <= 15)
+
+p_scatter_imp <- ggplot(scatter_df, aes(x = lfc_imp_scaled, y = perm_drop_scaled)) +
+  geom_point(alpha = 0.5, size = 2, color = "grey50") +
+  geom_point(data = label_df, size = 2.5, color = "#0072B2") +
+  ggrepel::geom_text_repel(
+    data    = label_df,
+    aes(label = feature_clean),
+    size    = 2.8,
+    max.overlaps = 20,
+    segment.color = "grey70"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  theme_cowplot() +
+  labs(
+    title    = "LFC Impurity Importance vs Permutation Spearman Drop",
+    subtitle = paste0("Features top-right: important for both | High y only: ranking-specific | ",
+                      tools::toTitleCase(params$condition), " | ", params$timepoint),
+    x = "LFC impurity importance (scaled 0-1)",
+    y = "Permutation Spearman drop (scaled 0-1)"
+  )
+
+print(p_scatter_imp)
+ggsave(here("plots", paste0("rf_regression_importance_scatter_", suffix, ".pdf")),
+       plot = p_scatter_imp, width = 8, height = 7)
+```
+
 # Export Results
 
 ```{r export_results}
@@ -748,12 +1122,12 @@ p_final_importance <- importance_final_plot %>%
   coord_flip() +
   theme_cowplot() +
   labs(
-    title    = "Feature Importance: TE LFC Regression",
-    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
-                      " | R² = ", round(r2_test, 3),
-                      " | Pearson r = ", round(pearson_r, 3)),
+    title = "Feature Importance: TE LFC Regression",
     x = "",
-    y = "Variable Importance (Impurity)"
+    y = "Variable Importance (Impurity)",
+    caption = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                     " | R\u00b2 = ", round(r2_test, 3),
+                     " | Pearson r = ", round(pearson_r, 3))
   )
 
 print(p_final_importance)

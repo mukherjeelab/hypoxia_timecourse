@@ -1,0 +1,231 @@
+---
+title: "33 — UTR and CDS Length and GC Content"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Compare 5' UTR, CDS, and 3' UTR length (log2) and GC content across three groups:
+promoted genes (eIF3d or eIF3e, LFC > 0.5, padj < 0.05), size-matched negative
+controls (set.seed = 9), and all expressed genes (background). Analysed for four
+conditions: eIF3d hypoxia 1 hr, eIF3d normoxia 1+4 hr, eIF3e hypoxia 1 hr, eIF3e
+normoxia 1+4 hr.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+```
+
+# Load Feature Matrix
+
+```{r load_feature_matrix}
+features <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+# Pre-compute log2 length columns (add 1 to avoid log2(0))
+features <- features %>%
+  mutate(
+    log2_utr5_length = log2(utr5_length + 1),
+    log2_cds_length  = log2(cds_length  + 1),
+    log2_utr3_length = log2(utr3_length + 1)
+  )
+
+cat("Sequence feature columns available:\n")
+cat(" utr5_length, cds_length, utr3_length\n")
+cat(" utr5_gc, cds_gc, utr3_gc\n")
+```
+
+# Load Gene Sets
+
+```{r load_gene_sets}
+# --- eIF3d hypoxia 1 hr ---
+d_hyp1 <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+d_hyp1_ids <- d_hyp1$ensembl_gene
+cat("3d hypoxia 1hr promoted:", length(d_hyp1_ids), "\n")
+
+# --- eIF3d normoxia 1+4 hr ---
+d_norm14 <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+  show_col_types = FALSE
+) %>%
+  filter(te_lfc > 0.5, te_padj < 0.05) %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id))
+d_norm14_ids <- d_norm14$ensembl_gene
+cat("3d normoxia 1+4hr promoted:", length(d_norm14_ids), "\n")
+
+# --- eIF3e hypoxia 1 hr ---
+e_hyp1 <- read_csv(
+  here("output", "genesets", "hypoxia_3e_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+e_hyp1_ids <- e_hyp1$ensembl_gene
+cat("3e hypoxia 1hr promoted:", length(e_hyp1_ids), "\n")
+
+# --- eIF3e normoxia 1+4 hr (TE-only file) ---
+e_norm14 <- read_csv(
+  here("output", "te_si3e_vs_sictrl_normoxia_1and4hr.csv"),
+  show_col_types = FALSE
+) %>%
+  filter(te_lfc > 0.5, te_padj < 0.05) %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id))
+e_norm14_ids <- e_norm14$ensembl_gene
+cat("3e normoxia 1+4hr promoted:", length(e_norm14_ids), "\n")
+```
+
+# Build Negative Controls
+
+```{r neg_controls}
+# 3d negative control pool (genes never regulated by si3d)
+neg_pool_3d <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  filter(gene_id_clean %in% features$gene_id_clean)
+cat("3d neg pool in feature matrix:", nrow(neg_pool_3d), "\n")
+
+# 3e negative control pool (genes never regulated by si3e)
+neg_pool_3e <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes_si3e.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  filter(gene_id_clean %in% features$gene_id_clean)
+cat("3e neg pool in feature matrix:", nrow(neg_pool_3e), "\n")
+
+# Size-matched sampling with set.seed(9) — each condition independently
+set.seed(9)
+neg_d_hyp1   <- sample(neg_pool_3d$gene_id_clean, size = min(length(d_hyp1_ids),  nrow(neg_pool_3d)))
+set.seed(9)
+neg_d_norm14 <- sample(neg_pool_3d$gene_id_clean, size = min(length(d_norm14_ids), nrow(neg_pool_3d)))
+set.seed(9)
+neg_e_hyp1   <- sample(neg_pool_3e$gene_id_clean, size = min(length(e_hyp1_ids),  nrow(neg_pool_3e)))
+set.seed(9)
+neg_e_norm14 <- sample(neg_pool_3e$gene_id_clean, size = min(length(e_norm14_ids), nrow(neg_pool_3e)))
+
+cat("\nNeg control sizes:\n")
+cat(" 3d hypoxia 1hr:    ", length(neg_d_hyp1),   "(pos:", length(d_hyp1_ids),  ")\n")
+cat(" 3d normoxia 1+4hr: ", length(neg_d_norm14), "(pos:", length(d_norm14_ids), ")\n")
+cat(" 3e hypoxia 1hr:    ", length(neg_e_hyp1),   "(pos:", length(e_hyp1_ids),  ")\n")
+cat(" 3e normoxia 1+4hr: ", length(neg_e_norm14), "(pos:", length(e_norm14_ids), ")\n")
+```
+
+# Plot Helper
+
+```{r plot_helper}
+# Density plot: grey = all genes, black = neg control, orange = promoted
+# col: column name in features (already on the desired scale)
+# xlabel: x-axis label
+# title_str: plot title
+plot_density <- function(all_df, promoted_ids, neg_ids, col, xlabel, title_str) {
+  bg   <- all_df %>% filter(!is.na(.data[[col]]))
+  fg_p <- bg %>% filter(gene_id_clean %in% promoted_ids)
+  fg_n <- bg %>% filter(gene_id_clean %in% neg_ids)
+  ks   <- ks.test(
+    fg_p[[col]],
+    bg %>% filter(!gene_id_clean %in% promoted_ids) %>% pull(col)
+  )
+  ggplot() +
+    geom_density(data = bg,   aes(x = .data[[col]]), color = "grey60",  fill = NA, linewidth = 0.9) +
+    geom_density(data = fg_n, aes(x = .data[[col]]), color = "#000000", fill = NA, linewidth = 0.9) +
+    geom_density(data = fg_p, aes(x = .data[[col]]), color = "#E69F00", fill = NA, linewidth = 0.9) +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+             label = paste0("KS p = ", formatC(ks$p.value, format = "e", digits = 2)),
+             size = 3.5) +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2,
+             label = paste0("All genes (n = ", nrow(bg), ")"),
+             size = 3.5, color = "grey50") +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 4.9,
+             label = paste0("Promoted (n = ", nrow(fg_p), ")"),
+             size = 3.5, color = "#E69F00") +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 6.6,
+             label = paste0("Neg ctrl (n = ", nrow(fg_n), ")"),
+             size = 3.5, color = "#000000") +
+    labs(title = title_str, x = xlabel, y = "Density") +
+    theme_classic(base_size = 13)
+}
+
+# Generate all 6 plots for one condition and return a list
+make_condition_plots <- function(promoted_ids, neg_ids, condition_label) {
+  list(
+    # Top row: lengths
+    plot_density(features, promoted_ids, neg_ids, "log2_utr5_length",
+                 "5' UTR length (log2 nt)", paste0("5' UTR length\n", condition_label)),
+    plot_density(features, promoted_ids, neg_ids, "log2_cds_length",
+                 "CDS length (log2 nt)", paste0("CDS length\n", condition_label)),
+    plot_density(features, promoted_ids, neg_ids, "log2_utr3_length",
+                 "3' UTR length (log2 nt)", paste0("3' UTR length\n", condition_label)),
+    # Bottom row: GC content
+    plot_density(features, promoted_ids, neg_ids, "utr5_gc",
+                 "5' UTR GC content (%)", paste0("5' UTR GC\n", condition_label)),
+    plot_density(features, promoted_ids, neg_ids, "cds_gc",
+                 "CDS GC content (%)", paste0("CDS GC\n", condition_label)),
+    plot_density(features, promoted_ids, neg_ids, "utr3_gc",
+                 "3' UTR GC content (%)", paste0("3' UTR GC\n", condition_label))
+  )
+}
+```
+
+# eIF3d Hypoxia 1 hr
+
+```{r d_hyp1_plots, fig.width=15, fig.height=8}
+plots_d_hyp1 <- make_condition_plots(d_hyp1_ids, neg_d_hyp1, "eIF3d hypoxia 1 hr")
+panel_d_hyp1 <- plot_grid(plotlist = plots_d_hyp1, nrow = 2, ncol = 3)
+panel_d_hyp1
+ggsave(
+  here("plots", "33_3d_hypoxia_1hr_utr_cds_length_gc.pdf"),
+  panel_d_hyp1, width = 15, height = 8
+)
+```
+
+# eIF3d Normoxia 1+4 hr
+
+```{r d_norm14_plots, fig.width=15, fig.height=8}
+plots_d_norm14 <- make_condition_plots(d_norm14_ids, neg_d_norm14, "eIF3d normoxia 1+4 hr")
+panel_d_norm14 <- plot_grid(plotlist = plots_d_norm14, nrow = 2, ncol = 3)
+panel_d_norm14
+ggsave(
+  here("plots", "33_3d_normoxia_1and4hr_utr_cds_length_gc.pdf"),
+  panel_d_norm14, width = 15, height = 8
+)
+```
+
+# eIF3e Hypoxia 1 hr
+
+```{r e_hyp1_plots, fig.width=15, fig.height=8}
+plots_e_hyp1 <- make_condition_plots(e_hyp1_ids, neg_e_hyp1, "eIF3e hypoxia 1 hr")
+panel_e_hyp1 <- plot_grid(plotlist = plots_e_hyp1, nrow = 2, ncol = 3)
+panel_e_hyp1
+ggsave(
+  here("plots", "33_3e_hypoxia_1hr_utr_cds_length_gc.pdf"),
+  panel_e_hyp1, width = 15, height = 8
+)
+```
+
+# eIF3e Normoxia 1+4 hr
+
+```{r e_norm14_plots, fig.width=15, fig.height=8}
+plots_e_norm14 <- make_condition_plots(e_norm14_ids, neg_e_norm14, "eIF3e normoxia 1+4 hr")
+panel_e_norm14 <- plot_grid(plotlist = plots_e_norm14, nrow = 2, ncol = 3)
+panel_e_norm14
+ggsave(
+  here("plots", "33_3e_normoxia_1and4hr_utr_cds_length_gc.pdf"),
+  panel_e_norm14, width = 15, height = 8
+)
+```
