@@ -1,0 +1,384 @@
+---
+title: "Notebook 35: RF Regression on Hypoxia/Normoxia eIF3d Residuals"
+output: html_document
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(cowplot)
+library(ggpubr)
+```
+
+# Overview
+
+Random forest regression predicting the **residual** from the normoxia vs hypoxia eIF3d TE LFC linear fit (notebook 34). Positive residuals = more hypoxia-specific eIF3d promotion than predicted from normoxia; negative = more normoxia-specific. Gene set restricted to significant promoted genes (LFC > 0.5, padj < 0.05 in normoxia or hypoxia 1hr).
+
+```{r params}
+feature_matrix_rds <- "feature_matrix_external_stability.rds"
+suffix             <- "eif3d_residuals_external_stability"
+```
+
+# Load Data
+
+```{r load_data}
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds)) %>%
+  dplyr::select(-any_of(c("te_lfc", "te_padj", "te_lfc_bin", "symbol")))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+residuals_df <- read_csv(here("output", "34_sig_genes_residuals.csv"),
+                         show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::select(gene_id_clean, symbol, outcome = residual,
+                te_lfc_normoxia, te_lfc_hypoxia)
+
+cat("Significant promoted genes:", nrow(residuals_df), "\n")
+cat("Outcome (residual) summary:\n")
+print(summary(residuals_df$outcome))
+```
+
+# Join Features and Outcome
+
+```{r create_outcome}
+model_genes <- features %>%
+  inner_join(residuals_df, by = "gene_id_clean") %>%
+  filter(!is.na(outcome))
+
+cat("Genes in model (feature matrix ∩ sig genes):", nrow(model_genes), "\n")
+```
+
+# Filter Features
+
+```{r filter_features}
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "outcome", "te_lfc", "te_padj", "te_lfc_bin",
+             "te_lfc_normoxia", "te_lfc_hypoxia", "eif3d_target", "category")
+id_pattern_cols <- colnames(model_genes)[str_detect(colnames(model_genes), "gene_id|transcript_id|^symbol$")]
+id_cols     <- unique(c(id_cols, id_pattern_cols))
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count:", length(feature_cols), "\n")
+
+# Use aggregate CLIP only
+aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                         "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                         "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment")
+regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+feature_cols  <- setdiff(feature_cols, regional_clip)
+
+# Remove k-mer / RBP motif columns
+kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+
+# Remove own-data TE features
+own_te_cols  <- feature_cols[str_detect(feature_cols, "^indiv_te_|^delta_te_|^sig_")]
+feature_cols <- setdiff(feature_cols, own_te_cols)
+
+# Remove sparse features (< 50% non-NA)
+sparse_cols  <- feature_cols[
+  sapply(feature_cols, function(f) mean(!is.na(model_genes[[f]])) < 0.5)
+]
+if (length(sparse_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, sparse_cols)
+  cat("Removed", length(sparse_cols), "sparse features\n")
+}
+
+cat("Feature count after filtering:", length(feature_cols), "\n")
+```
+
+# Train/Test Split and Imputation
+
+```{r train_test_split}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, outcome, all_of(feature_cols))
+
+set.seed(9)
+train_idx  <- createDataPartition(model_data$outcome, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+
+cat("Training set:", nrow(train_data), "\n")
+cat("Test set:", nrow(test_data), "\n")
+
+train_medians <- train_data %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~median(., na.rm = TRUE)))
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) {
+    df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  }
+  df
+}
+
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+
+# Rank outcome: percentile rank within training set; map test set via training ECDF
+train_data$outcome_rank <- rank(train_data$outcome, ties.method = "average") / nrow(train_data)
+ecdf_train              <- ecdf(train_data$outcome)
+test_data$outcome_rank  <- ecdf_train(test_data$outcome)
+```
+
+# Train Random Forest (rank outcome)
+
+```{r train_rf}
+set.seed(9)
+rf_model <- ranger(
+  x          = train_data[, feature_cols],
+  y          = train_data$outcome_rank,
+  num.trees  = 500,
+  importance = "impurity",
+  seed       = 9
+)
+
+print(rf_model)
+cat("OOB R²:", round(rf_model$r.squared, 4), "\n")
+```
+
+# Test Set Evaluation
+
+```{r test_set_evaluation, fig.width=6, fig.height=5}
+pred_test  <- predict(rf_model, test_data[, feature_cols])$predictions
+actual     <- test_data$outcome_rank
+
+r2_test    <- cor(pred_test, actual)^2
+rmse_test  <- sqrt(mean((pred_test - actual)^2))
+pearson_r  <- cor(pred_test, actual, method = "pearson")
+spearman_r <- cor(pred_test, actual, method = "spearman")
+
+cat("Test Set Metrics (rank outcome):\n")
+cat("  R²:        ", round(r2_test,    4), "\n")
+cat("  RMSE:      ", round(rmse_test,  4), "\n")
+cat("  Pearson r: ", round(pearson_r,  4), "\n")
+cat("  Spearman ρ:", round(spearman_r, 4), "\n")
+
+scatter_df <- data.frame(actual = actual, predicted = pred_test, symbol = test_data$symbol)
+
+p_scatter <- ggplot(scatter_df, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.4, size = 1.5, color = "#0072B2") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E69F00", linewidth = 0.8) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5, size = 3.5,
+           label = paste0("R² = ", round(r2_test, 3),
+                          "  |  Pearson r = ", round(pearson_r, 3),
+                          "  |  Spearman ρ = ", round(spearman_r, 3))) +
+  labs(
+    title = "RF Regression: Predicted vs Observed Residual Rank",
+    x     = "Observed residual percentile rank",
+    y     = "Predicted residual percentile rank"
+  ) +
+  theme_cowplot()
+
+print(p_scatter)
+ggsave(here("plots", paste0("rf_regression_scatter_", suffix, ".pdf")),
+       plot = p_scatter, width = 7, height = 5)
+```
+
+# 5-Fold Cross-Validation
+
+```{r cross_validation}
+set.seed(9)
+folds <- createFolds(train_data$outcome_rank, k = 5, list = TRUE)
+
+cv_results <- lapply(seq_along(folds), function(i) {
+  cat("Fold", i, "...\n")
+  test_idx <- folds[[i]]
+  train_cv <- train_data[-test_idx, ]
+  val_cv   <- train_data[test_idx, ]
+
+  cv_medians <- train_cv %>%
+    dplyr::select(all_of(feature_cols)) %>%
+    summarise(across(everything(), ~median(., na.rm = TRUE)))
+  train_cv <- impute_with_medians(train_cv, cv_medians)
+  val_cv   <- impute_with_medians(val_cv,   cv_medians)
+
+  train_cv$outcome_rank <- rank(train_cv$outcome, ties.method = "average") / nrow(train_cv)
+  val_cv$outcome_rank   <- ecdf(train_cv$outcome)(val_cv$outcome)
+
+  rf_cv    <- ranger(x = train_cv[, feature_cols], y = train_cv$outcome_rank,
+                     num.trees = 500, seed = 9)
+  pred_cv  <- predict(rf_cv, val_cv[, feature_cols])$predictions
+  actual_cv <- val_cv$outcome_rank
+
+  data.frame(
+    fold     = i,
+    R2       = cor(pred_cv, actual_cv)^2,
+    RMSE     = sqrt(mean((pred_cv - actual_cv)^2)),
+    Pearson  = cor(pred_cv, actual_cv, method = "pearson"),
+    Spearman = cor(pred_cv, actual_cv, method = "spearman")
+  )
+})
+
+cv_results_df <- bind_rows(cv_results)
+rownames(cv_results_df) <- NULL
+print(cv_results_df)
+
+cat("\nMean +/- SD:\n")
+for (metric in c("R2", "RMSE", "Pearson", "Spearman")) {
+  vals <- cv_results_df[[metric]]
+  cat(metric, ":", round(mean(vals, na.rm = TRUE), 4), "+/-",
+      round(sd(vals, na.rm = TRUE), 4), "\n")
+}
+```
+
+# Feature Importance
+
+```{r feature_importance, fig.width=10, fig.height=10}
+importance_df <- data.frame(
+  feature    = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%")
+  )
+
+cat("Top 30 Features:\n")
+print(importance_df %>% head(30) %>% dplyr::select(feature, importance))
+
+p_importance <- importance_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  labs(
+    title    = "Top 30 Features: Residual Regression (eIF3d hypoxia vs normoxia)",
+    subtitle = "Variable Importance (Impurity)",
+    x = "", y = "Variable Importance"
+  ) +
+  theme_cowplot()
+
+print(p_importance)
+ggsave(here("plots", paste0("rf_regression_feature_importance_", suffix, ".pdf")),
+       plot = p_importance, width = 10, height = 10)
+```
+
+## Feature Category Summary
+
+```{r feature_categories, fig.width=8, fig.height=5}
+importance_df <- importance_df %>%
+  mutate(
+    category = case_when(
+      str_detect(feature, "^struct_")                          ~ "RNA Structure",
+      str_detect(feature, "^orfquant_")                       ~ "ORFquant",
+      str_detect(feature, "^clip_")                           ~ "CLIP Binding",
+      str_detect(feature, "^lit_")                            ~ "Literature Signatures",
+      str_detect(feature, "length|Length")                     ~ "Region Lengths",
+      str_detect(feature, "_gc$|^gc3$")                       ~ "GC Content",
+      str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_")  ~ "4E / DAP5",
+      str_detect(feature, "^indiv_te_|^delta_te_")            ~ "Translational Efficiency",
+      str_detect(feature, "^codon_|^cai_|^tai_|^csc_")        ~ "Codon Optimality",
+      TRUE                                                     ~ "Other"
+    )
+  )
+
+category_summary <- importance_df %>%
+  group_by(category) %>%
+  summarise(total_importance = sum(importance), n_features = n()) %>%
+  arrange(desc(total_importance))
+
+print(category_summary)
+
+p_cat <- category_summary %>%
+  ggplot(aes(x = reorder(category, total_importance), y = total_importance)) +
+  geom_bar(stat = "identity", fill = "#56B4E9") +
+  coord_flip() +
+  labs(
+    title = "Feature Category Importance: Residual Regression",
+    x = "", y = "Total Importance"
+  ) +
+  theme_cowplot()
+
+print(p_cat)
+ggsave(here("plots", paste0("rf_regression_category_importance_", suffix, ".pdf")),
+       plot = p_cat, width = 8, height = 5)
+```
+
+## Directionality & Signed-Importance Lollipop
+
+```{r compute_directionality}
+directionality <- importance_df %>%
+  rowwise() %>%
+  mutate(
+    correlation = tryCatch(
+      cor(train_data[[feature]], train_data$outcome_rank, use = "complete.obs"),
+      error = function(e) NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    direction = case_when(
+      is.na(correlation) ~ NA_character_,
+      correlation > 0    ~ "Positively correlated with residual rank",
+      TRUE               ~ "Negatively correlated with residual rank"
+    )
+  ) %>%
+  arrange(desc(importance))
+
+cat("Positively correlated:", sum(directionality$direction == "Positively correlated with residual rank", na.rm = TRUE), "\n")
+cat("Negatively correlated:", sum(directionality$direction == "Negatively correlated with residual rank", na.rm = TRUE), "\n")
+```
+
+```{r plot_lollipop, fig.width=10, fig.height=10}
+lollipop_data <- directionality %>%
+  filter(!is.na(correlation)) %>%
+  head(30) %>%
+  mutate(
+    signed_importance = importance * sign(correlation),
+    broad_category = case_when(
+      category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+      category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+      category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+      category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+      TRUE                                                     ~ "Intrinsic mRNA features"
+    ),
+    broad_category = factor(broad_category, levels = c(
+      "Intrinsic mRNA features", "eIF3 binding evidence",
+      "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+    )),
+    feature_clean = fct_reorder(feature_clean, signed_importance)
+  )
+
+category_colors <- c(
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1",
+  "Translation in hypoxia"  = "#E07030"
+)
+
+p_lollipop <- ggdotchart(
+  lollipop_data,
+  x        = "feature_clean",
+  y        = "signed_importance",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 4,
+  xlab     = "",
+  ylab     = "Signed Importance (positive = higher residual rank)",
+  title    = "Top 30 Features: Signed Importance",
+  subtitle = "Residual rank regression (hypoxia vs normoxia eIF3d)"
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_lollipop)
+ggsave(here("plots", paste0("rf_regression_lollipop_", suffix, ".pdf")),
+       plot = p_lollipop, width = 10, height = 10)
+```
