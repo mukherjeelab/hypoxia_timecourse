@@ -1,5 +1,5 @@
 ---
-title: "Notebook 35: RF Regression on Hypoxia/Normoxia eIF3d Residuals"
+title: "Notebook 37: RF Regression on eIF3d Residuals (relaxed filter: te_lfc > 0)"
 output: html_document
 date: "`r Sys.Date()`"
 editor_options:
@@ -17,33 +17,72 @@ library(ranger)
 library(caret)
 library(cowplot)
 library(ggpubr)
+library(broom)
 ```
 
 # Overview
 
-Random forest regression predicting the **residual** from the normoxia vs hypoxia eIF3d TE LFC linear fit (notebook 34). Positive residuals = more hypoxia-specific eIF3d promotion than predicted from normoxia; negative = more normoxia-specific. Gene set restricted to significant promoted genes (LFC > 0.5, padj < 0.05 in normoxia or hypoxia 1hr).
+Same approach as notebook 35 but with a configurable gene filter (params: `lfc_min`, `padj_max`).
+Default: `te_lfc > 0` in normoxia OR hypoxia, `padj < 1` (no significance filter).
+Set `padj_max = 0.3` for a loose filter or `0.05` to match nb35's strict threshold.
+Residuals are computed inline from the same normoxia~hypoxia linear regression as nb34.
 
 ```{r params}
 feature_matrix_rds <- "feature_matrix_external_stability.rds"
-suffix             <- "eif3d_residuals_external_stability"
+
+# Gene filter parameters
+# lfc_min:  minimum te_lfc in normoxia OR hypoxia (use 0 for any positive effect)
+# padj_max: maximum padj in normoxia OR hypoxia (use 1 to disable p-value filter)
+lfc_min  <- 0
+padj_max <- 0.3   # e.g. set to 0.3 for loose filter, 0.05 for strict
+
+suffix <- paste0("eif3d_residuals_lfc", lfc_min,
+                 "_padj", padj_max,
+                 "_external_stability")
+cat("Suffix:", suffix, "\n")
 ```
 
-# Load Data
+# Compute Residuals
 
-```{r load_data}
+```{r compute_residuals}
+normoxia    <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+                        show_col_types = FALSE)
+hypoxia_1hr <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+                        show_col_types = FALSE)
+
+plot_df <- normoxia %>%
+  dplyr::select(gene_id, symbol, te_lfc_normoxia = te_lfc, te_padj_normoxia = te_padj) %>%
+  inner_join(
+    hypoxia_1hr %>% dplyr::select(gene_id, te_lfc_hypoxia = te_lfc, te_padj_hypoxia = te_padj),
+    by = "gene_id"
+  )
+
+cat("Genes measured in both conditions:", nrow(plot_df), "\n")
+
+lm_fit  <- lm(te_lfc_hypoxia ~ te_lfc_normoxia, data = plot_df, na.action = na.exclude)
+plot_df <- augment(lm_fit, data = plot_df)
+
+# Filter by lfc_min and padj_max (set padj_max = 1 to disable p-value filter)
+residuals_df <- plot_df %>%
+  filter(
+    (te_lfc_normoxia > lfc_min | te_lfc_hypoxia > lfc_min),
+    (te_padj_normoxia < padj_max | te_padj_hypoxia < padj_max)
+  ) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::select(gene_id_clean, symbol, outcome = .resid,
+                te_lfc_normoxia, te_lfc_hypoxia)
+
+cat(sprintf("Genes passing filter (lfc > %g, padj < %g): %d\n", lfc_min, padj_max, nrow(residuals_df)))
+cat("Outcome (residual) summary:\n")
+print(summary(residuals_df$outcome))
+```
+
+# Load Feature Matrix
+
+```{r load_features}
 features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds)) %>%
   dplyr::select(-any_of(c("te_lfc", "te_padj", "te_lfc_bin", "symbol")))
 cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
-
-residuals_df <- read_csv(here("output", "34_sig_genes_residuals.csv"),
-                         show_col_types = FALSE) %>%
-  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
-  dplyr::select(gene_id_clean, symbol, outcome = residual,
-                te_lfc_normoxia, te_lfc_hypoxia)
-
-cat("Significant promoted genes:", nrow(residuals_df), "\n")
-cat("Outcome (residual) summary:\n")
-print(summary(residuals_df$outcome))
 ```
 
 # Join Features and Outcome
@@ -53,7 +92,7 @@ model_genes <- features %>%
   inner_join(residuals_df, by = "gene_id_clean") %>%
   filter(!is.na(outcome))
 
-cat("Genes in model (feature matrix ∩ sig genes):", nrow(model_genes), "\n")
+cat("Genes in model (feature matrix ∩ filtered genes):", nrow(model_genes), "\n")
 ```
 
 # Filter Features
@@ -64,7 +103,7 @@ id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
              "symbol", "outcome", "te_lfc", "te_padj", "te_lfc_bin",
              "te_lfc_normoxia", "te_lfc_hypoxia", "eif3d_target", "category")
 id_pattern_cols <- colnames(model_genes)[str_detect(colnames(model_genes), "gene_id|transcript_id|^symbol$")]
-id_cols     <- unique(c(id_cols, id_pattern_cols))
+id_cols      <- unique(c(id_cols, id_pattern_cols))
 feature_cols <- setdiff(colnames(model_genes), id_cols)
 cat("Initial feature count:", length(feature_cols), "\n")
 
@@ -200,7 +239,7 @@ prec_df <- scatter_df %>%
 
 n_positive  <- sum(scatter_df$residual >= resid_threshold)
 prec_at_n   <- prec_df$precision[prec_df$rank_k == n_positive]
-auc_pk      <- mean(prec_df$precision) / baseline  # normalized to baseline
+auc_pk      <- mean(prec_df$precision) / baseline
 
 cat("Positive set size (top quartile):", n_positive, "\n")
 cat(sprintf("Precision@%d: %.3f (baseline = %.2f, fold-enrichment = %.2fx)\n",
@@ -238,7 +277,7 @@ scatter_df <- scatter_df %>%
 p_quartile <- ggplot(scatter_df, aes(x = factor(pred_quartile), y = actual)) +
   geom_boxplot(fill = "grey90", color = "black", outlier.size = 0.8) +
   labs(title = "Actual residual rank by predicted quartile",
-       x = "Predicted quartile (1 = normoxia-specific → 4 = hypoxia-specific)",
+       x = "Predicted quartile (1 = normoxia-specific \u2192 4 = hypoxia-specific)",
        y = "Observed residual percentile rank") +
   theme_classic(base_size = 13)
 
@@ -268,9 +307,9 @@ cv_results <- lapply(seq_along(folds), function(i) {
   train_cv$outcome_rank <- rank(train_cv$outcome, ties.method = "average") / nrow(train_cv)
   val_cv$outcome_rank   <- ecdf(train_cv$outcome)(val_cv$outcome)
 
-  rf_cv    <- ranger(x = train_cv[, feature_cols], y = train_cv$outcome_rank,
-                     num.trees = 500, seed = 9)
-  pred_cv  <- predict(rf_cv, val_cv[, feature_cols])$predictions
+  rf_cv     <- ranger(x = train_cv[, feature_cols], y = train_cv$outcome_rank,
+                      num.trees = 500, seed = 9)
+  pred_cv   <- predict(rf_cv, val_cv[, feature_cols])$predictions
   actual_cv <- val_cv$outcome_rank
 
   data.frame(
@@ -337,7 +376,7 @@ p_importance <- importance_df %>%
   coord_flip() +
   labs(
     title    = "Top 30 Features: Residual Regression (eIF3d hypoxia vs normoxia)",
-    subtitle = "Variable Importance (Impurity)",
+    subtitle = "Variable Importance (Impurity) — relaxed filter (te_lfc > 0)",
     x = "", y = "Variable Importance"
   ) +
   theme_cowplot()
@@ -454,7 +493,7 @@ p_lollipop <- ggdotchart(
   xlab     = "",
   ylab     = "Signed Importance (positive = higher residual rank)",
   title    = "Top 30 Features: Signed Importance",
-  subtitle = "Residual rank regression (hypoxia vs normoxia eIF3d)"
+  subtitle = "Residual rank regression — relaxed filter (te_lfc > 0)"
 ) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
   theme(legend.title = element_blank())
@@ -462,4 +501,8 @@ p_lollipop <- ggdotchart(
 print(p_lollipop)
 ggsave(here("plots", paste0("rf_regression_lollipop_", suffix, ".pdf")),
        plot = p_lollipop, width = 10, height = 10)
+```
+
+```{r}
+
 ```

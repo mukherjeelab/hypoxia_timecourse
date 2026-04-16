@@ -7,10 +7,12 @@ params:
   gene: "3d"
   direction: "promotes"
   timepoint: "1hr"
+  timepoint_nor: "1and4hr"
   lfc: "0.5"
-  feature_set: "te_lfc"
+  feature_set: "external_stability"
   clip_mode: "aggregate"
   source_model: "no_boruta"
+  exclude_own_te: true
 editor_options:
   chunk_output_type: console
 ---
@@ -28,30 +30,30 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
     gene      = "3d",
     direction = "promotes",
-    timepoint = "1hr",
+    timepoint     = "1hr",           # hypoxia timepoint
+    timepoint_nor = "1and4hr",       # normoxia timepoint
     lfc       = "0.5",
-    feature_set = "te_lfc", #targeted, combined, structure, clip_split, or te_lfc
-    clip_mode   = "aggregate", # "individual", "aggregate", or "both"
-    source_model = "no_boruta" # "no_boruta" (07) or "boruta" (06)
+    feature_set = "external_stability",
+    clip_mode   = "aggregate",
+    source_model = "no_boruta",
+    exclude_own_te = TRUE            # appends _noOwnTE to match 07 output
   )
 }
 
 # Build suffixes for each condition
-make_suffix <- function(condition) {
+make_suffix <- function(condition, timepoint = params$timepoint) {
   base <- paste0("eif3", params$gene, "_", params$direction, "_",
-                 condition, "_", params$timepoint, "_lfc", params$lfc,
+                 condition, "_", timepoint, "_lfc", params$lfc,
                  "_", params$feature_set, "_clip", params$clip_mode)
-  if (params$source_model == "no_boruta") {
-    paste0(base, "_no_boruta")
-  } else {
-    base
-  }
+  suffix <- if (params$source_model == "no_boruta") paste0(base, "_no_boruta") else base
+  if (isTRUE(params$exclude_own_te)) paste0(suffix, "_noOwnTE") else suffix
 }
 
-suffix_hyp <- make_suffix("hypoxia")
-suffix_nor <- make_suffix("normoxia")
+suffix_hyp <- make_suffix("hypoxia", params$timepoint)
+suffix_nor <- make_suffix("normoxia", params$timepoint_nor)
 gene_label <- paste0("eIF", params$gene)
-subtitle_label <- paste0(gene_label, " ", params$direction, " | ", params$timepoint,
+subtitle_label <- paste0(gene_label, " ", params$direction,
+                         " | hyp: ", params$timepoint, " vs nor: ", params$timepoint_nor,
                          " | LFC ", params$lfc, " | ", params$feature_set,
                          " | clip", params$clip_mode, " | ", params$source_model)
 
@@ -77,11 +79,11 @@ library(ggpubr)
 # Load Data
 
 ```{r load_data}
-# Directionality CSVs (from 08)
+# Directionality CSVs (from 07)
 dir_hyp <- read_csv(here("output", "predictive_modeling",
-  paste0("rf_feature_directionality_", suffix_hyp, ".csv")))
+  paste0("rf_classification_directionality_", suffix_hyp, ".csv")))
 dir_nor <- read_csv(here("output", "predictive_modeling",
-  paste0("rf_feature_directionality_", suffix_nor, ".csv")))
+  paste0("rf_classification_directionality_", suffix_nor, ".csv")))
 
 cat("Hypoxia features:", nrow(dir_hyp), "\n")
 cat("Normoxia features:", nrow(dir_nor), "\n")
@@ -105,14 +107,14 @@ cat("Unique features in lookup:", nrow(feature_lookup), "\n")
 # Join Conditions
 
 ```{r join_data}
-# Normalize importance to proportions within each model so that
+# Normalize importance to % share within each model so that
 # values are on a common scale (raw impurity importance is not
 # comparable across independently trained forests).
-dir_hyp <- dir_hyp %>% mutate(importance = importance / sum(importance))
-dir_nor <- dir_nor %>% mutate(importance = importance / sum(importance))
+dir_hyp <- dir_hyp %>% mutate(importance = 100 * importance / sum(importance))
+dir_nor <- dir_nor %>% mutate(importance = 100 * importance / sum(importance))
 
-cat("Hypoxia importance sums to:", sum(dir_hyp$importance), "\n")
-cat("Normoxia importance sums to:", sum(dir_nor$importance), "\n")
+cat("Hypoxia importance sums to:", sum(dir_hyp$importance), "%\n")
+cat("Normoxia importance sums to:", sum(dir_nor$importance), "%\n")
 
 # Inner join directionality tables on feature
 joined <- inner_join(
@@ -147,13 +149,18 @@ cat("Features only in normoxia:", sum(!dir_nor$feature %in% dir_hyp$feature), "\
 ## 1. Scatter Plot: Hypoxia vs Normoxia Importance
 
 ```{r scatter_plot, fig.width=10, fig.height=9}
-# Label top features by combined importance
-top_n_label <- min(15, nrow(joined))
-label_data <- joined %>% head(top_n_label)
+# Label top features by distance from diagonal (abs delta = residual from y=x)
+top_n_label <- 4
+label_data <- joined %>%
+  slice_max(abs(delta_importance), n = top_n_label)
 
-p_scatter <- ggplot(joined, aes(x = importance_hyp, y = importance_nor)) +
-  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
-  geom_point(aes(color = category), size = 3, alpha = 0.7) +
+p_scatter <- ggplot(joined, aes(x = importance_nor, y = importance_hyp)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey60") +
+  geom_point(aes(color = delta_sign), size = 3, alpha = 0.85) +
+  scale_color_manual(
+    values = c("Higher in Hypoxia" = "#E69F00", "Higher in Normoxia" = "#0072B2"),
+    name = NULL
+  ) +
   ggrepel::geom_text_repel(
     data = label_data,
     aes(label = feature_clean),
@@ -163,18 +170,217 @@ p_scatter <- ggplot(joined, aes(x = importance_hyp, y = importance_nor)) +
   labs(
     title = "Variable Importance: Hypoxia vs Normoxia",
     subtitle = subtitle_label,
-    x = "Relative Importance (Hypoxia)",
-    y = "Relative Importance (Normoxia)",
-    color = "Category"
+    x = "Normoxia: % of total importance",
+    y = "Hypoxia: % of total importance"
   )
 
 print(p_scatter)
 
 ggsave(here("plots", paste0("rf_importance_comparison_scatter_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
        plot = p_scatter, width = 10, height = 9)
+
+
 ```
 
-## 2. Dumbbell Plot: Paired Importance by Condition
+## 2. Signed Importance Quadrant Plot
+
+```{r signed_importance_quadrant, fig.width=10, fig.height=9}
+# Signed importance = % share × sign(correlation)
+# Positive = feature higher in eIF3d targets; negative = lower in eIF3d targets
+quad_levels <- c(
+  "Up in both\n(same direction)",
+  "Down in both\n(same direction)",
+  "Discordant\n(hyp+, nor−)",
+  "Discordant\n(hyp−, nor+)"
+)
+
+quad_data <- joined %>%
+  mutate(
+    signed_hyp = importance_hyp * sign(correlation_hyp),
+    signed_nor = importance_nor * sign(correlation_nor),
+    quadrant = factor(case_when(
+      signed_nor >= 0 & signed_hyp >= 0 ~ "Up in both\n(same direction)",
+      signed_nor <  0 & signed_hyp <  0 ~ "Down in both\n(same direction)",
+      signed_nor <  0 & signed_hyp >= 0 ~ "Discordant\n(hyp+, nor−)",
+      signed_nor >= 0 & signed_hyp <  0 ~ "Discordant\n(hyp−, nor+)"
+    ), levels = quad_levels)
+  )
+
+quad_colors <- c(
+  "Up in both\n(same direction)"  = "#009E73",
+  "Down in both\n(same direction)"   = "#D55E00",
+  "Discordant\n(hyp+, nor−)"             = "#CC79A7",
+  "Discordant\n(hyp−, nor+)"             = "#0072B2"
+)
+
+quad_labels <- bind_rows(
+  quad_data %>% filter(signed_nor >= 0, signed_hyp >= 0) %>%
+    slice_max(sqrt(signed_hyp^2 + signed_nor^2), n = 1),
+  quad_data %>% filter(signed_nor <  0, signed_hyp <  0) %>%
+    slice_max(sqrt(signed_hyp^2 + signed_nor^2), n = 1),
+  quad_data %>% filter(signed_nor <  0, signed_hyp >= 0) %>%
+    slice_max(sqrt(signed_hyp^2 + signed_nor^2), n = 1),
+  quad_data %>% filter(signed_nor >= 0, signed_hyp <  0) %>%
+    slice_max(sqrt(signed_hyp^2 + signed_nor^2), n = 1)
+)
+
+p_quad <- ggplot(quad_data, aes(x = signed_nor, y = signed_hyp)) +
+  geom_vline(xintercept = 0, color = "grey60", linewidth = 0.5) +
+  geom_hline(yintercept = 0, color = "grey60", linewidth = 0.5) +
+  geom_point(aes(color = quadrant), size = 3, alpha = 0.85) +
+  scale_color_manual(values = quad_colors, name = NULL) +
+  ggrepel::geom_text_repel(
+    data = quad_labels,
+    aes(label = feature_clean),
+    size = 3, max.overlaps = 20, segment.color = "grey50"
+  ) +
+  theme_cowplot() +
+  labs(
+    title = "Signed Importance: Hypoxia vs Normoxia",
+    subtitle = subtitle_label,
+    x = "Normoxia: signed importance (% share × direction)",
+    y = "Hypoxia: signed importance (% share × direction)"
+  )
+
+print(p_quad)
+
+ggsave(here("plots", paste0("rf_importance_quadrant_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_quad, width = 10, height = 9)
+```
+
+```{r hypoxia_score_barplot, fig.width=8, fig.height=10}
+p_hyp_bar <- ggbarplot(
+  quad_data,
+  x        = "feature_clean",
+  y        = "delta_importance",
+  fill     = "quadrant",
+  palette  = quad_colors,
+  sort.val = "asc",
+  sort.by.groups = FALSE,
+  rotate   = TRUE,
+  xlab     = "",
+  ylab     = "Hypoxia-Specific Score (% Hypoxia \u2212 % Normoxia)",
+  title    = "Feature Importance: Hypoxia-Specific Score",
+  subtitle = subtitle_label
+) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+print(p_hyp_bar)
+
+ggsave(here("plots", paste0("rf_importance_hyp_score_barplot_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_hyp_bar, width = 8, height = 10)
+```
+
+```{r hypoxia_score_barplot_top30, fig.width=14, fig.height=5}
+top30_data <- quad_data %>%
+  slice_max(abs(delta_importance), n = 30)
+
+p_hyp_bar_top30 <- ggbarplot(
+  top30_data,
+  x        = "feature_clean",
+  y        = "delta_importance",
+  fill     = "quadrant",
+  palette  = quad_colors,
+  sort.val = "desc",
+  sort.by.groups = FALSE,
+  rotate   = FALSE,
+  xlab     = "",
+  ylab     = "Hypoxia-Specific Score (% Hypoxia - % Normoxia)",
+  title    = "Feature Importance: Hypoxia-Specific Score (Top 30 by |score|)",
+  subtitle = subtitle_label
+) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  theme(legend.title = element_blank(),
+        legend.position = "right",
+        legend.key.size = unit(0.5, "cm"),
+        legend.key.spacing.y = unit(0.4, "cm"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+print(p_hyp_bar_top30)
+
+ggsave(here("plots", paste0("rf_importance_hyp_score_barplot_top30_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_hyp_bar_top30, width = 12, height = 5)
+```
+
+```{r}
+# Same scatter, colored by quadrant (directionality-aware)
+scatter_quad_labels <- quad_data %>%
+  slice_max(abs(delta_importance), n = 8)
+
+p_scatter_quad <- ggplot(quad_data, aes(x = importance_nor, y = importance_hyp)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey60") +
+  geom_point(aes(color = quadrant), size = 3, alpha = 0.85) +
+  scale_color_manual(values = quad_colors, name = NULL) +
+  ggrepel::geom_text_repel(
+    data = scatter_quad_labels,
+    aes(label = feature_clean),
+    size = 3, max.overlaps = 20,
+    segment.color = "black", segment.linewidth = 0.5,
+    segment.alpha = 0.8, min.segment.length = 0,
+    box.padding = 0.5
+  ) +
+  theme_cowplot() +
+  labs(
+    title = "Variable Importance: Hypoxia vs Normoxia",
+    subtitle = subtitle_label,
+    x = "Normoxia: % of total importance",
+    y = "Hypoxia: % of total importance"
+  )
+
+print(p_scatter_quad)
+
+ggsave(here("plots", paste0("rf_importance_comparison_scatter_quad_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_scatter_quad, width = 10, height = 9)
+
+# Same scatter, colored by four broad categories
+broad_colors <- c(
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1"
+)
+
+quad_data <- quad_data %>%
+  mutate(broad_category = case_when(
+    str_detect(feature, "^clip_")                                          ~ "eIF3 binding evidence",
+    str_detect(feature, "^dap5_|^lit_DAP5")                               ~ "Sensitivity to DAP5",
+    str_detect(feature, "^4e_resistance|^eif4e_ip|^lit_eIF4E|^lit_eIF4E2|
+                          ^lit_mTOR|^lit_phospho_eIF4E|^lit_TOP|
+                          ^lit_translation_is|^lit_si_eIF4")               ~ "Sensitivity to eIF4E",
+    TRUE                                                                   ~ "Intrinsic mRNA features"
+  ))
+
+p_scatter_cat <- ggplot(quad_data, aes(x = importance_nor, y = importance_hyp)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey60") +
+  geom_point(aes(color = broad_category), size = 3, alpha = 0.85) +
+  scale_color_manual(values = broad_colors, name = NULL) +
+  ggrepel::geom_text_repel(
+    data = scatter_quad_labels,
+    aes(label = feature_clean),
+    size = 6, max.overlaps = 20,
+    segment.color = "black", segment.linewidth = 0.5,
+    segment.alpha = 0.8, min.segment.length = 0,
+    box.padding = 0.5
+  ) +
+  theme_cowplot(font_size = 20) +
+  labs(
+    title = "Variable Importance: Hypoxia vs Normoxia",
+    subtitle = subtitle_label,
+    x = "Normoxia: % of total importance",
+    y = "Hypoxia: % of total importance"
+  )
+
+print(p_scatter_cat)
+
+ggsave(here("plots", paste0("rf_importance_comparison_scatter_broad_", suffix_hyp, "_vs_", suffix_nor, ".pdf")),
+       plot = p_scatter_cat, width = 10, height = 9)
+```
+
+
+
+## 3. Dumbbell Plot: Paired Importance by Condition
 
 ```{r dumbbell_plot, fig.width=10, fig.height=10}
 # Top features by max importance across conditions
@@ -198,7 +404,7 @@ p_dumbbell <- ggplot(dumbbell_data) +
   labs(
     title = "Top 30 Features: Paired Importance by Condition",
     subtitle = subtitle_label,
-    x = "Relative Importance (Proportion)",
+    x = "% of total importance",
     y = ""
   )
 
@@ -329,12 +535,20 @@ cat("Exported:", nrow(export_df), "features\n")
 ```{r venn_genesets, fig.width=6, fig.height=5}
 library(ggVennDiagram)
 
-norm_genes <- read_csv(
-  here("output", "genesets",
-       paste0("normoxia_", params$gene, "_", params$direction,
-              "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")),
-  show_col_types = FALSE
-) %>% pull(db_gene_symbol)
+norm_genes <- if (params$timepoint_nor %in% c("1and4hr", "alltimepoints")) {
+  read_csv(here("output",
+    paste0("translation_categories_si", params$gene, "_vs_sictrl_normoxia_",
+           params$timepoint_nor, ".csv")),
+    show_col_types = FALSE) %>%
+    filter(te_lfc > as.numeric(params$lfc), te_padj < 0.05) %>%
+    pull(symbol)
+} else {
+  read_csv(here("output", "genesets",
+    paste0("normoxia_", params$gene, "_", params$direction,
+           "_TE_", params$timepoint_nor, "_lfc", params$lfc, ".csv")),
+    show_col_types = FALSE) %>%
+    pull(db_gene_symbol)
+}
 
 hyp_genes <- read_csv(
   here("output", "genesets",

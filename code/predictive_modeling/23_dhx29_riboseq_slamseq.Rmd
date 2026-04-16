@@ -159,22 +159,45 @@ dhx29_occupancy <- tibble(
   dhx29_occupancy_score = occupancy_scores
 ) %>%
   left_join(tx_gene, by = "transcript_id_clean") %>%
-  filter(!is.na(ensembl_gene), !is.na(dhx29_occupancy_score))
+  filter(!is.na(ensembl_gene), !is.na(dhx29_occupancy_score)) %>%
+  mutate(across(where(is.list), ~ as.character(unlist(.x))))
 
 cat("Genes with DHX29 occupancy score:", nrow(dhx29_occupancy), "\n")
 cat("Summary:\n")
 print(summary(dhx29_occupancy$dhx29_occupancy_score))
 ```
 
+```{r dhx29_occupancy_sanity_check}
+# Simpler alternative: str_extract_all splits codons via regex instead of index arithmetic
+compute_occupancy_v2 <- function(seq_char) {
+  n_codons <- nchar(seq_char) / 3
+  if (n_codons < 10) return(NA_real_)
+  codons <- str_extract_all(seq_char, "...")[[1]]   # "..." matches exactly 3 chars, non-overlapping
+  codons <- codons[!codons %in% stop_codons]
+  sum(ces_vec[codons], na.rm = TRUE) / n_codons
+}
+
+occupancy_v2 <- vapply(cds_char, compute_occupancy_v2, numeric(1))
+names(occupancy_v2) <- names(cds_sequences)
+
+stopifnot(isTRUE(all.equal(occupancy_scores, occupancy_v2)))
+cat("Sanity check passed: v1 and v2 produce identical scores.\n")
+```
+
 ```{r dhx29_occupancy_annotate}
 dhx29_occupancy <- dhx29_occupancy %>%
-  mutate(group = case_when(
-    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
-    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
-    TRUE                            ~ "All other genes"
-  ))
+  mutate(
+    ensembl_gene = as.character(unlist(ensembl_gene)),
+    group = case_when(
+      ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+      ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+      TRUE                            ~ "All other genes"
+    )
+  )
 
 cat("Group counts:\n")
+print(table(dhx29_occupancy$group))
+
 print(dhx29_occupancy %>% count(group))
 ```
 
@@ -195,17 +218,17 @@ p_occ <- ggplot() +
   geom_density(
     data = bg_occ,
     aes(x = dhx29_occupancy_score),
-    color = NA, fill = "grey80", alpha = 0.6
+    color = "grey60", fill = NA, linewidth = 0.9
   ) +
   geom_density(
     data = fg_occ %>% filter(group == "Negative control"),
-    aes(x = dhx29_occupancy_score, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    aes(x = dhx29_occupancy_score, color = group),
+    fill = NA, linewidth = 0.9
   ) +
   geom_density(
     data = fg_occ %>% filter(group == "eIF3d hypoxia promotes"),
-    aes(x = dhx29_occupancy_score, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    aes(x = dhx29_occupancy_score, color = group),
+    fill = NA, linewidth = 0.9
   ) +
   geom_vline(
     data = median_occ,
@@ -213,14 +236,13 @@ p_occ <- ggplot() +
     linetype = "dashed", linewidth = 0.6
   ) +
   scale_color_manual(values = set_colors) +
-  scale_fill_manual(values  = set_colors) +
   labs(
     title    = "DHX29 ribosome occupancy: eIF3d-promoted genes (hypoxia 1hr)",
     subtitle = "Occupancy = weighted mean CES across CDS codons (S8 Fold_Change weights)\nGrey = all other genes; dashed = median",
     x = "DHX29 occupancy score", y = "Density",
-    color = NULL, fill = NULL
+    color = NULL
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_occ
@@ -1163,6 +1185,19 @@ cat("  dhx29_slamseq_ctrl_halflife:",
     sum(!is.na(fm_dhx29$dhx29_slamseq_ctrl_halflife)), "/", nrow(fm_dhx29), "\n")
 cat("  dhx29_slamseq_logFC:        ",
     sum(!is.na(fm_dhx29$dhx29_slamseq_logFC)), "/", nrow(fm_dhx29), "\n")
+
+# Sanity check: scores in feature matrix match dhx29_occupancy source
+check_genes <- intersect(fm_dhx29$gene_id_clean, dhx29_occupancy$ensembl_gene)
+fm_scores  <- fm_dhx29 %>%
+  filter(gene_id_clean %in% check_genes) %>%
+  arrange(gene_id_clean) %>%
+  pull(dhx29_occupancy_score)
+src_scores <- dhx29_occupancy %>%
+  filter(ensembl_gene %in% check_genes) %>%
+  arrange(ensembl_gene) %>%
+  pull(dhx29_occupancy_score)
+stopifnot(isTRUE(all.equal(fm_scores, src_scores)))
+cat("Sanity check passed: feature matrix occupancy scores match source (", length(check_genes), "genes).\n")
 
 saveRDS(fm_dhx29, here("output", "predictive_modeling", "feature_matrix_dhx29.rds"))
 cat("\nSaved: output/predictive_modeling/feature_matrix_dhx29.rds\n")
