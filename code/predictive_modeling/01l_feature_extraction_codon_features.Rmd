@@ -1,0 +1,488 @@
+---
+title: "01l — Feature Extraction: Background-Corrected RSCU & Codon Frequencies"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Adds three sets of codon-level features to `feature_matrix_external_stability.rds`
+(which already incorporates positional CSC from 01j and CDS/3'UTR structure from 01k),
+producing `feature_matrix_codon_features.rds`.
+
+**Features added (121 total new columns):**
+
+1. **Per-codon background-corrected RSCU** (`bg_rscu_*`, 59 columns) — for each
+   multi-synonymous codon, the ratio of per-transcript codon proportion to the
+   transcriptome-wide average proportion. bg_RSCU = 1 → on-background;
+   > 1 → over-used; < 1 → under-used.
+
+2. **bg-RSCU summary scores** (3 columns) — `bg_rscu_at_mean`, `bg_rscu_gc_mean`,
+   `bg_rscu_deviation` (mean squared deviation from 1).
+
+3. **Per-codon raw frequency** (`codon_freq_*`, 59 columns) — count_j /
+   total_sense_codons (length-normalized absolute frequency per transcript).
+
+Multi-synonymous codons only (Met ATG and Trp TGG excluded — no synonyms,
+bg_RSCU always = 1 by construction).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+```
+
+---
+
+# Section 1: Load Base Feature Matrix
+
+```{r load_feature_matrix}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Base feature matrix:", nrow(feature_matrix), "genes x", ncol(feature_matrix), "columns\n")
+```
+
+---
+
+# Section 2: CDS Sequences & Codon Counts
+
+```{r extract_cds}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r codon_counts}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts x", ncol(counts_mat0), "codons\n")
+```
+
+---
+
+# Section 3: Genetic Code Setup
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+multi_syn_codons <- intersect(unlist(aa_to_codons[multi_aa]), colnames(counts_mat0))
+
+codon_gc3 <- tibble(
+  codon     = sense_codons,
+  gc3_class = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
+)
+
+cat("Multi-synonymous codons available in counts matrix:", length(multi_syn_codons),
+    "(expected 59: 61 sense minus Met ATG, Trp TGG)\n")
+```
+
+---
+
+# Section 4: Background-Corrected RSCU
+
+## 4a: Background proportions
+
+```{r bg_props}
+# Per-AA mean per-transcript codon proportion across all expressed mRNAs.
+# Equal weight per gene (consistent with per-transcript averaging used in nb 38).
+bg_props <- imap(aa_to_codons, function(codons, aa) {
+  codons  <- intersect(codons, colnames(counts_mat0))
+  if (length(codons) == 0) return(NULL)
+  sub_cnt <- counts_mat0[, codons, drop = FALSE]
+  aa_tot  <- rowSums(sub_cnt)
+  valid   <- aa_tot > 0
+  if (!any(valid)) return(NULL)
+  prop_mat <- sub_cnt[valid, , drop = FALSE] / aa_tot[valid]
+  colMeans(prop_mat)
+})
+bg_props <- Filter(Negate(is.null), bg_props)
+
+cat("Background proportions computed for", length(bg_props), "amino acids\n")
+
+# Sanity check: each AA's proportions must sum to 1
+prop_sums <- sapply(bg_props, sum)
+stopifnot(all(abs(prop_sums - 1) < 1e-6))
+cat("bg_props sum check: passed (all AAs sum to 1)\n")
+```
+
+## 4b: Per-transcript background-corrected RSCU matrix
+
+```{r compute_bg_rscu}
+compute_bg_rscu_matrix <- function(counts_mat, bg_props) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(bg_props)) {
+    props  <- bg_props[[aa]]
+    codons <- intersect(names(props), colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    for (codon in codons) {
+      bp <- props[codon]
+      if (bp > 0 && any(valid)) {
+        rscu_mat[valid, codon] <- (sub_cnt[valid, codon] / aa_tot[valid]) / bp
+      }
+    }
+  }
+  rscu_mat
+}
+
+bg_rscu_mat0 <- compute_bg_rscu_matrix(counts_mat0, bg_props)
+cat("bg-RSCU matrix:", nrow(bg_rscu_mat0), "x", ncol(bg_rscu_mat0), "\n")
+
+# Sanity: no negative values
+stopifnot(min(bg_rscu_mat0, na.rm = TRUE) >= 0)
+cat("No negative bg-RSCU values: passed\n")
+
+# Sanity: mean per codon across all transcripts must be ≈ 1 (by construction)
+bg_codon_means <- colMeans(bg_rscu_mat0[, multi_syn_codons], na.rm = TRUE)
+cat("Mean bg-RSCU per codon range:", round(range(bg_codon_means), 4), "(expected ≈ 1)\n")
+stopifnot(all(abs(bg_codon_means - 1) < 0.01))
+cat("bg-RSCU mean ≈ 1 check: passed\n")
+```
+
+## 4c: Build per-codon bg-RSCU feature columns
+
+```{r bg_rscu_features}
+bg_rscu_df <- as_tibble(bg_rscu_mat0[, multi_syn_codons], rownames = "transcript_id_clean") %>%
+  rename_with(~ paste0("bg_rscu_", .), -transcript_id_clean)
+
+# Sanity: Met and Trp must not appear
+stopifnot(!"bg_rscu_ATG" %in% colnames(bg_rscu_df))
+stopifnot(!"bg_rscu_TGG" %in% colnames(bg_rscu_df))
+cat("Met/Trp exclusion (bg_rscu): passed\n")
+cat("bg_rscu_* columns:", ncol(bg_rscu_df) - 1, "(expected 59)\n")
+```
+
+## 4d: bg-RSCU summary scores per mRNA
+
+```{r bg_rscu_summary}
+at_codons <- codon_gc3 %>% filter(gc3_class == "AT-ending") %>%
+  pull(codon) %>% intersect(multi_syn_codons)
+gc_codons <- codon_gc3 %>% filter(gc3_class == "GC-ending") %>%
+  pull(codon) %>% intersect(multi_syn_codons)
+
+cat("AT-ending multi-syn codons:", length(at_codons), "\n")
+cat("GC-ending multi-syn codons:", length(gc_codons), "\n")
+
+bg_rscu_at_cols <- paste0("bg_rscu_", at_codons)
+bg_rscu_gc_cols <- paste0("bg_rscu_", gc_codons)
+bg_rscu_all_cols <- paste0("bg_rscu_", multi_syn_codons)
+
+bg_rscu_summary <- bg_rscu_df %>%
+  mutate(
+    bg_rscu_at_mean   = rowMeans(across(all_of(bg_rscu_at_cols)),  na.rm = TRUE),
+    bg_rscu_gc_mean   = rowMeans(across(all_of(bg_rscu_gc_cols)),  na.rm = TRUE),
+    bg_rscu_deviation = rowMeans(
+      across(all_of(bg_rscu_all_cols), ~ (. - 1)^2), na.rm = TRUE
+    )
+  ) %>%
+  dplyr::select(transcript_id_clean, bg_rscu_at_mean, bg_rscu_gc_mean, bg_rscu_deviation)
+
+# Sanity: summary scores must be non-negative and finite for most transcripts
+stopifnot(all(bg_rscu_summary$bg_rscu_deviation >= 0, na.rm = TRUE))
+stopifnot(all(bg_rscu_summary$bg_rscu_at_mean  >= 0, na.rm = TRUE))
+stopifnot(all(bg_rscu_summary$bg_rscu_gc_mean  >= 0, na.rm = TRUE))
+cat("bg_rscu summary non-negative check: passed\n")
+
+cat("bg_rscu_at_mean  range:", round(range(bg_rscu_summary$bg_rscu_at_mean,  na.rm = TRUE), 3), "\n")
+cat("bg_rscu_gc_mean  range:", round(range(bg_rscu_summary$bg_rscu_gc_mean,  na.rm = TRUE), 3), "\n")
+cat("bg_rscu_deviation range:", round(range(bg_rscu_summary$bg_rscu_deviation, na.rm = TRUE), 3), "\n")
+```
+
+---
+
+# Section 5: Per-Codon Raw Frequencies
+
+```{r codon_freq_features}
+sense_in_mat  <- sense_codons[sense_codons %in% colnames(counts_mat0)]
+total_sense   <- rowSums(counts_mat0[, sense_in_mat, drop = FALSE])
+
+freq_mat <- counts_mat0[, multi_syn_codons, drop = FALSE] / total_sense
+
+freq_df <- as_tibble(freq_mat, rownames = "transcript_id_clean") %>%
+  rename_with(~ paste0("codon_freq_", .), -transcript_id_clean)
+
+# Sanity: Met and Trp must not appear
+stopifnot(!"codon_freq_ATG" %in% colnames(freq_df))
+stopifnot(!"codon_freq_TGG" %in% colnames(freq_df))
+cat("Met/Trp exclusion (codon_freq): passed\n")
+
+# Sanity: row sums must be < 1 (multi-syn is a subset of all sense codons)
+freq_row_sums <- rowSums(freq_mat, na.rm = TRUE)
+cat("codon_freq row sum range:", round(range(freq_row_sums), 4), "(expected < 1)\n")
+stopifnot(all(freq_row_sums <= 1 + 1e-6))
+stopifnot(min(freq_mat, na.rm = TRUE) >= 0)
+cat("codon_freq range check: passed\n")
+cat("codon_freq_* columns:", ncol(freq_df) - 1, "(expected 59)\n")
+```
+
+---
+
+# Section 6: Spot-Check
+
+```{r spot_check}
+# CTG is the most-used Leu codon in human — expect bg_rscu > 1, relatively high freq
+cat("CTG spot-check:\n")
+cat("  mean bg_rscu_CTG =", round(mean(bg_rscu_mat0[, "CTG"], na.rm = TRUE), 3),
+    "(expect > 1)\n")
+cat("  mean codon_freq_CTG =", round(mean(freq_mat[, "CTG"], na.rm = TRUE), 4), "\n")
+cat("  bg_prop_CTG (Leu background) =", round(bg_props$L["CTG"], 4), "\n")
+
+# Verify bg_rscu and codon_freq point in consistent direction for a transcript sample
+set.seed(42)
+sample_tx <- sample(rownames(counts_mat0), 5)
+for (tx in sample_tx) {
+  prop_ctg <- counts_mat0[tx, "CTG"] / sum(counts_mat0[tx, aa_to_codons[["L"]]])
+  bg_rscu_ctg <- ifelse(bg_props$L["CTG"] > 0, prop_ctg / bg_props$L["CTG"], NA)
+  stored     <- bg_rscu_mat0[tx, "CTG"]
+  discrepancy <- abs(bg_rscu_ctg - stored)
+  if (!is.na(discrepancy)) stopifnot(discrepancy < 1e-10)
+}
+cat("bg_rscu manual recompute spot-check (CTG, 5 transcripts): passed\n")
+```
+
+---
+
+# Section 7: Join and Save
+
+```{r join_save}
+feature_matrix_out <- feature_matrix %>%
+  left_join(bg_rscu_df,      by = "transcript_id_clean") %>%
+  left_join(bg_rscu_summary, by = "transcript_id_clean") %>%
+  left_join(freq_df,         by = "transcript_id_clean")
+
+# Final dimension check
+new_cols <- setdiff(colnames(feature_matrix_out), colnames(feature_matrix))
+cat("New columns added:", length(new_cols), "(expected 121)\n")
+cat("  bg_rscu_* cols:    ", sum(startsWith(new_cols, "bg_rscu_")),
+    "(expected 62: 59 per-codon + 3 summary)\n")
+cat("  codon_freq_* cols: ", sum(startsWith(new_cols, "codon_freq_")),
+    "(expected 59)\n")
+stopifnot(length(new_cols) == 121)
+stopifnot(nrow(feature_matrix_out) == nrow(feature_matrix))
+cat("Row count preserved:", nrow(feature_matrix_out), "\n")
+
+saveRDS(feature_matrix_out,
+        here("output", "predictive_modeling", "feature_matrix_codon_features.rds"))
+cat("Saved: output/predictive_modeling/feature_matrix_codon_features.rds\n")
+```
+
+---
+
+# Section 8: Visualizations
+
+## 8a: Background codon proportions
+
+```{r vis_bg_props}
+bg_props_df <- imap_dfr(
+  bg_props,
+  ~ tibble(amino_acid = .y, codon = names(.x), bg_prop = as.numeric(.x))
+) %>%
+  left_join(codon_gc3, by = "codon") %>%
+  group_by(amino_acid) %>%
+  mutate(
+    uniform_prop = 1 / n(),
+    codon        = reorder(codon, -bg_prop)
+  ) %>%
+  ungroup()
+
+ggplot(bg_props_df, aes(x = codon, y = bg_prop, fill = gc3_class)) +
+  geom_col() +
+  geom_point(aes(y = uniform_prop), shape = 4, size = 1.5, colour = "grey30") +
+  scale_fill_manual(
+    values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"), name = NULL
+  ) +
+  facet_wrap(~ amino_acid, scales = "free", ncol = 5) +
+  labs(
+    title    = "Transcriptome-wide background codon proportions (per amino acid)",
+    subtitle = "Bars = mean per-transcript codon proportion; × = uniform usage\nExpected: CTG dominant for Leu, confirming background model is biologically sensible",
+    x = "Codon", y = "Background proportion"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "top"
+  )
+ggsave(here("plots", "01l_bg_codon_proportions.pdf"), width = 14, height = 10)
+```
+
+## 8b: bg-RSCU summary scores by gene group
+
+```{r vis_group_setup}
+hyp_promotes <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+neg_pool <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+pos_ids <- hyp_promotes$ensembl_gene
+set.seed(9)
+neg_ids <- sample(neg_pool$gene_id_clean, min(length(pos_ids), nrow(neg_pool)))
+
+group_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "grey40",
+  "All other genes"        = "grey80"
+)
+summary_feats <- c("bg_rscu_at_mean", "bg_rscu_gc_mean", "bg_rscu_deviation")
+
+grp_df <- feature_matrix_out %>%
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    group = case_when(
+      gene_id_clean %in% pos_ids ~ "eIF3d hypoxia promotes",
+      gene_id_clean %in% neg_ids ~ "Negative control",
+      TRUE                       ~ "All other genes"
+    ),
+    group = factor(group, levels = c("eIF3d hypoxia promotes",
+                                     "Negative control", "All other genes"))
+  )
+cat("eIF3d promotes in matrix:", sum(grp_df$group == "eIF3d hypoxia promotes"), "\n")
+cat("Negative controls in matrix:", sum(grp_df$group == "Negative control"), "\n")
+```
+
+```{r vis_summary_by_group}
+density_df <- grp_df %>%
+  dplyr::select(gene_id_clean, group, all_of(summary_feats)) %>%
+  pivot_longer(all_of(summary_feats), names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value))
+
+feat_labels <- c(
+  bg_rscu_at_mean   = "AT-ending mean bg-RSCU",
+  bg_rscu_gc_mean   = "GC-ending mean bg-RSCU",
+  bg_rscu_deviation = "bg-RSCU deviation"
+)
+density_df <- density_df %>%
+  mutate(feature = factor(feature, levels = summary_feats, labels = feat_labels[summary_feats]))
+
+wx_stats <- density_df %>%
+  filter(group != "All other genes") %>%
+  group_by(feature) %>%
+  summarise(
+    p_val = wilcox.test(
+      value[group == "eIF3d hypoxia promotes"],
+      value[group == "Negative control"],
+      exact = FALSE
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0("Wilcoxon p = ", signif(p_val, 2)))
+
+density_ordered <- density_df %>%
+  arrange(match(as.character(group),
+                c("All other genes", "Negative control", "eIF3d hypoxia promotes")))
+
+ggplot(density_ordered, aes(x = value, colour = group, fill = group)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(
+    data = density_df %>%
+      group_by(feature, group) %>%
+      summarise(med = median(value, na.rm = TRUE), .groups = "drop"),
+    aes(xintercept = med, colour = group),
+    linetype = "dashed", linewidth = 0.5
+  ) +
+  geom_text(
+    data = wx_stats,
+    aes(label = label),
+    x = Inf, y = Inf, hjust = 1.05, vjust = 1.4,
+    colour = "grey30", size = 3, inherit.aes = FALSE
+  ) +
+  facet_wrap(~ feature, scales = "free", ncol = 3) +
+  scale_colour_manual(values = group_colors, name = NULL) +
+  scale_fill_manual(values  = group_colors, name = NULL) +
+  labs(
+    title    = "bg-RSCU summary scores by gene group",
+    subtitle = "dashed = group median | Wilcoxon p: eIF3d promotes vs neg ctrl",
+    x = "Score", y = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position  = "top",
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 10)
+  )
+ggsave(here("plots", "01l_summary_scores_by_group.pdf"), width = 12, height = 5)
+```
+
+## 8c: AT vs GC codon usage scatter
+
+```{r vis_at_vs_gc_scatter}
+scatter_df <- grp_df %>%
+  dplyr::select(gene_id_clean, group, bg_rscu_at_mean, bg_rscu_gc_mean) %>%
+  filter(!is.na(bg_rscu_at_mean), !is.na(bg_rscu_gc_mean)) %>%
+  arrange(match(as.character(group),
+                c("eIF3d hypoxia promotes", "Negative control", "All other genes")))
+
+r_all <- cor(scatter_df$bg_rscu_at_mean, scatter_df$bg_rscu_gc_mean, use = "complete.obs")
+
+ggplot(scatter_df, aes(x = bg_rscu_at_mean, y = bg_rscu_gc_mean, colour = group)) +
+  geom_point(
+    data = filter(scatter_df, group == "All other genes"),
+    alpha = 0.1, size = 0.5
+  ) +
+  geom_point(
+    data = filter(scatter_df, group != "All other genes"),
+    alpha = 0.5, size = 1.2
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4, colour = "grey60") +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.4, colour = "grey60") +
+  scale_colour_manual(values = group_colors, name = NULL) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 3, colour = "grey30",
+           label = paste0("r = ", round(r_all, 2), " (all transcripts)")) +
+  labs(
+    title    = "AT-ending vs GC-ending bg-RSCU per transcript",
+    subtitle = "Transcripts with high AT-codon usage tend to have lower GC-codon usage\ndashed lines = bg-RSCU 1 (uniform background)",
+    x = "bg_rscu_at_mean", y = "bg_rscu_gc_mean"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+ggsave(here("plots", "01l_at_vs_gc_rscu_scatter.pdf"), width = 5.5, height = 5)
+```
+
+---
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

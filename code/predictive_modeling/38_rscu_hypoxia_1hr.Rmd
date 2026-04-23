@@ -38,6 +38,8 @@ library(GenomicFeatures)
 library(BSgenome.Hsapiens.UCSC.hg38)
 library(Biostrings)
 library(coRdon)
+library(iCodon)
+library(ggrepel)
 ```
 
 ---
@@ -105,6 +107,12 @@ aa_three_letter <- c(
   S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
 )
 
+codon_gc3 <- tibble(
+  codon          = sense_codons,
+  gc3_nucleotide = substr(sense_codons, 3, 3),
+  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
+)
+
 tx_to_gene <- feature_matrix %>%
   dplyr::select(transcript_id_clean, gene_id) %>%
   mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
@@ -132,10 +140,14 @@ neg_pool <- read_csv(
   mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
 
 neg_filtered <- neg_pool %>% filter(!ensembl_gene %in% promotes_ids)
+# Single draw — any codon-level signal that differs between this draw and promotes
+# could look real by chance. A follow-up analysis should repeat this sampling
+# 100–1000 times and report an empirical p-value (fraction of random draws where
+# |Δ RSCU| ≥ observed) to confirm the most significant hits are not seed-specific.
 set.seed(9)
 neg_ctrl_ids <- sample(neg_filtered$ensembl_gene,
                        size = length(promotes_ids), replace = FALSE)
-cat("Neg ctrl (size-matched):", length(neg_ctrl_ids), "\n")
+cat("Neg ctrl (size-matched, single draw seed=9):", length(neg_ctrl_ids), "\n")
 
 promotes_tx <- tx_gene_df %>%
   filter(ensembl_gene %in% promotes_ids) %>%
@@ -183,6 +195,234 @@ cat("Range of non-NA RSCU values:",
     round(max(rscu_mat0, na.rm = TRUE), 3), "\n")
 ```
 
+---
+
+# RSCUcaller Formula Verification
+
+RSCUcaller (github.com/Mordziarz/RSCUcaller) could not be installed in this
+environment (requires ComplexHeatmap ≥ 2.20.0; installed: 2.18.0). Its source
+shows it delegates to `seqinr::uco()` and applies:
+
+`RSCU_i = n_i × (count_i + pseudo) / (total_AA + pseudo × n_i)`
+
+with pseudo = 1 by default. At pseudo = 0 this is identical to
+`compute_rscu_matrix()`. The chunk below implements the RSCUcaller formula
+directly (pseudo = 1) on a random sample of transcripts and compares per-mRNA
+RSCU values with our custom implementation to confirm they are in numerical
+agreement (expected r ≈ 1, small offset from the pseudocount).
+
+```{r rscucaller_validation, fig.width=5.5, fig.height=5}
+set.seed(42)
+val_tx <- sample(rownames(counts_mat0), min(300, nrow(counts_mat0)))
+
+# RSCUcaller formula: RSCU_i = n_i * (count_i + pseudo) / (total_AA + pseudo * n_i)
+# At pseudo = 0 this is algebraically identical to compute_rscu_matrix().
+# RSCUcaller's default is pseudo = 1 (shrinks sparse amino acids toward 1).
+compute_rscu_pkg <- function(counts_mat, pseudo = 0) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(aa_to_codons)) {
+    codons  <- intersect(aa_to_codons[[aa]], colnames(counts_mat))
+    if (length(codons) == 0) next
+    n_syn   <- length(codons)
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    if (!any(valid)) next
+    rscu_mat[valid, codons] <-
+      (sub_cnt[valid, , drop = FALSE] + pseudo) * n_syn /
+      (aa_tot[valid] + pseudo * n_syn)
+  }
+  rscu_mat
+}
+
+rscu_ours_val  <- rscu_mat0[val_tx, ]
+rscu_pkg0_val  <- compute_rscu_pkg(counts_mat0[val_tx, ], pseudo = 0)  # identical formula
+rscu_pkg1_val  <- compute_rscu_pkg(counts_mat0[val_tx, ], pseudo = 1)  # RSCUcaller default
+
+# Per-codon Pearson r for both pseudocount settings — extract to plain vectors
+sense_in_mat <- intersect(sense_codons, colnames(rscu_ours_val))
+codon_cor <- function(mat_a, mat_b, codons) {
+  vapply(codons, function(cdn) {
+    x    <- as.numeric(mat_a[, cdn])
+    y    <- as.numeric(mat_b[, cdn])
+    keep <- !is.na(x) & !is.na(y)
+    if (sum(keep) < 5 || sd(x[keep]) == 0 || sd(y[keep]) == 0) return(NA_real_)
+    cor(x[keep], y[keep])
+  }, numeric(1))
+}
+cor_p0 <- codon_cor(rscu_pkg0_val, rscu_ours_val, sense_in_mat)
+cor_p1 <- codon_cor(rscu_pkg1_val, rscu_ours_val, sense_in_mat)
+
+cat("RSCUcaller formula vs custom — per-mRNA RSCU correlation (n =",
+    length(val_tx), "transcripts):\n")
+cat("  pseudo = 0 (identical formula): median r =",
+    round(median(cor_p0, na.rm = TRUE), 4),
+    "| min r =", round(min(cor_p0, na.rm = TRUE), 4), "\n")
+cat("  pseudo = 1 (RSCUcaller default): median r =",
+    round(median(cor_p1, na.rm = TRUE), 4),
+    "| min r =", round(min(cor_p1, na.rm = TRUE), 4), "\n")
+cat("  pseudo=0 should be r = 1.0 exactly; any deviation is floating-point only.\n")
+cat("  pseudo=1 shrinks sparse AAs toward 1 — lower r is the intended smoothing,\n")
+cat("  not a formula discrepancy.\n\n")
+
+# Visual: scatter for 6 codons, pseudo=0 (should be identity line) and pseudo=1
+example_codons <- intersect(c("CTG", "GAA", "GGC", "AGA", "CAG", "ACC"), sense_in_mat)
+
+# Build scatter data with explicit intermediate vectors — no nested closures
+scatter_rows <- vector("list", length(example_codons) * 2)
+k <- 0L
+for (cdn in example_codons) {
+  ours <- as.numeric(rscu_ours_val[, cdn])
+  p0   <- as.numeric(rscu_pkg0_val[, cdn])
+  p1   <- as.numeric(rscu_pkg1_val[, cdn])
+  k <- k + 1L
+  scatter_rows[[k]] <- tibble(codon = cdn, our_rscu = ours, pkg_rscu = p0,
+                               pseudo = "pseudo = 0 (identical)")
+  k <- k + 1L
+  scatter_rows[[k]] <- tibble(codon = cdn, our_rscu = ours, pkg_rscu = p1,
+                               pseudo = "pseudo = 1 (RSCUcaller default)")
+}
+scatter_df <- bind_rows(scatter_rows) %>%
+  filter(!is.na(our_rscu), !is.na(pkg_rscu))
+
+ggplot(scatter_df, aes(x = our_rscu, y = pkg_rscu, colour = pseudo)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey40", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_point(alpha = 0.25, size = 0.7) +
+  scale_colour_manual(values = c("pseudo = 0 (identical)"          = "#0072B2",
+                                  "pseudo = 1 (RSCUcaller default)" = "#E69F00"),
+                      name = NULL) +
+  facet_wrap(~ codon, scales = "free", nrow = 2) +
+  labs(
+    title    = "RSCUcaller formula vs custom per-mRNA RSCU",
+    subtitle = paste0("n = ", length(val_tx), " transcripts. Dashed = identity.\n",
+                      "pseudo=0: algebraically identical (r ≈ 1.0). ",
+                      "pseudo=1: RSCUcaller default — shrinks sparse AAs toward 1."),
+    x = "Custom RSCU (this notebook)", y = "RSCUcaller RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"), legend.position = "top")
+```
+
+---
+
+# Section 3b: Background-Corrected RSCU
+
+Per-transcript RSCU relative to the observed codon usage of all ~7 k expressed
+mRNAs in the feature matrix. Instead of assuming uniform synonymous codon usage
+(1/n_syn), the expected frequency for codon j within amino acid AA is the
+fraction of all expressed-mRNA counts of AA that fall on codon j.
+
+bg_RSCU_j = (count_j_tx / aa_total_tx) / (Σ_all_tx count_j / Σ_all_tx aa_total)
+
+bg_RSCU = 1 → same rate as the transcriptome background
+bg_RSCU > 1 → over-used relative to background
+bg_RSCU < 1 → under-used relative to background
+
+```{r bg_rscu_background_props}
+# Background = mean per-transcript codon proportion across all expressed mRNAs.
+# Each gene gets equal weight regardless of CDS length, consistent with the
+# per-transcript averaging used throughout this notebook. (Pooling raw colSums
+# would let long transcripts dominate the background.)
+bg_props <- imap(aa_to_codons, function(codons, aa) {
+  codons  <- intersect(codons, colnames(counts_mat0))
+  if (length(codons) == 0) return(NULL)
+  sub_cnt <- counts_mat0[, codons, drop = FALSE]
+  aa_tot  <- rowSums(sub_cnt)
+  valid   <- aa_tot > 0
+  if (!any(valid)) return(NULL)
+  # Per-transcript proportion for each codon, then average across transcripts
+  prop_mat <- sub_cnt[valid, , drop = FALSE] / aa_tot[valid]
+  colMeans(prop_mat)
+})
+bg_props <- Filter(Negate(is.null), bg_props)
+
+cat("Background proportions computed for", length(bg_props), "amino acids\n")
+
+# Sanity: each AA's props should sum to 1
+prop_sums <- sapply(bg_props, sum)
+cat("Background proportions sum check (should all be ~1):",
+    round(range(prop_sums), 4), "\n")
+```
+
+```{r compute_bg_rscu_function}
+compute_bg_rscu_matrix <- function(counts_mat, bg_props) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(bg_props)) {
+    props  <- bg_props[[aa]]
+    codons <- intersect(names(props), colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    for (codon in codons) {
+      bp <- props[codon]
+      if (bp > 0 && any(valid)) {
+        rscu_mat[valid, codon] <- (sub_cnt[valid, codon] / aa_tot[valid]) / bp
+      }
+    }
+  }
+  rscu_mat
+}
+```
+
+```{r compute_bg_rscu}
+bg_rscu_mat0 <- compute_bg_rscu_matrix(counts_mat0, bg_props)
+cat("Background RSCU matrix:", nrow(bg_rscu_mat0), "×", ncol(bg_rscu_mat0), "\n")
+cat("Range:", round(min(bg_rscu_mat0, na.rm = TRUE), 3), "—",
+    round(max(bg_rscu_mat0, na.rm = TRUE), 3), "\n")
+
+# Sanity: mean bg_RSCU across all transcripts per codon should be ≈ 1
+bg_mean_per_codon <- colMeans(bg_rscu_mat0, na.rm = TRUE)
+bg_mean_per_codon <- bg_mean_per_codon[sense_codons[sense_codons %in% names(bg_mean_per_codon)]]
+cat("Mean bg_RSCU across all expressed mRNAs — range:",
+    round(range(bg_mean_per_codon, na.rm = TRUE), 3), "\n")
+cat("(Should be ≈ 1 for all codons by construction)\n")
+```
+
+```{r std_vs_bg_rscu_corr, fig.width=5.5, fig.height=5}
+# Per-codon: mean standard RSCU vs mean background RSCU across all transcripts.
+# They differ because standard RSCU assumes uniform usage; background RSCU corrects
+# for transcriptome-wide bias. Codons the transcriptome already favours have
+# standard RSCU > 1 but background RSCU ≈ 1.
+std_mean  <- colMeans(rscu_mat0[, sense_codons[sense_codons %in% colnames(rscu_mat0)],
+                                drop = FALSE], na.rm = TRUE)
+bg_mean   <- colMeans(bg_rscu_mat0[, sense_codons[sense_codons %in% colnames(bg_rscu_mat0)],
+                                   drop = FALSE], na.rm = TRUE)
+
+corr_df <- tibble(
+  codon     = names(std_mean),
+  std_rscu  = std_mean,
+  bg_rscu   = bg_mean[names(std_mean)]
+) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  filter(!is.na(bg_rscu))
+
+cat("Pearson r (mean standard RSCU ~ mean background RSCU, per codon):",
+    round(cor(corr_df$std_rscu, corr_df$bg_rscu, use = "complete.obs"), 3), "\n")
+
+ggplot(corr_df, aes(x = std_rscu, y = bg_rscu, colour = gc3_class)) +
+  geom_hline(yintercept = 1, colour = "grey70", linewidth = 0.4, linetype = "dashed") +
+  geom_vline(xintercept = 1, colour = "grey70", linewidth = 0.4, linetype = "dashed") +
+  geom_point(size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data = . %>% filter(abs(std_rscu - bg_rscu) > 0.15),
+    aes(label = codon), size = 2.5, show.legend = FALSE, max.overlaps = 20
+  ) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  labs(
+    title    = "Standard RSCU vs background-corrected RSCU (per codon, all expressed mRNAs)",
+    subtitle = "Background RSCU uses transcriptome codon frequencies as expected; standard assumes uniform\nDashed lines = 1 (uniform / on-background)",
+    x = "Mean standard RSCU (all expressed mRNAs)",
+    y = "Mean background RSCU (all expressed mRNAs)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+```
+
 ```{r rscu_summary_function}
 # Summarize per-transcript RSCU values into group-level stats.
 summarize_rscu <- function(rscu_mat, tx_ids) {
@@ -224,8 +464,9 @@ rscu_combined <- rscu_promotes %>%
   ) %>%
   mutate(delta_rscu = promotes_mean - neg_mean)
 
-# Wilcoxon test per codon (per-transcript RSCU)
-wilcox_df <- imap_dfr(aa_to_codons, function(codons, aa) {
+# Wilcoxon test per codon — multi-synonymous AAs only so Met/Trp (RSCU always 1)
+# don't inflate the BH denominator.
+wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
   codons <- intersect(codons, colnames(rscu_mat0))
   map_dfr(codons, function(codon) {
     p_vals <- rscu_mat0[promotes_tx[promotes_tx %in% rownames(rscu_mat0)], codon]
@@ -451,7 +692,7 @@ p_c <- ggplot(frame_delta_df, aes(x = codon, y = delta, fill = frame)) +
   geom_hline(yintercept = 0, linewidth = 0.3) +
   labs(
     title    = "Δ RSCU by reading frame: frame 0 vs frameshift controls (Hypoxia 1hr)",
-    subtitle = "Frames 1 & 2 control for nucleotide composition; persistent frame-0 signal = true codon preference\nBlue border: frame 0 significant, controls not (clean codon signal). *: frame 0 significant. [q < 0.05, BH Wilcoxon]",
+    subtitle = "Frames 1 & 2 share ~2/3 of nucleotides with frame 0 (shifted tiling of the same sequence).\nThey partially control for mononucleotide composition but NOT dinucleotide/trinucleotide bias.\nA signal that collapses in shifted frames is reassuring; persistence in shifted frames does not rule out codon preference.\nBlue border: frame 0 sig, neither control sig. *: frame 0 significant. [q < 0.05, BH Wilcoxon]",
     x = "Codon", y = "\u0394 mean RSCU (promotes \u2212 neg ctrl)",
     fill = NULL
   ) +
@@ -470,13 +711,6 @@ ggsave(here("plots", "rscu_frame_ctrl_hypoxia_1hr.pdf"), p_c, width = 12, height
 # Section 5: Top Codons Summary & GC3 Bias Check
 
 ```{r gc3_sanity_check}
-# Annotate each codon with its third-position nucleotide
-codon_gc3 <- tibble(
-  codon          = sense_codons,
-  gc3_nucleotide = substr(sense_codons, 3, 3),
-  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
-)
-
 # Compute per-transcript GC3 from counts_mat0 and compare to feature_matrix$gc3
 # gc3 = sum of GC-ending codon counts / total sense codon count per transcript
 gc3_codons <- codon_gc3 %>% filter(gc3_class == "GC-ending") %>% pull(codon)
@@ -523,6 +757,15 @@ se_gc3_neg   <- sd(per_tx_gc3[neg_ctrl_tx[neg_ctrl_tx  %in% names(per_tx_gc3)]],
 cat("Mean GC3 — promotes:", round(gc3_promotes, 4), "± SE", round(se_gc3_prom, 4), "\n")
 cat("Mean GC3 — neg ctrl:", round(gc3_neg, 4),      "± SE", round(se_gc3_neg, 4), "\n")
 cat("Δ GC3 (promotes - neg ctrl):", round(gc3_promotes - gc3_neg, 4), "\n")
+
+gc3_p_vals <- per_tx_gc3[promotes_tx[promotes_tx %in% names(per_tx_gc3)]]
+gc3_n_vals <- per_tx_gc3[neg_ctrl_tx[neg_ctrl_tx  %in% names(per_tx_gc3)]]
+gc3_wt     <- wilcox.test(gc3_p_vals, gc3_n_vals, exact = FALSE)
+cat("Wilcoxon test (GC3: promotes vs neg ctrl): W =", gc3_wt$statistic,
+    ", p =", signif(gc3_wt$p.value, 3), "\n")
+cat("Interpretation: if p < 0.05, GC3 differs between groups and RSCU signals\n",
+    "should be interpreted cautiously — AT/GC-ending codon enrichment may partly\n",
+    "reflect composition rather than codon selection.\n")
 ```
 
 ```{r top_codons_summary}
@@ -606,10 +849,7 @@ ggsave(here("plots", "rscu_delta_vs_gc3_hypoxia_1hr.pdf"), p_gc3, width = 5.5, h
 ```{r rscu_vs_csc_weight, fig.width=5.5, fig.height=5}
 # Load per-codon iCodon CSC weights and check whether AT-ending codons enriched
 # in promotes are selectively the stabilizing (high-CSC) ones.
-e <- new.env()
-data(list = iCodon:::global_vars_data, package = "iCodon", envir = e)
-codon_csc_weights <- e$human_optimality %>%
-  rename(csc_weight = optimality)
+codon_csc_weights <- dplyr::select(iCodon:::human_optimality, codon, csc_weight = optimality)
 
 plot_df_csc <- rscu_combined %>%
   filter(amino_acid %in% multi_aa) %>%
@@ -668,6 +908,348 @@ ggsave(here("plots", "rscu_delta_vs_csc_weight_hypoxia_1hr.pdf"),
 ```
 
 ---
+
+# Section 6: Background-Corrected RSCU — eIF3d-Promoted vs Control
+
+Using the transcriptome-background-corrected RSCU matrix computed above. This
+asks whether promoted mRNAs use codons differently from the background *and*
+differently from size-matched controls, after removing the transcriptome-wide
+codon bias.
+
+```{r bg_rscu_group_summaries}
+bg_rscu_promotes <- summarize_rscu(bg_rscu_mat0, promotes_tx)
+bg_rscu_neg      <- summarize_rscu(bg_rscu_mat0, neg_ctrl_tx)
+
+cat("Background RSCU summary — promotes:", nrow(bg_rscu_promotes), "codon-rows\n")
+```
+
+```{r bg_rscu_delta}
+bg_rscu_combined <- bg_rscu_promotes %>%
+  dplyr::select(amino_acid, codon, promotes_mean = mean_rscu,
+                promotes_se = se_rscu, promotes_n = n) %>%
+  left_join(
+    bg_rscu_neg %>% dplyr::select(amino_acid, codon, neg_mean = mean_rscu,
+                                  neg_se = se_rscu, neg_n = n),
+    by = c("amino_acid", "codon")
+  ) %>%
+  mutate(delta_bg_rscu = promotes_mean - neg_mean)
+
+# Wilcoxon test per codon on per-transcript background RSCU (multi_aa only)
+bg_wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons <- intersect(codons, colnames(bg_rscu_mat0))
+  map_dfr(codons, function(codon) {
+    p_vals <- bg_rscu_mat0[promotes_tx[promotes_tx %in% rownames(bg_rscu_mat0)], codon]
+    n_vals <- bg_rscu_mat0[neg_ctrl_tx[neg_ctrl_tx %in% rownames(bg_rscu_mat0)], codon]
+    p_vals <- p_vals[!is.na(p_vals)]
+    n_vals <- n_vals[!is.na(n_vals)]
+    if (length(p_vals) < 3 || length(n_vals) < 3) {
+      return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_))
+    }
+    wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val = wt$p.value)
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+bg_rscu_combined <- bg_rscu_combined %>%
+  left_join(bg_wilcox_df %>% dplyr::select(amino_acid, codon, p_val, p_adj),
+            by = c("amino_acid", "codon"))
+
+cat("Top 10 codons by |Δ background RSCU|:\n")
+print(bg_rscu_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_bg_rscu))) %>%
+        dplyr::select(codon, amino_acid, promotes_mean, neg_mean, delta_bg_rscu, p_adj) %>%
+        head(10))
+```
+
+```{r bg_rscu_plot_sidebyside, fig.width=11, fig.height=9}
+plot_df_bg_a <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  pivot_longer(cols = c(promotes_mean, neg_mean),
+               names_to = "group", values_to = "mean_bg_rscu") %>%
+  mutate(
+    se      = if_else(group == "promotes_mean", promotes_se, neg_se),
+    group   = recode(group,
+                     promotes_mean = "eIF3d-promoted",
+                     neg_mean      = "Neg ctrl"),
+    group   = factor(group, levels = c("eIF3d-promoted", "Neg ctrl")),
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon    = reorder(codon, mean_bg_rscu)
+  )
+
+p_bg_a <- ggplot(plot_df_bg_a, aes(x = codon, y = mean_bg_rscu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = mean_bg_rscu - se, ymax = mean_bg_rscu + se),
+                position = position_dodge(width = 0.8), width = 0.3,
+                linewidth = 0.4) +
+  scale_fill_manual(values = c("eIF3d-promoted" = "#E69F00", "Neg ctrl" = "#000000"),
+                    name = NULL) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  labs(
+    title    = "Background-corrected RSCU: eIF3d-promoted vs neg ctrl (Hypoxia 1hr)",
+    subtitle = "Mean per-transcript bg-RSCU ± SE; dashed = 1 (same rate as transcriptome background)",
+    x = "Codon", y = "Mean background-corrected RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_bg_a
+ggsave(here("plots", "bg_rscu_sidebyside_hypoxia_1hr.pdf"), p_bg_a, width = 11, height = 9)
+```
+
+```{r bg_rscu_plot_delta, fig.width=10, fig.height=8}
+plot_df_bg_b <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta_bg_rscu >= 0, "promotes", "neg_ctrl"),
+    sig_label = case_when(!is.na(p_adj) & p_adj < 0.05 ~ "*", TRUE ~ ""),
+    codon     = reorder(codon, delta_bg_rscu)
+  )
+
+p_bg_b <- ggplot(plot_df_bg_b, aes(x = codon, y = delta_bg_rscu, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label, y = delta_bg_rscu + sign(delta_bg_rscu) * 0.015),
+            size = 3, vjust = 0.5) +
+  scale_fill_manual(values = c(promotes = "#E69F00", neg_ctrl = "#000000"),
+                    guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ background-corrected RSCU: eIF3d-promoted minus neg ctrl (Hypoxia 1hr)",
+    subtitle = "Mean per-transcript bg-RSCU difference; * = BH-adjusted Wilcoxon q < 0.05",
+    x = "Codon", y = "Δ mean bg-RSCU (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_bg_b
+ggsave(here("plots", "bg_rscu_delta_hypoxia_1hr.pdf"), p_bg_b, width = 10, height = 8)
+```
+
+```{r std_vs_bg_delta_scatter, fig.width=5.5, fig.height=5}
+# Does the signal shift when we switch from standard to background RSCU?
+# If a codon's Δ standard RSCU ≈ Δ background RSCU, the signal is not explained
+# by the transcriptome-wide bias. If they diverge, the standard RSCU signal was
+# partly driven by baseline usage differences.
+delta_compare <- rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(amino_acid, codon, delta_std = delta_rscu, p_adj_std = p_adj) %>%
+  left_join(
+    bg_rscu_combined %>% dplyr::select(amino_acid, codon, delta_bg = delta_bg_rscu,
+                                       p_adj_bg = p_adj),
+    by = c("amino_acid", "codon")
+  ) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(
+    sig_either = (!is.na(p_adj_std) & p_adj_std < 0.05) |
+                 (!is.na(p_adj_bg)  & p_adj_bg  < 0.05),
+    label_codon = if_else(sig_either | abs(delta_std - delta_bg) > 0.05,
+                          codon, NA_character_)
+  )
+
+r_std_bg <- cor(delta_compare$delta_std, delta_compare$delta_bg, use = "complete.obs")
+cat("Pearson r (Δ standard RSCU ~ Δ background RSCU):", round(r_std_bg, 3), "\n")
+
+p_comp <- ggplot(delta_compare, aes(x = delta_std, y = delta_bg, colour = gc3_class)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey80", linewidth = 0.3) +
+  geom_point(aes(shape = sig_either), size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.5,
+                           max.overlaps = 20, show.legend = FALSE) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 8),
+                     labels = c(`FALSE` = "ns (both)", `TRUE` = "sig in either"),
+                     name = NULL) +
+  annotate("text", x = min(delta_compare$delta_std, na.rm = TRUE),
+           y = max(delta_compare$delta_bg, na.rm = TRUE),
+           label = paste0("r = ", round(r_std_bg, 2)),
+           hjust = 0, vjust = 1, size = 3.5, colour = "grey30") +
+  labs(
+    title    = "Δ standard RSCU vs Δ background-corrected RSCU (Hypoxia 1hr)",
+    subtitle = "Dashed = identity line. Points off the diagonal: signal partly driven by\ntranscriptome-wide codon bias rather than group-specific preference.",
+    x = "Δ standard RSCU (promotes − neg ctrl)",
+    y = "Δ background RSCU (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_comp
+ggsave(here("plots", "rscu_standard_vs_bg_delta_hypoxia_1hr.pdf"), p_comp,
+       width = 5.5, height = 5)
+```
+
+```{r bg_rscu_violin_by_aa, fig.width=12, fig.height=8}
+# Violin + boxplot for amino acids with ≥1 significant codon in background RSCU
+sig_aas <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa, !is.na(p_adj), p_adj < 0.05) %>%
+  pull(amino_acid) %>%
+  unique()
+
+cat("Amino acids with ≥1 significant codon (bg RSCU, BH q < 0.05):",
+    length(sig_aas), "\n")
+if (length(sig_aas) > 0) cat(paste(sig_aas, collapse = ", "), "\n")
+
+if (length(sig_aas) > 0) {
+  # Build per-transcript long-format data for significant amino acids
+  sig_codons_by_aa <- bg_rscu_combined %>%
+    filter(amino_acid %in% sig_aas, !is.na(p_adj), p_adj < 0.05) %>%
+    dplyr::select(amino_acid, codon)
+
+  violin_df <- map_dfr(seq_len(nrow(sig_codons_by_aa)), function(i) {
+    aa    <- sig_codons_by_aa$amino_acid[i]
+    codon <- sig_codons_by_aa$codon[i]
+    tx_promotes <- promotes_tx[promotes_tx %in% rownames(bg_rscu_mat0)]
+    tx_neg      <- neg_ctrl_tx[neg_ctrl_tx  %in% rownames(bg_rscu_mat0)]
+    p_vals <- bg_rscu_mat0[tx_promotes, codon]
+    n_vals <- bg_rscu_mat0[tx_neg,      codon]
+    bind_rows(
+      tibble(codon = codon, amino_acid = aa, group = "eIF3d-promoted",
+             bg_rscu = p_vals[!is.na(p_vals)]),
+      tibble(codon = codon, amino_acid = aa, group = "Neg ctrl",
+             bg_rscu = n_vals[!is.na(n_vals)])
+    )
+  }) %>%
+    mutate(
+      group    = factor(group, levels = c("eIF3d-promoted", "Neg ctrl")),
+      aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+      codon_aa = paste0(codon, "\n(", amino_acid, ")")
+    ) %>%
+    left_join(bg_rscu_combined %>% dplyr::select(codon, p_adj_label = p_adj),
+              by = "codon") %>%
+    mutate(codon_aa = paste0(codon, "\nq=", signif(p_adj_label, 2)))
+
+  p_viol <- ggplot(violin_df, aes(x = group, y = bg_rscu, fill = group)) +
+    geom_violin(alpha = 0.6, linewidth = 0.4, trim = TRUE) +
+    geom_boxplot(width = 0.18, outlier.size = 0.5, linewidth = 0.4,
+                 fill = "white", alpha = 0.8) +
+    geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c("eIF3d-promoted" = "#E69F00", "Neg ctrl" = "#000000"),
+                      guide = "none") +
+    facet_wrap(~ codon_aa, scales = "free_y", nrow = 2) +
+    labs(
+      title    = "Per-transcript background RSCU for significant codons (Hypoxia 1hr)",
+      subtitle = "Codons with BH q < 0.05 between eIF3d-promoted and neg ctrl.\nDashed = 1 (same usage rate as transcriptome background).",
+      x = NULL, y = "Per-transcript background-corrected RSCU"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      strip.text  = element_text(face = "bold", size = 9)
+    )
+  p_viol
+  ggsave(here("plots", "bg_rscu_violin_by_aa_hypoxia_1hr.pdf"), p_viol,
+         width = max(8, length(sig_aas) * 2.5), height = 8)
+} else {
+  cat("No significant codons in background RSCU comparison — skipping violin plot.\n")
+}
+```
+
+```{r bg_rscu_frame_ctrl, fig.width=12, fig.height=9}
+bg_rscu_mat1 <- compute_bg_rscu_matrix(counts_mat1, bg_props)
+bg_rscu_mat2 <- compute_bg_rscu_matrix(counts_mat2, bg_props)
+
+bg_f0_delta <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(amino_acid, codon, delta = delta_bg_rscu) %>%
+  mutate(frame = "Frame 0 (coding)")
+bg_f1_delta <- summarize_delta_rscu(bg_rscu_mat1, promotes_tx, neg_ctrl_tx, "Frame 1 (control)")
+bg_f2_delta <- summarize_delta_rscu(bg_rscu_mat2, promotes_tx, neg_ctrl_tx, "Frame 2 (control)")
+
+bg_frame_delta_df <- bind_rows(bg_f0_delta, bg_f1_delta, bg_f2_delta) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    frame    = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+bg_codon_order <- bg_f0_delta %>%
+  filter(amino_acid %in% multi_aa) %>%
+  arrange(amino_acid, delta) %>%
+  pull(codon)
+bg_frame_delta_df <- bg_frame_delta_df %>%
+  mutate(codon = factor(codon, levels = bg_codon_order))
+
+bg_sig_df <- bind_rows(
+  per_tx_sig_rscu(bg_rscu_mat0, promotes_tx, neg_ctrl_tx, "Frame 0 (coding)"),
+  per_tx_sig_rscu(bg_rscu_mat1, promotes_tx, neg_ctrl_tx, "Frame 1 (control)"),
+  per_tx_sig_rscu(bg_rscu_mat2, promotes_tx, neg_ctrl_tx, "Frame 2 (control)")
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    q_val = p.adjust(p_val, method = "BH"),
+    sig   = !is.na(q_val) & q_val < 0.05,
+    frame = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+bg_f0_sig   <- bg_sig_df %>% filter(frame == "Frame 0 (coding)") %>%
+  dplyr::select(amino_acid, codon, f0_sig = sig)
+bg_ctrl_sig <- bg_sig_df %>% filter(frame != "Frame 0 (coding)") %>%
+  group_by(amino_acid, codon) %>%
+  summarise(any_ctrl_sig = any(sig), .groups = "drop")
+bg_f0_labels <- bg_f0_sig %>%
+  left_join(bg_ctrl_sig, by = c("amino_acid", "codon")) %>%
+  mutate(sig_label = case_when(
+    f0_sig & !any_ctrl_sig ~ "✦",
+    f0_sig &  any_ctrl_sig ~ "·",
+    TRUE                   ~ ""
+  )) %>%
+  dplyr::select(amino_acid, codon, sig_label) %>%
+  mutate(frame = factor("Frame 0 (coding)",
+                        levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)")))
+
+bg_aa_any_f0 <- bg_f0_labels %>% filter(sig_label != "") %>% pull(amino_acid) %>% unique()
+bg_aa_clean  <- bg_f0_labels %>% filter(sig_label == "✦") %>% pull(amino_acid) %>% unique()
+
+bg_frame_delta_df <- bg_frame_delta_df %>%
+  mutate(aa_label = ifelse(amino_acid %in% bg_aa_any_f0,
+                           paste0(aa_label, " *"), aa_label))
+
+bg_aa_label_map <- bg_frame_delta_df %>% distinct(amino_acid, aa_label)
+bg_facet_clean  <- bg_aa_label_map %>% filter(amino_acid %in% bg_aa_clean)
+
+bg_rect_layer <- if (nrow(bg_facet_clean) > 0) {
+  geom_rect(data = bg_facet_clean,
+            aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE, fill = NA, color = "#0072B2", linewidth = 1.5)
+} else {
+  NULL
+}
+
+p_bg_c <- ggplot(bg_frame_delta_df, aes(x = codon, y = delta, fill = frame)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  bg_rect_layer +
+  scale_fill_manual(
+    values = c("Frame 0 (coding)"  = "#E69F00",
+               "Frame 1 (control)" = "#999999",
+               "Frame 2 (control)" = "#CCCCCC")
+  ) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ background-corrected RSCU by reading frame: frame 0 vs frameshift controls (Hypoxia 1hr)",
+    subtitle = "Frames 1 & 2 shifted tiling of the same sequence; background from frame 0 CDS transcriptome proportions.\nBlue border: frame 0 sig, neither control sig. ✦: clean signal. *: frame 0 significant. [q < 0.05, BH Wilcoxon]",
+    x = "Codon", y = "Δ mean bg-RSCU (promotes − neg ctrl)",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_bg_c
+ggsave(here("plots", "bg_rscu_frame_ctrl_hypoxia_1hr.pdf"), p_bg_c, width = 12, height = 9)
+```
 
 # Session Info
 
