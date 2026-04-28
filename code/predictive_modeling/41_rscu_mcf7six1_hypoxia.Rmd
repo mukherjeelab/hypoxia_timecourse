@@ -1,0 +1,1358 @@
+---
+title: "41 — RSCU Analysis: eIF3d-Promoted vs Control (MCF7-SIX1, Hypoxia)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Background-aware RSCU for eIF3d-promoted genes vs size-matched negative controls
+in MCF7-SIX1 cells (hypoxia). Parallels notebook 38 (MDA-MB-231, hypoxia 1hr).
+Promotes set: padj < 0.05, te_lfc > 0 (no LFC magnitude cutoff).
+Cross-cell-line comparison is in the final section.
+
+Transcript selection: most-expressed transcript per gene from RNA-seq sictrl
+hypoxia Salmon quantification (NM2023_0101/0111/0121). Fallback to longest CDS
+for genes with no Salmon coverage.
+
+**Directionality:** MCF7-SIX1 DESeq2 contrast = log2(si3d / sictrl).
+Positive LFC = higher TE in si3d KD = eIF3d INHIBITS.
+Negative LFC = lower TE in si3d KD = eIF3d PROMOTES.
+We negate to te_lfc where positive = eIF3d promotes.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(iCodon)
+library(ggrepel)
+library(AnnotationDbi)
+```
+
+---
+
+# Section 1: MCF7-SIX1 TE Data + Directionality Checks
+
+```{r load_te_data}
+eif3_dir <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+
+hyp_raw  <- read_csv(file.path(eif3_dir, "counts/hypoxia_si_ctrl_3d.csv"),
+                     show_col_types = FALSE)
+norm_raw <- read_csv(file.path(eif3_dir, "counts/normoxia_sictrl_3d.csv"),
+                     show_col_types = FALSE)
+
+cat("MCF7-SIX1 hypoxia TE file: ", nrow(hyp_raw),  "genes\n")
+cat("MCF7-SIX1 normoxia TE file:", nrow(norm_raw), "genes\n")
+cat("Columns:", paste(names(hyp_raw), collapse = ", "), "\n\n")
+```
+
+```{r directionality_check}
+# ---- DIRECTIONALITY VERIFICATION ----
+# DESeq2 contrast: si3d vs sictrl (sictrl = reference)
+# log2FoldChange = log2(si3d / sictrl)
+# Positive LFC → higher TE when eIF3d is KD → eIF3d normally INHIBITS translation
+# Negative LFC → lower TE when eIF3d is KD  → eIF3d normally PROMOTES translation
+
+cat("=== DIRECTIONALITY CHECK (raw log2FoldChange = log2(si3d / sictrl)) ===\n")
+cat("Total genes tested:", nrow(hyp_raw), "\n")
+cat("Genes with padj < 0.05:", sum(!is.na(hyp_raw$padj) & hyp_raw$padj < 0.05), "\n\n")
+
+cat("UP with 3d KD (positive LFC, padj < 0.05) = eIF3d INHIBITS translation:\n")
+cat(" ", sum(hyp_raw$log2FoldChange > 0 & !is.na(hyp_raw$padj) & hyp_raw$padj < 0.05), "genes\n\n")
+
+cat("DOWN with 3d KD (negative LFC, padj < 0.05) = eIF3d PROMOTES translation:\n")
+cat(" ", sum(hyp_raw$log2FoldChange < 0 & !is.na(hyp_raw$padj) & hyp_raw$padj < 0.05), "genes\n\n")
+
+cat("UP with 3d KD (|LFC| > 0.5, padj < 0.05) = eIF3d INHIBITS:\n")
+cat(" ", sum(hyp_raw$log2FoldChange > 0.5 & !is.na(hyp_raw$padj) & hyp_raw$padj < 0.05), "genes\n")
+cat("DOWN with 3d KD (|LFC| > 0.5, padj < 0.05) = eIF3d PROMOTES:\n")
+cat(" ", sum(hyp_raw$log2FoldChange < -0.5 & !is.na(hyp_raw$padj) & hyp_raw$padj < 0.05), "genes\n")
+```
+
+```{r recode_lfc}
+# Negate so positive te_lfc = eIF3d promotes translation
+hyp_te <- hyp_raw %>%
+  mutate(te_lfc       = -log2FoldChange,
+         gene_id_clean = str_remove(gene_id, "\\..*"))
+
+norm_te <- norm_raw %>%
+  mutate(te_lfc        = -log2FoldChange,
+         gene_id_clean = str_remove(gene_id, "\\..*"))
+
+cat("=== AFTER RE-CODING (positive te_lfc = eIF3d PROMOTES) ===\n")
+cat("Hypoxia eIF3d promotes (te_lfc > 0, padj < 0.05):",
+    sum(hyp_te$te_lfc > 0  & !is.na(hyp_te$padj) & hyp_te$padj < 0.05), "\n")
+cat("Hypoxia eIF3d inhibits (te_lfc < 0, padj < 0.05):",
+    sum(hyp_te$te_lfc < 0  & !is.na(hyp_te$padj) & hyp_te$padj < 0.05), "\n")
+# Load paper gene set for MCF7-SIX1 hypoxia eIF3d-promoted to validate directionality/count
+paper_sigs <- read_csv(here("accessories", "all_combined_sigs_1_13_26.csv"),
+                        show_col_types = FALSE)
+paper_mcf7_promotes <- paper_sigs %>%
+  filter(gs_name == "MCF7-SIX1_hypoxia_3d_promotes_TE") %>%
+  pull(ensembl_gene) %>%
+  str_remove("\\..*")
+
+cat("\nPaper MCF7-SIX1 hypoxia 3d-promotes gene set:", length(paper_mcf7_promotes), "genes\n")
+cat("Our set (te_lfc > 0, padj < 0.05):",
+    sum(hyp_te$te_lfc > 0 & !is.na(hyp_te$padj) & hyp_te$padj < 0.05), "genes\n")
+cat("Overlap with paper set:",
+    sum((hyp_te %>% filter(te_lfc > 0, padj < 0.05) %>% pull(gene_id_clean))
+        %in% paper_mcf7_promotes), "\n")
+cat("(Our set should substantially overlap the paper set; differences reflect threshold choices)\n")
+```
+
+---
+
+# Section 2: Gene Set Definition
+
+```{r analysis_params}
+# Toggle: set to TRUE to require te_lfc > 0.5 AND |te_lfc| < 0.5 for neg ctrl
+#         (matching 231 analysis in notebook 38 — recommended for cross-cell-line comparison)
+#         set to FALSE to use te_lfc > 0 with no LFC filter on neg ctrl
+use_lfc_threshold <- TRUE
+lfc_cutoff        <- 0.5
+```
+
+```{r promotes_set}
+if (use_lfc_threshold) {
+  promotes_ids <- hyp_te %>%
+    filter(te_lfc > lfc_cutoff, padj < 0.05) %>%
+    pull(gene_id_clean)
+  cat("MCF7-SIX1 hypoxia eIF3d-promoted genes (te_lfc >", lfc_cutoff, ", padj < 0.05):",
+      length(promotes_ids), "\n")
+} else {
+  promotes_ids <- hyp_te %>%
+    filter(te_lfc > 0, padj < 0.05) %>%
+    pull(gene_id_clean)
+  cat("MCF7-SIX1 hypoxia eIF3d-promoted genes (te_lfc > 0, padj < 0.05):",
+      length(promotes_ids), "\n")
+}
+```
+
+```{r negative_control}
+# Negative control pool: |LFC| < 0.5 AND padj > 0.3 in BOTH hypoxia and normoxia
+if (use_lfc_threshold) {
+  neg_hyp  <- hyp_te  %>% filter(abs(te_lfc) < lfc_cutoff, !is.na(padj), padj > 0.3) %>% pull(gene_id_clean)
+  neg_norm <- norm_te %>% filter(abs(te_lfc) < lfc_cutoff, !is.na(padj), padj > 0.3) %>% pull(gene_id_clean)
+} else {
+  neg_hyp  <- hyp_te  %>% filter(!is.na(padj), padj > 0.3) %>% pull(gene_id_clean)
+  neg_norm <- norm_te %>% filter(!is.na(padj), padj > 0.3) %>% pull(gene_id_clean)
+}
+
+neg_pool_ids <- intersect(neg_hyp, neg_norm)
+neg_pool_ids <- setdiff(neg_pool_ids, promotes_ids)
+
+cat("Genes passing neg ctrl criteria (|LFC| < 0.5, padj > 0.3 in both conditions):",
+    length(neg_pool_ids), "\n")
+cat("Promotes set size:", length(promotes_ids), "\n")
+
+if (length(neg_pool_ids) < length(promotes_ids)) {
+  stop("Negative control pool smaller than promotes set — cannot size-match. ",
+       "Consider relaxing padj threshold.")
+}
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool_ids, size = length(promotes_ids), replace = FALSE)
+cat("Size-matched neg ctrl drawn (seed = 9):", length(neg_ctrl_ids), "\n")
+```
+
+---
+
+# Section 3: CDS Sequences from Genome
+
+```{r load_txdb}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# Extract all CDS sequences — same approach as notebook 38
+cds_all      <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all <- extractTranscriptSeqs(genome, cds_all)
+
+cds_names_clean_all <- as.character(sub("\\..*", "", names(cds_seqs_all)))
+cat("Total CDS sequences in txdb:", length(cds_seqs_all), "\n")
+
+# Build CDS length table for fallback transcript selection
+cds_len_df <- tibble(
+  transcript_id_clean = cds_names_clean_all,
+  cds_length          = as.integer(width(cds_seqs_all))
+)
+```
+
+---
+
+# Section 4: Transcript Selection via Salmon RNA-seq TPM
+
+RNA-seq sictrl hypoxia samples: NM2023_0101 (RepA), NM2023_0111 (RepB), NM2023_0121 (RepC).
+These are rRNADepletion library prep, contrasting with RibosomeLysate (ribosome profiling) samples.
+
+```{r salmon_tpm}
+rnaseq_sictrl_hyp_ids <- c("NM2023_0101", "NM2023_0111", "NM2023_0121")
+salmon_dir <- file.path(eif3_dir, "salmon")
+
+tpm_list <- map(rnaseq_sictrl_hyp_ids, function(sid) {
+  f <- file.path(salmon_dir, sid, "quant.sf.gz")
+  read_tsv(f, show_col_types = FALSE) %>%
+    mutate(
+      # Handle both plain ENST... and GENCODE pipe-separated format
+      transcript_id_clean = str_remove(str_extract(Name, "^[^|]+"), "\\..*")
+    ) %>%
+    dplyr::select(transcript_id_clean, !!sid := TPM)
+})
+
+tpm_wide <- purrr::reduce(tpm_list, full_join, by = "transcript_id_clean")
+tpm_mat  <- as.matrix(tpm_wide[, rnaseq_sictrl_hyp_ids])
+tpm_avg  <- tibble(
+  transcript_id_clean = as.character(tpm_wide$transcript_id_clean),
+  mean_tpm            = as.numeric(rowMeans(tpm_mat, na.rm = TRUE))
+)
+
+cat("Salmon TPM data: ", nrow(tpm_avg), "transcripts\n")
+cat("Transcripts with mean TPM > 0:", sum(tpm_avg$mean_tpm > 0, na.rm = TRUE), "\n")
+```
+
+```{r tx2gene_map}
+# Map transcript → gene from txdb
+tx2gene_all <- AnnotationDbi::select(
+  txdb,
+  keys    = keys(txdb, keytype = "TXNAME"),
+  columns = c("TXNAME", "GENEID"),
+  keytype = "TXNAME"
+) %>%
+  as_tibble() %>%
+  mutate(TXNAME = as.character(TXNAME),
+         GENEID = as.character(GENEID),
+         transcript_id_clean = str_remove(TXNAME,  "\\..*"),
+         gene_id_clean        = str_remove(GENEID, "\\..*")) %>%
+  filter(transcript_id_clean %in% as.character(cds_names_clean_all))
+
+cat("Transcripts with CDS in txdb:", nrow(tx2gene_all), "\n")
+```
+
+```{r select_most_expressed_tx}
+# All MCF7-SIX1-expressed genes (tested by DESeq2 in hypoxia)
+mcf7_expressed <- unique(hyp_te$gene_id_clean)
+cat("MCF7-SIX1 expressed genes:", length(mcf7_expressed), "\n")
+
+# Drop raw AnnotationDbi columns early to avoid any residual S4 types
+tx_candidates <- tx2gene_all %>%
+  dplyr::select(transcript_id_clean, gene_id_clean) %>%
+  filter(gene_id_clean %in% mcf7_expressed) %>%
+  left_join(tpm_avg, by = "transcript_id_clean") %>%
+  left_join(cds_len_df, by = "transcript_id_clean") %>%
+  mutate(transcript_id_clean = as.character(transcript_id_clean),
+         gene_id_clean       = as.character(gene_id_clean),
+         mean_tpm            = as.numeric(replace_na(mean_tpm, 0)),
+         cds_length          = as.integer(cds_length))
+
+# For each gene: highest mean TPM first, longest CDS as tie-break.
+# Use arrange + duplicated to avoid group_by/slice on S4-typed columns.
+tx_map <- tx_candidates %>%
+  arrange(gene_id_clean, desc(mean_tpm), desc(cds_length)) %>%
+  dplyr::filter(!duplicated(gene_id_clean)) %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, mean_tpm, cds_length)
+
+n_salmon_covered <- sum(tx_map$mean_tpm > 0)
+n_fallback       <- sum(tx_map$mean_tpm == 0)
+cat("Transcripts selected (most expressed per gene):", nrow(tx_map), "\n")
+cat("  Salmon-covered (mean TPM > 0):", n_salmon_covered, "\n")
+cat("  Fallback to longest CDS (mean TPM = 0):", n_fallback, "\n")
+cat("  Genes with no CDS in txdb (not selectable):",
+    length(mcf7_expressed) - nrow(tx_map), "\n")
+```
+
+---
+
+# Section 5: Codon Counts
+
+```{r filter_cds_sequences}
+keep_tx <- tx_map$transcript_id_clean
+
+keep_idx   <- cds_names_clean_all %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean_all[keep_idx]
+
+# Keep only in-frame CDS (length > 0 and divisible by 3)
+valid      <- width(cds_frame0) > 0 & width(cds_frame0) %% 3 == 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+cat("Min CDS length:", min(width(cds_frame0)), "| Max:", max(width(cds_frame0)), "\n")
+```
+
+```{r codon_matrices}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)
+  new_len  <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+make_counts <- function(seqs) {
+  seqs <- seqs[width(seqs) > 0]
+  ct   <- codonTable(seqs)
+  mat  <- codonCounts(ct)
+  rownames(mat) <- names(seqs)
+  mat
+}
+
+cds_frame1  <- shift_frame(cds_frame0, 1)
+cds_frame2  <- shift_frame(cds_frame0, 2)
+counts_mat1 <- make_counts(cds_frame1)
+counts_mat2 <- make_counts(cds_frame2)
+
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts ×", ncol(counts_mat0), "codons\n")
+```
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+
+codon_gc3 <- tibble(
+  codon          = sense_codons,
+  gc3_nucleotide = substr(sense_codons, 3, 3),
+  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
+)
+
+# Transcript → gene mapping for the counts matrix
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_map %>% dplyr::select(transcript_id_clean, gene_id_clean), by = "transcript_id_clean")
+```
+
+```{r resolve_gene_sets}
+promotes_tx <- tx_gene_df %>%
+  filter(gene_id_clean %in% promotes_ids) %>%
+  pull(transcript_id_clean)
+neg_ctrl_tx <- tx_gene_df %>%
+  filter(gene_id_clean %in% neg_ctrl_ids) %>%
+  pull(transcript_id_clean)
+
+promotes_tx <- promotes_tx[promotes_tx %in% rownames(counts_mat0)]
+neg_ctrl_tx <- neg_ctrl_tx[neg_ctrl_tx  %in% rownames(counts_mat0)]
+
+cat("Promotes transcripts with codon data:", length(promotes_tx), "\n")
+cat("Neg ctrl transcripts with codon data:", length(neg_ctrl_tx), "\n")
+cat("Promotes genes matched to transcript:", length(promotes_tx),
+    "/", length(promotes_ids), "\n")
+cat("Neg ctrl genes matched to transcript:", length(neg_ctrl_tx),
+    "/", length(neg_ctrl_ids), "\n")
+```
+
+---
+
+# Section 6: RSCU Functions (copied from notebook 38)
+
+```{r rscu_functions}
+compute_rscu_matrix <- function(counts_mat) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(aa_to_codons)) {
+    codons  <- intersect(aa_to_codons[[aa]], colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    n_syn   <- length(codons)
+    valid   <- aa_tot > 0
+    if (any(valid)) {
+      rscu_mat[valid, codons] <- sub_cnt[valid, , drop = FALSE] * n_syn / aa_tot[valid]
+    }
+  }
+  rscu_mat
+}
+
+compute_bg_rscu_matrix <- function(counts_mat, bg_props) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(bg_props)) {
+    props  <- bg_props[[aa]]
+    codons <- intersect(names(props), colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    for (codon in codons) {
+      bp <- props[codon]
+      if (bp > 0 && any(valid)) {
+        rscu_mat[valid, codon] <- (sub_cnt[valid, codon] / aa_tot[valid]) / bp
+      }
+    }
+  }
+  rscu_mat
+}
+
+summarize_rscu <- function(rscu_mat, tx_ids) {
+  tx_ids <- tx_ids[tx_ids %in% rownames(rscu_mat)]
+  sub    <- rscu_mat[tx_ids, sense_codons, drop = FALSE]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    codons <- intersect(codons, colnames(sub))
+    map_dfr(codons, function(codon) {
+      vals <- sub[, codon]
+      vals <- vals[!is.na(vals)]
+      tibble(
+        amino_acid  = aa,
+        codon       = codon,
+        mean_rscu   = mean(vals),
+        median_rscu = median(vals),
+        se_rscu     = if (length(vals) > 1) sd(vals) / sqrt(length(vals)) else NA_real_,
+        n           = length(vals)
+      )
+    })
+  })
+}
+
+summarize_delta_rscu <- function(rscu_mat, promotes_ids, neg_ctrl_ids, frame_label) {
+  p_ids <- promotes_ids[promotes_ids %in% rownames(rscu_mat)]
+  n_ids <- neg_ctrl_ids[neg_ctrl_ids  %in% rownames(rscu_mat)]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    codons <- intersect(codons, colnames(rscu_mat))
+    map_dfr(codons, function(codon) {
+      p_vals <- rscu_mat[p_ids, codon]; p_vals <- p_vals[!is.na(p_vals)]
+      n_vals <- rscu_mat[n_ids, codon]; n_vals <- n_vals[!is.na(n_vals)]
+      tibble(amino_acid = aa, codon = codon,
+             delta = mean(p_vals) - mean(n_vals),
+             frame = frame_label)
+    })
+  })
+}
+
+per_tx_sig_rscu <- function(rscu_mat, promotes_ids, neg_ctrl_ids, frame_label) {
+  p_ids <- promotes_ids[promotes_ids %in% rownames(rscu_mat)]
+  n_ids <- neg_ctrl_ids[neg_ctrl_ids  %in% rownames(rscu_mat)]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    if (length(codons) < 2) return(NULL)
+    codons <- intersect(codons, colnames(rscu_mat))
+    map_dfr(codons, function(codon) {
+      p_vals <- rscu_mat[p_ids, codon]; p_vals <- p_vals[!is.na(p_vals)]
+      n_vals <- rscu_mat[n_ids, codon]; n_vals <- n_vals[!is.na(n_vals)]
+      if (length(p_vals) < 3 || length(n_vals) < 3) {
+        return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_, frame = frame_label))
+      }
+      wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+      tibble(amino_acid = aa, codon = codon, p_val = wt$p.value, frame = frame_label)
+    })
+  })
+}
+```
+
+---
+
+# Section 7: Standard RSCU
+
+```{r compute_rscu}
+rscu_mat0 <- compute_rscu_matrix(counts_mat0)
+cat("RSCU matrix:", nrow(rscu_mat0), "×", ncol(rscu_mat0), "\n")
+cat("Range:", round(min(rscu_mat0, na.rm = TRUE), 3), "—",
+    round(max(rscu_mat0, na.rm = TRUE), 3), "\n")
+```
+
+```{r rscu_group_summaries}
+rscu_promotes <- summarize_rscu(rscu_mat0, promotes_tx)
+rscu_neg      <- summarize_rscu(rscu_mat0, neg_ctrl_tx)
+cat("RSCU summary rows — promotes:", nrow(rscu_promotes), "| neg ctrl:", nrow(rscu_neg), "\n")
+```
+
+```{r rscu_delta}
+rscu_combined <- rscu_promotes %>%
+  dplyr::select(amino_acid, codon, promotes_mean = mean_rscu,
+                promotes_se = se_rscu, promotes_median = median_rscu,
+                promotes_n = n) %>%
+  left_join(
+    rscu_neg %>% dplyr::select(amino_acid, codon, neg_mean = mean_rscu,
+                               neg_se = se_rscu, neg_median = median_rscu,
+                               neg_n = n),
+    by = c("amino_acid", "codon")
+  ) %>%
+  mutate(delta_rscu = promotes_mean - neg_mean)
+
+wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons <- intersect(codons, colnames(rscu_mat0))
+  map_dfr(codons, function(codon) {
+    p_vals <- rscu_mat0[promotes_tx[promotes_tx %in% rownames(rscu_mat0)], codon]
+    n_vals <- rscu_mat0[neg_ctrl_tx[neg_ctrl_tx %in% rownames(rscu_mat0)], codon]
+    p_vals <- p_vals[!is.na(p_vals)]
+    n_vals <- n_vals[!is.na(n_vals)]
+    if (length(p_vals) < 3 || length(n_vals) < 3) {
+      return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_))
+    }
+    wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val = wt$p.value)
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+rscu_combined <- rscu_combined %>%
+  left_join(wilcox_df %>% dplyr::select(amino_acid, codon, p_val, p_adj),
+            by = c("amino_acid", "codon"))
+
+cat("Top 10 codons by |Δ RSCU| (standard):\n")
+print(rscu_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_rscu))) %>%
+        dplyr::select(codon, amino_acid, promotes_mean, neg_mean, delta_rscu, p_adj) %>%
+        head(10))
+```
+
+```{r plot_rscu_sidebyside, fig.width=11, fig.height=9}
+plot_df_a <- rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  pivot_longer(cols = c(promotes_mean, neg_mean),
+               names_to = "group", values_to = "mean_rscu") %>%
+  mutate(
+    se       = if_else(group == "promotes_mean", promotes_se, neg_se),
+    group    = recode(group,
+                      promotes_mean = "eIF3d-promoted",
+                      neg_mean      = "Neg ctrl"),
+    group    = factor(group, levels = c("eIF3d-promoted", "Neg ctrl")),
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon    = reorder(codon, mean_rscu)
+  )
+
+p_a <- ggplot(plot_df_a, aes(x = codon, y = mean_rscu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = mean_rscu - se, ymax = mean_rscu + se),
+                position = position_dodge(width = 0.8), width = 0.3, linewidth = 0.4) +
+  scale_fill_manual(values = c("eIF3d-promoted" = "#E69F00", "Neg ctrl" = "#000000"),
+                    name = NULL) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  labs(
+    title    = "RSCU by group: eIF3d-promoted vs negative control (MCF7-SIX1, Hypoxia)",
+    subtitle = "Mean per-transcript RSCU ± SE; dashed line = RSCU 1 (uniform usage)",
+    x = "Codon", y = "Mean RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_a
+ggsave(here("plots", "41_rscu_sidebyside_mcf7six1_hypoxia.pdf"), p_a, width = 11, height = 9)
+```
+
+```{r plot_rscu_delta, fig.width=10, fig.height=8}
+plot_df_b <- rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta_rscu >= 0, "promotes", "neg_ctrl"),
+    sig_label = case_when(!is.na(p_adj) & p_adj < 0.05 ~ "*", TRUE ~ ""),
+    codon     = reorder(codon, delta_rscu)
+  )
+
+p_b <- ggplot(plot_df_b, aes(x = codon, y = delta_rscu, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label, y = delta_rscu + sign(delta_rscu) * 0.03),
+            size = 3, vjust = 0.5) +
+  scale_fill_manual(values = c(promotes = "#E69F00", neg_ctrl = "#000000"), guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ RSCU: eIF3d-promoted minus negative control (MCF7-SIX1, Hypoxia)",
+    subtitle = "Mean per-transcript RSCU difference; * = BH-adjusted Wilcoxon q < 0.05",
+    x = "Codon", y = "Δ mean RSCU (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_b
+ggsave(here("plots", "41_rscu_delta_mcf7six1_hypoxia.pdf"), p_b, width = 10, height = 8)
+```
+
+---
+
+# Section 8: Background-Corrected RSCU
+
+Background proportions computed from all MCF7-SIX1 expressed transcripts
+(those in tx_map), giving each gene equal weight regardless of CDS length.
+
+```{r bg_rscu_background_props}
+bg_props <- imap(aa_to_codons, function(codons, aa) {
+  codons  <- intersect(codons, colnames(counts_mat0))
+  if (length(codons) == 0) return(NULL)
+  sub_cnt <- counts_mat0[, codons, drop = FALSE]
+  aa_tot  <- rowSums(sub_cnt)
+  valid   <- aa_tot > 0
+  if (!any(valid)) return(NULL)
+  prop_mat <- sub_cnt[valid, , drop = FALSE] / aa_tot[valid]
+  colMeans(prop_mat)
+})
+bg_props <- Filter(Negate(is.null), bg_props)
+
+cat("Background proportions computed for", length(bg_props), "amino acids\n")
+prop_sums <- sapply(bg_props, sum)
+cat("Background proportions sum check (should all be ~1):",
+    round(range(prop_sums), 4), "\n")
+```
+
+```{r compute_bg_rscu}
+bg_rscu_mat0 <- compute_bg_rscu_matrix(counts_mat0, bg_props)
+cat("Background RSCU matrix:", nrow(bg_rscu_mat0), "×", ncol(bg_rscu_mat0), "\n")
+cat("Range:", round(min(bg_rscu_mat0, na.rm = TRUE), 3), "—",
+    round(max(bg_rscu_mat0, na.rm = TRUE), 3), "\n")
+
+bg_mean_per_codon <- colMeans(bg_rscu_mat0, na.rm = TRUE)
+bg_mean_per_codon <- bg_mean_per_codon[sense_codons[sense_codons %in% names(bg_mean_per_codon)]]
+cat("Mean bg_RSCU across all expressed mRNAs — range:",
+    round(range(bg_mean_per_codon, na.rm = TRUE), 3), "\n")
+cat("(Should be ≈ 1 for all codons by construction)\n")
+```
+
+```{r bg_rscu_group_summaries}
+bg_rscu_promotes <- summarize_rscu(bg_rscu_mat0, promotes_tx)
+bg_rscu_neg      <- summarize_rscu(bg_rscu_mat0, neg_ctrl_tx)
+cat("Background RSCU summary — promotes:", nrow(bg_rscu_promotes), "codon-rows\n")
+```
+
+```{r bg_rscu_delta}
+bg_rscu_combined <- bg_rscu_promotes %>%
+  dplyr::select(amino_acid, codon, promotes_mean = mean_rscu,
+                promotes_se = se_rscu, promotes_n = n) %>%
+  left_join(
+    bg_rscu_neg %>% dplyr::select(amino_acid, codon, neg_mean = mean_rscu,
+                                  neg_se = se_rscu, neg_n = n),
+    by = c("amino_acid", "codon")
+  ) %>%
+  mutate(delta_bg_rscu = promotes_mean - neg_mean)
+
+bg_wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons <- intersect(codons, colnames(bg_rscu_mat0))
+  map_dfr(codons, function(codon) {
+    p_vals <- bg_rscu_mat0[promotes_tx[promotes_tx %in% rownames(bg_rscu_mat0)], codon]
+    n_vals <- bg_rscu_mat0[neg_ctrl_tx[neg_ctrl_tx %in% rownames(bg_rscu_mat0)], codon]
+    p_vals <- p_vals[!is.na(p_vals)]
+    n_vals <- n_vals[!is.na(n_vals)]
+    if (length(p_vals) < 3 || length(n_vals) < 3) {
+      return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_))
+    }
+    wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val = wt$p.value)
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+bg_rscu_combined <- bg_rscu_combined %>%
+  left_join(bg_wilcox_df %>% dplyr::select(amino_acid, codon, p_val, p_adj),
+            by = c("amino_acid", "codon"))
+
+cat("Top 10 codons by |Δ background RSCU|:\n")
+print(bg_rscu_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_bg_rscu))) %>%
+        dplyr::select(codon, amino_acid, promotes_mean, neg_mean, delta_bg_rscu, p_adj) %>%
+        head(10))
+
+sig_codons <- bg_rscu_combined %>% filter(!is.na(p_adj), p_adj < 0.05)
+cat("\nSignificant codons (bg RSCU, BH q < 0.05):", nrow(sig_codons), "\n")
+if (nrow(sig_codons) > 0) print(sig_codons %>% dplyr::select(codon, amino_acid, delta_bg_rscu, p_adj))
+```
+
+```{r save_mcf7_results}
+write_csv(bg_rscu_combined,
+          here("output", "predictive_modeling", "bg_rscu_mcf7six1_hypoxia.csv"))
+cat("Saved bg_rscu_combined to output/predictive_modeling/bg_rscu_mcf7six1_hypoxia.csv\n")
+```
+
+```{r bg_rscu_plot_sidebyside, fig.width=11, fig.height=9}
+plot_df_bg_a <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  pivot_longer(cols = c(promotes_mean, neg_mean),
+               names_to = "group", values_to = "mean_bg_rscu") %>%
+  mutate(
+    se       = if_else(group == "promotes_mean", promotes_se, neg_se),
+    group    = recode(group,
+                      promotes_mean = "eIF3d-promoted",
+                      neg_mean      = "Neg ctrl"),
+    group    = factor(group, levels = c("eIF3d-promoted", "Neg ctrl")),
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon    = reorder(codon, mean_bg_rscu)
+  )
+
+p_bg_a <- ggplot(plot_df_bg_a, aes(x = codon, y = mean_bg_rscu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = mean_bg_rscu - se, ymax = mean_bg_rscu + se),
+                position = position_dodge(width = 0.8), width = 0.3, linewidth = 0.4) +
+  scale_fill_manual(values = c("eIF3d-promoted" = "#E69F00", "Neg ctrl" = "#000000"),
+                    name = NULL) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  labs(
+    title    = "Background-corrected RSCU: eIF3d-promoted vs neg ctrl (MCF7-SIX1, Hypoxia)",
+    subtitle = "Mean per-transcript bg-RSCU ± SE; dashed = 1 (same rate as MCF7-SIX1 transcriptome background)",
+    x = "Codon", y = "Mean background-corrected RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_bg_a
+ggsave(here("plots", "41_bg_rscu_sidebyside_mcf7six1_hypoxia.pdf"), p_bg_a,
+       width = 11, height = 9)
+```
+
+```{r bg_rscu_plot_delta, fig.width=10, fig.height=8}
+plot_df_bg_b <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta_bg_rscu >= 0, "promotes", "neg_ctrl"),
+    sig_label = case_when(!is.na(p_adj) & p_adj < 0.05 ~ "*", TRUE ~ ""),
+    codon     = reorder(codon, delta_bg_rscu)
+  )
+
+p_bg_b <- ggplot(plot_df_bg_b, aes(x = codon, y = delta_bg_rscu, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label, y = delta_bg_rscu + sign(delta_bg_rscu) * 0.015),
+            size = 3, vjust = 0.5) +
+  scale_fill_manual(values = c(promotes = "#E69F00", neg_ctrl = "#000000"), guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ background-corrected RSCU: eIF3d-promoted minus neg ctrl (MCF7-SIX1, Hypoxia)",
+    subtitle = "Mean per-transcript bg-RSCU difference; * = BH-adjusted Wilcoxon q < 0.05",
+    x = "Codon", y = "Δ mean bg-RSCU (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_bg_b
+ggsave(here("plots", "41_bg_rscu_delta_mcf7six1_hypoxia.pdf"), p_bg_b, width = 10, height = 8)
+```
+
+```{r bg_rscu_violin_by_aa, fig.width=12, fig.height=8}
+sig_aas <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa, !is.na(p_adj), p_adj < 0.05) %>%
+  pull(amino_acid) %>% unique()
+
+cat("Amino acids with ≥1 significant codon (bg RSCU, BH q < 0.05):", length(sig_aas), "\n")
+if (length(sig_aas) > 0) cat(paste(sig_aas, collapse = ", "), "\n")
+
+if (length(sig_aas) > 0) {
+  sig_codons_by_aa <- bg_rscu_combined %>%
+    filter(amino_acid %in% sig_aas, !is.na(p_adj), p_adj < 0.05) %>%
+    dplyr::select(amino_acid, codon)
+
+  violin_df <- map_dfr(seq_len(nrow(sig_codons_by_aa)), function(i) {
+    aa    <- sig_codons_by_aa$amino_acid[i]
+    codon <- sig_codons_by_aa$codon[i]
+    tx_p  <- promotes_tx[promotes_tx %in% rownames(bg_rscu_mat0)]
+    tx_n  <- neg_ctrl_tx[neg_ctrl_tx  %in% rownames(bg_rscu_mat0)]
+    bind_rows(
+      tibble(codon = codon, amino_acid = aa, group = "eIF3d-promoted",
+             bg_rscu = bg_rscu_mat0[tx_p, codon][!is.na(bg_rscu_mat0[tx_p, codon])]),
+      tibble(codon = codon, amino_acid = aa, group = "Neg ctrl",
+             bg_rscu = bg_rscu_mat0[tx_n, codon][!is.na(bg_rscu_mat0[tx_n, codon])])
+    )
+  }) %>%
+    mutate(
+      group    = factor(group, levels = c("eIF3d-promoted", "Neg ctrl")),
+      codon_aa = paste0(codon, "\n(", amino_acid, ")")
+    ) %>%
+    left_join(bg_rscu_combined %>% dplyr::select(codon, p_adj_label = p_adj), by = "codon") %>%
+    mutate(codon_aa = paste0(codon, "\nq=", signif(p_adj_label, 2)))
+
+  p_viol <- ggplot(violin_df, aes(x = group, y = bg_rscu, fill = group)) +
+    geom_violin(alpha = 0.6, linewidth = 0.4, trim = TRUE) +
+    geom_boxplot(width = 0.18, outlier.size = 0.5, linewidth = 0.4,
+                 fill = "white", alpha = 0.8) +
+    geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c("eIF3d-promoted" = "#E69F00", "Neg ctrl" = "#000000"),
+                      guide = "none") +
+    facet_wrap(~ codon_aa, scales = "free_y", nrow = 2) +
+    labs(
+      title    = "Per-transcript background RSCU for significant codons (MCF7-SIX1, Hypoxia)",
+      subtitle = "Codons with BH q < 0.05. Dashed = 1 (same rate as MCF7-SIX1 transcriptome background).",
+      x = NULL, y = "Per-transcript background-corrected RSCU"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      strip.text  = element_text(face = "bold", size = 9)
+    )
+  p_viol
+  ggsave(here("plots", "41_bg_rscu_violin_mcf7six1_hypoxia.pdf"), p_viol,
+         width = max(8, length(sig_aas) * 2.5), height = 8)
+} else {
+  cat("No significant codons in background RSCU comparison — skipping violin plot.\n")
+}
+```
+
+---
+
+# Section 9: Frame Control Analysis
+
+```{r bg_rscu_frame_ctrl, fig.width=12, fig.height=9}
+bg_rscu_mat1 <- compute_bg_rscu_matrix(counts_mat1, bg_props)
+bg_rscu_mat2 <- compute_bg_rscu_matrix(counts_mat2, bg_props)
+
+bg_f0_delta <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(amino_acid, codon, delta = delta_bg_rscu) %>%
+  mutate(frame = "Frame 0 (coding)")
+bg_f1_delta <- summarize_delta_rscu(bg_rscu_mat1, promotes_tx, neg_ctrl_tx, "Frame 1 (control)")
+bg_f2_delta <- summarize_delta_rscu(bg_rscu_mat2, promotes_tx, neg_ctrl_tx, "Frame 2 (control)")
+
+bg_frame_delta_df <- bind_rows(bg_f0_delta, bg_f1_delta, bg_f2_delta) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    frame    = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+bg_codon_order <- bg_f0_delta %>%
+  filter(amino_acid %in% multi_aa) %>%
+  arrange(amino_acid, delta) %>%
+  pull(codon)
+bg_frame_delta_df <- bg_frame_delta_df %>%
+  mutate(codon = factor(codon, levels = bg_codon_order))
+
+bg_sig_df <- bind_rows(
+  per_tx_sig_rscu(bg_rscu_mat0, promotes_tx, neg_ctrl_tx, "Frame 0 (coding)"),
+  per_tx_sig_rscu(bg_rscu_mat1, promotes_tx, neg_ctrl_tx, "Frame 1 (control)"),
+  per_tx_sig_rscu(bg_rscu_mat2, promotes_tx, neg_ctrl_tx, "Frame 2 (control)")
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    q_val = p.adjust(p_val, method = "BH"),
+    sig   = !is.na(q_val) & q_val < 0.05,
+    frame = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+bg_f0_sig   <- bg_sig_df %>% filter(frame == "Frame 0 (coding)") %>%
+  dplyr::select(amino_acid, codon, f0_sig = sig)
+bg_ctrl_sig <- bg_sig_df %>% filter(frame != "Frame 0 (coding)") %>%
+  group_by(amino_acid, codon) %>%
+  summarise(any_ctrl_sig = any(sig), .groups = "drop")
+bg_f0_labels <- bg_f0_sig %>%
+  left_join(bg_ctrl_sig, by = c("amino_acid", "codon")) %>%
+  mutate(sig_label = case_when(
+    f0_sig & !any_ctrl_sig ~ "✦",
+    f0_sig &  any_ctrl_sig ~ "·",
+    TRUE                   ~ ""
+  )) %>%
+  dplyr::select(amino_acid, codon, sig_label) %>%
+  mutate(frame = factor("Frame 0 (coding)",
+                        levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)")))
+
+bg_aa_any_f0 <- bg_f0_labels %>% filter(sig_label != "") %>% pull(amino_acid) %>% unique()
+bg_aa_clean  <- bg_f0_labels %>% filter(sig_label == "✦") %>% pull(amino_acid) %>% unique()
+
+bg_frame_delta_df <- bg_frame_delta_df %>%
+  mutate(aa_label = ifelse(amino_acid %in% bg_aa_any_f0,
+                           paste0(aa_label, " *"), aa_label))
+
+bg_aa_label_map <- bg_frame_delta_df %>% distinct(amino_acid, aa_label)
+bg_facet_clean  <- bg_aa_label_map %>% filter(amino_acid %in% bg_aa_clean)
+
+bg_rect_layer <- if (nrow(bg_facet_clean) > 0) {
+  geom_rect(data = bg_facet_clean,
+            aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE, fill = NA, color = "#0072B2", linewidth = 1.5)
+} else {
+  NULL
+}
+
+p_bg_c <- ggplot(bg_frame_delta_df, aes(x = codon, y = delta, fill = frame)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  bg_rect_layer +
+  scale_fill_manual(
+    values = c("Frame 0 (coding)"  = "#E69F00",
+               "Frame 1 (control)" = "#999999",
+               "Frame 2 (control)" = "#CCCCCC")
+  ) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ background-corrected RSCU by reading frame: frame 0 vs frameshift controls (MCF7-SIX1, Hypoxia)",
+    subtitle = "Frames 1 & 2: shifted tiling of the same sequence.\nBlue border: frame 0 sig, neither control sig (✦). *: frame 0 significant. [q < 0.05, BH Wilcoxon]",
+    x = "Codon", y = "Δ mean bg-RSCU (promotes − neg ctrl)",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_bg_c
+ggsave(here("plots", "41_bg_rscu_frame_ctrl_mcf7six1_hypoxia.pdf"), p_bg_c,
+       width = 12, height = 9)
+```
+
+---
+
+# Section 10: GC3 Bias Check
+
+```{r gc3_by_group}
+gc3_codons <- codon_gc3 %>% filter(gc3_class == "GC-ending") %>% pull(codon)
+gc3_codons <- intersect(gc3_codons, colnames(counts_mat0))
+
+per_tx_sense_total <- rowSums(counts_mat0[, sense_codons[sense_codons %in% colnames(counts_mat0)]])
+per_tx_gc3_count   <- rowSums(counts_mat0[, gc3_codons, drop = FALSE])
+per_tx_gc3         <- per_tx_gc3_count / per_tx_sense_total
+
+gc3_prom <- mean(per_tx_gc3[promotes_tx[promotes_tx %in% names(per_tx_gc3)]], na.rm = TRUE)
+gc3_neg  <- mean(per_tx_gc3[neg_ctrl_tx[neg_ctrl_tx  %in% names(per_tx_gc3)]], na.rm = TRUE)
+
+cat("Mean GC3 — promotes:", round(gc3_prom, 4), "\n")
+cat("Mean GC3 — neg ctrl:", round(gc3_neg, 4), "\n")
+cat("Δ GC3 (promotes - neg ctrl):", round(gc3_prom - gc3_neg, 4), "\n")
+
+gc3_wt <- wilcox.test(
+  per_tx_gc3[promotes_tx[promotes_tx %in% names(per_tx_gc3)]],
+  per_tx_gc3[neg_ctrl_tx[neg_ctrl_tx  %in% names(per_tx_gc3)]],
+  exact = FALSE
+)
+cat("Wilcoxon test (GC3: promotes vs neg ctrl): W =", gc3_wt$statistic,
+    ", p =", signif(gc3_wt$p.value, 3), "\n")
+```
+
+```{r rscu_vs_gc3, fig.width=5.5, fig.height=5}
+plot_df_gc3 <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_nucleotide, gc3_class), by = "codon") %>%
+  mutate(
+    gc3_nucleotide = factor(gc3_nucleotide, levels = c("A", "T", "G", "C")),
+    sig            = !is.na(p_adj) & p_adj < 0.05,
+    label_codon    = if_else(abs(delta_bg_rscu) > 0.05 | sig, codon, NA_character_)
+  )
+
+gc_vals <- plot_df_gc3 %>% filter(gc3_class == "GC-ending") %>% pull(delta_bg_rscu)
+at_vals <- plot_df_gc3 %>% filter(gc3_class == "AT-ending") %>% pull(delta_bg_rscu)
+wt_gc3  <- wilcox.test(gc_vals, at_vals, exact = FALSE)
+gc3_p_label <- paste0("Wilcoxon p = ", signif(wt_gc3$p.value, 2),
+                       "\n(GC-ending vs AT-ending)")
+
+nt_colours <- c(A = "#56B4E9", T = "#009E73", G = "#E69F00", C = "#CC79A7")
+
+p_gc3 <- ggplot(plot_df_gc3,
+                aes(x = gc3_nucleotide, y = delta_bg_rscu, colour = gc3_nucleotide)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_jitter(aes(shape = sig), width = 0.2, size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = nt_colours, guide = "none") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 8),
+                     labels = c(`FALSE` = "ns", `TRUE` = "q < 0.05"),
+                     name = "BH Wilcoxon") +
+  annotate("text", x = 4.4, y = max(plot_df_gc3$delta_bg_rscu, na.rm = TRUE),
+           label = gc3_p_label, hjust = 1, vjust = 1, size = 3, colour = "grey30") +
+  labs(
+    title    = "Δ bg-RSCU vs codon third-position nucleotide (MCF7-SIX1, Hypoxia)",
+    subtitle = "Each point = one codon (multi-synonymous AAs only)",
+    x = "Third-position nucleotide", y = "Δ mean bg-RSCU (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_gc3
+ggsave(here("plots", "41_bg_rscu_delta_vs_gc3_mcf7six1.pdf"), p_gc3, width = 5.5, height = 5)
+```
+
+---
+
+# Section 11: CSC Weight Correlation
+
+```{r rscu_vs_csc_weight, fig.width=5.5, fig.height=5}
+data("human_optimality", package = "iCodon")
+codon_csc_weights <- dplyr::select(human_optimality, codon, csc_weight = optimality)
+
+plot_df_csc <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  left_join(codon_csc_weights %>% dplyr::select(codon, csc_weight), by = "codon") %>%
+  mutate(
+    sig         = !is.na(p_adj) & p_adj < 0.05,
+    label_codon = if_else(abs(delta_bg_rscu) > 0.05 | sig, codon, NA_character_)
+  )
+
+cor_at <- cor(
+  filter(plot_df_csc, gc3_class == "AT-ending")$csc_weight,
+  filter(plot_df_csc, gc3_class == "AT-ending")$delta_bg_rscu,
+  use = "complete.obs"
+)
+cor_gc <- cor(
+  filter(plot_df_csc, gc3_class == "GC-ending")$csc_weight,
+  filter(plot_df_csc, gc3_class == "GC-ending")$delta_bg_rscu,
+  use = "complete.obs"
+)
+cat("Pearson r (Δ bg-RSCU ~ CSC weight) — AT-ending:", round(cor_at, 3),
+    "| GC-ending:", round(cor_gc, 3), "\n")
+
+p_csc <- ggplot(plot_df_csc,
+                aes(x = csc_weight, y = delta_bg_rscu, colour = gc3_class)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_point(aes(shape = sig), size = 2.2, alpha = 0.85) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, alpha = 0.15) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(
+    values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+    name   = "Third-position"
+  ) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 8),
+                     labels = c(`FALSE` = "ns", `TRUE` = "q < 0.05"),
+                     name   = "BH Wilcoxon") +
+  annotate("text", x = min(plot_df_csc$csc_weight, na.rm = TRUE),
+           y = max(plot_df_csc$delta_bg_rscu, na.rm = TRUE),
+           label = paste0("r (AT) = ", round(cor_at, 2),
+                          "\nr (GC) = ", round(cor_gc, 2)),
+           hjust = 0, vjust = 1, size = 3, colour = "grey30") +
+  labs(
+    title    = "Δ bg-RSCU vs per-codon iCodon CSC weight (MCF7-SIX1, Hypoxia)",
+    subtitle = "Tests whether promotes-enriched AT-ending codons are selectively high-CSC",
+    x = "iCodon CSC weight (human)", y = "Δ mean bg-RSCU (promotes − neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_csc
+ggsave(here("plots", "41_bg_rscu_delta_vs_csc_mcf7six1.pdf"), p_csc, width = 5.5, height = 5)
+```
+
+---
+
+# Section 12: Cross-Cell-Line Comparison (231s vs MCF7-SIX1)
+
+```{r load_231_results}
+rscu_231_path <- here("output", "predictive_modeling", "bg_rscu_231_hypoxia_1hr.csv")
+if (!file.exists(rscu_231_path)) {
+  stop("bg_rscu_231_hypoxia_1hr.csv not found. Knit notebook 38 first to generate it.")
+}
+rscu_231 <- read_csv(rscu_231_path, show_col_types = FALSE)
+cat("231 bg_rscu_combined loaded:", nrow(rscu_231), "rows\n")
+```
+
+```{r cross_cellline_comparison}
+comp <- rscu_231 %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(codon, amino_acid, delta_231 = delta_bg_rscu, p_adj_231 = p_adj) %>%
+  inner_join(
+    bg_rscu_combined %>%
+      filter(amino_acid %in% multi_aa) %>%
+      dplyr::select(codon, delta_mcf7 = delta_bg_rscu, p_adj_mcf7 = p_adj),
+    by = "codon"
+  ) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(
+    sig = case_when(
+      !is.na(p_adj_231) & p_adj_231 < 0.05 & !is.na(p_adj_mcf7) & p_adj_mcf7 < 0.05 ~ "Both",
+      !is.na(p_adj_231) & p_adj_231 < 0.05                                             ~ "231 only",
+      !is.na(p_adj_mcf7) & p_adj_mcf7 < 0.05                                           ~ "MCF7-SIX1 only",
+      TRUE                                                                               ~ "Neither"
+    ),
+    sig = factor(sig, levels = c("Both", "231 only", "MCF7-SIX1 only", "Neither")),
+    label_codon = if_else(sig != "Neither", codon, NA_character_)
+  )
+
+r_val <- cor(comp$delta_231, comp$delta_mcf7, use = "complete.obs")
+cat("Codons in cross-cell-line comparison:", nrow(comp), "\n")
+cat("Pearson r (Δ bg_RSCU: MDA-MB-231 vs MCF7-SIX1):", round(r_val, 3), "\n\n")
+
+cat("Significance breakdown:\n")
+print(table(comp$sig))
+
+cat("\nCodons significant in both cell lines:\n")
+both_sig <- comp %>% filter(sig == "Both") %>%
+  arrange(desc(abs(delta_231))) %>%
+  dplyr::select(codon, amino_acid, gc3_class, delta_231, delta_mcf7, p_adj_231, p_adj_mcf7)
+if (nrow(both_sig) > 0) print(both_sig) else cat("  None\n")
+```
+
+```{r cross_cellline_scatter, fig.width=6, fig.height=5.5}
+sig_colours <- c(
+  "Both"          = "#E69F00",
+  "231 only"      = "#0072B2",
+  "MCF7-SIX1 only" = "#CC79A7",
+  "Neither"       = "grey70"
+)
+sig_sizes <- c("Both" = 2.8, "231 only" = 2.2, "MCF7-SIX1 only" = 2.2, "Neither" = 1.6)
+sig_alpha  <- c("Both" = 1, "231 only" = 0.9, "MCF7-SIX1 only" = 0.9, "Neither" = 0.5)
+
+axis_lim <- range(c(comp$delta_231, comp$delta_mcf7), na.rm = TRUE)
+axis_lim <- axis_lim + diff(axis_lim) * c(-0.05, 0.05)
+
+p_cross <- ggplot(comp, aes(x = delta_231, y = delta_mcf7, colour = sig)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(size = sig, alpha = sig)) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 25, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = sig_colours, name = "Significant") +
+  scale_size_manual(values = sig_sizes, guide = "none") +
+  scale_alpha_manual(values = sig_alpha, guide = "none") +
+  annotate("text",
+           x = axis_lim[1] + diff(axis_lim) * 0.02,
+           y = axis_lim[2] - diff(axis_lim) * 0.02,
+           label = paste0("r = ", round(r_val, 2)),
+           hjust = 0, vjust = 1, size = 4, colour = "grey30") +
+  coord_fixed(xlim = axis_lim, ylim = axis_lim) +
+  labs(
+    title    = "Cross-cell-line Δ bg-RSCU comparison: MDA-MB-231 vs MCF7-SIX1",
+    subtitle = paste0("Each point = one codon (multi-synonymous AAs). Dashed = identity line.\n",
+                      "231: eIF3d-promoted vs neg ctrl, hypoxia 1hr (notebook 38).\n",
+                      "MCF7-SIX1: eIF3d-promoted vs neg ctrl, hypoxia (this notebook)."),
+    x = "Δ bg-RSCU (MDA-MB-231, hypoxia 1hr)",
+    y = "Δ bg-RSCU (MCF7-SIX1, hypoxia)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_cross
+ggsave(here("plots", "41_rscu_cross_cellline_scatter.pdf"), p_cross, width = 6, height = 5.5)
+```
+
+# Section 13: Raw Codon Frequency (count / CDS length)
+
+Raw codon proportion per transcript (no synonymous-family normalization, no background
+correction). Helps diagnose whether the bg-RSCU cross-cell-line anti-correlation
+originates in the gene sets or in the background correction step.
+
+```{r codon_freq_mcf7}
+sense_codons_in_mat <- sense_codons[sense_codons %in% colnames(counts_mat0)]
+sense_mat_mcf7  <- counts_mat0[, sense_codons_in_mat, drop = FALSE]
+total_sense_mcf7 <- rowSums(sense_mat_mcf7)
+freq_mat_mcf7   <- sense_mat_mcf7 / total_sense_mcf7
+
+prom_freq_mcf7 <- colMeans(
+  freq_mat_mcf7[promotes_tx[promotes_tx %in% rownames(freq_mat_mcf7)], , drop = FALSE],
+  na.rm = TRUE
+)
+neg_freq_mcf7 <- colMeans(
+  freq_mat_mcf7[neg_ctrl_tx[neg_ctrl_tx %in% rownames(freq_mat_mcf7)], , drop = FALSE],
+  na.rm = TRUE
+)
+
+delta_freq_mcf7 <- tibble(
+  codon         = names(prom_freq_mcf7),
+  promotes_freq = prom_freq_mcf7,
+  neg_freq      = neg_freq_mcf7,
+  delta_freq    = prom_freq_mcf7 - neg_freq_mcf7,
+  amino_acid    = gen_code[names(prom_freq_mcf7)]
+) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class, gc3_nucleotide), by = "codon") %>%
+  filter(amino_acid != "*")
+
+write_csv(delta_freq_mcf7,
+          here("output", "predictive_modeling", "codon_freq_mcf7six1_hypoxia.csv"))
+
+cat("Top 10 codons by |Δ frequency| (MCF7-SIX1):\n")
+print(delta_freq_mcf7 %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_freq))) %>%
+        dplyr::select(codon, amino_acid, gc3_class, promotes_freq, neg_freq, delta_freq) %>%
+        head(10))
+
+cat("\nMean Δ frequency by GC3 class:\n")
+delta_freq_mcf7 %>%
+  filter(amino_acid %in% multi_aa) %>%
+  group_by(gc3_class) %>%
+  summarise(mean_delta = mean(delta_freq), n = n(), .groups = "drop") %>%
+  print()
+```
+
+```{r plot_codon_freq_delta, fig.width=10, fig.height=8}
+plot_df_freq <- delta_freq_mcf7 %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta_freq >= 0, "promotes", "neg_ctrl"),
+    codon     = reorder(codon, delta_freq)
+  )
+
+p_freq <- ggplot(plot_df_freq, aes(x = codon, y = delta_freq * 1000, fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c(promotes = "#E69F00", neg_ctrl = "#000000"), guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ Codon Frequency: eIF3d-promoted minus neg ctrl (MCF7-SIX1, Hypoxia)",
+    subtitle = "Mean proportion (count / total sense codons) difference × 1000; no synonymous-family normalization",
+    x = "Codon", y = "Δ mean frequency (× 1000)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_freq
+ggsave(here("plots", "41_codon_freq_delta_mcf7six1.pdf"), p_freq, width = 10, height = 8)
+```
+
+---
+
+# Section 14: Cross-Cell-Line Diagnostics
+
+Three parallel comparisons — bg-corrected RSCU (Section 12), standard RSCU, and raw
+codon frequency — to isolate where the cross-cell-line anti-correlation originates.
+
+```{r cross_cellline_std_rscu, fig.width=6, fig.height=5.5}
+rscu_231_path <- here("output", "predictive_modeling", "rscu_231_hypoxia_1hr.csv")
+if (!file.exists(rscu_231_path)) {
+  message("rscu_231_hypoxia_1hr.csv not found — knit notebook 38 to generate it.")
+} else {
+  rscu_231_std <- read_csv(rscu_231_path, show_col_types = FALSE)
+
+  comp_std <- rscu_231_std %>%
+    filter(amino_acid %in% multi_aa) %>%
+    dplyr::select(codon, amino_acid, delta_231 = delta_rscu, p_adj_231 = p_adj) %>%
+    inner_join(
+      rscu_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        dplyr::select(codon, delta_mcf7 = delta_rscu, p_adj_mcf7 = p_adj),
+      by = "codon"
+    ) %>%
+    left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+    mutate(
+      sig_std = case_when(
+        !is.na(p_adj_231) & p_adj_231 < 0.05 & !is.na(p_adj_mcf7) & p_adj_mcf7 < 0.05 ~ "Both",
+        !is.na(p_adj_231) & p_adj_231 < 0.05                                             ~ "231 only",
+        !is.na(p_adj_mcf7) & p_adj_mcf7 < 0.05                                           ~ "MCF7-SIX1 only",
+        TRUE                                                                               ~ "Neither"
+      ),
+      label_codon = if_else(sig_std != "Neither", codon, NA_character_)
+    )
+
+  r_std <- cor(comp_std$delta_231, comp_std$delta_mcf7, use = "complete.obs")
+  cat("=== STANDARD RSCU cross-cell-line ===\n")
+  cat("Codons:", nrow(comp_std), "\n")
+  cat("Pearson r (Δ std RSCU: 231 vs MCF7-SIX1):", round(r_std, 3), "\n")
+  cat("Significance breakdown:\n")
+  print(table(comp_std$sig_std))
+
+  ax_lim_std <- range(c(comp_std$delta_231, comp_std$delta_mcf7), na.rm = TRUE)
+  ax_lim_std <- ax_lim_std + diff(ax_lim_std) * c(-0.05, 0.05)
+
+  p_std_cross <- ggplot(comp_std, aes(x = delta_231, y = delta_mcf7, colour = gc3_class)) +
+    geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5, linetype = "dashed") +
+    geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+    geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+    geom_point(size = 2, alpha = 0.8) +
+    ggrepel::geom_text_repel(aes(label = label_codon), size = 2.5,
+                             max.overlaps = 20, min.segment.length = 0.2,
+                             show.legend = FALSE) +
+    scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                        name = "Third-position") +
+    annotate("text",
+             x = ax_lim_std[1] + diff(ax_lim_std) * 0.02,
+             y = ax_lim_std[2] - diff(ax_lim_std) * 0.02,
+             label = paste0("r = ", round(r_std, 2), "\n(standard RSCU)"),
+             hjust = 0, vjust = 1, size = 4, colour = "grey30") +
+    coord_fixed(xlim = ax_lim_std, ylim = ax_lim_std) +
+    labs(
+      title    = "Cross-cell-line Δ RSCU (standard, no bg correction)",
+      subtitle = "Each point = one codon. Dashed = identity line.",
+      x = "Δ RSCU (MDA-MB-231, hypoxia 1hr)",
+      y = "Δ RSCU (MCF7-SIX1, hypoxia)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+  p_std_cross
+  ggsave(here("plots", "41_rscu_std_cross_cellline_scatter.pdf"), p_std_cross, width = 6, height = 5.5)
+}
+```
+
+```{r cross_cellline_codon_freq, fig.width=6, fig.height=5.5}
+freq_231_path <- here("output", "predictive_modeling", "codon_freq_231_hypoxia_1hr.csv")
+if (!file.exists(freq_231_path)) {
+  message("codon_freq_231_hypoxia_1hr.csv not found — knit notebook 38 to generate it.")
+} else {
+  freq_231 <- read_csv(freq_231_path, show_col_types = FALSE)
+
+  comp_freq <- freq_231 %>%
+    filter(amino_acid %in% multi_aa) %>%
+    dplyr::select(codon, amino_acid, delta_231 = delta_freq) %>%
+    inner_join(
+      delta_freq_mcf7 %>%
+        filter(amino_acid %in% multi_aa) %>%
+        dplyr::select(codon, delta_mcf7 = delta_freq, gc3_class),
+      by = "codon"
+    )
+
+  r_freq <- cor(comp_freq$delta_231, comp_freq$delta_mcf7, use = "complete.obs")
+  cat("=== RAW CODON FREQUENCY cross-cell-line ===\n")
+  cat("Codons:", nrow(comp_freq), "\n")
+  cat("Pearson r (Δ codon freq: 231 vs MCF7-SIX1):", round(r_freq, 3), "\n")
+
+  cat("\n--- Summary of three cross-cell-line r values ---\n")
+  cat("  Δ raw codon frequency:   r =", round(r_freq, 3), "\n")
+  cat("  Δ standard RSCU:         r =", if (exists("r_std")) round(r_std, 3) else "NA (nb38 not run)", "\n")
+  cat("  Δ bg-corrected RSCU:     r =", round(r_val, 3), "\n")
+  cat("(If freq r ≈ 0 but bg_rscu r = -0.9, the background correction is driving inversion)\n")
+  cat("(If freq r also ≈ -0.9, gene sets differ fundamentally in codon composition)\n")
+
+  ax_lim_freq <- range(c(comp_freq$delta_231, comp_freq$delta_mcf7), na.rm = TRUE) * 1000
+  ax_lim_freq <- ax_lim_freq + diff(ax_lim_freq) * c(-0.05, 0.05)
+
+  top_thresh <- quantile(abs(comp_freq$delta_231), 0.85, na.rm = TRUE)
+
+  p_freq_cross <- ggplot(comp_freq,
+                         aes(x = delta_231 * 1000, y = delta_mcf7 * 1000, colour = gc3_class)) +
+    geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5, linetype = "dashed") +
+    geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+    geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+    geom_point(size = 2, alpha = 0.8) +
+    ggrepel::geom_text_repel(
+      data = comp_freq %>% filter(abs(delta_231) > top_thresh | abs(delta_mcf7) > top_thresh),
+      aes(x = delta_231 * 1000, y = delta_mcf7 * 1000, label = codon),
+      size = 2.5, max.overlaps = 20, min.segment.length = 0.2, show.legend = FALSE
+    ) +
+    scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                        name = "Third-position") +
+    annotate("text",
+             x = ax_lim_freq[1] + diff(ax_lim_freq) * 0.02,
+             y = ax_lim_freq[2] - diff(ax_lim_freq) * 0.02,
+             label = paste0("r = ", round(r_freq, 2), "\n(raw freq)"),
+             hjust = 0, vjust = 1, size = 4, colour = "grey30") +
+    coord_fixed(xlim = ax_lim_freq, ylim = ax_lim_freq) +
+    labs(
+      title    = "Cross-cell-line Δ codon frequency (raw, no normalization)",
+      subtitle = "Mean proportion (× 1000) difference: promotes − neg ctrl. No synonymous-family or background correction.",
+      x = "Δ codon freq × 1000 (MDA-MB-231, hypoxia 1hr)",
+      y = "Δ codon freq × 1000 (MCF7-SIX1, hypoxia)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+  p_freq_cross
+  ggsave(here("plots", "41_codon_freq_cross_cellline_scatter.pdf"), p_freq_cross, width = 6, height = 5.5)
+}
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

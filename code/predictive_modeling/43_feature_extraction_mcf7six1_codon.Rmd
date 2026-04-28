@@ -1,0 +1,1015 @@
+---
+title: "43 — Feature Extraction: MCF7-SIX1 External Stability Features"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Builds the MCF7-SIX1 external stability feature matrix for RF classification
+(notebooks 07 and 09). Mirrors the feature scope of MDA-MB-231
+`feature_matrix_external_stability.rds` after notebook 07 stripping, but uses
+MCF7-SIX1-specific transcript selection and cell-line-specific background RSCU.
+
+**Features included:**
+
+| Group | Columns | Notes |
+|-------|---------|-------|
+| bg-RSCU | 62 (`bg_rscu_*` × 59 + 3 summaries) | MCF7-SIX1 background |
+| Codon frequencies | 59 (`codon_freq_*`) | Length-normalized raw |
+| Region lengths + log2 | 9 (`utr5_length`, `utr3_length`, `cds_length`, `total_length`, log2 transforms) | From txdb |
+| GC content | 4 (`utr5_gc`, `utr3_gc`, `cds_gc`, `transcript_gc`) | |
+| GC3 | 1 (`gc3`) | Fraction of sense codons with GC at 3rd position |
+| CAI | 1 | Ribosomal protein reference (MCF7-SIX1 expressed) |
+| tAI | 1 | GtRNAdb hg38 tRNA GCN |
+| CSC | 1 | iCodon human weights (Diez 2022) |
+| FOP | 1 | Top-10% TE reference from MDA-MB-231 sictrl normoxia |
+| 4E / DAP5 binary | 4 (`is_4e_resistant`, `is_4e_sensitive`, `is_dap5_repressed`, `is_dap5_promoted`) | Gene symbol lookup |
+| Translation signatures | ~34 (`sig_*`) | Same set as notebook 01_ |
+| Kozak context | 3 (`kozak_score`, `kozak_optimal`, `kozak_pwm_score`) | MCF7-SIX1 transcript selection |
+| CNOT3 external | 2 (`cnot3_ribo_enrichment`, `cnot3_weighted_codon_score`) | Joined from saved RDS |
+| External stability | 6 (Zhu2024, Hia2026, Karner2026) | Joined from saved RDS |
+
+**Features NOT included vs MDA-MB-231 `feature_matrix_external_stability.rds`:**
+- k-mers / RBP motifs (notebook 07 already removes them; no computational need)
+- eIF3 CLIP binding (MDA-MB-231 CLIP-seq data only)
+- RNA secondary structure (cluster-computed, not reproducible locally)
+- TE LFC features (excluded by `exclude_own_te_features = TRUE` in notebook 07)
+
+**Transcript selection:** most-expressed per gene from MCF7-SIX1 RNA-seq sictrl
+hypoxia Salmon (NM2023_0101/0111/0121 — rRNADepletion/KAPA_RNAHyper libraries,
+NOT ribosome profiling samples NM2023_0037–0066). One matrix serves both hypoxia
+and normoxia RF runs.
+
+**Outputs:**
+- `output/predictive_modeling/feature_matrix_mcf7six1_codon_features.rds` (121 codon features only)
+- `output/predictive_modeling/feature_matrix_mcf7six1_external_stability.rds` (full matrix)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(AnnotationDbi)
+library(iCodon)
+library(readxl)
+```
+
+---
+
+# Section 1: MCF7-SIX1 TE Data
+
+```{r load_te_data}
+eif3_dir <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+
+hyp_raw <- read_csv(file.path(eif3_dir, "counts/hypoxia_si_ctrl_3d.csv"),
+                    show_col_types = FALSE) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+mcf7_expressed <- unique(hyp_raw$gene_id_clean)
+cat("MCF7-SIX1 expressed genes:", length(mcf7_expressed), "\n")
+```
+
+---
+
+# Section 2: Transcript Database & CDS Sequences
+
+```{r load_txdb}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+cds_len_df <- tibble(
+  transcript_id_clean = cds_names_clean,
+  cds_length          = as.integer(width(cds_seqs_all))
+)
+cat("Total CDS sequences in txdb:", length(cds_seqs_all), "\n")
+```
+
+---
+
+# Section 3: Transcript Selection via Salmon RNA-seq
+
+RNA-seq sictrl hypoxia samples: NM2023_0101 (RepA), NM2023_0111 (RepB), NM2023_0121 (RepC).
+Confirmed rRNADepletion / KAPA_RNAHyper library prep (NOT ribosome profiling).
+Ribo profiling samples (NM2023_0037–0066) are excluded.
+
+```{r salmon_tpm}
+rnaseq_ids <- c("NM2023_0101", "NM2023_0111", "NM2023_0121")
+salmon_dir <- file.path(eif3_dir, "salmon")
+
+tpm_list <- map(rnaseq_ids, function(sid) {
+  f <- file.path(salmon_dir, sid, "quant.sf.gz")
+  read_tsv(f, show_col_types = FALSE) %>%
+    mutate(
+      transcript_id_clean = str_remove(str_extract(Name, "^[^|]+"), "\\..*")
+    ) %>%
+    dplyr::select(transcript_id_clean, !!sid := TPM)
+})
+
+tpm_wide <- purrr::reduce(tpm_list, full_join, by = "transcript_id_clean")
+tpm_mat  <- as.matrix(tpm_wide[, rnaseq_ids])
+tpm_avg  <- tibble(
+  transcript_id_clean = as.character(tpm_wide$transcript_id_clean),
+  mean_tpm            = as.numeric(rowMeans(tpm_mat, na.rm = TRUE))
+)
+
+cat("Salmon TPM data:", nrow(tpm_avg), "transcripts\n")
+cat("Transcripts with mean TPM > 0:", sum(tpm_avg$mean_tpm > 0, na.rm = TRUE), "\n")
+```
+
+```{r tx2gene_map}
+tx2gene_all <- AnnotationDbi::select(
+  txdb,
+  keys    = keys(txdb, keytype = "TXNAME"),
+  columns = c("TXNAME", "GENEID"),
+  keytype = "TXNAME"
+) %>%
+  as_tibble() %>%
+  mutate(
+    TXNAME              = as.character(TXNAME),
+    GENEID              = as.character(GENEID),
+    transcript_id_clean = str_remove(TXNAME,  "\\..*"),
+    gene_id_clean       = str_remove(GENEID,  "\\..*")
+  ) %>%
+  filter(transcript_id_clean %in% cds_names_clean)
+
+cat("Transcripts with CDS in txdb:", nrow(tx2gene_all), "\n")
+```
+
+```{r select_primary_tx}
+tx_candidates <- tx2gene_all %>%
+  dplyr::select(transcript_id_clean, gene_id_clean) %>%
+  filter(gene_id_clean %in% mcf7_expressed) %>%
+  left_join(tpm_avg,    by = "transcript_id_clean") %>%
+  left_join(cds_len_df, by = "transcript_id_clean") %>%
+  mutate(
+    transcript_id_clean = as.character(transcript_id_clean),
+    gene_id_clean       = as.character(gene_id_clean),
+    mean_tpm            = as.numeric(replace_na(mean_tpm, 0)),
+    cds_length          = as.integer(cds_length)
+  )
+
+# Highest mean TPM per gene; longest CDS as tie-break
+tx_map <- tx_candidates %>%
+  arrange(gene_id_clean, desc(mean_tpm), desc(cds_length)) %>%
+  filter(!duplicated(gene_id_clean)) %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, mean_tpm, cds_length)
+
+cat("Transcripts selected:", nrow(tx_map), "\n")
+cat("  Salmon-covered (mean TPM > 0):", sum(tx_map$mean_tpm > 0), "\n")
+cat("  Fallback to longest CDS (mean TPM = 0):", sum(tx_map$mean_tpm == 0), "\n")
+```
+
+---
+
+# Section 4: CDS Sequences & Codon Counts
+
+```{r filter_cds}
+keep_tx  <- tx_map$transcript_id_clean
+keep_idx <- cds_names_clean %in% keep_tx
+
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) > 0 & width(cds_frame0) %% 3 == 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r codon_counts}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+cat("Codon counts matrix:", nrow(counts_mat0), "x", ncol(counts_mat0), "\n")
+```
+
+---
+
+# Section 5: Genetic Code Setup
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+stop_codons  <- names(gen_code[gen_code == "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+multi_syn_codons <- intersect(unlist(aa_to_codons[multi_aa]), colnames(counts_mat0))
+
+codon_gc3 <- tibble(
+  codon     = sense_codons,
+  gc3_class = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
+)
+
+cat("Multi-synonymous codons:", length(multi_syn_codons), "(expected 59)\n")
+```
+
+---
+
+# Section 6: Background-Corrected RSCU
+
+MCF7-SIX1-specific background: proportions computed from all MCF7-SIX1 expressed
+transcripts (not imported from MDA-MB-231 to preserve cell-line context).
+
+```{r bg_props}
+bg_props <- imap(aa_to_codons, function(codons, aa) {
+  codons  <- intersect(codons, colnames(counts_mat0))
+  if (length(codons) == 0) return(NULL)
+  sub_cnt <- counts_mat0[, codons, drop = FALSE]
+  aa_tot  <- rowSums(sub_cnt)
+  valid   <- aa_tot > 0
+  if (!any(valid)) return(NULL)
+  prop_mat <- sub_cnt[valid, , drop = FALSE] / aa_tot[valid]
+  colMeans(prop_mat)
+})
+bg_props <- Filter(Negate(is.null), bg_props)
+
+prop_sums <- sapply(bg_props, sum)
+stopifnot(all(abs(prop_sums - 1) < 1e-6))
+cat("bg_props: computed for", length(bg_props), "amino acids; sum-to-1 check: passed\n")
+```
+
+```{r compute_bg_rscu}
+compute_bg_rscu_matrix <- function(counts_mat, bg_props) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(bg_props)) {
+    props  <- bg_props[[aa]]
+    codons <- intersect(names(props), colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    for (codon in codons) {
+      bp <- props[codon]
+      if (bp > 0 && any(valid)) {
+        rscu_mat[valid, codon] <- (sub_cnt[valid, codon] / aa_tot[valid]) / bp
+      }
+    }
+  }
+  rscu_mat
+}
+
+bg_rscu_mat0 <- compute_bg_rscu_matrix(counts_mat0, bg_props)
+cat("bg-RSCU matrix:", nrow(bg_rscu_mat0), "x", ncol(bg_rscu_mat0), "\n")
+
+stopifnot(min(bg_rscu_mat0, na.rm = TRUE) >= 0)
+bg_codon_means <- colMeans(bg_rscu_mat0[, multi_syn_codons], na.rm = TRUE)
+cat("bg-RSCU codon mean range:", round(range(bg_codon_means), 4), "(expected ≈ 1)\n")
+stopifnot(all(abs(bg_codon_means - 1) < 0.01))
+cat("bg-RSCU sanity checks: passed\n")
+```
+
+```{r bg_rscu_features}
+bg_rscu_df <- as_tibble(bg_rscu_mat0[, multi_syn_codons], rownames = "transcript_id_clean") %>%
+  rename_with(~ paste0("bg_rscu_", .), -transcript_id_clean)
+
+stopifnot(!"bg_rscu_ATG" %in% colnames(bg_rscu_df))
+stopifnot(!"bg_rscu_TGG" %in% colnames(bg_rscu_df))
+cat("bg_rscu_* columns:", ncol(bg_rscu_df) - 1, "(expected 59)\n")
+```
+
+```{r bg_rscu_summary}
+at_codons <- codon_gc3 %>% filter(gc3_class == "AT-ending") %>%
+  pull(codon) %>% intersect(multi_syn_codons)
+gc_codons <- codon_gc3 %>% filter(gc3_class == "GC-ending") %>%
+  pull(codon) %>% intersect(multi_syn_codons)
+
+bg_rscu_at_cols  <- paste0("bg_rscu_", at_codons)
+bg_rscu_gc_cols  <- paste0("bg_rscu_", gc_codons)
+bg_rscu_all_cols <- paste0("bg_rscu_", multi_syn_codons)
+
+bg_rscu_summary <- bg_rscu_df %>%
+  mutate(
+    bg_rscu_at_mean   = rowMeans(across(all_of(bg_rscu_at_cols)),  na.rm = TRUE),
+    bg_rscu_gc_mean   = rowMeans(across(all_of(bg_rscu_gc_cols)),  na.rm = TRUE),
+    bg_rscu_deviation = rowMeans(
+      across(all_of(bg_rscu_all_cols), ~ (. - 1)^2), na.rm = TRUE
+    )
+  ) %>%
+  dplyr::select(transcript_id_clean, bg_rscu_at_mean, bg_rscu_gc_mean, bg_rscu_deviation)
+
+stopifnot(all(bg_rscu_summary$bg_rscu_deviation >= 0, na.rm = TRUE))
+stopifnot(all(bg_rscu_summary$bg_rscu_at_mean  >= 0, na.rm = TRUE))
+stopifnot(all(bg_rscu_summary$bg_rscu_gc_mean  >= 0, na.rm = TRUE))
+cat("bg_rscu summary: computed; non-negative checks: passed\n")
+```
+
+---
+
+# Section 7: Per-Codon Raw Frequencies
+
+```{r codon_freq}
+sense_in_mat <- sense_codons[sense_codons %in% colnames(counts_mat0)]
+total_sense  <- rowSums(counts_mat0[, sense_in_mat, drop = FALSE])
+freq_mat     <- counts_mat0[, multi_syn_codons, drop = FALSE] / total_sense
+
+freq_df <- as_tibble(freq_mat, rownames = "transcript_id_clean") %>%
+  rename_with(~ paste0("codon_freq_", .), -transcript_id_clean)
+
+stopifnot(!"codon_freq_ATG" %in% colnames(freq_df))
+stopifnot(!"codon_freq_TGG" %in% colnames(freq_df))
+stopifnot(all(rowSums(freq_mat, na.rm = TRUE) <= 1 + 1e-6))
+stopifnot(min(freq_mat, na.rm = TRUE) >= 0)
+cat("codon_freq_* columns:", ncol(freq_df) - 1, "(expected 59)\n")
+cat("codon_freq range check: passed\n")
+```
+
+---
+
+# Section 8: Build Codon Feature Matrix
+
+```{r build_feature_matrix}
+gene_anno <- hyp_raw %>%
+  dplyr::select(gene_id, symbol, gene_id_clean) %>%
+  distinct(gene_id_clean, .keep_all = TRUE)
+
+feature_matrix <- tx_map %>%
+  dplyr::select(transcript_id_clean, gene_id_clean) %>%
+  inner_join(gene_anno, by = "gene_id_clean") %>%
+  left_join(bg_rscu_df,      by = "transcript_id_clean") %>%
+  left_join(bg_rscu_summary, by = "transcript_id_clean") %>%
+  left_join(freq_df,         by = "transcript_id_clean")
+
+cat("Codon feature matrix dimensions:", nrow(feature_matrix), "genes x", ncol(feature_matrix), "columns\n")
+
+new_feat_cols <- colnames(feature_matrix)[
+  !colnames(feature_matrix) %in% c("transcript_id_clean", "gene_id_clean", "gene_id", "symbol")
+]
+cat("Feature columns added:", length(new_feat_cols), "(expected 121)\n")
+cat("  bg_rscu_* :", sum(startsWith(new_feat_cols, "bg_rscu_")), "(expected 62: 59 + 3 summary)\n")
+cat("  codon_freq_*:", sum(startsWith(new_feat_cols, "codon_freq_")), "(expected 59)\n")
+
+stopifnot(sum(startsWith(new_feat_cols, "bg_rscu_")) == 62)
+stopifnot(sum(startsWith(new_feat_cols, "codon_freq_")) == 59)
+cat("Dimension checks: passed\n")
+```
+
+---
+
+# Section 9: Save Codon-Only Matrix
+
+```{r save_codon_only}
+dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(feature_matrix,
+        here("output", "predictive_modeling", "feature_matrix_mcf7six1_codon_features.rds"))
+cat("Saved: output/predictive_modeling/feature_matrix_mcf7six1_codon_features.rds\n")
+cat("Rows:", nrow(feature_matrix), "| Columns:", ncol(feature_matrix), "\n")
+```
+
+---
+
+# Section 10: Region Lengths and GC Content
+
+Extracts 5'UTR, CDS, and 3'UTR lengths and GC content for MCF7-SIX1 selected
+transcripts. Pattern mirrors `01_feature_extraction.Rmd`.
+
+```{r extract_utrs}
+utr5 <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr3 <- threeUTRsByTranscript(txdb, use.names = TRUE)
+cat("Total 5'UTR transcripts in txdb:", length(utr5), "\n")
+cat("Total 3'UTR transcripts in txdb:", length(utr3), "\n")
+```
+
+```{r utr_lengths}
+utr5_widths <- as.data.frame(utr5) %>%
+  mutate(transcript_id_clean = sub("\\..*", "", group_name)) %>%
+  group_by(transcript_id_clean) %>%
+  summarise(utr5_length = as.integer(sum(width)), .groups = "drop")
+
+utr3_widths <- as.data.frame(utr3) %>%
+  mutate(transcript_id_clean = sub("\\..*", "", group_name)) %>%
+  group_by(transcript_id_clean) %>%
+  summarise(utr3_length = as.integer(sum(width)), .groups = "drop")
+
+cat("5'UTR widths computed:", nrow(utr5_widths), "transcripts\n")
+cat("3'UTR widths computed:", nrow(utr3_widths), "transcripts\n")
+```
+
+```{r gc_content_function}
+gc_content <- function(seq) {
+  gc_count   <- str_count(seq, "[GC]")
+  total_len  <- nchar(seq)
+  result     <- (gc_count / total_len) * 100
+  result[total_len == 0] <- NA_real_
+  result
+}
+```
+
+```{r utr_gc}
+utr5_seq_all <- extractTranscriptSeqs(genome, utr5) %>% as.data.frame() %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw),
+         utr5_gc = gc_content(x)) %>%
+  dplyr::rename(utr5_sequence = x) %>%
+  dplyr::select(transcript_id_clean, utr5_sequence, utr5_gc)
+
+utr3_seq_all <- extractTranscriptSeqs(genome, utr3) %>% as.data.frame() %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw),
+         utr3_gc = gc_content(x)) %>%
+  dplyr::select(transcript_id_clean, utr3_gc)
+
+cds_gc_df <- tibble(
+  transcript_id_clean = names(cds_frame0),
+  cds_gc              = gc_content(as.character(cds_frame0))
+)
+
+cat("5'UTR GC computed:", nrow(utr5_seq_all), "transcripts\n")
+cat("3'UTR GC computed:", nrow(utr3_seq_all), "transcripts\n")
+```
+
+```{r join_lengths_gc}
+feature_matrix <- feature_matrix %>%
+  left_join(tx_map %>% dplyr::select(transcript_id_clean, cds_length),
+            by = "transcript_id_clean") %>%
+  left_join(utr5_widths,  by = "transcript_id_clean") %>%
+  left_join(utr3_widths,  by = "transcript_id_clean") %>%
+  left_join(utr5_seq_all %>% dplyr::select(transcript_id_clean, utr5_gc),
+            by = "transcript_id_clean") %>%
+  left_join(utr3_seq_all, by = "transcript_id_clean") %>%
+  left_join(cds_gc_df,    by = "transcript_id_clean") %>%
+  mutate(
+    utr5_length_safe  = coalesce(as.integer(utr5_length), 0L),
+    utr3_length_safe  = coalesce(as.integer(utr3_length), 0L),
+    total_length      = utr5_length_safe + cds_length + utr3_length_safe,
+    log2_utr5_length  = log2(utr5_length_safe + 1),
+    log2_utr3_length  = log2(utr3_length_safe + 1),
+    log2_cds_length   = log2(cds_length + 1),
+    log2_total_length = log2(total_length + 1),
+    transcript_gc     = (coalesce(utr5_gc, 0) * utr5_length_safe +
+                         cds_gc             * cds_length +
+                         coalesce(utr3_gc, 0) * utr3_length_safe) /
+                        pmax(total_length, 1L)
+  ) %>%
+  dplyr::select(-utr5_length_safe, -utr3_length_safe)
+
+cat("Region length + GC columns added. Matrix now:", nrow(feature_matrix), "x", ncol(feature_matrix), "\n")
+cat("Genes with 5'UTR length:", sum(!is.na(feature_matrix$utr5_length)), "\n")
+cat("Genes with 3'UTR length:", sum(!is.na(feature_matrix$utr3_length)), "\n")
+```
+
+---
+
+# Section 11: Codon Optimality (GC3, CAI, tAI, CSC, FOP)
+
+Pattern mirrors `01g_feature_extraction_codon_optimality.Rmd`. Reuses `counts_mat0`,
+`cds_frame0`, `gen_code`, `sense_codons`, and `aa_to_codons` from Sections 4–5.
+
+## GC3
+
+```{r gc3}
+gc3_codons   <- sense_codons[substr(sense_codons, 3, 3) %in% c("G", "C")]
+gc3_codons   <- intersect(gc3_codons, colnames(counts_mat0))
+sense_in_cnt <- intersect(sense_codons, colnames(counts_mat0))
+
+gc3_num <- rowSums(counts_mat0[, gc3_codons,   drop = FALSE])
+gc3_den <- rowSums(counts_mat0[, sense_in_cnt, drop = FALSE])
+gc3_scores <- gc3_num / gc3_den
+gc3_scores[gc3_den == 0] <- NA_real_
+
+cat("GC3 range:", round(range(gc3_scores, na.rm = TRUE), 4), "\n")
+stopifnot(all(gc3_scores >= 0 & gc3_scores <= 1, na.rm = TRUE))
+cat("GC3 range check passed\n")
+```
+
+## CAI — Codon Adaptation Index
+
+Ribosomal protein transcripts from MCF7-SIX1 hypoxia data as reference.
+
+```{r cai}
+ribo_tx <- hyp_raw %>%
+  filter(str_detect(symbol, "^RPL|^RPS")) %>%
+  mutate(transcript_id_clean = tx_map$transcript_id_clean[match(gene_id_clean, tx_map$gene_id_clean)]) %>%
+  filter(!is.na(transcript_id_clean)) %>%
+  pull(transcript_id_clean)
+
+ribo_subset <- rownames(counts_mat0) %in% ribo_tx
+cat("Ribosomal protein transcripts in codon matrix:", sum(ribo_subset), "\n")
+
+ref_counts_cai <- colSums(counts_mat0[ribo_subset, , drop = FALSE])
+
+w_cai <- setNames(rep(NA_real_, length(gen_code)), names(gen_code))
+w_cai[stop_codons] <- 0
+
+for (aa in names(aa_to_codons)) {
+  codons <- aa_to_codons[[aa]]
+  counts <- ref_counts_cai[codons]
+  total  <- sum(counts)
+  if (total == 0) {
+    w_cai[codons] <- 1
+    next
+  }
+  n_syn <- length(codons)
+  rscu  <- counts / (total / n_syn)
+  max_r <- max(rscu)
+  if (max_r == 0) {
+    w_cai[codons] <- 0
+  } else {
+    w_cai[codons] <- pmin(rscu / max_r, 1)
+  }
+}
+
+compute_cai_gene <- function(gene_counts, w_vals) {
+  use     <- sense_codons[!is.na(w_vals[sense_codons]) & w_vals[sense_codons] > 0]
+  c_use   <- gene_counts[use]
+  w_use   <- w_vals[use]
+  n_total <- sum(c_use)
+  if (n_total == 0) return(NA_real_)
+  exp(sum(c_use * log(w_use)) / n_total)
+}
+
+cai_scores0 <- apply(counts_mat0, 1, compute_cai_gene, w_vals = w_cai)
+names(cai_scores0) <- rownames(counts_mat0)
+
+cat("CAI summary:\n")
+print(summary(cai_scores0))
+stopifnot("CAI must be in [0,1]" = all(cai_scores0 <= 1 + 1e-9, na.rm = TRUE))
+cat("CAI range check passed\n")
+```
+
+## tAI — tRNA Adaptation Index
+
+```{r tai}
+trna_gcn <- read_csv(here("accessories", "human", "human_trna_gcn.csv"),
+                     comment = "#", show_col_types = FALSE)
+cat("tRNA GCN table:", nrow(trna_gcn), "rows\n")
+
+decode_anticodon <- function(ac) {
+  x1 <- substr(ac, 1, 1); x2 <- substr(ac, 2, 2); x3 <- substr(ac, 3, 3)
+  wc <- c(A = "T", T = "A", G = "C", C = "G")
+  y1 <- unname(wc[x3]); y2 <- unname(wc[x2])
+  if (x1 == "A") {
+    y3 <- c("T", "C", "A"); svs <- c(0, 0, 0)
+  } else if (x1 == "G") {
+    y3 <- c("C", "T"); svs <- c(0, 0.41)
+  } else if (x1 == "C") {
+    y3 <- "G"; svs <- 0
+  } else {
+    y3 <- "A"; svs <- 0
+  }
+  data.frame(codon = paste0(y1, y2, y3), s = svs, stringsAsFactors = FALSE)
+}
+
+aa_of_codon <- setNames(as.character(gen_code), names(gen_code))
+ws_tai <- setNames(rep(0, length(gen_code)), names(gen_code))
+
+for (i in seq_len(nrow(trna_gcn))) {
+  ac  <- trna_gcn$anticodon[i]
+  aa  <- trna_gcn$amino_acid[i]
+  gcn <- trna_gcn$gcn[i]
+  decoded <- decode_anticodon(ac)
+  for (j in seq_len(nrow(decoded))) {
+    codon <- decoded$codon[j]; s_val <- decoded$s[j]
+    if (!is.na(aa_of_codon[codon]) && aa_of_codon[codon] == aa)
+      ws_tai[codon] <- ws_tai[codon] + (1 - s_val) * gcn
+  }
+}
+
+w_tai <- ws_tai / max(ws_tai[sense_codons])
+cat("w_tai range:", round(range(w_tai[sense_codons]), 4), "\n")
+
+compute_tai_gene <- function(gene_counts, w_vals) {
+  use     <- sense_codons[!is.na(w_vals[sense_codons]) & w_vals[sense_codons] > 0]
+  c_use   <- gene_counts[use]; w_use <- w_vals[use]
+  n_total <- sum(c_use)
+  if (n_total == 0) return(NA_real_)
+  exp(sum(c_use * log(w_use)) / n_total)
+}
+
+tai_scores0 <- apply(counts_mat0, 1, compute_tai_gene, w_vals = w_tai)
+names(tai_scores0) <- rownames(counts_mat0)
+
+cat("tAI summary:\n")
+print(summary(tai_scores0))
+stopifnot("tAI must be in [0,1]" = all(tai_scores0 <= 1 + 1e-9, na.rm = TRUE))
+cat("tAI range check passed\n")
+```
+
+## CSC — Codon Stabilisation Coefficient
+
+```{r csc}
+predict_human <- iCodon::predict_stability("human")
+
+cds_char0     <- as.character(cds_frame0)
+unique_seqs0  <- unique(cds_char0)
+cat("Unique CDS sequences:", length(unique_seqs0), "\n")
+
+unique_scores0 <- predict_human(unique_seqs0)
+names(unique_scores0) <- unique_seqs0
+
+csc_scores0 <- unique_scores0[cds_char0]
+names(csc_scores0) <- names(cds_frame0)
+
+cat("CSC summary (iCodon human):\n")
+print(summary(csc_scores0))
+```
+
+## FOP — Frequency of Optimal Codons
+
+Reference: top 10% of MDA-MB-231 genes by mean TE in sictrl normoxia.
+
+```{r fop}
+te_condition <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE)
+
+te_ranked <- te_condition %>%
+  filter(condition == "normoxia", treatment == "sictrl") %>%
+  group_by(gene_id) %>%
+  summarise(mean_te = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mean_te)) %>%
+  arrange(desc(mean_te))
+
+top10_cutoff <- ceiling(nrow(te_ranked) * 0.10)
+top10_clean  <- sub("\\..*", "", te_ranked$gene_id[seq_len(top10_cutoff)])
+cat("Top 10% TE reference genes:", length(top10_clean), "\n")
+
+ref_tx_fop <- tx_map$transcript_id_clean[tx_map$gene_id_clean %in% top10_clean]
+ref_tx_fop <- ref_tx_fop[ref_tx_fop %in% rownames(counts_mat0)]
+cat("Reference transcripts in codon matrix:", length(ref_tx_fop), "\n")
+
+ref_counts_fop <- colSums(counts_mat0[ref_tx_fop, , drop = FALSE])
+
+optimal_codons <- sapply(aa_to_codons, function(codons) {
+  codons[which.max(ref_counts_fop[codons])]
+})
+optimal_codon_vec <- unname(optimal_codons)
+
+sense_cols_fop  <- setdiff(colnames(counts_mat0), stop_codons)
+sense_counts_fop <- rowSums(counts_mat0[, sense_cols_fop, drop = FALSE])
+opti_counts_fop  <- rowSums(counts_mat0[, optimal_codon_vec, drop = FALSE])
+fop_scores0      <- opti_counts_fop / sense_counts_fop
+fop_scores0[sense_counts_fop == 0] <- NA_real_
+names(fop_scores0) <- rownames(counts_mat0)
+
+cat("FOP summary:\n")
+print(summary(fop_scores0))
+stopifnot("FOP must be in [0,1]" = all(fop_scores0 >= 0 & fop_scores0 <= 1, na.rm = TRUE))
+cat("FOP range check passed\n")
+```
+
+## Join Codon Optimality
+
+```{r join_codon_optimality}
+codon_opt_df <- tibble(
+  transcript_id_clean = rownames(counts_mat0),
+  gc3 = gc3_scores,
+  cai = cai_scores0,
+  tai = tai_scores0,
+  csc = csc_scores0,
+  fop = fop_scores0
+)
+
+feature_matrix <- feature_matrix %>%
+  left_join(codon_opt_df, by = "transcript_id_clean")
+
+cat("Codon optimality joined. Matrix now:", nrow(feature_matrix), "x", ncol(feature_matrix), "\n")
+cat("Non-NA: gc3 =", sum(!is.na(feature_matrix$gc3)),
+    ", cai =", sum(!is.na(feature_matrix$cai)),
+    ", tai =", sum(!is.na(feature_matrix$tai)),
+    ", csc =", sum(!is.na(feature_matrix$csc)),
+    ", fop =", sum(!is.na(feature_matrix$fop)), "\n")
+```
+
+---
+
+# Section 12: Literature and Binary Features
+
+Pattern mirrors `01_feature_extraction.Rmd` 4E/DAP5 and signature membership sections.
+Gene symbol lookups are cell-line agnostic.
+
+```{r lit_4e_dap5}
+teleman_data <- read_csv("/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv",
+                         show_col_types = FALSE) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  slice_max(order_by = baseMean, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+resistant_4e_symbols <- teleman_data %>% filter(log2FoldChange >  1, padj < 0.05) %>% pull(symbol)
+sensitive_4e_symbols  <- teleman_data %>% filter(log2FoldChange < -1, padj < 0.05) %>% pull(symbol)
+cat("4E-resistant genes:", length(resistant_4e_symbols), "\n")
+cat("4E-sensitive genes:", length(sensitive_4e_symbols), "\n")
+
+dap5_data <- read_xlsx(here("accessories", "dap5kd_riboseq_weber2022.xlsx")) %>%
+  filter(!is.na(geneIDs), comment != "no")
+
+dap5_repressed_symbols <- dap5_data %>% filter(comment == "up")   %>% pull(geneIDs)
+dap5_promoted_symbols  <- dap5_data %>% filter(comment == "down") %>% pull(geneIDs)
+cat("DAP5-repressed (up with KD):", length(dap5_repressed_symbols), "\n")
+cat("DAP5-promoted (down with KD):", length(dap5_promoted_symbols), "\n")
+```
+
+```{r sig_membership}
+all_sigs <- read_csv(here("output", "genesets", "all_te_signatures.csv"),
+                     show_col_types = FALSE)
+
+selected_sig_names <- c(
+  "hypoxia_3d_promotes_TE_1hr_lfc0.5", "hypoxia_3d_inhibits_TE_1hr_lfc0.5",
+  "hypoxia_3d_promotes_TE_4hr_lfc0.5", "hypoxia_3d_inhibits_TE_4hr_lfc0.5",
+  "hypoxia_3d_promotes_TE_24hr_lfc0.5", "hypoxia_3d_inhibits_TE_24hr_lfc0.5",
+  "hypoxia_3e_promotes_TE_1hr_lfc0.5", "hypoxia_3e_inhibits_TE_1hr_lfc0.5",
+  "hypoxia_3e_promotes_TE_4hr_lfc0.5", "hypoxia_3e_inhibits_TE_4hr_lfc0.5",
+  "hypoxia_3e_promotes_TE_24hr_lfc0.5", "hypoxia_3e_inhibits_TE_24hr_lfc0.5",
+  "normoxia_3d_promotes_TE_combined_lfc0.5", "normoxia_3d_inhibits_TE_combined_lfc0.5",
+  "normoxia_3e_promotes_TE_combined_lfc0.5", "normoxia_3e_inhibits_TE_combined_lfc0.5",
+  "hypoxia_response_increases_TE_1hr_lfc0.5", "hypoxia_response_decreases_TE_1hr_lfc0.5",
+  "hypoxia_response_increases_TE_4hr_lfc0.5", "hypoxia_response_decreases_TE_4hr_lfc0.5",
+  "hypoxia_response_increases_TE_24hr_lfc0.5", "hypoxia_response_decreases_TE_24hr_lfc0.5",
+  "hypoxia_response_increases_TE_1hr_inhibited_by_3d_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_1hr_inhibited_by_3d_lfc0.5",
+  "hypoxia_response_increases_TE_1hr_inhibited_by_3e_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_1hr_inhibited_by_3e_lfc0.5",
+  "hypoxia_response_increases_TE_4hr_inhibited_by_3d_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_4hr_inhibited_by_3d_lfc0.5",
+  "hypoxia_response_increases_TE_4hr_inhibited_by_3e_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_4hr_inhibited_by_3e_lfc0.5",
+  "hypoxia_response_increases_TE_24hr_inhibited_by_3d_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_24hr_inhibited_by_3d_lfc0.5",
+  "hypoxia_response_increases_TE_24hr_inhibited_by_3e_kd_lfc0.5",
+  "hypoxia_response_decreases_TE_24hr_inhibited_by_3e_lfc0.5"
+)
+
+sig_features <- all_sigs %>%
+  filter(gs_name %in% selected_sig_names) %>%
+  dplyr::select(symbol = db_gene_symbol, gs_name) %>%
+  distinct() %>%
+  mutate(member = 1L) %>%
+  pivot_wider(names_from = gs_name, values_from = member,
+              values_fill = 0L, names_prefix = "sig_")
+
+cat("Signature features:", ncol(sig_features) - 1, "signatures\n")
+cat("Genes with any membership:", nrow(sig_features), "\n")
+```
+
+```{r join_lit_features}
+feature_matrix <- feature_matrix %>%
+  mutate(
+    is_4e_resistant   = as.integer(symbol %in% resistant_4e_symbols),
+    is_4e_sensitive   = as.integer(symbol %in% sensitive_4e_symbols),
+    is_dap5_repressed = as.integer(symbol %in% dap5_repressed_symbols),
+    is_dap5_promoted  = as.integer(symbol %in% dap5_promoted_symbols)
+  ) %>%
+  left_join(sig_features, by = "symbol") %>%
+  mutate(across(starts_with("sig_"), ~replace_na(., 0L)))
+
+# Drop any sig_ columns that are all zero (no MCF7-SIX1 genes present)
+sig_cols    <- colnames(feature_matrix)[startsWith(colnames(feature_matrix), "sig_")]
+all_zero_sig <- sig_cols[sapply(sig_cols, function(col) sum(feature_matrix[[col]]) == 0)]
+if (length(all_zero_sig) > 0) {
+  feature_matrix <- feature_matrix %>% dplyr::select(-all_of(all_zero_sig))
+  cat("Dropped", length(all_zero_sig), "all-zero sig_ columns\n")
+}
+
+cat("Literature features joined. Matrix now:", nrow(feature_matrix), "x", ncol(feature_matrix), "\n")
+cat("sig_* columns remaining:", sum(startsWith(colnames(feature_matrix), "sig_")), "\n")
+```
+
+---
+
+# Section 13: Kozak Features
+
+Extracts Kozak window (last 6 nt of 5'UTR + first 4 nt of CDS) for MCF7-SIX1
+selected transcripts. Pattern mirrors `01h_feature_extraction_kozak.Rmd`.
+Reuses `utr5` GRangesList already loaded in Section 10.
+
+```{r kozak_sequences}
+# 5'UTR sequences — reuse utr5_seq_all from Section 10 (avoids repeat genome extraction)
+utr5_seq_kozak <- utr5_seq_all %>%
+  dplyr::select(transcript_id_clean, utr5_sequence) %>%
+  filter(transcript_id_clean %in% tx_map$transcript_id_clean)
+
+# CDS sequences (first 4 nt of each CDS in cds_frame0)
+cds_seq_kozak <- tibble(
+  transcript_id_clean = names(cds_frame0),
+  cds_sequence        = as.character(cds_frame0)
+) %>%
+  filter(transcript_id_clean %in% tx_map$transcript_id_clean)
+
+cat("5'UTR sequences for Kozak:", nrow(utr5_seq_kozak), "\n")
+cat("CDS sequences for Kozak:", nrow(cds_seq_kozak), "\n")
+```
+
+```{r kozak_window}
+seq_joined_koz <- inner_join(utr5_seq_kozak, cds_seq_kozak, by = "transcript_id_clean") %>%
+  mutate(
+    utr5_len     = nchar(utr5_sequence),
+    utr5_tail    = str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),
+    cds_head     = str_sub(cds_sequence, 1, 4),
+    kozak_window = paste0(utr5_tail, cds_head)
+  )
+
+cat("Transcripts with Kozak window:", nrow(seq_joined_koz), "\n")
+```
+
+```{r kozak_score}
+match_kozak <- function(seq) {
+  if (nchar(seq) < 10) return("unknown_short")
+  if (grepl("^(GCCACC|GCCGCC)ATGG$", seq)) return("optimal")
+  if (grepl("^...[AG]..ATGG$", seq))        return("strong")
+  if (grepl("^...[AG]..ATG[ACT]$", seq))    return("moderate")
+  if (grepl("^...[CT]..ATGG$", seq))        return("moderate")
+  return("unknown")
+}
+
+score_map <- c(unknown = 0L, moderate = 1L, strong = 2L, optimal = 3L, unknown_short = NA_integer_)
+
+seq_scored_koz <- seq_joined_koz %>%
+  mutate(
+    kozak_category = sapply(kozak_window, match_kozak),
+    kozak_score    = unname(score_map[kozak_category]),
+    kozak_optimal  = as.integer(kozak_score == 3L),
+    kozak_category = if_else(kozak_category == "unknown_short", NA_character_, kozak_category)
+  )
+
+cat("Kozak categories:\n")
+print(table(seq_scored_koz$kozak_category, useNA = "ifany"))
+```
+
+```{r kozak_pwm}
+kozak_pwm <- matrix(
+  c(0.23, 0.22, 0.27, 0.28,
+    0.25, 0.28, 0.23, 0.24,
+    0.21, 0.34, 0.23, 0.22,
+    0.71, 0.09, 0.13, 0.07,
+    0.27, 0.28, 0.19, 0.26,
+    0.25, 0.39, 0.15, 0.21,
+    0.17, 0.12, 0.54, 0.17),
+  nrow = 7, ncol = 4, byrow = TRUE,
+  dimnames = list(c("m6","m5","m4","m3","m2","m1","p4"), c("A","C","G","T"))
+)
+log_odds_koz <- log2((kozak_pwm + 0.001) / 0.25)
+pos_indices  <- c(1, 2, 3, 4, 5, 6, 10)
+pos_names    <- c("m6","m5","m4","m3","m2","m1","p4")
+
+score_pwm <- function(seq) {
+  if (nchar(seq) < 10) return(NA_real_)
+  nts <- strsplit(seq, "")[[1]]
+  s   <- 0
+  for (i in seq_along(pos_indices)) {
+    nt <- nts[pos_indices[i]]
+    if (!nt %in% c("A","C","G","T")) return(NA_real_)
+    s <- s + log_odds_koz[pos_names[i], nt]
+  }
+  s
+}
+
+seq_scored_koz <- seq_scored_koz %>%
+  mutate(kozak_pwm_score = sapply(kozak_window, score_pwm))
+
+cat("kozak_pwm_score summary:\n")
+print(summary(seq_scored_koz$kozak_pwm_score))
+```
+
+```{r join_kozak}
+kozak_scores_df <- seq_scored_koz %>%
+  dplyr::select(transcript_id_clean, kozak_score, kozak_optimal, kozak_pwm_score)
+
+feature_matrix <- feature_matrix %>%
+  left_join(kozak_scores_df, by = "transcript_id_clean")
+
+stopifnot(all(na.omit(feature_matrix$kozak_score) %in% 0:3))
+cat("Kozak features joined. Matrix now:", nrow(feature_matrix), "x", ncol(feature_matrix), "\n")
+cat("kozak_score non-NA:", sum(!is.na(feature_matrix$kozak_score)), "\n")
+```
+
+---
+
+# Section 14: CNOT3 External Features
+
+Joins CNOT3 selective riboseq enrichment and codon stability scores from Zhu et al. 2024.
+These are external datasets keyed by Ensembl gene ID — applicable to any human gene.
+
+```{r cnot3_external}
+cnot3_ribo <- readRDS(here("output", "predictive_modeling", "cnot3_riboseq_enrichment.rds")) %>%
+  dplyr::select(ensembl_gene, cnot3_ribo_enrichment = neg_log10_min_fdr)
+
+# cnot3_codon_stability_scores.rds is per-codon Spearman r (columns: codons, spearman_r, n_genes, rank)
+# Compute per-gene weighted score: sum(spearman_r[codon] * freq[codon]) across all sense codons
+codon_spearman <- readRDS(here("output", "predictive_modeling", "cnot3_codon_stability_scores.rds"))
+weight_vec    <- setNames(codon_spearman$spearman_r, codon_spearman$codons)
+shared_codons <- intersect(names(weight_vec), colnames(counts_mat0))
+cat("Codons with Spearman weights:", length(shared_codons), "\n")
+
+sense_in_mat0 <- intersect(sense_codons, colnames(counts_mat0))
+total_sense0  <- rowSums(counts_mat0[, sense_in_mat0, drop = FALSE])
+
+w_sub   <- weight_vec[shared_codons]
+cnt_sub <- counts_mat0[, shared_codons, drop = FALSE]
+
+cnot3_ws <- as.numeric(cnt_sub %*% w_sub) / total_sense0
+cnot3_ws[total_sense0 == 0] <- NA_real_
+names(cnot3_ws) <- rownames(counts_mat0)
+
+cat("cnot3_weighted_codon_score summary:\n")
+print(summary(cnot3_ws))
+
+cnot3_codon_df <- tibble(
+  transcript_id_clean        = rownames(counts_mat0),
+  cnot3_weighted_codon_score = cnot3_ws
+)
+
+feature_matrix <- feature_matrix %>%
+  left_join(cnot3_ribo,     by = c("gene_id_clean" = "ensembl_gene")) %>%
+  left_join(cnot3_codon_df, by = "transcript_id_clean")
+
+cat("CNOT3 features joined. Coverage:\n")
+cat("  cnot3_ribo_enrichment:     ", sum(!is.na(feature_matrix$cnot3_ribo_enrichment)),
+    "/", nrow(feature_matrix), "\n")
+cat("  cnot3_weighted_codon_score:", sum(!is.na(feature_matrix$cnot3_weighted_codon_score)),
+    "/", nrow(feature_matrix), "\n")
+```
+
+---
+
+# Section 15: External Stability Features
+
+Joins SLAM-seq half-lives and riboseq occupancy from Zhu 2024, Hia 2026, and Karner 2026.
+Mirrors `01i_feature_extraction_external_stability.Rmd` exactly.
+
+```{r external_stability}
+cnot3_hl <- readRDS(here("output", "predictive_modeling", "cnot3_slamseq_halflives.rds")) %>%
+  dplyr::select(
+    ensembl_gene,
+    zhu2024_ctrl_halflife          = sgNT_halflife,
+    zhu2024_cnot3ko_halflife_logfc = log2_ratio
+  )
+
+dhx29_slam <- readRDS(here("output", "predictive_modeling", "dhx29_slamseq_halflives.rds")) %>%
+  dplyr::select(
+    ensembl_gene,
+    hia2026_ctrl_halflife        = Ctrl_Half_life,
+    hia2026_dhx29_halflife_logfc = logFC
+  )
+
+dhx29_ribo <- readRDS(here("output", "predictive_modeling", "dhx29_riboseq_occupancy.rds")) %>%
+  group_by(ensembl_gene) %>%
+  summarise(hia2026_dhx29_occupancy = mean(dhx29_occupancy_score, na.rm = TRUE),
+            .groups = "drop")
+
+karner <- readRDS(here("output", "predictive_modeling", "goodarzi_231_ct_ratios.rds")) %>%
+  dplyr::select(ensembl_gene, karner2026_mda231_log2_ct = log2_ct)
+
+feature_matrix_ext <- feature_matrix %>%
+  left_join(cnot3_hl,   by = c("gene_id_clean" = "ensembl_gene")) %>%
+  left_join(dhx29_slam, by = c("gene_id_clean" = "ensembl_gene")) %>%
+  left_join(dhx29_ribo, by = c("gene_id_clean" = "ensembl_gene")) %>%
+  left_join(karner,     by = c("gene_id_clean" = "ensembl_gene"))
+
+ext_cols <- c("zhu2024_ctrl_halflife", "zhu2024_cnot3ko_halflife_logfc",
+              "hia2026_ctrl_halflife", "hia2026_dhx29_halflife_logfc",
+              "hia2026_dhx29_occupancy", "karner2026_mda231_log2_ct")
+cat("External stability feature coverage:\n")
+for (col in ext_cols) {
+  cat(" ", col, ":", sum(!is.na(feature_matrix_ext[[col]])), "/", nrow(feature_matrix_ext), "\n")
+}
+```
+
+---
+
+# Section 16: Save External Stability Matrix
+
+```{r save_external_stability}
+saveRDS(feature_matrix_ext,
+        here("output", "predictive_modeling", "feature_matrix_mcf7six1_external_stability.rds"))
+cat("Saved: output/predictive_modeling/feature_matrix_mcf7six1_external_stability.rds\n")
+cat("Rows:", nrow(feature_matrix_ext), "| Columns:", ncol(feature_matrix_ext), "\n")
+
+cat("\n=== FEATURE COLUMN SUMMARY ===\n")
+all_cols <- colnames(feature_matrix_ext)
+cat("bg_rscu_*        :", sum(startsWith(all_cols, "bg_rscu_")), "\n")
+cat("codon_freq_*     :", sum(startsWith(all_cols, "codon_freq_")), "\n")
+cat("Region lengths   :", sum(all_cols %in% c("utr5_length","utr3_length","total_length","log2_utr5_length","log2_utr3_length","log2_cds_length","log2_total_length","utr5_gc","utr3_gc","cds_gc","transcript_gc","gc3")), "\n")
+cat("Codon optimality :", sum(all_cols %in% c("cai","tai","csc","fop")), "\n")
+cat("4E/DAP5 binary   :", sum(all_cols %in% c("is_4e_resistant","is_4e_sensitive","is_dap5_repressed","is_dap5_promoted")), "\n")
+cat("sig_*            :", sum(startsWith(all_cols, "sig_")), "\n")
+cat("Kozak            :", sum(all_cols %in% c("kozak_score","kozak_optimal","kozak_pwm_score")), "\n")
+cat("CNOT3 external   :", sum(all_cols %in% c("cnot3_ribo_enrichment","cnot3_weighted_codon_score")), "\n")
+cat("Stability ext.   :", sum(all_cols %in% ext_cols), "\n")
+```
+
+---
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
