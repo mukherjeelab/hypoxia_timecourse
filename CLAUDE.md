@@ -57,13 +57,13 @@ The `code/predictive_modeling/` notebooks form a sequential pipeline:
 | `22_cnot3_riboseq_slamseq` | `feature_matrix_cnot3.rds` | Zhu 2024 SLAM-seq half-lives + CNOT3 KO riboseq |
 | `23_dhx29_riboseq_slamseq` | `feature_matrix_dhx29.rds` | Hia 2026 DHX29 SLAM-seq + riboseq occupancy |
 | `01i_` | `feature_matrix_external_stability.rds` | Karner 2026 MDA-MB-231 SLAM-seq (reads `feature_matrix_dhx29.rds`) |
-| `01j_` | `feature_matrix_csc_positional.rds` | Positional CSC (full CDS + quarters + first 75 codons) |
-| `01k_` | (appends to csc_positional) | CDS/3'UTR structure features |
+| `01j_` | overwrites `feature_matrix_external_stability.rds` | Positional CSC (full CDS + quarters + first 75 codons) |
+| `01k_` | overwrites `feature_matrix_external_stability.rds` | CDS/3'UTR structure features (drops 5'UTR RNAfold cols) |
 | `01l_` | `feature_matrix_codon_features.rds` | bg-corrected RSCU + raw codon frequencies, 121 features (reads `feature_matrix_external_stability.rds`) |
 | `01m_` | `feature_matrix_codon_only.rds` | Codon features without external stability base |
 | `43_` | `feature_matrix_mcf7six1_codon_features.rds` | MCF7-SIX1 codon features with cell-line-specific transcript selection |
 
-The chain `22_cnot3` → `23_dhx29` → `01i_` is non-obvious: two non-`01_`-prefixed notebooks are required steps before `01i_` can run. RNA secondary structure inputs (from `01d_`) were pre-computed on a compute cluster using `cluster_scripts/` and read in as flat files — they cannot be recomputed locally.
+The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvious. `01j_` and `01k_` overwrite `feature_matrix_external_stability.rds` in place — both must run after `01i_` before notebook 07 is called. RNA secondary structure inputs (from `01d_`, `01k_`) were pre-computed on a compute cluster using `cluster_scripts/` and read in as flat files. `01c_` (k-mer + RBP motif features) can be skipped for the `external_stability` pipeline — `01d_` is patched to read directly from `01_` + `01b_` outputs instead.
 
 **Negative control definition:**
 - `02_negative_control_set.Rmd` → `output/predictive_modeling/negative_control_genes.csv`
@@ -79,6 +79,54 @@ The chain `22_cnot3` → `23_dhx29` → `01i_` is non-obvious: two non-`01_`-pre
   - `condition_hyp`, `condition_nor` — condition strings used to construct the 07 output file suffixes (default `"hypoxia"` / `"normoxia"`; set to e.g. `"mcf7six1_hypoxia"` for MCF7-SIX1)
 
 **Analysis notebooks (11–43):** Feature-specific deep dives, external validations, regression models, and MCF7-SIX1 analyses.
+
+## Integrating External Data from Papers
+
+Before incorporating any dataset from a published paper into the feature matrix or analysis code, first verify that the data reproduces a key result from that paper. This protects against using the wrong file, a misread column, or a pre/post-processing mismatch that would silently corrupt downstream models.
+
+**What to replicate:** A single quantitative result that is easy to check — a reported median half-life, a named gene's enrichment score, a summary statistic from a figure, or the gene count in a reported set. It does not need to be a full analysis.
+
+**Where to put the check:** In the notebook section that loads the external data, immediately after reading the file and before any joins. Use `stopifnot` or an explicit comparison with `cat` reporting the expected vs. observed value.
+
+Example pattern:
+```r
+# Zhu 2024: paper reports median sgNT half-life ~3.5h (Fig 2B)
+stopifnot("Zhu2024 median half-life outside expected range" =
+  between(median(halflives$sgNT_halflife, na.rm = TRUE), 2.5, 5.0))
+cat("Zhu2024 median sgNT half-life:", round(median(halflives$sgNT_halflife, na.rm = TRUE), 2), "h\n")
+```
+
+## Feature Extraction Validation Conventions
+
+Every feature extraction notebook (including new feature groups added to `43_`) **must** include both types of checks for each feature group added:
+
+### 1. Computational checks (`stopifnot`)
+Assert value ranges that must hold by definition. Use `stopifnot()` — never `cat(check)`, which passes silently on failure.
+
+| Feature type | Required check |
+|---|---|
+| GC content (%) | `all(x >= 0 & x <= 100, na.rm = TRUE)` |
+| Accessibility (RNAplfold) | `all(x >= 0 & x <= 1, na.rm = TRUE)` |
+| MFE (RNAfold) | `all(x <= 0, na.rm = TRUE)` |
+| CAI, tAI, FOP | `all(x >= 0 & x <= 1, na.rm = TRUE)` |
+| -log10 enrichment (riboseq) | `all(x >= 0, na.rm = TRUE)` |
+| Half-lives | `all(x > 0, na.rm = TRUE)` |
+| Log-fold changes | `all(is.finite(x[!is.na(x)]))` |
+| CLIP counts | range within [0, n_conditions] |
+| Feature column presence | `stopifnot(all(expected_cols %in% colnames(df)))` |
+| Leakage guard | `stopifnot(!"target_col" %in% colnames(df))` |
+
+### 2. Biological spot-checks
+Assert known invariants about specific genes or codon families. These catch implementation errors that pass range checks.
+
+Established examples (copy/adapt for new notebooks):
+- **ACTB CDS GC%**: expected 50–70% (`01_`)
+- **Ribosomal proteins have above-median CAI**: `median(ribo_cai) > median(all_cai)` (`01g_`)
+- **CTG is optimal Leu codon**: `w["CTG"] == 1` (`01g_`)
+- **Kozak PWM monotonicity**: mean PWM increases tier 0 → 3 (`01h_`, `43_`)
+- **GC3 median in [40, 65]%** (`01_`, `43_`)
+
+Both check types must be present. `cat()` summaries are informative but are not substitutes for `stopifnot()`.
 
 ## Key Data Objects and Conventions
 
@@ -116,6 +164,7 @@ Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size
 
 | File | Contents |
 |------|---------|
+| `accessories/metadata_231_timecourse.csv` | MDA-MB-231 sample metadata: columns `id`, `type` (RiboSeq / Input_Ribo_RNAseq), `rep`, `treatment`, `condition`, `hours`; used in `01_` to select siCTRL normoxia RNA-seq samples for transcript isoform selection |
 | `accessories/human/txdb.gencode49.sqlite` | GENCODE v49 transcript database (built by `00_build_txdb_v49.R`) |
 | `accessories/human/gene_anno_hs_dm_v49_r111.tsv` | Gene annotation: gene_id, symbol, biotype |
 | `accessories/translation_signatures_literature.csv` | Published translation signature gene sets |

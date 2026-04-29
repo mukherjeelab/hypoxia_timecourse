@@ -9,6 +9,7 @@ editor_options:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+skip_motifs_kmers <- TRUE   # set FALSE only if you need k-mer/RBP motif columns
 ```
 
 # Overview
@@ -107,13 +108,24 @@ cat("Transcripts in tx2gene:", nrow(tx2gene), "\n")
 # Select Most Abundant Transcript Per Gene
 
 ```{r load_salmon}
+# Load sample metadata and restrict to siCTRL normoxia RNA-seq
+# (Input_Ribo_RNAseq = mRNA input; RiboSeq = ribosome footprints — exclude those)
+metadata <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
+                     show_col_types = FALSE)
+sictrl_norm_ids <- metadata %>%
+  filter(type == "Input_Ribo_RNAseq",
+         treatment == "siCTRL",
+         condition == "normoxia") %>%
+  pull(id)
+cat("siCTRL normoxia RNA-seq samples:", length(sictrl_norm_ids), "\n")
+cat(" ", paste(sictrl_norm_ids, collapse = ", "), "\n")
+
 # Get list of salmon quant files
 salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
-salmon_samples <- list.dirs(salmon_dir, recursive = FALSE, full.names = FALSE)
 
-# Build file paths
-salmon_files <- file.path(salmon_dir, salmon_samples, "quant.sf.gz")
-names(salmon_files) <- salmon_samples
+# Build file paths — restricted to siCTRL normoxia RNA-seq samples
+salmon_files <- file.path(salmon_dir, sictrl_norm_ids, "quant.sf.gz")
+names(salmon_files) <- sictrl_norm_ids
 
 # Filter to files that exist
 salmon_files <- salmon_files[file.exists(salmon_files)]
@@ -296,132 +308,147 @@ cds_gc <- cds_seq %>%
   dplyr::select(transcript_id_clean, cds_gc)
 
 cat("Calculated GC content for all regions\n")
+
+stopifnot(
+  "utr5_gc out of [0, 100]" = all(utr5_gc$utr5_gc >= 0 & utr5_gc$utr5_gc <= 100, na.rm = TRUE),
+  "utr3_gc out of [0, 100]" = all(utr3_gc$utr3_gc >= 0 & utr3_gc$utr3_gc <= 100, na.rm = TRUE),
+  "cds_gc out of [0, 100]"  = all(cds_gc$cds_gc  >= 0 & cds_gc$cds_gc  <= 100, na.rm = TRUE)
+)
+cat("Range checks passed: all GC values in [0, 100]\n")
+
+# Biological spot-check: ACTB — well-characterised lengths
+actb_tx <- most_abundant_tx %>% filter(symbol == "ACTB") %>% pull(transcript_id_clean)
+if (length(actb_tx) > 0) {
+  actb_cds_gc <- cds_gc %>% filter(transcript_id_clean == actb_tx[1]) %>% pull(cds_gc)
+  stopifnot("ACTB CDS GC% expected ~55–65%" = length(actb_cds_gc) == 0 ||
+              (actb_cds_gc >= 50 & actb_cds_gc <= 70))
+  cat("ACTB CDS GC%:", round(actb_cds_gc, 1), "% (expected ~55–65%)\n")
+}
 ```
 
 # Calculate 4-mer Frequencies in 5' UTR
 
 ```{r calculate_4mers}
-# Get transcripts that we'll use (those with 5' UTR sequences)
-# Use transcript_id_clean for joining with TxDb data
-valid_transcripts <- most_abundant_tx %>%
-  filter(transcript_id_clean %in% utr5_seq$transcript_id_clean)
+if (!skip_motifs_kmers) {
+  # Get transcripts that we'll use (those with 5' UTR sequences)
+  # Use transcript_id_clean for joining with TxDb data
+  valid_transcripts <- most_abundant_tx %>%
+    filter(transcript_id_clean %in% utr5_seq$transcript_id_clean)
 
-cat("Transcripts with 5' UTR data:", nrow(valid_transcripts), "out of", nrow(most_abundant_tx), "\n")
+  cat("Transcripts with 5' UTR data:", nrow(valid_transcripts), "out of", nrow(most_abundant_tx), "\n")
 
-# Create DNAStringSet for 5' UTR sequences
-utr5_for_kmers <- utr5_seq %>%
-  filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
-         !is.na(utr5_sequence),
-         utr5_sequence != "")
+  # Create DNAStringSet for 5' UTR sequences
+  utr5_for_kmers <- utr5_seq %>%
+    filter(transcript_id_clean %in% valid_transcripts$transcript_id_clean,
+           !is.na(utr5_sequence),
+           utr5_sequence != "")
 
-# Filter out very short sequences (need at least 4nt for 4-mers)
-utr5_for_kmers <- utr5_for_kmers %>%
-  filter(str_length(utr5_sequence) >= 4)
+  # Filter out very short sequences (need at least 4nt for 4-mers)
+  utr5_for_kmers <- utr5_for_kmers %>%
+    filter(str_length(utr5_sequence) >= 4)
 
-utr5_dna <- DNAStringSet(utr5_for_kmers$utr5_sequence)
-names(utr5_dna) <- utr5_for_kmers$transcript_id_clean
+  utr5_dna <- DNAStringSet(utr5_for_kmers$utr5_sequence)
+  names(utr5_dna) <- utr5_for_kmers$transcript_id_clean
 
-# Calculate 4-mer frequencies (as proportions)
-kmer4_matrix <- oligonucleotideFrequency(utr5_dna, width = 4, as.prob = TRUE)
+  # Calculate 4-mer frequencies (as proportions)
+  kmer4_matrix <- oligonucleotideFrequency(utr5_dna, width = 4, as.prob = TRUE)
 
-# Convert to data frame
-kmer4_df <- as.data.frame(kmer4_matrix) %>%
-  mutate(transcript_id_clean = utr5_for_kmers$transcript_id_clean) %>%
-  distinct(transcript_id_clean, .keep_all = TRUE)
+  # Convert to data frame
+  kmer4_df <- as.data.frame(kmer4_matrix) %>%
+    mutate(transcript_id_clean = utr5_for_kmers$transcript_id_clean) %>%
+    distinct(transcript_id_clean, .keep_all = TRUE)
 
-# Add prefix to column names for clarity
-colnames(kmer4_df)[1:256] <- paste0("utr5_4mer_", colnames(kmer4_df)[1:256])
+  # Add prefix to column names for clarity
+  colnames(kmer4_df)[1:256] <- paste0("utr5_4mer_", colnames(kmer4_df)[1:256])
 
-cat("Calculated 4-mer frequencies for", nrow(kmer4_df), "transcripts\n")
-cat("Number of 4-mer features:", 256, "\n")
+  cat("Calculated 4-mer frequencies for", nrow(kmer4_df), "transcripts\n")
+  cat("Number of 4-mer features:", 256, "\n")
+}
 ```
 
 # Calculate 5-mer Frequencies in 5' UTR
 
 ```{r calculate_5mers}
-# Filter sequences with at least 5nt
-utr5_for_5mers <- utr5_for_kmers %>%
-  filter(str_length(utr5_sequence) >= 5)
+if (!skip_motifs_kmers) {
+  # Filter sequences with at least 5nt
+  utr5_for_5mers <- utr5_for_kmers %>%
+    filter(str_length(utr5_sequence) >= 5)
 
-utr5_dna_5mer <- DNAStringSet(utr5_for_5mers$utr5_sequence)
-names(utr5_dna_5mer) <- utr5_for_5mers$transcript_id_clean
+  utr5_dna_5mer <- DNAStringSet(utr5_for_5mers$utr5_sequence)
+  names(utr5_dna_5mer) <- utr5_for_5mers$transcript_id_clean
 
-# Calculate 5-mer frequencies (as proportions)
-kmer5_matrix <- oligonucleotideFrequency(utr5_dna_5mer, width = 5, as.prob = TRUE)
+  # Calculate 5-mer frequencies (as proportions)
+  kmer5_matrix <- oligonucleotideFrequency(utr5_dna_5mer, width = 5, as.prob = TRUE)
 
-# Convert to data frame
-kmer5_df <- as.data.frame(kmer5_matrix) %>%
-  mutate(transcript_id_clean = utr5_for_5mers$transcript_id_clean) %>%
-  distinct(transcript_id_clean, .keep_all = TRUE)
+  # Convert to data frame
+  kmer5_df <- as.data.frame(kmer5_matrix) %>%
+    mutate(transcript_id_clean = utr5_for_5mers$transcript_id_clean) %>%
+    distinct(transcript_id_clean, .keep_all = TRUE)
 
-# Add prefix to column names for clarity
-colnames(kmer5_df)[1:1024] <- paste0("utr5_5mer_", colnames(kmer5_df)[1:1024])
+  # Add prefix to column names for clarity
+  colnames(kmer5_df)[1:1024] <- paste0("utr5_5mer_", colnames(kmer5_df)[1:1024])
 
-cat("Calculated 5-mer frequencies for", nrow(kmer5_df), "transcripts\n")
-cat("Number of 5-mer features:", 1024, "\n")
+  cat("Calculated 5-mer frequencies for", nrow(kmer5_df), "transcripts\n")
+  cat("Number of 5-mer features:", 1024, "\n")
+}
 ```
 
 # Calculate 6-mer Frequencies in 5' UTR
 
 ```{r calculate_6mers}
-# Filter sequences with at least 6nt
-utr5_for_6mers <- utr5_for_kmers %>%
-  filter(str_length(utr5_sequence) >= 6)
+if (!skip_motifs_kmers) {
+  # Filter sequences with at least 6nt
+  utr5_for_6mers <- utr5_for_kmers %>%
+    filter(str_length(utr5_sequence) >= 6)
 
-utr5_dna_6mer <- DNAStringSet(utr5_for_6mers$utr5_sequence)
-names(utr5_dna_6mer) <- utr5_for_6mers$transcript_id_clean
+  utr5_dna_6mer <- DNAStringSet(utr5_for_6mers$utr5_sequence)
+  names(utr5_dna_6mer) <- utr5_for_6mers$transcript_id_clean
 
-# Calculate 6-mer frequencies (as proportions)
-kmer6_matrix <- oligonucleotideFrequency(utr5_dna_6mer, width = 6, as.prob = TRUE)
+  # Calculate 6-mer frequencies (as proportions)
+  kmer6_matrix <- oligonucleotideFrequency(utr5_dna_6mer, width = 6, as.prob = TRUE)
 
-# Convert to data frame
-kmer6_df <- as.data.frame(kmer6_matrix) %>%
-  mutate(transcript_id_clean = utr5_for_6mers$transcript_id_clean) %>%
-  distinct(transcript_id_clean, .keep_all = TRUE)
+  # Convert to data frame
+  kmer6_df <- as.data.frame(kmer6_matrix) %>%
+    mutate(transcript_id_clean = utr5_for_6mers$transcript_id_clean) %>%
+    distinct(transcript_id_clean, .keep_all = TRUE)
 
-# Add prefix to column names for clarity
-colnames(kmer6_df)[1:4096] <- paste0("utr5_6mer_", colnames(kmer6_df)[1:4096])
+  # Add prefix to column names for clarity
+  colnames(kmer6_df)[1:4096] <- paste0("utr5_6mer_", colnames(kmer6_df)[1:4096])
 
-cat("Calculated 6-mer frequencies for", nrow(kmer6_df), "transcripts\n")
-cat("Number of 6-mer features:", 4096, "\n")
+  cat("Calculated 6-mer frequencies for", nrow(kmer6_df), "transcripts\n")
+  cat("Number of 6-mer features:", 4096, "\n")
+}
 ```
 
 # Calculate GC3 Content (Third Codon Position GC)
 
 ```{r calculate_gc3}
-# Function to calculate GC3 content
-calculate_gc3 <- function(cds_sequence) {
-  if (is.na(cds_sequence) || nchar(cds_sequence) < 3) {
-    return(NA)
-  }
-
-  # Split into codons
-  seq <- str_to_upper(cds_sequence)
-  seq_len <- nchar(seq)
-
-  # Only use complete codons
-  complete_codons <- seq_len %/% 3
-  if (complete_codons == 0) return(NA)
-
-  # Extract third positions
-  third_positions <- sapply(1:complete_codons, function(i) {
-    substr(seq, (i-1)*3 + 3, (i-1)*3 + 3)
-  })
-
-  # Calculate GC percentage at third position
-  gc_count <- sum(third_positions %in% c("G", "C"))
-  gc3 <- (gc_count / length(third_positions)) * 100
-
-  return(gc3)
+# Vectorised GC3: extract all third-codon positions with a single substr() call per gene
+calculate_gc3 <- function(seqs) {
+  seqs <- str_to_upper(seqs)
+  vapply(seqs, function(seq) {
+    if (is.na(seq) || nchar(seq) < 3L) return(NA_real_)
+    n_codons <- nchar(seq) %/% 3L
+    starts    <- seq.int(3L, n_codons * 3L, 3L)
+    thirds    <- substr(rep.int(seq, n_codons), starts, starts)
+    sum(thirds %in% c("G", "C")) * 100 / n_codons
+  }, numeric(1L), USE.NAMES = FALSE)
 }
 
 # Calculate GC3 for all CDS sequences
 cds_gc3 <- cds_seq %>%
-  mutate(gc3 = sapply(cds_sequence, calculate_gc3)) %>%
+  mutate(gc3 = calculate_gc3(cds_sequence)) %>%
   dplyr::select(transcript_id_clean, gc3)
 
 cat("Calculated GC3 content\n")
 cat("Median GC3:", round(median(cds_gc3$gc3, na.rm = TRUE), 2), "%\n")
+
+stopifnot(
+  "gc3 out of [0, 100]" = all(cds_gc3$gc3 >= 0 & cds_gc3$gc3 <= 100, na.rm = TRUE),
+  "gc3 median not in expected range [40, 65]" =
+    between(median(cds_gc3$gc3, na.rm = TRUE), 40, 65)
+)
+cat("GC3 range check passed\n")
 ```
 
 # 4E Resistance & DAP5 Sensitivity
@@ -575,6 +602,7 @@ cat("Genes with CLIP data:", nrow(clip_features), "\n")
 # Calculate RBP Motif Scores (Unbiased - All Motifs, All Regions)
 
 ```{r rbp_motifs}
+if (!skip_motifs_kmers) {
 # Score all RBP motifs from both RBNS_PWM and CISBPRNA_hs_PWM databases
 # across 5' UTR, CDS, and 3' UTR regions
 # This unbiased approach lets the Random Forest determine which motifs are predictive
@@ -673,9 +701,19 @@ motif_scores <- rbns_utr5 %>%
 cat("Total RBP motif features:", ncol(motif_scores) - 1, "\n")
 cat("  Per database: RBNS =", length(RBNS_PWM), ", CISBP-RNA =", length(CISBPRNA_hs_PWM), "\n")
 cat("  Per region: 5' UTR, CDS, 3' UTR\n")
+} # end if (!skip_motifs_kmers)
 ```
 
 # Assemble Feature Matrix
+
+```{r kmer_motif_fallback}
+# When skip_motifs_kmers = TRUE the four compute chunks above were skipped.
+# Define empty fallback tibbles so the left_joins below still work cleanly.
+if (!exists("kmer4_df"))     kmer4_df     <- tibble(transcript_id_clean = character(0))
+if (!exists("kmer5_df"))     kmer5_df     <- tibble(transcript_id_clean = character(0))
+if (!exists("kmer6_df"))     kmer6_df     <- tibble(transcript_id_clean = character(0))
+if (!exists("motif_scores")) motif_scores <- tibble(transcript_id_clean = character(0))
+```
 
 ```{r assemble_features}
 # Start with most abundant transcripts and TE data
