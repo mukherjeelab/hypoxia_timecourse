@@ -1,0 +1,268 @@
+---
+title: "47 — Delta-Delta bg-RSCU: Hypoxia vs Normoxia eIF3d Codon Preference (MCF7-SIX1)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Compares the condition-specificity of eIF3d codon preference between hypoxia
+(1hr) and normoxia (1hr) in MCF7-SIX1 cells using pre-computed background-corrected
+RSCU summaries from notebooks 41 and 46.
+
+**Delta-delta** = Δbg-RSCU(hypoxia) − Δbg-RSCU(normoxia), where each Δ is
+(eIF3d-promoted mean bg-RSCU) − (neg ctrl mean bg-RSCU). Positive delta-delta
+= codon more preferred by eIF3d-promoted genes specifically in hypoxia; negative
+= normoxia-specific preference.
+
+**Prerequisite:** knit notebook 46 before this one to generate
+`bg_rscu_mcf7six1_normoxia_1hr.csv`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ggrepel)
+```
+
+---
+
+# Load Data
+
+```{r load_data}
+hyp <- read_csv(here("output", "predictive_modeling", "bg_rscu_mcf7six1_hypoxia.csv"),
+                show_col_types = FALSE)
+nor <- read_csv(here("output", "predictive_modeling", "bg_rscu_mcf7six1_normoxia_1hr.csv"),
+                show_col_types = FALSE)
+
+stopifnot(
+  "Hypoxia CSV missing expected columns" =
+    all(c("codon", "amino_acid", "delta_bg_rscu", "p_adj") %in% colnames(hyp)),
+  "Normoxia CSV missing expected columns" =
+    all(c("codon", "amino_acid", "delta_bg_rscu", "p_adj") %in% colnames(nor))
+)
+
+cat("Hypoxia codons:", nrow(hyp), "| Normoxia codons:", nrow(nor), "\n")
+cat("Hypoxia sig (q < 0.05):", sum(hyp$p_adj < 0.05, na.rm = TRUE), "\n")
+cat("Normoxia sig (q < 0.05):", sum(nor$p_adj < 0.05, na.rm = TRUE), "\n")
+```
+
+---
+
+# Compute Delta-Delta
+
+```{r compute_delta_delta}
+# GC3 class from codon string — no external packages needed
+codon_gc3 <- tibble(codon = unique(hyp$codon)) %>%
+  mutate(gc3_class = if_else(substr(codon, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending"))
+
+# Multi-synonymous amino acids only (Met/Trp have only 1 synonymous codon — RSCU always 1)
+multi_aa <- hyp %>% count(amino_acid) %>% filter(n > 1) %>% pull(amino_acid)
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+
+comp <- hyp %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(codon, amino_acid, delta_hyp = delta_bg_rscu, p_adj_hyp = p_adj) %>%
+  inner_join(
+    nor %>%
+      filter(amino_acid %in% multi_aa) %>%
+      dplyr::select(codon, delta_nor = delta_bg_rscu, p_adj_nor = p_adj),
+    by = "codon"
+  ) %>%
+  left_join(codon_gc3, by = "codon") %>%
+  mutate(
+    delta_delta = delta_hyp - delta_nor,
+    sig = case_when(
+      !is.na(p_adj_hyp) & p_adj_hyp < 0.05 & !is.na(p_adj_nor) & p_adj_nor < 0.05 ~ "Both",
+      !is.na(p_adj_hyp) & p_adj_hyp < 0.05 ~ "Hypoxia only",
+      !is.na(p_adj_nor) & p_adj_nor < 0.05 ~ "Normoxia only",
+      TRUE ~ "Neither"
+    ),
+    sig         = factor(sig, levels = c("Both", "Hypoxia only", "Normoxia only", "Neither")),
+    label_codon = if_else(sig != "Neither", codon, NA_character_)
+  )
+
+r_val <- cor(comp$delta_hyp, comp$delta_nor, use = "complete.obs")
+cat("Codons in comparison:", nrow(comp), "\n")
+cat("Pearson r (Δ bg-RSCU: hypoxia ~ normoxia):", round(r_val, 3), "\n\n")
+cat("Significance breakdown:\n")
+print(table(comp$sig))
+
+cat("\nTop 10 codons by |delta-delta| (hypoxia − normoxia preference):\n")
+print(comp %>%
+  arrange(desc(abs(delta_delta))) %>%
+  dplyr::select(codon, amino_acid, gc3_class, delta_hyp, delta_nor, delta_delta, sig) %>%
+  head(10))
+
+cat("\nCodons significant in both conditions:\n")
+both_sig <- comp %>%
+  filter(sig == "Both") %>%
+  arrange(desc(abs(delta_delta))) %>%
+  dplyr::select(codon, amino_acid, gc3_class, delta_hyp, delta_nor, delta_delta)
+if (nrow(both_sig) > 0) print(both_sig) else cat("  None\n")
+```
+
+---
+
+# Plots
+
+## Scatter: Δbg-RSCU Hypoxia vs Normoxia
+
+```{r plot_scatter, fig.width=6, fig.height=5.5}
+sig_colours <- c(
+  "Both"          = "#E69F00",
+  "Hypoxia only"  = "#0072B2",
+  "Normoxia only" = "#CC79A7",
+  "Neither"       = "grey70"
+)
+sig_sizes <- c("Both" = 2.8, "Hypoxia only" = 2.2, "Normoxia only" = 2.2, "Neither" = 1.6)
+sig_alpha  <- c("Both" = 1,   "Hypoxia only" = 0.9, "Normoxia only" = 0.9, "Neither" = 0.5)
+
+axis_lim <- range(c(comp$delta_hyp, comp$delta_nor), na.rm = TRUE)
+axis_lim <- axis_lim + diff(axis_lim) * c(-0.05, 0.05)
+
+p_scatter <- ggplot(comp, aes(x = delta_nor, y = delta_hyp, colour = sig)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(size = sig, alpha = sig)) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 25, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = sig_colours, name = "Significant (q < 0.05)") +
+  scale_size_manual(values = sig_sizes, guide = "none") +
+  scale_alpha_manual(values = sig_alpha, guide = "none") +
+  annotate("text",
+           x = axis_lim[1] + diff(axis_lim) * 0.02,
+           y = axis_lim[2] - diff(axis_lim) * 0.02,
+           label = paste0("r = ", round(r_val, 2)),
+           hjust = 0, vjust = 1, size = 4, colour = "grey30") +
+  coord_fixed(xlim = axis_lim, ylim = axis_lim) +
+  labs(
+    title    = "Δ bg-RSCU: eIF3d codon preference in hypoxia vs normoxia (MCF7-SIX1)",
+    subtitle = paste0("Each point = one codon (multi-synonymous AAs). Dashed = identity line.\n",
+                      "Points above diagonal: hypoxia-enriched preference. ",
+                      "Below diagonal: normoxia-enriched."),
+    x = "Δ bg-RSCU (MCF7-SIX1 normoxia 1hr, notebook 46)",
+    y = "Δ bg-RSCU (MCF7-SIX1 hypoxia 1hr, notebook 41)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_scatter
+ggsave(here("plots", "47_bg_rscu_delta_delta_mcf7six1_scatter.pdf"), p_scatter,
+       width = 6, height = 5.5)
+```
+
+## Faceted Bar: Delta-Delta by Amino Acid
+
+```{r plot_delta_delta_faceted, fig.width=10, fig.height=8}
+plot_df <- comp %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = if_else(delta_delta >= 0, "hypoxia", "normoxia"),
+    sig_label = if_else(sig == "Both", "*", ""),
+    codon     = reorder(codon, delta_delta)
+  )
+
+p_facet <- ggplot(plot_df, aes(x = codon, y = delta_delta, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label,
+                y = delta_delta + sign(delta_delta) * 0.01),
+            size = 3.5, vjust = 0.5) +
+  scale_fill_manual(
+    values = c(hypoxia = "#E69F00", normoxia = "#000000"),
+    labels = c(hypoxia = "Hypoxia-enriched", normoxia = "Normoxia-enriched"),
+    name   = NULL,
+    guide  = "none"
+  ) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Delta-delta bg-RSCU: hypoxia minus normoxia eIF3d preference (MCF7-SIX1)",
+    subtitle = "Positive = more preferred by eIF3d in hypoxia; negative = normoxia-specific.\n* = significant in both conditions (BH q < 0.05 in both notebooks 41 and 46).",
+    x = "Codon", y = "Δ(Δ bg-RSCU) = hypoxia − normoxia"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_facet
+ggsave(here("plots", "47_bg_rscu_delta_delta_mcf7six1_faceted.pdf"), p_facet,
+       width = 10, height = 8)
+```
+
+## Ranked Residuals from Identity Line
+
+```{r plot_residuals, fig.width=5.5, fig.height=9}
+plot_resid <- comp %>%
+  mutate(
+    codon     = fct_reorder(codon, delta_delta),
+    sig_label = if_else(sig != "Neither", as.character(codon), NA_character_)
+  )
+
+p_resid <- ggplot(plot_resid, aes(x = delta_delta, y = codon, colour = gc3_class)) +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_segment(aes(x = 0, xend = delta_delta, yend = codon),
+               linewidth = 0.5, alpha = 0.7) +
+  geom_point(aes(shape = sig), size = 2) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c(Both = 8, "Hypoxia only" = 17, "Normoxia only" = 15, Neither = 16),
+    name   = "Significant (q < 0.05)"
+  ) +
+  labs(
+    title    = "Ranked residuals: hypoxia vs normoxia eIF3d codon preference (MCF7-SIX1)",
+    subtitle = "Residual = Δbg-RSCU(hypoxia) − Δbg-RSCU(normoxia)\nPositive = stronger eIF3d preference in hypoxia",
+    x = "Δ(Δ bg-RSCU) = hypoxia − normoxia",
+    y = NULL
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y     = element_text(size = 7, family = "mono"),
+    legend.position = "top",
+    legend.box      = "vertical"
+  )
+p_resid
+ggsave(here("plots", "47_bg_rscu_residuals_mcf7six1_ranked.pdf"), p_resid,
+       width = 5.5, height = 9)
+```
+
+---
+
+# Save
+
+```{r save}
+write_csv(comp,
+          here("output", "predictive_modeling", "bg_rscu_delta_delta_mcf7six1_hyp_vs_nor.csv"))
+cat("Saved: output/predictive_modeling/bg_rscu_delta_delta_mcf7six1_hyp_vs_nor.csv\n")
+cat("Columns:", paste(colnames(comp), collapse = ", "), "\n")
+cat("Rows:", nrow(comp), "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
