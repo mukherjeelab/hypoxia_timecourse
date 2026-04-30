@@ -1,0 +1,384 @@
+---
+title: "48 — TE Quartiles vs Sequence Features (siCTRL Hypoxia vs Normoxia 1hr)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Examines how mRNA sequence features (GC content and region lengths) vary across
+genes stratified by hypoxic translational response in control cells. TE change
+= mean TE(hypoxia 1hr) − mean TE(normoxia 1hr) in siCTRL cells; genes are split
+into four equal-size quartiles from most repressed (Q1) to most induced (Q4).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+---
+
+# Section 1: Load & Join Data
+
+```{r load_data}
+te_raw <- read_csv(
+  here("output", "te_change_sictrl_normoxia_vs_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+)
+
+stopifnot(
+  "TE file missing expected columns" =
+    all(c("gene_id", "te_change") %in% colnames(te_raw))
+)
+cat("TE change file: ", nrow(te_raw), "genes\n")
+cat("Columns:", paste(colnames(te_raw), collapse = ", "), "\n")
+cat("te_change range:", round(range(te_raw$te_change, na.rm = TRUE), 3), "\n")
+```
+
+```{r load_feature_matrix}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_1hr.rds"))
+
+needed_cols <- c(
+  "gene_id_clean", "utr5_gc", "cds_gc", "utr3_gc",
+  "utr5_length", "cds_length", "utr3_length", "gc3"
+)
+stopifnot(
+  "Feature matrix missing required columns" =
+    all(needed_cols %in% colnames(fm))
+)
+cat("Feature matrix: ", nrow(fm), "rows (transcripts)\n")
+```
+
+```{r join_data}
+te <- te_raw %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+# One representative row per gene — feature matrix is keyed by transcript,
+# so multiple transcripts per gene are possible
+fm_genes <- fm %>%
+  dplyr::select(gene_id_clean, symbol, utr5_gc, cds_gc, utr3_gc,
+                utr5_length, cds_length, utr3_length, gc3) %>%
+  distinct(gene_id_clean, .keep_all = TRUE)
+
+joined <- te %>%
+  inner_join(fm_genes, by = "gene_id_clean") %>%
+  filter(!is.na(te_change))
+
+cat("Genes after inner join:", nrow(joined), "\n")
+
+# Sanity checks on feature values
+stopifnot(
+  "cds_gc out of range"  = all(joined$cds_gc  >= 0 & joined$cds_gc  <= 100, na.rm = TRUE),
+  "utr5_gc out of range" = all(joined$utr5_gc >= 0 & joined$utr5_gc <= 100, na.rm = TRUE),
+  "utr3_gc out of range" = all(joined$utr3_gc >= 0 & joined$utr3_gc <= 100, na.rm = TRUE),
+  "cds_length > 0"       = all(joined$cds_length  > 0, na.rm = TRUE),
+  "utr5_length >= 0"     = all(joined$utr5_length >= 0, na.rm = TRUE),
+  "utr3_length >= 0"     = all(joined$utr3_length >= 0, na.rm = TRUE)
+)
+cat("All feature range checks passed.\n")
+```
+
+---
+
+# Section 2: Quartile Assignment
+
+```{r assign_quartiles}
+plot_df <- joined %>%
+  mutate(
+    quartile = ntile(te_change, 4),
+    quartile_label = factor(
+      quartile,
+      labels = c("Q1\n(low TE)", "Q2", "Q3", "Q4\n(high TE)")
+    )
+  )
+
+cat("Genes per quartile:\n")
+print(table(plot_df$quartile_label))
+
+q_breaks <- quantile(plot_df$te_change, probs = c(0, 0.25, 0.5, 0.75, 1))
+cat("\nTE change quartile boundaries:\n")
+print(round(q_breaks, 3))
+```
+
+## Biological spot-checks
+
+```{r spot_checks}
+# Helper: returns quartile label for a given symbol
+gene_quartile <- function(sym) {
+  row <- plot_df %>% filter(symbol == sym)
+  if (nrow(row) == 0) return(NA_character_)
+  paste0("Q", row$quartile[1], " (te_change = ", round(row$te_change[1], 3), ")")
+}
+
+# TIGAR is strongly translationally induced at 1hr hypoxia in sictrl
+# (rank ~15 by raw TE change; confirmed in heatmap.Rmd top-500 increased set)
+stopifnot(
+  "TIGAR not in Q4 — unexpected given strong TE increase at 1hr hypoxia" =
+    filter(plot_df, symbol == "TIGAR")$quartile == 4
+)
+
+# EIF4EBP1 (4E-BP1): mTOR-regulated translational repressor; TE increases when
+# mTOR is suppressed under hypoxia — confirmed in prior per-sample TE analysis
+stopifnot(
+  "EIF4EBP1 not in Q4 — unexpected given known TE increase at 1hr hypoxia" =
+    filter(plot_df, symbol == "EIF4EBP1")$quartile == 4
+)
+
+cat("TIGAR:    ", gene_quartile("TIGAR"), "\n")
+cat("EIF4EBP1: ", gene_quartile("EIF4EBP1"), "\n")
+cat("EPAS1:    ", gene_quartile("EPAS1"), "\n")
+cat("SLC2A1:   ", gene_quartile("SLC2A1"), "\n")
+
+# ATF4: known ISR/hypoxia translational responder (confirmed elevated in hypoxia
+# by DESeq2 in individual_te_per_sample.Rmd). Raw mean comparison at 1hr can
+# show smaller or near-zero effect vs DESeq2 — report position without asserting Q4.
+cat("\nATF4: ", gene_quartile("ATF4"),
+    "— note: DESeq2 confirms upregulation; raw mean TE change is near zero at 1hr\n")
+```
+
+## Directionality check: top hypoxia genes remain in Q4 after feature matrix join
+
+```{r directionality_check}
+# Top 50 most increased genes in hypoxia from the raw TE change file (before join).
+# After the inner join with the feature matrix, verify none have been displaced to
+# Q1 — that would indicate a ranking distortion or gene ID mismatch in the join.
+top50_orig_ids <- te_raw %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  slice_max(te_change, n = 50, with_ties = FALSE) %>%
+  pull(gene_id_clean)
+
+top50_in_plot <- plot_df %>%
+  filter(gene_id_clean %in% top50_orig_ids)
+
+cat("Top 50 hypoxia-increased genes (siCTRL, original ranking):\n")
+cat("  Retained after feature matrix join:", nrow(top50_in_plot), "/ 50\n")
+cat("  In Q4:", sum(top50_in_plot$quartile == 4), "\n")
+cat("  In Q3:", sum(top50_in_plot$quartile == 3), "\n")
+cat("  In Q1 (directionality concern):", sum(top50_in_plot$quartile == 1), "\n")
+
+stopifnot(
+  "Top hypoxia-increased genes not predominantly in Q4 after join — check for gene ID mismatch" =
+    mean(top50_in_plot$quartile == 4) > 0.70,
+  "Top hypoxia-increased genes appearing in Q1 — possible directionality reversal" =
+    sum(top50_in_plot$quartile == 1) == 0
+)
+cat("Directionality check passed: top-50 genes are in Q4 with none in Q1.\n")
+
+cat("\nTop 20 genes most increased in hypoxia (siCTRL, in plot_df):\n")
+plot_df %>%
+  slice_max(te_change, n = 20, with_ties = FALSE) %>%
+  dplyr::select(symbol, te_change, quartile_label) %>%
+  print(n = 20)
+```
+
+---
+
+# Section 3: TE Change Distribution by Quartile
+
+```{r plot_distribution, fig.width=7, fig.height=4}
+quartile_colours <- c(
+  "Q1\n(low TE)" = "#2166AC",
+  "Q2"        = "#92C5DE",
+  "Q3"        = "#F4A582",
+  "Q4\n(high TE)" = "#D6604D"
+)
+
+vlines <- tibble(
+  xintercept = q_breaks[2:4],
+  label      = paste0(c(25, 50, 75), "th pct")
+)
+
+p_dist <- ggplot(plot_df, aes(x = te_change, fill = quartile_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.5) +
+  geom_vline(data = vlines, aes(xintercept = xintercept),
+             linewidth = 0.4, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = quartile_colours, name = "Quartile") +
+  labs(
+    title    = "Distribution of TE change in siCTRL cells (hypoxia vs normoxia, 1hr)",
+    subtitle = "TE change = mean TE(hypoxia) − mean TE(normoxia). Dashed lines = quartile boundaries.",
+    x        = "TE change (hypoxia − normoxia)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right")
+p_dist
+ggsave(here("plots", "48_te_change_distribution_by_quartile.pdf"),
+       p_dist, width = 7, height = 4)
+```
+
+---
+
+# Section 4: GC Content by Quartile
+
+```{r plot_gc, fig.width=8, fig.height=4.5}
+gc_long <- plot_df %>%
+  dplyr::select(gene_id_clean, quartile_label, utr5_gc, cds_gc, utr3_gc) %>%
+  pivot_longer(
+    cols      = c(utr5_gc, cds_gc, utr3_gc),
+    names_to  = "region",
+    values_to = "gc_pct"
+  ) %>%
+  filter(!is.na(gc_pct)) %>%
+  mutate(
+    region = factor(
+      region,
+      levels = c("utr5_gc", "cds_gc", "utr3_gc"),
+      labels = c("5' UTR", "CDS", "3' UTR")
+    )
+  )
+
+# Kruskal-Wallis p per region for annotation
+kw_gc <- gc_long %>%
+  group_by(region) %>%
+  summarise(
+    p_kw  = kruskal.test(gc_pct ~ quartile_label)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = if_else(
+      p_kw < 0.001,
+      paste0("KW p < 0.001"),
+      paste0("KW p = ", signif(p_kw, 2))
+    )
+  )
+
+p_gc <- ggplot(gc_long, aes(x = quartile_label, y = gc_pct, fill = quartile_label)) +
+  geom_violin(alpha = 0.5, linewidth = 0.4, trim = TRUE) +
+  geom_boxplot(width = 0.18, outlier.size = 0.3, linewidth = 0.4,
+               fill = "white", alpha = 0.85) +
+  geom_text(
+    data    = kw_gc,
+    aes(x = Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = 1.05, vjust = 1.4, size = 3, colour = "grey30"
+  ) +
+  scale_fill_manual(values = quartile_colours, guide = "none") +
+  facet_wrap(~ region, scales = "free_y") +
+  labs(
+    title    = "GC content by TE quartile (siCTRL hypoxia vs normoxia, 1hr)",
+    subtitle = "Q1 = most repressed in hypoxia; Q4 = most induced. KW = Kruskal-Wallis test across all 4 quartiles.",
+    x        = "TE quartile",
+    y        = "GC content (%)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+p_gc
+ggsave(here("plots", "48_gc_content_by_te_quartile.pdf"),
+       p_gc, width = 8, height = 4.5)
+```
+
+---
+
+# Section 5: Region Lengths by Quartile
+
+```{r plot_lengths, fig.width=8, fig.height=4.5}
+len_long <- plot_df %>%
+  dplyr::select(gene_id_clean, quartile_label, utr5_length, cds_length, utr3_length) %>%
+  pivot_longer(
+    cols      = c(utr5_length, cds_length, utr3_length),
+    names_to  = "region",
+    values_to = "length_nt"
+  ) %>%
+  filter(!is.na(length_nt), length_nt > 0) %>%
+  mutate(
+    region = factor(
+      region,
+      levels = c("utr5_length", "cds_length", "utr3_length"),
+      labels = c("5' UTR", "CDS", "3' UTR")
+    ),
+    log2_length = log2(length_nt + 1)
+  )
+
+kw_len <- len_long %>%
+  group_by(region) %>%
+  summarise(
+    p_kw  = kruskal.test(log2_length ~ quartile_label)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = if_else(
+      p_kw < 0.001,
+      paste0("KW p < 0.001"),
+      paste0("KW p = ", signif(p_kw, 2))
+    )
+  )
+
+p_len <- ggplot(len_long, aes(x = quartile_label, y = log2_length, fill = quartile_label)) +
+  geom_violin(alpha = 0.5, linewidth = 0.4, trim = TRUE) +
+  geom_boxplot(width = 0.18, outlier.size = 0.3, linewidth = 0.4,
+               fill = "white", alpha = 0.85) +
+  geom_text(
+    data    = kw_len,
+    aes(x = Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = 1.05, vjust = 1.4, size = 3, colour = "grey30"
+  ) +
+  scale_fill_manual(values = quartile_colours, guide = "none") +
+  facet_wrap(~ region, scales = "free_y") +
+  labs(
+    title    = "Region lengths by TE quartile (siCTRL hypoxia vs normoxia, 1hr)",
+    subtitle = "Q1 = most repressed in hypoxia; Q4 = most induced. Lengths log₂-transformed. KW = Kruskal-Wallis.",
+    x        = "TE quartile",
+    y        = "log₂(length, nt)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+p_len
+ggsave(here("plots", "48_region_length_by_te_quartile.pdf"),
+       p_len, width = 8, height = 4.5)
+```
+
+---
+
+# Section 6: GC3 (Third-Codon-Position GC) by Quartile
+
+```{r plot_gc3, fig.width=4.5, fig.height=4.5}
+stopifnot(
+  "gc3 out of range" = all(plot_df$gc3 >= 0 & plot_df$gc3 <= 100, na.rm = TRUE)
+)
+
+kw_gc3 <- kruskal.test(gc3 ~ quartile_label, data = plot_df)
+kw_gc3_label <- if_else(
+  kw_gc3$p.value < 0.001,
+  "KW p < 0.001",
+  paste0("KW p = ", signif(kw_gc3$p.value, 2))
+)
+
+p_gc3 <- ggplot(plot_df, aes(x = quartile_label, y = gc3, fill = quartile_label)) +
+  geom_violin(alpha = 0.5, linewidth = 0.4, trim = TRUE) +
+  geom_boxplot(width = 0.18, outlier.size = 0.3, linewidth = 0.4,
+               fill = "white", alpha = 0.85) +
+  annotate("text", x = Inf, y = Inf, label = kw_gc3_label,
+           hjust = 1.05, vjust = 1.4, size = 3, colour = "grey30") +
+  scale_fill_manual(values = quartile_colours, guide = "none") +
+  labs(
+    title    = "CDS third-codon-position GC (GC3) by TE quartile",
+    subtitle = "siCTRL hypoxia vs normoxia, 1hr. Q1 = most repressed; Q4 = most induced.\nKW = Kruskal-Wallis test across all 4 quartiles.",
+    x        = "TE quartile",
+    y        = "GC3 (%)"
+  ) +
+  theme_classic(base_size = 12)
+p_gc3
+ggsave(here("plots", "48_gc3_by_te_quartile.pdf"), p_gc3, width = 4.5, height = 4.5)
+```
+
+---
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

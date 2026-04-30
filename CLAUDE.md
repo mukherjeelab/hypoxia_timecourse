@@ -155,6 +155,9 @@ Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size
 
 **Gene set CSV naming convention:** `{condition}_{gene}_{direction}_TE_{timepoint}_lfc{lfc}.csv` in `output/genesets/`. Notebooks 07 and 09 construct paths from params using this pattern. For MCF7-SIX1: `mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`; negative controls go in `output/genesets/` (not `output/predictive_modeling/`) when using the `neg_geneset_csv` param.
 
+**Namespace conventions:**
+- Always use `dplyr::select()`, never bare `select()` — avoids conflicts with `MASS`, `Biostrings`, and other packages that export `select`
+
 **Plot conventions:**
 - Save to `plots/` via `here("plots", "notebooknum_description.pdf")`
 - `theme_classic(base_size = 12)`, density `alpha = 0.15`, `linewidth = 0.8`
