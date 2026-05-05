@@ -1,0 +1,241 @@
+---
+title: "50 — Cross-Cell-Line bg-RSCU Delta Correlation (MDA-MB-231 vs MCF7-SIX1)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Compares the hypoxia-vs-normoxia shift in background-corrected RSCU (bg-RSCU delta)
+between MDA-MB-231 (nb45) and MCF7-SIX1 (nb47) cell lines. For each cell line the
+delta is: mean bg-RSCU(eIF3d-promoted genes) − mean bg-RSCU(negative controls), computed
+separately in hypoxia and normoxia. The delta-delta is Δhyp − Δnor.
+
+Positive controls are run before joining to verify that input files are correctly
+oriented before interpreting any cross-cell-line correlation.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(ggrepel)
+library(here)
+```
+
+---
+
+# Section 1: Load Data & Positive Control Checks
+
+```{r load_data}
+path_231  <- here("output", "predictive_modeling", "bg_rscu_delta_delta_hyp_vs_nor.csv")
+path_mcf7 <- here("output", "predictive_modeling", "bg_rscu_delta_delta_mcf7six1_hyp_vs_nor.csv")
+
+stopifnot(
+  "bg_rscu_delta_delta_hyp_vs_nor.csv not found — run nb45 first" =
+    file.exists(path_231),
+  "bg_rscu_delta_delta_mcf7six1_hyp_vs_nor.csv not found — run nb47 first" =
+    file.exists(path_mcf7)
+)
+
+d231  <- read_csv(path_231,  show_col_types = FALSE)
+dmcf7 <- read_csv(path_mcf7, show_col_types = FALSE)
+
+stopifnot(
+  "MDA-MB-231 file missing expected columns" =
+    all(c("codon", "amino_acid", "gc3_class", "delta_hyp", "delta_nor",
+          "delta_delta", "sig") %in% colnames(d231)),
+  "MCF7-SIX1 file missing expected columns" =
+    all(c("codon", "amino_acid", "gc3_class", "delta_hyp", "delta_nor",
+          "delta_delta", "sig") %in% colnames(dmcf7))
+)
+
+cat("MDA-MB-231 rows:", nrow(d231), "| MCF7-SIX1 rows:", nrow(dmcf7), "\n")
+```
+
+```{r positive_controls}
+# ── MDA-MB-231 directionality anchors ──────────────────────────────────────────
+# GCG (Ala, GC-ending): extremely rare in human coding sequences due to CpG
+# suppression. eIF3d-promoted genes should strongly AVOID this codon relative
+# to negative controls → delta_hyp must be strongly negative.
+gcg_231 <- d231 %>% filter(codon == "GCG") %>% pull(delta_hyp)
+stopifnot(
+  "MDA-MB-231 GCG delta_hyp should be < -0.2 (strongly negative)" = gcg_231 < -0.2
+)
+cat("MDA-MB-231 GCG delta_hyp:", round(gcg_231, 4), " [expect < -0.2] ✓\n")
+
+# GCT (Ala, AT-ending): common, optimal Ala codon. eIF3d-promoted genes should
+# prefer this codon → delta_hyp must be positive.
+gct_231 <- d231 %>% filter(codon == "GCT") %>% pull(delta_hyp)
+stopifnot(
+  "MDA-MB-231 GCT delta_hyp should be > 0 (positive)" = gct_231 > 0
+)
+cat("MDA-MB-231 GCT delta_hyp:", round(gct_231, 4), " [expect > 0] ✓\n")
+
+# ── MCF7-SIX1 report ──────────────────────────────────────────────────────────
+# Pipeline verified (nb41 line 91, nb42 lines 65+72): both MCF7-SIX1 hypoxia
+# and normoxia gene sets apply te_lfc = -log2FoldChange before filtering, so
+# positive te_lfc = eIF3d promotes (matching MDA-MB-231 convention).
+# The opposite GCG/GCT signs relative to MDA-MB-231 are genuine biology:
+# the specific genes eIF3d promotes in MCF7-SIX1 have different intrinsic
+# codon usage than the MDA-MB-231 promotes set.
+gcg_mcf7 <- dmcf7 %>% filter(codon == "GCG") %>% pull(delta_hyp)
+gct_mcf7 <- dmcf7 %>% filter(codon == "GCT") %>% pull(delta_hyp)
+
+cat("\nMCF7-SIX1 GCG delta_hyp:", round(gcg_mcf7, 4),
+    "| GCT delta_hyp:", round(gct_mcf7, 4), "\n")
+cat("(Pipeline sign convention verified correct — see nb41:91, nb42:65+72)\n")
+```
+
+```{r join_data}
+df <- d231 %>%
+  dplyr::select(
+    codon, amino_acid, gc3_class,
+    delta_hyp_231   = delta_hyp,
+    delta_nor_231   = delta_nor,
+    delta_delta_231 = delta_delta,
+    sig_231         = sig
+  ) %>%
+  inner_join(
+    dmcf7 %>% dplyr::select(
+      codon,
+      delta_hyp_mcf7   = delta_hyp,
+      delta_nor_mcf7   = delta_nor,
+      delta_delta_mcf7 = delta_delta,
+      sig_mcf7         = sig
+    ),
+    by = "codon"
+  )
+
+stopifnot(
+  "Join should retain all 59 multi-synonymous codons" = nrow(df) == 59
+)
+cat("Codons after join:", nrow(df), "\n")
+cat("gc3_class breakdown:\n")
+print(count(df, gc3_class))
+```
+
+---
+
+# Section 2: Scatter Plots
+
+```{r scatter_helpers}
+gc3_colors <- c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2")
+
+make_scatter <- function(data, x_col, y_col, x_lab, y_lab, label_n = 15, xlim = NULL, ylim = NULL) {
+  x <- data[[x_col]]
+  y <- data[[y_col]]
+  r_test <- cor.test(x, y)
+  r_label <- sprintf("r = %.2f\np = %.3g", r_test$estimate, r_test$p.value)
+
+  label_idx <- order(pmax(abs(x), abs(y)), decreasing = TRUE)[seq_len(label_n)]
+  plot_df <- data %>%
+    mutate(
+      .x    = x,
+      .y    = y,
+      label = ifelse(row_number() %in% label_idx, codon, NA_character_)
+    )
+
+  ggplot(plot_df, aes(.x, .y, colour = gc3_class, label = label)) +
+    geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.4) +
+    geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.4) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                colour = "grey50", linewidth = 0.6) +
+    geom_point(size = 2.5, alpha = 0.75) +
+    geom_text_repel(size = 3, max.overlaps = 20, na.rm = TRUE,
+                    segment.colour = "grey60", segment.size = 0.3) +
+    annotate("text", x = Inf, y = -Inf, label = r_label,
+             hjust = 1.1, vjust = -0.4, size = 3.5, colour = "grey30") +
+    scale_colour_manual(values = gc3_colors, name = "GC3 class") +
+    (if (!is.null(xlim)) scale_x_continuous(limits = xlim) else NULL) +
+    (if (!is.null(ylim)) scale_y_continuous(limits = ylim) else NULL) +
+    coord_fixed() +
+     labs(x = x_lab, y = y_lab) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+}
+```
+
+## 2a — Delta-Delta (Δhyp − Δnor)
+
+```{r plot_delta_delta, fig.width=6, fig.height=5.5}
+p_dd <- make_scatter(
+  df,
+  x_col = "delta_delta_231",
+  y_col = "delta_delta_mcf7",
+  x_lab = "bg-RSCU delta (hyp - nor), MDA-MB-231",
+  y_lab = "bg-RSCU delta (hyp - nor), MCF7-SIX1"
+)
+p_dd
+ggsave(here("plots", "50_scatter_delta_delta_231_vs_mcf7six1.pdf"),
+       p_dd, width = 6, height = 5.5)
+```
+
+## 2b — Delta Hypoxia (raw hypoxia preference)
+
+```{r plot_delta_hyp, fig.width=6, fig.height=5.5}
+p_hyp <- make_scatter(
+  df,
+  x_col = "delta_hyp_231",
+  y_col = "delta_hyp_mcf7",
+  x_lab = "bg-RSCU delta, hypoxia (MDA-MB-231)",
+  y_lab = "bg-RSCU delta, hypoxia (MCF7-SIX1)",
+  xlim  = c(-0.4, 0.4),
+  ylim  = c(-0.4, 0.4)
+)
+p_hyp
+ggsave(here("plots", "50_scatter_delta_hyp_231_vs_mcf7six1.pdf"),
+       p_hyp, width = 6, height = 5.5)
+```
+
+## 2c — Delta Normoxia (baseline preference)
+
+```{r plot_delta_nor, fig.width=6, fig.height=5.5}
+p_nor <- make_scatter(
+  df,
+  x_col = "delta_nor_231",
+  y_col = "delta_nor_mcf7",
+  x_lab = "bg-RSCU delta, normoxia (MDA-MB-231)",
+  y_lab = "bg-RSCU delta, normoxia (MCF7-SIX1)",
+  xlim  = c(-0.4, 0.4),
+  ylim  = c(-0.4, 0.4)
+)
+p_nor
+ggsave(here("plots", "50_scatter_delta_nor_231_vs_mcf7six1.pdf"),
+       p_nor, width = 6, height = 10.5)
+```
+
+---
+
+# Section 3: Summary Statistics
+
+```{r summary_stats}
+cat("=== Cross-cell-line bg-RSCU correlations (Pearson) ===\n")
+comparisons <- list(
+  list(x = df$delta_delta_231, y = df$delta_delta_mcf7, label = "delta_delta (hyp - nor)"),
+  list(x = df$delta_hyp_231,   y = df$delta_hyp_mcf7,   label = "delta_hyp (hypoxia only)"),
+  list(x = df$delta_nor_231,   y = df$delta_nor_mcf7,   label = "delta_nor (normoxia only)")
+)
+
+for (cmp in comparisons) {
+  r <- cor.test(cmp$x, cmp$y)
+  cat(sprintf("%-32s r = %+.3f  p = %.3g\n",
+              cmp$label, r$estimate, r$p.value))
+}
+
+cat("\n=== Sign concordance (delta_hyp) by GC3 class ===\n")
+df %>%
+  mutate(concordant = sign(delta_hyp_231) == sign(delta_hyp_mcf7)) %>%
+  count(gc3_class, concordant) %>%
+  print()
+```

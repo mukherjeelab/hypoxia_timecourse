@@ -1,0 +1,872 @@
+---
+title: "54 — Pooled RSCU: Hypoxia-Promoted vs Normoxia-Promoted (MDA-MB-231)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  lfc_cutoff:  0.5
+  padj_cutoff: 0.05
+  n_boot:      1000
+  seed:        9
+editor_options:
+  chunk_output_type: console
+---
+
+Parallel to notebook 51 (per-gene-then-averaged bg-RSCU), but using corpus-level
+(pooled) RSCU: all codon counts from the promoted gene set are summed first, then
+a single RSCU value is computed per codon. This is the original Sharp & Li (1987)
+definition. Length-weighted: longer genes contribute proportionally more.
+
+Background proportions are also pooled (sum all codon counts across all expressed
+transcripts, compute per-AA proportions) — keeping numerator and denominator
+consistent.
+
+Statistical significance is assessed by bootstrap (1000 iterations, resampling
+genes with replacement): 95% CI on delta excludes 0 → significant.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(ggrepel)
+library(ggVennDiagram)
+```
+
+---
+
+# Section 1: Setup — CDS Sequences & Codon Counts
+
+```{r load_data}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Feature matrix:", nrow(feature_matrix), "genes\n")
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0 & width(cds_frame0) > 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r codon_matrices}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts ×", ncol(counts_mat0), "codons\n")
+stopifnot("Zero-count rows in codon matrix" = all(rowSums(counts_mat0) > 0))
+```
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+
+codon_gc3 <- tibble(
+  codon          = sense_codons,
+  gc3_nucleotide = substr(sense_codons, 3, 3),
+  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"),
+                           "GC-ending", "AT-ending")
+)
+
+tx_to_gene <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_to_gene, by = "transcript_id_clean")
+```
+
+---
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+n_boot      <- 1000
+seed        <- 9
+# if (exists("params") && !is.null(params) && length(params) > 0) {
+#   lfc_cutoff  <- params$lfc_cutoff
+#   padj_cutoff <- params$padj_cutoff
+#   n_boot      <- params$n_boot
+#   seed        <- params$seed
+# }
+```
+
+# Section 2: Gene Set Loading
+
+```{r gene_sets}
+hyp_raw      <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+hyp_gene_ids <- hyp_raw$ensembl_gene
+cat("Hypoxia 1hr promoted genes:", length(hyp_gene_ids), "\n")
+
+tc <- read_csv(
+  here("output", "genesets",
+       "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+  show_col_types = FALSE
+)
+nor_gene_ids <- tc %>%
+  filter(te_lfc > lfc_cutoff, !is.na(te_padj), te_padj < padj_cutoff) %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id)) %>%
+  pull(ensembl_gene) %>%
+  unique()
+cat("Normoxia 1+4hr promoted genes (te_lfc >", lfc_cutoff, ", padj <",
+    padj_cutoff, "):", length(nor_gene_ids), "\n")
+
+stopifnot(
+  "No hypoxia promoted genes found"  = length(hyp_gene_ids) > 0,
+  "No normoxia promoted genes found" = length(nor_gene_ids) > 0
+)
+
+overlap_ids <- intersect(hyp_gene_ids, nor_gene_ids)
+cat("Overlap:", length(overlap_ids), "| Hypoxia-only:", length(setdiff(hyp_gene_ids, nor_gene_ids)),
+    "| Normoxia-only:", length(setdiff(nor_gene_ids, hyp_gene_ids)), "\n")
+```
+
+---
+
+# Section 3: Venn Diagram — Gene Set Overlap
+
+```{r venn_diagram, fig.width=5, fig.height=4.5}
+venn_sets <- list(
+  "Hypoxia\npromoted"  = hyp_gene_ids,
+  "Normoxia\npromoted" = nor_gene_ids
+)
+
+p_venn <- ggVennDiagram(venn_sets, label_alpha = 0,
+                        set_color = c("#D55E00", "#009E73")) +
+  scale_fill_gradient(low = "white", high = "white") +
+  labs(title = "eIF3d-promoted gene set overlap\nHypoxia 1hr vs Normoxia 1+4hr (MDA-MB-231)",
+       subtitle = paste0("lfc > ", lfc_cutoff, ", padj < ", padj_cutoff)) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, size = 11))
+
+print(p_venn)
+ggsave(here("plots", "54_venn_pooled_hyp_vs_nor.pdf"), p_venn, width = 8, height = 4.5)
+```
+
+---
+
+# Section 4: Pooled Background Computation
+
+```{r pooled_background}
+# Pool raw codon counts across ALL expressed transcripts.
+# This gives a length-weighted background: longer genes contribute proportionally more.
+# Consistent with pooled group RSCU computed below.
+bg_counts_pooled <- colSums(counts_mat0)
+cat("Total pooled sense codons (background):",
+    sum(bg_counts_pooled[sense_codons[sense_codons %in% names(bg_counts_pooled)]]), "\n")
+
+bg_props_pooled <- imap(aa_to_codons, function(codons, aa) {
+  codons   <- intersect(codons, names(bg_counts_pooled))
+  if (length(codons) == 0) return(NULL)
+  aa_total <- sum(bg_counts_pooled[codons])
+  if (aa_total == 0) return(NULL)
+  bg_counts_pooled[codons] / aa_total
+})
+bg_props_pooled <- Filter(Negate(is.null), bg_props_pooled)
+
+cat("Background proportions computed for", length(bg_props_pooled), "amino acids\n")
+prop_sums <- sapply(bg_props_pooled, sum)
+cat("Proportions sum check (should all be ~1):", round(range(prop_sums), 6), "\n")
+```
+
+---
+
+# Section 5: Group Transcript Assignment
+
+```{r assign_groups}
+hyp_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% hyp_gene_ids) %>%
+  pull(transcript_id_clean)
+nor_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% nor_gene_ids) %>%
+  pull(transcript_id_clean)
+
+hyp_tx <- hyp_tx[hyp_tx %in% rownames(counts_mat0)]
+nor_tx <- nor_tx[nor_tx %in% rownames(counts_mat0)]
+
+cat("Hypoxia promoted transcripts:", length(hyp_tx), "\n")
+cat("Normoxia promoted transcripts:", length(nor_tx), "\n")
+
+stopifnot(
+  "No hypoxia transcripts in matrix"  = length(hyp_tx) > 100,
+  "No normoxia transcripts in matrix" = length(nor_tx) > 100
+)
+```
+
+---
+
+# Section 6: Pooled RSCU & Bootstrap Significance
+
+```{r pooled_rscu_function}
+# Compute a single pooled RSCU vector from a set of transcript IDs.
+# For each codon j in amino acid aa:
+#   pooled_RSCU_j = (sum_count_j / sum_aa_total) / bg_proportion_j
+compute_pooled_rscu <- function(tx_ids, counts_mat, bg_props) {
+  tx_ids  <- intersect(tx_ids, rownames(counts_mat))
+  pooled  <- colSums(counts_mat[tx_ids, , drop = FALSE])
+  rscu_vec <- set_names(rep(NA_real_, length(sense_codons)), sense_codons)
+  for (aa in names(bg_props)) {
+    props    <- bg_props[[aa]]
+    codons   <- intersect(names(props), names(pooled))
+    if (length(codons) == 0) next
+    aa_total <- sum(pooled[codons])
+    if (aa_total == 0) next
+    bp      <- props[codons]
+    valid   <- bp > 0
+    if (any(valid)) {
+      rscu_vec[codons[valid]] <- (pooled[codons[valid]] / aa_total) / bp[valid]
+    }
+  }
+  rscu_vec
+}
+```
+
+```{r compute_pooled_rscu}
+hyp_counts_pooled <- colSums(counts_mat0[hyp_tx, , drop = FALSE])
+nor_counts_pooled <- colSums(counts_mat0[nor_tx, , drop = FALSE])
+
+rscu_hyp   <- compute_pooled_rscu(hyp_tx, counts_mat0, bg_props_pooled)
+rscu_nor   <- compute_pooled_rscu(nor_tx, counts_mat0, bg_props_pooled)
+delta_rscu <- rscu_hyp - rscu_nor
+
+stopifnot(
+  "Pooled RSCU contains negative values (hypoxia)"  = all(rscu_hyp >= 0, na.rm = TRUE),
+  "Pooled RSCU contains negative values (normoxia)" = all(rscu_nor >= 0, na.rm = TRUE)
+)
+cat("Hypoxia pooled RSCU range:", round(range(rscu_hyp, na.rm = TRUE), 3), "\n")
+cat("Normoxia pooled RSCU range:", round(range(rscu_nor, na.rm = TRUE), 3), "\n")
+cat("Total sense codons — hypoxia pool:",
+    sum(hyp_counts_pooled[sense_codons[sense_codons %in% names(hyp_counts_pooled)]]),
+    "| normoxia pool:",
+    sum(nor_counts_pooled[sense_codons[sense_codons %in% names(nor_counts_pooled)]]), "\n")
+```
+
+```{r bg_validation}
+# Validation: bg-RSCU computed from the background itself should = 1 for all codons.
+rscu_bg_check <- compute_pooled_rscu(rownames(counts_mat0), counts_mat0, bg_props_pooled)
+rscu_bg_sense <- rscu_bg_check[sense_codons[sense_codons %in% names(rscu_bg_check)]]
+rscu_bg_sense <- rscu_bg_sense[!is.na(rscu_bg_sense)]
+cat("Pooled bg-RSCU (should all = 1):",
+    "min =", round(min(rscu_bg_sense), 6),
+    "max =", round(max(rscu_bg_sense), 6), "\n")
+stopifnot(
+  "Pooled bg-RSCU deviates from 1 — background computation error" =
+    all(abs(rscu_bg_sense - 1) < 1e-10)
+)
+```
+
+```{r spot_check}
+# Biological spot-check: TTA should have positive delta (AT-ending, nb51 result)
+tta_delta <- delta_rscu["TTA"]
+cat("TTA delta pooled RSCU (expect positive):", round(tta_delta, 4), "\n")
+
+# CTG (optimal Leu by tAI) — informational: shows relative usage vs background
+cat("CTG pooled RSCU — hypoxia:", round(rscu_hyp["CTG"], 3),
+    "| normoxia:", round(rscu_nor["CTG"], 3),
+    "| delta:", round(rscu_hyp["CTG"] - rscu_nor["CTG"], 3), "\n")
+```
+
+```{r bootstrap}
+cat("Running bootstrap with", n_boot, "iterations...\n")
+set.seed(seed)
+
+boot_list <- lapply(seq_len(n_boot), function(i) {
+  b_hyp  <- sample(hyp_tx, length(hyp_tx), replace = TRUE)
+  b_nor  <- sample(nor_tx, length(nor_tx), replace = TRUE)
+  rscu_h <- compute_pooled_rscu(b_hyp, counts_mat0, bg_props_pooled)
+  rscu_n <- compute_pooled_rscu(b_nor, counts_mat0, bg_props_pooled)
+  list(hyp = rscu_h, nor = rscu_n, delta = rscu_h - rscu_n)
+})
+
+boot_delta_mat <- do.call(cbind, lapply(boot_list, `[[`, "delta"))
+boot_hyp_mat   <- do.call(cbind, lapply(boot_list, `[[`, "hyp"))
+boot_nor_mat   <- do.call(cbind, lapply(boot_list, `[[`, "nor"))
+
+delta_ci_lo <- apply(boot_delta_mat, 1, quantile, 0.025, na.rm = TRUE)
+delta_ci_hi <- apply(boot_delta_mat, 1, quantile, 0.975, na.rm = TRUE)
+hyp_ci_lo   <- apply(boot_hyp_mat,   1, quantile, 0.025, na.rm = TRUE)
+hyp_ci_hi   <- apply(boot_hyp_mat,   1, quantile, 0.975, na.rm = TRUE)
+nor_ci_lo   <- apply(boot_nor_mat,   1, quantile, 0.025, na.rm = TRUE)
+nor_ci_hi   <- apply(boot_nor_mat,   1, quantile, 0.975, na.rm = TRUE)
+
+cat("Bootstrap complete — CIs computed for", length(delta_ci_lo), "codons.\n")
+```
+
+```{r chisq_test}
+# Per-codon 2×2 chi-squared test on raw pooled counts.
+# For codon j in amino acid aa: rows = groups (hyp, nor), cols = (j, all other synonyms).
+# Tests whether codon j is proportionally over/under-used in one pool vs the other,
+# conditional on amino acid usage. Powered by total codon counts, not gene N.
+chi_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons    <- intersect(codons, names(hyp_counts_pooled))
+  if (length(codons) < 2) return(NULL)
+  n_aa_hyp  <- sum(hyp_counts_pooled[codons])
+  n_aa_nor  <- sum(nor_counts_pooled[codons])
+  map_dfr(codons, function(codon) {
+    n_j_hyp <- hyp_counts_pooled[codon]
+    n_j_nor <- nor_counts_pooled[codon]
+    mat <- matrix(
+      c(n_j_hyp, n_aa_hyp - n_j_hyp,
+        n_j_nor, n_aa_nor - n_j_nor),
+      nrow = 2, byrow = TRUE
+    )
+    test <- if (any(mat < 5)) fisher.test(mat) else chisq.test(mat, correct = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val_chi = test$p.value)
+  })
+}) %>%
+  mutate(p_adj_chi = p.adjust(p_val_chi, method = "BH"))
+
+cat("Chi-squared test complete.\n")
+cat("Significant codons (BH q < 0.05):",
+    sum(chi_df$p_adj_chi < 0.05, na.rm = TRUE), "\n")
+```
+
+```{r build_results}
+rscu_df <- tibble(
+  codon       = sense_codons,
+  amino_acid  = gen_code[sense_codons]
+) %>%
+  filter(amino_acid != "*") %>%
+  mutate(
+    rscu_hyp    = rscu_hyp[codon],
+    rscu_nor    = rscu_nor[codon],
+    delta_rscu  = delta_rscu[codon],
+    delta_ci_lo = delta_ci_lo[codon],
+    delta_ci_hi = delta_ci_hi[codon],
+    hyp_ci_lo   = hyp_ci_lo[codon],
+    hyp_ci_hi   = hyp_ci_hi[codon],
+    nor_ci_lo   = nor_ci_lo[codon],
+    nor_ci_hi   = nor_ci_hi[codon]
+  ) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  left_join(chi_df %>% dplyr::select(codon, p_val_chi, p_adj_chi),
+            by = "codon") %>%
+  mutate(significant = !is.na(p_adj_chi) & p_adj_chi < 0.05)
+
+stopifnot(
+  "Result table missing expected columns" =
+    all(c("rscu_hyp", "rscu_nor", "delta_rscu", "p_adj_chi", "significant") %in%
+          colnames(rscu_df))
+)
+
+cat("\nTop 10 codons by |Δ pooled RSCU|:\n")
+print(rscu_df %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_rscu))) %>%
+        dplyr::select(codon, amino_acid, rscu_hyp, rscu_nor, delta_rscu,
+                      p_adj_chi, significant) %>%
+        head(10))
+```
+
+---
+
+# Section 7: Visualization
+
+```{r plot_sidebyside, fig.width=11, fig.height=9}
+plot_df_a <- rscu_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  pivot_longer(
+    cols      = c(rscu_hyp, rscu_nor),
+    names_to  = "group",
+    values_to = "pooled_rscu"
+  ) %>%
+  mutate(
+    ci_lo    = if_else(group == "rscu_hyp", hyp_ci_lo, nor_ci_lo),
+    ci_hi    = if_else(group == "rscu_hyp", hyp_ci_hi, nor_ci_hi),
+    group    = recode(group,
+                      rscu_hyp = "Hypoxia promoted",
+                      rscu_nor = "Normoxia promoted"),
+    group    = factor(group, levels = c("Hypoxia promoted", "Normoxia promoted")),
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon    = reorder(codon, pooled_rscu)
+  )
+
+p_a <- ggplot(plot_df_a, aes(x = codon, y = pooled_rscu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi),
+                position = position_dodge(width = 0.8), width = 0.3,
+                linewidth = 0.4) +
+  scale_fill_manual(values = c("Hypoxia promoted"  = "#D55E00",
+                                "Normoxia promoted" = "#009E73"),
+                    name = NULL) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  labs(
+    title    = "Pooled RSCU: hypoxia vs normoxia eIF3d-promoted (MDA-MB-231)",
+    subtitle = "Pooled corpus-level RSCU ± 95% bootstrap CI; dashed = 1 (same rate as transcriptome background)",
+    x = "Codon", y = "Pooled RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_a
+ggsave(here("plots", "54_rscu_pooled_sidebyside_hyp_vs_nor.pdf"),
+       p_a, width = 11, height = 9)
+```
+
+```{r plot_delta, fig.width=10, fig.height=8}
+plot_df_b <- rscu_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = if_else(delta_rscu >= 0, "hypoxia", "normoxia"),
+    sig_label = if_else(!is.na(significant) & significant, "*", ""),
+    codon     = reorder(codon, delta_rscu)
+  )
+
+p_b <- ggplot(plot_df_b, aes(x = codon, y = delta_rscu, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label, y = delta_rscu + sign(delta_rscu) * 0.015),
+            size = 3, vjust = 0.5) +
+  scale_fill_manual(values = c(hypoxia = "#D55E00", normoxia = "#009E73"),
+                    guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ Pooled RSCU: hypoxia-promoted minus normoxia-promoted (MDA-MB-231)",
+    subtitle = "Positive = codon more characteristic of hypoxia-promoted genes;\n* = BH-adjusted chi-squared q < 0.05",
+    x = "Codon", y = "Δ pooled RSCU (hypoxia − normoxia)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_b
+ggsave(here("plots", "54_rscu_pooled_delta_hyp_vs_nor.pdf"),
+       p_b, width = 10, height = 8)
+```
+
+```{r plot_scatter, fig.width=6, fig.height=5.5}
+comp_scatter <- rscu_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    sig         = if_else(!is.na(significant) & significant, "Significant", "Neither"),
+    label_codon = if_else(sig == "Significant", codon, NA_character_)
+  )
+
+r_val    <- cor(comp_scatter$rscu_hyp, comp_scatter$rscu_nor, use = "complete.obs")
+axis_lim <- range(c(comp_scatter$rscu_hyp, comp_scatter$rscu_nor), na.rm = TRUE)
+axis_lim <- axis_lim + diff(axis_lim) * c(-0.05, 0.05)
+
+p_scatter <- ggplot(comp_scatter, aes(x = rscu_nor, y = rscu_hyp)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 1, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 1, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(shape = sig, colour = sig, size = sig, alpha = sig)) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 25, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c(Significant = "#0072B2", Neither = "grey70"),
+                      name = "Significant (BH q < 0.05)") +
+  scale_shape_manual(values  = c(Significant = 17, Neither = 16),
+                     name = "Significant (BH q < 0.05)") +
+  scale_size_manual(values   = c(Significant = 2.5, Neither = 1.6),
+                    guide = "none") +
+  scale_alpha_manual(values  = c(Significant = 1, Neither = 0.5),
+                     guide = "none") +
+  annotate("text",
+           x = axis_lim[1] + diff(axis_lim) * 0.02,
+           y = axis_lim[2] - diff(axis_lim) * 0.02,
+           label = paste0("r = ", round(r_val, 2)),
+           hjust = 0, vjust = 1, size = 4, colour = "grey30") +
+  coord_fixed(xlim = axis_lim, ylim = axis_lim) +
+  labs(
+    title    = "Pooled RSCU: eIF3d codon usage in hypoxia vs normoxia promoted genes (MDA-MB-231)",
+    subtitle = paste0("Each point = one codon (multi-synonymous AAs). Dashed = identity line.\n",
+                      "Points above diagonal: higher pooled usage in hypoxia-promoted genes."),
+    x = "Pooled RSCU (normoxia-promoted)",
+    y = "Pooled RSCU (hypoxia-promoted)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_scatter
+ggsave(here("plots", "54_rscu_pooled_scatter_hyp_vs_nor.pdf"), p_scatter, width = 6, height = 5.5)
+
+p_scatter_ci <- p_scatter +
+  geom_errorbar(aes(ymin = hyp_ci_lo, ymax = hyp_ci_hi),
+                width = 0, linewidth = 0.3, alpha = 0.4) +
+  geom_errorbarh(aes(xmin = nor_ci_lo, xmax = nor_ci_hi),
+                 height = 0, linewidth = 0.3, alpha = 0.4) +
+  labs(subtitle = paste0("Each point = one codon (multi-synonymous AAs). Dashed = identity line.\n",
+                         "Error bars = 95% bootstrap CI per group (gene-resampling uncertainty)."))
+p_scatter_ci
+ggsave(here("plots", "54_rscu_pooled_scatter_hyp_vs_nor_ci.pdf"), p_scatter_ci, width = 6, height = 5.5)
+```
+
+```{r plot_lollipop, fig.width=5.5, fig.height=9}
+plot_lollipop <- rscu_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    sig = case_when(
+      !is.na(significant) & significant & delta_rscu >= 0 ~ "Hypoxia only",
+      !is.na(significant) & significant & delta_rscu <  0 ~ "Normoxia only",
+      TRUE ~ "Neither"
+    ),
+    sig   = factor(sig, levels = c("Hypoxia only", "Normoxia only", "Neither")),
+    codon = fct_reorder(codon, delta_rscu)
+  )
+codon_order_f0 <- levels(plot_lollipop$codon)  # saved for frame-shift plot
+
+lollipop_base <- ggplot(plot_lollipop,
+                        aes(x = delta_rscu, y = codon, colour = gc3_class)) +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_point(aes(shape = sig), size = 2) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c("Hypoxia only" = 17, "Normoxia only" = 15, "Neither" = 16),
+    name   = "Significant (BH q < 0.05)"
+  ) +
+  labs(x = "Δ pooled RSCU (hypoxia − normoxia)", y = NULL) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y     = element_text(size = 7, family = "mono"),
+    legend.position = "top",
+    legend.box      = "vertical"
+  )
+
+p_lollipop <- lollipop_base +
+  labs(
+    title    = "Ranked Δ Pooled RSCU: hypoxia vs normoxia eIF3d-promoted (MDA-MB-231)",
+    subtitle = "Positive = stronger codon usage in hypoxia-promoted gene pool."
+  )
+p_lollipop
+ggsave(here("plots", "54_rscu_pooled_delta_ranked.pdf"), p_lollipop, width = 5.5, height = 9)
+
+p_lollipop_ci <- lollipop_base +
+  geom_errorbarh(aes(xmin = delta_ci_lo, xmax = delta_ci_hi),
+                 height = 0.3, linewidth = 0.4, alpha = 0.6) +
+  labs(
+    title    = "Ranked Δ Pooled RSCU: hypoxia vs normoxia eIF3d-promoted (MDA-MB-231)",
+    subtitle = "Positive = stronger codon usage in hypoxia-promoted gene pool.\nError bars = 95% bootstrap CI on delta (gene-resampling uncertainty)."
+  )
+p_lollipop_ci
+ggsave(here("plots", "54_rscu_pooled_delta_ranked_ci.pdf"), p_lollipop_ci, width = 5.5, height = 9)
+```
+
+---
+
+# Section 7d: Validation — Is the AT/GC Preference Specific to Synonymous Positions?
+
+The bg-RSCU pattern could reflect: (1) a real synonymous codon usage bias, or
+(2) hypoxia-promoted genes simply being AT-rich at ALL codon positions, making the
+pattern an artifact of gene composition rather than codon choice.
+
+Two tests: a frame-shift control (do out-of-frame "codons" show the same AT/GC
+pattern?) and a GC-by-position breakdown (is AT-enrichment specific to position 3?).
+
+## Frame-Shift Control
+
+```{r frame_shift_ctrl}
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)
+  new_len  <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+make_counts <- function(seqs) {
+  seqs <- seqs[width(seqs) > 0]
+  ct   <- codonTable(seqs)
+  mat  <- codonCounts(ct)
+  rownames(mat) <- names(seqs)
+  mat
+}
+
+cds_frame1  <- shift_frame(cds_frame0, 1)
+cds_frame2  <- shift_frame(cds_frame0, 2)
+counts_mat1 <- make_counts(cds_frame1)
+counts_mat2 <- make_counts(cds_frame2)
+
+# Compute pooled RSCU for each frame using the same frame-0 background.
+# Keeps reference constant so any differences reflect frame-specific signal.
+rscu_hyp_f1 <- compute_pooled_rscu(hyp_tx, counts_mat1, bg_props_pooled)
+rscu_nor_f1 <- compute_pooled_rscu(nor_tx, counts_mat1, bg_props_pooled)
+delta_f1    <- rscu_hyp_f1 - rscu_nor_f1
+
+rscu_hyp_f2 <- compute_pooled_rscu(hyp_tx, counts_mat2, bg_props_pooled)
+rscu_nor_f2 <- compute_pooled_rscu(nor_tx, counts_mat2, bg_props_pooled)
+delta_f2    <- rscu_hyp_f2 - rscu_nor_f2
+
+cat("Frame 0 mean |delta| (multi-synonymous codons):",
+    round(mean(abs(delta_rscu[sense_codons[sense_codons %in% names(delta_rscu)]]),
+               na.rm = TRUE), 4), "\n")
+cat("Frame 1 mean |delta|:",
+    round(mean(abs(delta_f1[sense_codons[sense_codons %in% names(delta_f1)]]),
+               na.rm = TRUE), 4), "\n")
+cat("Frame 2 mean |delta|:",
+    round(mean(abs(delta_f2[sense_codons[sense_codons %in% names(delta_f2)]]),
+               na.rm = TRUE), 4), "\n")
+```
+
+```{r plot_frame_ctrl_scatter, fig.width=6, fig.height=5.5}
+# Scatter: frame-0 delta vs frame-1 delta, colored by AT/GC ending.
+# If AT/GC pattern is purely gene GC content, points cluster on identity line.
+# If frame 0 is stronger: AT-ending above diagonal, GC-ending below.
+frame_ctrl_df <- tibble(
+  codon      = sense_codons,
+  amino_acid = gen_code[sense_codons]
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    delta_f0 = delta_rscu[codon],
+    delta_f1 = delta_f1[codon]
+  ) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  filter(!is.na(delta_f0), !is.na(delta_f1))
+
+ax_lim <- range(c(frame_ctrl_df$delta_f0, frame_ctrl_df$delta_f1), na.rm = TRUE)
+ax_lim <- ax_lim + diff(ax_lim) * c(-0.05, 0.05)
+
+p_frame_scatter <- ggplot(frame_ctrl_df,
+                          aes(x = delta_f1, y = delta_f0, colour = gc3_class)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey60", linewidth = 0.5) +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey80") +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey80") +
+  geom_point(size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = codon), size = 2.5,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  coord_fixed(xlim = ax_lim, ylim = ax_lim) +
+  labs(
+    title    = "Frame-shift control: frame-0 vs frame-1 delta pooled RSCU (MDA-MB-231)",
+    subtitle = paste0("x = delta in frame-1 (non-coding); y = frame-0 (real codons).\n",
+                      "Points above diagonal: stronger AT/GC effect in real frame than in shifted frame."),
+    x = "Δ pooled RSCU, frame +1 (non-coding control)",
+    y = "Δ pooled RSCU, frame 0 (real codons)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_frame_scatter
+ggsave(here("plots", "54_rscu_pooled_frame_ctrl_scatter.pdf"),
+       p_frame_scatter, width = 6, height = 5.5)
+```
+
+```{r plot_frame_ctrl_lollipop, fig.width=7, fig.height=9}
+# Three-panel lollipop with fixed codon order (sorted by frame-0 delta).
+frame_long <- tibble(
+  codon      = sense_codons,
+  amino_acid = gen_code[sense_codons]
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    `Frame 0\n(real codons)`       = delta_rscu[codon],
+    `Frame +1\n(non-coding ctrl)`  = delta_f1[codon],
+    `Frame +2\n(non-coding ctrl)`  = delta_f2[codon]
+  ) %>%
+  pivot_longer(cols = starts_with("Frame"),
+               names_to = "frame", values_to = "delta") %>%
+  mutate(frame = factor(frame,
+                        levels = c("Frame 0\n(real codons)",
+                                   "Frame +1\n(non-coding ctrl)",
+                                   "Frame +2\n(non-coding ctrl)"))) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(codon = factor(codon, levels = codon_order_f0))
+
+p_frame_lollipop <- ggplot(frame_long, aes(x = delta, y = codon, colour = gc3_class)) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey60") +
+  geom_point(size = 1.5, alpha = 0.85) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  facet_wrap(~ frame, nrow = 1) +
+  labs(
+    title    = "Frame-shift control: Δ pooled RSCU across frames (MDA-MB-231)",
+    subtitle = "Codon order fixed to frame-0 ranking. AT/GC pattern should weaken in non-coding frames if real.",
+    x = "Δ pooled RSCU (hypoxia − normoxia)",
+    y = NULL
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y     = element_text(size = 6, family = "mono"),
+    legend.position = "top",
+    strip.text      = element_text(face = "bold")
+  )
+p_frame_lollipop
+ggsave(here("plots", "54_rscu_pooled_frame_ctrl_lollipop.pdf"),
+       p_frame_lollipop, width = 7, height = 9)
+```
+
+```{r plot_frame_ctrl_lollipop_star, fig.width=7, fig.height=9}
+# Classify codons as "codon-specific" if frame-0 chi-sq significant AND
+# |frame-0 delta| exceeds the shifted-frame baseline (mean of frames +1 and +2).
+frame_specificity <- tibble(
+  codon    = names(delta_rscu),
+  f0_delta = as.numeric(delta_rscu),
+  f1_delta = as.numeric(delta_f1[names(delta_rscu)]),
+  f2_delta = as.numeric(delta_f2[names(delta_rscu)])
+) %>%
+  mutate(max_shift = pmax(abs(f1_delta), abs(f2_delta))) %>%
+  left_join(chi_df %>% dplyr::select(codon, p_adj_chi), by = "codon") %>%
+  mutate(codon_specific = !is.na(p_adj_chi) & p_adj_chi < 0.05 &
+           abs(f0_delta) > max_shift * 1.5)
+
+cat("Codons with codon-specific preference:",
+    sum(frame_specificity$codon_specific, na.rm = TRUE), "of",
+    sum(!is.na(frame_specificity$codon_specific)), "multi-synonymous codons\n")
+
+frame_long_star <- frame_long %>%
+  left_join(frame_specificity %>% dplyr::select(codon, codon_specific),
+            by = "codon") %>%
+  mutate(
+    codon_specific = replace_na(codon_specific, FALSE),
+    codon = factor(codon, levels = codon_order_f0)
+  )
+
+# Stars only in Frame 0 panel, pinned to the left edge as a row indicator.
+x_left <- min(frame_long_star$delta, na.rm = TRUE)
+star_data <- frame_long_star %>%
+  filter(codon_specific, frame == "Frame 0\n(real codons)") %>%
+  mutate(delta = x_left)
+
+p_frame_lollipop_star <- ggplot(
+    frame_long_star,
+    aes(x = delta, y = codon, colour = gc3_class)
+  ) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey60") +
+  geom_point(size = 1.5, alpha = 0.85) +
+  geom_point(
+    data  = star_data,
+    shape = 8, size = 2.5, colour = "black", stroke = 0.6
+  ) +
+  facet_wrap(~ frame, nrow = 1) +
+  scale_colour_manual(
+    values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+    name   = "Third-position"
+  ) +
+  labs(
+    title    = "Frame-shift control: star = real codon preference",
+    subtitle = "star (Frame 0 only): BH-adj chi-sq p<0.05 AND abs(frame-0 delta) > 1.5x max(abs(frame+1), abs(frame+2))",
+    x        = "delta pooled RSCU (hypoxia minus normoxia)",
+    y        = NULL
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y     = element_text(size = 6, family = "mono"),
+    legend.position = "top",
+    strip.text      = element_text(face = "bold")
+  )
+p_frame_lollipop_star
+ggsave(here("plots", "54_rscu_pooled_frame_ctrl_lollipop_star.pdf"),
+       p_frame_lollipop_star, width = 7, height = 9)
+```
+
+---
+
+## GC Content by Codon Position
+
+```{r gc_by_position, fig.width=5, fig.height=4}
+sense_in_mat <- sense_codons[sense_codons %in% colnames(counts_mat0)]
+
+gc_position <- function(counts_vec) {
+  counts_vec <- counts_vec[sense_in_mat]
+  total <- sum(counts_vec, na.rm = TRUE)
+  tibble(
+    position = c("GC1", "GC2", "GC3"),
+    gc_frac  = c(
+      sum(counts_vec[substr(sense_in_mat, 1, 1) %in% c("G","C")], na.rm=TRUE) / total,
+      sum(counts_vec[substr(sense_in_mat, 2, 2) %in% c("G","C")], na.rm=TRUE) / total,
+      sum(counts_vec[substr(sense_in_mat, 3, 3) %in% c("G","C")], na.rm=TRUE) / total
+    )
+  )
+}
+
+gc_df <- bind_rows(
+  gc_position(bg_counts_pooled)  %>% mutate(pool = "Background"),
+  gc_position(nor_counts_pooled) %>% mutate(pool = "Normoxia promoted"),
+  gc_position(hyp_counts_pooled) %>% mutate(pool = "Hypoxia promoted")
+) %>%
+  mutate(pool = factor(pool,
+                       levels = c("Background", "Normoxia promoted", "Hypoxia promoted")))
+
+stopifnot("GC fractions out of [0,1]" = all(gc_df$gc_frac >= 0 & gc_df$gc_frac <= 1))
+
+cat("GC content by position and pool:\n")
+print(gc_df %>% mutate(gc_pct = round(gc_frac * 100, 1)) %>%
+        dplyr::select(pool, position, gc_pct) %>%
+        pivot_wider(names_from = position, values_from = gc_pct))
+
+p_gc <- ggplot(gc_df, aes(x = position, y = gc_frac * 100, fill = pool)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c(
+    "Background"        = "grey60",
+    "Normoxia promoted" = "#009E73",
+    "Hypoxia promoted"  = "#D55E00"
+  ), name = NULL) +
+  labs(
+    title    = "GC content at each codon position by gene pool (MDA-MB-231)",
+    subtitle = paste0("If AT-enrichment in hypoxia-promoted genes is specific to position 3,\n",
+                      "that confirms synonymous codon bias rather than overall gene GC content."),
+    x = "Codon position", y = "GC content (%)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_gc
+ggsave(here("plots", "54_rscu_pooled_gc_by_position.pdf"), p_gc, width = 5, height = 4)
+```
+
+---
+
+# Section 8: Save Results
+
+```{r save_csv}
+out_df <- rscu_df %>%
+  dplyr::select(amino_acid, codon, gc3_class,
+                rscu_hyp, hyp_ci_lo, hyp_ci_hi,
+                rscu_nor, nor_ci_lo, nor_ci_hi,
+                delta_rscu, delta_ci_lo, delta_ci_hi,
+                p_val_chi, p_adj_chi, significant)
+
+write_csv(out_df,
+          here("output", "predictive_modeling", "bg_rscu_pooled_231_hyp_vs_nor.csv"))
+cat("Saved to output/predictive_modeling/bg_rscu_pooled_231_hyp_vs_nor.csv\n")
+cat("Rows:", nrow(out_df), "\n")
+cat("Significant codons (BH q < 0.05):", sum(out_df$significant, na.rm = TRUE), "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

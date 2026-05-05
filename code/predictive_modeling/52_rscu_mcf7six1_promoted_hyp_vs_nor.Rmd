@@ -1,0 +1,580 @@
+---
+title: "52 — bg-RSCU: Hypoxia-Promoted vs Normoxia-Promoted (MCF7-SIX1, No Negative Control)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Robustness analysis complementing notebooks 41/46/47. Instead of comparing
+promoted genes to a negative control (Δ = promoted − neg ctrl), this notebook
+compares the bg-RSCU of the hypoxia 1hr promoted set directly to the normoxia
+1hr promoted set (Δ = hyp_promoted − nor_promoted). A codon enriched here
+is more characteristic of eIF3d-promoted genes in hypoxia than of eIF3d-promoted
+genes in normoxia, without the negative control serving as reference.
+
+LFC cutoff: > 0 (any positive TE), padj < 0.05 — matching nb41/46 convention.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(ggrepel)
+library(ggVennDiagram)
+```
+
+---
+
+# Section 1: Setup — CDS Sequences & Codon Counts
+
+```{r load_data}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_mcf7six1_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Feature matrix:", nrow(feature_matrix), "genes\n")
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0 & width(cds_frame0) > 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r codon_matrices}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts ×", ncol(counts_mat0), "codons\n")
+```
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+
+codon_gc3 <- tibble(
+  codon          = sense_codons,
+  gc3_nucleotide = substr(sense_codons, 3, 3),
+  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
+)
+
+tx_to_gene <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_to_gene, by = "transcript_id_clean")
+```
+
+---
+
+```{r cutoffs}
+lfc_cutoff  <- 0
+padj_cutoff <- 0.05
+```
+
+# Section 2: Gene Set Loading
+
+```{r gene_sets}
+# Hypoxia 1hr promoted — lfc > 0, padj < 0.05 (matching nb41 convention)
+hyp_raw      <- read_csv(
+  here("output", "genesets", "mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.csv"),
+  show_col_types = FALSE
+)
+hyp_gene_ids <- hyp_raw$ensembl_gene
+cat("Hypoxia 1hr promoted genes:", length(hyp_gene_ids), "\n")
+
+# Normoxia 1hr promoted — lfc > 0, padj < 0.05 (matching nb46 convention)
+nor_raw      <- read_csv(
+  here("output", "genesets", "mcf7six1_normoxia_3d_promotes_TE_1hr_lfc0.csv"),
+  show_col_types = FALSE
+)
+nor_gene_ids <- nor_raw$ensembl_gene
+cat("Normoxia 1hr promoted genes:", length(nor_gene_ids), "\n")
+
+stopifnot(
+  "No hypoxia promoted genes found"  = length(hyp_gene_ids) > 0,
+  "No normoxia promoted genes found" = length(nor_gene_ids) > 0
+)
+
+overlap_ids <- intersect(hyp_gene_ids, nor_gene_ids)
+cat("Overlap (genes promoted in both conditions):", length(overlap_ids), "\n")
+cat("Hypoxia-only:", length(setdiff(hyp_gene_ids, nor_gene_ids)), "\n")
+cat("Normoxia-only:", length(setdiff(nor_gene_ids, hyp_gene_ids)), "\n")
+```
+
+---
+
+# Section 3: Venn Diagram — Gene Set Overlap
+
+```{r venn_diagram, fig.width=5, fig.height=4.5}
+venn_sets <- list(
+  "Hypoxia\npromoted"  = hyp_gene_ids,
+  "Normoxia\npromoted" = nor_gene_ids
+)
+
+p_venn <- ggVennDiagram(venn_sets, label_alpha = 0,
+                        set_color = c("#D55E00", "#009E73")) +
+  scale_fill_gradient(low = "white", high = "white") +
+  labs(title = "eIF3d-promoted gene set overlap\nHypoxia 1hr vs Normoxia 1hr (MCF7-SIX1)",
+       subtitle = paste0("lfc > ", lfc_cutoff, ", padj < ", padj_cutoff)) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, size = 11))
+
+print(p_venn)
+ggsave(here("plots", "52_venn_hyp_vs_nor_promoted.pdf"), p_venn, width = 8, height = 4.5)
+```
+
+---
+
+# Section 4: Background-Corrected RSCU
+
+```{r bg_rscu_background_props}
+# Background = mean per-transcript codon proportion across all expressed mRNAs.
+# Each gene gets equal weight regardless of CDS length.
+bg_props <- imap(aa_to_codons, function(codons, aa) {
+  codons  <- intersect(codons, colnames(counts_mat0))
+  if (length(codons) == 0) return(NULL)
+  sub_cnt <- counts_mat0[, codons, drop = FALSE]
+  aa_tot  <- rowSums(sub_cnt)
+  valid   <- aa_tot > 0
+  if (!any(valid)) return(NULL)
+  prop_mat <- sub_cnt[valid, , drop = FALSE] / aa_tot[valid]
+  colMeans(prop_mat)
+})
+bg_props <- Filter(Negate(is.null), bg_props)
+
+cat("Background proportions computed for", length(bg_props), "amino acids\n")
+prop_sums <- sapply(bg_props, sum)
+cat("Background proportions sum check (should all be ~1):",
+    round(range(prop_sums), 4), "\n")
+```
+
+```{r compute_bg_rscu_function}
+compute_bg_rscu_matrix <- function(counts_mat, bg_props) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(bg_props)) {
+    props  <- bg_props[[aa]]
+    codons <- intersect(names(props), colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    for (codon in codons) {
+      bp <- props[codon]
+      if (bp > 0 && any(valid)) {
+        rscu_mat[valid, codon] <- (sub_cnt[valid, codon] / aa_tot[valid]) / bp
+      }
+    }
+  }
+  rscu_mat
+}
+```
+
+```{r compute_bg_rscu}
+bg_rscu_mat0 <- compute_bg_rscu_matrix(counts_mat0, bg_props)
+cat("Background RSCU matrix:", nrow(bg_rscu_mat0), "×", ncol(bg_rscu_mat0), "\n")
+cat("Range:", round(min(bg_rscu_mat0, na.rm = TRUE), 3), "—",
+    round(max(bg_rscu_mat0, na.rm = TRUE), 3), "\n")
+
+stopifnot(
+  "bg-RSCU contains negative values" = all(bg_rscu_mat0 >= 0, na.rm = TRUE)
+)
+```
+
+---
+
+# Section 5: Group Transcript Assignment
+
+```{r assign_groups}
+hyp_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% hyp_gene_ids) %>%
+  pull(transcript_id_clean)
+nor_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% nor_gene_ids) %>%
+  pull(transcript_id_clean)
+
+hyp_tx <- hyp_tx[hyp_tx %in% rownames(bg_rscu_mat0)]
+nor_tx <- nor_tx[nor_tx %in% rownames(bg_rscu_mat0)]
+
+cat("Hypoxia promoted transcripts:", length(hyp_tx), "\n")
+cat("Normoxia promoted transcripts:", length(nor_tx), "\n")
+
+stopifnot(
+  "No hypoxia transcripts in matrix"  = length(hyp_tx) > 0,
+  "No normoxia transcripts in matrix" = length(nor_tx) > 0
+)
+```
+
+---
+
+# Section 6: Group Summaries & Statistical Testing
+
+```{r summarize_function}
+summarize_rscu <- function(rscu_mat, tx_ids) {
+  tx_ids <- tx_ids[tx_ids %in% rownames(rscu_mat)]
+  sub    <- rscu_mat[tx_ids, sense_codons, drop = FALSE]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    codons <- intersect(codons, colnames(sub))
+    map_dfr(codons, function(codon) {
+      vals <- sub[, codon]
+      vals <- vals[!is.na(vals)]
+      tibble(
+        amino_acid  = aa,
+        codon       = codon,
+        mean_rscu   = mean(vals),
+        se_rscu     = if (length(vals) > 1) sd(vals) / sqrt(length(vals)) else NA_real_,
+        n           = length(vals)
+      )
+    })
+  })
+}
+
+bg_rscu_hyp <- summarize_rscu(bg_rscu_mat0, hyp_tx)
+bg_rscu_nor <- summarize_rscu(bg_rscu_mat0, nor_tx)
+cat("bg-RSCU summary — hypoxia promoted:", nrow(bg_rscu_hyp), "codon-rows\n")
+```
+
+```{r biological_spotcheck}
+# Biological spot-check: CTG (optimal Leu codon) should have bg-RSCU near 1.0
+ctg_hyp <- bg_rscu_hyp %>% filter(codon == "CTG") %>% pull(mean_rscu)
+ctg_nor <- bg_rscu_nor %>% filter(codon == "CTG") %>% pull(mean_rscu)
+cat("CTG (Leu, optimal) mean bg-RSCU — hypoxia:", round(ctg_hyp, 3),
+    "| normoxia:", round(ctg_nor, 3), "\n")
+cat("(Both should be near 1.0 for an optimally-used reference codon)\n")
+```
+
+```{r delta_and_wilcox}
+bg_rscu_combined <- bg_rscu_hyp %>%
+  dplyr::select(amino_acid, codon, hyp_mean = mean_rscu,
+                hyp_se = se_rscu, hyp_n = n) %>%
+  left_join(
+    bg_rscu_nor %>% dplyr::select(amino_acid, codon, nor_mean = mean_rscu,
+                                  nor_se = se_rscu, nor_n = n),
+    by = c("amino_acid", "codon")
+  ) %>%
+  mutate(delta_bg_rscu = hyp_mean - nor_mean)
+
+# Wilcoxon test per codon, multi-synonymous AAs only
+wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons <- intersect(codons, colnames(bg_rscu_mat0))
+  map_dfr(codons, function(codon) {
+    h_vals <- bg_rscu_mat0[hyp_tx[hyp_tx %in% rownames(bg_rscu_mat0)], codon]
+    n_vals <- bg_rscu_mat0[nor_tx[nor_tx %in% rownames(bg_rscu_mat0)], codon]
+    h_vals <- h_vals[!is.na(h_vals)]
+    n_vals <- n_vals[!is.na(n_vals)]
+    if (length(h_vals) < 3 || length(n_vals) < 3) {
+      return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_))
+    }
+    wt <- wilcox.test(h_vals, n_vals, exact = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val = wt$p.value)
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+bg_rscu_combined <- bg_rscu_combined %>%
+  left_join(wilcox_df %>% dplyr::select(amino_acid, codon, p_val, p_adj),
+            by = c("amino_acid", "codon"))
+
+stopifnot(
+  "groups missing from bg_rscu_combined" =
+    all(c("hyp_mean", "nor_mean") %in% colnames(bg_rscu_combined))
+)
+
+cat("Significant codons (BH q < 0.05):",
+    sum(!is.na(bg_rscu_combined$p_adj) & bg_rscu_combined$p_adj < 0.05,
+        na.rm = TRUE), "\n")
+
+cat("\nTop 10 codons by |Δ bg-RSCU|:\n")
+print(bg_rscu_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_bg_rscu))) %>%
+        dplyr::select(codon, amino_acid, hyp_mean, nor_mean, delta_bg_rscu, p_adj) %>%
+        head(10))
+```
+
+---
+
+# Section 7: Visualization
+
+```{r plot_sidebyside, fig.width=11, fig.height=9}
+plot_df_a <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  pivot_longer(cols = c(hyp_mean, nor_mean),
+               names_to = "group", values_to = "mean_bg_rscu") %>%
+  mutate(
+    se      = if_else(group == "hyp_mean", hyp_se, nor_se),
+    group   = recode(group,
+                     hyp_mean = "Hypoxia promoted",
+                     nor_mean = "Normoxia promoted"),
+    group   = factor(group, levels = c("Hypoxia promoted", "Normoxia promoted")),
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon    = reorder(codon, mean_bg_rscu)
+  )
+
+p_a <- ggplot(plot_df_a, aes(x = codon, y = mean_bg_rscu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = mean_bg_rscu - se, ymax = mean_bg_rscu + se),
+                position = position_dodge(width = 0.8), width = 0.3,
+                linewidth = 0.4) +
+  scale_fill_manual(values = c("Hypoxia promoted" = "#D55E00",
+                                "Normoxia promoted" = "#009E73"),
+                    name = NULL) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  labs(
+    title    = "RSCU: hypoxia vs normoxia eIF3d-promoted (MCF7-SIX1)",
+    subtitle = "Mean per-transcript RSCU ± SE; dashed = 1 (same rate as transcriptome background)",
+    x = "Codon", y = "Mean RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_a
+ggsave(here("plots", "52_bg_rscu_sidebyside_hyp_vs_nor_promoted.pdf"),
+       p_a, width = 11, height = 9)
+```
+
+```{r plot_delta, fig.width=10, fig.height=8}
+plot_df_b <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta_bg_rscu >= 0, "hypoxia", "normoxia"),
+    sig_label = case_when(!is.na(p_adj) & p_adj < 0.05 ~ "*", TRUE ~ ""),
+    codon     = reorder(codon, delta_bg_rscu)
+  )
+
+p_b <- ggplot(plot_df_b, aes(x = codon, y = delta_bg_rscu, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label, y = delta_bg_rscu + sign(delta_bg_rscu) * 0.015),
+            size = 3, vjust = 0.5) +
+  scale_fill_manual(values = c(hypoxia = "#D55E00", normoxia = "#009E73"),
+                    guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Δ RSCU: hypoxia-promoted minus normoxia-promoted (MCF7-SIX1)",
+    subtitle = "Positive = codon more characteristic of hypoxia-promoted genes;\n* = BH-adjusted Wilcoxon q < 0.05",
+    x = "Codon", y = "Δ mean RSCU (hypoxia − normoxia)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_b
+ggsave(here("plots", "52_bg_rscu_delta_hyp_vs_nor_promoted.pdf"),
+       p_b, width = 10, height = 8)
+```
+
+```{r plot_violin, fig.width=12, fig.height=8}
+sig_codons <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa, !is.na(p_adj), p_adj < 0.05) %>%
+  dplyr::select(amino_acid, codon)
+
+cat("Codons with BH q < 0.05:", nrow(sig_codons), "\n")
+if (nrow(sig_codons) > 0) cat(paste(sig_codons$codon, collapse = ", "), "\n")
+
+if (nrow(sig_codons) > 0) {
+  violin_df <- map_dfr(seq_len(nrow(sig_codons)), function(i) {
+    aa    <- sig_codons$amino_acid[i]
+    codon <- sig_codons$codon[i]
+    h_vals <- bg_rscu_mat0[hyp_tx[hyp_tx %in% rownames(bg_rscu_mat0)], codon]
+    n_vals <- bg_rscu_mat0[nor_tx[nor_tx %in% rownames(bg_rscu_mat0)], codon]
+    bind_rows(
+      tibble(codon = codon, amino_acid = aa, group = "Hypoxia promoted",
+             bg_rscu = h_vals[!is.na(h_vals)]),
+      tibble(codon = codon, amino_acid = aa, group = "Normoxia promoted",
+             bg_rscu = n_vals[!is.na(n_vals)])
+    )
+  }) %>%
+    mutate(
+      group = factor(group, levels = c("Hypoxia promoted", "Normoxia promoted"))
+    ) %>%
+    left_join(bg_rscu_combined %>% dplyr::select(codon, p_adj),
+              by = "codon") %>%
+    mutate(codon_label = paste0(codon, "\nq=", signif(p_adj, 2)))
+
+  p_viol <- ggplot(violin_df, aes(x = group, y = bg_rscu, fill = group)) +
+    geom_violin(alpha = 0.6, linewidth = 0.4, trim = TRUE) +
+    geom_boxplot(width = 0.18, outlier.size = 0.5, linewidth = 0.4,
+                 fill = "white", alpha = 0.8) +
+    geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c("Hypoxia promoted"  = "#D55E00",
+                                  "Normoxia promoted" = "#009E73"),
+                      guide = "none") +
+    facet_wrap(~ codon_label, scales = "free_y", nrow = 2) +
+    labs(
+      title    = "Per-transcript RSCU for significant codons (MCF7-SIX1)",
+      subtitle = "Codons with BH q < 0.05 between hypoxia-promoted and normoxia-promoted.\nDashed = 1 (same usage rate as transcriptome background).",
+      x = NULL, y = "Per-transcript RSCU"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      strip.text  = element_text(face = "bold", size = 9)
+    )
+  p_viol
+  ggsave(here("plots", "52_bg_rscu_violin_hyp_vs_nor_promoted.pdf"), p_viol,
+         width = max(8, nrow(sig_codons) * 2.5), height = 8, limitsize = FALSE)
+} else {
+  cat("No significant codons — skipping violin plot.\n")
+}
+```
+
+```{r plot_scatter, fig.width=6, fig.height=5.5}
+comp_scatter <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(
+    sig         = if_else(!is.na(p_adj) & p_adj < 0.05, "Significant", "Neither"),
+    label_codon = if_else(sig == "Significant", codon, NA_character_)
+  )
+
+r_val    <- cor(comp_scatter$hyp_mean, comp_scatter$nor_mean, use = "complete.obs")
+axis_lim <- range(c(comp_scatter$hyp_mean, comp_scatter$nor_mean), na.rm = TRUE)
+axis_lim <- axis_lim + diff(axis_lim) * c(-0.05, 0.05)
+
+p_scatter <- ggplot(comp_scatter, aes(x = nor_mean, y = hyp_mean)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 1, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 1, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(shape = sig, colour = sig,
+                 size  = sig, alpha = sig)) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 25, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c(Significant = "#0072B2", Neither = "grey70"),
+                      name = "Significant (q < 0.05)") +
+  scale_shape_manual(values  = c(Significant = 17, Neither = 16),
+                     name = "Significant (q < 0.05)") +
+  scale_size_manual(values   = c(Significant = 2.5, Neither = 1.6),
+                    guide = "none") +
+  scale_alpha_manual(values  = c(Significant = 1, Neither = 0.5),
+                     guide = "none") +
+  annotate("text",
+           x = axis_lim[1] + diff(axis_lim) * 0.02,
+           y = axis_lim[2] - diff(axis_lim) * 0.02,
+           label = paste0("r = ", round(r_val, 2)),
+           hjust = 0, vjust = 1, size = 4, colour = "grey30") +
+  coord_fixed(xlim = axis_lim, ylim = axis_lim) +
+  labs(
+    title    = "RSCU: eIF3d codon usage in hypoxia vs normoxia promoted genes (MCF7-SIX1)",
+    subtitle = paste0("Each point = one codon (multi-synonymous AAs). Dashed = identity line.\n",
+                      "Points above diagonal: higher usage in hypoxia-promoted genes."),
+    x = "Mean RSCU (normoxia-promoted)",
+    y = "Mean RSCU (hypoxia-promoted)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_scatter
+ggsave(here("plots", "52_bg_rscu_scatter_hyp_vs_nor.pdf"), p_scatter, width = 6, height = 5.5)
+```
+
+```{r plot_lollipop, fig.width=5.5, fig.height=9}
+plot_lollipop <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(
+    sig = case_when(
+      !is.na(p_adj) & p_adj < 0.05 & delta_bg_rscu >= 0 ~ "Hypoxia only",
+      !is.na(p_adj) & p_adj < 0.05 & delta_bg_rscu <  0 ~ "Normoxia only",
+      TRUE ~ "Neither"
+    ),
+    sig   = factor(sig, levels = c("Hypoxia only", "Normoxia only", "Neither")),
+    codon = fct_reorder(codon, delta_bg_rscu)
+  )
+
+p_lollipop <- ggplot(plot_lollipop,
+                     aes(x = delta_bg_rscu, y = codon, colour = gc3_class)) +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_segment(aes(x = 0, xend = delta_bg_rscu, yend = codon),
+               linewidth = 0.5, alpha = 0.7) +
+  geom_point(aes(shape = sig), size = 2) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c("Hypoxia only" = 17, "Normoxia only" = 15, "Neither" = 16),
+    name   = "Significant (q < 0.05)"
+  ) +
+  labs(
+    title    = "Ranked Δ RSCU: hypoxia vs normoxia eIF3d-promoted (MCF7-SIX1)",
+    subtitle = "Positive = stronger codon usage in hypoxia-promoted genes",
+    x = "Δ RSCU (hypoxia − normoxia)",
+    y = NULL
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y     = element_text(size = 7, family = "mono"),
+    legend.position = "top",
+    legend.box      = "vertical"
+  )
+p_lollipop
+ggsave(here("plots", "52_bg_rscu_lollipop_ranked.pdf"), p_lollipop, width = 5.5, height = 9)
+```
+
+---
+
+# Section 8: Save Results
+
+```{r save_csv}
+out_df <- bg_rscu_combined %>%
+  dplyr::select(amino_acid, codon,
+                hyp_promoted_mean = hyp_mean,
+                hyp_promoted_se   = hyp_se,
+                hyp_promoted_n    = hyp_n,
+                nor_promoted_mean = nor_mean,
+                nor_promoted_se   = nor_se,
+                nor_promoted_n    = nor_n,
+                delta_bg_rscu, p_val, p_adj)
+
+write_csv(out_df,
+          here("output", "predictive_modeling", "bg_rscu_mcf7six1_promoted_hyp_vs_nor.csv"))
+cat("Saved to output/predictive_modeling/bg_rscu_mcf7six1_promoted_hyp_vs_nor.csv\n")
+cat("Rows:", nrow(out_df), "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
