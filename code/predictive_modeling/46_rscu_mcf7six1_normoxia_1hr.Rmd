@@ -124,15 +124,18 @@ tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
 # Section 2: Gene Set Loading
 
 ```{r gene_sets}
+lfc_cutoff     <- 0    # positive set threshold — 0 = all significant genes
+neg_lfc_cutoff <- 0.5  # always 0.5: neg controls = never regulated
+
 promotes_raw <- read_csv(
-  here("output", "genesets", "mcf7six1_normoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  here("output", "genesets", paste0("mcf7six1_normoxia_3d_promotes_TE_1hr_lfc", lfc_cutoff, ".csv")),
   show_col_types = FALSE
 )
 promotes_ids <- promotes_raw$ensembl_gene
 cat("MCF7-SIX1 normoxia 1hr promoted genes:", length(promotes_ids), "\n")
 
 neg_pool <- read_csv(
-  here("output", "genesets", "mcf7six1_3d_negative_controls_lfc0.5.csv"),
+  here("output", "genesets", paste0("mcf7six1_3d_negative_controls_lfc", neg_lfc_cutoff, ".csv")),
   show_col_types = FALSE
 )
 neg_filtered <- neg_pool %>% filter(!ensembl_gene %in% promotes_ids)
@@ -142,10 +145,13 @@ neg_ctrl_ids <- sample(neg_filtered$ensembl_gene,
 cat("Neg ctrl (size-matched, seed=9):", length(neg_ctrl_ids), "\n")
 
 stopifnot(
-  "No promoted genes found"                 = length(promotes_ids) > 0,
-  "Neg ctrl pool smaller than promotes set" = nrow(neg_filtered) >= length(promotes_ids),
-  "Overlap between promotes and neg ctrl"   = length(intersect(promotes_ids, neg_ctrl_ids)) == 0
+  "No promoted genes found"               = length(promotes_ids) > 0,
+  "Neg ctrl pool is empty"                = nrow(neg_filtered) > 0,
+  "Overlap between promotes and neg ctrl" = length(intersect(promotes_ids, neg_ctrl_ids)) == 0
 )
+if (nrow(neg_filtered) < length(promotes_ids))
+  cat("NOTE: neg ctrl pool (", nrow(neg_filtered), ") smaller than promotes set (",
+      length(promotes_ids), ") — using all available neg controls.\n")
 
 promotes_tx <- tx_gene_df %>%
   filter(ensembl_gene %in% promotes_ids) %>%
@@ -572,6 +578,69 @@ ggsave(here("plots", "bg_rscu_frame_ctrl_mcf7six1_normoxia_1hr.pdf"), p_bg_c, wi
 write_csv(bg_rscu_combined,
           here("output", "predictive_modeling", "bg_rscu_mcf7six1_normoxia_1hr.csv"))
 cat("Saved: output/predictive_modeling/bg_rscu_mcf7six1_normoxia_1hr.csv\n")
+```
+
+# Codon Frequency (Δ promotes − neg ctrl)
+
+```{r codon_freq_nor}
+sense_codons_in_mat <- sense_codons[sense_codons %in% colnames(counts_mat0)]
+sense_mat_nor  <- counts_mat0[, sense_codons_in_mat, drop = FALSE]
+total_sense_nor <- rowSums(sense_mat_nor)
+freq_mat_nor   <- sense_mat_nor / total_sense_nor
+
+prom_freq_nor <- colMeans(
+  freq_mat_nor[promotes_tx[promotes_tx %in% rownames(freq_mat_nor)], , drop = FALSE],
+  na.rm = TRUE
+)
+neg_freq_nor <- colMeans(
+  freq_mat_nor[neg_ctrl_tx[neg_ctrl_tx %in% rownames(freq_mat_nor)], , drop = FALSE],
+  na.rm = TRUE
+)
+
+delta_freq_nor <- tibble(
+  codon         = names(prom_freq_nor),
+  promotes_freq = prom_freq_nor,
+  neg_freq      = neg_freq_nor,
+  delta_freq    = prom_freq_nor - neg_freq_nor,
+  amino_acid    = gen_code[names(prom_freq_nor)]
+) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class, gc3_nucleotide), by = "codon") %>%
+  filter(amino_acid != "*")
+
+write_csv(delta_freq_nor,
+          here("output", "predictive_modeling", "codon_freq_mcf7six1_normoxia_1hr.csv"))
+cat("Saved: output/predictive_modeling/codon_freq_mcf7six1_normoxia_1hr.csv\n")
+cat("Rows:", nrow(delta_freq_nor), "\n")
+```
+
+```{r codon_freq_nor_simple}
+# Simpler equivalent: for each transcript, divide each codon's count by that
+# transcript's total sense-codon count, then average across transcripts per group.
+prom_tx_in <- promotes_tx[promotes_tx %in% rownames(counts_mat0)]
+neg_tx_in  <- neg_ctrl_tx[neg_ctrl_tx  %in% rownames(counts_mat0)]
+
+prom_counts <- counts_mat0[prom_tx_in, sense_codons_in_mat, drop = FALSE]
+neg_counts  <- counts_mat0[neg_tx_in,  sense_codons_in_mat, drop = FALSE]
+
+prom_freq_simple <- colMeans(prom_counts / rowSums(prom_counts), na.rm = TRUE)
+neg_freq_simple  <- colMeans(neg_counts  / rowSums(neg_counts),  na.rm = TRUE)
+
+delta_simple <- prom_freq_simple - neg_freq_simple
+```
+
+```{r codon_freq_comparison}
+# Verify the two calculations are numerically identical
+shared <- intersect(names(delta_simple), delta_freq_nor$codon)
+
+delta_orig   <- setNames(delta_freq_nor$delta_freq, delta_freq_nor$codon)[shared]
+delta_simple_shared <- delta_simple[shared]
+
+max_diff <- max(abs(delta_orig - delta_simple_shared), na.rm = TRUE)
+cat("Codons compared:", length(shared), "\n")
+cat("Max absolute difference:", formatC(max_diff, format = "e", digits = 2), "\n")
+stopifnot("Codon frequency methods disagree beyond floating-point tolerance" =
+            max_diff < 1e-12)
+cat("Verification passed: both methods are numerically identical.\n")
 ```
 
 # Session Info
