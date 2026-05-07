@@ -149,6 +149,8 @@ Both check types must be present. `cat()` summaries are informative but are not 
 
 **Translation efficiency (TE)** = log2(ribosome footprint / RNA) computed under si3d vs sictrl knockdown. Positive TE LFC = eIF3d promotes translation; negative = inhibits.
 
+**MDA-MB-231 DESeq2 contrast direction** — despite files being named `translation_categories_si3d_vs_sictrl_*.csv`, the DESeq2 call inside `eif3e_eif3d_normoxia_and_hypoxia.Rmd` runs **sictrl as `test_condition` and si3d as `control_condition` (reference)**. The extracted coefficient is therefore log2(sictrl / si3d). Positive te_lfc = sictrl TE > si3d TE = knockdown reduces TE = eIF3d promotes. The file naming describes the experiment ("si3d knockdown study vs sictrl"), not the DESeq2 numerator/denominator. Do not confuse with MCF7-SIX1 (below).
+
 **MCF7-SIX1 directionality differs:** DESeq2 contrast is log2(si3d / sictrl), so positive LFC = eIF3d **inhibits**. Always negate: `te_lfc = -log2FoldChange` so positive = promotes (matching MDA-MB-231 convention). MCF7-SIX1 TE data lives in a separate repo: `/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia/`. Salmon RNA-seq samples for transcript selection: `NM2023_0104`, `NM2023_0114`, `NM2023_0124` (sictrl normoxia, KAPA_RNAHyper). Matches MDA-MB-231 convention. Ribosome profiling samples are `NM2023_0037–0066` — do not use for transcript selection.
 
 **Gene group conventions** (used across all visualization notebooks):

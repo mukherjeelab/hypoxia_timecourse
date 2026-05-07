@@ -1,0 +1,242 @@
+---
+title: "56 — Candidate mRNA Selection and GC3 Content (MDA-MB-231)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Motivation: nb54 found that pooled RSCU in hypoxia-specific eIF3d targets
+is enriched for AT-ending (low-GC3) codons. This notebook asks whether that
+effect is visible at the level of individual mRNAs. We pick the top
+`r params$n_candidates` mRNAs most strongly and specifically promoted by
+eIF3d in hypoxia (not promoted in normoxia) in MDA-MB-231 cells, then compare
+their per-gene GC3% to background expressed genes and negative controls.
+
+All data: MDA-MB-231.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r params}
+n_candidates <- 30
+lfc_cutoff   <- 0.5
+padj_cutoff  <- 0.05
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(knitr)
+```
+
+---
+
+# Section 1: Load Data
+
+```{r load_feature_matrix}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_te_lfc.rds"))
+cat("Feature matrix:", nrow(fm), "transcripts x", ncol(fm), "columns\n")
+
+# Dedup to one transcript per gene (take first, as in other notebooks)
+fm_gene <- fm |>
+  distinct(gene_id_clean, .keep_all = TRUE)
+cat("After dedup:", nrow(fm_gene), "genes\n")
+
+# Sanity check: gc3 range
+stopifnot("gc3 out of range" = all(fm_gene$gc3 >= 0 & fm_gene$gc3 <= 100, na.rm = TRUE))
+cat("GC3 range:", round(range(fm_gene$gc3, na.rm = TRUE), 1), "\n")
+```
+
+```{r load_gene_sets}
+hyp_specific <- read_csv(
+  here("output", "genesets",
+       "hypoxia_3d_promotes_TE_hypoxia_specific_lfc0.5.csv"),
+  show_col_types = FALSE
+)
+cat("Hypoxia-specific gene set:", nrow(hyp_specific), "genes\n")
+# Strip version from ensembl ID for joining
+hyp_specific <- hyp_specific |>
+  mutate(gene_id_clean = sub("\\..*", "", ensembl_gene))
+```
+
+```{r load_te_direct}
+# DESeq2 TE results for si3d knockdown in hypoxia 1hr.
+# Sign convention (MDA-MB-231): positive te_lfc = eIF3d promotes translation
+# (sictrl TE > si3d TE, i.e. knockdown reduces TE).
+hyp_te <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  dplyr::select(gene_id_clean, hyp_te_lfc = te_lfc, hyp_te_padj = te_padj)
+cat("Hypoxia si3d TE genes:", nrow(hyp_te), "\n")
+cat("  promoted (LFC >", params$lfc_cutoff, ", padj <", params$padj_cutoff, "):",
+    sum(hyp_te$hyp_te_lfc > params$lfc_cutoff & hyp_te$hyp_te_padj < params$padj_cutoff, na.rm = TRUE), "\n")
+
+# Normoxia 1hr equivalent (same sign convention).
+nor_te <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  dplyr::select(gene_id_clean, nor_te_lfc = te_lfc, nor_te_padj = te_padj)
+cat("Normoxia si3d TE genes:", nrow(nor_te), "\n")
+cat("  promoted (LFC >", params$lfc_cutoff, ", padj <", params$padj_cutoff, "):",
+    sum(nor_te$nor_te_lfc > params$lfc_cutoff & nor_te$nor_te_padj < params$padj_cutoff, na.rm = TRUE), "\n")
+```
+
+```{r load_neg_controls}
+neg_ctrl <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+cat("Negative control genes:", nrow(neg_ctrl), "\n")
+```
+
+---
+
+# Section 2: Identify Top Candidates
+
+Rank all hypoxia-specific eIF3d targets by 1hr hypoxia TE LFC descending,
+take top `r params$n_candidates`.
+
+```{r build_candidates}
+# Inner join with feature matrix: requires protein-coding gene with GC3 data
+# (excludes fusion genes, lncRNAs, and other non-CDS entries)
+candidates <- hyp_specific |>
+  inner_join(hyp_te, by = "gene_id_clean") |>
+  left_join(nor_te,  by = "gene_id_clean") |>
+  inner_join(fm_gene |> dplyr::select(gene_id_clean, gc3),
+             by = "gene_id_clean") |>
+  filter(!is.na(gc3)) |>
+  arrange(desc(hyp_te_lfc)) |>
+  slice_head(n = params$n_candidates)
+
+stopifnot("Wrong number of candidates" = nrow(candidates) == params$n_candidates)
+cat("Top", params$n_candidates, "hypoxia-specific eIF3d targets (protein-coding, with GC3) selected.\n")
+```
+
+```{r candidate_table}
+candidates |>
+  dplyr::select(
+    Symbol              = db_gene_symbol,
+    `Hyp TE LFC (1hr)` = hyp_te_lfc,
+    `Hyp TE padj`       = hyp_te_padj,
+    `Nor TE LFC (1hr)` = nor_te_lfc,
+    `Nor TE padj`       = nor_te_padj,
+    `GC3 (%)`           = gc3
+  ) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  kable(caption = paste0(
+    "Top ", params$n_candidates,
+    " mRNAs most strongly promoted by eIF3d in hypoxia (231s, 1hr, si3d vs sictrl), ",
+    "not promoted in normoxia. Ranked by hypoxia TE LFC."
+  ))
+```
+
+---
+
+# Section 3: Build Comparison Groups
+
+```{r build_groups}
+background_gc3 <- fm_gene |>
+  dplyr::select(gene_id_clean, gc3)
+
+neg_gc3 <- fm_gene |>
+  filter(gene_id_clean %in% neg_ctrl$gene_id_clean) |>
+  dplyr::select(gene_id_clean, gc3)
+
+cat("Background genes:", nrow(background_gc3), "\n")
+cat("Negative control genes with GC3:", nrow(neg_gc3), "\n")
+
+# Wilcoxon: candidates vs background
+wt <- wilcox.test(candidates$gc3, background_gc3$gc3, exact = FALSE)
+cat("Wilcoxon candidates vs background: W =", wt$statistic,
+    ", p =", signif(wt$p.value, 3), "\n")
+```
+
+---
+
+# Section 4: Plot — Per-gene GC3 for Candidates
+
+```{r plot_pergene, fig.width=13, fig.height=4}
+bg_median  <- median(background_gc3$gc3, na.rm = TRUE)
+bg_q25     <- quantile(background_gc3$gc3, 0.25, na.rm = TRUE)
+bg_q75     <- quantile(background_gc3$gc3, 0.75, na.rm = TRUE)
+neg_median <- median(neg_gc3$gc3, na.rm = TRUE)
+
+cat("Background median GC3:", round(bg_median, 1), "%\n")
+cat("Negative control median GC3:", round(neg_median, 1), "%\n")
+
+cand_plot <- candidates |>
+  dplyr::select(symbol = db_gene_symbol, gc3, hyp_te_lfc) |>
+  filter(!is.na(gc3)) |>
+  mutate(symbol = fct_reorder(symbol, gc3))
+
+p_pergene <- ggplot(cand_plot, aes(x = symbol, y = gc3)) +
+  geom_hline(yintercept = bg_median, colour = "grey50",
+             linetype = "dashed", linewidth = 0.7) +
+  geom_point(colour = "#E69F00", size = 3) +
+  # geom_text(aes(label = round(gc3, 1)), vjust = -0.8, size = 3.0) +
+  labs(
+    x        = NULL,
+    y        = "GC3 (%)",
+    title    = "GC3% for top 10 hypoxia-specific eIF3d targets",
+    subtitle = paste0("Grey dashed = background median (", round(bg_median, 1), "%)")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+print(p_pergene)
+```
+
+---
+
+# Section 5: Save Plots
+
+```{r save_plots}
+pdf(here("plots", "56_candidate_gc3_comparison.pdf"), width = 13, height = 4.5)
+print(p_pergene)
+dev.off()
+cat("Plots saved to plots/56_candidate_gc3_comparison.pdf\n")
+```
+
+---
+
+# Section 6: Summary Table
+
+```{r summary_table}
+summary_df <- candidates |>
+  dplyr::select(
+    Symbol        = db_gene_symbol,
+    `Hyp TE LFC` = hyp_te_lfc,
+    `Nor TE LFC` = nor_te_lfc,
+    `GC3 (%)`    = gc3
+  ) |>
+  mutate(
+    `GC3 deviation` = round(gc3 - bg_median, 1),
+    `GC3 (%)`    = round(gc3, 1),
+    `Hyp TE LFC` = round(`Hyp TE LFC`, 2),
+    `Nor TE LFC` = round(`Nor TE LFC`, 2)
+  )
+
+kable(summary_df,
+  caption = paste0(
+    "Top ", params$n_candidates, " candidates. ",
+    "GC3 deviation = candidate GC3 minus background median (",
+    round(bg_median, 1), "%). Negative = AT-enriched relative to background."
+  )
+)
+```
