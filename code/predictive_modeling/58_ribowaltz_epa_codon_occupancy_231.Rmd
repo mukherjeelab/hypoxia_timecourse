@@ -10,180 +10,89 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 
 ## Overview
 
-This notebook uses riboWaltz to compute per-codon occupancy at the E, P, and A ribosomal
-sites for MDA-MB-231 siCTRL and si3d knockdown samples at 1 hour, in both normoxia and
-hypoxia. Enrichment is expressed as log2(siCTRL / si3d): positive = codon more occupied
-when eIF3d is present; negative = codon less occupied when eIF3d is present.
+This notebook analyses preferential codon occupancy at the E (exit), P (peptidyl), and
+A (aminoacyl) ribosomal sites for MDA-MB-231 samples at 1 hour, using pre-computed
+riboWaltz output. Three questions:
+
+1. Are E and P site profiles "as expected" (tracking codon usage) while the A site shows
+   differential occupancy reflecting decoding pausing?
+2. What is the impact of eIF3d KD (si3d vs siCTRL) on site occupancy?
+3. What is the impact of hypoxia on site occupancy?
 
 Inputs:
-- `ribowaltz_output/timecourse_231/reads_psite_list_timecourse.rds`
-- `ribowaltz_output/timecourse_231/annot_object.rds`
+- `ribowaltz_output/timecourse_231/epa_codon_occupancy_1hr.csv`
 - `accessories/metadata_231_timecourse.csv`
 
 ```{r load_libraries}
-library(riboWaltz)
 library(tidyverse)
 library(here)
+library(ggrepel)
 library(pheatmap)
 ```
 
 ---
 
-## Section 1: Load data and map samples to conditions
+## Section 1: Load data and join metadata
 
 ```{r load_data}
-annot <- readRDS(here("ribowaltz_output", "timecourse_231", "annot_object.rds"))
-reads_psite_list <- readRDS(here("ribowaltz_output", "timecourse_231",
-                                  "reads_psite_list_timecourse.rds"))
+epa_raw <- read_csv(here("ribowaltz_output", "timecourse_231", "epa_codon_occupancy_1hr.csv"),
+                    show_col_types = FALSE)
 
-cat("Sample names in reads_psite_list:\n")
-print(names(reads_psite_list))
-cat("\nAnnotation object dimensions:", nrow(annot), "transcripts\n")
-```
-
-```{r filter_samples}
 meta <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
-                 show_col_types = FALSE)
+                 show_col_types = FALSE) %>%
+  dplyr::filter(type == "RiboSeq", hours == 1)
 
-meta_1hr <- meta %>%
-  dplyr::filter(type == "RiboSeq", hours == 1,
-                treatment %in% c("siCTRL", "si3d"))
-
-cat("1hr RiboSeq siCTRL + si3d samples:\n")
-print(meta_1hr %>% dplyr::select(id, rep, treatment, condition))
-
-# Match sample names: riboWaltz names may include suffixes after the NM ID
-# Strip everything after the first underscore-free NM ID match
-psite_names <- names(reads_psite_list)
-sample_map <- meta_1hr %>%
-  rowwise() %>%
-  mutate(psite_name = {
-    hit <- psite_names[str_detect(psite_names, fixed(id))]
-    if (length(hit) == 1) hit else NA_character_
-  }) %>%
-  ungroup() %>%
-  dplyr::filter(!is.na(psite_name))
-
-cat("\nMatched", nrow(sample_map), "samples to psite list\n")
-stopifnot("Expected 12 matched samples (3 reps × 2 treatments × 2 conditions)" =
-  nrow(sample_map) == 12)
-
-reads_filtered <- reads_psite_list[sample_map$psite_name]
+cat("EPA CSV dimensions:", nrow(epa_raw), "×", ncol(epa_raw), "\n")
+cat("Unique samples in CSV:", n_distinct(epa_raw$sample), "\n")
+cat("1hr RiboSeq samples in metadata:", nrow(meta), "\n")
 ```
 
----
-
-## Section 2: Compute codon coverage at E, P, A sites
-
-```{r codon_coverage}
-epa_coverage <- codon_coverage(reads_psite_list = reads_filtered,
-                                annotation = annot,
-                                psite = TRUE,
-                                asite = TRUE,
-                                esite = TRUE)
-
-cat("codon_coverage output class:", class(epa_coverage), "\n")
-cat("Dimensions:", nrow(epa_coverage), "×", ncol(epa_coverage), "\n")
-cat("Column names:\n")
-print(names(epa_coverage))
-```
-
----
-
-## Section 3: Aggregate and normalize
-
-```{r aggregate}
-# Identify site columns: expect pattern <sample>_psite, <sample>_asite, <sample>_esite
-psite_cols <- grep("_psite$", names(epa_coverage), value = TRUE)
-asite_cols <- grep("_asite$", names(epa_coverage), value = TRUE)
-esite_cols <- grep("_esite$", names(epa_coverage), value = TRUE)
-
-stopifnot("P-site columns present" = length(psite_cols) == 12)
-stopifnot("A-site columns present" = length(asite_cols) == 12)
-stopifnot("E-site columns present" = length(esite_cols) == 12)
-
-# Sum per codon across all transcript positions
-codon_counts <- epa_coverage %>%
-  group_by(codon) %>%
-  summarise(across(all_of(c(psite_cols, asite_cols, esite_cols)), sum),
-            .groups = "drop") %>%
-  dplyr::filter(!str_detect(codon, "N|X"))   # drop ambiguous codons
-
-# Pivot to long format
-codon_long <- codon_counts %>%
-  pivot_longer(-codon, names_to = "sample_site", values_to = "count") %>%
+```{r join_metadata}
+epa_df <- epa_raw %>%
   mutate(
-    psite_name = str_remove(sample_site, "_(p|a|e)site$"),
-    site       = str_extract(sample_site, "(p|a|e)site$")
+    id    = str_remove(sample, "Aligned\\.toTranscriptome\\.out.*"),
+    codon = str_replace_all(codon, "U", "T")   # RNA → DNA notation
   ) %>%
-  dplyr::select(-sample_site)
+  left_join(meta, by = "id")
 
-# Join with condition metadata
-codon_long <- codon_long %>%
-  left_join(dplyr::select(sample_map, psite_name, rep, treatment, condition),
-            by = "psite_name")
+stopifnot("All rows have treatment metadata" = !any(is.na(epa_df$treatment)))
+stopifnot("18 samples present" = n_distinct(epa_df$id) == 18)
 
-stopifnot("All rows have condition metadata" = !any(is.na(codon_long$condition)))
+cat("\nSamples per treatment × condition:\n")
+epa_df %>%
+  distinct(id, treatment, condition) %>%
+  count(treatment, condition) %>%
+  print()
 ```
+
+---
+
+## Section 2: Normalize to relative frequencies
 
 ```{r normalize}
-# Relative frequency within each (sample, site)
-codon_freq <- codon_long %>%
-  group_by(psite_name, site) %>%
+codon_freq <- epa_df %>%
+  group_by(id, site) %>%
   mutate(freq = count / sum(count)) %>%
   ungroup()
 
-stopifnot("Frequencies in [0,1]" = all(codon_freq$freq >= 0 & codon_freq$freq <= 1,
-                                        na.rm = TRUE))
+stopifnot("Frequencies in [0,1]" =
+  all(codon_freq$freq >= 0 & codon_freq$freq <= 1, na.rm = TRUE))
 
-# Average across replicates
 codon_means <- codon_freq %>%
   group_by(codon, site, condition, treatment) %>%
-  summarise(mean_freq = mean(freq, na.rm = TRUE), .groups = "drop")
-```
+  summarise(mean_freq = mean(freq, na.rm = TRUE),
+            sd_freq   = sd(freq, na.rm = TRUE),
+            .groups = "drop")
 
-```{r enrichment}
-# log2(siCTRL / si3d): positive = codon more occupied when eIF3d is present
-enrichment_df <- codon_means %>%
-  pivot_wider(names_from = treatment, values_from = mean_freq) %>%
-  mutate(log2_enrich = log2(siCTRL / si3d)) %>%
-  dplyr::filter(is.finite(log2_enrich))
-
-# Order codons by P-site siCTRL frequency for consistent axis ordering
-psite_order <- codon_means %>%
-  dplyr::filter(site == "psite", treatment == "siCTRL", condition == "normoxia") %>%
-  arrange(desc(mean_freq)) %>%
-  pull(codon)
-
-enrichment_df <- enrichment_df %>%
-  mutate(codon = factor(codon, levels = psite_order))
+cat("Codons per site:\n")
+codon_means %>% distinct(codon, site) %>% count(site) %>% print()
 ```
 
 ---
 
-## Section 4: Validation checks
+## Section 3: Validation
 
 ```{r validation}
-# ATG (Met / start codons) should rank in top P-site codons in siCTRL
-atg_rank <- which(psite_order == "ATG")
-cat("ATG P-site rank (normoxia siCTRL):", atg_rank, "of", length(psite_order), "\n")
-stopifnot("ATG in top 20 P-site codons" = atg_rank <= 20)
-
-# Stop codons should have low P-site frequency
-stop_codons <- c("TAA", "TAG", "TGA")
-stop_pfreq <- codon_means %>%
-  dplyr::filter(codon %in% stop_codons, site == "psite", treatment == "siCTRL",
-                condition == "normoxia") %>%
-  pull(mean_freq)
-cat("Stop codon P-site frequencies:", round(stop_pfreq, 5), "\n")
-stopifnot("Stop codons rare at P-site (< 0.01)" = all(stop_pfreq < 0.01, na.rm = TRUE))
-```
-
----
-
-## Section 5: Genetic code — codon to amino acid mapping
-
-```{r codon_aa}
 genetic_code <- c(
   TTT="Phe", TTC="Phe", TTA="Leu", TTG="Leu",
   CTT="Leu", CTC="Leu", CTA="Leu", CTG="Leu",
@@ -203,85 +112,334 @@ genetic_code <- c(
   GGT="Gly", GGC="Gly", GGA="Gly", GGG="Gly"
 )
 
-enrichment_df <- enrichment_df %>%
-  mutate(aa = genetic_code[as.character(codon)])
-
 codon_means <- codon_means %>%
-  mutate(aa = genetic_code[as.character(codon)])
+  mutate(aa = genetic_code[codon])
+
+# ATG should rank in top 20 P-site codons in siCTRL normoxia
+psite_order <- codon_means %>%
+  dplyr::filter(site == "psite", treatment == "siCTRL", condition == "normoxia") %>%
+  arrange(desc(mean_freq)) %>%
+  pull(codon)
+
+atg_rank <- which(psite_order == "ATG")
+cat("ATG P-site rank (siCTRL normoxia):", atg_rank, "of", length(psite_order), "\n")
+stopifnot("ATG in top 20 P-site codons" = atg_rank <= 20)
+
+# Stop codons should be rare at P-site
+stop_pfreq <- codon_means %>%
+  dplyr::filter(codon %in% c("TAA", "TAG", "TGA"),
+                site == "psite", treatment == "siCTRL", condition == "normoxia") %>%
+  pull(mean_freq)
+cat("Stop codon P-site frequencies:", round(stop_pfreq, 5), "\n")
+stopifnot("Stop codons rare at P-site (< 0.01)" = all(stop_pfreq < 0.01, na.rm = TRUE))
 ```
 
 ---
 
-## Section 6: Visualizations
+## Section 4: Helper objects
 
-### Plot A: Dot plots of log2(siCTRL/si3d) enrichment, per condition
+```{r helpers}
+# Codon order (by P-site siCTRL normoxia frequency, most frequent first)
+# Used for consistent x-axis ordering across dot plots
+codon_order_pfreq <- psite_order
 
-```{r plot_dot_normoxia, fig.width=14, fig.height=5}
 site_labels <- c(esite = "E site", psite = "P site", asite = "A site")
 
-plot_dot <- function(cond) {
-  enrichment_df %>%
-    dplyr::filter(condition == cond, !aa %in% c("Stop", NA)) %>%
-    mutate(site = factor(site, levels = c("esite", "psite", "asite"),
-                         labels = site_labels)) %>%
-    ggplot(aes(x = codon, y = log2_enrich, color = aa)) +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
-    geom_point(size = 1.8, alpha = 0.8) +
-    facet_wrap(~site, ncol = 3) +
-    theme_classic(base_size = 12) +
-    theme(
-      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5),
-      legend.position = "right",
-      legend.title = element_text(size = 9),
-      legend.text  = element_text(size = 8)
-    ) +
-    labs(
-      title  = paste0("Codon E/P/A site occupancy — ", cond, " (siCTRL vs si3d, 1hr)"),
-      x      = "Codon",
-      y      = "log2(siCTRL / si3d)",
-      color  = "Amino acid"
-    )
+# Wide helper: one row per codon, columns for each site's mean_freq
+wide_by_site <- function(df) {
+  df %>%
+    pivot_wider(names_from = site, values_from = mean_freq,
+                names_prefix = "freq_")
 }
-
-p_nor <- plot_dot("normoxia")
-p_hyp <- plot_dot("hypoxia")
-
-print(p_nor)
 ```
 
-```{r plot_dot_hypoxia, fig.width=14, fig.height=5}
-print(p_hyp)
+---
+
+## Plot 0: siCTRL normoxia vs hypoxia codon frequency per site
+
+Scatter of mean relative frequency in siCTRL normoxia (x) vs siCTRL hypoxia (y) for each
+codon, faceted by site. Codons with the largest residuals from the y=x line are labelled.
+
+```{r plot_0, fig.width=11, fig.height=4}
+plot_0_df <- codon_means %>%
+  dplyr::filter(treatment == "siCTRL", !aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, condition, mean_freq) %>%
+  pivot_wider(names_from = condition, values_from = mean_freq) %>%
+  mutate(
+    residual = hypoxia - normoxia,
+    label    = ifelse(abs(residual) >= quantile(abs(residual), 0.85, na.rm = TRUE),
+                      codon, NA_character_),
+    site     = factor(site, levels = c("esite", "psite", "asite"),
+                      labels = site_labels)
+  )
+
+p_0 <- ggplot(plot_0_df, aes(x = normoxia, y = hypoxia, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  facet_wrap(~site, ncol = 3, scales = "free") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title    = "Codon frequency: siCTRL normoxia vs hypoxia, 1hr",
+    subtitle = "Top 15% residuals from y=x labelled per site",
+    x        = "siCTRL normoxia — relative frequency",
+    y        = "siCTRL hypoxia — relative frequency",
+    color    = "Amino acid"
+  )
+
+print(p_0)
+ggsave(here("plots", "58_codon_freq_normoxia_vs_hypoxia_sictrl.pdf"), p_0,
+       width = 11, height = 4)
 ```
 
-```{r save_dot_plots}
-ggsave(here("plots", "58_epa_enrichment_dot_normoxia.pdf"), p_nor,
-       width = 14, height = 5)
-ggsave(here("plots", "58_epa_enrichment_dot_hypoxia.pdf"), p_hyp,
-       width = 14, height = 5)
+---
+
+## Plot 0b: siCTRL normoxia vs si3d normoxia codon frequency per site
+
+```{r plot_0b, fig.width=11, fig.height=4}
+plot_0b_df <- codon_means %>%
+  dplyr::filter(condition == "normoxia", treatment %in% c("siCTRL", "si3d"),
+                !aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, treatment, mean_freq) %>%
+  pivot_wider(names_from = treatment, values_from = mean_freq) %>%
+  mutate(
+    residual = si3d - siCTRL,
+    label    = ifelse(abs(residual) >= quantile(abs(residual), 0.85, na.rm = TRUE),
+                      codon, NA_character_),
+    site     = factor(site, levels = c("esite", "psite", "asite"),
+                      labels = site_labels)
+  )
+
+p_0b <- ggplot(plot_0b_df, aes(x = siCTRL, y = si3d, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  facet_wrap(~site, ncol = 3, scales = "free") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title    = "Codon frequency: siCTRL vs si3d normoxia, 1hr",
+    subtitle = "Top 15% residuals from y=x labelled per site",
+    x        = "siCTRL normoxia — relative frequency",
+    y        = "si3d normoxia — relative frequency",
+    color    = "Amino acid"
+  )
+
+print(p_0b)
+ggsave(here("plots", "58_codon_freq_sictrl_vs_si3d_normoxia.pdf"), p_0b,
+       width = 11, height = 4)
 ```
 
-### Plot B: Heatmap of log2(siCTRL/si3d) enrichment
+---
 
-```{r plot_heatmap, fig.width=10, fig.height=12}
-make_heatmap <- function(cond) {
-  mat <- enrichment_df %>%
-    dplyr::filter(condition == cond, !aa %in% c("Stop", NA)) %>%
+## Plot 0c: siCTRL hypoxia vs si3d hypoxia codon frequency per site
+
+```{r plot_0c, fig.width=11, fig.height=4}
+plot_0c_df <- codon_means %>%
+  dplyr::filter(condition == "hypoxia", treatment %in% c("siCTRL", "si3d"),
+                !aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, treatment, mean_freq) %>%
+  pivot_wider(names_from = treatment, values_from = mean_freq) %>%
+  mutate(
+    residual = si3d - siCTRL,
+    label    = ifelse(abs(residual) >= quantile(abs(residual), 0.85, na.rm = TRUE),
+                      codon, NA_character_),
+    site     = factor(site, levels = c("esite", "psite", "asite"),
+                      labels = site_labels)
+  )
+
+p_0c <- ggplot(plot_0c_df, aes(x = siCTRL, y = si3d, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  facet_wrap(~site, ncol = 3, scales = "free") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title    = "Codon frequency: siCTRL vs si3d hypoxia, 1hr",
+    subtitle = "Top 15% residuals from y=x labelled per site",
+    x        = "siCTRL hypoxia — relative frequency",
+    y        = "si3d hypoxia — relative frequency",
+    color    = "Amino acid"
+  )
+
+print(p_0c)
+ggsave(here("plots", "58_codon_freq_sictrl_vs_si3d_hypoxia.pdf"), p_0c,
+       width = 11, height = 4)
+```
+
+---
+
+## Plot A: P-site vs A-site scatter — is A-site different?
+
+```{r plot_a, fig.width=8, fig.height=4}
+plot_a_df <- codon_means %>%
+  dplyr::filter(treatment == "siCTRL", !aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, condition, mean_freq) %>%
+  pivot_wider(names_from = site, values_from = mean_freq) %>%
+  rename(freq_p = psite, freq_a = asite, freq_e = esite) %>%
+  mutate(ap_log2 = log2(freq_a / freq_p),
+         label   = ifelse(abs(ap_log2) > 1, codon, NA_character_))
+
+p_a <- ggplot(plot_a_df, aes(x = freq_p, y = freq_a, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 20,
+                  show.legend = FALSE) +
+  facet_wrap(~condition, ncol = 2) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 9),
+        legend.text  = element_text(size = 8)) +
+  labs(
+    title  = "A-site vs P-site codon occupancy — siCTRL 1hr",
+    subtitle = "Diagonal = identical distribution; labelled codons deviate by |log2(A/P)| > 1",
+    x      = "P-site relative frequency",
+    y      = "A-site relative frequency",
+    color  = "Amino acid"
+  )
+
+print(p_a)
+ggsave(here("plots", "58a_psite_vs_asite_scatter.pdf"), p_a, width = 8, height = 4)
+```
+
+---
+
+## Plot B: A/P pausing index — top paused and fastest codons
+
+```{r plot_b, fig.width=8, fig.height=6}
+ap_index <- codon_means %>%
+  dplyr::filter(treatment == "siCTRL", !aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, condition, mean_freq) %>%
+  pivot_wider(names_from = site, values_from = mean_freq) %>%
+  mutate(ap_ratio = log2(asite / psite)) %>%
+  dplyr::filter(is.finite(ap_ratio))
+
+# Top 10 most paused + 10 fastest per condition
+top_codons <- ap_index %>%
+  group_by(condition) %>%
+  slice_max(ap_ratio, n = 10) %>%
+  bind_rows(
+    ap_index %>%
+      group_by(condition) %>%
+      slice_min(ap_ratio, n = 10)
+  ) %>%
+  ungroup() %>%
+  distinct(codon)
+
+plot_b_df <- ap_index %>%
+  dplyr::filter(codon %in% top_codons$codon) %>%
+  mutate(codon = reorder(codon, ap_ratio))
+
+p_b <- ggplot(plot_b_df, aes(x = ap_ratio, y = codon, color = aa)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_segment(aes(x = 0, xend = ap_ratio, y = codon, yend = codon),
+               color = "grey70", linewidth = 0.5) +
+  geom_point(size = 2.2, alpha = 0.9) +
+  facet_wrap(~condition, ncol = 2) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 9),
+        legend.text  = element_text(size = 8),
+        axis.text.y  = element_text(size = 8)) +
+  labs(
+    title    = "A/P pausing index — siCTRL 1hr (top 10 paused & fastest codons)",
+    subtitle = "log2(A-site freq / P-site freq): positive = enriched at A-site (slower decoding)",
+    x        = "log2(A-site / P-site)",
+    y        = "Codon",
+    color    = "Amino acid"
+  )
+
+print(p_b)
+ggsave(here("plots", "58b_ap_pausing_index.pdf"), p_b, width = 8, height = 6)
+```
+
+---
+
+## Plot C: Impact of eIF3d KD on site occupancy
+
+```{r enrich_kd}
+enrich_kd <- codon_means %>%
+  dplyr::filter(treatment %in% c("siCTRL", "si3d"), !aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, condition, treatment, mean_freq) %>%
+  pivot_wider(names_from = treatment, values_from = mean_freq) %>%
+  mutate(log2_enrich = log2(siCTRL / si3d)) %>%
+  dplyr::filter(is.finite(log2_enrich)) %>%
+  mutate(codon = factor(codon, levels = codon_order_pfreq),
+         site  = factor(site, levels = c("esite", "psite", "asite"),
+                        labels = site_labels))
+```
+
+```{r plot_c_dot, fig.width=14, fig.height=6}
+p_c_dot <- ggplot(enrich_kd, aes(x = codon, y = log2_enrich, color = aa)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  facet_grid(condition ~ site) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 4.5),
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title  = "eIF3d KD effect on codon occupancy — log2(siCTRL / si3d), 1hr",
+    x      = "Codon (ordered by P-site siCTRL normoxia frequency)",
+    y      = "log2(siCTRL / si3d)",
+    color  = "Amino acid"
+  )
+
+print(p_c_dot)
+ggsave(here("plots", "58c_eif3d_kd_enrichment_dotplot.pdf"), p_c_dot,
+       width = 14, height = 6)
+```
+
+```{r plot_c_heatmap, fig.width=10, fig.height=12}
+make_kd_heatmap <- function(cond) {
+  mat <- enrich_kd %>%
+    dplyr::filter(condition == cond) %>%
     dplyr::select(codon, site, log2_enrich) %>%
     pivot_wider(names_from = site, values_from = log2_enrich) %>%
     tibble::column_to_rownames("codon") %>%
     as.matrix()
 
-  # Order rows by amino acid, then codon
-  row_order <- enrichment_df %>%
-    dplyr::filter(condition == cond, !aa %in% c("Stop", NA)) %>%
+  row_order <- enrich_kd %>%
+    dplyr::filter(condition == cond) %>%
     distinct(codon, aa) %>%
     arrange(aa, codon) %>%
     pull(codon)
   mat <- mat[row_order[row_order %in% rownames(mat)], , drop = FALSE]
 
-  # Annotation for amino acid grouping
-  aa_annot <- enrichment_df %>%
-    dplyr::filter(condition == cond, !aa %in% c("Stop", NA)) %>%
+  aa_annot <- enrich_kd %>%
+    dplyr::filter(condition == cond) %>%
     distinct(codon, aa) %>%
     tibble::column_to_rownames("codon")
 
@@ -300,43 +458,151 @@ make_heatmap <- function(cond) {
   )
 }
 
-make_heatmap("normoxia")
+make_kd_heatmap("normoxia")
 ```
 
-```{r heatmap_hypoxia}
-make_heatmap("hypoxia")
+```{r plot_c_heatmap_hyp}
+make_kd_heatmap("hypoxia")
 ```
 
-```{r save_heatmap}
-pdf(here("plots", "58_epa_enrichment_heatmap.pdf"), width = 10, height = 12)
-make_heatmap("normoxia")
-make_heatmap("hypoxia")
+```{r save_c_heatmap}
+pdf(here("plots", "58c_eif3d_kd_enrichment_heatmap.pdf"), width = 10, height = 12)
+make_kd_heatmap("normoxia")
+make_kd_heatmap("hypoxia")
 dev.off()
 ```
 
-### Plot C: Global P-site codon composition in siCTRL (normoxia vs hypoxia)
+---
 
-```{r plot_psite_composition, fig.width=14, fig.height=5}
-p_comp <- codon_means %>%
-  dplyr::filter(site == "psite", treatment == "siCTRL", !aa %in% c("Stop", NA)) %>%
-  mutate(codon = factor(codon, levels = psite_order)) %>%
-  ggplot(aes(x = codon, y = mean_freq, fill = condition)) +
-  geom_col(position = "dodge", width = 0.7, alpha = 0.85) +
-  scale_fill_manual(values = c(normoxia = "#56B4E9", hypoxia = "#E69F00")) +
+## Plot D: Impact of hypoxia on site occupancy
+
+```{r enrich_hyp}
+enrich_hyp <- codon_means %>%
+  dplyr::filter(!aa %in% c("Stop", NA)) %>%
+  dplyr::select(codon, aa, site, condition, treatment, mean_freq) %>%
+  pivot_wider(names_from = condition, values_from = mean_freq) %>%
+  mutate(log2_enrich = log2(hypoxia / normoxia)) %>%
+  dplyr::filter(is.finite(log2_enrich)) %>%
+  mutate(codon = factor(codon, levels = codon_order_pfreq),
+         site  = factor(site, levels = c("esite", "psite", "asite"),
+                        labels = site_labels))
+```
+
+```{r plot_d_dot, fig.width=14, fig.height=6}
+p_d_dot <- enrich_hyp %>%
+  dplyr::filter(treatment %in% c("siCTRL", "si3d")) %>%
+  ggplot(aes(x = codon, y = log2_enrich, color = aa)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  facet_grid(treatment ~ site) +
   theme_classic(base_size = 12) +
   theme(
-    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5)
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 4.5),
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
   ) +
   labs(
-    title = "P-site codon composition — siCTRL, normoxia vs hypoxia (1hr)",
-    x     = "Codon (ordered by normoxia frequency)",
-    y     = "Mean relative frequency",
-    fill  = "Condition"
+    title  = "Hypoxia effect on codon occupancy — log2(hypoxia / normoxia), 1hr",
+    x      = "Codon (ordered by P-site siCTRL normoxia frequency)",
+    y      = "log2(hypoxia / normoxia)",
+    color  = "Amino acid"
   )
 
-print(p_comp)
-ggsave(here("plots", "58_psite_composition_sictrl.pdf"), p_comp,
-       width = 14, height = 5)
+print(p_d_dot)
+ggsave(here("plots", "58d_hypoxia_enrichment_dotplot.pdf"), p_d_dot,
+       width = 14, height = 6)
+```
+
+```{r plot_d_heatmap, fig.width=10, fig.height=12}
+make_hyp_heatmap <- function(trt) {
+  mat <- enrich_hyp %>%
+    dplyr::filter(treatment == trt) %>%
+    dplyr::select(codon, site, log2_enrich) %>%
+    pivot_wider(names_from = site, values_from = log2_enrich) %>%
+    tibble::column_to_rownames("codon") %>%
+    as.matrix()
+
+  row_order <- enrich_hyp %>%
+    dplyr::filter(treatment == trt) %>%
+    distinct(codon, aa) %>%
+    arrange(aa, codon) %>%
+    pull(codon)
+  mat <- mat[row_order[row_order %in% rownames(mat)], , drop = FALSE]
+
+  aa_annot <- enrich_hyp %>%
+    dplyr::filter(treatment == trt) %>%
+    distinct(codon, aa) %>%
+    tibble::column_to_rownames("codon")
+
+  lim <- max(abs(mat), na.rm = TRUE)
+  pheatmap(
+    mat,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    color          = colorRampPalette(c("#2166AC", "white", "#D6604D"))(101),
+    breaks         = seq(-lim, lim, length.out = 102),
+    annotation_row = aa_annot,
+    main           = paste0("log2(hypoxia / normoxia) — ", trt, " 1hr"),
+    fontsize_row   = 6,
+    angle_col      = 45,
+    border_color   = NA
+  )
+}
+
+make_hyp_heatmap("siCTRL")
+```
+
+```{r plot_d_heatmap_si3d}
+make_hyp_heatmap("si3d")
+```
+
+```{r save_d_heatmap}
+pdf(here("plots", "58d_hypoxia_enrichment_heatmap.pdf"), width = 10, height = 12)
+make_hyp_heatmap("siCTRL")
+make_hyp_heatmap("si3d")
+dev.off()
+```
+
+---
+
+## Plot E: A-site — eIF3d KD effect vs hypoxia effect
+
+Do the same codons respond to both perturbations at the A site?
+
+```{r plot_e, fig.width=6, fig.height=6}
+asite_kd <- enrich_kd %>%
+  dplyr::filter(site == "A site", condition == "normoxia") %>%
+  dplyr::select(codon, aa, log2_kd = log2_enrich)
+
+asite_hyp <- enrich_hyp %>%
+  dplyr::filter(site == "A site", treatment == "siCTRL") %>%
+  dplyr::select(codon, aa, log2_hyp = log2_enrich)
+
+plot_e_df <- inner_join(asite_kd, asite_hyp, by = c("codon", "aa")) %>%
+  mutate(label = ifelse(abs(log2_kd) > 0.3 | abs(log2_hyp) > 0.3,
+                        codon, NA_character_))
+
+p_e <- ggplot(plot_e_df, aes(x = log2_kd, y = log2_hyp, color = aa)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 9),
+        legend.text  = element_text(size = 8)) +
+  labs(
+    title    = "A-site: eIF3d KD vs hypoxia effect (1hr normoxia siCTRL reference)",
+    subtitle = "Labelled codons: |log2| > 0.3 in either axis",
+    x        = "log2(siCTRL / si3d) A-site [normoxia]",
+    y        = "log2(hypoxia / normoxia) A-site [siCTRL]",
+    color    = "Amino acid"
+  )
+
+print(p_e)
+ggsave(here("plots", "58e_asite_kd_vs_hypoxia_scatter.pdf"), p_e, width = 6, height = 6)
 ```
 
 ---
