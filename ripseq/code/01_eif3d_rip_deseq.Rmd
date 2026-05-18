@@ -1,0 +1,263 @@
+---
+title: "RIP-seq DESeq2: FLAG-eIF3d enrichment over IgG"
+author: "Kate"
+date: "2026-05"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(ggrepel)
+library(ggvenn)
+library(ggokabeito)
+library(cowplot)
+```
+
+# Load inputs from 00
+
+```{r load_data}
+allCounts <- readRDS(here("ripseq", "output", "ripseq_allCounts_raw.rds"))
+metadata  <- read_csv(here("ripseq", "output", "ripseq_metadata_clean.csv"),
+                      show_col_types = FALSE) |>
+  mutate(
+    condition = factor(condition, levels = c("normoxia", "hypoxia")),
+    ip_type   = factor(ip_type,   levels = c("igg_mock", "flag_eif3d", "eif4e")),
+    hours     = factor(hours)
+  )
+
+cat("allCounts:", nrow(allCounts), "genes x", ncol(allCounts), "samples\n")
+cat("metadata:", nrow(metadata), "rows\n")
+cat("condition levels:", levels(metadata$condition), "\n")
+cat("ip_type levels:", levels(metadata$ip_type), "\n")
+cat("hours levels:", levels(metadata$hours), "\n")
+```
+
+```{r gene_anno}
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
+                      col_names = c("gene_id", "symbol", "biotype", "species", "version"),
+                      show_col_types = FALSE) |>
+  filter(species == "human") |>
+  dplyr::select(gene_id, symbol) |>
+  distinct(gene_id, .keep_all = TRUE) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+```
+
+# Per-timepoint DESeq2: FLAG-eIF3d vs IgG-mock
+
+```{r run_deseq}
+LFC_CUTOFF  <- 0.5
+PADJ_CUTOFF <- 0.05
+
+timepoints <- list(
+  normoxia_1hr = list(condition = "normoxia", hours = "1"),
+  hypoxia_1hr  = list(condition = "hypoxia",  hours = "1"),
+  hypoxia_4hr  = list(condition = "hypoxia",  hours = "4"),
+  hypoxia_24hr = list(condition = "hypoxia",  hours = "24")
+)
+
+deseq_results <- list()
+
+for (tp_name in names(timepoints)) {
+  tp <- timepoints[[tp_name]]
+
+  meta_sub <- metadata |>
+    filter(condition == tp$condition, hours == tp$hours,
+           ip_type %in% c("flag_eif3d", "igg_mock"))
+  meta_sub$ip_type <- relevel(droplevels(factor(meta_sub$ip_type)), ref = "igg_mock")
+
+  cat("\n---", tp_name, "---\n")
+  cat("ip_type levels (reference first):", levels(meta_sub$ip_type), "\n")
+  cat("Samples:", nrow(meta_sub), "| per group:", table(meta_sub$ip_type), "\n")
+
+  # allCounts columns are compound names (e.g. "normoxia_flag_eif3d_1_a_NM2026_0045")
+  # match each sample ID as a suffix
+  cts_sub <- allCounts[, grep(paste(meta_sub$id, collapse = "|"), colnames(allCounts))]
+
+  dds <- DESeqDataSetFromMatrix(countData = cts_sub, colData = meta_sub, design = ~ ip_type)
+  dds <- DESeq(dds)
+  cat("Coefficients:", resultsNames(dds), "\n")
+
+  coef_name  <- resultsNames(dds)[grep("flag_eif3d", resultsNames(dds))]
+  res_shrunk <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+
+  deseq_results[[tp_name]] <- as.data.frame(res_shrunk) |>
+    rownames_to_column("gene_id") |>
+    left_join(gene_anno, by = "gene_id") |>
+    mutate(timepoint = tp_name) |>
+    arrange(padj)
+}
+```
+
+```{r save_results}
+for (tp_name in names(deseq_results)) {
+  write_csv(
+    deseq_results[[tp_name]],
+    here("ripseq", "output",
+         paste0("ripseq_deseq_", tp_name, "_flag_eif3d_vs_igg.csv"))
+  )
+}
+saveRDS(deseq_results, here("ripseq", "output", "ripseq_deseq_results_list.rds"))
+cat("Saved DESeq2 results for", length(deseq_results), "timepoints\n")
+```
+
+# Enriched gene counts
+
+```{r enriched_counts}
+enriched_per_tp <- lapply(deseq_results, function(res) {
+  res |> filter(padj < PADJ_CUTOFF, log2FoldChange > LFC_CUTOFF) |> pull(gene_id)
+})
+
+cat("Enriched genes (padj <", PADJ_CUTOFF, ", log2FC >", LFC_CUTOFF, "):\n")
+for (tp in names(enriched_per_tp)) {
+  cat(" ", tp, ":", length(enriched_per_tp[[tp]]), "\n")
+}
+```
+
+# Volcano plots
+
+```{r volcano_plots, fig.width=12, fig.height=10}
+make_volcano <- function(res_df, tp_name) {
+  plot_df <- res_df |>
+    filter(!is.na(padj)) |>
+    mutate(
+      sig = case_when(
+        padj < PADJ_CUTOFF & log2FoldChange >  LFC_CUTOFF ~ "enriched",
+        padj < PADJ_CUTOFF & log2FoldChange < -LFC_CUTOFF ~ "depleted",
+        TRUE ~ "ns"
+      )
+    )
+
+  top_labels <- plot_df |>
+    filter(sig == "enriched") |>
+    slice_min(padj, n = 15)
+
+  ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    geom_text_repel(data = top_labels, aes(label = symbol),
+                    size = 2.5, max.overlaps = 20, color = "black") +
+    scale_color_manual(values = c(enriched = "#E69F00", depleted = "steelblue", ns = "grey70")) +
+    geom_vline(xintercept = c(-LFC_CUTOFF, LFC_CUTOFF), linetype = "dashed", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(PADJ_CUTOFF), linetype = "dashed", linewidth = 0.4) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+             label = paste0("enriched: ", sum(plot_df$sig == "enriched")), size = 3) +
+    labs(title = tp_name,
+         x = "log2FC (eIF3d IP / IgG)",
+         y = "-log10(padj)",
+         color = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none")
+}
+
+volcano_plots <- lapply(names(deseq_results), function(tp) {
+  make_volcano(deseq_results[[tp]], tp)
+})
+
+plot_grid(plotlist = volcano_plots, ncol = 2, labels = "AUTO")
+ggsave(here("ripseq", "plots", "ripseq_volcano_flag_eif3d.pdf"), width = 12, height = 10)
+```
+
+# Overlap with eIF3d translatome
+
+```{r load_te_genes}
+te_genes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE) |>
+  pull(ensembl_gene)
+
+cat("eIF3d promotes TE genes (hypoxia 1hr):", length(te_genes), "\n")
+```
+
+```{r venn_rip_te}
+# use version-stripped IDs for comparison
+enriched_hypoxia_1hr_clean <- sub("\\..*", "", enriched_per_tp$hypoxia_1hr)
+
+venn_list <- list(
+  "RIP enriched\n(hypoxia 1hr)"    = enriched_hypoxia_1hr_clean,
+  "eIF3d promotes TE\n(hypoxia 1hr)" = te_genes
+)
+
+overlap_ids <- intersect(enriched_hypoxia_1hr_clean, te_genes)
+
+overlap_df <- deseq_results$hypoxia_1hr |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  filter(gene_id_clean %in% overlap_ids) |>
+  dplyr::select(gene_id, symbol, log2FoldChange, padj) |>
+  arrange(symbol)
+
+cat("RIP enriched:", length(enriched_hypoxia_1hr_clean), "\n")
+cat("TE regulon:", length(te_genes), "\n")
+cat("Overlap:", nrow(overlap_df), "\n\n")
+cat("Overlap genes (alphabetical):\n")
+cat(sort(overlap_df$symbol), sep = "\n")
+
+write_csv(overlap_df, here("ripseq", "output", "ripseq_rip_te_overlap_hypoxia_1hr.csv"))
+
+p_venn <- ggvenn(venn_list,
+                 fill_color  = c("#E69F00", "grey50"),
+                 stroke_size = 0.5,
+                 text_size   = 3.5) +
+  theme_void()
+
+p_venn
+ggsave(here("ripseq", "plots", "ripseq_venn_rip_vs_te.pdf"), p_venn, width = 5, height = 5)
+```
+
+```{r fisher_test}
+all_genes <- nrow(allCounts)
+n_rip     <- length(enriched_hypoxia_1hr_clean)
+n_te      <- length(te_genes)
+n_overlap <- length(intersect(enriched_hypoxia_1hr_clean, te_genes))
+
+mat <- matrix(
+  c(n_overlap,          n_rip - n_overlap,
+    n_te - n_overlap,   all_genes - n_rip - n_te + n_overlap),
+  nrow = 2,
+  dimnames = list(c("RIP enriched", "not RIP enriched"),
+                  c("TE regulated", "not TE regulated"))
+)
+print(mat)
+fisher.test(mat, alternative = "greater")
+```
+
+# CDF: TE changes colored by RIP binding
+
+```{r cdf_te_rip}
+te_data <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+                    show_col_types = FALSE) |>
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    rip_bound     = gene_id_clean %in% enriched_hypoxia_1hr_clean
+  ) |>
+  filter(!is.na(te_lfc))
+
+cat("Total genes:", nrow(te_data), "\n")
+cat("RIP-bound:", sum(te_data$rip_bound), "\n")
+
+wt <- wilcox.test(te_lfc ~ rip_bound, data = te_data)
+wt_label <- paste0("Wilcoxon p = ", signif(wt$p.value, 2))
+
+p_cdf <- ggplot(te_data, aes(x = te_lfc, color = rip_bound, group = rip_bound)) +
+  stat_ecdf(linewidth = 0.8) +
+  scale_color_manual(
+    values = c("TRUE" = "#E69F00", "FALSE" = "grey50"),
+    labels = c("TRUE" = "RIP-bound (hypoxia 1hr)", "FALSE" = "Not bound")
+  ) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = wt_label, size = 3.5) +
+  labs(x = "TE log2FC (si3d / sictrl, hypoxia 1hr)",
+       y = "Cumulative fraction",
+       color = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.25, 0.85))+
+  xlim(-1,1)
+
+p_cdf
+ggsave(here("ripseq", "plots", "ripseq_cdf_te_rip_bound.pdf"), p_cdf, width = 6, height = 5)
+```
