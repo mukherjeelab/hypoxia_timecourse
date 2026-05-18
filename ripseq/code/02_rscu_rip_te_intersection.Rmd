@@ -1,0 +1,966 @@
+---
+title: "02 - Background-Corrected RSCU: eIF3d RIP-bound + TE-regulated intersection (Hypoxia 1hr)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Gene sets:
+
+- **Positive (intersection):** mRNAs that are both eIF3d RIP-enriched (hypoxia 1hr, log2FC > 0.5, padj < 0.05) AND eIF3d-promoted in translation efficiency (hypoxia 1hr, te_lfc > 0.5, te_padj < 0.05). From `ripseq/output/ripseq_rip_te_overlap_hypoxia_1hr.csv`.
+- **Negative controls:** size-matched from `negative_control_genes.csv` (|TE LFC| < 0.5, padj > 0.3 across all si3d conditions), with all RIP-bound genes excluded. Neither bound nor translationally regulated.
+
+Background-corrected RSCU (bg-RSCU): per-transcript codon proportion divided by the mean proportion across all expressed mRNAs (equal-weight per transcript). bg-RSCU = 1 means on-background; >1 over-used relative to background.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(iCodon)
+library(ggrepel)
+```
+
+# Section 1: CDS Sequences and Codon Counts
+
+```{r load_data}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Feature matrix:", nrow(feature_matrix), "genes\n")
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r codon_matrices}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)
+  new_len  <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+make_counts <- function(seqs) {
+  ct  <- codonTable(seqs)
+  mat <- codonCounts(ct)
+  rownames(mat) <- names(seqs)
+  mat
+}
+
+cds_frame1  <- shift_frame(cds_frame0, 1)
+cds_frame2  <- shift_frame(cds_frame0, 2)
+counts_mat1 <- make_counts(cds_frame1)
+counts_mat2 <- make_counts(cds_frame2)
+
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts x", ncol(counts_mat0), "codons\n")
+```
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+
+codon_gc3 <- tibble(
+  codon          = sense_codons,
+  gc3_nucleotide = substr(sense_codons, 3, 3),
+  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending")
+)
+
+tx_to_gene <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_to_gene, by = "transcript_id_clean")
+```
+
+# Section 2: Gene Sets
+
+```{r gene_sets}
+# Positive set: intersection of RIP-bound and TE-regulated (hypoxia 1hr)
+intersection_raw <- read_csv(
+  here("ripseq", "output", "ripseq_rip_te_overlap_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+)
+intersection_ids <- sub("\\..*", "", intersection_raw$gene_id)
+cat("Intersection (RIP-bound + TE-regulated, hypoxia 1hr):", length(intersection_ids), "\n")
+
+# All RIP-bound genes at hypoxia 1hr — exclude from negative controls
+rip_bound_ids <- read_csv(
+  here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_flag_eif3d_vs_igg.csv"),
+  show_col_types = FALSE
+) |>
+  filter(log2FoldChange > 0.5, padj < 0.05) |>
+  mutate(ensembl_gene = sub("\\..*", "", gene_id)) |>
+  pull(ensembl_gene)
+cat("Total RIP-bound genes excluded from neg ctrl:", length(rip_bound_ids), "\n")
+
+# Negative controls: not RIP-bound, not in intersection, size-matched
+neg_pool <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  filter(
+    !ensembl_gene %in% intersection_ids,
+    !ensembl_gene %in% rip_bound_ids
+  )
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene,
+                       size = length(intersection_ids), replace = FALSE)
+cat("Neg ctrl (size-matched, not RIP-bound, seed=9):", length(neg_ctrl_ids), "\n")
+
+# Spot check: no overlap between intersection and neg ctrl
+stopifnot("intersection and neg ctrl must be disjoint" =
+  length(intersect(intersection_ids, neg_ctrl_ids)) == 0)
+
+# Map to transcript IDs
+intersection_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% intersection_ids) %>%
+  pull(transcript_id_clean)
+neg_ctrl_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% neg_ctrl_ids) %>%
+  pull(transcript_id_clean)
+
+intersection_tx <- intersection_tx[intersection_tx %in% rownames(counts_mat0)]
+neg_ctrl_tx     <- neg_ctrl_tx[neg_ctrl_tx %in% rownames(counts_mat0)]
+cat("Intersection transcripts:", length(intersection_tx),
+    "| Neg ctrl transcripts:", length(neg_ctrl_tx), "\n")
+
+# RIP-only set: all RIP-bound genes (regardless of TE regulation)
+rip_only_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% rip_bound_ids) %>%
+  pull(transcript_id_clean)
+rip_only_tx <- rip_only_tx[rip_only_tx %in% rownames(counts_mat0)]
+
+# Size-matched neg ctrl for RIP-only (same pool, different size and seed)
+set.seed(42)
+neg_rip_ids <- sample(neg_pool$ensembl_gene,
+                      size = min(length(rip_bound_ids), nrow(neg_pool)),
+                      replace = FALSE)
+neg_rip_tx <- tx_gene_df %>%
+  filter(ensembl_gene %in% neg_rip_ids) %>%
+  pull(transcript_id_clean)
+neg_rip_tx <- neg_rip_tx[neg_rip_tx %in% rownames(counts_mat0)]
+
+cat("RIP-only transcripts:", length(rip_only_tx),
+    "| RIP neg ctrl transcripts:", length(neg_rip_tx), "\n")
+```
+
+# Section 3: Background-Corrected RSCU
+
+```{r bg_rscu_background_props}
+# Background = mean per-transcript codon proportion across all expressed mRNAs.
+# Each transcript gets equal weight regardless of CDS length.
+bg_props <- imap(aa_to_codons, function(codons, aa) {
+  codons  <- intersect(codons, colnames(counts_mat0))
+  if (length(codons) == 0) return(NULL)
+  sub_cnt <- counts_mat0[, codons, drop = FALSE]
+  aa_tot  <- rowSums(sub_cnt)
+  valid   <- aa_tot > 0
+  if (!any(valid)) return(NULL)
+  prop_mat <- sub_cnt[valid, , drop = FALSE] / aa_tot[valid]
+  colMeans(prop_mat)
+})
+bg_props <- Filter(Negate(is.null), bg_props)
+
+cat("Background proportions computed for", length(bg_props), "amino acids\n")
+
+prop_sums <- sapply(bg_props, sum)
+cat("Background proportions sum check (should all be ~1):",
+    round(range(prop_sums), 4), "\n")
+```
+
+```{r compute_bg_rscu_function}
+compute_bg_rscu_matrix <- function(counts_mat, bg_props) {
+  rscu_mat <- matrix(NA_real_, nrow = nrow(counts_mat), ncol = ncol(counts_mat),
+                     dimnames = dimnames(counts_mat))
+  for (aa in names(bg_props)) {
+    props  <- bg_props[[aa]]
+    codons <- intersect(names(props), colnames(counts_mat))
+    if (length(codons) == 0) next
+    sub_cnt <- counts_mat[, codons, drop = FALSE]
+    aa_tot  <- rowSums(sub_cnt)
+    valid   <- aa_tot > 0
+    for (codon in codons) {
+      bp <- props[codon]
+      if (bp > 0 && any(valid)) {
+        rscu_mat[valid, codon] <- (sub_cnt[valid, codon] / aa_tot[valid]) / bp
+      }
+    }
+  }
+  rscu_mat
+}
+```
+
+```{r compute_bg_rscu}
+bg_rscu_mat0 <- compute_bg_rscu_matrix(counts_mat0, bg_props)
+cat("Background RSCU matrix:", nrow(bg_rscu_mat0), "x", ncol(bg_rscu_mat0), "\n")
+cat("Range:", round(min(bg_rscu_mat0, na.rm = TRUE), 3), "-",
+    round(max(bg_rscu_mat0, na.rm = TRUE), 3), "\n")
+
+bg_mean_per_codon <- colMeans(bg_rscu_mat0, na.rm = TRUE)
+bg_mean_per_codon <- bg_mean_per_codon[sense_codons[sense_codons %in% names(bg_mean_per_codon)]]
+cat("Mean bg_RSCU across all expressed mRNAs - range:",
+    round(range(bg_mean_per_codon, na.rm = TRUE), 3), "\n")
+cat("(Should be ~1 for all codons by construction)\n")
+```
+
+```{r rscu_summary_function}
+summarize_rscu <- function(rscu_mat, tx_ids) {
+  tx_ids <- tx_ids[tx_ids %in% rownames(rscu_mat)]
+  sub    <- rscu_mat[tx_ids, sense_codons, drop = FALSE]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    codons <- intersect(codons, colnames(sub))
+    map_dfr(codons, function(codon) {
+      vals <- sub[, codon]
+      vals <- vals[!is.na(vals)]
+      tibble(
+        amino_acid  = aa,
+        codon       = codon,
+        mean_rscu   = mean(vals),
+        median_rscu = median(vals),
+        se_rscu     = if (length(vals) > 1) sd(vals) / sqrt(length(vals)) else NA_real_,
+        n           = length(vals)
+      )
+    })
+  })
+}
+```
+
+```{r bg_rscu_group_summaries}
+bg_rscu_intersection <- summarize_rscu(bg_rscu_mat0, intersection_tx)
+bg_rscu_neg          <- summarize_rscu(bg_rscu_mat0, neg_ctrl_tx)
+bg_rscu_rip_only     <- summarize_rscu(bg_rscu_mat0, rip_only_tx)
+bg_rscu_neg_rip      <- summarize_rscu(bg_rscu_mat0, neg_rip_tx)
+
+cat("Background RSCU summary - intersection:", nrow(bg_rscu_intersection), "codon-rows\n")
+cat("Background RSCU summary - RIP-only:", nrow(bg_rscu_rip_only), "codon-rows\n")
+```
+
+```{r bg_rscu_rip_only_delta}
+bg_rscu_rip_combined <- bg_rscu_rip_only %>%
+  dplyr::select(amino_acid, codon, rip_mean = mean_rscu, rip_se = se_rscu, rip_n = n) %>%
+  left_join(
+    bg_rscu_neg_rip %>% dplyr::select(amino_acid, codon, neg_mean = mean_rscu,
+                                      neg_se = se_rscu, neg_n = n),
+    by = c("amino_acid", "codon")
+  ) %>%
+  mutate(delta_rip_only = rip_mean - neg_mean)
+
+# Wilcoxon per codon (multi_aa only)
+rip_wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons <- intersect(codons, colnames(bg_rscu_mat0))
+  map_dfr(codons, function(codon) {
+    p_vals <- bg_rscu_mat0[rip_only_tx[rip_only_tx %in% rownames(bg_rscu_mat0)], codon]
+    n_vals <- bg_rscu_mat0[neg_rip_tx[neg_rip_tx   %in% rownames(bg_rscu_mat0)], codon]
+    p_vals <- p_vals[!is.na(p_vals)]
+    n_vals <- n_vals[!is.na(n_vals)]
+    if (length(p_vals) < 3 || length(n_vals) < 3) {
+      return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_))
+    }
+    wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val = wt$p.value)
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+bg_rscu_rip_combined <- bg_rscu_rip_combined %>%
+  left_join(rip_wilcox_df %>% dplyr::select(amino_acid, codon, p_adj_rip = p_adj),
+            by = c("amino_acid", "codon"))
+
+cat("Top 10 codons by |delta bg-RSCU| (RIP-only):\n")
+print(bg_rscu_rip_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_rip_only))) %>%
+        dplyr::select(codon, amino_acid, rip_mean, neg_mean, delta_rip_only, p_adj_rip) %>%
+        head(10))
+```
+
+```{r bg_rscu_delta}
+bg_rscu_combined <- bg_rscu_intersection %>%
+  dplyr::select(amino_acid, codon, intersection_mean = mean_rscu,
+                intersection_se = se_rscu, intersection_n = n) %>%
+  left_join(
+    bg_rscu_neg %>% dplyr::select(amino_acid, codon, neg_mean = mean_rscu,
+                                  neg_se = se_rscu, neg_n = n),
+    by = c("amino_acid", "codon")
+  ) %>%
+  mutate(delta_bg_rscu = intersection_mean - neg_mean)
+
+# Wilcoxon test per codon — multi-synonymous AAs only
+bg_wilcox_df <- imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+  codons <- intersect(codons, colnames(bg_rscu_mat0))
+  map_dfr(codons, function(codon) {
+    p_vals <- bg_rscu_mat0[intersection_tx[intersection_tx %in% rownames(bg_rscu_mat0)], codon]
+    n_vals <- bg_rscu_mat0[neg_ctrl_tx[neg_ctrl_tx %in% rownames(bg_rscu_mat0)], codon]
+    p_vals <- p_vals[!is.na(p_vals)]
+    n_vals <- n_vals[!is.na(n_vals)]
+    if (length(p_vals) < 3 || length(n_vals) < 3) {
+      return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_))
+    }
+    wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+    tibble(amino_acid = aa, codon = codon, p_val = wt$p.value)
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+bg_rscu_combined <- bg_rscu_combined %>%
+  left_join(bg_wilcox_df %>% dplyr::select(amino_acid, codon, p_val, p_adj),
+            by = c("amino_acid", "codon"))
+
+cat("Top 10 codons by |delta background RSCU|:\n")
+print(bg_rscu_combined %>%
+        filter(amino_acid %in% multi_aa) %>%
+        arrange(desc(abs(delta_bg_rscu))) %>%
+        dplyr::select(codon, amino_acid, intersection_mean, neg_mean, delta_bg_rscu, p_adj) %>%
+        head(10))
+```
+
+# Section 4: Visualization
+
+```{r bg_rscu_plot_sidebyside, fig.width=11, fig.height=9}
+plot_df_bg_a <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  pivot_longer(cols = c(intersection_mean, neg_mean),
+               names_to = "group", values_to = "mean_bg_rscu") %>%
+  mutate(
+    se      = if_else(group == "intersection_mean", intersection_se, neg_se),
+    group   = recode(group,
+                     intersection_mean = "RIP-bound + TE-regulated",
+                     neg_mean          = "Neg ctrl"),
+    group   = factor(group, levels = c("RIP-bound + TE-regulated", "Neg ctrl")),
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon    = reorder(codon, mean_bg_rscu)
+  )
+
+p_bg_a <- ggplot(plot_df_bg_a, aes(x = codon, y = mean_bg_rscu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = mean_bg_rscu - se, ymax = mean_bg_rscu + se),
+                position = position_dodge(width = 0.8), width = 0.3,
+                linewidth = 0.4) +
+  scale_fill_manual(values = c("RIP-bound + TE-regulated" = "#E69F00", "Neg ctrl" = "#000000"),
+                    name = NULL) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  labs(
+    title    = "Background-corrected RSCU: RIP-bound + TE-regulated vs neg ctrl (Hypoxia 1hr)",
+    subtitle = "Mean per-transcript bg-RSCU +/- SE; dashed = 1 (same rate as transcriptome background)",
+    x = "Codon", y = "Mean background-corrected RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+p_bg_a
+ggsave(here("ripseq", "plots", "bg_rscu_sidebyside_rip_te_intersection.pdf"),
+       p_bg_a, width = 11, height = 9)
+```
+
+```{r bg_rscu_plot_delta, fig.width=10, fig.height=8}
+plot_df_bg_b <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    direction = ifelse(delta_bg_rscu >= 0, "intersection", "neg_ctrl"),
+    sig_label = case_when(!is.na(p_adj) & p_adj < 0.05 ~ "*", TRUE ~ ""),
+    codon     = reorder(codon, delta_bg_rscu)
+  )
+
+p_bg_b <- ggplot(plot_df_bg_b, aes(x = codon, y = delta_bg_rscu, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig_label, y = delta_bg_rscu + sign(delta_bg_rscu) * 0.015),
+            size = 3, vjust = 0.5) +
+  scale_fill_manual(values = c(intersection = "#E69F00", neg_ctrl = "#000000"),
+                    guide = "none") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Delta background-corrected RSCU: RIP-bound + TE-regulated minus neg ctrl (Hypoxia 1hr)",
+    subtitle = "Mean per-transcript bg-RSCU difference; * = BH-adjusted Wilcoxon q < 0.05",
+    x = "Codon", y = "Delta mean bg-RSCU (intersection - neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text  = element_text(face = "bold")
+  )
+p_bg_b
+ggsave(here("ripseq", "plots", "bg_rscu_delta_rip_te_intersection.pdf"),
+       p_bg_b, width = 10, height = 8)
+```
+
+```{r frame_ctrl_functions}
+summarize_delta_rscu <- function(rscu_mat, pos_ids, neg_ids, frame_label) {
+  p_ids <- pos_ids[pos_ids %in% rownames(rscu_mat)]
+  n_ids <- neg_ids[neg_ids  %in% rownames(rscu_mat)]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    codons <- intersect(codons, colnames(rscu_mat))
+    map_dfr(codons, function(codon) {
+      p_vals <- rscu_mat[p_ids, codon]; p_vals <- p_vals[!is.na(p_vals)]
+      n_vals <- rscu_mat[n_ids, codon]; n_vals <- n_vals[!is.na(n_vals)]
+      tibble(amino_acid = aa, codon = codon,
+             delta = mean(p_vals) - mean(n_vals),
+             frame = frame_label)
+    })
+  })
+}
+
+per_tx_sig_rscu <- function(rscu_mat, pos_ids, neg_ids, frame_label) {
+  p_ids <- pos_ids[pos_ids %in% rownames(rscu_mat)]
+  n_ids <- neg_ids[neg_ids  %in% rownames(rscu_mat)]
+  imap_dfr(aa_to_codons, function(codons, aa) {
+    if (length(codons) < 2) return(NULL)
+    codons <- intersect(codons, colnames(rscu_mat))
+    map_dfr(codons, function(codon) {
+      p_vals <- rscu_mat[p_ids, codon]; p_vals <- p_vals[!is.na(p_vals)]
+      n_vals <- rscu_mat[n_ids, codon]; n_vals <- n_vals[!is.na(n_vals)]
+      if (length(p_vals) < 3 || length(n_vals) < 3) {
+        return(tibble(amino_acid = aa, codon = codon, p_val = NA_real_, frame = frame_label))
+      }
+      wt <- wilcox.test(p_vals, n_vals, exact = FALSE)
+      tibble(amino_acid = aa, codon = codon, p_val = wt$p.value, frame = frame_label)
+    })
+  })
+}
+```
+
+```{r bg_rscu_frame_ctrl, fig.width=12, fig.height=9}
+bg_rscu_mat1 <- compute_bg_rscu_matrix(counts_mat1, bg_props)
+bg_rscu_mat2 <- compute_bg_rscu_matrix(counts_mat2, bg_props)
+
+bg_f0_delta <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(amino_acid, codon, delta = delta_bg_rscu) %>%
+  mutate(frame = "Frame 0 (coding)")
+bg_f1_delta <- summarize_delta_rscu(bg_rscu_mat1, intersection_tx, neg_ctrl_tx, "Frame 1 (control)")
+bg_f2_delta <- summarize_delta_rscu(bg_rscu_mat2, intersection_tx, neg_ctrl_tx, "Frame 2 (control)")
+
+bg_frame_delta_df <- bind_rows(bg_f0_delta, bg_f1_delta, bg_f2_delta) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    frame    = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+bg_codon_order <- bg_f0_delta %>%
+  filter(amino_acid %in% multi_aa) %>%
+  arrange(amino_acid, delta) %>%
+  pull(codon)
+bg_frame_delta_df <- bg_frame_delta_df %>%
+  mutate(codon = factor(codon, levels = bg_codon_order))
+
+bg_sig_df <- bind_rows(
+  per_tx_sig_rscu(bg_rscu_mat0, intersection_tx, neg_ctrl_tx, "Frame 0 (coding)"),
+  per_tx_sig_rscu(bg_rscu_mat1, intersection_tx, neg_ctrl_tx, "Frame 1 (control)"),
+  per_tx_sig_rscu(bg_rscu_mat2, intersection_tx, neg_ctrl_tx, "Frame 2 (control)")
+) %>%
+  filter(amino_acid %in% multi_aa) %>%
+  mutate(
+    q_val = p.adjust(p_val, method = "BH"),
+    sig   = !is.na(q_val) & q_val < 0.05,
+    frame = factor(frame, levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)"))
+  )
+
+bg_f0_sig   <- bg_sig_df %>% filter(frame == "Frame 0 (coding)") %>%
+  dplyr::select(amino_acid, codon, f0_sig = sig)
+bg_ctrl_sig <- bg_sig_df %>% filter(frame != "Frame 0 (coding)") %>%
+  group_by(amino_acid, codon) %>%
+  summarise(any_ctrl_sig = any(sig), .groups = "drop")
+bg_f0_labels <- bg_f0_sig %>%
+  left_join(bg_ctrl_sig, by = c("amino_acid", "codon")) %>%
+  mutate(sig_label = case_when(
+    f0_sig & !any_ctrl_sig ~ "✦",
+    f0_sig &  any_ctrl_sig ~ "·",
+    TRUE                   ~ ""
+  )) %>%
+  dplyr::select(amino_acid, codon, sig_label) %>%
+  mutate(frame = factor("Frame 0 (coding)",
+                        levels = c("Frame 0 (coding)", "Frame 1 (control)", "Frame 2 (control)")))
+
+bg_aa_any_f0 <- bg_f0_labels %>% filter(sig_label != "") %>% pull(amino_acid) %>% unique()
+bg_aa_clean  <- bg_f0_labels %>% filter(sig_label == "✦") %>% pull(amino_acid) %>% unique()
+
+bg_frame_delta_df <- bg_frame_delta_df %>%
+  mutate(aa_label = ifelse(amino_acid %in% bg_aa_any_f0,
+                           paste0(aa_label, " *"), aa_label))
+
+bg_aa_label_map <- bg_frame_delta_df %>% distinct(amino_acid, aa_label)
+bg_facet_clean  <- bg_aa_label_map %>% filter(amino_acid %in% bg_aa_clean)
+
+bg_rect_layer <- if (nrow(bg_facet_clean) > 0) {
+  geom_rect(data = bg_facet_clean,
+            aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE, fill = NA, color = "#0072B2", linewidth = 1.5)
+} else {
+  NULL
+}
+
+p_bg_c <- ggplot(bg_frame_delta_df, aes(x = codon, y = delta, fill = frame)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  bg_rect_layer +
+  scale_fill_manual(
+    values = c("Frame 0 (coding)"  = "#E69F00",
+               "Frame 1 (control)" = "#999999",
+               "Frame 2 (control)" = "#CCCCCC")
+  ) +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    title    = "Delta bg-RSCU by reading frame: frame 0 vs frameshift controls (RIP+TE intersection, Hypoxia 1hr)",
+    subtitle = "Frames 1 & 2: shifted tiling of the same sequence.\nBlue border: frame 0 sig, neither control sig. *: frame 0 significant. [q < 0.05, BH Wilcoxon]",
+    x = "Codon", y = "Delta mean bg-RSCU (intersection - neg ctrl)",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "top"
+  )
+p_bg_c
+ggsave(here("ripseq", "plots", "bg_rscu_frame_ctrl_rip_te_intersection.pdf"),
+       p_bg_c, width = 12, height = 9)
+```
+
+# Section 5: GC3 and CSC Bias Checks
+
+```{r bg_rscu_vs_gc3, fig.width=5.5, fig.height=5}
+plot_df_gc3 <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_nucleotide, gc3_class),
+            by = "codon") %>%
+  mutate(
+    gc3_nucleotide = factor(gc3_nucleotide, levels = c("A", "T", "G", "C")),
+    sig            = !is.na(p_adj) & p_adj < 0.05,
+    label_codon    = if_else(abs(delta_bg_rscu) > 0.15 | sig, codon, NA_character_)
+  )
+
+gc_vals <- plot_df_gc3 %>% filter(gc3_class == "GC-ending") %>% pull(delta_bg_rscu)
+at_vals <- plot_df_gc3 %>% filter(gc3_class == "AT-ending") %>% pull(delta_bg_rscu)
+wt_gc3  <- wilcox.test(gc_vals, at_vals, exact = FALSE)
+gc3_p_label <- paste0("Wilcoxon p = ", signif(wt_gc3$p.value, 2),
+                       "\n(GC-ending vs AT-ending)")
+
+nt_colours <- c(A = "#56B4E9", T = "#009E73", G = "#E69F00", C = "#CC79A7")
+
+p_gc3 <- ggplot(plot_df_gc3,
+                aes(x = gc3_nucleotide, y = delta_bg_rscu, colour = gc3_nucleotide)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_jitter(aes(shape = sig), width = 0.2, size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = nt_colours, guide = "none") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 8),
+                     labels = c(`FALSE` = "ns", `TRUE` = "q < 0.05"),
+                     name = "BH Wilcoxon") +
+  annotate("text", x = 4.4, y = max(plot_df_gc3$delta_bg_rscu, na.rm = TRUE),
+           label = gc3_p_label, hjust = 1, vjust = 1, size = 3, colour = "grey30") +
+  labs(
+    title    = "Delta bg-RSCU vs codon third-position nucleotide (RIP+TE intersection, Hypoxia 1hr)",
+    subtitle = "Each point = one codon (multi-synonymous AAs only)",
+    x = "Third-position nucleotide", y = "Delta mean bg-RSCU (intersection - neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_gc3
+ggsave(here("ripseq", "plots", "bg_rscu_delta_vs_gc3_rip_te_intersection.pdf"),
+       p_gc3, width = 5.5, height = 5)
+```
+
+```{r bg_rscu_vs_csc, fig.width=5.5, fig.height=5}
+data("human_optimality", package = "iCodon")
+codon_csc_weights <- dplyr::select(human_optimality, codon, csc_weight = optimality)
+
+plot_df_csc <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  left_join(codon_csc_weights %>% dplyr::select(codon, csc_weight), by = "codon") %>%
+  mutate(
+    sig         = !is.na(p_adj) & p_adj < 0.05,
+    label_codon = if_else(abs(delta_bg_rscu) > 0.15 | sig, codon, NA_character_)
+  )
+
+cor_at <- cor(
+  filter(plot_df_csc, gc3_class == "AT-ending")$csc_weight,
+  filter(plot_df_csc, gc3_class == "AT-ending")$delta_bg_rscu,
+  use = "complete.obs"
+)
+cor_gc <- cor(
+  filter(plot_df_csc, gc3_class == "GC-ending")$csc_weight,
+  filter(plot_df_csc, gc3_class == "GC-ending")$delta_bg_rscu,
+  use = "complete.obs"
+)
+cat("Pearson r (delta bg-RSCU ~ CSC weight) - AT-ending:", round(cor_at, 3),
+    "| GC-ending:", round(cor_gc, 3), "\n")
+
+p_csc <- ggplot(plot_df_csc,
+                aes(x = csc_weight, y = delta_bg_rscu, colour = gc3_class)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_point(aes(shape = sig), size = 2.2, alpha = 0.85) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, alpha = 0.15) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(
+    values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+    name   = "Third-position"
+  ) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 8),
+                     labels = c(`FALSE` = "ns", `TRUE` = "q < 0.05"),
+                     name   = "BH Wilcoxon") +
+  annotate("text", x = min(plot_df_csc$csc_weight, na.rm = TRUE),
+           y = max(plot_df_csc$delta_bg_rscu, na.rm = TRUE),
+           label = paste0("r (AT) = ", round(cor_at, 2),
+                          "\nr (GC) = ", round(cor_gc, 2)),
+           hjust = 0, vjust = 1, size = 3, colour = "grey30") +
+  labs(
+    title    = "Delta bg-RSCU vs iCodon CSC weight (RIP+TE intersection, Hypoxia 1hr)",
+    subtitle = "Positive r (AT-ending) = intersection targets preferentially use stabilizing codons",
+    x = "iCodon CSC weight (human)", y = "Delta mean bg-RSCU (intersection - neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_csc
+ggsave(here("ripseq", "plots", "bg_rscu_delta_vs_csc_rip_te_intersection.pdf"),
+       p_csc, width = 5.5, height = 5)
+```
+
+# Section 6: Violin Plots for Significant Codons
+
+```{r bg_rscu_violin, fig.width=12, fig.height=8}
+sig_aas <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa, !is.na(p_adj), p_adj < 0.05) %>%
+  pull(amino_acid) %>%
+  unique()
+
+cat("Amino acids with >=1 significant codon (bg RSCU, BH q < 0.05):",
+    length(sig_aas), "\n")
+if (length(sig_aas) > 0) cat(paste(sig_aas, collapse = ", "), "\n")
+
+if (length(sig_aas) > 0) {
+  sig_codons_by_aa <- bg_rscu_combined %>%
+    filter(amino_acid %in% sig_aas, !is.na(p_adj), p_adj < 0.05) %>%
+    dplyr::select(amino_acid, codon)
+
+  violin_df <- map_dfr(seq_len(nrow(sig_codons_by_aa)), function(i) {
+    aa    <- sig_codons_by_aa$amino_acid[i]
+    codon <- sig_codons_by_aa$codon[i]
+    tx_pos <- intersection_tx[intersection_tx %in% rownames(bg_rscu_mat0)]
+    tx_neg <- neg_ctrl_tx[neg_ctrl_tx  %in% rownames(bg_rscu_mat0)]
+    p_vals <- bg_rscu_mat0[tx_pos, codon]
+    n_vals <- bg_rscu_mat0[tx_neg, codon]
+    bind_rows(
+      tibble(codon = codon, amino_acid = aa, group = "RIP-bound + TE-regulated",
+             bg_rscu = p_vals[!is.na(p_vals)]),
+      tibble(codon = codon, amino_acid = aa, group = "Neg ctrl",
+             bg_rscu = n_vals[!is.na(n_vals)])
+    )
+  }) %>%
+    mutate(
+      group    = factor(group, levels = c("RIP-bound + TE-regulated", "Neg ctrl")),
+      aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+      codon_aa = paste0(codon, "\n(", amino_acid, ")")
+    ) %>%
+    left_join(bg_rscu_combined %>% dplyr::select(codon, p_adj_label = p_adj),
+              by = "codon") %>%
+    mutate(codon_aa = paste0(codon, "\nq=", signif(p_adj_label, 2)))
+
+  p_viol <- ggplot(violin_df, aes(x = group, y = bg_rscu, fill = group)) +
+    geom_violin(alpha = 0.6, linewidth = 0.4, trim = TRUE) +
+    geom_boxplot(width = 0.18, outlier.size = 0.5, linewidth = 0.4,
+                 fill = "white", alpha = 0.8) +
+    geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c("RIP-bound + TE-regulated" = "#E69F00", "Neg ctrl" = "#000000"),
+                      guide = "none") +
+    facet_wrap(~ codon_aa, scales = "free_y", nrow = 2) +
+    labs(
+      title    = "Per-transcript bg-RSCU for significant codons (RIP+TE intersection, Hypoxia 1hr)",
+      subtitle = "Codons with BH q < 0.05 between RIP-bound + TE-regulated and neg ctrl.\nDashed = 1 (same usage rate as transcriptome background).",
+      x = NULL, y = "Per-transcript background-corrected RSCU"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      strip.text  = element_text(face = "bold", size = 9)
+    )
+  p_viol
+  ggsave(here("ripseq", "plots", "bg_rscu_violin_rip_te_intersection.pdf"), p_viol,
+         width = max(8, length(sig_aas) * 2.5), height = 8)
+} else {
+  cat("No significant codons in background RSCU comparison - skipping violin plot.\n")
+}
+```
+
+# Save Results
+
+```{r save_results}
+write_csv(bg_rscu_combined,
+          here("ripseq", "output", "bg_rscu_rip_te_intersection_hyp1hr.csv"))
+cat("Saved bg_rscu_combined to ripseq/output/bg_rscu_rip_te_intersection_hyp1hr.csv\n")
+cat("Rows:", nrow(bg_rscu_combined), "\n")
+```
+
+# Section 7: Comparison -- Intersection vs TE-only Codon Preferences
+
+Are codon preferences more extreme in the RIP+TE intersection than in TE-regulated genes alone?
+
+- **TE-only**: eIF3d-promoted genes (hypoxia 1hr, te_lfc > 0.5, padj < 0.05) vs neg ctrl (nb38)
+- **Intersection**: RIP-bound AND TE-regulated vs neg ctrl (this notebook)
+
+```{r load_te_only_rscu}
+te_only <- read_csv(
+  here("output", "predictive_modeling", "bg_rscu_231_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+) %>%
+  dplyr::select(amino_acid, codon, delta_te_only = delta_bg_rscu, p_adj_te = p_adj)
+
+stopifnot("TE-only bg-RSCU file must have rows" = nrow(te_only) > 0)
+cat("TE-only bg-RSCU loaded:", nrow(te_only), "codon-rows\n")
+```
+
+```{r comparison_df}
+comparison_df <- bg_rscu_combined %>%
+  filter(amino_acid %in% multi_aa) %>%
+  dplyr::select(amino_acid, codon, delta_intersection = delta_bg_rscu, p_adj_intersection = p_adj) %>%
+  left_join(te_only %>% filter(amino_acid %in% multi_aa), by = c("amino_acid", "codon")) %>%
+  left_join(
+    bg_rscu_rip_combined %>% filter(amino_acid %in% multi_aa) %>%
+      dplyr::select(amino_acid, codon, delta_rip_only, p_adj_rip),
+    by = c("amino_acid", "codon")
+  ) %>%
+  left_join(codon_gc3 %>% dplyr::select(codon, gc3_class), by = "codon")
+
+stopifnot("comparison_df must have rows" = nrow(comparison_df) > 0)
+
+# Summary stats: intersection vs TE-only
+frac_vs_te <- mean(abs(comparison_df$delta_intersection) > abs(comparison_df$delta_te_only),
+                   na.rm = TRUE)
+wt_vs_te   <- wilcox.test(abs(comparison_df$delta_intersection),
+                           abs(comparison_df$delta_te_only),
+                           paired = TRUE, exact = FALSE)
+
+# Summary stats: intersection vs RIP-only
+frac_vs_rip <- mean(abs(comparison_df$delta_intersection) > abs(comparison_df$delta_rip_only),
+                    na.rm = TRUE)
+wt_vs_rip   <- wilcox.test(abs(comparison_df$delta_intersection),
+                            abs(comparison_df$delta_rip_only),
+                            paired = TRUE, exact = FALSE)
+
+cat("Multi-AA codons compared:", nrow(comparison_df), "\n\n")
+cat("Intersection vs TE-only:\n")
+cat("  Fraction where intersection |delta| > TE-only |delta|:",
+    round(frac_vs_te, 3), "\n")
+cat("  Paired Wilcoxon p =", signif(wt_vs_te$p.value, 3), "\n\n")
+cat("Intersection vs RIP-only:\n")
+cat("  Fraction where intersection |delta| > RIP-only |delta|:",
+    round(frac_vs_rip, 3), "\n")
+cat("  Paired Wilcoxon p =", signif(wt_vs_rip$p.value, 3), "\n")
+```
+
+```{r scatter_intersection_vs_te, fig.width=5.5, fig.height=5}
+plot_vs_te <- comparison_df %>%
+  mutate(
+    sig_group   = case_when(
+      (!is.na(p_adj_intersection) & p_adj_intersection < 0.05) &
+        (!is.na(p_adj_te)          & p_adj_te          < 0.05) ~ "both",
+      (!is.na(p_adj_intersection) & p_adj_intersection < 0.05) ~ "intersection only",
+      (!is.na(p_adj_te)           & p_adj_te           < 0.05) ~ "TE only",
+      TRUE ~ "neither"
+    ),
+    label_codon = if_else(
+      abs(delta_intersection - delta_te_only) > 0.05 |
+        sig_group %in% c("both", "intersection only", "TE only"),
+      codon, NA_character_
+    )
+  )
+
+wt_label_te <- paste0(
+  "Paired Wilcoxon p = ", signif(wt_vs_te$p.value, 2),
+  "\n", round(frac_vs_te * 100, 0), "% codons more extreme\nin intersection"
+)
+
+p_vs_te <- ggplot(plot_vs_te,
+                  aes(x = delta_te_only, y = delta_intersection, colour = gc3_class)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(shape = sig_group), size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c(both = 8, "intersection only" = 17, "TE only" = 15, neither = 16),
+    name = "Significant (q < 0.05)"
+  ) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.3,
+           label = wt_label_te, size = 2.8, colour = "grey30") +
+  labs(
+    title    = "Codon preferences: RIP+TE intersection vs TE-only (Hypoxia 1hr)",
+    subtitle = "Points above diagonal = more extreme preference in intersection than TE-only",
+    x = "Delta bg-RSCU (TE-only: promoted - neg ctrl)",
+    y = "Delta bg-RSCU (intersection: RIP+TE - neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_vs_te
+ggsave(here("ripseq", "plots", "bg_rscu_intersection_vs_te_comparison.pdf"),
+       p_vs_te, width = 5.5, height = 5)
+```
+
+```{r scatter_intersection_vs_rip, fig.width=5.5, fig.height=5}
+plot_vs_rip <- comparison_df %>%
+  mutate(
+    sig_group   = case_when(
+      (!is.na(p_adj_intersection) & p_adj_intersection < 0.05) &
+        (!is.na(p_adj_rip)         & p_adj_rip         < 0.05) ~ "both",
+      (!is.na(p_adj_intersection) & p_adj_intersection < 0.05) ~ "intersection only",
+      (!is.na(p_adj_rip)          & p_adj_rip          < 0.05) ~ "RIP only",
+      TRUE ~ "neither"
+    ),
+    label_codon = if_else(
+      abs(delta_intersection - delta_rip_only) > 0.05 |
+        sig_group %in% c("both", "intersection only", "RIP only"),
+      codon, NA_character_
+    )
+  )
+
+wt_label_rip <- paste0(
+  "Paired Wilcoxon p = ", signif(wt_vs_rip$p.value, 2),
+  "\n", round(frac_vs_rip * 100, 0), "% codons more extreme\nin intersection"
+)
+
+p_vs_rip <- ggplot(plot_vs_rip,
+                   aes(x = delta_rip_only, y = delta_intersection, colour = gc3_class)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(shape = sig_group), size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c(both = 8, "intersection only" = 17, "RIP only" = 15, neither = 16),
+    name = "Significant (q < 0.05)"
+  ) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.3,
+           label = wt_label_rip, size = 2.8, colour = "grey30") +
+  labs(
+    title    = "Codon preferences: RIP+TE intersection vs RIP-only (Hypoxia 1hr)",
+    subtitle = "Points above diagonal = more extreme preference in intersection than RIP-only alone",
+    x = "Delta bg-RSCU (RIP-only: bound - neg ctrl)",
+    y = "Delta bg-RSCU (intersection: RIP+TE - neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_vs_rip
+ggsave(here("ripseq", "plots", "bg_rscu_intersection_vs_rip_comparison.pdf"),
+       p_vs_rip, width = 5.5, height = 5)
+```
+
+```{r scatter_rip_vs_te, fig.width=5.5, fig.height=5}
+plot_rip_vs_te <- comparison_df %>%
+  mutate(
+    sig_group   = case_when(
+      (!is.na(p_adj_rip) & p_adj_rip < 0.05) &
+        (!is.na(p_adj_te) & p_adj_te  < 0.05) ~ "both",
+      (!is.na(p_adj_rip) & p_adj_rip < 0.05) ~ "RIP only",
+      (!is.na(p_adj_te)  & p_adj_te  < 0.05) ~ "TE only",
+      TRUE ~ "neither"
+    ),
+    label_codon = if_else(
+      abs(delta_rip_only - delta_te_only) > 0.05 |
+        sig_group %in% c("both", "RIP only", "TE only"),
+      codon, NA_character_
+    )
+  )
+
+cor_rip_te <- cor(plot_rip_vs_te$delta_rip_only, plot_rip_vs_te$delta_te_only,
+                  use = "complete.obs")
+cat("Pearson r (delta RIP-only ~ delta TE-only):", round(cor_rip_te, 3), "\n")
+
+p_rip_vs_te <- ggplot(plot_rip_vs_te,
+                      aes(x = delta_rip_only, y = delta_te_only, colour = gc3_class)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.5,
+              linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey85", linewidth = 0.3) +
+  geom_point(aes(shape = sig_group), size = 2.2, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = label_codon), size = 2.8,
+                           max.overlaps = 20, min.segment.length = 0.2,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c(both = 8, "RIP only" = 17, "TE only" = 15, neither = 16),
+    name = "Significant (q < 0.05)"
+  ) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = paste0("r = ", round(cor_rip_te, 2)), size = 3, colour = "grey30") +
+  labs(
+    title    = "Codon preferences: RIP-only vs TE-only (Hypoxia 1hr)",
+    subtitle = "Points near diagonal = same preference in both; off-diagonal = divergent",
+    x = "Delta bg-RSCU (RIP-only: bound - neg ctrl)",
+    y = "Delta bg-RSCU (TE-only: promoted - neg ctrl)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+p_rip_vs_te
+ggsave(here("ripseq", "plots", "bg_rscu_rip_vs_te_comparison.pdf"),
+       p_rip_vs_te, width = 5.5, height = 5)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
