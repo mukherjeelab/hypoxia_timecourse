@@ -179,6 +179,7 @@ Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size
 - Save to `plots/` via `here("plots", "notebooknum_description.pdf")`
 - `theme_classic(base_size = 12)`, density `alpha = 0.15`, `linewidth = 0.8`
 - Wilcoxon tests annotated with `x = Inf, y = Inf, hjust = 1.1, vjust = 1.4`
+- Do not use em dashes (`—`) in axis labels — they render as `...` in PDF output. Use plain text only.
 
 ## Reference Files
 

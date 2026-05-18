@@ -1,0 +1,313 @@
+---
+title: "Notebook 60: riboWaltz E/P/A Site Codon Occupancy — Positive vs Negative Gene Sets (MDA-MB-231, 1hr)"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Replicates the Plot 0 scatter plots from Notebook 58, comparing codon frequency at E/P/A
+sites between two transcript subsets:
+
+- **eIF3d promotes** — positive gene set (hypoxia 1hr eIF3d promotes translation)
+- **Negative control** — matched negative control transcripts
+
+Inputs:
+- `ribowaltz_output/timecourse_231/epa_codon_occupancy_positive_hypoxia_3d_1.csv`
+- `ribowaltz_output/timecourse_231/epa_codon_occupancy_matched_negative_hypoxia_3d_1.csv`
+- `accessories/metadata_231_timecourse.csv`
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ggrepel)
+```
+
+---
+
+## Section 1: Load data and join metadata
+
+```{r load_data}
+meta <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
+                 show_col_types = FALSE) %>%
+  dplyr::filter(type == "RiboSeq", hours == 1)
+
+pos_genes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                      show_col_types = FALSE)
+neg_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                      show_col_types = FALSE)
+
+cat("Positive set mRNAs:", nrow(pos_genes), "\n")
+cat("Negative set mRNAs:", nrow(neg_genes), "\n")
+
+epa_pos <- read_csv(
+  here("ribowaltz_output", "timecourse_231", "epa_codon_occupancy_positive_hypoxia_3d_1.csv"),
+  show_col_types = FALSE
+) %>% mutate(gene_set = "eIF3d promotes")
+
+epa_neg <- read_csv(
+  here("ribowaltz_output", "timecourse_231", "epa_codon_occupancy_matched_negative_hypoxia_3d_1.csv"),
+  show_col_types = FALSE
+) %>% mutate(gene_set = "Negative control")
+
+cat("1hr RiboSeq samples in metadata:", nrow(meta), "\n")
+```
+
+```{r join_metadata}
+join_meta <- function(df) {
+  df %>%
+    mutate(
+      id    = str_remove(sample, "Aligned\\.toTranscriptome\\.out.*"),
+      codon = str_replace_all(codon, "U", "T")
+    ) %>%
+    left_join(meta, by = "id")
+}
+
+epa_df <- bind_rows(join_meta(epa_pos), join_meta(epa_neg)) %>%
+  mutate(gene_set = factor(gene_set, levels = c("eIF3d promotes", "Negative control")))
+
+stopifnot("All rows have treatment metadata" = !any(is.na(epa_df$treatment)))
+stopifnot("Positive set: 18 samples" =
+  n_distinct(epa_df$id[epa_df$gene_set == "eIF3d promotes"]) == 18)
+stopifnot("Negative set: 18 samples" =
+  n_distinct(epa_df$id[epa_df$gene_set == "Negative control"]) == 18)
+
+cat("\nSamples per gene_set × treatment × condition:\n")
+epa_df %>%
+  distinct(gene_set, id, treatment, condition) %>%
+  count(gene_set, treatment, condition) %>%
+  print()
+```
+
+---
+
+## Section 2: Normalize to relative frequencies
+
+```{r normalize}
+codon_freq <- epa_df %>%
+  group_by(gene_set, id, site) %>%
+  mutate(freq = count / sum(count)) %>%
+  ungroup()
+
+stopifnot("Frequencies in [0,1]" =
+  all(codon_freq$freq >= 0 & codon_freq$freq <= 1, na.rm = TRUE))
+
+codon_means <- codon_freq %>%
+  group_by(gene_set, codon, site, condition, treatment) %>%
+  summarise(mean_freq = mean(freq, na.rm = TRUE),
+            sd_freq   = sd(freq, na.rm = TRUE),
+            .groups = "drop")
+
+cat("Codons per site × gene_set:\n")
+codon_means %>% distinct(gene_set, codon, site) %>% count(gene_set, site) %>% print()
+```
+
+---
+
+## Section 3: Validation
+
+```{r validation}
+genetic_code <- c(
+  TTT="Phe", TTC="Phe", TTA="Leu", TTG="Leu",
+  CTT="Leu", CTC="Leu", CTA="Leu", CTG="Leu",
+  ATT="Ile", ATC="Ile", ATA="Ile", ATG="Met",
+  GTT="Val", GTC="Val", GTA="Val", GTG="Val",
+  TCT="Ser", TCC="Ser", TCA="Ser", TCG="Ser",
+  CCT="Pro", CCC="Pro", CCA="Pro", CCG="Pro",
+  ACT="Thr", ACC="Thr", ACA="Thr", ACG="Thr",
+  GCT="Ala", GCC="Ala", GCA="Ala", GCG="Ala",
+  TAT="Tyr", TAC="Tyr", TAA="Stop", TAG="Stop",
+  CAT="His", CAC="His", CAA="Gln", CAG="Gln",
+  AAT="Asn", AAC="Asn", AAA="Lys", AAG="Lys",
+  GAT="Asp", GAC="Asp", GAA="Glu", GAG="Glu",
+  TGT="Cys", TGC="Cys", TGA="Stop", TGG="Trp",
+  CGT="Arg", CGC="Arg", CGA="Arg", CGG="Arg",
+  AGT="Ser", AGC="Ser", AGA="Arg", AGG="Arg",
+  GGT="Gly", GGC="Gly", GGA="Gly", GGG="Gly"
+)
+
+codon_means <- codon_means %>%
+  mutate(aa = genetic_code[codon])
+
+for (gs in levels(codon_means$gene_set)) {
+  psite_order <- codon_means %>%
+    dplyr::filter(gene_set == gs, site == "psite",
+                  treatment == "siCTRL", condition == "normoxia") %>%
+    arrange(desc(mean_freq)) %>%
+    pull(codon)
+
+  atg_rank <- which(psite_order == "ATG")
+  cat(gs, "— ATG P-site rank:", atg_rank, "of", length(psite_order), "\n")
+  stopifnot("ATG in top 20 P-site codons" = atg_rank <= 20)
+
+  stop_pfreq <- codon_means %>%
+    dplyr::filter(gene_set == gs, codon %in% c("TAA", "TAG", "TGA"),
+                  site == "psite", treatment == "siCTRL", condition == "normoxia") %>%
+    pull(mean_freq)
+  cat(gs, "— stop codon P-site frequencies:", round(stop_pfreq, 5), "\n")
+  stopifnot("Stop codons rare at P-site (< 0.01)" = all(stop_pfreq < 0.01, na.rm = TRUE))
+}
+```
+
+---
+
+## Section 4: Helper objects
+
+```{r helpers}
+site_labels <- c(esite = "E site", psite = "P site", asite = "A site")
+```
+
+---
+
+## Plot 0: siCTRL normoxia vs hypoxia codon frequency per site
+
+Scatter of mean relative frequency in siCTRL normoxia (x) vs siCTRL hypoxia (y), faceted
+by site (columns) and gene set (rows). Top 15% residuals from y=x are labelled per panel.
+
+```{r plot_0, fig.width=11, fig.height=8}
+plot_0_df <- codon_means %>%
+  dplyr::filter(treatment == "siCTRL", !aa %in% c("Stop", NA)) %>%
+  dplyr::select(gene_set, codon, aa, site, condition, mean_freq) %>%
+  pivot_wider(names_from = condition, values_from = mean_freq) %>%
+  mutate(residual = hypoxia - normoxia,
+         site = factor(site, levels = c("esite", "psite", "asite"), labels = site_labels)) %>%
+  group_by(gene_set, site) %>%
+  mutate(label = ifelse(abs(residual) >= quantile(abs(residual), 0.85, na.rm = TRUE),
+                        codon, NA_character_)) %>%
+  ungroup()
+
+lim_0 <- max(plot_0_df$normoxia, plot_0_df$hypoxia, na.rm = TRUE)
+
+p_0 <- ggplot(plot_0_df, aes(x = normoxia, y = hypoxia, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  facet_grid(gene_set ~ site) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, lim_0)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, lim_0)) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title    = "Codon frequency: siCTRL normoxia vs hypoxia, 1hr",
+    subtitle = "Top 15% residuals from y=x labelled per panel",
+    x        = "siCTRL normoxia",
+    y        = "siCTRL hypoxia",
+    color    = "Amino acid"
+  )
+
+print(p_0)
+ggsave(here("plots", "60_codon_freq_normoxia_vs_hypoxia_sictrl.pdf"), p_0,
+       width = 11, height = 8)
+```
+
+---
+
+## Plot 0b: siCTRL normoxia vs si3d normoxia codon frequency per site
+
+```{r plot_0b, fig.width=11, fig.height=8}
+plot_0b_df <- codon_means %>%
+  dplyr::filter(condition == "normoxia", treatment %in% c("siCTRL", "si3d"),
+                !aa %in% c("Stop", NA)) %>%
+  dplyr::select(gene_set, codon, aa, site, treatment, mean_freq) %>%
+  pivot_wider(names_from = treatment, values_from = mean_freq) %>%
+  mutate(residual = si3d - siCTRL,
+         site = factor(site, levels = c("esite", "psite", "asite"), labels = site_labels)) %>%
+  group_by(gene_set, site) %>%
+  mutate(label = ifelse(abs(residual) >= quantile(abs(residual), 0.85, na.rm = TRUE),
+                        codon, NA_character_)) %>%
+  ungroup()
+
+lim_0b <- max(plot_0b_df$siCTRL, plot_0b_df$si3d, na.rm = TRUE)
+
+p_0b <- ggplot(plot_0b_df, aes(x = siCTRL, y = si3d, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  facet_grid(gene_set ~ site) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, lim_0b)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, lim_0b)) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title    = "Codon frequency: siCTRL vs si3d normoxia, 1hr",
+    subtitle = "Top 15% residuals from y=x labelled per panel",
+    x        = "siCTRL normoxia",
+    y        = "si3d normoxia",
+    color    = "Amino acid"
+  )
+
+print(p_0b)
+ggsave(here("plots", "60_codon_freq_sictrl_vs_si3d_normoxia.pdf"), p_0b,
+       width = 11, height = 8)
+```
+
+---
+
+## Plot 0c: siCTRL hypoxia vs si3d hypoxia codon frequency per site
+
+```{r plot_0c, fig.width=11, fig.height=8}
+plot_0c_df <- codon_means %>%
+  dplyr::filter(condition == "hypoxia", treatment %in% c("siCTRL", "si3d"),
+                !aa %in% c("Stop", NA)) %>%
+  dplyr::select(gene_set, codon, aa, site, treatment, mean_freq) %>%
+  pivot_wider(names_from = treatment, values_from = mean_freq) %>%
+  mutate(residual = si3d - siCTRL,
+         site = factor(site, levels = c("esite", "psite", "asite"), labels = site_labels)) %>%
+  group_by(gene_set, site) %>%
+  mutate(label = ifelse(abs(residual) >= quantile(abs(residual), 0.85, na.rm = TRUE),
+                        codon, NA_character_)) %>%
+  ungroup()
+
+lim_0c <- max(plot_0c_df$siCTRL, plot_0c_df$si3d, na.rm = TRUE)
+
+p_0c <- ggplot(plot_0c_df, aes(x = siCTRL, y = si3d, color = aa)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.6) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 25,
+                  show.legend = FALSE) +
+  facet_grid(gene_set ~ site) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, lim_0c)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, lim_0c)) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  ) +
+  labs(
+    title    = "Codon frequency: siCTRL vs si3d hypoxia, 1hr",
+    subtitle = "Top 15% residuals from y=x labelled per panel",
+    x        = "siCTRL hypoxia",
+    y        = "si3d hypoxia",
+    color    = "Amino acid"
+  )
+
+print(p_0c)
+ggsave(here("plots", "60_codon_freq_sictrl_vs_si3d_hypoxia.pdf"), p_0c,
+       width = 11, height = 8)
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```
