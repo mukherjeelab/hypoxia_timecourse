@@ -1,0 +1,641 @@
+---
+title: "`r paste0('Random Forest Permutation Importance: eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set: "external_stability"
+  clip_mode: "aggregate"
+  exclude_4e_features: false
+  exclude_own_te_features: true
+  neg_geneset_csv: ""
+  feature_matrix_path: ""
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    condition = "normoxia",
+    gene      = "3d",
+    direction = "promotes",
+    timepoint = "1and4hr",
+    lfc       = "0.5",
+    feature_set = "external_stability",
+    clip_mode   = "aggregate",
+    exclude_4e_features     = FALSE,
+    exclude_own_te_features = TRUE,
+    neg_geneset_csv = "",
+    feature_matrix_path = ""
+  )
+}
+
+geneset_csv <- if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
+  paste0("translation_categories_si", params$gene, "_vs_sictrl_", params$condition, "_", params$timepoint, ".csv")
+} else {
+  paste0(params$condition, "_", params$gene, "_", params$direction,
+         "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
+}
+feature_matrix_rds <- if (params$feature_set == "te_lfc") {
+  "feature_matrix_te_lfc.rds"
+} else if (params$feature_set == "codon_optimality") {
+  "feature_matrix_codon_optimality.rds"
+} else if (params$feature_set == "kozak") {
+  "feature_matrix_kozak.rds"
+} else if (params$feature_set == "cnot3") {
+  "feature_matrix_cnot3.rds"
+} else if (params$feature_set == "external_stability") {
+  "feature_matrix_external_stability.rds"
+} else if (params$feature_set == "codon_features") {
+  "feature_matrix_codon_features.rds"
+} else if (params$feature_set == "codon_only") {
+  "feature_matrix_codon_only.rds"
+} else if (params$feature_set == "clip_split") {
+  paste0("feature_matrix_", params$timepoint, "_clip_split.rds")
+} else if (params$feature_set == "structure") {
+  paste0("feature_matrix_", params$timepoint, "_structure.rds")
+} else {
+  paste0("feature_matrix_", params$timepoint, "_combined.rds")
+}
+if (!is.null(params$feature_matrix_path) && nchar(params$feature_matrix_path) > 0) {
+  feature_matrix_rds <- params$feature_matrix_path
+}
+suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 params$condition, "_", params$timepoint, "_lfc", params$lfc,
+                 "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta",
+                 if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
+                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
+suffix_perm <- paste0(suffix, "_perm")
+
+pos_label  <- params$direction
+neg_label  <- paste0("does_not_", sub("s$", "", params$direction))
+gene_label <- paste0("eIF", params$gene)
+
+cat("Gene set CSV:", geneset_csv, "\n")
+cat("Feature matrix:", feature_matrix_rds, "\n")
+cat("Output suffix (perm):", suffix_perm, "\n")
+```
+
+# Overview
+
+Permutation importance validation for the eIF3d/3e RF classifier. A second `ranger` model is trained on identical data (same split, same seed as notebook 07) using `importance = "permutation"` (mean decrease in OOB prediction accuracy when each feature is shuffled). This directly confirms whether the codon features that rank highly under Gini impurity also rank highly under a less biased importance measure.
+
+- **Positive class ("`r pos_label`")**: `` `r geneset_csv` ``
+- **Negative class ("`r neg_label`")**: `negative_control_genes.csv` (or custom via `neg_geneset_csv`)
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+library(cowplot)
+library(ggpubr)
+```
+
+# Load Data
+
+```{r load_data}
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
+  positive_genes <- read_csv(here("output", geneset_csv)) %>%
+    filter(te_lfc > as.numeric(params$lfc), te_padj < 0.05) %>%
+    mutate(ensembl_gene = sub("\\..*", "", gene_id))
+} else {
+  positive_genes <- read_csv(here("output", "genesets", geneset_csv))
+}
+cat("Positive genes:", nrow(positive_genes), "\n")
+
+if (params$neg_geneset_csv != "") {
+  negative_control_genes <- read_csv(
+    here("output", "genesets", params$neg_geneset_csv),
+    show_col_types = FALSE
+  ) %>%
+    mutate(gene_id_clean = ensembl_gene)
+} else {
+  neg_csv <- if (params$gene == "3e") {
+    "negative_control_genes_si3e.csv"
+  } else {
+    "negative_control_genes.csv"
+  }
+  negative_control_genes <- read_csv(
+    here("output", "predictive_modeling", neg_csv),
+    show_col_types = FALSE
+  ) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id))
+}
+cat("Negative genes:", nrow(negative_control_genes), "\n")
+```
+
+# Create Binary Target
+
+```{r create_target}
+set.seed(9)
+
+pos_in_features <- positive_genes %>%
+  filter(ensembl_gene %in% features$gene_id_clean)
+cat("Positive genes in feature matrix:", nrow(pos_in_features), "\n")
+
+neg_in_features <- negative_control_genes %>%
+  filter(gene_id_clean %in% features$gene_id_clean)
+cat("Negative control genes in feature matrix:", nrow(neg_in_features), "\n")
+
+number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+
+features <- features %>%
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+    gene_id_clean %in% sample(neg_in_features$gene_id_clean, number_to_match) ~ neg_label,
+    TRUE ~ NA_character_
+  ))
+
+model_genes <- features %>%
+  filter(!is.na(eif3d_target)) %>%
+  mutate(eif3d_target = factor(eif3d_target, levels = c(neg_label, pos_label)))
+
+cat("Positive (", pos_label, "):", sum(model_genes$eif3d_target == pos_label), "\n")
+cat("Negative (", neg_label, "):", sum(model_genes$eif3d_target == neg_label), "\n")
+cat("Total:", nrow(model_genes), "\n")
+```
+
+# Preprocessing
+
+```{r filter_features}
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+all_cols <- colnames(model_genes)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols <- unique(c(id_cols, id_pattern_cols))
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count:", length(feature_cols), "\n")
+
+if (params$clip_mode == "aggregate") {
+  aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                           "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                           "clip_lee_glu_vs_cm_enrichment")
+  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+  feature_cols <- setdiff(feature_cols, regional_clip)
+  cat("CLIP mode: aggregate — dropped", length(regional_clip), "regional features\n")
+} else if (params$clip_mode == "individual") {
+  feature_cols <- setdiff(feature_cols, c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                                          "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                                          "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment"))
+  cat("CLIP mode: individual\n")
+} else {
+  cat("CLIP mode: both\n")
+}
+
+if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality",
+                               "kozak", "cnot3", "external_stability", "codon_features")) {
+  kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+  excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
+  feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+  cat("Targeted mode: removed", length(excluded), "k-mer/motif columns\n")
+}
+
+if (params$feature_set == "external_stability") {
+  codon_detail_cols <- feature_cols[str_detect(feature_cols, "^bg_rscu_|^codon_freq_")]
+  if (length(codon_detail_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, codon_detail_cols)
+    cat("external_stability mode: removed", length(codon_detail_cols), "bg_rscu_/codon_freq_ columns\n")
+  }
+}
+
+if (isTRUE(params$exclude_4e_features)) {
+  circular_regex <- "^4e_resistance|^eif4e_ip"
+  circular_lit_exact <- c(
+    "lit_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_suppressed_translation",
+    "lit_translation_is_sensitive_to_4E_inhibition",
+    "lit_translation_is_resistant_to_4E_inhibition"
+  )
+  circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) |
+                                feature_cols %in% circular_lit_exact]
+  if (length(circular_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, circular_cols)
+    cat("Removed", length(circular_cols), "circular eIF4E features\n")
+  }
+}
+
+if (isTRUE(params$exclude_own_te_features)) {
+  own_te_cols <- feature_cols[str_detect(feature_cols, "^indiv_te_|^delta_te_|^sig_")]
+  if (length(own_te_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, own_te_cols)
+    cat("Removed", length(own_te_cols), "own-data TE features\n")
+  }
+}
+
+raw_length_cols <- feature_cols[str_detect(feature_cols, "^(utr5|utr3|cds|total)_length$")]
+if (length(raw_length_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, raw_length_cols)
+  cat("Removed", length(raw_length_cols), "raw length columns:", paste(raw_length_cols, collapse = ", "), "\n")
+}
+
+sparsity_threshold <- 0.5
+sparse_cols <- feature_cols[
+  sapply(feature_cols, function(f) mean(!is.na(unlist(model_genes[[f]]))) < sparsity_threshold)
+]
+if (length(sparse_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, sparse_cols)
+  cat("Removed", length(sparse_cols), "features with <", sparsity_threshold * 100, "% non-NA values:\n")
+  cat(paste(" ", sparse_cols, collapse = "\n"), "\n")
+}
+
+cat("Feature count after filtering:", length(feature_cols), "\n")
+
+list_cols <- feature_cols[sapply(feature_cols, function(f) is.list(model_genes[[f]]))]
+if (length(list_cols) > 0) {
+  cat("Coercing", length(list_cols), "list columns to numeric\n")
+  for (col in list_cols) model_genes[[col]] <- as.numeric(unlist(model_genes[[col]]))
+}
+```
+
+# Prepare Modeling Data
+
+```{r prepare_data}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols))
+
+cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+print(table(model_data$eif3d_target))
+```
+
+# Train/Test Split
+
+```{r train_test_split}
+set.seed(9)
+
+train_idx <- createDataPartition(model_data$eif3d_target, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+
+cat("Training set:", nrow(train_data), "\n")
+cat("Test set:", nrow(test_data), "\n")
+
+train_medians <- train_data %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~median(., na.rm = TRUE)))
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) {
+    df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  }
+  df
+}
+
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+```
+
+# Train Random Forest (Permutation Importance)
+
+```{r train_rf_perm}
+set.seed(9)
+rf_model_perm <- ranger(
+  x          = train_data[, feature_cols],
+  y          = train_data$eif3d_target,
+  num.trees  = 500,
+  importance = "permutation",
+  probability = TRUE,
+  seed       = 9
+)
+
+print(rf_model_perm)
+cat("OOB prediction error:", round(rf_model_perm$prediction.error, 4), "\n")
+```
+
+# Feature Importance
+
+```{r feature_importance, fig.width=10, fig.height=10}
+importance_df <- data.frame(
+  feature    = names(rf_model_perm$variable.importance),
+  importance = rf_model_perm$variable.importance
+) %>%
+  arrange(desc(importance))
+
+importance_df <- importance_df %>%
+  mutate(
+    feature_clean = feature %>%
+      str_replace("^utr5_4mer_", "5'UTR 4mer: ") %>%
+      str_replace("^utr3_4mer_", "3'UTR 4mer: ") %>%
+      str_replace("^cds_4mer_", "CDS 4mer: ") %>%
+      str_replace("^rbp_", "RBP: ") %>%
+      str_replace("^log2_", "log2 ") %>%
+      str_replace("_length$", " length") %>%
+      str_replace("_gc$", " GC%") %>%
+      str_replace("^bg_rscu_at_mean$", "bg-RSCU: AT-codon mean") %>%
+      str_replace("^bg_rscu_gc_mean$", "bg-RSCU: GC-codon mean") %>%
+      str_replace("^bg_rscu_deviation$", "bg-RSCU: deviation from background") %>%
+      str_replace("^bg_rscu_", "bg-RSCU: ") %>%
+      str_replace("^codon_freq_", "Codon freq: ")
+  )
+
+cat("Top 30 Features (permutation importance):\n")
+print(importance_df %>% head(30) %>% dplyr::select(feature, importance))
+
+p_importance <- importance_df %>%
+  head(30) %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Top 30 Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Permutation — mean decrease in OOB accuracy)",
+    x = "",
+    y = "Permutation Importance"
+  )
+
+print(p_importance)
+ggsave(here("plots", paste0("rf_classification_feature_importance_", suffix_perm, ".pdf")),
+       plot = p_importance, width = 10, height = 10)
+
+importance_all_plot <- importance_df %>% head(40)
+all_height <- max(6, nrow(importance_all_plot) * 0.35)
+
+p_importance_all <- importance_all_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Top ", nrow(importance_all_plot), " Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Permutation — mean decrease in OOB accuracy)",
+    x = "",
+    y = "Permutation Importance"
+  )
+
+print(p_importance_all)
+ggsave(here("plots", paste0("rf_classification_feature_importance_all_", suffix_perm, ".pdf")),
+       plot = p_importance_all, width = 10, height = all_height)
+
+importance_custom <- importance_df %>%
+  filter(!str_detect(feature, "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbp_|^rbns_|^cisbp_")) %>%
+  head(40)
+custom_height <- max(6, nrow(importance_custom) * 0.35)
+
+p_importance_custom <- importance_custom %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Custom Features: ", gene_label, " Target Classification (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Variable Importance (Permutation) — CLIP, 4E/DAP5, Signatures, Lengths, GC",
+    x = "",
+    y = "Permutation Importance"
+  )
+
+print(p_importance_custom)
+ggsave(here("plots", paste0("rf_classification_feature_importance_custom_", suffix_perm, ".pdf")),
+       plot = p_importance_custom, width = 10, height = custom_height)
+```
+
+## Feature Category Summary
+
+```{r feature_categories, fig.width=10, fig.height=6}
+importance_df <- importance_df %>%
+  mutate(
+    category = case_when(
+      str_detect(feature, "^struct_")                          ~ "RNA Structure",
+      str_detect(feature, "^orfquant_")                       ~ "ORFquant",
+      str_detect(feature, "^utr5_4mer_")                      ~ "5' UTR 4-mers",
+      str_detect(feature, "^utr3_4mer_")                      ~ "3' UTR 4-mers",
+      str_detect(feature, "^cds_4mer_")                       ~ "CDS 4-mers",
+      str_detect(feature, "^rbns_|^cisbp_")                   ~ "RBP Motifs",
+      str_detect(feature, "^clip_")                           ~ "CLIP Binding",
+      str_detect(feature, "^lit_")                            ~ "Literature Signatures",
+      str_detect(feature, "length|Length")                     ~ "Region Lengths",
+      str_detect(feature, "_gc$|^gc3$")                       ~ "GC Content",
+      str_detect(feature, "^4e_resistance|^eif4e_ip|^dap5_")  ~ "4E / DAP5",
+      str_detect(feature, "^indiv_te_|^delta_te_")            ~ "Translational Efficiency",
+      str_detect(feature, "^cai$|^tai$|^csc$")               ~ "Codon Optimality",
+      str_detect(feature, "^bg_rscu_")                        ~ "Background RSCU",
+      str_detect(feature, "^codon_freq_")                     ~ "Codon Frequency",
+      TRUE                                                    ~ "Other"
+    )
+  )
+
+category_summary <- importance_df %>%
+  group_by(category) %>%
+  summarise(
+    n_features       = n(),
+    total_importance = sum(importance),
+    mean_importance  = mean(importance),
+    top_feature      = feature[which.max(importance)],
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_importance))
+
+cat("\nPermutation Importance by Category:\n")
+print(category_summary)
+
+p_category <- ggplot(category_summary,
+                     aes(x = reorder(category, total_importance), y = total_importance)) +
+  geom_bar(stat = "identity", fill = "#56B4E9") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title = paste0("Feature Importance by Category (", tools::toTitleCase(params$condition), ")"),
+    subtitle = "Total Permutation Importance",
+    x = "",
+    y = "Total Permutation Importance"
+  )
+
+print(p_category)
+ggsave(here("plots", paste0("rf_classification_importance_by_category_", suffix_perm, ".pdf")),
+       plot = p_category, width = 10, height = 6)
+```
+
+## Directionality & Signed-Importance Lollipop
+
+```{r compute_directionality}
+target_numeric <- as.numeric(model_genes$eif3d_target) - 1
+
+directionality <- importance_df %>%
+  rowwise() %>%
+  mutate(
+    mean_promotes         = mean(model_genes[[feature]][target_numeric == 1], na.rm = TRUE),
+    mean_does_not_promote = mean(model_genes[[feature]][target_numeric == 0], na.rm = TRUE),
+    diff        = mean_promotes - mean_does_not_promote,
+    correlation = tryCatch(
+      cor(model_genes[[feature]], target_numeric, use = "complete.obs"),
+      error = function(e) NA_real_
+    ),
+    wilcox_p = tryCatch({
+      wt <- wilcox.test(model_genes[[feature]][target_numeric == 1],
+                        model_genes[[feature]][target_numeric == 0])
+      wt$p.value
+    }, error = function(e) NA_real_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    wilcox_p_adj = p.adjust(wilcox_p, method = "BH"),
+    direction    = case_when(
+      is.na(correlation) ~ NA_character_,
+      correlation > 0    ~ "Higher in promotes",
+      TRUE               ~ "Lower in promotes"
+    )
+  ) %>%
+  arrange(desc(importance))
+
+cat("Directionality computed for", nrow(directionality), "features\n")
+cat("Higher in promotes:", sum(directionality$direction == "Higher in promotes", na.rm = TRUE), "\n")
+cat("Lower in promotes: ", sum(directionality$direction == "Lower in promotes",  na.rm = TRUE), "\n")
+```
+
+```{r plot_lollipop, fig.width=10, fig.height=10}
+lollipop_data <- directionality %>%
+  filter(!is.na(correlation)) %>%
+  head(30) %>%
+  mutate(
+    signed_importance = importance * sign(correlation),
+    broad_category = case_when(
+      category == "4E / DAP5" & str_detect(feature, "^dap5_") ~ "Sensitivity to DAP5",
+      category == "4E / DAP5"                                  ~ "Sensitivity to eIF4E",
+      category %in% c("CLIP Binding", "Literature Signatures") ~ "eIF3 binding evidence",
+      category == "Translational Efficiency"                   ~ "Translation in hypoxia",
+      TRUE                                                     ~ "Intrinsic mRNA features"
+    ),
+    broad_category = factor(broad_category, levels = c(
+      "Intrinsic mRNA features", "eIF3 binding evidence",
+      "Sensitivity to DAP5", "Sensitivity to eIF4E", "Translation in hypoxia"
+    )),
+    feature_clean = fct_reorder(feature_clean, signed_importance)
+  )
+
+category_colors <- c(
+  "Intrinsic mRNA features" = "#3D9C60",
+  "eIF3 binding evidence"   = "#E6A817",
+  "Sensitivity to DAP5"     = "#D668C6",
+  "Sensitivity to eIF4E"    = "#4A7FC1",
+  "Translation in hypoxia"  = "#E07030"
+)
+
+p_lollipop <- ggdotchart(
+  lollipop_data,
+  x        = "feature_clean",
+  y        = "signed_importance",
+  color    = "broad_category",
+  palette  = category_colors,
+  sorting  = "none",
+  add      = "segments",
+  rotate   = TRUE,
+  dot.size = 4,
+  xlab     = "",
+  ylab     = "Signed Permutation Importance (positive = higher in promotes)",
+  title    = "Top 30 Features: Signed Permutation Importance",
+  subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition),
+                    " | ", params$timepoint, " | LFC ", params$lfc)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(legend.title = element_blank())
+
+print(p_lollipop)
+ggsave(here("plots", paste0("rf_directionality_lollipop_", suffix_perm, ".pdf")),
+       plot = p_lollipop, width = 10, height = 10)
+```
+
+# Final Feature Importance Plot
+
+```{r final_importance_plot, fig.width=8, fig.height=max(4, min(40, length(feature_cols)) * 0.35)}
+importance_final_plot <- importance_df %>% head(40)
+final_height <- max(4, nrow(importance_final_plot) * 0.35)
+
+p_final_importance <- importance_final_plot %>%
+  ggplot(aes(x = reorder(feature_clean, importance), y = importance)) +
+  geom_segment(aes(xend = reorder(feature_clean, importance), y = 0, yend = importance),
+               color = "grey60", linewidth = 0.6) +
+  geom_point(size = 3, color = "#0072B2") +
+  coord_flip() +
+  theme_cowplot() +
+  labs(
+    title    = paste0("Feature Importance: ", gene_label, " Target Classification"),
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | LFC ", params$lfc, " | Permutation Importance"),
+    x = "",
+    y = "Permutation Importance"
+  )
+
+print(p_final_importance)
+ggsave(here("plots", paste0("rf_final_importance_", suffix_perm, ".pdf")),
+       plot = p_final_importance, width = 8, height = final_height)
+```
+
+# Export Results
+
+```{r export_results}
+output_dir <- here("output", "predictive_modeling")
+
+saveRDS(rf_model_perm,
+        file.path(output_dir, paste0("rf_classifier_", suffix_perm, ".rds")))
+
+write_csv(importance_df,
+          file.path(output_dir, paste0("rf_classification_importance_", suffix_perm, ".csv")))
+
+directionality_export <- directionality %>%
+  mutate(signed_importance = importance * sign(correlation))
+write_csv(directionality_export,
+          file.path(output_dir, paste0("rf_classification_directionality_", suffix_perm, ".csv")))
+
+cat("Exported: model RDS, importance CSV, directionality CSV\n")
+```
+
+# Summary
+
+```{r summary}
+cat("========================================\n")
+cat(paste0("PERMUTATION IMPORTANCE SUMMARY (", tools::toTitleCase(params$condition), ")\n"))
+cat("========================================\n\n")
+
+cat("Parameters:\n")
+cat("  Condition:", params$condition, "\n")
+cat("  Gene:", gene_label, "\n")
+cat("  Direction:", params$direction, "\n")
+cat("  Timepoint:", params$timepoint, "\n")
+cat("  LFC threshold:", params$lfc, "\n")
+cat("  Feature set:", params$feature_set, "\n")
+cat("  CLIP mode:", params$clip_mode, "\n\n")
+
+cat("Classes:\n")
+cat("  Positive (", pos_label, "):", sum(model_data$eif3d_target == pos_label), "\n")
+cat("  Negative (", neg_label, "):", sum(model_data$eif3d_target == neg_label), "\n")
+cat("  Features:", length(feature_cols), "\n\n")
+
+cat("OOB prediction error:", round(rf_model_perm$prediction.error, 4), "\n\n")
+
+cat("Top 10 Features (permutation importance):\n")
+for (i in 1:10) {
+  cat("  ", i, ". ", importance_df$feature[i],
+      " (", round(importance_df$importance[i], 4), ")\n", sep = "")
+}
+
+cat("\nPermutation importance by category:\n")
+print(category_summary %>% dplyr::select(category, n_features, total_importance, mean_importance))
+
+cat("========================================\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

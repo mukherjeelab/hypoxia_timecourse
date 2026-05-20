@@ -1,0 +1,384 @@
+---
+title: "59 — Pooled RSCU by tRNA Isodecoder Diversity (MDA-MB-231)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Builds on notebook 54 (pooled RSCU, hypoxia vs normoxia eIF3d-promoted genes,
+MDA-MB-231). Instead of recomputing RSCU, this notebook loads the nb54 output
+CSV and overlays per-codon tRNA isodecoder diversity scraped from GtRNAdb (hg38).
+
+**Hypothesis:** Codons whose cognate anticodon has many distinct isodecoder
+body-sequence variants (high isodecoder count) are enriched in hypoxia-promoted
+genes. More isodecoder diversity implies more potential for stress-responsive
+regulation of that tRNA pool.
+
+Isodecoder count per codon = sum of isodecoder counts across all anticodons that
+can decode that codon (using standard eukaryotic wobble rules: inosine at
+anticodon position 34 reads codon third positions A/C/U; G at position 34 reads
+C and U; C reads G only; U reads A only).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(Biostrings)
+library(rvest)
+library(ggrepel)
+```
+
+---
+
+# Section 1: Genetic Code Setup
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+cat("Sense codons:", length(sense_codons), "\n")
+cat("Multi-synonymous amino acids:", length(multi_aa), "\n")
+```
+
+---
+
+# Section 2: Load nb54 Delta-RSCU Data
+
+```{r load_rscu}
+rscu_df <- read_csv(
+  here("output", "predictive_modeling", "bg_rscu_pooled_231_hyp_vs_nor.csv"),
+  show_col_types = FALSE
+)
+cat("Delta-RSCU rows:", nrow(rscu_df), "\n")
+cat("Columns:", paste(colnames(rscu_df), collapse = ", "), "\n")
+stopifnot(all(c("codon", "amino_acid", "delta_rscu", "significant", "gc3_class") %in%
+                colnames(rscu_df)))
+```
+
+---
+
+# Section 3: Scrape GtRNAdb Isodecoder Counts
+
+Fetch the GtRNAdb hg38 summary page and extract per-anticodon isodecoder counts.
+Each table cell contains `ANTICODON <br/> COUNT`; `html_text2()` renders `<br/>`
+as newline.
+
+```{r scrape_gtrnadb}
+gtrnadb_url <- "https://gtrnadb.ucsc.edu/genomes/eukaryota/Hsapi38/"
+page <- rvest::read_html(gtrnadb_url)
+tables <- page %>% rvest::html_nodes("table")
+cat("Tables found on page:", length(tables), "\n")
+
+parse_trna_table <- function(tbl) {
+  rows <- tbl %>% rvest::html_nodes("tr")
+  rows <- rows[sapply(rows, function(r) length(html_nodes(r, "th")) > 0)]
+
+  purrr::map_dfr(rows, function(row) {
+    aa_name <- row %>% rvest::html_node("th") %>% rvest::html_text(trim = TRUE)
+    cells   <- row %>% rvest::html_nodes("td")
+    if (length(cells) == 0) return(NULL)
+
+    # Last cell is total count — skip it
+    anticodon_cells <- cells[-length(cells)]
+
+    purrr::map_dfr(anticodon_cells, function(cell) {
+      txt   <- cell %>% rvest::html_text2()
+      lines <- str_trim(str_split(txt, "\n")[[1]])
+      lines <- lines[lines != "" & lines != " "]
+      if (length(lines) == 0) return(NULL)
+
+      anticodon <- lines[1]
+      count_raw <- if (length(lines) >= 2) lines[2] else NA_character_
+      count     <- suppressWarnings(as.integer(count_raw))
+
+      # Skip malformed cells (e.g. headers, totals)
+      if (!str_detect(anticodon, "^[ACGT]{3}$")) return(NULL)
+
+      tibble(amino_acid_long = aa_name,
+             anticodon       = anticodon,
+             isodecoder_count = if_else(is.na(count), 0L, count))
+    })
+  })
+}
+
+gtrna_df <- purrr::map_dfr(tables, parse_trna_table) %>%
+  filter(!is.na(anticodon)) %>%
+  distinct(anticodon, .keep_all = TRUE)  # GtRNAdb lists each anticodon once
+
+cat("Anticodons scraped:", nrow(gtrna_df), "\n")
+print(gtrna_df %>% arrange(amino_acid_long, anticodon))
+```
+
+## Cross-check with human_trna_gcn.csv
+
+```{r crosscheck_gcn}
+gcn_ref <- read_csv(here("accessories", "human", "human_trna_gcn.csv"),
+                    comment = "#", show_col_types = FALSE)
+cat("GCN reference anticodons:", nrow(gcn_ref), "\n")
+
+in_gcn_not_scraped <- setdiff(gcn_ref$anticodon, gtrna_df$anticodon)
+in_scraped_not_gcn <- setdiff(gtrna_df$anticodon, gcn_ref$anticodon)
+cat("In GCN ref but not scraped:", length(in_gcn_not_scraped),
+    if (length(in_gcn_not_scraped) > 0) paste0(" → ", paste(in_gcn_not_scraped, collapse=", ")) else "", "\n")
+cat("Scraped but not in GCN ref:", length(in_scraped_not_gcn),
+    if (length(in_scraped_not_gcn) > 0) paste0(" → ", paste(in_scraped_not_gcn, collapse=", ")) else "", "\n")
+```
+
+---
+
+# Section 4: Map Anticodon → Decoded Codons (Wobble Expansion)
+
+```{r wobble_expansion}
+# Eukaryotic wobble rules (anticodon position 34 = first base of anticodon, 5'→3'):
+#   A → edited to inosine (I) by ADAT; I decodes codon position 3 = A, C, or T
+#   G → G:C (Watson-Crick) and G:U wobble; reads codon pos3 = C or T
+#   C → C:G only; reads codon pos3 = G
+#   T → U:A only; reads codon pos3 = A
+
+expand_anticodon_wobble <- function(anticodon) {
+  primary     <- as.character(Biostrings::reverseComplement(Biostrings::DNAString(anticodon)))
+  stem        <- substr(primary, 1, 2)   # codon positions 1-2 (fixed)
+  wobble_base <- substr(anticodon, 1, 1) # anticodon position 34
+
+  suffixes <- switch(wobble_base,
+    "A" = c("A", "C", "T"),
+    "G" = c("C", "T"),
+    "C" = "G",
+    "T" = "A",
+    character(0)
+  )
+
+  codons <- paste0(stem, suffixes)
+  # Restrict to sense codons (filters out stop codons for edge cases like Tyr-ATA)
+  intersect(codons, sense_codons)
+}
+
+# Expand each anticodon to its decoded codon(s)
+anticodon_codon_map <- gtrna_df %>%
+  mutate(decoded_codons = map(anticodon, expand_anticodon_wobble)) %>%
+  unnest(decoded_codons) %>%
+  rename(codon = decoded_codons)
+
+cat("Anticodon-codon pairs after wobble expansion:", nrow(anticodon_codon_map), "\n")
+```
+
+```{r aggregate_isodecoders}
+# Sum isodecoder counts across all anticodons that can decode each codon
+codon_isodecoder_df <- anticodon_codon_map %>%
+  group_by(codon) %>%
+  summarise(
+    n_isodecoders    = sum(isodecoder_count, na.rm = TRUE),
+    n_anticodons     = n(),
+    anticodons_list  = paste(anticodon, collapse = "; "),
+    .groups = "drop"
+  )
+
+cat("Codons with isodecoder assignments:", nrow(codon_isodecoder_df), "\n")
+```
+
+---
+
+# Section 5: Validation
+
+```{r validate_mapping}
+# Alanine: GCG should have fewest isodecoders (decoded only by CGC anticodon)
+ala_df <- codon_isodecoder_df %>% filter(codon %in% c("GCT", "GCC", "GCA", "GCG"))
+cat("Ala codon isodecoder counts:\n")
+print(ala_df)
+stopifnot("GCG should have fewer isodecoders than other Ala codons" =
+  ala_df$n_isodecoders[ala_df$codon == "GCG"] <
+  min(ala_df$n_isodecoders[ala_df$codon != "GCG"]))
+
+# All multi-synonymous sense codons are covered
+multi_codons <- unlist(aa_to_codons[multi_aa])
+missing_codons <- setdiff(multi_codons, codon_isodecoder_df$codon)
+cat("Multi-AA codons missing from isodecoder table:",
+    if (length(missing_codons) == 0) "none" else paste(missing_codons, collapse = ", "), "\n")
+stopifnot("All multi-AA codons must have isodecoder assignment" =
+  length(missing_codons) == 0)
+
+# Met and Trp are single-codon AAs — not in multi_aa
+stopifnot(!("ATG" %in% multi_codons), !("TGG" %in% multi_codons))
+
+cat("Validation passed.\n")
+```
+
+```{r save_isodecoder_csv}
+write_csv(codon_isodecoder_df,
+          here("output", "predictive_modeling", "codon_isodecoder_counts.csv"))
+cat("Saved: output/predictive_modeling/codon_isodecoder_counts.csv\n")
+```
+
+---
+
+# Section 6: Isodecoder Count Distribution
+
+```{r isodecoder_distribution, fig.width=6, fig.height=4}
+p_hist <- codon_isodecoder_df %>%
+  filter(codon %in% multi_codons) %>%
+  ggplot(aes(x = n_isodecoders)) +
+  geom_histogram(binwidth = 5, fill = "grey60", colour = "white") +
+  labs(x = "Isodecoder count (summed across anticodons)",
+       y = "Number of codons",
+       title = "Distribution of tRNA isodecoder counts per codon (multi-synonymous AAs)") +
+  theme_classic(base_size = 12)
+p_hist
+
+# Print summary to choose bins
+cat("Isodecoder count summary (multi-AA codons):\n")
+codon_isodecoder_df %>%
+  filter(codon %in% multi_codons) %>%
+  pull(n_isodecoders) %>%
+  summary() %>%
+  print()
+```
+
+---
+
+# Section 7: Join to Delta-RSCU and Bin
+
+```{r join_and_bin}
+# Natural bin breakpoints based on biological groupings visible in the histogram
+plot_df <- rscu_df %>%
+  filter(amino_acid %in% multi_aa) %>%
+  left_join(codon_isodecoder_df %>% dplyr::select(codon, n_isodecoders, n_anticodons,
+                                                    anticodons_list),
+            by = "codon") %>%
+  mutate(
+    isodecoder_bin = cut(
+      n_isodecoders,
+      breaks = c(0, 10, 20, 30, Inf),
+      labels = c("1–10", "11–20", "21–30", "31+"),
+      include.lowest = TRUE
+    )
+  )
+
+stopifnot("NA isodecoder counts after join" = !any(is.na(plot_df$n_isodecoders)))
+
+cat("Codons per isodecoder bin:\n")
+print(count(plot_df, isodecoder_bin))
+```
+
+---
+
+# Section 8: Lollipop Plot — Faceted by Isodecoder Bin
+
+Adapts the nb54 ranked lollipop. Each panel shows the codons in that isodecoder
+count tier, ranked by Δ pooled RSCU. Color = GC3 class (matches nb54 palette).
+Shape = significance (BH q < 0.05).
+
+```{r plot_lollipop_facet, fig.width=9, fig.height=11}
+plot_lollipop <- plot_df %>%
+  mutate(
+    sig = case_when(
+      !is.na(significant) & significant & delta_rscu >= 0 ~ "Hypoxia only",
+      !is.na(significant) & significant & delta_rscu <  0 ~ "Normoxia only",
+      TRUE ~ "Neither"
+    ),
+    sig   = factor(sig, levels = c("Hypoxia only", "Normoxia only", "Neither")),
+    codon = fct_reorder(codon, delta_rscu)
+  )
+
+p_lollipop_facet <- ggplot(plot_lollipop,
+                            aes(x = delta_rscu, y = codon, colour = gc3_class)) +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_point(aes(shape = sig), size = 2) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  scale_shape_manual(
+    values = c("Hypoxia only" = 17, "Normoxia only" = 15, "Neither" = 16),
+    name   = "Significant (BH q < 0.05)"
+  ) +
+  facet_wrap(~ isodecoder_bin, scales = "free_y", ncol = 2,
+             labeller = labeller(isodecoder_bin = function(x) paste0("Isodecoders: ", x))) +
+  labs(
+    x        = "Δ pooled RSCU (hypoxia − normoxia)",
+    y        = NULL,
+    title    = "Ranked Δ Pooled RSCU by tRNA Isodecoder Diversity (MDA-MB-231)",
+    subtitle = "Positive = stronger codon usage in hypoxia-promoted gene pool.\nFacets show anticodon isodecoder count bins."
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y      = element_text(size = 7, family = "mono"),
+    legend.position  = "top",
+    legend.box       = "vertical",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 9)
+  )
+
+p_lollipop_facet
+ggsave(here("plots", "59_rscu_lollipop_isodecoder_facet.pdf"),
+       p_lollipop_facet, width = 9, height = 11)
+```
+
+---
+
+# Section 9: Scatter — Isodecoder Count vs Δ RSCU
+
+```{r plot_scatter, fig.width=6, fig.height=5}
+spearman_r <- cor(plot_df$n_isodecoders, plot_df$delta_rscu,
+                  method = "spearman", use = "complete.obs")
+spearman_p <- cor.test(plot_df$n_isodecoders, plot_df$delta_rscu,
+                       method = "spearman")$p.value
+cat(sprintf("Spearman r = %.3f, p = %.3e\n", spearman_r, spearman_p))
+
+p_scatter <- ggplot(plot_df, aes(x = n_isodecoders, y = delta_rscu)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey60") +
+  geom_point(aes(colour = gc3_class), alpha = 0.75, size = 2) +
+  geom_smooth(method = "loess", colour = "black", linewidth = 0.6, se = TRUE,
+              alpha = 0.15) +
+  ggrepel::geom_label_repel(
+    data        = plot_df %>% filter(!is.na(significant) & significant),
+    aes(label   = codon),
+    size        = 2.5,
+    max.overlaps = 20,
+    label.padding = 0.15
+  ) +
+  annotate("text",
+           x = Inf, y = Inf,
+           label = sprintf("Spearman r = %.3f\np = %.3e", spearman_r, spearman_p),
+           hjust = 1.1, vjust = 1.4, size = 3.2) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#0072B2"),
+                      name = "Third-position") +
+  labs(
+    x        = "Number of tRNA isodecoders (summed across anticodons)",
+    y        = "Δ pooled RSCU (hypoxia − normoxia)",
+    title    = "Isodecoder diversity vs codon preference shift (MDA-MB-231)",
+    subtitle = "Positive Δ RSCU = enriched in hypoxia-promoted gene pool."
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_scatter
+ggsave(here("plots", "59_rscu_scatter_isodecoder.pdf"),
+       p_scatter, width = 6, height = 5)
+```
+
+---
+
+# Section 10: Summary Table
+
+```{r summary_table}
+plot_df %>%
+  dplyr::select(codon, amino_acid, gc3_class, n_isodecoders, n_anticodons,
+                anticodons_list, delta_rscu, significant) %>%
+  arrange(isodecoder_bin = cut(n_isodecoders, breaks = c(0,10,20,30,Inf),
+                               include.lowest = TRUE),
+          delta_rscu) %>%
+  knitr::kable(digits = 3, caption = "All codons with isodecoder diversity and delta-RSCU")
+```
