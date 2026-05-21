@@ -19,6 +19,8 @@ library(ggrepel)
 library(ggvenn)
 library(ggokabeito)
 library(cowplot)
+library(pheatmap)
+library(matrixStats)
 ```
 
 # Load inputs from 00
@@ -34,6 +36,8 @@ metadata  <- read_csv(here("ripseq", "output", "ripseq_metadata_clean.csv"),
   )
 
 cat("allCounts:", nrow(allCounts), "genes x", ncol(allCounts), "samples\n")
+
+OUTLIER_ID <- "0077"
 cat("metadata:", nrow(metadata), "rows\n")
 cat("condition levels:", levels(metadata$condition), "\n")
 cat("ip_type levels:", levels(metadata$ip_type), "\n")
@@ -63,37 +67,87 @@ timepoints <- list(
   hypoxia_24hr = list(condition = "hypoxia",  hours = "24")
 )
 
-deseq_results <- list()
-
-for (tp_name in names(timepoints)) {
-  tp <- timepoints[[tp_name]]
-
-  meta_sub <- metadata |>
-    filter(condition == tp$condition, hours == tp$hours,
-           ip_type %in% c("flag_eif3d", "igg_mock"))
-  meta_sub$ip_type <- relevel(droplevels(factor(meta_sub$ip_type)), ref = "igg_mock")
-
-  cat("\n---", tp_name, "---\n")
-  cat("ip_type levels (reference first):", levels(meta_sub$ip_type), "\n")
-  cat("Samples:", nrow(meta_sub), "| per group:", table(meta_sub$ip_type), "\n")
-
-  # allCounts columns are compound names (e.g. "normoxia_flag_eif3d_1_a_NM2026_0045")
-  # match each sample ID as a suffix
-  cts_sub <- allCounts[, grep(paste(meta_sub$id, collapse = "|"), colnames(allCounts))]
-
-  dds <- DESeqDataSetFromMatrix(countData = cts_sub, colData = meta_sub, design = ~ ip_type)
-  dds <- DESeq(dds)
-  cat("Coefficients:", resultsNames(dds), "\n")
-
-  coef_name  <- resultsNames(dds)[grep("flag_eif3d", resultsNames(dds))]
-  res_shrunk <- lfcShrink(dds, coef = coef_name, type = "apeglm")
-
-  deseq_results[[tp_name]] <- as.data.frame(res_shrunk) |>
-    rownames_to_column("gene_id") |>
-    left_join(gene_anno, by = "gene_id") |>
-    mutate(timepoint = tp_name) |>
-    arrange(padj)
+run_deseq_lfc <- function(counts_mat, meta_df, ip_target = "flag_eif3d") {
+  results <- list()
+  for (tp_name in names(timepoints)) {
+    tp       <- timepoints[[tp_name]]
+    meta_sub <- meta_df |>
+      filter(condition == tp$condition, hours == tp$hours,
+             ip_type %in% c(ip_target, "igg_mock"))
+    meta_sub$ip_type <- relevel(droplevels(factor(meta_sub$ip_type)), ref = "igg_mock")
+    # allCounts columns are compound names (e.g. "normoxia_flag_eif3d_1_a_NM2026_0045")
+    cts_sub  <- counts_mat[, grep(paste(meta_sub$id, collapse = "|"), colnames(counts_mat))]
+    dds      <- DESeqDataSetFromMatrix(cts_sub, meta_sub, design = ~ ip_type)
+    dds      <- DESeq(dds, quiet = TRUE)
+    coef     <- resultsNames(dds)[grep(ip_target, resultsNames(dds))]
+    res      <- as.data.frame(lfcShrink(dds, coef = coef, type = "apeglm"))
+    results[[tp_name]] <- res |>
+      rownames_to_column("gene_id") |>
+      left_join(gene_anno, by = "gene_id") |>
+      mutate(timepoint = tp_name) |>
+      arrange(padj)
+  }
+  results
 }
+
+deseq_results_full   <- run_deseq_lfc(allCounts, metadata)
+deseq_results_no_out <- run_deseq_lfc(
+  allCounts[, !grepl(OUTLIER_ID, colnames(allCounts))],
+  metadata |> dplyr::filter(!grepl(OUTLIER_ID, id))
+)
+```
+
+# log2FC distributions: with vs without outlier
+
+```{r density_comparison}
+tp_levels <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+
+lfc_compare <- bind_rows(
+  bind_rows(deseq_results_full)   |> mutate(status = paste0("with ",    OUTLIER_ID)),
+  bind_rows(deseq_results_no_out) |> mutate(status = paste0("without ", OUTLIER_ID))
+) |>
+  dplyr::filter(!is.na(log2FoldChange)) |>
+  mutate(
+    timepoint = factor(timepoint, levels = tp_levels),
+    status    = factor(status, levels = c(paste0("with ",    OUTLIER_ID),
+                                          paste0("without ", OUTLIER_ID)))
+  )
+
+# normoxia_1hr only: with vs without outlier (2 panels)
+p_compare <- lfc_compare |>
+  dplyr::filter(timepoint == "normoxia_1hr") |>
+  ggplot(aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#E69F00", fill = "#E69F00", alpha = 0.15) +
+  facet_wrap(~ status, nrow = 1) +
+  xlim(-1, 1) +
+  labs(x = "log2FC (eIF3d IP / IgG)", y = "Density",
+       title = "normoxia 1hr: with vs without outlier") +
+  theme_classic(base_size = 12)
+
+p_compare
+ggsave(here("ripseq", "plots", "ripseq_density_outlier_comparison.pdf"),
+       p_compare, width = 6, height = 3)
+
+# 4-panel: without outlier only
+p_without <- bind_rows(deseq_results_no_out) |>
+  dplyr::filter(!is.na(log2FoldChange)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  ggplot(aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#E69F00", fill = "#E69F00", alpha = 0.15) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  xlim(-1, 1) +
+  labs(x = "log2FC (eIF3d IP / IgG)", y = "Density",
+       title = paste0("log2FC density: without outlier (", OUTLIER_ID, ")")) +
+  theme_classic(base_size = 12)
+
+p_without
+ggsave(here("ripseq", "plots", "ripseq_density_no_outlier.pdf"),
+       p_without, width = 12, height = 3)
+```
+
+```{r select_results}
+# Change to deseq_results_full to include the outlier
+deseq_results <- deseq_results_no_out
 ```
 
 ```{r save_results}
@@ -106,38 +160,355 @@ for (tp_name in names(deseq_results)) {
 }
 saveRDS(deseq_results, here("ripseq", "output", "ripseq_deseq_results_list.rds"))
 cat("Saved DESeq2 results for", length(deseq_results), "timepoints\n")
-
-
-norm_1 <- deseq_results$normoxia_1hr
-hyp_1 <- deseq_results$hypoxia_1hr
-hyp_4 <- deseq_results$hypoxia_4hr
-hyp_24 <- deseq_results$hypoxia_24hr
-
 ```
 
-distributions
+```{r density_eif3d_v2, fig.width=12, fig.height=3}
+enriched_counts_3d <- bind_rows(deseq_results) |>
+  filter(!is.na(log2FoldChange), !is.na(padj)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  group_by(timepoint) |>
+  summarise(n_enriched = sum(log2FoldChange > LFC_CUTOFF & padj < PADJ_CUTOFF),
+            .groups = "drop") |>
+  mutate(label = paste0("LFC>1, padj<0.05, n = ", n_enriched))
 
-```{r}
+p_density_3d_v2 <- bind_rows(deseq_results) |>
+  filter(!is.na(log2FoldChange)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  ggplot(aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#E69F00", fill = "#E69F00", alpha = 0.15) +
+  geom_text(data = enriched_counts_3d, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            inherit.aes = FALSE, size = 3) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(x = "log2FC (eIF3d IP / IgG)", y = "Density") +
+  theme_classic(base_size = 12) +
+  xlim(-2, 10)
 
-ggplot(norm_1, aes(x=log2FoldChange))+
-  geom_density()
-
-ggplot(hyp_1, aes(x=log2FoldChange))+
-  geom_density()
-
-ggplot(hyp_4, aes(x=log2FoldChange))+
-  geom_density()
-
-ggplot(hyp_24, aes(x=log2FoldChange))+
-  geom_density()
-
+p_density_3d_v2
+ggsave(here("ripseq", "plots", "ripseq_density_eif3d_v2.pdf"), p_density_3d_v2,
+       width = 12, height = 3)
 ```
 
+# Per-timepoint DESeq2: eIF4E vs IgG-mock
 
+```{r run_deseq_4e}
+cts_no_out  <- allCounts[, !grepl(OUTLIER_ID, colnames(allCounts))]
+meta_no_out <- metadata |> dplyr::filter(!grepl(OUTLIER_ID, id))
 
+deseq_results_4e_full <- run_deseq_lfc(allCounts, metadata, ip_target = "eif4e")
+deseq_results_4e      <- run_deseq_lfc(cts_no_out, meta_no_out, ip_target = "eif4e")
+```
 
+```{r density_4e}
+p_density_4e <- bind_rows(deseq_results_4e) |>
+  dplyr::filter(!is.na(log2FoldChange)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  ggplot(aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#56B4E9", fill = "#56B4E9", alpha = 0.15) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  xlim(-1, 1) +
+  labs(x = "log2FC (eIF4E IP / IgG)", y = "Density",
+       title = "log2FC density: eIF4E vs IgG") +
+  theme_classic(base_size = 12)
 
+p_density_4e
+ggsave(here("ripseq", "plots", "ripseq_density_4e.pdf"), p_density_4e, width = 12, height = 3)
+```
 
+```{r density_comparison_4e}
+lfc_compare_4e <- bind_rows(
+  bind_rows(deseq_results_4e_full) |> mutate(status = paste0("with ",    OUTLIER_ID)),
+  bind_rows(deseq_results_4e)      |> mutate(status = paste0("without ", OUTLIER_ID))
+) |>
+  dplyr::filter(!is.na(log2FoldChange), timepoint == "normoxia_1hr") |>
+  mutate(status = factor(status, levels = c(paste0("with ",    OUTLIER_ID),
+                                            paste0("without ", OUTLIER_ID))))
+
+p_compare_4e <- ggplot(lfc_compare_4e, aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#56B4E9", fill = "#56B4E9", alpha = 0.15) +
+  facet_wrap(~ status, nrow = 1) +
+  labs(x = "log2FC (eIF4E IP / IgG)", y = "Density",
+       title = "normoxia 1hr eIF4E: with vs without outlier") +
+  theme_classic(base_size = 12)
+
+p_compare_4e
+ggsave(here("ripseq", "plots", "ripseq_density_outlier_comparison_4e.pdf"),
+       p_compare_4e, width = 6, height = 3)
+```
+
+```{r save_results_4e}
+for (tp_name in names(deseq_results_4e)) {
+  write_csv(
+    deseq_results_4e[[tp_name]],
+    here("ripseq", "output",
+         paste0("ripseq_deseq_", tp_name, "_eif4e_vs_igg.csv"))
+  )
+}
+saveRDS(deseq_results_4e, here("ripseq", "output", "ripseq_deseq_4e_results_list.rds"))
+cat("Saved eIF4E DESeq2 results for", length(deseq_results_4e), "timepoints\n")
+```
+
+# Post-normalization QC
+
+```{r norm_counts}
+meta_qc <- metadata |> dplyr::filter(!grepl(OUTLIER_ID, id))
+cts_qc  <- allCounts[, grep(paste(meta_qc$id, collapse = "|"), colnames(allCounts))]
+
+dds_qc  <- DESeqDataSetFromMatrix(cts_qc, meta_qc, design = ~ ip_type)
+dds_qc  <- estimateSizeFactors(dds_qc)
+qcinput <- log2(counts(dds_qc, normalized = TRUE) + 1)
+qcinput <- qcinput[matrixStats::rowSds(qcinput) > 1, ]
+cat("QC matrix after SD filter:", nrow(qcinput), "genes x", ncol(qcinput), "samples\n")
+```
+
+```{r qc_heatmap}
+col_ids <- sub(".*_(NM\\d+_\\d+)$", "\\1", colnames(qcinput))
+sample_anno <- data.frame(
+  ip_type   = as.character(meta_qc$ip_type[match(col_ids, meta_qc$id)]),
+  condition = as.character(meta_qc$condition[match(col_ids, meta_qc$id)]),
+  hours     = as.character(meta_qc$hours[match(col_ids, meta_qc$id)]),
+  row.names = colnames(qcinput)
+)
+
+mycor <- cor(qcinput, method = "pearson")
+p_heatmap <- pheatmap::pheatmap(
+  mat            = mycor,
+  annotation_col = sample_anno,
+  border_color   = "black",
+  scale          = "none",
+  cluster_rows   = TRUE,
+  cluster_cols   = TRUE,
+  fontsize       = 7
+)
+ggsave(here("ripseq", "plots", "ripseq_postnorm_heatmap.pdf"), p_heatmap, width = 14, height = 13)
+```
+
+```{r qc_pca}
+pca_res  <- prcomp(t(qcinput), scale. = TRUE)
+pca_data <- as.data.frame(pca_res$x) |>
+  rownames_to_column("sample") |>
+  mutate(id = sub(".*_(NM\\d+_\\d+)$", "\\1", sample)) |>
+  left_join(dplyr::select(meta_qc, id, condition, ip_type, hours, rep), by = "id")
+
+pc1_var <- round(summary(pca_res)$importance[2, 1] * 100, 1)
+pc2_var <- round(summary(pca_res)$importance[2, 2] * 100, 1)
+
+p_pca_ip <- ggplot(pca_data, aes(x = PC1, y = PC2, color = ip_type, shape = condition)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1_var, "%)"), y = paste0("PC2 (", pc2_var, "%)"),
+       color = "IP type", shape = "Condition",
+       title = "PCA post-normalization: IP type") +
+  theme_classic(base_size = 12)
+
+p_pca_time <- ggplot(pca_data, aes(x = PC1, y = PC2, color = hours, shape = ip_type)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1_var, "%)"), y = paste0("PC2 (", pc2_var, "%)"),
+       color = "Timepoint (hr)", shape = "IP type",
+       title = "PCA post-normalization: timepoint") +
+  theme_classic(base_size = 12)
+
+p_pca_rep <- ggplot(pca_data, aes(x = PC1, y = PC2, color = rep, shape = ip_type)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1_var, "%)"), y = paste0("PC2 (", pc2_var, "%)"),
+       color = "Replicate", shape = "IP type",
+       title = "PCA post-normalization: replicate") +
+  theme_classic(base_size = 12)
+
+p_pca_ip
+ggsave(here("ripseq", "plots", "ripseq_postnorm_pca_iptype.pdf"), p_pca_ip, width = 7, height = 5)
+
+p_pca_time
+ggsave(here("ripseq", "plots", "ripseq_postnorm_pca_timepoint.pdf"), p_pca_time, width = 7, height = 5)
+
+p_pca_rep
+ggsave(here("ripseq", "plots", "ripseq_postnorm_pca_replicate.pdf"), p_pca_rep, width = 7, height = 5)
+```
+## Remove PCA outlier and replot
+
+```{r qc_pca2}
+OUTLIER2_IP   <- "igg_mock"   # ip_type: flag_eif3d | eif4e | igg_mock
+OUTLIER2_COND <- "hypoxia"      # condition: normoxia | hypoxia
+OUTLIER2_HOUR <- "1"            # hours: 1 | 4 | 24
+OUTLIER2_REP  <- "c"            # rep: a | b | c
+
+pca_outlier_id <- meta_qc |>
+  dplyr::filter(ip_type == OUTLIER2_IP, condition == OUTLIER2_COND,
+                hours == OUTLIER2_HOUR, rep == OUTLIER2_REP) |>
+  pull(id)
+
+stopifnot("PCA outlier not found -- check OUTLIER2_* params" = length(pca_outlier_id) == 1)
+cat("PCA outlier set to:", pca_outlier_id, "\n")
+cat(with(meta_qc[meta_qc$id == pca_outlier_id, ],
+         paste0("  ip_type=", ip_type, " | condition=", condition,
+                " | hours=", hours, " | rep=", rep)), "\n")
+
+meta_qc2 <- meta_qc |> dplyr::filter(id != pca_outlier_id)
+cts_qc2  <- allCounts[, grep(paste(meta_qc2$id, collapse = "|"), colnames(allCounts))]
+
+dds_qc2  <- DESeqDataSetFromMatrix(cts_qc2, meta_qc2, design = ~ ip_type)
+dds_qc2  <- estimateSizeFactors(dds_qc2)
+qcinput2 <- log2(counts(dds_qc2, normalized = TRUE) + 1)
+qcinput2 <- qcinput2[matrixStats::rowSds(qcinput2) > 1, ]
+
+pca_res2  <- prcomp(t(qcinput2), scale. = TRUE)
+pca_data2 <- as.data.frame(pca_res2$x) |>
+  rownames_to_column("sample") |>
+  mutate(id = sub(".*_(NM\\d+_\\d+)$", "\\1", sample)) |>
+  left_join(dplyr::select(meta_qc2, id, condition, ip_type, hours, rep), by = "id")
+
+pc1_var2 <- round(summary(pca_res2)$importance[2, 1] * 100, 1)
+pc2_var2 <- round(summary(pca_res2)$importance[2, 2] * 100, 1)
+
+p_pca2_ip <- ggplot(pca_data2, aes(x = PC1, y = PC2, color = ip_type, shape = condition)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1_var2, "%)"), y = paste0("PC2 (", pc2_var2, "%)"),
+       color = "IP type", shape = "Condition",
+       title = "PCA post-normalization (outlier removed): IP type") +
+  theme_classic(base_size = 12)
+
+p_pca2_time <- ggplot(pca_data2, aes(x = PC1, y = PC2, color = hours, shape = ip_type)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1_var2, "%)"), y = paste0("PC2 (", pc2_var2, "%)"),
+       color = "Timepoint (hr)", shape = "IP type",
+       title = "PCA post-normalization (outlier removed): timepoint") +
+  theme_classic(base_size = 12)
+
+p_pca2_rep <- ggplot(pca_data2, aes(x = PC1, y = PC2, color = rep, shape = ip_type)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1_var2, "%)"), y = paste0("PC2 (", pc2_var2, "%)"),
+       color = "Replicate", shape = "IP type",
+       title = "PCA post-normalization (outlier removed): replicate") +
+  theme_classic(base_size = 12)
+
+p_pca2_ip
+ggsave(here("ripseq", "plots", "ripseq_postnorm2_pca_iptype.pdf"), p_pca2_ip, width = 7, height = 5)
+
+p_pca2_time
+ggsave(here("ripseq", "plots", "ripseq_postnorm2_pca_timepoint.pdf"), p_pca2_time, width = 7, height = 5)
+
+p_pca2_rep
+ggsave(here("ripseq", "plots", "ripseq_postnorm2_pca_replicate.pdf"), p_pca2_rep, width = 7, height = 5)
+```
+
+```{r qc_pca_3d_4e}
+meta_3d4e <- meta_qc2 |> dplyr::filter(ip_type %in% c("flag_eif3d", "eif4e"))
+cts_3d4e  <- allCounts[, grep(paste(meta_3d4e$id, collapse = "|"), colnames(allCounts))]
+
+dds_3d4e  <- DESeqDataSetFromMatrix(cts_3d4e, meta_3d4e, design = ~ ip_type)
+dds_3d4e  <- estimateSizeFactors(dds_3d4e)
+qc_3d4e   <- log2(counts(dds_3d4e, normalized = TRUE) + 1)
+qc_3d4e   <- qc_3d4e[matrixStats::rowSds(qc_3d4e) > 1, ]
+
+pca_3d4e  <- prcomp(t(qc_3d4e), scale. = TRUE)
+pca_df    <- as.data.frame(pca_3d4e$x) |>
+  rownames_to_column("sample") |>
+  mutate(id = sub(".*_(NM\\d+_\\d+)$", "\\1", sample)) |>
+  left_join(dplyr::select(meta_3d4e, id, condition, ip_type, hours, rep), by = "id")
+
+pc1 <- round(summary(pca_3d4e)$importance[2, 1] * 100, 1)
+pc2 <- round(summary(pca_3d4e)$importance[2, 2] * 100, 1)
+
+p_3d4e_ip <- ggplot(pca_df, aes(x = PC1, y = PC2, color = ip_type, shape = condition)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1, "%)"), y = paste0("PC2 (", pc2, "%)"),
+       color = "IP type", shape = "Condition",
+       title = "PCA: flag_eif3d + eif4e only") +
+  theme_classic(base_size = 12)
+
+p_3d4e_time <- ggplot(pca_df, aes(x = PC1, y = PC2, color = hours, shape = ip_type)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito() +
+  labs(x = paste0("PC1 (", pc1, "%)"), y = paste0("PC2 (", pc2, "%)"),
+       color = "Timepoint (hr)", shape = "IP type",
+       title = "PCA: flag_eif3d + eif4e only") +
+  theme_classic(base_size = 12)
+
+p_3d4e_ip
+ggsave(here("ripseq", "plots", "ripseq_pca_3d4e_iptype.pdf"), p_3d4e_ip, width = 7, height = 5)
+
+p_3d4e_time
+ggsave(here("ripseq", "plots", "ripseq_pca_3d4e_timepoint.pdf"), p_3d4e_time, width = 7, height = 5)
+```
+
+# Final DESeq2: remove both outliers
+
+```{r deseq_final}
+meta_final <- metadata |>
+  dplyr::filter(!grepl(OUTLIER_ID, id), id != pca_outlier_id)
+cts_final  <- allCounts[, grep(paste(meta_final$id, collapse = "|"), colnames(allCounts))]
+
+cat("Final dataset excludes:", OUTLIER_ID, "(sample QC) and", pca_outlier_id, "(PCA outlier)\n")
+cat("Samples retained:", nrow(meta_final), "\n")
+
+deseq_results    <- run_deseq_lfc(cts_final, meta_final, ip_target = "flag_eif3d")
+deseq_results_4e <- run_deseq_lfc(cts_final, meta_final, ip_target = "eif4e")
+```
+
+```{r density_final_3d, fig.width=12, fig.height=3}
+enriched_counts_final <- bind_rows(deseq_results) |>
+  filter(!is.na(log2FoldChange), !is.na(padj)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  group_by(timepoint) |>
+  summarise(n_enriched = sum(log2FoldChange > LFC_CUTOFF & padj < PADJ_CUTOFF), .groups = "drop") |>
+  mutate(label = paste0("LFC>0.5, padj<0.05, n = ", n_enriched))
+
+p_density_3d_final <- bind_rows(deseq_results) |>
+  filter(!is.na(log2FoldChange)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  ggplot(aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#E69F00", fill = "#E69F00", alpha = 0.15) +
+  geom_text(data = enriched_counts_final, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            inherit.aes = FALSE, size = 3) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(x = "log2FC (eIF3d IP / IgG)", y = "Density") +
+  theme_classic(base_size = 12) +
+  xlim(-2, 10)
+
+p_density_3d_final
+ggsave(here("ripseq", "plots", "ripseq_density_eif3d_final.pdf"), p_density_3d_final,
+       width = 12, height = 3)
+```
+
+```{r density_final_4e, fig.width=12, fig.height=3}
+p_density_4e_final <- bind_rows(deseq_results_4e) |>
+  dplyr::filter(!is.na(log2FoldChange)) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels)) |>
+  ggplot(aes(x = log2FoldChange)) +
+  geom_density(linewidth = 0.8, color = "#56B4E9", fill = "#56B4E9", alpha = 0.15) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(x = "log2FC (eIF4E IP / IgG)", y = "Density") +
+  theme_classic(base_size = 12)
+
+p_density_4e_final
+ggsave(here("ripseq", "plots", "ripseq_density_4e_final.pdf"), p_density_4e_final,
+       width = 12, height = 3)
+```
+
+```{r save_results_final}
+for (tp_name in names(deseq_results)) {
+  write_csv(deseq_results[[tp_name]],
+            here("ripseq", "output",
+                 paste0("ripseq_deseq_", tp_name, "_flag_eif3d_vs_igg.csv")))
+}
+saveRDS(deseq_results, here("ripseq", "output", "ripseq_deseq_results_list.rds"))
+
+for (tp_name in names(deseq_results_4e)) {
+  write_csv(deseq_results_4e[[tp_name]],
+            here("ripseq", "output",
+                 paste0("ripseq_deseq_", tp_name, "_eif4e_vs_igg.csv")))
+}
+saveRDS(deseq_results_4e, here("ripseq", "output", "ripseq_deseq_4e_results_list.rds"))
+cat("Final results saved:", length(deseq_results), "timepoints (3d),",
+    length(deseq_results_4e), "timepoints (4e)\n")
+```
 
 # Enriched gene counts
 
