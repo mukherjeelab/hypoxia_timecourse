@@ -1,0 +1,183 @@
+---
+title: "RIP-seq: eIF3d-dependent TE vs eIF4E binding change, per hypoxia timepoint"
+author: "Kate"
+date: "2026-05"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+```
+
+Requires the 3 eIF4E delta CSVs from notebook 09.
+
+# Load data
+
+```{r load}
+eif4e_paths <- list(
+  "1hr"  = here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_1hr_vs_normoxia_delta.csv"),
+  "4hr"  = here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_4hr_vs_normoxia_delta.csv"),
+  "24hr" = here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_24hr_vs_normoxia_delta.csv")
+)
+
+stopifnot("Run notebook 09 first to generate eIF4E delta CSVs" =
+  all(file.exists(unlist(eif4e_paths))))
+
+eif4e_all <- imap_dfr(eif4e_paths, \(path, tp) {
+  read_csv(path, show_col_types = FALSE) |>
+    dplyr::select(gene_id_clean, delta_eif4e_lfc, delta_eif4e_padj) |>
+    mutate(tp = tp)
+})
+
+te_paths <- list(
+  "1hr"  = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  "4hr"  = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"),
+  "24hr" = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv")
+)
+
+te_all <- imap_dfr(te_paths, \(path, tp) {
+  read_csv(path, show_col_types = FALSE) |>
+    mutate(gene_id_clean = sub("\\..*", "", gene_id),
+           tp = tp)
+})
+
+eif4e_enrich_paths <- list(
+  "1hr"  = here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_eif4e_vs_igg.csv"),
+  "4hr"  = here("ripseq", "output", "ripseq_deseq_hypoxia_4hr_eif4e_vs_igg.csv"),
+  "24hr" = here("ripseq", "output", "ripseq_deseq_hypoxia_24hr_eif4e_vs_igg.csv")
+)
+
+eif4e_bound_all <- imap_dfr(eif4e_enrich_paths, \(path, tp) {
+  read_csv(path, show_col_types = FALSE) |>
+    dplyr::select(gene_id_clean, log2FoldChange, padj) |>
+    mutate(tp         = tp,
+           eif4e_bound = !is.na(padj) & padj < 0.05 & log2FoldChange > 1)
+})
+
+cat("TE genes (all timepoints):", nrow(te_all), "\n")
+cat("eIF4E delta genes (all timepoints):", nrow(eif4e_all), "\n")
+cat("eIF4E-bound genes per timepoint:\n")
+eif4e_bound_all |> dplyr::count(tp, eif4e_bound) |> print()
+```
+
+# Join and label
+
+```{r join}
+group_colors <- c("eIF3d hypoxia promotes" = "#E69F00", "All other genes" = "grey80")
+
+plot_df <- te_all |>
+  inner_join(eif4e_all, by = c("gene_id_clean", "tp")) |>
+  left_join(eif4e_bound_all |> dplyr::select(gene_id_clean, tp, eif4e_bound),
+            by = c("gene_id_clean", "tp")) |>
+  filter(!is.na(te_lfc), !is.na(delta_eif4e_lfc)) |>
+  mutate(
+    group = if_else(te_lfc > 0.5 & te_padj < 0.05,
+                    "eIF3d hypoxia promotes", "All other genes"),
+    group = factor(group, levels = c("eIF3d hypoxia promotes", "All other genes")),
+    eif4e_bound  = replace_na(eif4e_bound, FALSE),
+    eif4e_group  = if_else(eif4e_bound, "eIF4E bound", "All other genes"),
+    eif4e_group  = factor(eif4e_group, levels = c("eIF4E bound", "All other genes")),
+    tp    = factor(tp, levels = c("1hr", "4hr", "24hr"))
+  )
+
+plot_df |>
+  dplyr::count(tp, group) |>
+  print()
+```
+
+# Scatter plot: eIF3d-dependent TE vs eIF4E binding change, faceted by timepoint
+
+```{r scatter}
+p_scatter <- ggplot(plot_df, aes(x = te_lfc, y = delta_eif4e_lfc)) +
+  geom_point(aes(color = group), alpha = 0.25, size = 0.7) +
+  scale_color_manual(values = group_colors) +
+  facet_wrap(~ tp, nrow = 1) +
+  labs(
+    x     = "eIF3d-dependent TE (log2FC, hypoxia)",
+    y     = "eIF4E binding change (log2FC, hypoxia vs normoxia)",
+    color = NULL,
+    title = "eIF3d TE activity vs eIF4E binding change"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(here("ripseq", "plots", "10_scatter_te_vs_eif4e_per_timepoint.pdf"),
+       p_scatter, width = 10, height = 4)
+p_scatter
+```
+
+# CDF: eIF4E binding change by eIF3d-TE group, faceted by timepoint
+
+```{r cdf}
+wt_df <- plot_df |>
+  group_by(tp) |>
+  summarise(
+    p     = wilcox.test(delta_eif4e_lfc ~ group, alternative = "less")$p.value,
+    label = paste0("p = ", signif(p, 3)),
+    .groups = "drop"
+  )
+
+p_cdf <- ggplot(plot_df, aes(x = delta_eif4e_lfc, color = group)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_text(data  = wt_df,
+            aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            size = 3.5, inherit.aes = FALSE) +
+  scale_color_manual(values = group_colors) +
+  facet_wrap(~ tp, nrow = 1) +
+  labs(
+    x     = "eIF4E binding change (log2FC, hypoxia vs normoxia)",
+    y     = "Cumulative proportion",
+    color = NULL,
+    title = "eIF4E binding change: eIF3d-promoted vs all others"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(here("ripseq", "plots", "10_cdf_eif4e_delta_by_te_group_per_timepoint.pdf"),
+       p_cdf, width = 10, height = 4)
+p_cdf
+```
+
+# CDF: eIF3d-dependent TE by eIF4E-bound vs all others, faceted by timepoint
+
+```{r cdf_reverse}
+eif4e_colors <- c("eIF4E bound" = "#0072B2", "All other genes" = "grey80")
+
+wt_4e_df <- plot_df |>
+  group_by(tp) |>
+  summarise(
+    p     = wilcox.test(te_lfc ~ eif4e_group, alternative = "less")$p.value,
+    label = paste0("p = ", signif(p, 3)),
+    .groups = "drop"
+  )
+
+p_cdf_rev <- ggplot(plot_df, aes(x = te_lfc, color = eif4e_group)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_text(data = wt_4e_df,
+            aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            size = 3.5, inherit.aes = FALSE) +
+  scale_color_manual(values = eif4e_colors) +
+  facet_wrap(~ tp, nrow = 1) +
+  labs(
+    x     = "eIF3d-dependent TE (log2FC, hypoxia)",
+    y     = "Cumulative proportion",
+    color = NULL,
+    title = "eIF3d TE: eIF4E-bound vs all others"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")+
+  xlim(-2,2)
+
+ggsave(here("ripseq", "plots", "10_cdf_te_by_eif4e_bound_per_timepoint.pdf"),
+       p_cdf_rev, width = 10, height = 4)
+p_cdf_rev
+```

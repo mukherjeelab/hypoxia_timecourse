@@ -1,0 +1,133 @@
+---
+title: "RIP-seq: Hypoxia-Specific eIF3d Binding and TE Promotion"
+author: "Kate"
+date: "2026-05"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(ggvenn)
+```
+
+```{r constants}
+RIP_LFC_CUT   <- 1
+RIP_PADJ_CUT  <- 0.05
+TE_LFC_CUT    <- 0.5
+TE_PADJ_CUT   <- 0.05
+NOR_LFC_LIMIT <- 0.5   # |te_lfc| in normoxia must be below this to qualify as "not regulated"
+```
+
+```{r load_data}
+te_hyp <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv")) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+te_nor <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv")) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+rip_hyp <- read_csv(here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_flag_eif3d_vs_igg.csv"))
+```
+
+# Set Definitions
+
+```{r set_a}
+# Set A: eIF3d promotes TE in hypoxia 1hr
+set_a <- te_hyp |>
+  filter(!is.na(te_lfc), !is.na(te_padj), te_lfc > TE_LFC_CUT, te_padj < TE_PADJ_CUT)
+cat("Set A (hypoxia TE promoted, LFC>0.5, padj<0.05):", nrow(set_a), "genes\n")
+```
+
+```{r set_b}
+# Set B: |te_lfc| < 0.5 in normoxia (1+4hr time-normalized) -- not promoted or inhibited by eIF3d
+set_b <- te_nor |>
+  filter(!is.na(te_lfc), abs(te_lfc) < NOR_LFC_LIMIT)
+cat("Set B (not regulated in normoxia, |LFC|<0.5):", nrow(set_b), "genes\n")
+```
+
+```{r set_c}
+# Set C: hypoxia-specific TE promotion (A intersect B)
+set_c <- inner_join(
+  set_a |> dplyr::select(gene_id_clean, symbol, te_lfc, te_padj),
+  set_b |> dplyr::select(gene_id_clean, te_lfc_normoxia = te_lfc, te_padj_normoxia = te_padj),
+  by = "gene_id_clean"
+)
+cat("Set C (hypoxia-specific TE promoted, A intersect B):", nrow(set_c), "genes\n")
+```
+
+```{r set_d}
+# Set D: eIF3d RIP-bound in hypoxia 1hr (FLAG3D enriched over IgG)
+set_d <- rip_hyp |>
+  filter(!is.na(log2FoldChange), !is.na(padj),
+         log2FoldChange > RIP_LFC_CUT, padj < RIP_PADJ_CUT)
+cat("Set D (RIP-bound hypoxia 1hr, LFC>1, padj<0.05):", nrow(set_d), "genes\n")
+```
+
+```{r final_overlap}
+# Final gene list: hypoxia-specific TE promotion AND eIF3d-bound (C intersect D)
+final_df <- inner_join(
+  set_c,
+  set_d |> dplyr::select(gene_id_clean, rip_lfc = log2FoldChange, rip_padj = padj),
+  by = "gene_id_clean"
+) |>
+  arrange(desc(te_lfc))
+
+cat("Final overlap (hypoxia-specific TE + RIP-bound):", nrow(final_df), "genes\n")
+```
+
+# Venn Diagram
+
+```{r venn}
+# Build a shared universe: genes present in all three datasets
+joined_all <- te_hyp |>
+  inner_join(
+    te_nor |> dplyr::select(gene_id_clean, te_lfc_nor = te_lfc, te_padj_nor = te_padj),
+    by = "gene_id_clean"
+  ) |>
+  inner_join(
+    rip_hyp |> dplyr::select(gene_id_clean, rip_lfc = log2FoldChange, rip_padj = padj),
+    by = "gene_id_clean"
+  )
+
+venn_list <- list(
+  "Hypoxia TE promoted\n(LFC>0.5, padj<0.05)"  = joined_all$gene_id_clean[
+    !is.na(joined_all$te_lfc) & joined_all$te_lfc > TE_LFC_CUT & joined_all$te_padj < TE_PADJ_CUT],
+  "Not regulated normoxia\n(|LFC|<0.5)"          = joined_all$gene_id_clean[
+    !is.na(joined_all$te_lfc_nor) & abs(joined_all$te_lfc_nor) < NOR_LFC_LIMIT],
+  "FLAG3D RIP-bound\n(LFC>1, padj<0.05)"         = joined_all$gene_id_clean[
+    !is.na(joined_all$rip_lfc) & joined_all$rip_lfc > RIP_LFC_CUT & joined_all$rip_padj < RIP_PADJ_CUT]
+)
+
+p_venn <- ggvenn(venn_list, fill_color = c("#E69F00", "grey60", "#56B4E9"), text_size = 3.5)
+p_venn
+ggsave(here("ripseq", "plots", "11_venn_hypoxia_specific_rip_te.pdf"), p_venn, width = 6, height = 5)
+```
+
+# Gene List
+
+```{r gene_table}
+final_df |>
+  dplyr::select(symbol, gene_id_clean, te_lfc, te_padj, te_lfc_normoxia, te_padj_normoxia,
+                rip_lfc, rip_padj) |>
+  print(n = Inf)
+
+final_df |> 
+  head(n=50) |> 
+  pull(symbol)
+```
+
+# Export
+
+```{r export}
+write_csv(final_df |>
+            dplyr::select(gene_id_clean, symbol, te_lfc, te_padj,
+                          te_lfc_normoxia, te_padj_normoxia, rip_lfc, rip_padj),
+          here("ripseq", "output", "rip_te_hypoxia_specific_1hr.csv"))
+cat("Saved", nrow(final_df), "genes to ripseq/output/rip_te_hypoxia_specific_1hr.csv\n")
+```

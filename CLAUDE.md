@@ -174,6 +174,7 @@ Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size
 
 **Namespace conventions:**
 - Always use `dplyr::select()`, never bare `select()` — avoids conflicts with `MASS`, `Biostrings`, and other packages that export `select`
+- Always use `dplyr::rename()`, never bare `rename()` — same conflict risk
 
 **Plot conventions:**
 - Save to `plots/` via `here("plots", "notebooknum_description.pdf")`
