@@ -137,18 +137,15 @@ cat("Saved", nrow(final_df), "genes to ripseq/output/rip_te_hypoxia_specific_1hr
 ```{r candidate_transcripts}
 target_symbols <- c(
   "NRIP1", "S100A11", "CHMP4C", "NDUFAF4", "PFDN6", "SOD1",
-  "LAPTM4B", "AKR1C2", "L2HGDH", "PLPP3", "CAMTA1", "LZTFL1", "RAB7A"
+  "LAPTM4B", "AKR1C2", "L2HGDH", "PLPP3", "CAMTA1", "RAB7A"
 )
 
 # Transcript IDs from feature matrix (most-abundant transcript per gene from siCTRL
-# normoxia Salmon TPM). LZTFL1 is absent here because the feature matrix universe
-# is gated on translation_categories_1hr.csv (hypoxia-vs-normoxia timecourse DESeq2),
-# which predates and differs from the si3d-vs-sictrl analysis used in this notebook.
+# normoxia Salmon TPM).
 fm_ids <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds")) |>
   dplyr::select(transcript_id_clean, symbol)
 
-# Build table from the data sources already loaded in this notebook so that all
-# 13 genes (including LZTFL1) get TE and RIP stats where available.
+# Build table from the data sources already loaded in this notebook.
 candidate_tx <- tibble(symbol = target_symbols) |>
   left_join(
     te_hyp |>
@@ -193,6 +190,110 @@ write_csv(
 cat("Saved", nrow(candidate_tx), "rows to ripseq/output/11_candidate_gene_transcripts.csv\n")
 ```
 
-```{r}
+# Verify Hypoxia Expression and Extract 5'UTR Sequences
 
+```{r verify_hypoxia_expression}
+library(tximport)
+
+metadata <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
+                     show_col_types = FALSE)
+
+hyp_sictrl_ids <- metadata |>
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL", condition == "hypoxia", hours == 1) |>
+  pull(id)
+
+salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
+hyp_files  <- file.path(salmon_dir, hyp_sictrl_ids, "quant.sf.gz")
+names(hyp_files) <- hyp_sictrl_ids
+hyp_files <- hyp_files[file.exists(hyp_files)]
+cat("Hypoxia siCTRL 1hr RNA-seq samples:", length(hyp_files), "\n")
+
+tx2gene_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), show_col_types = FALSE
+) |>
+  filter(str_starts(transcript_id, "ENST"))
+
+txi_hyp <- tximport(hyp_files, type = "salmon", tx2gene = tx2gene_map, txOut = TRUE)
+
+hyp_abundance <- txi_hyp$abundance |>
+  as.data.frame() |>
+  rownames_to_column("transcript_id") |>
+  mutate(
+    transcript_id_clean = sub("\\..*", "", transcript_id),
+    gene_id_clean       = sub("\\..*", "",
+      tx2gene_map$gene_id[match(transcript_id, tx2gene_map$transcript_id)])
+  ) |>
+  mutate(total_tpm = rowSums(across(where(is.numeric)), na.rm = TRUE))
+
+hyp_check <- candidate_tx |>
+  filter(!is.na(transcript_id_clean)) |>
+  left_join(
+    hyp_abundance |> dplyr::select(transcript_id_clean, hyp_tpm = total_tpm),
+    by = "transcript_id_clean"
+  ) |>
+  left_join(
+    hyp_abundance |>
+      group_by(gene_id_clean) |>
+      slice_max(total_tpm, n = 1, with_ties = FALSE) |>
+      ungroup() |>
+      dplyr::select(gene_id_clean, top_tx_in_hypoxia = transcript_id_clean),
+    by = "gene_id_clean"
+  ) |>
+  mutate(is_top_in_hypoxia = transcript_id_clean == top_tx_in_hypoxia)
+
+cat("Transcript expression in hypoxia siCTRL 1hr:\n")
+print(hyp_check |> dplyr::select(symbol, transcript_id_clean, hyp_tpm, is_top_in_hypoxia))
+
+stopifnot(
+  "All candidate transcripts must be expressed in hypoxia siCTRL" =
+    all(hyp_check$hyp_tpm > 0, na.rm = TRUE)
+)
+```
+
+```{r extract_utr5_sequences}
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+tx_version_map <- candidate_tx |>
+  filter(!is.na(transcript_id_clean)) |>
+  left_join(
+    tx2gene_map |>
+      mutate(transcript_id_clean = sub("\\..*", "", transcript_id)) |>
+      dplyr::select(transcript_id_clean, transcript_id_versioned = transcript_id),
+    by = "transcript_id_clean"
+  )
+
+utr5_all  <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+target_utr5 <- utr5_all[names(utr5_all) %in% tx_version_map$transcript_id_versioned]
+utr5_seqs   <- extractTranscriptSeqs(genome, target_utr5)
+
+seq_df <- tx_version_map |>
+  mutate(utr5_sequence = as.character(utr5_seqs[transcript_id_versioned])) |>
+  dplyr::select(symbol, transcript_id_clean, utr5_sequence) |>
+  arrange(match(symbol, target_symbols))
+
+missing_utr5 <- seq_df |> filter(is.na(utr5_sequence)) |> pull(symbol)
+if (length(missing_utr5) > 0) cat("No annotated 5'UTR for:", paste(missing_utr5, collapse = ", "), "\n")
+
+cat("5'UTR lengths (bp):\n")
+print(seq_df |> dplyr::select(symbol, utr5_length = nchar(utr5_sequence)))
+```
+
+```{r export_benchling}
+benchling_df <- seq_df |>
+  filter(!is.na(utr5_sequence)) |>
+  mutate(
+    Name  = paste0(symbol, " 5UTR (", transcript_id_clean, ")"),
+    Bases = utr5_sequence
+  ) |>
+  dplyr::select(Name, Bases)
+
+stopifnot("Benchling names must be unique" = !anyDuplicated(benchling_df$Name))
+
+write_csv(benchling_df, here("ripseq", "output", "11_benchling_import.csv"))
+cat("Saved", nrow(benchling_df), "5'UTR sequences to ripseq/output/11_benchling_import.csv\n")
 ```
