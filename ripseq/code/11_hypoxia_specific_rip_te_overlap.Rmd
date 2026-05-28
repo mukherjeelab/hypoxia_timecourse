@@ -198,15 +198,7 @@ library(tximport)
 metadata <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
                      show_col_types = FALSE)
 
-hyp_sictrl_ids <- metadata |>
-  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL", condition == "hypoxia", hours == 1) |>
-  pull(id)
-
 salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
-hyp_files  <- file.path(salmon_dir, hyp_sictrl_ids, "quant.sf.gz")
-names(hyp_files) <- hyp_sictrl_ids
-hyp_files <- hyp_files[file.exists(hyp_files)]
-cat("Hypoxia siCTRL 1hr RNA-seq samples:", length(hyp_files), "\n")
 
 tx2gene_map <- read_tsv(
   here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
@@ -214,54 +206,80 @@ tx2gene_map <- read_tsv(
 ) |>
   filter(str_starts(transcript_id, "ENST"))
 
-txi_hyp <- tximport(hyp_files, type = "salmon", tx2gene = tx2gene_map, txOut = TRUE)
-
-hyp_abundance <- txi_hyp$abundance |>
-  as.data.frame() |>
-  rownames_to_column("transcript_id") |>
-  mutate(
-    transcript_id_clean = sub("\\..*", "", transcript_id),
-    gene_id_clean       = sub("\\..*", "",
-      tx2gene_map$gene_id[match(transcript_id, tx2gene_map$transcript_id)])
-  ) |>
-  mutate(total_tpm = rowSums(across(where(is.numeric)), na.rm = TRUE))
-
-hyp_check <- candidate_tx |>
-  filter(!is.na(transcript_id_clean)) |>
-  left_join(
-    hyp_abundance |> dplyr::select(transcript_id_clean, hyp_tpm = total_tpm),
-    by = "transcript_id_clean"
-  ) |>
-  left_join(
-    hyp_abundance |>
-      group_by(gene_id_clean) |>
-      slice_max(total_tpm, n = 1, with_ties = FALSE) |>
-      ungroup() |>
-      dplyr::select(gene_id_clean, top_tx_in_hypoxia = transcript_id_clean),
-    by = "gene_id_clean"
-  ) |>
-  mutate(is_top_in_hypoxia = transcript_id_clean == top_tx_in_hypoxia)
-
-cat("Transcript expression in hypoxia siCTRL 1hr:\n")
-print(hyp_check |> dplyr::select(symbol, transcript_id_clean, hyp_tpm, is_top_in_hypoxia))
-
-stopifnot(
-  "All candidate transcripts must be expressed in hypoxia siCTRL" =
-    all(hyp_check$hyp_tpm > 0, na.rm = TRUE)
-)
-
-# For genes where the normoxia-selected transcript is not the dominant isoform in
-# hypoxia, switch to the hypoxia-dominant transcript for the Benchling export.
-switched <- hyp_check |> filter(!is_top_in_hypoxia)
-if (nrow(switched) > 0) {
-  cat("Switching to hypoxia-dominant transcript for:",
-      paste(switched$symbol, collapse = ", "), "\n")
-  cat("  ", paste(switched$symbol, switched$transcript_id_clean, "->",
-                  switched$top_tx_in_hypoxia, collapse = "\n  "), "\n")
+# Helper: load Salmon TPM for a set of sample IDs and return transcript-level
+# total TPM + top transcript per gene
+load_top_tx <- function(sample_ids, label) {
+  files <- file.path(salmon_dir, sample_ids, "quant.sf.gz")
+  names(files) <- sample_ids
+  files <- files[file.exists(files)]
+  cat(label, "samples:", length(files), "\n")
+  txi <- tximport(files, type = "salmon", tx2gene = tx2gene_map, txOut = TRUE)
+  txi$abundance |>
+    as.data.frame() |>
+    rownames_to_column("transcript_id") |>
+    mutate(
+      transcript_id_clean = sub("\\..*", "", transcript_id),
+      gene_id_clean       = sub("\\..*", "",
+        tx2gene_map$gene_id[match(transcript_id, tx2gene_map$transcript_id)])
+    ) |>
+    mutate(total_tpm = rowSums(across(where(is.numeric)), na.rm = TRUE))
 }
 
-tx_for_benchling <- hyp_check |>
-  mutate(transcript_id_final = if_else(is_top_in_hypoxia, transcript_id_clean, top_tx_in_hypoxia)) |>
+nor_ids <- metadata |>
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL", condition == "normoxia", hours == 1) |>
+  pull(id)
+hyp_ids <- metadata |>
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL", condition == "hypoxia", hours == 1) |>
+  pull(id)
+
+nor_abundance <- load_top_tx(nor_ids, "Normoxia siCTRL 1hr RNA-seq")
+hyp_abundance <- load_top_tx(hyp_ids, "Hypoxia siCTRL 1hr RNA-seq")
+
+top_tx <- function(abundance_df, col_suffix) {
+  abundance_df |>
+    group_by(gene_id_clean) |>
+    slice_max(total_tpm, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    dplyr::select(gene_id_clean,
+                  !!paste0("top_tx_", col_suffix)  := transcript_id_clean,
+                  !!paste0("tpm_", col_suffix)      := total_tpm)
+}
+
+isoform_check <- candidate_tx |>
+  filter(!is.na(transcript_id_clean)) |>
+  left_join(nor_abundance |> dplyr::select(transcript_id_clean, nor_tpm = total_tpm),
+            by = "transcript_id_clean") |>
+  left_join(hyp_abundance |> dplyr::select(transcript_id_clean, hyp_tpm = total_tpm),
+            by = "transcript_id_clean") |>
+  left_join(top_tx(nor_abundance, "nor"), by = "gene_id_clean") |>
+  left_join(top_tx(hyp_abundance, "hyp"), by = "gene_id_clean") |>
+  mutate(
+    is_top_in_normoxia = transcript_id_clean == top_tx_nor,
+    is_top_in_hypoxia  = transcript_id_clean == top_tx_hyp,
+    consistent         = is_top_in_normoxia & is_top_in_hypoxia
+  )
+
+cat("Isoform dominance consistency (normoxia 1hr vs hypoxia 1hr siCTRL):\n")
+print(isoform_check |>
+        dplyr::select(symbol, transcript_id_clean,
+                      nor_tpm, is_top_in_normoxia,
+                      hyp_tpm, is_top_in_hypoxia,
+                      consistent))
+
+stopifnot(
+  "All candidate transcripts must be expressed in both conditions" =
+    all(isoform_check$nor_tpm > 0 & isoform_check$hyp_tpm > 0, na.rm = TRUE)
+)
+
+switched <- isoform_check |> filter(!consistent)
+if (nrow(switched) > 0) {
+  cat("Excluded from Benchling export (inconsistent dominant isoform):",
+      paste(switched$symbol, collapse = ", "), "\n")
+}
+
+tx_for_benchling <- isoform_check |>
+  filter(consistent) |>
+  mutate(transcript_id_final = transcript_id_clean) |>
   dplyr::select(symbol, gene_id_clean, transcript_id_final)
 ```
 
