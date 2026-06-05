@@ -81,10 +81,6 @@ final_df <- inner_join(
   arrange(desc(te_lfc))
 
 
-final_df |> 
-  head(n=21) |> 
-  pull(symbol)
-
 cat("Final overlap (hypoxia-specific TE + RIP-bound):", nrow(final_df), "genes\n")
 ```
 
@@ -124,9 +120,6 @@ final_df |>
                 rip_lfc, rip_padj) |>
   print(n = Inf)
 
-final_df |> 
-  head(n=50) |> 
-  pull(symbol)
 ```
 
 # Export
@@ -167,45 +160,29 @@ cat("Saved", nrow(neg_ctrl), "genes to ripseq/output/11_negative_control_genes.c
 # Candidate Gene Transcript Lookup
 
 ```{r candidate_transcripts}
-target_symbols <- c(
-  # Strong evidence
-  "S100A11", "RAB7A", "LZTFL1", "BTF3", "CHMP4C",
-  # Moderate evidence
-  "PFDN6", "NDUFAF4",
-  # Limited evidence
-  "PTMS", "UBL5", "COQ10A", "CMC1", "MAIP1",
-  "EIF1B", "PCMTD2", "IFT81", "TBC1D8B"
-)
+# Use all genes from the final overlap (no cherry-picking).
+# All genes in final_df already satisfy: Exclusive category, hypoxia TE promoted,
+# not regulated in normoxia, RIP-bound in hypoxia.
 
 # Transcript IDs from feature matrix (most-abundant transcript per gene from siCTRL
 # normoxia Salmon TPM).
 fm_ids <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds")) |>
   dplyr::select(transcript_id_clean, symbol)
 
-# Build table from the data sources already loaded in this notebook.
-candidate_tx <- tibble(symbol = target_symbols) |>
-  left_join(
-    te_hyp |>
-      mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
-      group_by(symbol) |>
-      slice_min(te_padj, n = 1, with_ties = FALSE) |>
-      ungroup() |>
-      dplyr::select(symbol, gene_id_clean, te_lfc_hyp = te_lfc, te_padj_hyp = te_padj, category),
-    by = "symbol"
-  ) |>
-  left_join(
-    te_nor |>
-      mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
-      dplyr::select(gene_id_clean, te_lfc_nor = te_lfc, te_padj_nor = te_padj),
-    by = "gene_id_clean"
-  ) |>
-  left_join(
-    rip_hyp |>
-      dplyr::select(gene_id_clean, rip_lfc = log2FoldChange, rip_padj = padj),
-    by = "gene_id_clean"
+candidate_tx <- final_df |>
+  dplyr::rename(
+    te_lfc_hyp  = te_lfc,
+    te_padj_hyp = te_padj,
+    te_lfc_nor  = te_lfc_normoxia,
+    te_padj_nor = te_padj_normoxia
   ) |>
   left_join(fm_ids, by = "symbol") |>
-  mutate(in_final_overlap = coalesce(gene_id_clean %in% final_df$gene_id_clean, FALSE))
+  mutate(
+    category         = "Exclusive",
+    in_final_overlap = TRUE
+  )
+
+cat("Using all", nrow(candidate_tx), "genes from final overlap as candidates.\n")
 
 candidate_tx |>
   dplyr::select(symbol, in_final_overlap, category,
@@ -282,6 +259,12 @@ top_tx <- function(abundance_df, col_suffix) {
                   !!paste0("tpm_", col_suffix)      := total_tpm)
 }
 
+no_tx <- candidate_tx |> filter(is.na(transcript_id_clean)) |> pull(symbol)
+if (length(no_tx) > 0) {
+  cat("WARNING — not in feature matrix, excluded from isoform check:",
+      paste(no_tx, collapse = ", "), "\n")
+}
+
 isoform_check <- candidate_tx |>
   filter(!is.na(transcript_id_clean)) |>
   left_join(nor_abundance |> dplyr::select(transcript_id_clean, nor_tpm = total_tpm),
@@ -335,14 +318,15 @@ tx_version_map <- tx_for_benchling |>
     by = c("transcript_id_final" = "transcript_id_clean")
   )
 
-utr5_all  <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr5_all    <- fiveUTRsByTranscript(txdb, use.names = TRUE)
 target_utr5 <- utr5_all[names(utr5_all) %in% tx_version_map$transcript_id_versioned]
 utr5_seqs   <- extractTranscriptSeqs(genome, target_utr5)
+utr5_char   <- setNames(as.character(utr5_seqs), names(utr5_seqs))
 
 seq_df <- tx_version_map |>
-  mutate(utr5_sequence = as.character(utr5_seqs[transcript_id_versioned])) |>
+  mutate(utr5_sequence = utr5_char[transcript_id_versioned]) |>
   dplyr::select(symbol, transcript_id_final, utr5_sequence) |>
-  arrange(match(symbol, target_symbols))
+  arrange(symbol)
 
 missing_utr5 <- seq_df |> filter(is.na(utr5_sequence)) |> pull(symbol)
 if (length(missing_utr5) > 0) cat("No annotated 5'UTR for:", paste(missing_utr5, collapse = ", "), "\n")
@@ -351,13 +335,38 @@ cat("5'UTR lengths (bp):\n")
 print(seq_df |> mutate(utr5_length = nchar(utr5_sequence)) |> dplyr::select(symbol, utr5_length))
 ```
 
-```{r export_benchling}
-non_exclusive <- candidate_tx |> filter(is.na(category) | category != "Exclusive") |> pull(symbol)
+```{r target_select}
+# Hand-selected from final overlap based on biological interest.
+# Tier 1: multi-axis oncogenes with strong hypoxia/stress/metastasis relevance
+# Tier 2: solid single-axis hits or mechanistically interesting nodes
+target_symbols_keep <- c(
+  # Tier 1
+  "LAPTM4B", "EIF4G2", "CLIC1", "FUT8",
+  # Tier 2
+  "UBE2M", "PIP5K1A", "IWS1", "STYXL1", "PIGBOS1", "SERTAD2", "ZNF146"
+)
 
+stopifnot(
+  "All target_symbols_keep must be in seq_df and pass pipeline filters" =
+    all(target_symbols_keep %in% seq_df$symbol[!is.na(seq_df$utr5_sequence) &
+                                                !seq_df$symbol %in% switched$symbol])
+)
+
+cat("Candidates available for selection:", length(target_symbols_keep), "\n")
+print(
+  seq_df |>
+    filter(symbol %in% target_symbols_keep) |>
+    mutate(utr5_length = nchar(utr5_sequence)) |>
+    dplyr::select(symbol, transcript_id_final, utr5_length) |>
+    arrange(desc(utr5_length))
+)
+```
+
+```{r export_benchling}
 benchling_df <- seq_df |>
   filter(!is.na(utr5_sequence),
          !symbol %in% switched$symbol,
-         !symbol %in% non_exclusive) |>
+         symbol %in% target_symbols_keep) |>
   mutate(
     Name  = paste0(symbol, " 5UTR (", transcript_id_final, ")"),
     Bases = utr5_sequence

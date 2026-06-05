@@ -16,12 +16,39 @@ library(BSgenome.Hsapiens.UCSC.hg38)
 # Gene lists
 
 ```{r define_genes}
-target_symbols <- c(
+# Previous hardcoded list (kept for sanity check below):
+# target_symbols <- c(
+#   "S100A11", "RAB7A", "BTF3", "CHMP4C", "PTMS",
+#   "UBL5", "COQ10A", "MAIP1", "EIF1B", "TBC1D8B"
+# )
+
+# Load candidates from nb11 Benchling export (Exclusive eIF3d hypoxia-specific targets,
+# ribo-only changes, RIP-bound, isoform-consistent)
+benchling_candidates <- read_csv(
+  here("ripseq", "output", "11_benchling_import.csv"),
+  show_col_types = FALSE
+)
+target_symbols <- sub(" 5UTR.*", "", benchling_candidates$Name)
+
+# Sanity check: previously hardcoded targets must all be present
+prior_targets <- c(
   "S100A11", "RAB7A", "BTF3", "CHMP4C", "PTMS",
   "UBL5", "COQ10A", "MAIP1", "EIF1B", "TBC1D8B"
 )
+missing_from_csv <- setdiff(prior_targets, target_symbols)
+stopifnot(
+  "All previously hardcoded target symbols must be present in 11_benchling_import.csv" =
+    length(missing_from_csv) == 0
+)
+cat("Loaded", length(target_symbols), "target symbols from 11_benchling_import.csv\n")
+cat("All", length(prior_targets), "prior hardcoded symbols confirmed present.\n")
 
-neg_symbols <- c("CADM4", "B4GAT1")
+neg_ctrl <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes_strict.csv"),
+  show_col_types = FALSE
+)
+neg_symbols <- neg_ctrl$symbol
+cat("Loaded", length(neg_symbols), "negative control candidates from negative_control_genes_strict.csv\n")
 
 all_symbols <- c(target_symbols, neg_symbols)
 
@@ -168,10 +195,21 @@ tx_selected <- isoform_check |>
   ) |>
   dplyr::select(symbol, gene_group, gene_id_clean, transcript_id_final)
 
+target_missing <- tx_selected |>
+  filter(gene_group == "target", is.na(transcript_id_final)) |>
+  pull(symbol)
 stopifnot(
-  "All genes must have a selected transcript" =
-    !any(is.na(tx_selected$transcript_id_final))
+  "All target genes must have a selected transcript" =
+    length(target_missing) == 0
 )
+neg_missing <- tx_selected |>
+  filter(gene_group == "negative_control", is.na(transcript_id_final)) |>
+  pull(symbol)
+if (length(neg_missing) > 0) {
+  cat("Negative controls without a 5'UTR-annotated transcript (excluded from pipeline):\n")
+  cat(paste(neg_missing, collapse = ", "), "\n")
+  tx_selected <- tx_selected |> filter(!is.na(transcript_id_final))
+}
 ```
 
 # Extract 5' UTR sequences
@@ -215,8 +253,8 @@ print(seq_df |> dplyr::select(symbol, gene_group, transcript_id_final, utr5_leng
 
 ```{r validate}
 stopifnot(
-  "No missing 5'UTR sequences" =
-    !any(is.na(seq_df$utr5_sequence)),
+  "No missing 5'UTR sequences for target genes" =
+    !any(is.na(seq_df$utr5_sequence[seq_df$gene_group == "target"])),
   "All 5'UTR sequences non-empty" =
     all(nchar(seq_df$utr5_sequence) > 0, na.rm = TRUE),
   "S100A11 5'UTR length in expected range (~89 bp)" =
@@ -261,30 +299,68 @@ stopifnot(
 
 cat("Construct lengths (bp):\n")
 print(constructs_df |> dplyr::select(Name, gene_group, utr5_length, construct_length))
+
+constructs_df <- constructs_df |> filter(construct_length >= 300)
+cat("\nAfter filtering to >= 300 bp constructs:", nrow(constructs_df), "remain",
+    "(", sum(constructs_df$gene_group == "target"), "targets,",
+    sum(constructs_df$gene_group == "negative_control"), "neg controls )\n")
 ```
 
+# Negative control candidate review
 
-Remove constructs that are bigger than 260 nt for teiwst purposes
+Review the table below (printed by `assemble_constructs`), then set `neg_symbols_keep`
+to the symbols you want to include in the export. All target genes are always included.
 
-```{r}
-constructs_df <- constructs_df |> 
-  filter(construct_length < 260)
+```{r neg_control_review}
+cat("Negative control candidates with construct details:\n")
+print(
+  constructs_df |>
+    filter(gene_group == "negative_control") |>
+    dplyr::select(symbol, transcript_id_final, utr5_length, construct_length)
+)
 ```
 
+```{r neg_select}
+# Update this vector after reviewing the table above.
+neg_symbols_keep <- c("ADAT3", "PAN2", "DXO")
 
+neg_candidates <- constructs_df |>
+  filter(gene_group == "negative_control") |>
+  pull(symbol)
+stopifnot(
+  "neg_symbols_keep must be a subset of neg controls passing the length filter" =
+    all(neg_symbols_keep %in% neg_candidates)
+)
+cat("Negative controls selected for export:", length(neg_symbols_keep), "\n")
+print(neg_symbols_keep)
+```
 
+# Final construct selection
+
+```{r final_select}
+constructs_final <- constructs_df |>
+  filter(
+    (gene_group == "target") |
+    (gene_group == "negative_control" & symbol %in% neg_symbols_keep)
+  )
+
+cat("Final selection:", nrow(constructs_final), "constructs\n")
+cat(" ", sum(constructs_final$gene_group == "target"), "targets\n")
+cat(" ", sum(constructs_final$gene_group == "negative_control"), "negative controls\n")
+print(constructs_final |> dplyr::select(symbol, gene_group, utr5_length, construct_length))
+```
 
 # Export
 
 ```{r export}
 write_csv(
-  constructs_df,
+  constructs_final,
   here("output", "predictive_modeling", "65_constructs_all.csv")
 )
-cat("Saved full construct table:",
-    nrow(constructs_df), "rows to output/predictive_modeling/65_constructs_all.csv\n")
+cat("Saved construct table:",
+    nrow(constructs_final), "rows to output/predictive_modeling/65_constructs_all.csv\n")
 
-benchling_df <- constructs_df |>
+benchling_df <- constructs_final |>
   dplyr::select(Name, Bases = full_construct, construct_length)
 
 write_csv(
