@@ -1,0 +1,945 @@
+---
+title: "64 -- NanoLuciferase GC3 Content and eIF3d Codon Preference Analysis (MDA-MB-231)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Analyzes GC3 content and synonymous codon usage of eIF3d hypoxia-promoted mRNAs
+(MDA-MB-231, 1hr hypoxia, TE LFC > 0.5, padj < 0.05), then compares a NanoLuciferase
+CDS to this profile and designs adapted and anti-adapted NanoLuc variants.
+
+All RSCU values are background-corrected pooled bg-RSCU (Sharp and Li 1987 corpus
+definition). For codon j encoding amino acid a:
+
+  bg-RSCU(j) = [count(j) / count(a_total) in gene set] / [count(j) / count(a_total) in background]
+
+Values > 1: codon is over-used relative to background. Values < 1: under-used.
+
+Two backgrounds are compared:
+- **Transcriptome-wide**: loaded from pre-computed `bg_rscu_pooled_231_hyp_vs_nor.csv`
+  (produced by nb54, uses all expressed transcripts as background).
+- **Negative controls**: genes with |TE LFC| < 0.5 and padj > 0.3 across all si3d
+  conditions (recomputed here from the same CDS sequences).
+
+Sequence design uses transcriptome-wide bg-RSCU as the primary ranking metric;
+negative-control bg-RSCU is shown for comparison.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Section 1: Libraries and Parameters
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(ggrepel)
+library(patchwork)
+```
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+n_boot      <- 1000
+seed        <- 9
+cat("Parameters: lfc_cutoff =", lfc_cutoff,
+    "| padj_cutoff =", padj_cutoff,
+    "| n_boot =", n_boot, "\n")
+```
+
+---
+
+# Section 2: NanoLuc CDS Input
+
+Paste the NanoLuc coding sequence from Benchling below (DNA, 5' to 3', without
+stop codon or with stop codon -- the code handles both). Replace the placeholder
+string with the actual sequence.
+
+```{r nanoluc_input}
+# ============================================================
+# PASTE NANOLUC CDS HERE (raw DNA sequence, no spaces/newlines)
+# ============================================================
+nanoluc_cds_raw <- "atgGTCTTCACACTCGAAGATTTCGTTGGGGACTGGCGACAGACAGCCGGCTACAACCTGGACCAAGTCCTTGAACAGGGAGGTGTGTCCAGTTTGTTTCAGAATCTCGGGGTGTCCGTAACTCCGATCCAAAGGATTGTCCTGAGCGGTGAAAATGGGCTGAAGATCGACATCCATGTCATCATCCCGTATGAAGGTCTGAGCGGCGACCAAATGGGCCAGATCGAAAAAATTTTTAAGGTGGTGTACCCTGTGGATGATCATCACTTTAAGGTGATCCTGCACTATGGCACACTGGTAATCGACGGGGTTACGCCGAACATGATCGACTATTTCGGACGGCCGTATGAAGGCATCGCCGTGTTCGACGGCAAAAAGATCACTGTAACAGGGACCCTGTGGAACGGCAACAAAATTATCGACGAGCGCCTGATCAACCCCGACGGCTCCCTGCTGTTCCGAGTAACCATCAACGGAGTGACCGGCTGGCGGCTGTGCGAACGCATTCTGGCG"   # <-- replace with sequence from Benchling
+
+# Validate input is non-empty
+stopifnot("NanoLuc sequence is empty -- paste CDS in nanoluc_cds_raw" =
+            nchar(nanoluc_cds_raw) > 0)
+# Uppercase, strip whitespace
+nanoluc_cds_raw <- toupper(gsub("\\s", "", nanoluc_cds_raw))
+
+# Validate length
+stopifnot("NanoLuc CDS length not divisible by 3" =
+            nchar(nanoluc_cds_raw) %% 3 == 0)
+cat("NanoLuc CDS length:", nchar(nanoluc_cds_raw), "nt\n")
+```
+
+```{r nanoluc_translate}
+nanoluc_dna <- DNAString(nanoluc_cds_raw)
+nanoluc_aa  <- as.character(translate(nanoluc_dna))
+
+# Remove trailing stop codon if present (make sequence stop-codon-free for design steps)
+has_stop <- endsWith(nanoluc_aa, "*")
+if (has_stop) {
+  nanoluc_aa_orf <- substr(nanoluc_aa, 1, nchar(nanoluc_aa) - 1)
+  # Trim stop codon from DNA too
+  nanoluc_cds_orf <- substr(nanoluc_cds_raw, 1, nchar(nanoluc_cds_raw) - 3)
+  cat("Stop codon present and trimmed. ORF length:", nchar(nanoluc_cds_orf), "nt\n")
+} else {
+  nanoluc_aa_orf  <- nanoluc_aa
+  nanoluc_cds_orf <- nanoluc_cds_raw
+  cat("No trailing stop codon. ORF length:", nchar(nanoluc_cds_orf), "nt\n")
+}
+
+# No internal stop codons
+stopifnot("Internal stop codon in NanoLuc ORF" =
+            !grepl("\\*", nanoluc_aa_orf))
+cat("NanoLuc protein length:", nchar(nanoluc_aa_orf), "aa\n")
+cat("NanoLuc protein (first 20 aa):", substr(nanoluc_aa_orf, 1, 20), "\n")
+```
+
+```{r nanoluc_codons}
+# Split ORF into codon vector (no stop)
+nl_codon_vec <- substring(
+  nanoluc_cds_orf,
+  seq(1, nchar(nanoluc_cds_orf) - 2, 3),
+  seq(3, nchar(nanoluc_cds_orf),     3)
+)
+stopifnot("Codon vector length mismatch" =
+            length(nl_codon_vec) == nchar(nanoluc_cds_orf) / 3)
+cat("NanoLuc codon count:", length(nl_codon_vec), "\n")
+
+# Genetic code (needed here for AA translation of each codon)
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- sort(names(aa_to_codons)[sapply(aa_to_codons, length) > 1])
+multi_syn_codons <- unlist(aa_to_codons[multi_aa], use.names = FALSE)
+
+# All NanoLuc codons should be sense codons
+stopifnot("Non-sense codon in NanoLuc ORF" =
+            all(nl_codon_vec %in% sense_codons))
+```
+
+```{r nanoluc_gc3}
+gc3_codons  <- sense_codons[substr(sense_codons, 3, 3) %in% c("G", "C")]
+at3_codons  <- sense_codons[substr(sense_codons, 3, 3) %in% c("A", "T")]
+
+nl_gc3_count <- sum(nl_codon_vec %in% gc3_codons)
+nl_at3_count <- sum(nl_codon_vec %in% at3_codons)
+nl_total_sense <- length(nl_codon_vec)
+
+nanoluc_gc3 <- nl_gc3_count / nl_total_sense * 100
+
+stopifnot("NanoLuc GC3 out of range [0,100]" =
+            dplyr::between(nanoluc_gc3, 0, 100))
+cat("NanoLuc GC3%:", round(nanoluc_gc3, 1),
+    "(GC-ending codons:", nl_gc3_count, "of", nl_total_sense, ")\n")
+```
+
+---
+
+# Section 3: Reference CDS Sequences and Codon Count Matrix
+
+Follows the same approach as nb54. All expressed transcripts from
+`feature_matrix_external_stability.rds` are used to build the codon count matrix.
+
+```{r load_feature_matrix}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Feature matrix:", nrow(feature_matrix), "genes\n")
+```
+
+```{r load_txdb}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0 & width(cds_frame0) > 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r codon_matrix}
+ct0         <- codonTable(cds_frame0)
+counts_mat0 <- codonCounts(ct0)
+rownames(counts_mat0) <- names(cds_frame0)
+cat("Codon counts matrix:", nrow(counts_mat0), "transcripts x", ncol(counts_mat0), "codons\n")
+stopifnot("Zero-count rows in codon matrix" = all(rowSums(counts_mat0) > 0))
+
+# Transcript-to-gene map
+tx_to_gene <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_to_gene, by = "transcript_id_clean")
+
+# GC3 classification table
+codon_gc3_tbl <- tibble(
+  codon          = sense_codons,
+  amino_acid     = gen_code[sense_codons],
+  gc3_nucleotide = substr(sense_codons, 3, 3),
+  gc3_class      = if_else(substr(sense_codons, 3, 3) %in% c("G", "C"),
+                           "GC-ending", "AT-ending")
+) %>% filter(amino_acid != "*")
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+```
+
+---
+
+# Section 4: Gene Sets
+
+```{r load_te_results}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+cat("Total genes in hypoxia TE results:", nrow(te_hyp), "\n")
+```
+
+```{r promoted_genes}
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff)
+cat("eIF3d hypoxia-promoted genes (TE LFC >", lfc_cutoff,
+    ", padj <", padj_cutoff, "):", nrow(promotes), "\n")
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+
+# Transcripts in codon matrix
+promotes_tx <- tx_gene_df %>%
+  filter(gene_id_clean %in% promotes$gene_id_clean) %>%
+  pull(transcript_id_clean)
+promotes_tx <- promotes_tx[promotes_tx %in% rownames(counts_mat0)]
+n_promotes_found <- length(promotes_tx)
+cat("Promoted transcripts found in codon matrix:", n_promotes_found, "\n")
+stopifnot("Fewer than 90% of promoted genes found in codon matrix" =
+            n_promotes_found > 0.9 * nrow(promotes))
+```
+
+```{r neg_control_genes}
+neg_ctrl <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+cat("Negative control pool:", nrow(neg_ctrl), "genes\n")
+
+neg_tx <- tx_gene_df %>%
+  filter(gene_id_clean %in% neg_ctrl$gene_id_clean) %>%
+  pull(transcript_id_clean)
+neg_tx <- neg_tx[neg_tx %in% rownames(counts_mat0)]
+cat("Negative control transcripts found in codon matrix:", length(neg_tx), "\n")
+stopifnot("Fewer than 80% of neg ctrl genes found in codon matrix" =
+            length(neg_tx) > 0.8 * nrow(neg_ctrl))
+```
+
+---
+
+# Section 5: GC3 Content of eIF3d-Promoted Genes
+
+GC3% is taken from `feature_matrix_te_lfc.rds`, which pre-computes it from the
+same transcript selection used across all feature matrices.
+
+```{r load_gc3}
+fm_te <- readRDS(here("output", "predictive_modeling", "feature_matrix_te_lfc.rds"))
+cat("Feature matrix (te_lfc):", nrow(fm_te), "genes,",
+    sum(!is.na(fm_te$gc3)), "have gc3\n")
+
+stopifnot("gc3 out of range" = all(fm_te$gc3 >= 0 & fm_te$gc3 <= 100, na.rm = TRUE))
+
+# Biological spot-check: ACTB GC3% should be 50-70%
+actb_gc3 <- fm_te$gc3[fm_te$symbol == "ACTB"]
+stopifnot("ACTB not found in feature matrix" = length(actb_gc3) > 0)
+stopifnot("ACTB GC3 outside expected range [50,70]" =
+            dplyr::between(actb_gc3[1], 50, 70))
+cat("ACTB GC3%:", round(actb_gc3[1], 1), "(expected 50-70)\n")
+```
+
+```{r gc3_groups}
+fm_gene <- fm_te %>%
+  distinct(gene_id_clean, .keep_all = TRUE) %>%
+  mutate(group = case_when(
+    gene_id_clean %in% promotes$gene_id_clean ~ "eIF3d hypoxia promotes",
+    TRUE ~ "All expressed"
+  ))
+
+gc3_promotes   <- fm_gene$gc3[fm_gene$group == "eIF3d hypoxia promotes"]
+gc3_background <- fm_gene$gc3[fm_gene$group == "All expressed"]
+
+n_promotes_gc3  <- sum(!is.na(gc3_promotes))
+n_background_gc3 <- sum(!is.na(gc3_background))
+cat("GC3 median -- promoted:", round(median(gc3_promotes, na.rm = TRUE), 1), "%",
+    "| background:", round(median(gc3_background, na.rm = TRUE), 1), "%\n")
+
+wilcox_res <- wilcox.test(gc3_promotes, gc3_background)
+cat("Wilcoxon p-value (promoted vs background):", signif(wilcox_res$p.value, 3), "\n")
+
+# Confirm promoted genes have lower GC3 (expected from nb54 AT-ending enrichment)
+cat("Promoted GC3 < background median:",
+    median(gc3_promotes, na.rm = TRUE) < median(gc3_background, na.rm = TRUE), "\n")
+```
+
+```{r plot_gc3_density, fig.width=6, fig.height=4}
+gc3_df <- fm_gene %>%
+  filter(!is.na(gc3)) %>%
+  dplyr::select(gene_id_clean, symbol, gc3, group) %>%
+  mutate(group = factor(group, levels = c("eIF3d hypoxia promotes", "All expressed")))
+
+group_colors_gc3 <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "All expressed"          = "grey70"
+)
+
+wilcox_label <- paste0("Wilcoxon p = ", signif(wilcox_res$p.value, 2))
+
+p_gc3 <- ggplot(gc3_df, aes(x = gc3, colour = group, fill = group)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = nanoluc_gc3, linetype = "dashed",
+             colour = "#0072B2", linewidth = 0.8) +
+  annotate("text",
+           x = nanoluc_gc3 + 1, y = Inf, vjust = 1.4, hjust = 0,
+           label = paste0("NanoLuc\n", round(nanoluc_gc3, 1), "%"),
+           colour = "#0072B2", size = 3.2) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = wilcox_label, size = 3.2) +
+  scale_colour_manual(values = group_colors_gc3, name = NULL) +
+  scale_fill_manual(values = group_colors_gc3, name = NULL) +
+  labs(
+    title    = "CDS GC3 content: eIF3d hypoxia-promoted vs all expressed (MDA-MB-231)",
+    subtitle = paste0("eIF3d promotes n = ", n_promotes_gc3,
+                      ", all expressed n = ", n_promotes_gc3 + n_background_gc3,
+                      "; NanoLuc shown as dashed line"),
+    x = "GC3% (fraction of sense codons ending in G or C)",
+    y = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_gc3)
+ggsave(here("plots", "64a_gc3_density_promotes_vs_background.pdf"),
+       p_gc3, width = 6, height = 4)
+```
+
+---
+
+# Section 6: Background-Corrected Pooled RSCU -- Dual Background Comparison
+
+## 6a. Background A: Transcriptome-Wide (pre-computed)
+
+```{r load_rscu_txwide}
+rscu_txwide <- read_csv(
+  here("output", "predictive_modeling", "bg_rscu_pooled_231_hyp_vs_nor.csv"),
+  show_col_types = FALSE
+)
+cat("Pooled bg-RSCU table (txwide):", nrow(rscu_txwide), "codons\n")
+cat("Columns:", paste(colnames(rscu_txwide), collapse = ", "), "\n")
+
+# Data integrity checks
+stopifnot("Missing multi-synonymous codons in txwide RSCU" =
+            all(multi_syn_codons %in% rscu_txwide$codon))
+stopifnot("Negative bg-RSCU values (txwide)" =
+            all(rscu_txwide$rscu_hyp > 0, na.rm = TRUE))
+
+# AT-ending bias check (key finding from nb54)
+rscu_txwide_multi <- rscu_txwide %>% filter(codon %in% multi_syn_codons)
+at_mean <- mean(rscu_txwide_multi$rscu_hyp[rscu_txwide_multi$gc3_class == "AT-ending"], na.rm = TRUE)
+gc_mean <- mean(rscu_txwide_multi$rscu_hyp[rscu_txwide_multi$gc3_class == "GC-ending"], na.rm = TRUE)
+cat("Mean bg-RSCU (txwide) -- AT-ending:", round(at_mean, 3),
+    "| GC-ending:", round(gc_mean, 3), "\n")
+stopifnot("Expected AT-ending mean bg-RSCU > GC-ending (nb54 result)" =
+            at_mean > gc_mean)
+
+# Phe spot-check: TTT (AT) vs TTC (GC) -- TTT should have higher rscu_hyp
+ttt_rscu <- rscu_txwide$rscu_hyp[rscu_txwide$codon == "TTT"]
+ttc_rscu <- rscu_txwide$rscu_hyp[rscu_txwide$codon == "TTC"]
+cat("Phe spot-check -- TTT (AT):", round(ttt_rscu, 3),
+    "TTC (GC):", round(ttc_rscu, 3), "(expect TTT > TTC)\n")
+stopifnot("TTT bg-RSCU not > TTC (Phe AT vs GC check failed)" =
+            ttt_rscu > ttc_rscu)
+```
+
+## 6b. Background B: Negative Control Transcripts (recomputed)
+
+```{r bg_props_negctrl}
+neg_counts_mat <- counts_mat0[rownames(counts_mat0) %in% neg_tx, , drop = FALSE]
+cat("Negative control codon matrix:", nrow(neg_counts_mat), "transcripts\n")
+stopifnot("Negative control codon matrix has zero rows" = nrow(neg_counts_mat) > 0)
+
+# Pool codon counts across negative control transcripts
+neg_counts_pooled <- colSums(neg_counts_mat)
+cat("Total pooled sense codons (neg ctrl background):",
+    sum(neg_counts_pooled[sense_codons[sense_codons %in% names(neg_counts_pooled)]]), "\n")
+
+# Per-AA background proportions from neg controls (length-weighted pool)
+bg_props_negctrl <- imap(aa_to_codons, function(codons, aa) {
+  codons   <- intersect(codons, names(neg_counts_pooled))
+  if (length(codons) == 0) return(NULL)
+  aa_total <- sum(neg_counts_pooled[codons])
+  if (aa_total == 0) return(NULL)
+  neg_counts_pooled[codons] / aa_total
+})
+bg_props_negctrl <- Filter(Negate(is.null), bg_props_negctrl)
+
+# Validate: proportions sum to 1 per AA
+prop_sums_nc <- sapply(bg_props_negctrl, sum)
+cat("Neg-ctrl background proportions -- sum range (expect all = 1):",
+    round(range(prop_sums_nc), 6), "\n")
+stopifnot("Neg-ctrl background proportions do not sum to 1" =
+            all(abs(prop_sums_nc - 1) < 1e-10))
+cat("Background proportions computed for", length(bg_props_negctrl), "amino acids\n")
+```
+
+```{r compute_rscu_negctrl}
+# Reuse compute_pooled_rscu from nb54
+compute_pooled_rscu <- function(tx_ids, counts_mat, bg_props) {
+  tx_ids  <- intersect(tx_ids, rownames(counts_mat))
+  pooled  <- colSums(counts_mat[tx_ids, , drop = FALSE])
+  rscu_vec <- set_names(rep(NA_real_, length(sense_codons)), sense_codons)
+  for (aa in names(bg_props)) {
+    props    <- bg_props[[aa]]
+    codons   <- intersect(names(props), names(pooled))
+    if (length(codons) == 0) next
+    aa_total <- sum(pooled[codons])
+    if (aa_total == 0) next
+    bp      <- props[codons]
+    valid   <- bp > 0
+    if (any(valid)) {
+      rscu_vec[codons[valid]] <- (pooled[codons[valid]] / aa_total) / bp[valid]
+    }
+  }
+  rscu_vec
+}
+
+# Validate: bg-RSCU of the background against itself must equal 1
+rscu_negctrl_selfcheck <- compute_pooled_rscu(neg_tx, counts_mat0, bg_props_negctrl)
+rscu_nc_sense <- rscu_negctrl_selfcheck[
+  sense_codons[sense_codons %in% names(rscu_negctrl_selfcheck)]]
+rscu_nc_sense <- rscu_nc_sense[!is.na(rscu_nc_sense)]
+cat("Self-check: neg-ctrl bg-RSCU against itself (should all = 1):",
+    "min =", round(min(rscu_nc_sense), 8),
+    "max =", round(max(rscu_nc_sense), 8), "\n")
+stopifnot("Neg-ctrl bg-RSCU self-check failed -- background computation error" =
+            all(abs(rscu_nc_sense - 1) < 1e-10))
+
+# Now compute bg-RSCU of promoted genes vs neg-ctrl background
+rscu_negctrl_vec <- compute_pooled_rscu(promotes_tx, counts_mat0, bg_props_negctrl)
+cat("bg-RSCU (neg-ctrl background) range for promoted genes:",
+    round(range(rscu_negctrl_vec[!is.na(rscu_negctrl_vec)]), 3), "\n")
+stopifnot("Negative bg-RSCU values (neg-ctrl)" =
+            all(rscu_negctrl_vec >= 0, na.rm = TRUE))
+
+# Also validate the txwide background self-check (re-derived here)
+bg_counts_pooled <- colSums(counts_mat0)
+bg_props_pooled  <- imap(aa_to_codons, function(codons, aa) {
+  codons   <- intersect(codons, names(bg_counts_pooled))
+  if (length(codons) == 0) return(NULL)
+  aa_total <- sum(bg_counts_pooled[codons])
+  if (aa_total == 0) return(NULL)
+  bg_counts_pooled[codons] / aa_total
+}) %>% Filter(Negate(is.null), .)
+
+rscu_txwide_selfcheck <- compute_pooled_rscu(rownames(counts_mat0), counts_mat0, bg_props_pooled)
+rscu_tx_sense <- rscu_txwide_selfcheck[
+  sense_codons[sense_codons %in% names(rscu_txwide_selfcheck)]]
+rscu_tx_sense <- rscu_tx_sense[!is.na(rscu_tx_sense)]
+cat("Self-check: txwide bg-RSCU against itself (should all = 1):",
+    "min =", round(min(rscu_tx_sense), 8),
+    "max =", round(max(rscu_tx_sense), 8), "\n")
+stopifnot("Txwide bg-RSCU self-check failed" =
+            all(abs(rscu_tx_sense - 1) < 1e-10))
+```
+
+```{r build_dual_rscu_table}
+# Combine both bg-RSCU estimates into one table for comparison
+rscu_dual <- tibble(
+  codon         = sense_codons,
+  amino_acid    = gen_code[sense_codons]
+) %>%
+  filter(amino_acid != "*", codon %in% multi_syn_codons) %>%
+  left_join(codon_gc3_tbl %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(
+    rscu_txwide  = rscu_txwide$rscu_hyp[match(codon, rscu_txwide$codon)],
+    rscu_negctrl = rscu_negctrl_vec[codon]
+  )
+
+stopifnot("Missing rscu_txwide values" = !any(is.na(rscu_dual$rscu_txwide)))
+stopifnot("Missing rscu_negctrl values" = !any(is.na(rscu_dual$rscu_negctrl)))
+
+# Per-AA preferred codon under each background
+rscu_dual <- rscu_dual %>%
+  group_by(amino_acid) %>%
+  mutate(
+    rank_txwide  = rank(-rscu_txwide,  ties.method = "min"),
+    rank_negctrl = rank(-rscu_negctrl, ties.method = "min"),
+    preferred_txwide  = rank_txwide == 1,
+    preferred_negctrl = rank_negctrl == 1,
+    backgrounds_agree = (rank_txwide == 1) == (rank_negctrl == 1)
+  ) %>%
+  ungroup()
+
+# Tie check
+tie_check_tx <- rscu_dual %>%
+  filter(preferred_txwide) %>%
+  count(amino_acid) %>%
+  filter(n > 1)
+tie_check_nc <- rscu_dual %>%
+  filter(preferred_negctrl) %>%
+  count(amino_acid) %>%
+  filter(n > 1)
+if (nrow(tie_check_tx) > 0) {
+  cat("WARNING: ties in txwide preferred codon for AAs:",
+      paste(tie_check_tx$amino_acid, collapse = ", "), "\n")
+} else {
+  cat("No ties in txwide preferred codons.\n")
+}
+if (nrow(tie_check_nc) > 0) {
+  cat("WARNING: ties in neg-ctrl preferred codon for AAs:",
+      paste(tie_check_nc$amino_acid, collapse = ", "), "\n")
+} else {
+  cat("No ties in neg-ctrl preferred codons.\n")
+}
+
+# Agreement between backgrounds (backgrounds_agree is already in rscu_dual)
+agreement_df <- rscu_dual %>%
+  filter(preferred_txwide) %>%
+  dplyr::select(amino_acid, codon, gc3_class, rscu_txwide, rscu_negctrl,
+                preferred_txwide, preferred_negctrl, backgrounds_agree)
+
+n_agree <- sum(agreement_df$backgrounds_agree)
+n_total <- nrow(agreement_df)
+cat("Preferred codon agrees between both backgrounds:",
+    n_agree, "of", n_total, "amino acids\n")
+
+if (n_agree < n_total) {
+  cat("Disagreements:\n")
+  print(
+    rscu_dual %>%
+      group_by(amino_acid) %>%
+      filter(preferred_txwide != preferred_negctrl |
+               (any(preferred_txwide) & any(preferred_negctrl) & !any(preferred_txwide & preferred_negctrl))) %>%
+      dplyr::select(amino_acid, codon, gc3_class, rscu_txwide, rscu_negctrl,
+                    preferred_txwide, preferred_negctrl) %>%
+      arrange(amino_acid, desc(rscu_txwide))
+  )
+}
+```
+
+## 6c. Visualizations
+
+```{r plot_rscu_scatter, fig.width=5.5, fig.height=5}
+scatter_df <- rscu_dual %>%
+  mutate(
+    aa_label  = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    highlight = preferred_txwide | preferred_negctrl
+  )
+
+p_scatter <- ggplot(scatter_df, aes(x = rscu_txwide, y = rscu_negctrl,
+                                     colour = gc3_class)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_hline(yintercept = 1, linewidth = 0.3, colour = "grey80") +
+  geom_vline(xintercept = 1, linewidth = 0.3, colour = "grey80") +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_text_repel(
+    data = scatter_df %>% filter(!backgrounds_agree | highlight),
+    aes(label = codon), size = 2.8, max.overlaps = 15
+  ) +
+  scale_colour_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#56B4E9"),
+                      name = "Codon 3rd position") +
+  labs(
+    title    = "bg-RSCU comparison: transcriptome-wide vs negative-control background",
+    subtitle = paste0("eIF3d hypoxia-promoted set (n = ", n_promotes_found,
+                      " transcripts); diagonal = perfect agreement"),
+    x = "bg-RSCU vs transcriptome-wide background",
+    y = "bg-RSCU vs negative-control background"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_scatter)
+ggsave(here("plots", "64b_rscu_dual_background_scatter.pdf"),
+       p_scatter, width = 5.5, height = 5)
+```
+
+```{r plot_rscu_faceted, fig.width=13, fig.height=10}
+facet_df <- rscu_dual %>%
+  pivot_longer(
+    cols      = c(rscu_txwide, rscu_negctrl),
+    names_to  = "background",
+    values_to = "bg_rscu"
+  ) %>%
+  mutate(
+    background = recode(background,
+                        rscu_txwide  = "Transcriptome-wide bg",
+                        rscu_negctrl = "Negative-control bg"),
+    background = factor(background,
+                        levels = c("Transcriptome-wide bg", "Negative-control bg")),
+    aa_label   = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
+    codon      = factor(codon, levels = codon[order(rscu_txwide[match(codon, codon)])])
+  ) %>%
+  group_by(amino_acid) %>%
+  mutate(codon = reorder(codon, if_else(background == "Transcriptome-wide bg",
+                                        bg_rscu, 0))) %>%
+  ungroup()
+
+p_facet <- ggplot(facet_df, aes(x = codon, y = bg_rscu,
+                                  fill = gc3_class, alpha = background)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~ aa_label, scales = "free_x", nrow = 4) +
+  scale_fill_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#56B4E9"),
+                    name = "3rd position") +
+  scale_alpha_manual(values = c("Transcriptome-wide bg" = 1, "Negative-control bg" = 0.55),
+                     name = "Background") +
+  labs(
+    title    = "Pooled bg-RSCU in eIF3d hypoxia-promoted genes, by amino acid",
+    subtitle = "Solid = transcriptome-wide background; faded = negative-control background; dashed = 1.0",
+    x = "Codon", y = "Background-corrected pooled RSCU"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+print(p_facet)
+ggsave(here("plots", "64c_rscu_faceted_by_aa.pdf"),
+       p_facet, width = 13, height = 10)
+```
+
+```{r plot_preferred_gc3, fig.width=5, fig.height=3.5}
+pref_summary <- rscu_dual %>%
+  filter(preferred_txwide) %>%
+  count(gc3_class) %>%
+  mutate(pct = n / sum(n) * 100)
+
+cat("Preferred codons by GC3 class (txwide background):\n")
+print(pref_summary)
+
+p_pref_gc3 <- ggplot(pref_summary, aes(x = gc3_class, y = n, fill = gc3_class)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0(n, " (", round(pct, 0), "%)")),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c("AT-ending" = "#E69F00", "GC-ending" = "#56B4E9"),
+                    name = NULL) +
+  labs(
+    title    = "GC3 class of preferred codon per amino acid",
+    subtitle = "Preferred = highest bg-RSCU in eIF3d hypoxia-promoted genes (txwide background)",
+    x = "Codon 3rd position class",
+    y = "Number of amino acids"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_pref_gc3)
+ggsave(here("plots", "64d_preferred_codon_gc3_class.pdf"),
+       p_pref_gc3, width = 5, height = 3.5)
+```
+
+---
+
+# Section 7: NanoLuc Position-by-Position bg-RSCU Scoring
+
+Score each codon position in the NanoLuc ORF by its bg-RSCU in the eIF3d
+hypoxia-promoted set (transcriptome-wide background). Met (ATG) and Trp (TGG) are
+excluded since they have no synonyms.
+
+```{r nanoluc_position_scoring}
+# Look up bg-RSCU for each NanoLuc codon from the txwide table
+rscu_lookup_txwide <- setNames(rscu_txwide$rscu_hyp, rscu_txwide$codon)
+
+nl_pos_df <- tibble(
+  position    = seq_along(nl_codon_vec),
+  codon       = nl_codon_vec,
+  amino_acid  = gen_code[nl_codon_vec]
+) %>%
+  left_join(codon_gc3_tbl %>% dplyr::select(codon, gc3_class), by = "codon") %>%
+  mutate(
+    rscu_txwide = rscu_lookup_txwide[codon],
+    has_synonyms = codon %in% multi_syn_codons
+  )
+
+n_scoreable <- sum(nl_pos_df$has_synonyms)
+cat("NanoLuc positions scoreable (has synonyms):", n_scoreable, "of",
+    nrow(nl_pos_df), "\n")
+cat("Mean bg-RSCU across scoreable positions:",
+    round(mean(nl_pos_df$rscu_txwide[nl_pos_df$has_synonyms], na.rm = TRUE), 3), "\n")
+
+# Codons with bg-RSCU < 0.8 are substantially sub-optimal for eIF3d-promoted genes
+n_suboptimal <- sum(nl_pos_df$rscu_txwide < 0.8, na.rm = TRUE)
+cat("Positions with bg-RSCU < 0.8 (sub-optimal for eIF3d):", n_suboptimal, "\n")
+```
+
+```{r plot_nanoluc_position, fig.width=9, fig.height=4}
+plot_pos_df <- nl_pos_df %>%
+  filter(has_synonyms) %>%
+  mutate(
+    rscu_class = case_when(
+      rscu_txwide >= 1.2 ~ "High (>=1.2)",
+      rscu_txwide >= 0.8 ~ "Moderate (0.8-1.2)",
+      TRUE               ~ "Low (<0.8)"
+    ),
+    rscu_class = factor(rscu_class,
+                        levels = c("High (>=1.2)", "Moderate (0.8-1.2)", "Low (<0.8)"))
+  )
+
+p_pos <- ggplot(plot_pos_df, aes(x = position, y = rscu_txwide, colour = rscu_class)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_smooth(method = "loess", span = 0.3, se = FALSE,
+              colour = "grey30", linewidth = 0.6, linetype = "solid") +
+  geom_hline(yintercept = 1, linewidth = 0.4, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = c("High (>=1.2)" = "#E69F00", "Moderate (0.8-1.2)" = "grey50",
+               "Low (<0.8)"   = "#56B4E9"),
+    name = "bg-RSCU class"
+  ) +
+  labs(
+    title    = "NanoLuc codon position vs bg-RSCU in eIF3d hypoxia-promoted genes",
+    subtitle = paste0("Transcriptome-wide background; Met/Trp excluded (no synonyms);",
+                      " n = ", n_scoreable, " positions; smoothed = loess"),
+    x = "Codon position in NanoLuc ORF",
+    y = "bg-RSCU (transcriptome-wide background)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_pos)
+ggsave(here("plots", "64e_nanoluc_position_rscu.pdf"),
+       p_pos, width = 9, height = 4)
+```
+
+---
+
+# Section 8: Design eIF3d-Adapted and Anti-Adapted NanoLuc Sequences
+
+For each NanoLuc codon, swap to the synonymous codon with highest bg-RSCU
+(3d-adapted) or lowest bg-RSCU (3d-anti-adapted) in the eIF3d hypoxia-promoted
+set (transcriptome-wide background). Met/Trp positions are unchanged.
+
+```{r build_preference_lookups}
+# Per-AA preferred codon (max bg-RSCU) and anti-preferred codon (min bg-RSCU)
+# Only for AAs with synonyms; use txwide bg-RSCU as ranking metric
+pref_adapted <- rscu_dual %>%
+  group_by(amino_acid) %>%
+  slice_max(rscu_txwide, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(amino_acid, preferred_codon = codon,
+                preferred_rscu = rscu_txwide, preferred_gc3 = gc3_class)
+
+pref_antiadapted <- rscu_dual %>%
+  group_by(amino_acid) %>%
+  slice_min(rscu_txwide, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(amino_acid, antipreferred_codon = codon,
+                antipreferred_rscu = rscu_txwide, antipreferred_gc3 = gc3_class)
+
+pref_table <- pref_adapted %>%
+  left_join(pref_antiadapted, by = "amino_acid") %>%
+  mutate(aa_label = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")")) %>%
+  arrange(amino_acid)
+
+cat("Preference table (", nrow(pref_table), "amino acids with synonyms):\n")
+print(pref_table %>% dplyr::select(aa_label, preferred_codon, preferred_rscu,
+                                   antipreferred_codon, antipreferred_rscu))
+
+# Lookup vectors (AA → codon)
+adapted_lookup     <- setNames(pref_adapted$preferred_codon, pref_adapted$amino_acid)
+antiadapted_lookup <- setNames(pref_antiadapted$antipreferred_codon, pref_antiadapted$amino_acid)
+```
+
+```{r design_sequences}
+design_cds <- function(codon_vec, lookup, gen_code_map) {
+  aa_vec <- gen_code_map[codon_vec]
+  vapply(seq_along(codon_vec), function(i) {
+    aa      <- aa_vec[[i]]
+    if (is.na(lookup[aa]) || is.null(lookup[aa])) return(codon_vec[i])
+    lookup[[aa]]
+  }, character(1))
+}
+
+adapted_codon_vec     <- design_cds(nl_codon_vec, adapted_lookup,     gen_code)
+antiadapted_codon_vec <- design_cds(nl_codon_vec, antiadapted_lookup, gen_code)
+
+adapted_cds     <- paste0(adapted_codon_vec,     collapse = "")
+antiadapted_cds <- paste0(antiadapted_codon_vec, collapse = "")
+
+cat("Original CDS length:     ", nchar(nanoluc_cds_orf), "nt\n")
+cat("Adapted CDS length:      ", nchar(adapted_cds), "nt\n")
+cat("Anti-adapted CDS length: ", nchar(antiadapted_cds), "nt\n")
+```
+
+```{r validate_designs}
+# Protein identity -- any codon swap error would show up here
+orig_protein    <- as.character(translate(DNAString(nanoluc_cds_orf)))
+adapted_protein <- as.character(translate(DNAString(adapted_cds)))
+anti_protein    <- as.character(translate(DNAString(antiadapted_cds)))
+
+stopifnot("Adapted protein length mismatch" =
+            nchar(adapted_protein) == nchar(orig_protein))
+stopifnot("Anti-adapted protein length mismatch" =
+            nchar(anti_protein) == nchar(orig_protein))
+stopifnot("Adapted protein differs from original" =
+            adapted_protein == orig_protein)
+stopifnot("Anti-adapted protein differs from original" =
+            anti_protein == orig_protein)
+stopifnot("Adapted CDS length mismatch" =
+            nchar(adapted_cds) == nchar(nanoluc_cds_orf))
+stopifnot("Anti-adapted CDS length mismatch" =
+            nchar(antiadapted_cds) == nchar(nanoluc_cds_orf))
+
+cat("Protein identity check -- PASSED for adapted and anti-adapted.\n")
+cat("Protein (first 30 aa):", substr(orig_protein, 1, 30), "\n")
+
+# Positions changed
+n_adapted_changed     <- sum(adapted_codon_vec != nl_codon_vec)
+n_antiadapted_changed <- sum(antiadapted_codon_vec != nl_codon_vec)
+cat("Positions changed (adapted):     ", n_adapted_changed,
+    "of", length(nl_codon_vec), "\n")
+cat("Positions changed (anti-adapted):", n_antiadapted_changed,
+    "of", length(nl_codon_vec), "\n")
+```
+
+```{r design_gc3_rscu}
+gc3_adapted     <- sum(adapted_codon_vec %in% gc3_codons) / length(adapted_codon_vec) * 100
+gc3_antiadapted <- sum(antiadapted_codon_vec %in% gc3_codons) / length(antiadapted_codon_vec) * 100
+
+mean_rscu_orig     <- mean(rscu_lookup_txwide[nl_codon_vec[nl_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+mean_rscu_adapted  <- mean(rscu_lookup_txwide[adapted_codon_vec[adapted_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+mean_rscu_anti     <- mean(rscu_lookup_txwide[antiadapted_codon_vec[antiadapted_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+
+stopifnot("GC3 values out of range" =
+            all(sapply(c(gc3_adapted, gc3_antiadapted), dplyr::between, 0, 100)))
+
+cat("\n--- Sequence design summary ---\n")
+cat("Metric             | Original  | 3d-Adapted | 3d-Anti-adapted\n")
+cat("GC3%               |", round(nanoluc_gc3, 1), "      |",
+    round(gc3_adapted, 1), "       |", round(gc3_antiadapted, 1), "\n")
+cat("Mean bg-RSCU       |", round(mean_rscu_orig, 3), "   |",
+    round(mean_rscu_adapted, 3), "    |", round(mean_rscu_anti, 3), "\n")
+cat("Codons changed     | 0         |", n_adapted_changed,
+    "      |", n_antiadapted_changed, "\n")
+```
+
+```{r plot_design_summary, fig.width=5, fig.height=4.5}
+design_summary <- tibble(
+  variant    = factor(c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted"),
+                      levels = c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted")),
+  gc3_pct    = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted),
+  mean_rscu  = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti),
+  colour     = c("#56B4E9", "#E69F00", "#009E73")
+)
+
+p_design_gc3 <- ggplot(design_summary, aes(x = variant, y = gc3_pct, fill = variant)) +
+  geom_col(width = 0.55) +
+  geom_text(aes(label = paste0(round(gc3_pct, 1), "%")),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = setNames(design_summary$colour, design_summary$variant),
+                    guide = "none") +
+  labs(
+    title = "GC3% of NanoLuc variants",
+    x = NULL, y = "GC3%"
+  ) +
+  theme_classic(base_size = 12)
+
+p_design_rscu <- ggplot(design_summary, aes(x = variant, y = mean_rscu, fill = variant)) +
+  geom_col(width = 0.55) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  geom_text(aes(label = round(mean_rscu, 3)),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = setNames(design_summary$colour, design_summary$variant),
+                    guide = "none") +
+  labs(
+    title = "Mean bg-RSCU of NanoLuc variants",
+    subtitle = "Mean across positions with synonymous codons (txwide background)",
+    x = NULL, y = "Mean bg-RSCU"
+  ) +
+  theme_classic(base_size = 12)
+
+p_design_combined <- p_design_gc3 / p_design_rscu
+print(p_design_combined)
+ggsave(here("plots", "64f_nanoluc_design_summary.pdf"),
+       p_design_combined, width = 5, height = 4.5)
+```
+
+```{r write_outputs}
+# Full per-position codon table
+position_table <- tibble(
+  position          = seq_along(nl_codon_vec),
+  amino_acid        = gen_code[nl_codon_vec],
+  codon_original    = nl_codon_vec,
+  codon_adapted     = adapted_codon_vec,
+  codon_antiadapted = antiadapted_codon_vec,
+  rscu_original     = rscu_lookup_txwide[nl_codon_vec],
+  rscu_adapted      = rscu_lookup_txwide[adapted_codon_vec],
+  rscu_antiadapted  = rscu_lookup_txwide[antiadapted_codon_vec],
+  gc3_original      = codon_gc3_tbl$gc3_class[match(nl_codon_vec, codon_gc3_tbl$codon)],
+  gc3_adapted       = codon_gc3_tbl$gc3_class[match(adapted_codon_vec, codon_gc3_tbl$codon)],
+  gc3_antiadapted   = codon_gc3_tbl$gc3_class[match(antiadapted_codon_vec, codon_gc3_tbl$codon)]
+)
+
+# Sequence summary table
+sequence_table <- tibble(
+  name           = c("nanoluc_original", "nanoluc_3d_adapted", "nanoluc_3d_antiadapted"),
+  sequence       = c(nanoluc_cds_orf, adapted_cds, antiadapted_cds),
+  length_nt      = nchar(sequence),
+  gc3_pct        = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted),
+  mean_bg_rscu   = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti),
+  n_codons_changed = c(0L, n_adapted_changed, n_antiadapted_changed)
+)
+
+# Codon preference reference table
+pref_export <- pref_table %>%
+  dplyr::select(amino_acid, aa_label,
+                preferred_codon, preferred_rscu, preferred_gc3,
+                antipreferred_codon, antipreferred_rscu, antipreferred_gc3)
+
+write_csv(sequence_table,
+          here("output", "predictive_modeling", "nanoluc_codon_designed_sequences.csv"))
+write_csv(position_table,
+          here("output", "predictive_modeling", "nanoluc_codon_positions.csv"))
+write_csv(pref_export,
+          here("output", "predictive_modeling", "eif3d_preferred_codons_per_aa.csv"))
+
+cat("Outputs written:\n")
+cat("  nanoluc_codon_designed_sequences.csv\n")
+cat("  nanoluc_codon_positions.csv\n")
+cat("  eif3d_preferred_codons_per_aa.csv\n")
+```
+
+---
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

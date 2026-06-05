@@ -1,0 +1,300 @@
+---
+title: "65 — Benchling Construct Design: 5' UTR Reporter Constructs"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+library(tximport)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+# Gene lists
+
+```{r define_genes}
+target_symbols <- c(
+  "S100A11", "RAB7A", "BTF3", "CHMP4C", "PTMS",
+  "UBL5", "COQ10A", "MAIP1", "EIF1B", "TBC1D8B"
+)
+
+neg_symbols <- c("CADM4", "B4GAT1")
+
+all_symbols <- c(target_symbols, neg_symbols)
+
+gene_groups <- tibble(
+  symbol     = all_symbols,
+  gene_group = c(rep("target", length(target_symbols)),
+                 rep("negative_control", length(neg_symbols)))
+)
+```
+
+# Gene annotation lookup
+
+Restrict to gene IDs present in the MDA-MB-231 TE dataset. This resolves ambiguous
+symbols like RING1, which maps to multiple ENSG IDs in GENCODE v49 (alternative
+loci in the MHC region) but only one of which (ENSG00000204227) is the expressed
+canonical locus in our data.
+
+```{r gene_annotation}
+# Load TE data to select the expressed gene ID for each symbol.
+# complete_te_list_1hr.csv columns: symbol, gene_id, TE columns, biotype,
+# RNA count columns ("_rna_"), ribosome footprint columns ("_ribo_").
+te_full <- read_csv(here("output", "complete_te_list_1hr.csv"),
+                    show_col_types = FALSE) |>
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    total_rna     = rowSums(across(contains("_rna_")), na.rm = TRUE)
+  )
+
+# For symbols with multiple expressed ENSG IDs (e.g. RING1 maps to two loci in
+# GENCODE v49), keep the one with higher total RNA expression — that is the
+# canonical expressed locus (ENSG00000204227 for RING1, which is also the ID
+# used in negative_control_genes.csv; the other locus ENSG00000235107 is
+# actually upregulated in si3d and is not a suitable negative control).
+gene_id_map <- te_full |>
+  dplyr::select(symbol, gene_id_clean, total_rna) |>
+  group_by(symbol) |>
+  dplyr::slice_max(total_rna, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+gene_df <- gene_groups |>
+  left_join(gene_id_map |> dplyr::select(symbol, gene_id_clean), by = "symbol")
+
+stopifnot(
+  "All symbols must be found in TE data" =
+    all(all_symbols %in% gene_df$symbol),
+  "Each symbol must resolve to exactly one gene ID" =
+    nrow(gene_df) == length(all_symbols)
+)
+
+cat("Gene IDs resolved:\n")
+print(gene_df |> dplyr::select(symbol, gene_group, gene_id_clean))
+```
+
+# Transcript isoform selection
+
+Select the most-expressed transcript per gene in siCTRL normoxia 1hr and siCTRL hypoxia 1hr, restricting to transcripts with an annotated 5'UTR in GENCODE v49. This avoids selecting transcripts that lack a 5'UTR annotation (e.g. RING1's most abundant isoform ENST00000436128 has no 5'UTR in the txdb). Use the normoxia-dominant transcript; verify it is also dominant in hypoxia. For any inconsistent gene, fall back to the hypoxia-dominant transcript and report it.
+
+```{r isoform_selection}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# Transcript IDs (clean, version-stripped) with annotated 5'UTR in GENCODE v49
+utr5_all         <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr5_tx_versioned <- names(utr5_all)
+utr5_tx_clean    <- sub("\\..*", "", utr5_tx_versioned)
+
+metadata <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
+                     show_col_types = FALSE)
+
+salmon_dir <- here("2025_MDAcells_riboseq", "salmon")
+
+tx2gene_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), show_col_types = FALSE
+) |>
+  filter(str_starts(transcript_id, "ENST"))
+
+load_top_tx <- function(sample_ids, label) {
+  files <- file.path(salmon_dir, sample_ids, "quant.sf.gz")
+  names(files) <- sample_ids
+  files <- files[file.exists(files)]
+  cat(label, "— samples found:", length(files), "\n")
+  txi <- tximport(files, type = "salmon", tx2gene = tx2gene_map, txOut = TRUE)
+  txi$abundance |>
+    as.data.frame() |>
+    rownames_to_column("transcript_id") |>
+    mutate(
+      transcript_id_clean = sub("\\..*", "", transcript_id),
+      gene_id_clean       = sub("\\..*", "",
+        tx2gene_map$gene_id[match(transcript_id, tx2gene_map$transcript_id)])
+    ) |>
+    mutate(total_tpm = rowSums(across(where(is.numeric)), na.rm = TRUE))
+}
+
+nor_ids <- metadata |>
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL",
+         condition == "normoxia", hours == 1) |>
+  pull(id)
+
+hyp_ids <- metadata |>
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL",
+         condition == "hypoxia", hours == 1) |>
+  pull(id)
+
+nor_abundance <- load_top_tx(nor_ids, "Normoxia siCTRL 1hr")
+hyp_abundance <- load_top_tx(hyp_ids, "Hypoxia siCTRL 1hr")
+
+top_tx_per_gene <- function(abund_df) {
+  abund_df |>
+    filter(gene_id_clean %in% gene_df$gene_id_clean,
+           transcript_id_clean %in% utr5_tx_clean) |>
+    group_by(gene_id_clean) |>
+    dplyr::slice_max(total_tpm, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    dplyr::select(gene_id_clean, transcript_id_clean, total_tpm)
+}
+
+nor_top <- top_tx_per_gene(nor_abundance) |>
+  dplyr::rename(top_tx_nor = transcript_id_clean, tpm_nor = total_tpm)
+
+hyp_top <- top_tx_per_gene(hyp_abundance) |>
+  dplyr::rename(top_tx_hyp = transcript_id_clean, tpm_hyp = total_tpm)
+
+isoform_check <- gene_df |>
+  left_join(nor_top, by = "gene_id_clean") |>
+  left_join(hyp_top, by = "gene_id_clean") |>
+  mutate(consistent = !is.na(top_tx_nor) & !is.na(top_tx_hyp) &
+                      top_tx_nor == top_tx_hyp)
+
+cat("\nIsoform dominance consistency (normoxia vs hypoxia siCTRL 1hr):\n")
+print(isoform_check |>
+        dplyr::select(symbol, gene_group, top_tx_nor, tpm_nor, top_tx_hyp, tpm_hyp, consistent))
+
+switched <- isoform_check |> filter(!consistent)
+if (nrow(switched) > 0) {
+  cat("\nInconsistent dominant isoform — using hypoxia-dominant transcript for:\n")
+  print(switched |> dplyr::select(symbol, top_tx_nor, top_tx_hyp))
+}
+
+# Use normoxia-dominant; fall back to hypoxia-dominant if inconsistent
+tx_selected <- isoform_check |>
+  mutate(
+    transcript_id_final = if_else(consistent, top_tx_nor, top_tx_hyp)
+  ) |>
+  dplyr::select(symbol, gene_group, gene_id_clean, transcript_id_final)
+
+stopifnot(
+  "All genes must have a selected transcript" =
+    !any(is.na(tx_selected$transcript_id_final))
+)
+```
+
+# Extract 5' UTR sequences
+
+```{r extract_utr5}
+# Map clean transcript IDs to versioned IDs needed by txdb
+# (txdb, genome, utr5_all already loaded in isoform_selection chunk)
+tx_version_map <- tx_selected |>
+  left_join(
+    tx2gene_map |>
+      mutate(transcript_id_clean = sub("\\..*", "", transcript_id)) |>
+      dplyr::select(transcript_id_clean, transcript_id_versioned = transcript_id) |>
+      distinct(transcript_id_clean, .keep_all = TRUE),
+    by = c("transcript_id_final" = "transcript_id_clean")
+  )
+
+target_utrs <- utr5_all[names(utr5_all) %in% tx_version_map$transcript_id_versioned]
+utr5_seqs   <- extractTranscriptSeqs(genome, target_utrs)
+
+# Convert to named character vector so indexing with missing names returns NA
+# instead of erroring (DNAStringSet subsetting errors on unknown names)
+utr5_char <- setNames(as.character(utr5_seqs), names(utr5_seqs))
+
+seq_df <- tx_version_map |>
+  mutate(
+    utr5_sequence = utr5_char[transcript_id_versioned],
+    utr5_length   = nchar(utr5_sequence)
+  ) |>
+  arrange(match(symbol, all_symbols))
+
+missing_utr5 <- seq_df |> filter(is.na(utr5_sequence)) |> pull(symbol)
+if (length(missing_utr5) > 0) {
+  cat("WARNING — no annotated 5'UTR in GENCODE v49 for:", paste(missing_utr5, collapse = ", "), "\n")
+}
+
+cat("\n5' UTR lengths (bp):\n")
+print(seq_df |> dplyr::select(symbol, gene_group, transcript_id_final, utr5_length))
+```
+
+# Validation
+
+```{r validate}
+stopifnot(
+  "No missing 5'UTR sequences" =
+    !any(is.na(seq_df$utr5_sequence)),
+  "All 5'UTR sequences non-empty" =
+    all(nchar(seq_df$utr5_sequence) > 0, na.rm = TRUE),
+  "S100A11 5'UTR length in expected range (~89 bp)" =
+    between(seq_df$utr5_length[seq_df$symbol == "S100A11"], 75, 105),
+  "UBL5 5'UTR length in expected range (~78 bp)" =
+    between(seq_df$utr5_length[seq_df$symbol == "UBL5"], 65, 95),
+  "PTMS 5'UTR length in expected range (~343 bp)" =
+    between(seq_df$utr5_length[seq_df$symbol == "PTMS"], 300, 380),
+  "All construct names unique" =
+    !anyDuplicated(seq_df$symbol)
+)
+
+cat("All validation checks passed.\n")
+```
+
+# Assemble constructs
+
+```{r assemble_constructs}
+prefix         <- "GTGAACCGTCAGATCAGATC"
+reporter_start <- "atgGTCTTCACACTCGAAGATTTCGTTGGGGACTGGCGACAGACAGCCGGCTACAACCTGGACCAAGTCCTTG"
+suffix         <- "AACAGGGAGGTGTGTCCAGT"
+
+constructs_df <- seq_df |>
+  mutate(
+    Name             = symbol,
+    prefix           = prefix,
+    reporter_start   = reporter_start,
+    suffix           = suffix,
+    full_construct   = paste0(prefix, utr5_sequence, reporter_start, suffix),
+    construct_length = nchar(full_construct)
+  ) |>
+  dplyr::select(Name, symbol, gene_group, transcript_id_final,
+                utr5_length, utr5_sequence,
+                prefix, reporter_start, suffix, full_construct, construct_length)
+
+stopifnot(
+  "All full_construct values start with expected prefix" =
+    all(str_starts(constructs_df$full_construct, prefix)),
+  "Benchling names must be unique" =
+    !anyDuplicated(constructs_df$Name)
+)
+
+cat("Construct lengths (bp):\n")
+print(constructs_df |> dplyr::select(Name, gene_group, utr5_length, construct_length))
+```
+
+
+Remove constructs that are bigger than 260 nt for teiwst purposes
+
+```{r}
+constructs_df <- constructs_df |> 
+  filter(construct_length < 260)
+```
+
+
+
+
+# Export
+
+```{r export}
+write_csv(
+  constructs_df,
+  here("output", "predictive_modeling", "65_constructs_all.csv")
+)
+cat("Saved full construct table:",
+    nrow(constructs_df), "rows to output/predictive_modeling/65_constructs_all.csv\n")
+
+benchling_df <- constructs_df |>
+  dplyr::select(Name, Bases = full_construct, construct_length)
+
+write_csv(
+  benchling_df,
+  here("output", "predictive_modeling", "65_benchling_import.csv")
+)
+cat("Saved Benchling import:", nrow(benchling_df),
+    "constructs to output/predictive_modeling/65_benchling_import.csv\n")
+
+cat("\nBenchling import preview:\n")
+print(benchling_df |>
+        mutate(Bases_preview = paste0(str_sub(Bases, 1, 40), "...")))
+```

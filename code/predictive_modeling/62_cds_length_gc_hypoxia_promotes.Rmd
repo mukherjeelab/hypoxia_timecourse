@@ -1,0 +1,212 @@
+---
+title: "62 - CDS length and GC content: eIF3d hypoxia-promoted mRNAs"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Characterize the CDS length and GC content of mRNAs translationally promoted by
+eIF3d in hypoxia (1hr, te_lfc > 1, te_padj < 0.05), compared to all expressed
+mRNAs. Transcript selection (most abundant isoform per gene, MDA-MB-231 siCTRL
+normoxia) is read directly from the pre-computed feature matrix.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+```
+
+# Load Gene Sets
+
+```{r load_promotes}
+te_hyp <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+                   show_col_types = FALSE)
+
+promotes <- te_hyp %>%
+  filter(te_lfc > 0.5, te_padj < 0.05) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes (te_lfc > 0.5, te_padj < 0.05):", nrow(promotes), "\n")
+```
+
+# Get Transcript IDs from Feature Matrix
+
+```{r load_feature_matrix}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+
+tx_all <- fm %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- tx_all %>%
+  filter(gene_id_clean %in% promotes$gene_id_clean)
+
+cat("All expressed genes in feature matrix:", nrow(tx_all), "\n")
+cat("Promoted genes found in feature matrix:", nrow(tx_promotes), "of", nrow(promotes), "\n")
+```
+
+# Extract CDS Lengths
+
+```{r extract_cds_lengths}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds  <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+cds_len_df <- as.data.frame(cds) %>%
+  group_by(group_name) %>%
+  summarise(cds_length = sum(width), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", group_name)) %>%
+  dplyr::select(transcript_id_clean, cds_length)
+
+cds_all <- tx_all %>%
+  left_join(cds_len_df, by = "transcript_id_clean") %>%
+  filter(!is.na(cds_length), cds_length > 0, cds_length %% 3 == 0)
+
+cds_promotes <- tx_promotes %>%
+  left_join(cds_len_df, by = "transcript_id_clean") %>%
+  filter(!is.na(cds_length), cds_length > 0, cds_length %% 3 == 0)
+
+cat("All expressed - valid CDS:", nrow(cds_all), "of", nrow(tx_all), "\n")
+cat("Promoted - valid CDS:", nrow(cds_promotes), "of", nrow(tx_promotes), "\n")
+```
+
+# CDS Length Distributions
+
+```{r plot_cds_length, fig.width=6, fig.height=4}
+med_len_all <- median(cds_all$cds_length)
+med_len_pro <- median(cds_promotes$cds_length)
+cat("Median CDS length - all expressed:", med_len_all, "nt (", round(med_len_all / 1000, 2), "kb)\n")
+cat("Median CDS length - promoted:     ", med_len_pro, "nt (", round(med_len_pro / 1000, 2), "kb)\n")
+
+p_len_all <- ggplot(cds_all, aes(x = cds_length / 1000)) +
+  geom_histogram(binwidth = 0.5, fill = "grey60", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = med_len_all / 1000, linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = med_len_all / 1000 + 0.5, y = Inf,
+           label = paste0("median = ", round(med_len_all / 1000, 2), " kb"),
+           hjust = 0, vjust = 1.4, size = 3.5) +
+  labs(x = "CDS length (kb)", y = "Number of genes",
+       title = "CDS length: all expressed mRNAs") +
+  theme_classic(base_size = 12)
+
+p_len_pro <- ggplot(cds_promotes, aes(x = cds_length / 1000)) +
+  geom_histogram(binwidth = 0.5, fill = "#E69F00", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = med_len_pro / 1000, linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = med_len_pro / 1000 + 0.5, y = Inf,
+           label = paste0("median = ", round(med_len_pro / 1000, 2), " kb"),
+           hjust = 0, vjust = 1.4, size = 3.5) +
+  labs(x = "CDS length (kb)", y = "Number of genes",
+       title = "CDS length: eIF3d hypoxia-promoted mRNAs") +
+  theme_classic(base_size = 12)
+
+print(p_len_all)
+print(p_len_pro)
+
+ggsave(here("plots", "62_cds_length_all_expressed.pdf"),      p_len_all, width = 6, height = 4)
+ggsave(here("plots", "62_cds_length_hypoxia_promotes.pdf"),   p_len_pro, width = 6, height = 4)
+```
+
+# Extract CDS Sequences and GC Content
+
+```{r extract_gc}
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_seqs_all  <- extractTranscriptSeqs(genome, cds)
+cds_seq_names <- sub("\\..*", "", names(cds_seqs_all))
+
+# GC for all expressed
+keep_all <- cds_seq_names %in% cds_all$transcript_id_clean
+cds_seqs_expressed <- cds_seqs_all[keep_all]
+names(cds_seqs_expressed) <- cds_seq_names[keep_all]
+
+gc_all <- tibble(
+  transcript_id_clean = names(cds_seqs_expressed),
+  gc_pct = as.numeric(letterFrequency(cds_seqs_expressed, letters = "GC", as.prob = TRUE)) * 100
+)
+
+# GC for promoted subset
+keep_pro <- cds_seq_names %in% cds_promotes$transcript_id_clean
+cds_seqs_promotes <- cds_seqs_all[keep_pro]
+names(cds_seqs_promotes) <- cds_seq_names[keep_pro]
+
+gc_promotes <- tibble(
+  transcript_id_clean = names(cds_seqs_promotes),
+  gc_pct = as.numeric(letterFrequency(cds_seqs_promotes, letters = "GC", as.prob = TRUE)) * 100
+)
+
+# Biological spot-check: ACTB CDS GC% expected 50-70%
+actb_tx <- cds_all %>% filter(symbol == "ACTB") %>% pull(transcript_id_clean)
+if (length(actb_tx) > 0) {
+  actb_gc <- gc_all %>% filter(transcript_id_clean == actb_tx[1]) %>% pull(gc_pct)
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb_gc, 50, 70))
+  cat("ACTB CDS GC%:", round(actb_gc, 2), "\n")
+}
+
+stopifnot("GC% out of range (all)" =
+  all(gc_all$gc_pct >= 0 & gc_all$gc_pct <= 100, na.rm = TRUE))
+stopifnot("GC% out of range (promotes)" =
+  all(gc_promotes$gc_pct >= 0 & gc_promotes$gc_pct <= 100, na.rm = TRUE))
+
+cat("GC computed - all expressed:", nrow(gc_all), "transcripts\n")
+cat("GC computed - promoted:     ", nrow(gc_promotes), "transcripts\n")
+```
+
+# CDS GC Content Distributions
+
+```{r plot_gc, fig.width=6, fig.height=4}
+med_gc_all <- median(gc_all$gc_pct)
+med_gc_pro <- median(gc_promotes$gc_pct)
+cat("Median CDS GC% - all expressed:", round(med_gc_all, 2), "\n")
+cat("Median CDS GC% - promoted:     ", round(med_gc_pro, 2), "\n")
+
+p_gc_all <- ggplot(gc_all, aes(x = gc_pct)) +
+  geom_histogram(binwidth = 1, fill = "grey60", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = med_gc_all, linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = med_gc_all + 1, y = Inf,
+           label = paste0("median = ", round(med_gc_all, 1), "%"),
+           hjust = 0, vjust = 1.4, size = 3.5) +
+  labs(x = "CDS GC content (%)", y = "Number of genes",
+       title = "CDS GC content: all expressed mRNAs") +
+  theme_classic(base_size = 12)
+
+p_gc_pro <- ggplot(gc_promotes, aes(x = gc_pct)) +
+  geom_histogram(binwidth = 1, fill = "#56B4E9", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = med_gc_pro, linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = med_gc_pro + 1, y = Inf,
+           label = paste0("median = ", round(med_gc_pro, 1), "%"),
+           hjust = 0, vjust = 1.4, size = 3.5) +
+  labs(x = "CDS GC content (%)", y = "Number of genes",
+       title = "CDS GC content: eIF3d hypoxia-promoted mRNAs") +
+  theme_classic(base_size = 12)
+
+print(p_gc_all)
+print(p_gc_pro)
+
+ggsave(here("plots", "62_cds_gc_all_expressed.pdf"),     p_gc_all, width = 6, height = 4)
+ggsave(here("plots", "62_cds_gc_hypoxia_promotes.pdf"),  p_gc_pro, width = 6, height = 4)
+```
+
+# Summary
+
+```{r summary}
+cat("=== Summary ===\n\n")
+cat("All expressed mRNAs (feature matrix):", nrow(tx_all), "genes\n")
+cat("  Valid CDS:              ", nrow(cds_all), "\n")
+cat("  Median CDS length:      ", med_len_all, "nt (", round(med_len_all / 1000, 2), "kb)\n")
+cat("  Median CDS GC%:         ", round(med_gc_all, 2), "\n\n")
+cat("eIF3d hypoxia-promoted (te_lfc > 0.5, te_padj < 0.05):", nrow(promotes), "genes\n")
+cat("  Found in feature matrix:", nrow(tx_promotes), "\n")
+cat("  Valid CDS:              ", nrow(cds_promotes), "\n")
+cat("  Median CDS length:      ", med_len_pro, "nt (", round(med_len_pro / 1000, 2), "kb)\n")
+cat("  Median CDS GC%:         ", round(med_gc_pro, 2), "\n")
+```
