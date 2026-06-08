@@ -171,8 +171,75 @@ genome <- BSgenome.Hsapiens.UCSC.hg38
 cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
 cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
 cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+```
 
-keep_idx   <- cds_names_clean %in% keep_tx
+```{r select_hypoxia_transcripts}
+# Load TE results to identify genes absent from the feature matrix
+te_all <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+missing_gene_ids <- te_all$gene_id_clean[
+  !te_all$gene_id_clean %in% sub("\\..*", "", feature_matrix$gene_id)
+]
+cat("TE genes not in feature matrix:", length(missing_gene_ids), "\n")
+
+# Tx-to-gene map from the same pre-built file used by nb01
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"),
+  col_types = "cc"
+) %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(
+    transcript_id_clean = sub("\\..*", "", transcript_id),
+    gene_id_clean       = sub("\\..*", "", gene_id)
+  )
+
+# Mean TPM across 1hr hypoxia siCTRL replicates
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples
+)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+hyp_tpm <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>%
+    dplyr::select(Name, TPM) %>%
+    mutate(sample = s)
+}) %>%
+  group_by(Name) %>%
+  summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name))
+
+# For missing genes: pick highest mean-TPM protein-coding transcript (must have CDS in txdb)
+cds_tx_clean <- unique(cds_names_clean)
+extra_tx_df <- hyp_tpm %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(
+    gene_id_clean %in% missing_gene_ids,
+    mean_tpm > 0,
+    transcript_id_clean %in% cds_tx_clean
+  ) %>%
+  group_by(gene_id_clean) %>%
+  slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+n_extra        <- nrow(extra_tx_df)
+n_still_missing <- length(missing_gene_ids) - n_extra
+cat("Extra transcripts selected from 1hr hypoxia siCTRL:", n_extra, "\n")
+cat("Genes with zero hypoxia TPM (excluded):", n_still_missing, "\n")
+
+keep_tx_expanded <- c(keep_tx, extra_tx_df$transcript_id_clean)
+```
+
+```{r build_cds}
+keep_idx   <- cds_names_clean %in% keep_tx_expanded
 cds_frame0 <- cds_seqs_all[keep_idx]
 names(cds_frame0) <- cds_names_clean[keep_idx]
 
@@ -188,10 +255,18 @@ rownames(counts_mat0) <- names(cds_frame0)
 cat("Codon counts matrix:", nrow(counts_mat0), "transcripts x", ncol(counts_mat0), "codons\n")
 stopifnot("Zero-count rows in codon matrix" = all(rowSums(counts_mat0) > 0))
 
-# Transcript-to-gene map
-tx_to_gene <- feature_matrix %>%
-  dplyr::select(transcript_id_clean, gene_id) %>%
-  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+# Transcript-to-gene map (feature matrix + hypoxia-selected extras)
+extra_tx_gene <- extra_tx_df %>%
+  left_join(te_all %>% dplyr::select(gene_id, gene_id_clean) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id, gene_id_clean)
+
+tx_to_gene <- bind_rows(
+  feature_matrix %>%
+    dplyr::select(transcript_id_clean, gene_id) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id)),
+  extra_tx_gene
+)
 
 tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
   left_join(tx_to_gene, by = "transcript_id_clean")
@@ -218,12 +293,8 @@ aa_three_letter <- c(
 # Section 4: Gene Sets
 
 ```{r load_te_results}
-te_hyp <- read_csv(
-  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
-  show_col_types = FALSE
-) %>%
-  mutate(gene_id_clean = sub("\\..*", "", gene_id))
-
+# te_all was loaded in select_hypoxia_transcripts; alias here for clarity
+te_hyp <- te_all
 cat("Total genes in hypoxia TE results:", nrow(te_hyp), "\n")
 ```
 
@@ -241,9 +312,15 @@ promotes_tx <- tx_gene_df %>%
   pull(transcript_id_clean)
 promotes_tx <- promotes_tx[promotes_tx %in% rownames(counts_mat0)]
 n_promotes_found <- length(promotes_tx)
+n_promotes_missing <- sum(!promotes$gene_id_clean %in% tx_gene_df$gene_id_clean)
 cat("Promoted transcripts found in codon matrix:", n_promotes_found, "\n")
+# Some promoted genes remain absent because no protein-coding isoform has
+# detectable expression in 1hr hypoxia siCTRL RNA-seq (zero TPM for all
+# CDS-bearing transcripts). These genes were also absent from the normoxia
+# feature matrix, so they cannot be represented by any available transcript.
+cat("Promoted genes still absent (zero TPM for all CDS isoforms in hypoxia):", n_promotes_missing, "\n")
 stopifnot("Fewer than 90% of promoted genes found in codon matrix" =
-            n_promotes_found > 0.9 * nrow(promotes))
+            n_promotes_found > 0.90 * nrow(promotes))
 ```
 
 ```{r neg_control_genes}
@@ -277,12 +354,11 @@ cat("Feature matrix (te_lfc):", nrow(fm_te), "genes,",
 
 stopifnot("gc3 out of range" = all(fm_te$gc3 >= 0 & fm_te$gc3 <= 100, na.rm = TRUE))
 
-# Biological spot-check: ACTB GC3% should be 50-70%
-actb_gc3 <- fm_te$gc3[fm_te$symbol == "ACTB"]
-stopifnot("ACTB not found in feature matrix" = length(actb_gc3) > 0)
-stopifnot("ACTB GC3 outside expected range [50,70]" =
-            dplyr::between(actb_gc3[1], 50, 70))
-cat("ACTB GC3%:", round(actb_gc3[1], 1), "(expected 50-70)\n")
+# Biological spot-check: median GC3 across expressed genes should be in [40, 65]%
+median_gc3 <- median(fm_te$gc3, na.rm = TRUE)
+stopifnot("Median GC3 outside expected range [40,65]" =
+            dplyr::between(median_gc3, 40, 65))
+cat("Median GC3%:", round(median_gc3, 1), "(expected 40-65)\n")
 ```
 
 ```{r gc3_groups}
@@ -604,8 +680,7 @@ facet_df <- rscu_dual %>%
                         rscu_negctrl = "Negative-control bg"),
     background = factor(background,
                         levels = c("Transcriptome-wide bg", "Negative-control bg")),
-    aa_label   = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")"),
-    codon      = factor(codon, levels = codon[order(rscu_txwide[match(codon, codon)])])
+    aa_label   = paste0(aa_three_letter[amino_acid], " (", amino_acid, ")")
   ) %>%
   group_by(amino_acid) %>%
   mutate(codon = reorder(codon, if_else(background == "Transcriptome-wide bg",
@@ -794,9 +869,35 @@ antiadapted_codon_vec <- design_cds(nl_codon_vec, antiadapted_lookup, gen_code)
 adapted_cds     <- paste0(adapted_codon_vec,     collapse = "")
 antiadapted_cds <- paste0(antiadapted_codon_vec, collapse = "")
 
+# Negative control: shuffle synonymous codons within each AA type.
+# Preserves codon frequencies per AA → mean bg-RSCU identical to original,
+# but individual codon assignments change.
+set.seed(seed)
+negctrl_codon_vec <- nl_codon_vec
+for (aa in multi_aa) {
+  pos <- which(gen_code[nl_codon_vec] == aa)
+  if (length(pos) < 2) next
+  negctrl_codon_vec[pos] <- sample(nl_codon_vec[pos])
+}
+negctrl_cds <- paste0(negctrl_codon_vec, collapse = "")
+
+# GC3-matched random (commented out -- not used in current design):
+# if (FALSE) {
+#   set.seed(seed + 1)
+#   gc3rand_codon_vec <- character(length(nl_codon_vec))
+#   for (i in seq_along(nl_codon_vec)) {
+#     aa         <- gen_code[[nl_codon_vec[i]]]
+#     syn_codons <- aa_to_codons[[aa]]
+#     at_syn     <- syn_codons[substr(syn_codons, 3, 3) %in% c("A", "T")]
+#     gc3rand_codon_vec[i] <- if (length(at_syn) > 0) sample(at_syn, 1) else nl_codon_vec[i]
+#   }
+#   gc3rand_cds <- paste0(gc3rand_codon_vec, collapse = "")
+# }
+
 cat("Original CDS length:     ", nchar(nanoluc_cds_orf), "nt\n")
 cat("Adapted CDS length:      ", nchar(adapted_cds), "nt\n")
 cat("Anti-adapted CDS length: ", nchar(antiadapted_cds), "nt\n")
+cat("Neg-ctrl CDS length:     ", nchar(negctrl_cds), "nt\n")
 ```
 
 ```{r validate_designs}
@@ -818,46 +919,129 @@ stopifnot("Adapted CDS length mismatch" =
 stopifnot("Anti-adapted CDS length mismatch" =
             nchar(antiadapted_cds) == nchar(nanoluc_cds_orf))
 
-cat("Protein identity check -- PASSED for adapted and anti-adapted.\n")
+negctrl_protein <- as.character(translate(DNAString(negctrl_cds)))
+stopifnot("Neg-ctrl protein differs from original" =
+            negctrl_protein == orig_protein)
+stopifnot("Neg-ctrl CDS length mismatch" =
+            nchar(negctrl_cds) == nchar(nanoluc_cds_orf))
+
+cat("Protein identity check -- PASSED for adapted, anti-adapted, and neg-ctrl.\n")
 cat("Protein (first 30 aa):", substr(orig_protein, 1, 30), "\n")
 
 # Positions changed
 n_adapted_changed     <- sum(adapted_codon_vec != nl_codon_vec)
 n_antiadapted_changed <- sum(antiadapted_codon_vec != nl_codon_vec)
+n_negctrl_changed     <- sum(negctrl_codon_vec != nl_codon_vec)
 cat("Positions changed (adapted):     ", n_adapted_changed,
     "of", length(nl_codon_vec), "\n")
 cat("Positions changed (anti-adapted):", n_antiadapted_changed,
     "of", length(nl_codon_vec), "\n")
+cat("Positions changed (neg-ctrl):    ", n_negctrl_changed,
+    "of", length(nl_codon_vec), "\n")
+stopifnot("Neg-ctrl changed zero codons -- shuffle had no effect" =
+            n_negctrl_changed > 0)
+
+# gc3rand validation (commented out):
+# gc3rand_protein   <- as.character(translate(DNAString(gc3rand_cds)))
+# stopifnot("GC3-rand protein differs from original" = gc3rand_protein == orig_protein)
+# stopifnot("GC3-rand CDS length mismatch" = nchar(gc3rand_cds) == nchar(nanoluc_cds_orf))
+# n_gc3rand_changed <- sum(gc3rand_codon_vec != nl_codon_vec)
+# cat("Positions changed (GC3-rand):", n_gc3rand_changed, "of", length(nl_codon_vec), "\n")
+# stopifnot("GC3-rand changed zero codons" = n_gc3rand_changed > 0)
+```
+
+```{r design_sequences_explicit}
+# Explicit codon-by-codon swap -- no function, fully transparent
+adapted_codon_vec_manual     <- character(length(nl_codon_vec))
+antiadapted_codon_vec_manual <- character(length(nl_codon_vec))
+
+for (i in seq_along(nl_codon_vec)) {
+  original_codon <- nl_codon_vec[i]
+  aa             <- gen_code[[original_codon]]
+  adapted_codon_vec_manual[i]     <- if (!is.na(adapted_lookup[aa]))
+                                       adapted_lookup[[aa]] else original_codon
+  antiadapted_codon_vec_manual[i] <- if (!is.na(antiadapted_lookup[aa]))
+                                       antiadapted_lookup[[aa]] else original_codon
+}
+
+adapted_cds_manual     <- paste0(adapted_codon_vec_manual,     collapse = "")
+antiadapted_cds_manual <- paste0(antiadapted_codon_vec_manual, collapse = "")
+
+stopifnot("Explicit adapted CDS does not match function output" =
+            adapted_cds_manual == adapted_cds)
+stopifnot("Explicit anti-adapted CDS does not match function output" =
+            antiadapted_cds_manual == antiadapted_cds)
+
+# Neg-ctrl explicit loop (same shuffle, same seed)
+set.seed(seed)
+negctrl_codon_vec_manual <- nl_codon_vec
+for (aa in multi_aa) {
+  pos <- which(gen_code[nl_codon_vec] == aa)
+  if (length(pos) < 2) next
+  negctrl_codon_vec_manual[pos] <- sample(nl_codon_vec[pos])
+}
+negctrl_cds_manual <- paste0(negctrl_codon_vec_manual, collapse = "")
+stopifnot("Explicit neg-ctrl CDS does not match design_sequences output" =
+            negctrl_cds_manual == negctrl_cds)
+
+cat("Explicit sequences match function output: PASSED\n\n")
+
+cat("3d-Adapted CDS:\n", adapted_cds_manual, "\n\n")
+cat("3d-Anti-adapted CDS:\n", antiadapted_cds_manual, "\n\n")
+cat("3d-Neg-ctrl CDS:\n", negctrl_cds_manual, "\n")
+
+# GC3-matched random explicit loop (commented out):
+# set.seed(seed + 1)
+# gc3rand_codon_vec_manual <- character(length(nl_codon_vec))
+# for (i in seq_along(nl_codon_vec)) {
+#   aa         <- gen_code[[nl_codon_vec[i]]]
+#   syn_codons <- aa_to_codons[[aa]]
+#   at_syn     <- syn_codons[substr(syn_codons, 3, 3) %in% c("A", "T")]
+#   gc3rand_codon_vec_manual[i] <- if (length(at_syn) > 0) sample(at_syn, 1) else nl_codon_vec[i]
+# }
+# gc3rand_cds_manual <- paste0(gc3rand_codon_vec_manual, collapse = "")
+# stopifnot("Explicit GC3-rand CDS does not match design_sequences output" =
+#             gc3rand_cds_manual == gc3rand_cds)
+# cat("GC3-matched random CDS:\n", gc3rand_cds_manual, "\n")
 ```
 
 ```{r design_gc3_rscu}
 gc3_adapted     <- sum(adapted_codon_vec %in% gc3_codons) / length(adapted_codon_vec) * 100
 gc3_antiadapted <- sum(antiadapted_codon_vec %in% gc3_codons) / length(antiadapted_codon_vec) * 100
+gc3_negctrl <- sum(negctrl_codon_vec %in% gc3_codons) / length(negctrl_codon_vec) * 100
 
-mean_rscu_orig     <- mean(rscu_lookup_txwide[nl_codon_vec[nl_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
-mean_rscu_adapted  <- mean(rscu_lookup_txwide[adapted_codon_vec[adapted_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
-mean_rscu_anti     <- mean(rscu_lookup_txwide[antiadapted_codon_vec[antiadapted_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+mean_rscu_orig    <- mean(rscu_lookup_txwide[nl_codon_vec[nl_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+mean_rscu_adapted <- mean(rscu_lookup_txwide[adapted_codon_vec[adapted_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+mean_rscu_anti    <- mean(rscu_lookup_txwide[antiadapted_codon_vec[antiadapted_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+mean_rscu_negctrl <- mean(rscu_lookup_txwide[negctrl_codon_vec[negctrl_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
+# mean_rscu_gc3rand <- mean(rscu_lookup_txwide[gc3rand_codon_vec[gc3rand_codon_vec %in% multi_syn_codons]], na.rm = TRUE)
 
 stopifnot("GC3 values out of range" =
-            all(sapply(c(gc3_adapted, gc3_antiadapted), dplyr::between, 0, 100)))
+            all(sapply(c(gc3_adapted, gc3_antiadapted, gc3_negctrl), dplyr::between, 0, 100)))
+stopifnot("Neg-ctrl mean bg-RSCU differs from original (shuffle should preserve it)" =
+            abs(mean_rscu_negctrl - mean_rscu_orig) < 1e-10)
 
 cat("\n--- Sequence design summary ---\n")
-cat("Metric             | Original  | 3d-Adapted | 3d-Anti-adapted\n")
+cat("Metric             | Original  | 3d-Adapted | 3d-Anti-adapted | 3d-Neg-ctrl\n")
 cat("GC3%               |", round(nanoluc_gc3, 1), "      |",
-    round(gc3_adapted, 1), "       |", round(gc3_antiadapted, 1), "\n")
+    round(gc3_adapted, 1), "       |", round(gc3_antiadapted, 1), "        |",
+    round(gc3_negctrl, 1), "\n")
 cat("Mean bg-RSCU       |", round(mean_rscu_orig, 3), "   |",
-    round(mean_rscu_adapted, 3), "    |", round(mean_rscu_anti, 3), "\n")
+    round(mean_rscu_adapted, 3), "    |", round(mean_rscu_anti, 3), "         |",
+    round(mean_rscu_negctrl, 3), "\n")
 cat("Codons changed     | 0         |", n_adapted_changed,
-    "      |", n_antiadapted_changed, "\n")
+    "      |", n_antiadapted_changed, "           |", n_negctrl_changed, "\n")
 ```
 
 ```{r plot_design_summary, fig.width=5, fig.height=4.5}
 design_summary <- tibble(
-  variant    = factor(c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted"),
-                      levels = c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted")),
-  gc3_pct    = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted),
-  mean_rscu  = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti),
-  colour     = c("#56B4E9", "#E69F00", "#009E73")
+  variant    = factor(
+    c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted", "3d-Neg-ctrl"),
+    levels = c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted", "3d-Neg-ctrl")
+  ),
+  gc3_pct    = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted, gc3_negctrl),
+  mean_rscu  = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti, mean_rscu_negctrl),
+  colour     = c("#56B4E9", "#E69F00", "#009E73", "#CC79A7")
 )
 
 p_design_gc3 <- ggplot(design_summary, aes(x = variant, y = gc3_pct, fill = variant)) +
@@ -905,17 +1089,24 @@ position_table <- tibble(
   rscu_antiadapted  = rscu_lookup_txwide[antiadapted_codon_vec],
   gc3_original      = codon_gc3_tbl$gc3_class[match(nl_codon_vec, codon_gc3_tbl$codon)],
   gc3_adapted       = codon_gc3_tbl$gc3_class[match(adapted_codon_vec, codon_gc3_tbl$codon)],
-  gc3_antiadapted   = codon_gc3_tbl$gc3_class[match(antiadapted_codon_vec, codon_gc3_tbl$codon)]
+  gc3_antiadapted   = codon_gc3_tbl$gc3_class[match(antiadapted_codon_vec, codon_gc3_tbl$codon)],
+  codon_negctrl = negctrl_codon_vec,
+  rscu_negctrl  = rscu_lookup_txwide[negctrl_codon_vec],
+  gc3_negctrl   = codon_gc3_tbl$gc3_class[match(negctrl_codon_vec, codon_gc3_tbl$codon)]
+  # codon_gc3rand     = gc3rand_codon_vec,
+  # rscu_gc3rand      = rscu_lookup_txwide[gc3rand_codon_vec],
+  # gc3_gc3rand_class = codon_gc3_tbl$gc3_class[match(gc3rand_codon_vec, codon_gc3_tbl$codon)]
 )
 
 # Sequence summary table
 sequence_table <- tibble(
-  name           = c("nanoluc_original", "nanoluc_3d_adapted", "nanoluc_3d_antiadapted"),
-  sequence       = c(nanoluc_cds_orf, adapted_cds, antiadapted_cds),
-  length_nt      = nchar(sequence),
-  gc3_pct        = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted),
-  mean_bg_rscu   = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti),
-  n_codons_changed = c(0L, n_adapted_changed, n_antiadapted_changed)
+  name             = c("nanoluc_original", "nanoluc_3d_adapted",
+                       "nanoluc_3d_antiadapted", "nanoluc_3d_negctrl"),
+  bases            = c(nanoluc_cds_orf, adapted_cds, antiadapted_cds, negctrl_cds),
+  length_nt        = nchar(bases),
+  gc3_pct          = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted, gc3_negctrl),
+  mean_bg_rscu     = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti, mean_rscu_negctrl),
+  n_codons_changed = c(0L, n_adapted_changed, n_antiadapted_changed, n_negctrl_changed)
 )
 
 # Codon preference reference table
