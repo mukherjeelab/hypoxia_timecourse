@@ -13,10 +13,16 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # Overview
 
-Characterize the CDS length and GC content of mRNAs translationally promoted by
-eIF3d in hypoxia (1hr, te_lfc > 1, te_padj < 0.05), compared to all expressed
-mRNAs. Transcript selection (most abundant isoform per gene, MDA-MB-231 siCTRL
-normoxia) is read directly from the pre-computed feature matrix.
+Characterize the CDS length, GC content, and GC3 content of mRNAs translationally
+promoted by eIF3d in hypoxia (1hr, te_lfc > 0.5, te_padj < 0.05), compared to all
+expressed mRNAs and a size-matched negative control set. Transcript selection (most
+abundant isoform per gene, MDA-MB-231 siCTRL normoxia) is read directly from the
+pre-computed feature matrix. For promoted genes absent from the normoxia feature
+matrix, the most abundant isoform from 1hr hypoxia siCTRL samples is used as a
+fallback.
+
+Overlaid density plots annotate CDS length, GC%, and GC3% for Renilla, Firefly, and
+NanoLuc luciferase reporters.
 
 # Load Libraries
 
@@ -26,6 +32,16 @@ library(here)
 library(GenomicFeatures)
 library(BSgenome.Hsapiens.UCSC.hg38)
 library(Biostrings)
+library(rentrez)
+```
+
+```{r helper_functions}
+compute_gc3_pct <- function(s) {
+  s <- toupper(gsub("\\s", "", s))
+  n <- nchar(s)
+  thirds <- substr(s, seq(3, n, 3), seq(3, n, 3))
+  mean(thirds %in% c("G", "C")) * 100
+}
 ```
 
 # Load Gene Sets
@@ -57,6 +73,132 @@ cat("All expressed genes in feature matrix:", nrow(tx_all), "\n")
 cat("Promoted genes found in feature matrix:", nrow(tx_promotes), "of", nrow(promotes), "\n")
 ```
 
+# Hypoxia Fallback for Missing Promoted Genes
+
+```{r select_hypoxia_transcripts}
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean
+]
+cat("Promoted genes not in feature matrix:", length(missing_gene_ids), "\n")
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"),
+  col_types = "cc"
+) %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(
+    transcript_id_clean = sub("\\..*", "", transcript_id),
+    gene_id_clean       = sub("\\..*", "", gene_id)
+  )
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples
+)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+hyp_tpm <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>%
+    dplyr::select(Name, TPM) %>%
+    mutate(sample = s)
+}) %>%
+  group_by(Name) %>%
+  summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name))
+
+extra_tx_df <- hyp_tpm %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(
+    gene_id_clean %in% missing_gene_ids,
+    mean_tpm > 0
+  ) %>%
+  group_by(gene_id_clean) %>%
+  slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(
+    promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+    by = "gene_id_clean"
+  ) %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+n_extra         <- nrow(extra_tx_df)
+n_still_missing <- length(missing_gene_ids) - n_extra
+cat("Extra transcripts selected from 1hr hypoxia siCTRL:", n_extra, "\n")
+cat("Genes with zero hypoxia TPM (still excluded):      ", n_still_missing, "\n")
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes after fallback:", nrow(tx_promotes), "\n")
+```
+
+# Negative Controls (Size-Matched)
+
+```{r load_neg_controls}
+neg_ctrl_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                          show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+set.seed(9)
+neg_ctrl <- neg_ctrl_pool %>% slice_sample(n = nrow(promotes))
+
+tx_neg <- tx_all %>%
+  filter(gene_id_clean %in% neg_ctrl$gene_id_clean)
+
+cat("Negative control genes (size-matched, n =", nrow(promotes), "):", nrow(tx_neg), "\n")
+```
+
+# Luciferase Reference Sequences
+
+```{r luciferase_sequences}
+# NanoLuc -- includes stop codon TAA
+nl_seq <- toupper("atgGTCTTCACACTCGAAGATTTCGTTGGGGACTGGCGACAGACAGCCGGCTACAACCTGGACCAAGTCCTTGAACAGGGAGGTGTGTCCAGTTTGTTTCAGAATCTCGGGGTGTCCGTAACTCCGATCCAAAGGATTGTCCTGAGCGGTGAAAATGGGCTGAAGATCGACATCCATGTCATCATCCCGTATGAAGGTCTGAGCGGCGACCAAATGGGCCAGATCGAAAAAATTTTTAAGGTGGTGTACCCTGTGGATGATCATCACTTTAAGGTGATCCTGCACTATGGCACACTGGTAATCGACGGGGTTACGCCGAACATGATCGACTATTTCGGACGGCCGTATGAAGGCATCGCCGTGTTCGACGGCAAAAAGATCACTGTAACAGGGACCCTGTGGAACGGCAACAAAATTATCGACGAGCGCCTGATCAACCCCGACGGCTCCCTGCTGTTCCGAGTAACCATCAACGGAGTGACCGGCTGGCGGCTGTGCGAACGCATTCTGGCGAATTCTCACGGCTTTCCGCCTGAGGTTGAAGAGCAAGCCGCCGGTACATTGCCTATGTCCTGCGCACAAGAAAGCGGTATGGACCGGCACCCAGCCGCTTGTGCTTCAGCTCGCATCAACGTCTAA")
+stopifnot("NanoLuc length not divisible by 3" = nchar(nl_seq) %% 3 == 0)
+nl_sense <- substr(nl_seq, 1, nchar(nl_seq) - 3)  # strip stop codon for GC3
+
+# Firefly luc2 -- forward coding strand, no stop codon
+ff_seq <- toupper("atggaagatgccaaaaacattaagaagggcccagcgccattctacccactcgaagacgggaccgccggcgagcagctgcacaaagccatgaagcgctacgccctggtgcccggcaccatcgcctttaccgacgcacatatcgaggtggacattacctacgccgagtacttcgagatgagcgttcggctggcagaagctatgaagcgctatgggctgaatacaaaccatcggatcgtggtgtgcagcgagaatagcttgcagttcttcatgcccgtgttgggtgccctgttcatcggtgtggctgtggccccagctaacgacatctacaacgagcgcgagctgctgaacagcatgggcatcagccagcccaccgtcgtattcgtgagcaagaaagggctgcaaaagatcctcaacgtgcaaaagaagctaccgatcatacaaaagatcatcatcatggatagcaagaccgactaccagggcttccaaagcatgtacaccttcgtgacttcccatttgccacccggcttcaacgagtacgacttcgtgcccgagagcttcgaccgggacaaaaccatcgccctgatcatgaacagtagtggcagtaccggattgcccaagggcgtagccctaccgcaccgcaccgcttgtgtccgattcagtcatgcccgcgaccccatcttcggcaaccagatcatccccgacaccgctatcctcagcgtggtgccatttcaccacggcttcggcatgttcaccacgctgggctacttgatctgcggctttcgggtcgtgctcatgtaccgcttcgaggaggagctattcttgcgcagcttgcaagactataagattcaatctgccctgctggtgcccacactatttagcttcttcgctaagagcactctcatcgacaagtacgacctaagcaacttgcacgagatcgccagcggcggagcgccgctcagcaaggaggtaggtgaggccgtggccaaacgcttccacctaccaggcatccgccagggctacggcctgacagaaacaaccagcgccattctgatcacccccgaaggggacgacaagcctggcgcagtaggcaaggtggtgcccttcttcgaggctaaggtggtggacttggacaccggaaagacactgggtgtgaaccagcgcggcgagctgtgcgtccgtggccccatgatcatgagcggctacgttaacaaccccgaggctacaaacgctctcatcgacaaggacggctggctgcacagcggcgacatcgcctactgggacgaggacgagcacttcttcatcgtggaccggctgaagagcctgatcaaatacaagggctaccaggtagccccagccgaactggagagcatcctgctgcaacaccccaacatcttcgacgccggagtcgcaggcctgccagacgacgatgcaggagaactgcccgccgcagtcgtcgtgctggaacacggtaaaaccatgaccgagaaggagatcgtggactatgtggccagccaggttacaaccgccaagaagctgcgcggtggtgttgtgttcgtggacgaggtgcctaaaggactgaccggcaagttggacgcccgcaagatccgcgagattctcattaaggccaagaagggcggcaagatcgccgtg")
+stopifnot("Firefly length not divisible by 3" = nchar(ff_seq) %% 3 == 0)
+
+# Renilla hRLuc -- fetch CDS from GenBank AF025843
+rl_fasta <- entrez_fetch(db = "nucleotide", id = "AF025843",
+                         rettype = "fasta_cds_na", retmode = "text")
+rl_lines <- strsplit(rl_fasta, "\n")[[1]]
+rl_seq   <- toupper(paste(
+  rl_lines[!startsWith(rl_lines, ">") & nchar(trimws(rl_lines)) > 0],
+  collapse = ""
+))
+stopifnot("Renilla sequence empty -- check NCBI fetch" = nchar(rl_seq) > 0)
+stopifnot("Renilla length not divisible by 3" = nchar(rl_seq) %% 3 == 0)
+# Strip stop codon if present
+rl_sense <- if (substr(rl_seq, nchar(rl_seq) - 2, nchar(rl_seq)) %in% c("TAA", "TAG", "TGA")) {
+  substr(rl_seq, 1, nchar(rl_seq) - 3)
+} else {
+  rl_seq
+}
+
+luc_df <- tibble(
+  reporter   = c("Renilla", "Firefly", "NanoLuc"),
+  cds_length = c(nchar(rl_seq), nchar(ff_seq), nchar(nl_seq)),
+  gc_pct     = c(
+    as.numeric(letterFrequency(DNAString(rl_seq), letters = "GC", as.prob = TRUE)) * 100,
+    as.numeric(letterFrequency(DNAString(ff_seq), letters = "GC", as.prob = TRUE)) * 100,
+    as.numeric(letterFrequency(DNAString(nl_seq), letters = "GC", as.prob = TRUE)) * 100
+  ),
+  gc3_pct    = c(
+    compute_gc3_pct(rl_sense),
+    compute_gc3_pct(ff_seq),
+    compute_gc3_pct(nl_sense)
+  ),
+  color      = c("#CC79A7", "#009E73", "#F0E442")
+)
+
+cat("Luciferase CDS properties:\n")
+print(luc_df %>% dplyr::select(reporter, cds_length, gc_pct, gc3_pct))
+```
+
 # Extract CDS Lengths
 
 ```{r extract_cds_lengths}
@@ -77,8 +219,13 @@ cds_promotes <- tx_promotes %>%
   left_join(cds_len_df, by = "transcript_id_clean") %>%
   filter(!is.na(cds_length), cds_length > 0, cds_length %% 3 == 0)
 
+cds_neg <- tx_neg %>%
+  left_join(cds_len_df, by = "transcript_id_clean") %>%
+  filter(!is.na(cds_length), cds_length > 0, cds_length %% 3 == 0)
+
 cat("All expressed - valid CDS:", nrow(cds_all), "of", nrow(tx_all), "\n")
 cat("Promoted - valid CDS:", nrow(cds_promotes), "of", nrow(tx_promotes), "\n")
+cat("Negative control - valid CDS:", nrow(cds_neg), "of", nrow(tx_neg), "\n")
 ```
 
 # CDS Length Distributions
@@ -91,7 +238,7 @@ cat("Median CDS length - promoted:     ", med_len_pro, "nt (", round(med_len_pro
 
 p_len_all <- ggplot(cds_all, aes(x = cds_length / 1000)) +
   geom_histogram(binwidth = 0.5, fill = "grey60", color = "white", alpha = 0.85) +
-  geom_vline(xintercept = med_len_all / 1000, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = med_len_all / 1000, linetype = "solid", linewidth = 0.8) +
   annotate("text", x = med_len_all / 1000 + 0.5, y = Inf,
            label = paste0("median = ", round(med_len_all / 1000, 2), " kb"),
            hjust = 0, vjust = 1.4, size = 3.5) +
@@ -101,7 +248,7 @@ p_len_all <- ggplot(cds_all, aes(x = cds_length / 1000)) +
 
 p_len_pro <- ggplot(cds_promotes, aes(x = cds_length / 1000)) +
   geom_histogram(binwidth = 0.5, fill = "#E69F00", color = "white", alpha = 0.85) +
-  geom_vline(xintercept = med_len_pro / 1000, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = med_len_pro / 1000, linetype = "solid", linewidth = 0.8) +
   annotate("text", x = med_len_pro / 1000 + 0.5, y = Inf,
            label = paste0("median = ", round(med_len_pro / 1000, 2), " kb"),
            hjust = 0, vjust = 1.4, size = 3.5) +
@@ -144,6 +291,16 @@ gc_promotes <- tibble(
   gc_pct = as.numeric(letterFrequency(cds_seqs_promotes, letters = "GC", as.prob = TRUE)) * 100
 )
 
+# GC for negative controls
+keep_neg <- cds_seq_names %in% cds_neg$transcript_id_clean
+cds_seqs_neg <- cds_seqs_all[keep_neg]
+names(cds_seqs_neg) <- cds_seq_names[keep_neg]
+
+gc_neg <- tibble(
+  transcript_id_clean = names(cds_seqs_neg),
+  gc_pct = as.numeric(letterFrequency(cds_seqs_neg, letters = "GC", as.prob = TRUE)) * 100
+)
+
 # Biological spot-check: ACTB CDS GC% expected 50-70%
 actb_tx <- cds_all %>% filter(symbol == "ACTB") %>% pull(transcript_id_clean)
 if (length(actb_tx) > 0) {
@@ -156,9 +313,12 @@ stopifnot("GC% out of range (all)" =
   all(gc_all$gc_pct >= 0 & gc_all$gc_pct <= 100, na.rm = TRUE))
 stopifnot("GC% out of range (promotes)" =
   all(gc_promotes$gc_pct >= 0 & gc_promotes$gc_pct <= 100, na.rm = TRUE))
+stopifnot("GC% out of range (neg ctrl)" =
+  all(gc_neg$gc_pct >= 0 & gc_neg$gc_pct <= 100, na.rm = TRUE))
 
 cat("GC computed - all expressed:", nrow(gc_all), "transcripts\n")
 cat("GC computed - promoted:     ", nrow(gc_promotes), "transcripts\n")
+cat("GC computed - neg control:  ", nrow(gc_neg), "transcripts\n")
 ```
 
 # CDS GC Content Distributions
@@ -171,7 +331,7 @@ cat("Median CDS GC% - promoted:     ", round(med_gc_pro, 2), "\n")
 
 p_gc_all <- ggplot(gc_all, aes(x = gc_pct)) +
   geom_histogram(binwidth = 1, fill = "grey60", color = "white", alpha = 0.85) +
-  geom_vline(xintercept = med_gc_all, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = med_gc_all, linetype = "solid", linewidth = 0.8) +
   annotate("text", x = med_gc_all + 1, y = Inf,
            label = paste0("median = ", round(med_gc_all, 1), "%"),
            hjust = 0, vjust = 1.4, size = 3.5) +
@@ -181,7 +341,7 @@ p_gc_all <- ggplot(gc_all, aes(x = gc_pct)) +
 
 p_gc_pro <- ggplot(gc_promotes, aes(x = gc_pct)) +
   geom_histogram(binwidth = 1, fill = "#56B4E9", color = "white", alpha = 0.85) +
-  geom_vline(xintercept = med_gc_pro, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = med_gc_pro, linetype = "solid", linewidth = 0.8) +
   annotate("text", x = med_gc_pro + 1, y = Inf,
            label = paste0("median = ", round(med_gc_pro, 1), "%"),
            hjust = 0, vjust = 1.4, size = 3.5) +
@@ -196,17 +356,166 @@ ggsave(here("plots", "62_cds_gc_all_expressed.pdf"),     p_gc_all, width = 6, he
 ggsave(here("plots", "62_cds_gc_hypoxia_promotes.pdf"),  p_gc_pro, width = 6, height = 4)
 ```
 
+# GC3 Content
+
+```{r compute_gc3}
+gc3_all <- tibble(
+  transcript_id_clean = names(cds_seqs_expressed),
+  gc3_pct = sapply(as.character(cds_seqs_expressed), compute_gc3_pct, USE.NAMES = FALSE)
+)
+
+gc3_promotes <- tibble(
+  transcript_id_clean = names(cds_seqs_promotes),
+  gc3_pct = sapply(as.character(cds_seqs_promotes), compute_gc3_pct, USE.NAMES = FALSE)
+)
+
+gc3_neg <- tibble(
+  transcript_id_clean = names(cds_seqs_neg),
+  gc3_pct = sapply(as.character(cds_seqs_neg), compute_gc3_pct, USE.NAMES = FALSE)
+)
+
+stopifnot("GC3% out of range (all)" =
+  all(gc3_all$gc3_pct >= 0 & gc3_all$gc3_pct <= 100, na.rm = TRUE))
+stopifnot("GC3% out of range (promotes)" =
+  all(gc3_promotes$gc3_pct >= 0 & gc3_promotes$gc3_pct <= 100, na.rm = TRUE))
+stopifnot("GC3% out of range (neg ctrl)" =
+  all(gc3_neg$gc3_pct >= 0 & gc3_neg$gc3_pct <= 100, na.rm = TRUE))
+
+# Biological spot-check: report ACTB GC3%
+if (length(actb_tx) > 0) {
+  actb_gc3 <- gc3_all %>% filter(transcript_id_clean == actb_tx[1]) %>% pull(gc3_pct)
+  cat("ACTB CDS GC3%:", round(actb_gc3, 2), "\n")
+}
+
+cat("Median GC3% - all expressed:", round(median(gc3_all$gc3_pct), 2), "\n")
+cat("Median GC3% - promoted:     ", round(median(gc3_promotes$gc3_pct), 2), "\n")
+cat("Median GC3% - neg control:  ", round(median(gc3_neg$gc3_pct), 2), "\n")
+```
+
+# Density Plots with Luciferase Reference Lines
+
+```{r density_setup}
+group_cols <- c("All expressed"    = "grey80",
+                "Negative control" = "grey40",
+                "eIF3d promotes"   = "#E69F00")
+luc_colors <- setNames(luc_df$color, luc_df$reporter)
+```
+
+```{r plot_density_length, fig.width=7, fig.height=4}
+len_df <- bind_rows(
+  cds_all      %>% dplyr::select(transcript_id_clean, cds_length) %>%
+    mutate(group = "All expressed"),
+  cds_neg      %>% dplyr::select(transcript_id_clean, cds_length) %>%
+    mutate(group = "Negative control"),
+  cds_promotes %>% dplyr::select(transcript_id_clean, cds_length) %>%
+    mutate(group = "eIF3d promotes")
+) %>%
+  mutate(group = factor(group, levels = c("All expressed", "Negative control", "eIF3d promotes")))
+
+p_density_len <- ggplot(len_df, aes(x = cds_length / 1000, fill = group)) +
+  geom_density(aes(color = group), alpha = 0.15, linewidth = 0.8, show.legend = FALSE) +
+  geom_vline(data = luc_df,
+             aes(xintercept = cds_length / 1000, color = reporter),
+             linewidth = 0.8, linetype = "solid") +
+  scale_fill_manual(values = group_cols, name = NULL) +
+  scale_color_manual(
+    values = c(group_cols, luc_colors),
+    breaks = names(luc_colors),
+    name   = NULL
+  ) +
+  labs(x = "CDS length (kb)", y = "Density",
+       title = "CDS length distribution") +
+  theme_classic(base_size = 12)
+
+print(p_density_len)
+ggsave(here("plots", "62_density_cds_length.pdf"), p_density_len, width = 7, height = 4)
+```
+
+```{r plot_density_gc, fig.width=7, fig.height=4}
+gc_df <- bind_rows(
+  gc_all      %>% mutate(group = "All expressed"),
+  gc_neg      %>% mutate(group = "Negative control"),
+  gc_promotes %>% mutate(group = "eIF3d promotes")
+) %>%
+  mutate(group = factor(group, levels = c("All expressed", "Negative control", "eIF3d promotes")))
+
+p_density_gc <- ggplot(gc_df, aes(x = gc_pct, fill = group)) +
+  geom_density(aes(color = group), alpha = 0.15, linewidth = 0.8, trim = TRUE, show.legend = FALSE) +
+  geom_vline(data = luc_df,
+             aes(xintercept = gc_pct, color = reporter),
+             linewidth = 0.8, linetype = "solid") +
+  scale_fill_manual(values = group_cols, name = NULL) +
+  scale_color_manual(
+    values = c(group_cols, luc_colors),
+    breaks = names(luc_colors),
+    name   = NULL
+  ) +
+  labs(x = "CDS GC content (%)", y = "Density",
+       title = "CDS GC content distribution") +
+  theme_classic(base_size = 12)
+
+print(p_density_gc)
+ggsave(here("plots", "62_density_cds_gc.pdf"), p_density_gc, width = 7, height = 4)
+```
+
+```{r plot_density_gc3, fig.width=7, fig.height=4}
+gc3_df <- bind_rows(
+  gc3_all      %>% mutate(group = "All expressed"),
+  gc3_neg      %>% mutate(group = "Negative control"),
+  gc3_promotes %>% mutate(group = "eIF3d promotes")
+) %>%
+  mutate(group = factor(group, levels = c("All expressed", "Negative control", "eIF3d promotes")))
+
+p_density_gc3 <- ggplot(gc3_df, aes(x = gc3_pct, fill = group)) +
+  geom_density(aes(color = group), alpha = 0.15, linewidth = 0.8, trim = TRUE, show.legend = FALSE) +
+  geom_vline(data = luc_df,
+             aes(xintercept = gc3_pct, color = reporter),
+             linewidth = 0.8, linetype = "solid") +
+  scale_fill_manual(values = group_cols, name = NULL) +
+  scale_color_manual(
+    values = c(group_cols, luc_colors),
+    breaks = names(luc_colors),
+    name   = NULL
+  ) +
+  labs(x = "CDS GC3 content (%)", y = "Density",
+       title = "CDS GC3 content distribution") +
+  theme_classic(base_size = 12)
+
+print(p_density_gc3)
+ggsave(here("plots", "62_density_cds_gc3.pdf"), p_density_gc3, width = 7, height = 4)
+```
+
 # Summary
 
 ```{r summary}
 cat("=== Summary ===\n\n")
 cat("All expressed mRNAs (feature matrix):", nrow(tx_all), "genes\n")
-cat("  Valid CDS:              ", nrow(cds_all), "\n")
-cat("  Median CDS length:      ", med_len_all, "nt (", round(med_len_all / 1000, 2), "kb)\n")
-cat("  Median CDS GC%:         ", round(med_gc_all, 2), "\n\n")
+cat("  Valid CDS:         ", nrow(cds_all), "\n")
+cat("  Median CDS length: ", med_len_all, "nt (", round(med_len_all / 1000, 2), "kb)\n")
+cat("  Median CDS GC%:    ", round(med_gc_all, 2), "\n")
+cat("  Median CDS GC3%:   ", round(median(gc3_all$gc3_pct), 2), "\n\n")
+
 cat("eIF3d hypoxia-promoted (te_lfc > 0.5, te_padj < 0.05):", nrow(promotes), "genes\n")
-cat("  Found in feature matrix:", nrow(tx_promotes), "\n")
-cat("  Valid CDS:              ", nrow(cds_promotes), "\n")
-cat("  Median CDS length:      ", med_len_pro, "nt (", round(med_len_pro / 1000, 2), "kb)\n")
-cat("  Median CDS GC%:         ", round(med_gc_pro, 2), "\n")
+cat("  Found in normoxia feature matrix:", nrow(promotes) - length(missing_gene_ids), "\n")
+cat("  Added via hypoxia fallback:      ", n_extra, "\n")
+cat("  Genes with no transcript:        ", n_still_missing, "\n")
+cat("  Total with transcript:           ", nrow(tx_promotes), "\n")
+cat("  Valid CDS:                       ", nrow(cds_promotes), "\n")
+cat("  Median CDS length:               ", med_len_pro, "nt (", round(med_len_pro / 1000, 2), "kb)\n")
+cat("  Median CDS GC%:                  ", round(med_gc_pro, 2), "\n")
+cat("  Median CDS GC3%:                 ", round(median(gc3_promotes$gc3_pct), 2), "\n\n")
+
+cat("Negative control (size-matched n =", nrow(promotes), "):\n")
+cat("  Valid CDS:         ", nrow(cds_neg), "\n")
+cat("  Median CDS length: ", median(cds_neg$cds_length),
+    "nt (", round(median(cds_neg$cds_length) / 1000, 2), "kb)\n")
+cat("  Median CDS GC%:    ", round(median(gc_neg$gc_pct), 2), "\n")
+cat("  Median CDS GC3%:   ", round(median(gc3_neg$gc3_pct), 2), "\n\n")
+
+cat("Luciferase reference sequences:\n")
+for (i in seq_len(nrow(luc_df))) {
+  cat(sprintf("  %s: %d bp, GC%% = %.1f%%, GC3%% = %.1f%%\n",
+              luc_df$reporter[i], luc_df$cds_length[i],
+              luc_df$gc_pct[i], luc_df$gc3_pct[i]))
+}
 ```

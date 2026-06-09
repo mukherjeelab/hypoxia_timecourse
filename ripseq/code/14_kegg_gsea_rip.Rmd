@@ -1,0 +1,239 @@
+---
+title: "KEGG GSEA: eIF4E and FLAG-eIF3d RIP-seq"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+GSEA (fgsea) on eIF4E and FLAG-eIF3d RIP-seq data across four conditions: normoxia 1hr, hypoxia 1hr, hypoxia 4hr, and hypoxia 24hr. Genes are ranked by log2FoldChange (IP vs IgG). Heatmaps show NES per condition; pathways included if padj < 0.05 in any condition.
+
+# Load Libraries
+
+```{r load_libraries}
+library(fgsea)
+library(msigdbr)
+library(pheatmap)
+library(tidyverse)
+library(here)
+```
+
+# Load KEGG Pathways
+
+```{r load_pathways}
+to_pathways <- function(db) {
+  db %>%
+    dplyr::select(gs_name, gene_symbol) %>%
+    group_by(gs_name) %>%
+    summarise(genes = list(gene_symbol), .groups = "drop") %>%
+    deframe()
+}
+
+pathways_kegg <- to_pathways(
+  msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY")
+)
+
+cat("KEGG pathways loaded:", length(pathways_kegg), "\n")
+```
+
+# Helper Functions
+
+```{r helpers}
+make_ranked <- function(df) {
+  df <- df %>%
+    filter(!is.na(symbol), !is.na(log2FoldChange)) %>%
+    group_by(symbol) %>%
+    slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+    ungroup()
+  ranked <- df$log2FoldChange
+  names(ranked) <- df$symbol
+  ranked <- sort(ranked, decreasing = TRUE)
+  ranked[!duplicated(names(ranked))]
+}
+
+run_fgsea <- function(ranked, pathways, condition_label, gsea_param = 1) {
+  set.seed(9)
+  res <- fgsea(
+    pathways  = pathways,
+    stats     = ranked,
+    minSize   = 10,
+    maxSize   = 500,
+    gseaParam = gsea_param,
+    nproc     = 1
+  )
+  res %>%
+    as_tibble() %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    mutate(condition = condition_label)
+}
+
+make_gsea_heatmap <- function(results_list, title, outfile,
+                              col_order = c("Normoxia 1hr", "Hypoxia 1hr",
+                                            "Hypoxia 4hr", "Hypoxia 24hr")) {
+  combined <- bind_rows(results_list)
+
+  sig_pathways <- combined %>%
+    filter(padj < 0.05) %>%
+    pull(pathway) %>%
+    unique()
+
+  if (length(sig_pathways) == 0) {
+    message("No significant pathways (padj < 0.05) for: ", title)
+    return(invisible(NULL))
+  }
+
+  wide <- combined %>%
+    filter(pathway %in% sig_pathways) %>%
+    dplyr::select(pathway, NES, condition) %>%
+    pivot_wider(names_from = condition, values_from = NES, values_fill = 0) %>%
+    column_to_rownames("pathway")
+  for (cn in col_order) if (!cn %in% colnames(wide)) wide[[cn]] <- 0
+  wide <- wide[, col_order, drop = FALSE]
+
+  sig_mat <- combined %>%
+    filter(pathway %in% sig_pathways) %>%
+    mutate(sig = ifelse(padj < 0.05, "*", "")) %>%
+    dplyr::select(pathway, condition, sig) %>%
+    pivot_wider(names_from = condition, values_from = sig, values_fill = "") %>%
+    column_to_rownames("pathway")
+  for (cn in col_order) if (!cn %in% colnames(sig_mat)) sig_mat[[cn]] <- ""
+  sig_mat <- sig_mat[rownames(wide), col_order, drop = FALSE]
+
+  max_abs <- max(abs(wide), na.rm = TRUE)
+  max_abs <- max(max_abs, 0.1)
+
+  p <- pheatmap(
+    wide,
+    cluster_rows    = TRUE,
+    cluster_cols    = FALSE,
+    scale           = "none",
+    color           = colorRampPalette(c("blue", "white", "red"))(100),
+    breaks          = seq(-max_abs, max_abs, length.out = 101),
+    display_numbers = sig_mat,
+    number_color    = "black",
+    fontsize_number = 12,
+    main            = title,
+    fontsize_row    = 7,
+    fontsize_col    = 10,
+    cellwidth       = 40,
+    cellheight      = 12
+  )
+
+  pdf(here("ripseq", "plots", outfile),
+      width = 10, height = max(4, length(sig_pathways) * 0.18 + 3))
+  print(p)
+  dev.off()
+
+  message("Saved: ", outfile, " (", length(sig_pathways), " pathways)")
+  invisible(p)
+}
+```
+
+# eIF4E IP KEGG GSEA
+
+## Load and rank data
+
+```{r eif4e_load}
+eif4e_files <- list(
+  "Normoxia 1hr" = here("ripseq", "output", "ripseq_deseq_normoxia_1hr_eif4e_vs_igg.csv"),
+  "Hypoxia 1hr"  = here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_eif4e_vs_igg.csv"),
+  "Hypoxia 4hr"  = here("ripseq", "output", "ripseq_deseq_hypoxia_4hr_eif4e_vs_igg.csv"),
+  "Hypoxia 24hr" = here("ripseq", "output", "ripseq_deseq_hypoxia_24hr_eif4e_vs_igg.csv")
+)
+
+eif4e_data <- map(eif4e_files, read_csv, show_col_types = FALSE)
+
+# Sanity check
+walk2(eif4e_data, names(eif4e_data), function(df, label) {
+  n_sym  <- sum(!is.na(df$symbol))
+  n_bound <- sum(df$log2FoldChange > 1 & df$padj < 0.05, na.rm = TRUE)
+  cat(label, "| genes with symbol:", n_sym, "| bound (log2FC>1, padj<0.05):", n_bound, "\n")
+})
+
+eif4e_ranked <- map2(eif4e_data, names(eif4e_data), ~ make_ranked(.x))
+cat("\nRanked list sizes:\n")
+walk2(eif4e_ranked, names(eif4e_ranked), ~ cat(.y, ":", length(.x), "\n"))
+```
+
+## Run fgsea
+
+```{r eif4e_fgsea}
+eif4e_gsea <- map2(eif4e_ranked, names(eif4e_ranked),
+                   ~ run_fgsea(.x, pathways_kegg, .y))
+
+walk2(eif4e_gsea, names(eif4e_gsea), function(res, label) {
+  n_sig <- sum(res$padj < 0.05, na.rm = TRUE)
+  cat(label, "| significant KEGG pathways (padj<0.05):", n_sig, "\n")
+})
+```
+
+## Heatmap
+
+```{r eif4e_heatmap, fig.width=10, fig.height=8}
+make_gsea_heatmap(
+  results_list = eif4e_gsea,
+  title        = "eIF4E RIP KEGG GSEA (NES, * = padj < 0.05)",
+  outfile      = "14_kegg_gsea_eif4e_rip.pdf"
+)
+```
+
+# FLAG-eIF3d IP KEGG GSEA
+
+## Load and rank data
+
+```{r flag3d_load}
+flag3d_files <- list(
+  "Normoxia 1hr" = here("ripseq", "output", "ripseq_deseq_normoxia_1hr_flag_eif3d_vs_igg.csv"),
+  "Hypoxia 1hr"  = here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_flag_eif3d_vs_igg.csv"),
+  "Hypoxia 4hr"  = here("ripseq", "output", "ripseq_deseq_hypoxia_4hr_flag_eif3d_vs_igg.csv"),
+  "Hypoxia 24hr" = here("ripseq", "output", "ripseq_deseq_hypoxia_24hr_flag_eif3d_vs_igg.csv")
+)
+
+flag3d_data <- map(flag3d_files, read_csv, show_col_types = FALSE)
+
+# Sanity check — EIF3D should be a top hit in normoxia 1hr
+walk2(flag3d_data, names(flag3d_data), function(df, label) {
+  n_sym   <- sum(!is.na(df$symbol))
+  n_bound <- sum(df$log2FoldChange > 1 & df$padj < 0.05, na.rm = TRUE)
+  cat(label, "| genes with symbol:", n_sym, "| bound (log2FC>1, padj<0.05):", n_bound, "\n")
+})
+
+eif3d_lfc_nor1hr <- flag3d_data[["Normoxia 1hr"]] %>%
+  filter(symbol == "EIF3D") %>%
+  pull(log2FoldChange)
+cat("\nEIF3D log2FC in FLAG-eIF3d IP normoxia 1hr:", round(eif3d_lfc_nor1hr, 2),
+    "(expected strongly positive)\n")
+
+flag3d_ranked <- map2(flag3d_data, names(flag3d_data), ~ make_ranked(.x))
+cat("\nRanked list sizes:\n")
+walk2(flag3d_ranked, names(flag3d_ranked), ~ cat(.y, ":", length(.x), "\n"))
+```
+
+## Run fgsea
+
+```{r flag3d_fgsea}
+flag3d_gsea <- map2(flag3d_ranked, names(flag3d_ranked),
+                    ~ run_fgsea(.x, pathways_kegg, .y))
+
+walk2(flag3d_gsea, names(flag3d_gsea), function(res, label) {
+  n_sig <- sum(res$padj < 0.05, na.rm = TRUE)
+  cat(label, "| significant KEGG pathways (padj<0.05):", n_sig, "\n")
+})
+```
+
+## Heatmap
+
+```{r flag3d_heatmap, fig.width=10, fig.height=8}
+make_gsea_heatmap(
+  results_list = flag3d_gsea,
+  title        = "FLAG-eIF3d RIP KEGG GSEA (NES, * = padj < 0.05)",
+  outfile      = "14_kegg_gsea_flag3d_rip.pdf"
+)
+```
