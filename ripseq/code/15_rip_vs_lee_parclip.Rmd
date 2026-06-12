@@ -1,0 +1,255 @@
+---
+title: "RIP-seq: eIF3d FLAG-IP enrichment vs Lee 2015 PAR-CLIP targets"
+author: "Kate"
+date: "2026-06"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(janitor)
+library(ggvenn)
+library(cowplot)
+```
+
+Compares FLAG-eIF3d RIP-seq enrichment (our data, 4 timepoints) to eIF3d PAR-CLIP
+targets from Lee et al. 2015. Mirrors the Teleman eIF4E comparison in notebook 03.
+
+```{r constants}
+LFC_CUTOFF  <- 0.5
+PADJ_CUTOFF <- 0.05
+LEE_COLOR   <- "#009E73"
+OTHER_COLOR <- "grey40"
+TP_LEVELS   <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+```
+
+# Load data
+
+```{r load_lee}
+lee_parclip <- read_csv(
+  "/Users/katematlin/github/mpra_preliminary/data/lee_parclip.csv",
+  show_col_types = FALSE
+) |> clean_names()
+
+lee_eif3d_ids <- lee_parclip |>
+  filter(subunit == "d") |>
+  mutate(ensembl_id = str_replace(ensembl_id, "\\..*", "")) |>
+  pull(ensembl_id) |>
+  unique()
+
+lee_eif3d_names <- lee_parclip |>
+  filter(subunit == "d") |>
+  pull(gene_name) |>
+  unique()
+
+cat("Lee PAR-CLIP eIF3d-bound genes (Ensembl IDs):", length(lee_eif3d_ids), "\n")
+cat("Lee PAR-CLIP eIF3d-bound genes (gene names):", length(lee_eif3d_names), "\n")
+```
+
+```{r load_rip}
+rip_paths <- list(
+  normoxia_1hr = here("ripseq", "output", "ripseq_deseq_normoxia_1hr_flag_eif3d_vs_igg.csv"),
+  hypoxia_1hr  = here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_flag_eif3d_vs_igg.csv"),
+  hypoxia_4hr  = here("ripseq", "output", "ripseq_deseq_hypoxia_4hr_flag_eif3d_vs_igg.csv"),
+  hypoxia_24hr = here("ripseq", "output", "ripseq_deseq_hypoxia_24hr_flag_eif3d_vs_igg.csv")
+)
+
+stopifnot("Run notebook 01 first to generate FLAG-eIF3d DESeq2 CSVs" =
+  all(file.exists(unlist(rip_paths))))
+
+rip_all <- imap_dfr(rip_paths, \(path, tp) {
+  read_csv(path, show_col_types = FALSE) |>
+    mutate(tp = tp)
+})
+
+cat("RIP-seq genes (all timepoints):", nrow(rip_all), "\n")
+```
+
+# Join and label
+
+```{r join}
+rip_labeled <- rip_all |>
+  filter(!is.na(log2FoldChange)) |>
+  mutate(
+    lee_bound    = gene_id_clean %in% lee_eif3d_ids,
+    our_enriched = log2FoldChange > LFC_CUTOFF & !is.na(padj) & padj < PADJ_CUTOFF,
+    tp           = factor(tp, levels = TP_LEVELS)
+  )
+
+stopifnot("Too few Lee-bound genes after join — check Ensembl ID matching" =
+  sum(rip_labeled$lee_bound) > 50)
+
+cat("Lee-bound genes detected per timepoint:\n")
+rip_labeled |> dplyr::count(tp, lee_bound) |> print()
+
+cat("\nOur enriched genes per timepoint (LFC >", LFC_CUTOFF, ", padj <", PADJ_CUTOFF, "):\n")
+rip_labeled |> dplyr::count(tp, our_enriched) |> print()
+```
+
+# CDF: FLAG-eIF3d enrichment by Lee PAR-CLIP status, faceted by timepoint
+
+```{r cdf}
+wt_df <- rip_labeled |>
+  group_by(tp) |>
+  summarise(
+    p     = wilcox.test(log2FoldChange ~ lee_bound, alternative = "less")$p.value,
+    label = paste0("p = ", signif(p, 3)),
+    .groups = "drop"
+  )
+
+n_lee  <- sum(rip_labeled$lee_bound[rip_labeled$tp == "normoxia_1hr"])
+n_other <- sum(!rip_labeled$lee_bound[rip_labeled$tp == "normoxia_1hr"])
+
+p_cdf <- ggplot(
+  rip_labeled,
+  aes(x     = log2FoldChange,
+      color = factor(lee_bound, levels = c(TRUE, FALSE)))
+) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_text(data = wt_df, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            size = 3.5, inherit.aes = FALSE) +
+  scale_color_manual(
+    values = c("TRUE" = LEE_COLOR, "FALSE" = OTHER_COLOR),
+    labels = c(
+      "TRUE"  = paste0("Lee PAR-CLIP bound (n = ", length(lee_eif3d_ids), ")"),
+      "FALSE" = "All other genes"
+    )
+  ) +
+  facet_wrap(~ tp, nrow = 1) +
+  labs(
+    x     = "log2FC (eIF3d IP / IgG)",
+    y     = "Cumulative fraction",
+    color = NULL,
+    title = "FLAG-eIF3d RIP enrichment: Lee PAR-CLIP bound vs all others"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")+
+  xlim(-3, 8)
+
+ggsave(here("ripseq", "plots", "15_cdf_rip_by_lee_parclip_bound.pdf"),
+       p_cdf, width = 12, height = 4)
+p_cdf
+```
+
+# Venn diagrams: our enriched vs Lee targets, per timepoint
+
+```{r venn, fig.width=10, fig.height=10}
+venn_plots <- lapply(TP_LEVELS, function(tp_name) {
+  df <- rip_labeled |> filter(tp == tp_name)
+
+  our_ids <- df |> filter(our_enriched) |> pull(gene_id_clean)
+  lee_ids <- lee_eif3d_ids
+
+  n_overlap <- length(intersect(our_ids, lee_ids))
+  cat(tp_name, "- our enriched:", length(our_ids),
+      "| Lee bound:", length(lee_ids),
+      "| overlap:", n_overlap, "\n")
+
+  venn_list <- list(
+    "FLAG-eIF3d\nenriched" = our_ids,
+    "Lee PAR-CLIP\neIF3d bound" = lee_ids
+  )
+
+  ggvenn(venn_list,
+         fill_color  = c("#E69F00", LEE_COLOR),
+         stroke_size = 0.5,
+         text_size   = 3.5) +
+    ggtitle(tp_name) +
+    theme_void()
+})
+
+p_venn_grid <- plot_grid(plotlist = venn_plots, ncol = 2, labels = "AUTO")
+
+ggsave(here("ripseq", "plots", "15_venn_rip_vs_lee_parclip.pdf"),
+       p_venn_grid, width = 10, height = 10)
+p_venn_grid
+```
+
+# LFC > 1 threshold
+
+```{r label_lfc1}
+LFC_CUTOFF_1 <- 1.0
+
+rip_labeled <- rip_labeled |>
+  mutate(our_enriched_lfc1 = log2FoldChange > LFC_CUTOFF_1 & !is.na(padj) & padj < PADJ_CUTOFF)
+
+cat("Our enriched genes per timepoint (LFC >", LFC_CUTOFF_1, ", padj <", PADJ_CUTOFF, "):\n")
+rip_labeled |> dplyr::count(tp, our_enriched_lfc1) |> print()
+```
+
+# CDF (LFC > 1): FLAG-eIF3d enrichment by Lee PAR-CLIP status, faceted by timepoint
+
+```{r cdf_lfc1}
+p_cdf_lfc1 <- ggplot(
+  rip_labeled,
+  aes(x     = log2FoldChange,
+      color = factor(lee_bound, levels = c(TRUE, FALSE)))
+) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_text(data = wt_df, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            size = 3.5, inherit.aes = FALSE) +
+  scale_color_manual(
+    values = c("TRUE" = LEE_COLOR, "FALSE" = OTHER_COLOR),
+    labels = c(
+      "TRUE"  = paste0("Lee PAR-CLIP bound (n = ", length(lee_eif3d_ids), ")"),
+      "FALSE" = "All other genes"
+    )
+  ) +
+  facet_wrap(~ tp, nrow = 1) +
+  labs(
+    x     = "log2FC (eIF3d IP / IgG)",
+    y     = "Cumulative fraction",
+    color = NULL,
+    title = "FLAG-eIF3d RIP enrichment: Lee PAR-CLIP bound vs all others (LFC > 1 threshold)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom") +
+  xlim(-3, 8)
+
+ggsave(here("ripseq", "plots", "15_cdf_rip_by_lee_parclip_bound_lfc1.pdf"),
+       p_cdf_lfc1, width = 12, height = 4)
+p_cdf_lfc1
+```
+
+# Venn diagrams (LFC > 1): our enriched vs Lee targets, per timepoint
+
+```{r venn_lfc1, fig.width=10, fig.height=10}
+venn_plots_lfc1 <- lapply(TP_LEVELS, function(tp_name) {
+  df <- rip_labeled |> filter(tp == tp_name)
+
+  our_ids <- df |> filter(our_enriched_lfc1) |> pull(gene_id_clean)
+  lee_ids <- lee_eif3d_ids
+
+  n_overlap <- length(intersect(our_ids, lee_ids))
+  cat(tp_name, "- our enriched (LFC > 1):", length(our_ids),
+      "| Lee bound:", length(lee_ids),
+      "| overlap:", n_overlap, "\n")
+
+  venn_list <- list(
+    "FLAG-eIF3d\nenriched" = our_ids,
+    "Lee PAR-CLIP\neIF3d bound" = lee_ids
+  )
+
+  ggvenn(venn_list,
+         fill_color  = c("#E69F00", LEE_COLOR),
+         stroke_size = 0.5,
+         text_size   = 3.5) +
+    ggtitle(tp_name) +
+    theme_void()
+})
+
+p_venn_grid_lfc1 <- plot_grid(plotlist = venn_plots_lfc1, ncol = 2, labels = "AUTO")
+
+ggsave(here("ripseq", "plots", "15_venn_rip_vs_lee_parclip_lfc1.pdf"),
+       p_venn_grid_lfc1, width = 10, height = 10)
+p_venn_grid_lfc1
+```
