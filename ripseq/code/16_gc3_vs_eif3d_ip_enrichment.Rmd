@@ -1,0 +1,127 @@
+---
+title: "RIP-seq: GC3 content vs eIF3d IP enrichment across timepoints"
+author: "Kate"
+date: "2026-06"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(cowplot)
+```
+
+# Load gene annotation
+
+```{r load_gene_anno}
+gene_anno <- read_tsv(
+  here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("gene_id", "symbol", "biotype", "species", "version"),
+  show_col_types = FALSE
+) |>
+  filter(species == "human") |>
+  dplyr::select(gene_id_clean = gene_id, symbol, biotype) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id_clean)) |>
+  distinct(gene_id_clean, .keep_all = TRUE)
+
+cat("Gene annotation rows:", nrow(gene_anno), "\n")
+cat("Protein-coding genes:", sum(gene_anno$biotype == "protein_coding"), "\n")
+```
+
+# Load GC3 from feature matrix
+
+```{r load_gc3}
+gc3_df <- readRDS(here("output", "predictive_modeling", "feature_matrix_codon_optimality.rds")) |>
+  dplyr::select(gene_id_clean, gc3) |>
+  distinct(gene_id_clean, .keep_all = TRUE)
+
+cat("Genes with GC3:", nrow(gc3_df), "\n")
+cat("GC3 range:", round(min(gc3_df$gc3, na.rm = TRUE), 1), "-",
+    round(max(gc3_df$gc3, na.rm = TRUE), 1), "%\n")
+```
+
+# Load eIF3d RIP-seq DESeq2 results
+
+```{r load_rip}
+tp_levels <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+
+rip_files <- here("ripseq", "output", paste0(
+  "ripseq_deseq_", tp_levels, "_flag_eif3d_vs_igg.csv"
+))
+stopifnot("RIP-seq DESeq2 CSVs not found — run notebook 01 first" =
+  all(file.exists(rip_files)))
+
+rip_list <- lapply(rip_files, read_csv, show_col_types = FALSE)
+names(rip_list) <- tp_levels
+
+cat("Genes per timepoint:\n")
+sapply(rip_list, nrow) |> print()
+```
+
+# Join and filter to protein-coding mRNAs
+
+```{r join}
+plot_df <- bind_rows(rip_list) |>
+  filter(!is.na(log2FoldChange)) |>
+  left_join(gene_anno |> dplyr::select(gene_id_clean, biotype), by = "gene_id_clean") |>
+  filter(biotype == "protein_coding") |>
+  left_join(gc3_df, by = "gene_id_clean") |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels))
+
+n_total  <- nrow(plot_df)
+n_gc3    <- sum(!is.na(plot_df$gc3))
+n_nogc3  <- sum(is.na(plot_df$gc3))
+
+cat("Protein-coding genes (all timepoints):", n_total, "\n")
+cat("With GC3 matched:", n_gc3, sprintf("(%.1f%%)\n", 100 * n_gc3 / n_total))
+cat("Missing GC3:", n_nogc3, sprintf("(%.1f%%)\n", 100 * n_nogc3 / n_total))
+
+if (n_nogc3 / n_total > 0.10)
+  warning("More than 10% of mRNA genes are missing GC3 — check GENCODE version alignment")
+
+plot_df <- filter(plot_df, !is.na(gc3))
+```
+
+# Spearman correlation per timepoint
+
+```{r spearman_cor}
+cor_df <- plot_df |>
+  group_by(timepoint) |>
+  summarise(
+    rho = cor(gc3, log2FoldChange, method = "spearman", use = "complete.obs"),
+    p   = cor.test(gc3, log2FoldChange, method = "spearman")$p.value,
+    .groups = "drop"
+  ) |>
+  mutate(label = paste0("rho = ", round(rho, 2),
+                        ", p = ", formatC(p, format = "e", digits = 1)))
+
+print(cor_df)
+```
+
+# Dotplot: GC3 vs eIF3d IP enrichment
+
+```{r dotplot, fig.width=14, fig.height=4}
+p_gc3 <- ggplot(plot_df, aes(x = gc3, y = log2FoldChange)) +
+  geom_point(color = "grey60", alpha = 0.3, size = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.7, fill = "grey70") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_text(data = cor_df, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            inherit.aes = FALSE, size = 3) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(
+    x = "GC3 content (%)",
+    y = "log2FC (eIF3d IP / IgG)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_gc3
+ggsave(here("ripseq", "plots", "16_gc3_vs_eif3d_ip_enrichment.pdf"), p_gc3,
+       width = 14, height = 4)
+```

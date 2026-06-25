@@ -1,0 +1,243 @@
+
+---
+title: "RIP-seq: binding and TE profiles for CSNK2B, HERC2, NLE1"
+author: "Kate"
+date: "2026-06"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+```
+
+Genes identified in notebook 12 as losing eIF4E binding in hypoxia without a
+corresponding change in eIF3d binding (trade-off quadrant: 4E drop < -2,
+|3d change| < 1, present across multiple timepoints).
+
+```{r constants}
+GENES_OF_INTEREST <- c("CSNK2B", "NLE1")
+
+COND_LEVELS <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+COND_LABELS <- c("Nor 1hr", "Hyp 1hr", "Hyp 4hr", "Hyp 24hr")
+TP_LEVELS   <- c("hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+TP_LABELS   <- c("Hyp 1hr", "Hyp 4hr", "Hyp 24hr")
+
+IP_COLORS <- c("eIF3d" = "#E69F00", "eIF4E" = "#0072B2")
+
+LFC_CUTOFF  <- 0.5
+PADJ_CUTOFF <- 0.05
+```
+
+# Load data
+
+```{r load_absolute}
+abs_paths <- list(
+  normoxia_1hr = list(
+    eIF3d = here("ripseq", "output", "ripseq_deseq_normoxia_1hr_flag_eif3d_vs_igg.csv"),
+    eIF4E = here("ripseq", "output", "ripseq_deseq_normoxia_1hr_eif4e_vs_igg.csv")
+  ),
+  hypoxia_1hr = list(
+    eIF3d = here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_flag_eif3d_vs_igg.csv"),
+    eIF4E = here("ripseq", "output", "ripseq_deseq_hypoxia_1hr_eif4e_vs_igg.csv")
+  ),
+  hypoxia_4hr = list(
+    eIF3d = here("ripseq", "output", "ripseq_deseq_hypoxia_4hr_flag_eif3d_vs_igg.csv"),
+    eIF4E = here("ripseq", "output", "ripseq_deseq_hypoxia_4hr_eif4e_vs_igg.csv")
+  ),
+  hypoxia_24hr = list(
+    eIF3d = here("ripseq", "output", "ripseq_deseq_hypoxia_24hr_flag_eif3d_vs_igg.csv"),
+    eIF4E = here("ripseq", "output", "ripseq_deseq_hypoxia_24hr_eif4e_vs_igg.csv")
+  )
+)
+
+stopifnot("Missing absolute RIP CSVs" =
+  all(sapply(unlist(lapply(abs_paths, unlist)), file.exists)))
+
+abs_df <- imap_dfr(abs_paths, \(paths, cond) {
+  imap_dfr(paths, \(path, ip) {
+    read_csv(path, show_col_types = FALSE) |>
+      dplyr::filter(symbol %in% GENES_OF_INTEREST) |>
+      dplyr::select(gene_id_clean, symbol, baseMean, log2FoldChange, padj) |>
+      dplyr::mutate(condition = cond, ip = ip)
+  })
+}) |>
+  dplyr::group_by(symbol, condition, ip) |>
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    condition = factor(condition, levels = COND_LEVELS, labels = COND_LABELS),
+    symbol    = factor(symbol, levels = GENES_OF_INTEREST),
+    sig       = !is.na(padj) & padj < PADJ_CUTOFF
+  )
+
+# canonical locus per gene: highest RIP baseMean across all conditions/IPs
+canonical_ids <- abs_df |>
+  dplyr::group_by(symbol) |>
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::select(symbol, gene_id_clean)
+
+cat("Absolute binding data:\n")
+abs_df |> dplyr::select(symbol, condition, ip, log2FoldChange, padj, sig) |>
+  dplyr::arrange(symbol, ip, condition) |> print()
+```
+
+
+```{r load_te_sictrl_hyp}
+te_sictrl_paths <- list(
+  hypoxia_1hr  = here("output", "translation_categories_1hr.csv"),
+  hypoxia_4hr  = here("output", "translation_categories_4hr.csv"),
+  hypoxia_24hr = here("output", "translation_categories_24hr.csv")
+)
+
+stopifnot("Missing sictrl hypoxia vs normoxia TE CSVs" =
+  all(sapply(unlist(te_sictrl_paths), file.exists)))
+
+te_sictrl_df <- imap_dfr(te_sictrl_paths, \(path, cond) {
+  read_csv(path, show_col_types = FALSE) |>
+    dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    dplyr::inner_join(canonical_ids, by = "gene_id_clean") |>
+    dplyr::select(gene_id_clean, symbol, te_lfc, te_padj, category) |>
+    dplyr::mutate(condition = cond)
+}) |>
+  dplyr::ungroup() |>
+  bind_rows(
+    tidyr::expand_grid(symbol = GENES_OF_INTEREST, condition = "normoxia_1hr") |>
+      dplyr::mutate(gene_id_clean = NA_character_, te_lfc = 0, te_padj = NA_real_,
+                    category = "normoxia")
+  ) |>
+  dplyr::mutate(
+    condition = factor(condition, levels = COND_LEVELS, labels = COND_LABELS),
+    symbol    = factor(symbol, levels = GENES_OF_INTEREST),
+    sig       = !is.na(te_padj) & te_padj < PADJ_CUTOFF
+  )
+
+cat("sictrl TE (hypoxia vs normoxia, normoxia anchored at 0):\n")
+te_sictrl_df |> dplyr::select(symbol, condition, te_lfc, te_padj, category, sig) |>
+  dplyr::arrange(symbol, condition) |> print()
+```
+
+```{r load_te}
+te_paths <- list(
+  normoxia_1hr = here("output", "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv"),
+  hypoxia_1hr  = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  hypoxia_4hr  = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"),
+  hypoxia_24hr = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv")
+)
+
+stopifnot("Missing si3d vs sictrl TE CSVs" =
+  all(sapply(unlist(te_paths), file.exists)))
+
+te_df <- imap_dfr(te_paths, \(path, cond) {
+  read_csv(path, show_col_types = FALSE) |>
+    dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    dplyr::filter(gene_id_clean %in% canonical_ids$gene_id_clean) |>
+    dplyr::select(gene_id_clean, symbol, te_lfc, te_padj, category) |>
+    dplyr::mutate(condition = cond)
+}) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    condition = factor(condition, levels = COND_LEVELS, labels = COND_LABELS),
+    symbol    = factor(symbol, levels = GENES_OF_INTEREST),
+    sig       = !is.na(te_padj) & te_padj < PADJ_CUTOFF
+  )
+
+cat("si3d vs sictrl TE (normoxia + hypoxia):\n")
+te_df |> dplyr::select(symbol, condition, te_lfc, te_padj, category, sig) |>
+  dplyr::arrange(symbol, condition) |> print()
+```
+
+# Plot: absolute IP/IgG binding across conditions
+
+```{r plot_absolute, fig.width=9, fig.height=4}
+sig_abs <- abs_df |> dplyr::filter(sig)
+
+p_abs <- ggplot(abs_df, aes(x = condition, y = log2FoldChange, color = ip, group = ip)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.5) +
+  geom_point(data = sig_abs, aes(x = condition, y = log2FoldChange),
+             shape = 8, size = 2, show.legend = FALSE) +
+  scale_color_manual(values = IP_COLORS) +
+  facet_wrap(~ symbol, nrow = 1) +
+  labs(
+    x     = NULL,
+    y     = "log2FC (IP / IgG)",
+    color = NULL,
+    title = "IP/IgG enrichment across conditions",
+    caption = "* = padj < 0.05"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x  = element_text(angle = 35, hjust = 1),
+    legend.position = "bottom"
+  )
+
+ggsave(here("ripseq", "plots", "17_absolute_binding_profiles.pdf"),
+       p_abs, width = 9, height = 4)
+p_abs
+```
+
+
+# Plot: si3d vs sictrl TE in hypoxia
+
+```{r plot_te, fig.width=9, fig.height=4}
+sig_te <- te_df |> dplyr::filter(sig)
+
+p_te <- ggplot(te_df, aes(x = condition, y = te_lfc, group = symbol)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_line(linewidth = 0.7, color = "grey40") +
+  geom_point(size = 2.5, color = "grey40") +
+  geom_point(data = sig_te, aes(x = condition, y = te_lfc),
+             shape = 8, size = 2, color = "grey40", show.legend = FALSE) +
+  facet_wrap(~ symbol, nrow = 1) +
+  labs(
+    x     = NULL,
+    y     = "TE log2FC (sictrl vs si3d)",
+    title = "eIF3d KD effect on TE",
+    caption = "* = padj < 0.05"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+ggsave(here("ripseq", "plots", "17_te_si3d_vs_sictrl_profiles.pdf"),
+       p_te, width = 9, height = 4)
+p_te
+```
+
+# Plot: sictrl TE across conditions (normoxia anchored at 0)
+
+```{r plot_te_sictrl, fig.width=9, fig.height=4}
+sig_te_sictrl <- te_sictrl_df |> dplyr::filter(sig)
+
+p_te_sictrl <- ggplot(te_sictrl_df, aes(x = condition, y = te_lfc, group = symbol)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_line(linewidth = 0.7, color = "grey40") +
+  geom_point(size = 2.5, color = "grey40") +
+  geom_point(data = sig_te_sictrl, aes(x = condition, y = te_lfc),
+             shape = 8, size = 2, color = "grey40", show.legend = FALSE) +
+  facet_wrap(~ symbol, nrow = 1) +
+  labs(
+    x       = NULL,
+    y       = "TE log2FC (hypoxia vs normoxia)",
+    title   = "TE change in hypoxia (sictrl cells)",
+    caption = "* = padj < 0.05"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+ggsave(here("ripseq", "plots", "17_te_sictrl_hypoxia_vs_normoxia.pdf"),
+       p_te_sictrl, width = 9, height = 4)
+p_te_sictrl
+```
+
+```{r}
+
+```

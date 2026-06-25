@@ -216,7 +216,7 @@ Restrict to genes expressed in the riboseq RNA-seq (Input_Ribo_RNAseq) experimen
 
 ```{r rnaseq_filter}
 rna_meta <- read_csv(here("accessories", "metadata_231_timecourse.csv")) |>
-  filter(type == "Input_Ribo_RNAseq")
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL")
 
 rna_raw <- read_csv(here("output", "human_allCounts_raw.csv")) |>
   column_to_rownames("gene_id")
@@ -227,9 +227,22 @@ rna_only <- rna_raw[, col_ids %in% rna_meta$id, drop = FALSE]
 
 cat("RNA-seq samples used:", ncol(rna_only), "\n")
 
-keepGenes_rnaseq <- rownames(rna_only)[log2(rowSums(rna_only)) > 9]
+# Keep only genes that passed filtering in the riboseq/RNA-seq TE analysis
+# (union across all four timepoints; genes absent here were removed by DESeq2 independent filtering)
+te_gene_files <- c(
+  here("output", "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv"),
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"),
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv")
+)
+stopifnot("TE gene files missing" = all(file.exists(te_gene_files)))
+keepGenes_rnaseq <- unique(unlist(lapply(te_gene_files, function(f) {
+  read_csv(f, show_col_types = FALSE) |> pull(gene_id)
+})))
+cat("Genes in TE analysis (union across 4 timepoints):", length(keepGenes_rnaseq), "\n")
+
 allCounts <- allCounts[rownames(allCounts) %in% keepGenes_rnaseq, ]
-cat("After RNA-seq expression filter:", nrow(allCounts), "genes\n")
+cat("After TE-analysis gene filter:", nrow(allCounts), "genes\n")
 ```
 
 # QC Input: SD Filtering
@@ -363,6 +376,21 @@ rna_sub      <- rna_only[shared_genes, , drop = FALSE]
 rna_cpm_mean <- setNames(rowMeans(sweep(rna_sub, 2, colSums(rna_sub), "/") * 1e6),
                          shared_genes)
 
+# Per condition x hours RNA CPM (siCTRL, condition-matched for faceted plots)
+rna_col_meta <- tibble(
+  col_name = colnames(rna_sub),
+  nm_id    = sub(".*_(NM\\d+_\\d+)$", "\\1", colnames(rna_sub))
+) |>
+  left_join(dplyr::select(rna_meta, id, condition, hours), by = c("nm_id" = "id"))
+
+rna_cpm_by_cond <- as.data.frame(sweep(rna_sub, 2, colSums(rna_sub), "/") * 1e6) |>
+  rownames_to_column("gene_id") |>
+  pivot_longer(-gene_id, names_to = "col_name", values_to = "cpm") |>
+  left_join(dplyr::select(rna_col_meta, col_name, condition, hours), by = "col_name") |>
+  group_by(gene_id, condition, hours) |>
+  summarise(rna_cpm = mean(cpm, na.rm = TRUE), .groups = "drop") |>
+  mutate(hours = as.factor(as.character(hours)))
+
 rip_cpm_mat <- sweep(allCounts[shared_genes, ], 2, colSums(allCounts[shared_genes, ]), "/") * 1e6
 
 rip_long_all <- as.data.frame(rip_cpm_mat) |>
@@ -398,6 +426,129 @@ p_cor_all <- ggplot(rip_long_all, aes(x = rna_cpm + 1, y = mean_ip_cpm + 1, colo
 
 p_cor_all
 ggsave(here("ripseq", "plots", "00a_ip_vs_rna_cpm_all.pdf"), p_cor_all, width = 14, height = 5)
+```
+
+```{r cor_rna_ip_by_condition}
+tp_levels <- rip_long_all |>
+  distinct(condition, hours, timepoint) |>
+  mutate(hours_num = as.numeric(as.character(hours))) |>
+  arrange(condition != "normoxia", hours_num) |>
+  pull(timepoint)
+
+rip_long_all <- rip_long_all |> mutate(timepoint = factor(timepoint, levels = tp_levels))
+
+# Condition-matched: each condition x hours gets siCTRL RNA from that same condition x hours
+rip_long_cond <- rip_long_all |>
+  dplyr::select(-rna_cpm) |>
+  left_join(rna_cpm_by_cond, by = c("gene_id", "condition", "hours"))
+
+r2_by_cond <- rip_long_cond |>
+  filter(!is.na(rna_cpm), !is.na(mean_ip_cpm)) |>
+  group_by(ip_type, timepoint) |>
+  summarise(r2 = cor(log10(rna_cpm + 1), log10(mean_ip_cpm + 1))^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_cor_by_cond <- ggplot(rip_long_cond, aes(x = rna_cpm + 1, y = mean_ip_cpm + 1, color = ip_type)) +
+  geom_point(size = 0.4, alpha = 0.25) +
+  geom_text(data = r2_by_cond, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 4, color = "black") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    "igg_mock"   = "#009E73",
+    "eif4e"      = "#0072B2",
+    "flag_eif3d" = "#E69F00"
+  )) +
+  facet_grid(timepoint ~ ip_type) +
+  labs(x = "RNA CPM (riboseq, log10)",
+       y = "IP CPM (RIP-seq, log10)",
+       color = "IP type",
+       title = "IP CPM vs RNA CPM by IP type and condition (all samples)") +
+  theme_classic(base_size = 14) +
+  theme(strip.text = element_text(size = 12))
+
+p_cor_by_cond
+ggsave(here("ripseq", "plots", "00a_ip_vs_rna_cpm_by_condition.pdf"), p_cor_by_cond, width = 12, height = 14)
+```
+
+```{r enrichment_vs_rna}
+igg_cpm <- rip_long_cond |>
+  filter(ip_type == "igg_mock") |>
+  dplyr::select(gene_id, condition, hours, igg_cpm = mean_ip_cpm)
+
+enrichment_long <- rip_long_cond |>
+  filter(ip_type != "igg_mock") |>
+  left_join(igg_cpm, by = c("gene_id", "condition", "hours")) |>
+  mutate(log2_enrichment = log2((mean_ip_cpm + 1) / (igg_cpm + 1)),
+         timepoint = factor(timepoint, levels = tp_levels))
+
+r2_enrich <- enrichment_long |>
+  filter(!is.na(rna_cpm), !is.na(log2_enrichment), is.finite(log2_enrichment)) |>
+  group_by(ip_type, timepoint) |>
+  summarise(r2 = cor(log10(rna_cpm + 1), log2_enrichment)^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_enrich <- ggplot(enrichment_long,
+                   aes(x = rna_cpm + 1, y = log2_enrichment, color = ip_type)) +
+  geom_point(size = 0.4, alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_text(data = r2_enrich, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 3, color = "black") +
+  scale_x_log10() +
+  scale_color_manual(values = c(
+    "eif4e"      = "#0072B2",
+    "flag_eif3d" = "#E69F00"
+  )) +
+  facet_grid(timepoint ~ ip_type) +
+  labs(x = "RNA CPM (riboseq, log10)",
+       y = "log2 enrichment (IP / IgG)",
+       color = "IP type",
+       title = "IP enrichment over IgG vs RNA level by condition") +
+  theme_classic(base_size = 10) +
+  theme(strip.text = element_text(size = 8))
+
+p_enrich
+ggsave(here("ripseq", "plots", "00a_enrichment_vs_rna_by_condition.pdf"), p_enrich, width = 10, height = 14)
+```
+
+```{r enrichment_vs_rna_no_outlier}
+igg_cpm_no <- rip_long_no_cond |>
+  filter(ip_type == "igg_mock") |>
+  dplyr::select(gene_id, condition, hours, igg_cpm = mean_ip_cpm)
+
+enrichment_long_no <- rip_long_no_cond |>
+  filter(ip_type != "igg_mock") |>
+  left_join(igg_cpm_no, by = c("gene_id", "condition", "hours")) |>
+  mutate(log2_enrichment = log2((mean_ip_cpm + 1) / (igg_cpm + 1)),
+         timepoint = factor(timepoint, levels = tp_levels))
+
+r2_enrich_no <- enrichment_long_no |>
+  filter(!is.na(rna_cpm), !is.na(log2_enrichment), is.finite(log2_enrichment)) |>
+  group_by(ip_type, timepoint) |>
+  summarise(r2 = cor(log10(rna_cpm + 1), log2_enrichment)^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_enrich_no <- ggplot(enrichment_long_no,
+                      aes(x = rna_cpm + 1, y = log2_enrichment, color = ip_type)) +
+  geom_point(size = 0.4, alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_text(data = r2_enrich_no, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 3, color = "black") +
+  scale_x_log10() +
+  scale_color_manual(values = c(
+    "eif4e"      = "#0072B2",
+    "flag_eif3d" = "#E69F00"
+  )) +
+  facet_grid(timepoint ~ ip_type) +
+  labs(x = "RNA CPM (riboseq, log10)",
+       y = "log2 enrichment (IP / IgG)",
+       color = "IP type",
+       title = "IP enrichment over IgG vs RNA level by condition (outlier 0077 removed)") +
+  theme_classic(base_size = 10) +
+  theme(strip.text = element_text(size = 8))
+
+p_enrich_no
+ggsave(here("ripseq", "plots", "00a_enrichment_vs_rna_by_condition_no_outlier.pdf"), p_enrich_no, width = 10, height = 14)
 ```
 
 ```{r cor_rna_ip_nozero}
@@ -443,6 +594,10 @@ rip_long_no <- as.data.frame(rip_cpm_mat_no) |>
   summarise(mean_ip_cpm = mean(cpm, na.rm = TRUE), .groups = "drop") |>
   mutate(rna_cpm   = rna_cpm_mean[gene_id],
          timepoint = paste0(condition, "_", hours, "hr"))
+
+rip_long_no_cond <- rip_long_no |>
+  dplyr::select(-rna_cpm) |>
+  left_join(rna_cpm_by_cond, by = c("gene_id", "condition", "hours"))
 
 r2_no <- rip_long_no |>
   filter(!is.na(rna_cpm), !is.na(mean_ip_cpm)) |>
@@ -505,8 +660,8 @@ rip_long_per_sample <- as.data.frame(rip_cpm_mat) |>
   pivot_longer(-gene_id, names_to = "sample_name", values_to = "ip_cpm") |>
   mutate(id = sub(".*_(NM\\d+_\\d+)$", "\\1", sample_name)) |>
   left_join(dplyr::select(metadata, id, condition, ip_type, hours, rep), by = "id") |>
-  mutate(rna_cpm     = rna_cpm_mean[gene_id],
-         facet_label = paste0(id, " | ", ip_type, " | ", condition, " ", hours, "hr ", rep))
+  left_join(rna_cpm_by_cond, by = c("gene_id", "condition", "hours")) |>
+  mutate(facet_label = paste0(id, " | ", ip_type, " | ", condition, " ", hours, "hr ", rep))
 
 p_cor_per_sample <- ggplot(rip_long_per_sample,
                            aes(x = rna_cpm + 1, y = ip_cpm + 1, color = ip_type)) +
@@ -531,6 +686,158 @@ ggsave(here("ripseq", "plots", "00a_ip_vs_rna_cpm_per_sample.pdf"),
        p_cor_per_sample, width = 22, height = 16)
 ```
 
+# IP TPM vs RNA TPM (length-normalized)
+
+```{r rna_tpm}
+rna_salmon_base <- file.path(here(), "2025_MDAcells_riboseq", "salmon", rna_meta$id)
+rna_quantfiles  <- ifelse(
+  file.exists(file.path(rna_salmon_base, "quant.sf.gz")),
+  file.path(rna_salmon_base, "quant.sf.gz"),
+  file.path(rna_salmon_base, "quant.sf")
+)
+names(rna_quantfiles) <- rna_meta$id
+
+rna_txi <- tximport(rna_quantfiles, type = "salmon", tx2gene = tx2gene)
+
+common_genes_tpm <- intersect(shared_genes, rownames(rna_txi$abundance))
+rna_tpm_mean <- setNames(
+  rowMeans(rna_txi$abundance[common_genes_tpm, , drop = FALSE]),
+  common_genes_tpm
+)
+cat("RNA-seq TPM: genes with TPM data:", length(rna_tpm_mean), "\n")
+```
+
+```{r cor_rna_ip_tpm}
+ip_tpm_mat <- myTxi$abundance[rownames(allCounts), ]
+
+rip_tpm_long <- as.data.frame(ip_tpm_mat) |>
+  rownames_to_column("gene_id") |>
+  pivot_longer(-gene_id, names_to = "sample_name", values_to = "tpm") |>
+  mutate(id = sub(".*_(NM\\d+_\\d+)$", "\\1", sample_name)) |>
+  left_join(dplyr::select(metadata, id, condition, ip_type, hours), by = "id") |>
+  group_by(gene_id, ip_type, condition, hours) |>
+  summarise(mean_ip_tpm = mean(tpm, na.rm = TRUE), .groups = "drop") |>
+  filter(gene_id %in% common_genes_tpm) |>
+  mutate(rna_tpm   = rna_tpm_mean[gene_id],
+         timepoint = paste0(condition, "_", hours, "hr"))
+
+r2_tpm <- rip_tpm_long |>
+  filter(!is.na(rna_tpm), !is.na(mean_ip_tpm)) |>
+  group_by(ip_type) |>
+  summarise(r2 = cor(log10(rna_tpm + 1), log10(mean_ip_tpm + 1))^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_cor_tpm <- ggplot(rip_tpm_long, aes(x = rna_tpm + 1, y = mean_ip_tpm + 1, color = timepoint)) +
+  geom_point(size = 0.4, alpha = 0.25) +
+  geom_text(data = r2_tpm, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 3.5, color = "black") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_okabe_ito() +
+  facet_wrap(~ ip_type, nrow = 1) +
+  labs(x = "RNA TPM (riboseq, log10)",
+       y = "IP TPM (RIP-seq, log10)",
+       color = "Condition",
+       title = "IP TPM vs RNA TPM by IP type (all samples, length-normalized)") +
+  theme_classic(base_size = 12)
+
+p_cor_tpm
+ggsave(here("ripseq", "plots", "00a_ip_vs_rna_tpm_all.pdf"), p_cor_tpm, width = 14, height = 5)
+```
+
+```{r cor_rna_ip_tpm_nozero}
+rip_tpm_long_nz <- rip_tpm_long |> filter(mean_ip_tpm > 0)
+
+r2_tpm_nz <- rip_tpm_long_nz |>
+  filter(!is.na(rna_tpm)) |>
+  group_by(ip_type) |>
+  summarise(r2 = cor(log10(rna_tpm + 1), log10(mean_ip_tpm + 1))^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_cor_tpm_nz <- ggplot(rip_tpm_long_nz, aes(x = rna_tpm + 1, y = mean_ip_tpm + 1, color = timepoint)) +
+  geom_point(size = 0.4, alpha = 0.25) +
+  geom_text(data = r2_tpm_nz, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 3.5, color = "black") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_okabe_ito() +
+  facet_wrap(~ ip_type, nrow = 1) +
+  labs(x = "RNA TPM (riboseq, log10)",
+       y = "IP TPM (RIP-seq, log10)",
+       color = "Condition",
+       title = "IP TPM vs RNA TPM by IP type (all samples, zeros excluded, length-normalized)") +
+  theme_classic(base_size = 12)
+
+p_cor_tpm_nz
+ggsave(here("ripseq", "plots", "00a_ip_vs_rna_tpm_all_nozero.pdf"), p_cor_tpm_nz, width = 14, height = 5)
+```
+
+```{r cor_rna_ip_tpm_no_outlier}
+ip_tpm_mat_no <- ip_tpm_mat[, !grepl("0077", colnames(ip_tpm_mat)), drop = FALSE]
+meta_no_out_tpm <- metadata |> dplyr::filter(!grepl("0077", id))
+
+rip_tpm_long_no <- as.data.frame(ip_tpm_mat_no) |>
+  rownames_to_column("gene_id") |>
+  pivot_longer(-gene_id, names_to = "sample_name", values_to = "tpm") |>
+  mutate(id = sub(".*_(NM\\d+_\\d+)$", "\\1", sample_name)) |>
+  left_join(dplyr::select(meta_no_out_tpm, id, condition, ip_type, hours), by = "id") |>
+  group_by(gene_id, ip_type, condition, hours) |>
+  summarise(mean_ip_tpm = mean(tpm, na.rm = TRUE), .groups = "drop") |>
+  filter(gene_id %in% common_genes_tpm) |>
+  mutate(rna_tpm   = rna_tpm_mean[gene_id],
+         timepoint = paste0(condition, "_", hours, "hr"))
+
+r2_tpm_no <- rip_tpm_long_no |>
+  filter(!is.na(rna_tpm), !is.na(mean_ip_tpm)) |>
+  group_by(ip_type) |>
+  summarise(r2 = cor(log10(rna_tpm + 1), log10(mean_ip_tpm + 1))^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_cor_tpm_no <- ggplot(rip_tpm_long_no, aes(x = rna_tpm + 1, y = mean_ip_tpm + 1, color = timepoint)) +
+  geom_point(size = 0.4, alpha = 0.25) +
+  geom_text(data = r2_tpm_no, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 3.5, color = "black") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_okabe_ito() +
+  facet_wrap(~ ip_type, nrow = 1) +
+  labs(x = "RNA TPM (riboseq, log10)",
+       y = "IP TPM (RIP-seq, log10)",
+       color = "Condition",
+       title = "IP TPM vs RNA TPM by IP type (outlier 0077 removed, length-normalized)") +
+  theme_classic(base_size = 12)
+
+p_cor_tpm_no
+ggsave(here("ripseq", "plots", "00a_ip_vs_rna_tpm_no_outlier.pdf"), p_cor_tpm_no, width = 14, height = 5)
+```
+
+```{r cor_rna_ip_tpm_no_outlier_nozero}
+rip_tpm_long_no_nz <- rip_tpm_long_no |> filter(mean_ip_tpm > 0)
+
+r2_tpm_no_nz <- rip_tpm_long_no_nz |>
+  filter(!is.na(rna_tpm)) |>
+  group_by(ip_type) |>
+  summarise(r2 = cor(log10(rna_tpm + 1), log10(mean_ip_tpm + 1))^2, .groups = "drop") |>
+  mutate(label = paste0("R2 = ", round(r2, 3)))
+
+p_cor_tpm_no_nz <- ggplot(rip_tpm_long_no_nz, aes(x = rna_tpm + 1, y = mean_ip_tpm + 1, color = timepoint)) +
+  geom_point(size = 0.4, alpha = 0.25) +
+  geom_text(data = r2_tpm_no_nz, aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.4, size = 3.5, color = "black") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_okabe_ito() +
+  facet_wrap(~ ip_type, nrow = 1) +
+  labs(x = "RNA TPM (riboseq, log10)",
+       y = "IP TPM (RIP-seq, log10)",
+       color = "Condition",
+       title = "IP TPM vs RNA TPM by IP type (outlier 0077 removed, zeros excluded, length-normalized)") +
+  theme_classic(base_size = 12)
+
+p_cor_tpm_no_nz
+ggsave(here("ripseq", "plots", "00a_ip_vs_rna_tpm_no_outlier_nozero.pdf"), p_cor_tpm_no_nz, width = 14, height = 5)
+```
+
 # Save Outputs
 
 ```{r save_outputs}
@@ -548,4 +855,9 @@ cat("  ripseq/output/ripseq_allCounts_raw.rds\n")
 cat("  ripseq/output/ripseq_allCounts_raw.csv\n")
 cat("  ripseq/output/ripseq_metadata_clean.csv\n")
 cat("Final dimensions:", nrow(allCounts), "genes x", ncol(allCounts), "samples (outlier NOT removed -- see 01)\n")
+```
+
+
+```{r}
+
 ```
