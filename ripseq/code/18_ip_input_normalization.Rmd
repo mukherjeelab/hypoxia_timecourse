@@ -37,18 +37,30 @@ direction note).
 # Load gene annotation
 
 ```{r gene_anno}
-gene_anno <- read_tsv(
+gene_anno_all <- read_tsv(
   here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
   col_names = c("gene_id", "symbol", "biotype", "species", "version"),
   show_col_types = FALSE
 ) |>
   filter(species == "human") |>
-  dplyr::select(gene_id_clean = gene_id, symbol, biotype) |>
-  mutate(gene_id_clean = sub("\\..*", "", gene_id_clean)) |>
-  distinct(gene_id_clean, .keep_all = TRUE)
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
 
-pc_genes <- gene_anno |> filter(biotype == "protein_coding") |> pull(gene_id_clean)
-cat("Protein-coding genes:", length(pc_genes), "\n")
+# A gene is protein-coding if ANY transcript row has biotype "protein_coding".
+# distinct() before this would arbitrarily pick one biotype per gene and misclassify
+# genes whose first listed transcript is NMD or protein_coding_CDS_not_defined.
+pc_genes <- gene_anno_all |>
+  filter(biotype == "protein_coding") |>
+  distinct(gene_id_clean) |>
+  pull(gene_id_clean)
+
+# Deduplicate for symbol lookups; prefer protein_coding row where available
+gene_anno <- gene_anno_all |>
+  arrange(gene_id_clean, desc(biotype == "protein_coding")) |>
+  distinct(gene_id_clean, .keep_all = TRUE) |>
+  dplyr::select(gene_id_clean, symbol, biotype)
+
+cat("Protein-coding genes (any-transcript rule):", length(pc_genes), "\n")
+cat("Unique genes in annotation:", nrow(gene_anno), "\n")
 ```
 
 ---
@@ -149,16 +161,32 @@ cat("Timepoints in RNA data:", paste(unique(rna_long$timepoint), collapse = ", "
 ## Compute log2(IP CPM / RNA norm) per gene per condition
 
 ```{r ip_over_rna}
-enrichment_rna <- ip_mean_cpm |>
-  left_join(rna_long, by = c("gene_id_clean", "condition", "hours", "timepoint")) |>
-  filter(!is.na(mean_rna_norm), mean_rna_norm > 0) |>
+joined <- ip_mean_cpm |>
+  left_join(rna_long, by = c("gene_id_clean", "condition", "hours", "timepoint"))
+cat("After join — genes:", n_distinct(joined$gene_id_clean), "| rows:", nrow(joined), "\n")
+cat("Missing RNA (NA):", sum(is.na(joined$mean_rna_norm)), "rows\n")
+
+after_rna_filter <- joined |> filter(!is.na(mean_rna_norm), mean_rna_norm > 0)
+cat("After RNA > 0 filter — genes:", n_distinct(after_rna_filter$gene_id_clean),
+    "| rows:", nrow(after_rna_filter), "\n")
+
+cat("\nBiotype breakdown of genes before pc filter:\n")
+after_rna_filter |>
+  distinct(gene_id_clean) |>
+  left_join(dplyr::select(gene_anno, gene_id_clean, biotype), by = "gene_id_clean") |>
+  dplyr::count(biotype, sort = TRUE) |>
+  print()
+
+enrichment_rna <- after_rna_filter |>
+  filter(gene_id_clean %in% pc_genes) |>
   mutate(
     log2_ip_over_rna = log2((mean_ip_cpm + 1) / (mean_rna_norm + 1)),
     timepoint = factor(timepoint, levels = tp_levels)
-  ) |>
-  filter(gene_id_clean %in% pc_genes)
+  )
+cat("\nAfter pc_genes filter — genes:", n_distinct(enrichment_rna$gene_id_clean),
+    "| rows:", nrow(enrichment_rna), "\n")
 
-cat("Genes with IP/RNA enrichment:\n")
+cat("\nGenes with IP/RNA enrichment per ip_type x timepoint:\n")
 enrichment_rna |>
   group_by(ip_type, timepoint) |>
   summarise(n = n(), .groups = "drop") |>
@@ -465,4 +493,8 @@ cor_summary <- bind_rows(
 print(cor_summary)
 write_csv(cor_summary, here("ripseq", "output", "18_spearman_normalization_comparison.csv"))
 cat("Saved correlation summary.\n")
+```
+
+```{r}
+
 ```

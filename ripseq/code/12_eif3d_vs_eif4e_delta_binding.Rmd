@@ -36,6 +36,14 @@ group_colors <- c(
 # Load data
 
 ```{r load}
+gene_anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
+                     col_names = c("gene_id", "symbol", "biotype", "species", "version"),
+                     show_col_types = FALSE) |>
+  filter(species == "human") |>
+  dplyr::select(gene_id_clean = gene_id, symbol) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id_clean)) |>
+  distinct(gene_id_clean, .keep_all = TRUE)
+
 delta_3d_path <- here("ripseq", "output", "ripseq_deseq_flag3d_hypoxia_1hr_vs_normoxia_delta.csv")
 delta_4e_path <- here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_1hr_vs_normoxia_delta.csv")
 
@@ -75,6 +83,9 @@ cat("sictrl hypoxia-promoted TE (>0.5, padj<0.05):",
 plot_df <- inner_join(delta_3d, delta_4e, by = "gene_id_clean") |>
   left_join(te_hyp, by = "gene_id_clean") |>
   left_join(te_sictrl_hyp, by = "gene_id_clean") |>
+  left_join(gene_anno |> dplyr::rename(symbol_anno = symbol), by = "gene_id_clean") |>
+  mutate(symbol = coalesce(symbol, symbol_anno)) |>
+  dplyr::select(-symbol_anno) |>
   filter(!is.na(delta_flag3d_lfc), !is.na(delta_eif4e_lfc)) |>
   mutate(
     group = if_else(
@@ -241,6 +252,78 @@ ggsave(here("ripseq", "plots", "12_scatter_delta3d_vs_delta4e_te_rank.pdf"),
 p_scatter_te_rank
 ```
 
+# identify dots
+
+what are the dots
+
+```{r identify_4e_drop_3d_neutral}
+trade_off_genes <- plot_df |>
+  filter(
+    abs(delta_flag3d_lfc) < 1,
+    delta_eif4e_lfc < -2
+  )
+
+cat("Genes with eIF4E drop (< -2) but neutral eIF3d change (|lfc| < 1):",
+    nrow(trade_off_genes), "\n")
+print(trade_off_genes |> dplyr::select(gene_id_clean, symbol, delta_flag3d_lfc, delta_eif4e_lfc) |>
+        arrange(delta_eif4e_lfc))
+
+# top quartile by sictrl TE LFC within trade-off set
+te_q75 <- quantile(trade_off_genes$sictrl_te_lfc, 0.75, na.rm = TRUE)
+cat("\nTop quartile sictrl TE LFC cutoff:", round(te_q75, 3), "\n")
+
+top_te_trade_off <- trade_off_genes |>
+  filter(!is.na(sictrl_te_lfc), sictrl_te_lfc >= te_q75)
+
+cat("Trade-off genes in top sictrl TE quartile:", nrow(top_te_trade_off), "\n")
+print(top_te_trade_off |>
+        dplyr::select(gene_id_clean, symbol, sictrl_te_lfc, delta_flag3d_lfc, delta_eif4e_lfc) |>
+        arrange(desc(sictrl_te_lfc)))
+
+# top quartile by eIF3d-promoted TE LFC (si3d vs sictrl hypoxia) within trade-off set
+eif3d_q75 <- quantile(trade_off_genes$te_lfc, 0.75, na.rm = TRUE)
+cat("\nTop quartile eIF3d-promoted TE LFC cutoff:", round(eif3d_q75, 3), "\n")
+
+top_eif3d_trade_off <- trade_off_genes |>
+  filter(!is.na(te_lfc), te_lfc >= eif3d_q75)
+
+cat("Trade-off genes in top eIF3d-promoted TE quartile:", nrow(top_eif3d_trade_off), "\n")
+print(top_eif3d_trade_off |>
+        dplyr::select(gene_id_clean, symbol, te_lfc, delta_flag3d_lfc, delta_eif4e_lfc) |>
+        arrange(desc(te_lfc)))
+
+# overlap: top quartile in both sictrl TE and eIF3d-promoted TE
+overlap_trade_off <- inner_join(
+  top_te_trade_off    |> dplyr::select(gene_id_clean),
+  top_eif3d_trade_off |> dplyr::select(gene_id_clean),
+  by = "gene_id_clean"
+) |>
+  left_join(trade_off_genes, by = "gene_id_clean")
+
+cat("\nOverlap (top quartile in both sictrl TE and eIF3d-promoted TE):", nrow(overlap_trade_off), "\n")
+print(overlap_trade_off |>
+        dplyr::select(gene_id_clean, symbol, sictrl_te_lfc, te_lfc, delta_flag3d_lfc, delta_eif4e_lfc) |>
+        arrange(desc(te_lfc)))
+
+      overlap_trade_off |> pull(symbol)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Scatter: sictrl hypoxia-promoted TE
 
 ```{r scatter_sictrl}
@@ -271,6 +354,17 @@ ggsave(here("ripseq", "plots", "12_scatter_delta3d_vs_delta4e_sictrl_hyp.pdf"),
        p_scatter_sictrl, width = 5, height = 5)
 p_scatter_sictrl
 ```
+
+
+
+
+
+
+
+
+
+
+
 
 # CDF: delta eIF4E by eIF3d-gained vs all
 
@@ -354,4 +448,256 @@ cat(sprintf(
 ggsave(here("ripseq", "plots", "12_quadrant_counts.pdf"),
        p_quad, width = 5, height = 4)
 p_quad
+```
+
+# Scatter across all hypoxia timepoints
+
+```{r load_all_timepoints}
+tp_labels <- c("hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+
+delta_paths <- list(
+  hypoxia_1hr  = list(
+    d3 = here("ripseq", "output", "ripseq_deseq_flag3d_hypoxia_1hr_vs_normoxia_delta.csv"),
+    e4 = here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_1hr_vs_normoxia_delta.csv")
+  ),
+  hypoxia_4hr  = list(
+    d3 = here("ripseq", "output", "ripseq_deseq_flag3d_hypoxia_4hr_vs_normoxia_delta.csv"),
+    e4 = here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_4hr_vs_normoxia_delta.csv")
+  ),
+  hypoxia_24hr = list(
+    d3 = here("ripseq", "output", "ripseq_deseq_flag3d_hypoxia_24hr_vs_normoxia_delta.csv"),
+    e4 = here("ripseq", "output", "ripseq_deseq_eif4e_hypoxia_24hr_vs_normoxia_delta.csv")
+  )
+)
+
+tp_to_te <- list(
+  hypoxia_1hr  = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  hypoxia_4hr  = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"),
+  hypoxia_24hr = here("output", "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv")
+)
+
+stopifnot("Missing delta CSVs — run notebook 09 first" =
+  all(sapply(unlist(lapply(delta_paths, unlist)), file.exists)))
+stopifnot("Missing TE CSVs" =
+  all(sapply(unlist(tp_to_te), file.exists)))
+
+# load all loci without deduplication
+plot_df_all_raw <- imap_dfr(delta_paths, \(paths, tp) {
+  d3 <- read_csv(paths$d3, show_col_types = FALSE) |>
+    dplyr::select(gene_id_clean, symbol, baseMean, delta_flag3d_lfc)
+  e4 <- read_csv(paths$e4, show_col_types = FALSE) |>
+    dplyr::select(gene_id_clean, baseMean_4e = baseMean, delta_eif4e_lfc)
+  te <- read_csv(tp_to_te[[tp]], show_col_types = FALSE) |>
+    dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    dplyr::select(gene_id_clean, te_lfc, te_padj)
+
+  inner_join(d3, e4, by = "gene_id_clean") |>
+    left_join(te, by = "gene_id_clean") |>
+    dplyr::mutate(timepoint = tp)
+})
+
+# canonical locus per gene: highest mean baseMean across timepoints
+canonical_ids_tp <- plot_df_all_raw |>
+  dplyr::group_by(symbol, gene_id_clean) |>
+  dplyr::summarise(mean_baseMean = mean(baseMean), .groups = "drop") |>
+  dplyr::group_by(symbol) |>
+  dplyr::slice_max(order_by = mean_baseMean, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::select(symbol, gene_id_clean)
+
+plot_df_all <- plot_df_all_raw |>
+  dplyr::filter(gene_id_clean %in% canonical_ids_tp$gene_id_clean) |>
+  dplyr::mutate(
+    timepoint = factor(timepoint, levels = tp_labels),
+    group = if_else(
+      !is.na(te_lfc) & !is.na(te_padj) & te_lfc > TE_LFC_CUT & te_padj < TE_PADJ_CUT,
+      "eIF3d hypoxia promotes", "All other genes"
+    ),
+    group = factor(group, levels = c("eIF3d hypoxia promotes", "All other genes"))
+  )
+
+cat("Genes and eIF3d-promoted counts per timepoint:\n")
+plot_df_all |> dplyr::count(timepoint, group) |> print()
+```
+
+```{r scatter_all_timepoints, fig.width=14, fig.height=5}
+rho_df_all <- plot_df_all |>
+  dplyr::group_by(timepoint) |>
+  dplyr::summarise(
+    rho   = cor.test(delta_flag3d_lfc, delta_eif4e_lfc,
+                     method = "spearman", exact = FALSE)$estimate,
+    pval  = cor.test(delta_flag3d_lfc, delta_eif4e_lfc,
+                     method = "spearman", exact = FALSE)$p.value,
+    n_prom = sum(group == "eIF3d hypoxia promotes"),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    rho_label  = sprintf("rho = %.2f, p = %.2e", rho, pval),
+    prom_label = paste0("eIF3d promotes (", gsub("hypoxia_", "", as.character(timepoint)), "): n = ", n_prom)
+  )
+
+p_scatter_all <- ggplot(mapping = aes(x = delta_flag3d_lfc, y = delta_eif4e_lfc)) +
+  geom_point(data = filter(plot_df_all, group == "All other genes"),
+             color = "grey80", alpha = 0.25, size = 0.5) +
+  geom_point(data = filter(plot_df_all, group == "eIF3d hypoxia promotes"),
+             color = "#E69F00", alpha = 0.5, size = 0.7) +
+  geom_smooth(data = plot_df_all, method = "lm", se = TRUE,
+              color = "black", linewidth = 0.7, fill = "grey70") +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_text(data = rho_df_all, aes(label = rho_label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            size = 5, inherit.aes = FALSE) +
+  geom_text(data = rho_df_all, aes(label = prom_label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 2.8,
+            color = "#E69F00", size = 5, inherit.aes = FALSE) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(
+    x     = "eIF3d binding change (log2FC, hypoxia vs normoxia, timepoint-matched)",
+    y     = "eIF4E binding change (log2FC, hypoxia vs normoxia, timepoint-matched)",
+    title = "eIF3d vs eIF4E binding trade-off across hypoxia timepoints\n(axes and eIF3d-promoted coloring timepoint-matched)"
+  ) +
+  theme_classic(base_size = 16)
+
+ggsave(here("ripseq", "plots", "12_scatter_delta3d_vs_delta4e_all_timepoints.pdf"),
+       p_scatter_all, width = 14, height = 5)
+p_scatter_all
+```
+
+```{r scatter_te_rank_all_timepoints, fig.width=14, fig.height=5}
+tp_to_sictrl_te <- list(
+  hypoxia_1hr  = here("output", "translation_categories_1hr.csv"),
+  hypoxia_4hr  = here("output", "translation_categories_4hr.csv"),
+  hypoxia_24hr = here("output", "translation_categories_24hr.csv")
+)
+
+stopifnot("Missing sictrl TE CSVs" =
+  all(sapply(unlist(tp_to_sictrl_te), file.exists)))
+
+sictrl_te_all <- imap_dfr(tp_to_sictrl_te, \(path, tp) {
+  read_csv(path, show_col_types = FALSE) |>
+    dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    dplyr::select(gene_id_clean, sictrl_te_lfc = te_lfc) |>
+    dplyr::mutate(timepoint = tp)
+})
+
+plot_df_rank_all <- plot_df_all |>
+  dplyr::select(gene_id_clean, timepoint, delta_flag3d_lfc, delta_eif4e_lfc) |>
+  left_join(sictrl_te_all, by = c("gene_id_clean", "timepoint")) |>
+  dplyr::group_by(timepoint) |>
+  dplyr::mutate(te_prank = percent_rank(sictrl_te_lfc)) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(te_prank)
+
+rho_df_rank_all <- plot_df_rank_all |>
+  dplyr::group_by(timepoint) |>
+  dplyr::summarise(
+    rho  = cor.test(delta_flag3d_lfc, delta_eif4e_lfc,
+                    method = "spearman", exact = FALSE)$estimate,
+    pval = cor.test(delta_flag3d_lfc, delta_eif4e_lfc,
+                    method = "spearman", exact = FALSE)$p.value,
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(rho_label = sprintf("rho = %.2f, p = %.2e", rho, pval))
+
+p_scatter_te_rank_all <- ggplot(
+  plot_df_rank_all,
+  aes(x = delta_flag3d_lfc, y = delta_eif4e_lfc, color = te_prank)
+) +
+  geom_point(alpha = 0.5, size = 0.7) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "black", linewidth = 0.7, fill = "grey70") +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_text(data = rho_df_rank_all, aes(label = rho_label),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+            size = 5, inherit.aes = FALSE) +
+  scale_color_gradient2(
+    low      = "#2C7BB6",
+    mid      = "grey85",
+    high     = "#D7191C",
+    midpoint = 0.5,
+    limits   = c(0, 1),
+    na.value = "grey85",
+    name     = "sictrl TE rank\n(timepoint-matched)",
+    labels   = c("lowest", "", "median", "", "highest"),
+    breaks   = c(0, 0.25, 0.5, 0.75, 1)
+  ) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(
+    x     = "eIF3d binding change (log2FC, hypoxia vs normoxia, timepoint-matched)",
+    y     = "eIF4E binding change (log2FC, hypoxia vs normoxia, timepoint-matched)",
+    title = "eIF3d vs eIF4E binding, colored by sictrl TE rank (timepoint-matched)"
+  ) +
+  theme_classic(base_size = 16)
+
+ggsave(here("ripseq", "plots", "12_scatter_delta3d_vs_delta4e_te_rank_all_timepoints.pdf"),
+       p_scatter_te_rank_all, width = 14, height = 5)
+p_scatter_te_rank_all
+```
+
+# Trade-off genes: 4E binding decrease, 3D neutral, across timepoints
+
+```{r trade_off_tp}
+TRADEOFF_4E_CUT <- -2
+TRADEOFF_3D_ABS <-  1
+
+trade_off_tp <- plot_df_all |>
+  dplyr::filter(
+    delta_eif4e_lfc  <  TRADEOFF_4E_CUT,
+    abs(delta_flag3d_lfc) < TRADEOFF_3D_ABS
+  )
+
+cat("Trade-off gene counts per timepoint (4E drop <", TRADEOFF_4E_CUT,
+    ", |3d change| <", TRADEOFF_3D_ABS, "):\n")
+trade_off_tp |> dplyr::count(timepoint) |> print()
+
+for (tp in levels(trade_off_tp$timepoint)) {
+  cat("\n---", tp, "---\n")
+  trade_off_tp |>
+    dplyr::filter(timepoint == tp) |>
+    dplyr::select(symbol, delta_flag3d_lfc, delta_eif4e_lfc) |>
+    dplyr::arrange(delta_eif4e_lfc) |>
+    print()
+}
+```
+
+```{r venn_trade_off_tp, fig.width=6, fig.height=6}
+sets_tp <- split(trade_off_tp$gene_id_clean, trade_off_tp$timepoint)
+
+p_venn_tp <- ggvenn(
+  sets_tp,
+  fill_color  = c("#56B4E9", "#E69F00", "#009E73"),
+  stroke_size = 0.5,
+  text_size   = 4.5
+) +
+  ggtitle(paste0(
+    "Trade-off genes overlap across timepoints\n",
+    "(4E drop < ", TRADEOFF_4E_CUT, ", |3d change| < ", TRADEOFF_3D_ABS, ")"
+  )) +
+  theme_void(base_size = 14)
+
+ggsave(here("ripseq", "plots", "12_venn_tradeoff_genes_timepoints.pdf"),
+       p_venn_tp, width = 6, height = 6)
+p_venn_tp
+```
+
+```{r trade_off_tp_table}
+trade_off_wide <- trade_off_tp |>
+  dplyr::select(gene_id_clean, symbol, timepoint) |>
+  dplyr::mutate(present = TRUE) |>
+  tidyr::pivot_wider(names_from = timepoint, values_from = present,
+                     values_fill = FALSE) |>
+  dplyr::mutate(n_timepoints = rowSums(dplyr::across(all_of(tp_labels)))) |>
+  dplyr::arrange(desc(n_timepoints), symbol)
+
+cat("Genes present at 2+ timepoints:\n")
+trade_off_wide |> dplyr::filter(n_timepoints >= 2) |> print()
+
+cat("\nGenes present at all 3 timepoints:\n")
+trade_off_wide |> dplyr::filter(n_timepoints == 3) |> print()
+```
+
+```{r}
+
 ```
