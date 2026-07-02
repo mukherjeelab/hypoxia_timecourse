@@ -70,6 +70,7 @@ The `code/predictive_modeling/` notebooks form a sequential pipeline:
 | `01k_` | overwrites `feature_matrix_external_stability.rds` | CDS/3'UTR structure features (drops 5'UTR RNAfold cols) |
 | `01l_` | `feature_matrix_codon_features.rds` | bg-corrected RSCU + raw codon frequencies, 121 features (reads `feature_matrix_external_stability.rds`) |
 | `01m_` | `feature_matrix_codon_only.rds` | Codon features without external stability base |
+| `01n_` | `feature_matrix_ripseq.rds` | eIF3d/eIF4E RIP-seq IP/IgG log2FC + IP/RNA log2 ratio, 4 timepoints, 16 features (reads `feature_matrix_external_stability.rds`; use with 07 via `feature_matrix_path`) |
 | `43_` | `feature_matrix_mcf7six1_codon_features.rds` | MCF7-SIX1 codon features with cell-line-specific transcript selection |
 
 The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvious. `01j_` and `01k_` overwrite `feature_matrix_external_stability.rds` in place — both must run after `01i_` before notebook 07 is called. RNA secondary structure inputs (from `01d_`, `01k_`) were pre-computed on a compute cluster using `cluster_scripts/` and read in as flat files. `01c_` (k-mer + RBP motif features) can be skipped for the `external_stability` pipeline — `01d_` is patched to read directly from `01_` + `01b_` outputs instead.

@@ -1,0 +1,215 @@
+---
+title: "01n — Feature Extraction: RIP-seq (IP/IgG, IP/RNA) Feature Matrix"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Adds eIF3d and eIF4E RIP-seq binding features (IP/IgG DESeq2 log2FC and IP/RNA log2
+ratio, at each of 4 timepoints) to `feature_matrix_external_stability.rds`, producing
+`feature_matrix_ripseq.rds` for use with notebook 07 via
+`feature_matrix_path = "feature_matrix_ripseq.rds"` (with `feature_set` set to any
+label, e.g. `"ripseq"`, purely for output-file naming).
+
+**16 features added, all gene-level (broadcast to every transcript of the same gene),
+NA for genes not covered by the RIP-seq experiment:**
+
+- `ripseq_eif3d_igg_lfc_{timepoint}` — DESeq2 log2FC, FLAG-eIF3d IP vs IgG (4 cols)
+- `ripseq_eif3d_rna_lfc_{timepoint}` — log2(IP CPM / spike-in normalized RNA), eIF3d IP (4 cols)
+- `eif4e_ip_igg_lfc_{timepoint}` — DESeq2 log2FC, eIF4E IP vs IgG (4 cols)
+- `eif4e_ip_rna_lfc_{timepoint}` — log2(IP CPM / spike-in normalized RNA), eIF4E IP (4 cols)
+
+Timepoints: `normoxia_1hr`, `hypoxia_1hr`, `hypoxia_4hr`, `hypoxia_24hr`.
+
+The `eif4e_ip_*` prefix intentionally matches the existing `exclude_4e_features` regex
+(`^eif4e_ip`) in notebook 07, so these new eIF4E columns are automatically excluded
+when that toggle is set — no change to 07 required.
+
+Source data: `ripseq/code/01_eif3d_rip_deseq.Rmd` (IP/IgG) and
+`ripseq/code/18_ip_input_normalization.Rmd` (IP/RNA, spike-in normalized RNA
+denominator, fixed 2026-07-01).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+---
+
+# Section 1: Load IP/IgG Data (DESeq2 log2FC vs IgG, per timepoint)
+
+```{r load_ip_igg}
+timepoints <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+
+read_igg_bait <- function(bait) {
+  map_dfr(timepoints, function(tp) {
+    read_csv(
+      here("ripseq", "output", paste0("ripseq_deseq_", tp, "_", bait, "_vs_igg.csv")),
+      show_col_types = FALSE
+    ) %>%
+      dplyr::select(gene_id_clean, timepoint, log2FoldChange)
+  })
+}
+
+igg_eif3d <- read_igg_bait("flag_eif3d")
+igg_eif4e <- read_igg_bait("eif4e")
+
+cat("eIF3d IP/IgG rows:", nrow(igg_eif3d), "\n")
+cat("eIF4E IP/IgG rows:", nrow(igg_eif4e), "\n")
+
+stopifnot(
+  "IP/IgG log2FC must be finite" =
+    all(is.finite(igg_eif3d$log2FoldChange[!is.na(igg_eif3d$log2FoldChange)])),
+  all(is.finite(igg_eif4e$log2FoldChange[!is.na(igg_eif4e$log2FoldChange)]))
+)
+cat("IP/IgG finiteness check: passed\n")
+```
+
+# Section 2: Load IP/RNA Data (log2 ratio vs spike-in normalized RNA, per timepoint)
+
+```{r load_ip_rna}
+ip_over_rna <- read_csv(
+  here("ripseq", "output", "18_ip_over_rna_enrichment.csv"),
+  show_col_types = FALSE
+)
+
+stopifnot(
+  "18_ip_over_rna_enrichment.csv must contain expected ip_type values" =
+    all(c("flag_eif3d", "eif4e") %in% unique(ip_over_rna$ip_type)),
+  "18_ip_over_rna_enrichment.csv must contain expected timepoints" =
+    all(timepoints %in% unique(ip_over_rna$timepoint))
+)
+
+rna_eif3d <- ip_over_rna %>%
+  filter(ip_type == "flag_eif3d") %>%
+  dplyr::select(gene_id_clean, timepoint, log2_ip_over_rna)
+
+rna_eif4e <- ip_over_rna %>%
+  filter(ip_type == "eif4e") %>%
+  dplyr::select(gene_id_clean, timepoint, log2_ip_over_rna)
+
+cat("eIF3d IP/RNA rows:", nrow(rna_eif3d), "\n")
+cat("eIF4E IP/RNA rows:", nrow(rna_eif4e), "\n")
+
+stopifnot(
+  "IP/RNA log2 ratio must be finite" =
+    all(is.finite(rna_eif3d$log2_ip_over_rna[!is.na(rna_eif3d$log2_ip_over_rna)])),
+  all(is.finite(rna_eif4e$log2_ip_over_rna[!is.na(rna_eif4e$log2_ip_over_rna)]))
+)
+cat("IP/RNA finiteness check: passed\n")
+```
+
+# Section 3: Pivot to Wide, Per-Gene Feature Table
+
+```{r pivot_wide}
+igg_eif3d_wide <- igg_eif3d %>%
+  pivot_wider(names_from = timepoint, values_from = log2FoldChange,
+              names_prefix = "ripseq_eif3d_igg_lfc_")
+
+igg_eif4e_wide <- igg_eif4e %>%
+  pivot_wider(names_from = timepoint, values_from = log2FoldChange,
+              names_prefix = "eif4e_ip_igg_lfc_")
+
+rna_eif3d_wide <- rna_eif3d %>%
+  pivot_wider(names_from = timepoint, values_from = log2_ip_over_rna,
+              names_prefix = "ripseq_eif3d_rna_lfc_")
+
+rna_eif4e_wide <- rna_eif4e %>%
+  pivot_wider(names_from = timepoint, values_from = log2_ip_over_rna,
+              names_prefix = "eif4e_ip_rna_lfc_")
+
+ripseq_features <- igg_eif3d_wide %>%
+  full_join(igg_eif4e_wide, by = "gene_id_clean") %>%
+  full_join(rna_eif3d_wide, by = "gene_id_clean") %>%
+  full_join(rna_eif4e_wide, by = "gene_id_clean")
+
+expected_ripseq_cols <- c(
+  paste0("ripseq_eif3d_igg_lfc_", timepoints),
+  paste0("eif4e_ip_igg_lfc_", timepoints),
+  paste0("ripseq_eif3d_rna_lfc_", timepoints),
+  paste0("eif4e_ip_rna_lfc_", timepoints)
+)
+stopifnot(all(expected_ripseq_cols %in% colnames(ripseq_features)))
+cat("RIP-seq feature table:", nrow(ripseq_features), "genes x",
+    length(expected_ripseq_cols), "features\n")
+```
+
+# Section 4: Join to Feature Matrix
+
+```{r join_to_feature_matrix}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Feature matrix loaded:", nrow(fm), "rows x", ncol(fm), "columns\n")
+
+fm_ripseq <- fm %>%
+  left_join(ripseq_features, by = "gene_id_clean")
+
+cat("After join:", nrow(fm_ripseq), "rows x", ncol(fm_ripseq), "columns\n")
+cat("New columns added:", ncol(fm_ripseq) - ncol(fm), "\n")
+
+cat("\nCoverage within feature matrix rows:\n")
+for (col in expected_ripseq_cols) {
+  cat(" ", col, ":", sum(!is.na(fm_ripseq[[col]])), "/", nrow(fm_ripseq), "\n")
+}
+```
+
+# Section 5: Validation
+
+```{r validation_computational}
+stopifnot(
+  "row count must be preserved by the join" = nrow(fm_ripseq) == nrow(fm),
+  "all expected RIP-seq columns must be present" =
+    all(expected_ripseq_cols %in% colnames(fm_ripseq)),
+  "RIP-seq LFC/ratio columns must be finite where non-NA" = all(sapply(
+    expected_ripseq_cols,
+    function(col) all(is.finite(fm_ripseq[[col]][!is.na(fm_ripseq[[col]])]))
+  ))
+)
+cat("Computational checks passed\n")
+```
+
+```{r validation_biological}
+# EIF3D is the bait in the flag_eif3d IP and should be strongly self-enriched
+eif3d_self <- fm_ripseq %>%
+  filter(symbol == "EIF3D") %>%
+  pull(ripseq_eif3d_igg_lfc_hypoxia_1hr)
+stopifnot(
+  "EIF3D self-enrichment in flag_eif3d IP/IgG must be strongly positive" =
+    length(eif3d_self) > 0 && all(eif3d_self > 2, na.rm = TRUE)
+)
+cat("EIF3D self-enrichment (ripseq_eif3d_igg_lfc_hypoxia_1hr):",
+    unique(eif3d_self), "\n")
+
+# EIF4E is the bait in the eif4e IP and should be self-enriched (positive)
+eif4e_self <- fm_ripseq %>%
+  filter(symbol == "EIF4E") %>%
+  pull(eif4e_ip_igg_lfc_hypoxia_1hr)
+stopifnot(
+  "EIF4E self-enrichment in eif4e IP/IgG must be positive" =
+    length(eif4e_self) > 0 && all(eif4e_self > 0, na.rm = TRUE)
+)
+cat("EIF4E self-enrichment (eif4e_ip_igg_lfc_hypoxia_1hr):",
+    unique(eif4e_self), "\n")
+
+cat("Biological spot-checks passed\n")
+```
+
+# Section 6: Save Output
+
+```{r save_output}
+saveRDS(fm_ripseq, here("output", "predictive_modeling", "feature_matrix_ripseq.rds"))
+cat("Saved: output/predictive_modeling/feature_matrix_ripseq.rds\n")
+```
