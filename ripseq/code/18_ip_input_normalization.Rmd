@@ -1,5 +1,5 @@
 ---
-title: "RIP-seq: IP normalized to riboseq sictrl RNA vs IP/IgG — correlation with eIF3d-promoted targets"
+title: "RIP-seq: IP vs riboseq sictrl RNA (DESeq2) vs IP/IgG (DESeq2) — correlation with eIF3d-promoted targets"
 author: "Kate"
 date: "2026-06"
 output: html_document
@@ -19,12 +19,18 @@ library(DESeq2)
 
 # Overview
 
-Compare two normalization strategies for RIP-seq enrichment:
+Compare two DESeq2-based normalization strategies for RIP-seq enrichment:
 
-1. **IP / riboseq sictrl RNA** (new): log2(IP CPM / spike-in normalized RNA). RNA is
-   condition- and timepoint-matched sictrl from the parallel riboseq experiment.
-   Note: the RIP-seq has no spike-ins, so IP is library-size normalized (CPM) while
-   the denominator uses spike-in normalized RNA counts.
+1. **IP / riboseq sictrl RNA** (DESeq2): raw RIP-seq IP counts combined with raw,
+   condition- and timepoint-matched sictrl RNA-seq counts from the parallel riboseq
+   experiment, contrasted with `DESeqDataSetFromMatrix(design = ~ seq_type)` the same
+   way IP/IgG is. Caveat: RIP-seq (2026 batch) and RNA-seq (2025 batch) are different
+   sequencing experiments with no shared spike-in, so `seq_type` is fully confounded
+   with sequencing batch — DESeq2's median-of-ratios normalization cannot separate true
+   IP enrichment from batch/library-prep composition differences. This limitation is
+   inherent (the prior CPM-ratio method was equally uncorrected for it) and not fixable
+   without a shared spike-in, so it is documented rather than "fixed" with an
+   unidentifiable batch covariate.
 
 2. **IP / IgG** (existing): log2FC from DESeq2 with outliers removed.
 
@@ -65,126 +71,121 @@ cat("Unique genes in annotation:", nrow(gene_anno), "\n")
 
 ---
 
-# Section 1: Compute IP/RNA enrichment (new normalization)
+# Section 1: Compute IP/RNA enrichment (DESeq2)
 
-## Load RIP-seq raw counts
+## Load RIP-seq raw counts (IP samples) and matched sictrl RNA-seq raw counts
 
-```{r load_rip_counts}
-allCounts <- readRDS(here("ripseq", "output", "ripseq_allCounts_raw.rds"))
-cat("RIP-seq raw counts:", nrow(allCounts), "genes x", ncol(allCounts), "samples\n")
+```{r load_rip_and_rna_counts}
+tp_map <- tribble(
+  ~timepoint,     ~condition,  ~hours,
+  "normoxia_1hr", "normoxia",  "1",
+  "hypoxia_1hr",  "hypoxia",   "1",
+  "hypoxia_4hr",  "hypoxia",   "4",
+  "hypoxia_24hr", "hypoxia",   "24"
+)
+tp_levels <- tp_map$timepoint
 
-# Remove sample QC fail (NM2026_0077). The IgG PCA outlier (NM2026_0065) is
-# not relevant here since we only use IP samples, not IgG, for this normalization.
-allCounts <- allCounts[, !grepl("NM2026_0077", colnames(allCounts))]
-cat("After outlier removal:", ncol(allCounts), "samples\n")
+# RIP-seq: IP samples only (no IgG needed for this contrast)
+rip_counts <- readRDS(here("ripseq", "output", "ripseq_allCounts_raw.rds"))
+rip_meta   <- read_csv(here("ripseq", "output", "ripseq_metadata_clean.csv"), show_col_types = FALSE) |>
+  mutate(hours = as.character(hours))
+cat("RIP-seq raw counts:", nrow(rip_counts), "genes x", ncol(rip_counts), "samples\n")
+
+# RNA-seq: sictrl only, raw counts (not spike-in normalized -- DESeq2 does its own
+# size-factor estimation on the combined matrix). col_select narrows the read to
+# gene_id + sictrl RNA columns only (out of 108 total sample columns in the file).
+rna_counts_all <- read_csv(
+  here("output", "human_allCounts_raw.csv"),
+  col_select = c(gene_id, matches("sictrl.*_rna_")),
+  show_col_types = FALSE
+) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+rna_meta <- read_csv(here("output", "metadata_clean.csv"), show_col_types = FALSE) |>
+  filter(library == "rna", treatment == "sictrl") |>
+  mutate(hours = as.character(hours))
+cat("sictrl RNA-seq raw counts:", nrow(rna_counts_all), "genes x", ncol(rna_counts_all), "samples\n")
+
+# RIP-seq genes are a strict subset of the RNA-seq gene set (both GENCODE v49) --
+# subset RNA counts to the RIP-seq gene set, no version-stripping needed.
+stopifnot("RIP-seq genes must be a subset of RNA-seq genes" =
+  all(rownames(rip_counts) %in% rownames(rna_counts_all)))
+rna_counts <- rna_counts_all[rownames(rip_counts), , drop = FALSE]
+
+# Protein-coding filter (belt-and-suspenders: rip_counts is already pc-filtered
+# upstream in 00_ripseq_qc.Rmd, so this is a no-op in practice)
+rip_gene_id_clean <- sub("\\..*", "", rownames(rip_counts))
+rip_counts <- rip_counts[rip_gene_id_clean %in% pc_genes, , drop = FALSE]
+rna_counts <- rna_counts[rownames(rip_counts), , drop = FALSE]
+cat("After protein-coding filter:", nrow(rip_counts), "genes\n")
 ```
 
-## Compute CPM per sample, then mean per condition
+## DESeq2: IP vs sictrl RNA, per ip_type x timepoint
 
-```{r ip_cpm}
-# CPM using total counts per sample as size factor
-lib_sizes <- colSums(allCounts)
-cpm_mat   <- sweep(allCounts, 2, lib_sizes, "/") * 1e6
-
-# Parse sample names into metadata columns
-# Column format: {condition}_{ip_type}_{hours}_{rep}_{NM_ID}
-# e.g. normoxia_flag_eif3d_1_a_NM2026_0045
-cpm_long <- as.data.frame(cpm_mat) |>
-  rownames_to_column("gene_id") |>
-  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
-  pivot_longer(-c(gene_id, gene_id_clean), names_to = "sample_name", values_to = "cpm") |>
-  mutate(
-    condition = case_when(
-      grepl("^normoxia", sample_name) ~ "normoxia",
-      grepl("^hypoxia",  sample_name) ~ "hypoxia",
-      TRUE ~ NA_character_
-    ),
-    ip_type = case_when(
-      grepl("flag_eif3d", sample_name) ~ "flag_eif3d",
-      grepl("eif4e",      sample_name) ~ "eif4e",
-      grepl("igg_mock",   sample_name) ~ "igg_mock",
-      TRUE ~ NA_character_
-    ),
-    hours = as.integer(sapply(strsplit(sample_name, "_"), function(p) {
-      rep_idx <- which(nchar(p) == 1 & p %in% c("a", "b", "c"))
-      p[rep_idx - 1]
-    })),
-    timepoint = paste0(condition, "_", hours, "hr")
+```{r run_deseq_ip_vs_rna}
+run_deseq_ip_vs_rna <- function(ip_target, timepoint, condition, hours) {
+  ip_ids  <- rip_meta |>
+    filter(ip_type == ip_target, condition == !!condition, hours == !!hours) |>
+    pull(id)
+  rna_ids <- rna_meta |>
+    filter(condition == !!condition, hours == !!hours) |>
+    pull(id)
+  stopifnot(
+    "Expected 3 IP replicates" = length(ip_ids) == 3,
+    "Expected 3 sictrl RNA replicates" = length(rna_ids) == 3
   )
 
-# Average CPM across replicates per gene x ip_type x timepoint
-ip_mean_cpm <- cpm_long |>
-  filter(ip_type %in% c("flag_eif3d", "eif4e")) |>
-  group_by(gene_id_clean, ip_type, condition, hours, timepoint) |>
-  summarise(mean_ip_cpm = mean(cpm, na.rm = TRUE), .groups = "drop")
+  ip_cts  <- rip_counts[, grep(paste(ip_ids, collapse = "|"), colnames(rip_counts)), drop = FALSE]
+  rna_cts <- rna_counts[, grep(paste(rna_ids, collapse = "|"), colnames(rna_counts)), drop = FALSE]
+  stopifnot(
+    "grep on IP sample IDs did not resolve to exactly 3 columns" = ncol(ip_cts) == 3,
+    "grep on RNA sample IDs did not resolve to exactly 3 columns" = ncol(rna_cts) == 3
+  )
 
-cat("Gene x ip x timepoint rows:", nrow(ip_mean_cpm), "\n")
-```
+  # Genes with zero RNA counts across all 3 sictrl replicates have no real
+  # denominator -- DESeq2/apeglm can still report these as large, "significant"
+  # log2FC (IP counts alone drive the estimate), which is a zero-denominator
+  # artifact, not enrichment. The old CPM-ratio method excluded these via
+  # `mean_rna_norm > 0`; reproduce that guard here before fitting DESeq2.
+  rna_covered  <- rowSums(rna_cts) > 0
+  n_dropped    <- sum(!rna_covered)
+  if (n_dropped > 0) {
+    cat("  Dropping", n_dropped, "genes with zero RNA coverage across all sictrl reps (",
+        ip_target, timepoint, ")\n")
+  }
+  ip_cts  <- ip_cts[rna_covered, , drop = FALSE]
+  rna_cts <- rna_cts[rna_covered, , drop = FALSE]
 
-## Load spike-in normalized sictrl RNA
+  combined_cts <- round(cbind(ip_cts, rna_cts))
 
-```{r load_rna}
-tp_levels <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+  seq_type <- factor(c(rep(ip_target, ncol(ip_cts)), rep("rna", ncol(rna_cts))),
+                      levels = c("rna", ip_target))
+  col_data <- data.frame(seq_type = seq_type, row.names = colnames(combined_cts))
 
-# Helper: load one SPIKE file, extract sictrl rna columns, return long df
-load_spike_rna <- function(file_path, timepoint_hours) {
-  raw <- read_csv(file_path, show_col_types = FALSE)
-  rna_cols <- grep("sictrl.*_rna_", colnames(raw), value = TRUE)
-  raw |>
-    dplyr::select(gene_id, all_of(rna_cols)) |>
-    mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
-    pivot_longer(-c(gene_id, gene_id_clean), names_to = "sample_name", values_to = "rna_norm") |>
+  dds  <- DESeqDataSetFromMatrix(combined_cts, col_data, design = ~ seq_type)
+  dds  <- DESeq(dds, quiet = TRUE)
+  result_names <- resultsNames(dds)
+  coef <- result_names[grep(ip_target, result_names)]
+  stopifnot("Expected exactly one matching DESeq2 coefficient" = length(coef) == 1)
+  res  <- as.data.frame(lfcShrink(dds, coef = coef, type = "apeglm"))
+
+  res |>
+    rownames_to_column("gene_id") |>
     mutate(
-      condition = ifelse(grepl("^normoxia", sample_name), "normoxia", "hypoxia"),
-      hours     = timepoint_hours,
-      timepoint = paste0(condition, "_", hours, "hr")
+      gene_id_clean    = sub("\\..*", "", gene_id),
+      ip_type          = ip_target,
+      timepoint        = timepoint,
+      log2_ip_over_rna = log2FoldChange
     ) |>
-    group_by(gene_id_clean, condition, hours, timepoint) |>
-    summarise(mean_rna_norm = mean(rna_norm, na.rm = TRUE), .groups = "drop")
+    dplyr::select(gene_id_clean, ip_type, timepoint, baseMean, log2_ip_over_rna, padj)
 }
 
-rna_1hr  <- load_spike_rna(here("output", "allCountsNorm_1hr_SPIKE.csv"),  1)
-rna_4hr  <- load_spike_rna(here("output", "allCountsNorm_4hr_SPIKE.csv"),  4)
-rna_24hr <- load_spike_rna(here("output", "allCountsNorm_24hr_SPIKE.csv"), 24)
-
-# For normoxia RIP-seq (timepoint = normoxia_1hr), use normoxia_1hr RNA
-# For hypoxia timepoints, use matching hypoxia RNA
-rna_long <- bind_rows(rna_1hr, rna_4hr, rna_24hr) |>
-  filter(
-    !(condition == "normoxia" & hours != 1)  # keep only normoxia_1hr (no normoxia RIP-seq at 4/24hr)
-  )
-
-cat("RNA long rows:", nrow(rna_long), "\n")
-cat("Timepoints in RNA data:", paste(unique(rna_long$timepoint), collapse = ", "), "\n")
-```
-
-## Compute log2(IP CPM / RNA norm) per gene per condition
-
-```{r ip_over_rna}
-joined <- ip_mean_cpm |>
-  left_join(rna_long, by = c("gene_id_clean", "condition", "hours", "timepoint"))
-cat("After join — genes:", n_distinct(joined$gene_id_clean), "| rows:", nrow(joined), "\n")
-cat("Missing RNA (NA):", sum(is.na(joined$mean_rna_norm)), "rows\n")
-
-after_rna_filter <- joined |> filter(!is.na(mean_rna_norm), mean_rna_norm > 0)
-cat("After RNA > 0 filter — genes:", n_distinct(after_rna_filter$gene_id_clean),
-    "| rows:", nrow(after_rna_filter), "\n")
-
-cat("\nBiotype breakdown of genes before pc filter:\n")
-after_rna_filter |>
-  distinct(gene_id_clean) |>
-  left_join(dplyr::select(gene_anno, gene_id_clean, biotype), by = "gene_id_clean") |>
-  dplyr::count(biotype, sort = TRUE) |>
-  print()
-
-enrichment_rna <- after_rna_filter |>
-  filter(gene_id_clean %in% pc_genes) |>
-  mutate(
-    log2_ip_over_rna = log2((mean_ip_cpm + 1) / (mean_rna_norm + 1)),
-    timepoint = factor(timepoint, levels = tp_levels)
-  )
-cat("\nAfter pc_genes filter — genes:", n_distinct(enrichment_rna$gene_id_clean),
-    "| rows:", nrow(enrichment_rna), "\n")
+enrichment_rna <- purrr::map_dfr(c("flag_eif3d", "eif4e"), function(ip_target) {
+  purrr::pmap_dfr(tp_map, function(timepoint, condition, hours) {
+    run_deseq_ip_vs_rna(ip_target, timepoint, condition, hours)
+  })
+}) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels))
 
 cat("\nGenes with IP/RNA enrichment per ip_type x timepoint:\n")
 enrichment_rna |>
@@ -198,8 +199,17 @@ eif3d_check <- enrichment_rna |>
   arrange(desc(log2_ip_over_rna)) |>
   dplyr::slice(1:10) |>
   left_join(dplyr::select(gene_anno, gene_id_clean, symbol), by = "gene_id_clean")
-cat("\nTop flag_eif3d IP/RNA enriched genes at hypoxia_1hr:\n")
-print(eif3d_check |> dplyr::select(symbol, log2_ip_over_rna))
+cat("\nTop flag_eif3d IP/RNA enriched genes at hypoxia_1hr (DESeq2):\n")
+print(eif3d_check |> dplyr::select(symbol, log2_ip_over_rna, padj))
+
+# Sanity check: EIF4E (the bait) should be in top enriched genes for eif4e
+eif4e_check <- enrichment_rna |>
+  filter(ip_type == "eif4e", timepoint == "hypoxia_1hr") |>
+  arrange(desc(log2_ip_over_rna)) |>
+  dplyr::slice(1:10) |>
+  left_join(dplyr::select(gene_anno, gene_id_clean, symbol), by = "gene_id_clean")
+cat("\nTop eif4e IP/RNA enriched genes at hypoxia_1hr (DESeq2):\n")
+print(eif4e_check |> dplyr::select(symbol, log2_ip_over_rna, padj))
 ```
 
 ## Save enrichment table
@@ -207,7 +217,7 @@ print(eif3d_check |> dplyr::select(symbol, log2_ip_over_rna))
 ```{r save_enrichment}
 out_table <- enrichment_rna |>
   left_join(dplyr::select(gene_anno, gene_id_clean, symbol), by = "gene_id_clean") |>
-  dplyr::select(gene_id_clean, symbol, ip_type, timepoint, mean_ip_cpm, mean_rna_norm, log2_ip_over_rna)
+  dplyr::select(gene_id_clean, symbol, ip_type, timepoint, baseMean, log2_ip_over_rna, padj)
 
 write_csv(out_table, here("ripseq", "output", "18_ip_over_rna_enrichment.csv"))
 cat("Saved:", here("ripseq", "output", "18_ip_over_rna_enrichment.csv"), "\n")
@@ -291,6 +301,102 @@ igg_long |> dplyr::count(ip_type, timepoint) |> print()
 
 ---
 
+# Section 3b: Correlation helper
+
+```{r cor_helper}
+spearman_label <- function(df, x_col, y_col) {
+  df |>
+    group_by(timepoint) |>
+    summarise(
+      rho = cor(.data[[x_col]], .data[[y_col]], method = "spearman", use = "complete.obs"),
+      pval = tryCatch(
+        cor.test(.data[[x_col]], .data[[y_col]], method = "spearman")$p.value,
+        error = function(e) NA_real_
+      ),
+      .groups = "drop"
+    ) |>
+    mutate(label = paste0("rho = ", round(rho, 2),
+                          "\np = ", formatC(pval, format = "e", digits = 1)))
+}
+```
+
+---
+
+# Section 3c: IP/IgG vs IP/RNA correlation (DESeq2)
+
+Directly compare the two enrichment metrics against each other (not against TE) --
+sanity check that the two DESeq2 contrasts broadly agree on which genes are IP-enriched.
+
+```{r build_igg_vs_rna_df}
+df_igg_vs_rna <- igg_long |>
+  filter(!is.na(log2FoldChange)) |>
+  dplyr::select(gene_id_clean, ip_type, timepoint, symbol, log2FoldChange) |>
+  inner_join(
+    enrichment_rna |> dplyr::select(gene_id_clean, ip_type, timepoint, log2_ip_over_rna),
+    by = c("gene_id_clean", "ip_type", "timepoint")
+  ) |>
+  filter(is.finite(log2FoldChange), is.finite(log2_ip_over_rna))
+
+cat("IP/IgG vs IP/RNA joined rows:\n")
+df_igg_vs_rna |> dplyr::count(ip_type, timepoint) |> print()
+```
+
+```{r fig_3d_igg_vs_rna, fig.width=14, fig.height=4}
+df_3d_igg_vs_rna <- df_igg_vs_rna |> filter(ip_type == "flag_eif3d")
+
+cor_3d_igg_vs_rna <- spearman_label(df_3d_igg_vs_rna, "log2FoldChange", "log2_ip_over_rna")
+cat("eIF3d IP/IgG vs IP/RNA Spearman:\n"); print(cor_3d_igg_vs_rna)
+
+p_3d_igg_vs_rna <- ggplot(df_3d_igg_vs_rna, aes(x = log2FoldChange, y = log2_ip_over_rna)) +
+  geom_point(size = 0.5, alpha = 0.3, color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.6, fill = "grey80") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_text(data = cor_3d_igg_vs_rna, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.05, vjust = 1.2,
+            inherit.aes = FALSE, size = 3) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(
+    x     = "log2FC (eIF3d IP / IgG, DESeq2)",
+    y     = "log2FC (eIF3d IP / sictrl RNA, DESeq2)",
+    title = "eIF3d: IP/IgG vs IP/RNA enrichment (DESeq2)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_3d_igg_vs_rna
+ggsave(here("ripseq", "plots", "18_eif3d_igg_vs_rna_correlation.pdf"), p_3d_igg_vs_rna,
+       width = 14, height = 5)
+```
+
+```{r fig_4e_igg_vs_rna, fig.width=14, fig.height=4}
+df_4e_igg_vs_rna <- df_igg_vs_rna |> filter(ip_type == "eif4e")
+
+cor_4e_igg_vs_rna <- spearman_label(df_4e_igg_vs_rna, "log2FoldChange", "log2_ip_over_rna")
+cat("eIF4E IP/IgG vs IP/RNA Spearman:\n"); print(cor_4e_igg_vs_rna)
+
+p_4e_igg_vs_rna <- ggplot(df_4e_igg_vs_rna, aes(x = log2FoldChange, y = log2_ip_over_rna)) +
+  geom_point(size = 0.5, alpha = 0.3, color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.6, fill = "grey80") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_text(data = cor_4e_igg_vs_rna, aes(label = label),
+            x = Inf, y = Inf, hjust = 1.05, vjust = 1.2,
+            inherit.aes = FALSE, size = 3) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  labs(
+    x     = "log2FC (eIF4E IP / IgG, DESeq2)",
+    y     = "log2FC (eIF4E IP / sictrl RNA, DESeq2)",
+    title = "eIF4E: IP/IgG vs IP/RNA enrichment (DESeq2)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_4e_igg_vs_rna
+ggsave(here("ripseq", "plots", "18_eif4e_igg_vs_rna_correlation.pdf"), p_4e_igg_vs_rna,
+       width = 14, height = 5)
+```
+
+---
+
 # Section 4: Build plot data frames
 
 ```{r build_plot_dfs}
@@ -314,28 +420,7 @@ df_igg <- igg_long |>
 
 ---
 
-# Section 5: Correlation helper
-
-```{r cor_helper}
-spearman_label <- function(df, x_col, y_col) {
-  df |>
-    group_by(timepoint) |>
-    summarise(
-      rho = cor(.data[[x_col]], .data[[y_col]], method = "spearman", use = "complete.obs"),
-      pval = tryCatch(
-        cor.test(.data[[x_col]], .data[[y_col]], method = "spearman")$p.value,
-        error = function(e) NA_real_
-      ),
-      .groups = "drop"
-    ) |>
-    mutate(label = paste0("rho = ", round(rho, 2),
-                          "\np = ", formatC(pval, format = "e", digits = 1)))
-}
-```
-
----
-
-# Section 6: Figure 1 — eIF3d IP/RNA vs TE (new normalization)
+# Section 6: Figure 1 — eIF3d IP/RNA vs TE (DESeq2)
 
 ```{r fig1_3d_rna, fig.width=14, fig.height=4}
 df_3d_rna <- df_rna |> filter(ip_type == "flag_eif3d")
@@ -358,9 +443,9 @@ p_3d_rna <- ggplot(df_3d_rna, aes(x = log2_ip_over_rna, y = te_lfc)) +
   ) +
   facet_wrap(~ timepoint, nrow = 1) +
   labs(
-    x     = "log2(eIF3d IP CPM / sictrl RNA)",
+    x     = "log2FC (eIF3d IP / sictrl RNA, DESeq2)",
     y     = "TE LFC (sictrl / si3d)",
-    title = "eIF3d IP / riboseq sictrl RNA vs eIF3d-promoted TE"
+    title = "eIF3d IP / riboseq sictrl RNA (DESeq2) vs eIF3d-promoted TE"
   ) +
   theme_classic(base_size = 12) +
   theme(legend.position = "bottom")
@@ -393,9 +478,9 @@ p_4e_rna <- ggplot(df_4e_rna, aes(x = log2_ip_over_rna, y = te_lfc)) +
   ) +
   facet_wrap(~ timepoint, nrow = 1) +
   labs(
-    x     = "log2(eIF4E IP CPM / sictrl RNA)",
+    x     = "log2FC (eIF4E IP / sictrl RNA, DESeq2)",
     y     = "TE LFC (sictrl / si3d)",
-    title = "eIF4E IP / riboseq sictrl RNA vs eIF3d-promoted TE"
+    title = "eIF4E IP / riboseq sictrl RNA (DESeq2) vs eIF3d-promoted TE"
   ) +
   theme_classic(base_size = 12) +
   theme(legend.position = "bottom")
@@ -407,7 +492,7 @@ ggsave(here("ripseq", "plots", "18_eif4e_ip_over_rna_vs_te.pdf"), p_4e_rna,
 
 ---
 
-# Section 7: Figure 2 — eIF3d IP/IgG vs TE (existing normalization)
+# Section 7: Figure 2 — eIF3d IP/IgG vs TE (DESeq2)
 
 ```{r fig2_3d_igg, fig.width=14, fig.height=4}
 df_3d_igg <- df_igg |> filter(ip_type == "flag_eif3d")
@@ -483,8 +568,8 @@ ggsave(here("ripseq", "plots", "18_eif4e_ip_over_igg_vs_te.pdf"), p_4e_igg,
 
 ```{r summary_table}
 cor_summary <- bind_rows(
-  cor_3d_rna |> mutate(ip_type = "flag_eif3d", normalization = "IP / riboseq RNA"),
-  cor_4e_rna |> mutate(ip_type = "eif4e",      normalization = "IP / riboseq RNA"),
+  cor_3d_rna |> mutate(ip_type = "flag_eif3d", normalization = "IP / riboseq RNA (DESeq2)"),
+  cor_4e_rna |> mutate(ip_type = "eif4e",      normalization = "IP / riboseq RNA (DESeq2)"),
   cor_3d_igg |> mutate(ip_type = "flag_eif3d", normalization = "IP / IgG"),
   cor_4e_igg |> mutate(ip_type = "eif4e",      normalization = "IP / IgG")
 ) |>
