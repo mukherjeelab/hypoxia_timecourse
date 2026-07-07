@@ -19,7 +19,7 @@ library(DESeq2)
 
 # Overview
 
-Compare two DESeq2-based normalization strategies for RIP-seq enrichment:
+Compute three DESeq2-based enrichment metrics for RIP-seq:
 
 1. **IP / riboseq sictrl RNA** (DESeq2): raw RIP-seq IP counts combined with raw,
    condition- and timepoint-matched sictrl RNA-seq counts from the parallel riboseq
@@ -34,8 +34,22 @@ Compare two DESeq2-based normalization strategies for RIP-seq enrichment:
 
 2. **IP / IgG** (existing): log2FC from DESeq2 with outliers removed.
 
-For each strategy, scatter plots show enrichment vs eIF3d-promoted TE (te_lfc from
-translation_categories_si3d_vs_sictrl; positive = eIF3d promotes, per CLAUDE.md
+3. **IgG (mock) / riboseq sictrl RNA** (new, Section 1b): same DESeq2 contrast design as
+   (1) above, but using IgG-mock (negative-control antibody) pulldown counts as the
+   numerator instead of a bait IP -- a background/nonspecific-binding reference. Sample
+   `NM2026_0077` (a confirmed real outlier: a normoxia_1hr IgG-mock replicate, rep "c")
+   is excluded from the IgG-mock numerator only, via the same `OUTLIER_ID` blanket-`grepl`
+   pattern used in `code/01_eif3d_rip_deseq.Rmd`. Because 0077 is normoxia_1hr-only, this
+   drops normoxia_1hr IgG-mock from 3 to 2 replicates; hypoxia_1hr/4hr/24hr are unaffected
+   and keep all 3 IgG-mock replicates (including `NM2026_0078`, a different hypoxia_1hr
+   IgG-mock replicate that is a deliberate, already-settled keep -- distinct from 0077).
+   Same RIP-seq (2026) vs RNA-seq (2025) batch-confound caveat as (1) applies here
+   identically (no shared spike-in). IgG/RNA does not get a TE scatter plot in this
+   notebook (Sections 6/7 below are IP-only); see `19_density_3group_ip_enrichment.Rmd`
+   for its CDF plots.
+
+For strategies (1) and (2), scatter plots show enrichment vs eIF3d-promoted TE (te_lfc
+from translation_categories_si3d_vs_sictrl; positive = eIF3d promotes, per CLAUDE.md
 direction note).
 
 ---
@@ -221,6 +235,132 @@ out_table <- enrichment_rna |>
 
 write_csv(out_table, here("ripseq", "output", "18_ip_over_rna_enrichment.csv"))
 cat("Saved:", here("ripseq", "output", "18_ip_over_rna_enrichment.csv"), "\n")
+```
+
+## DESeq2: IgG vs sictrl RNA, per timepoint (background reference)
+
+Background/nonspecific-binding reference: same DESeq2 contrast design as
+`run_deseq_ip_vs_rna()` above, but with IgG-mock pulldown counts as the numerator.
+`NM2026_0077` (normoxia_1hr, rep "c") is a confirmed outlier and is excluded from the
+IgG-mock numerator only (RNA-seq denominator is unaffected); this is a deliberate,
+already-settled exclusion distinct from `NM2026_0078` (hypoxia_1hr, rep "c"), which is
+retained. Because 0077 only exists at normoxia_1hr, the normoxia_1hr contrast runs on 2
+IgG-mock replicates instead of 3; hypoxia_1hr/4hr/24hr are unaffected (0077 doesn't exist
+there, so filtering it out is a no-op) and keep all 3 replicates.
+
+```{r outlier_const_igg}
+# Same OUTLIER_ID exclusion pattern as code/01_eif3d_rip_deseq.Rmd. NM2026_0078
+# (igg_mock, hypoxia_1hr, rep c) is a *different* sample and is intentionally
+# retained -- do not add it here.
+OUTLIER_ID <- "0077"
+```
+
+```{r run_deseq_igg_vs_rna}
+run_deseq_igg_vs_rna <- function(timepoint, condition, hours) {
+  igg_ids <- rip_meta |>
+    filter(ip_type == "igg_mock", condition == !!condition, hours == !!hours,
+           !grepl(OUTLIER_ID, id)) |>
+    pull(id)
+  rna_ids <- rna_meta |>
+    filter(condition == !!condition, hours == !!hours) |>
+    pull(id)
+  stopifnot(
+    # 2 or 3, not hardcoded 3: normoxia_1hr drops to 2 reps once NM2026_0077
+    # (confirmed outlier) is excluded; hypoxia timepoints stay at 3.
+    "Expected 2 or 3 IgG-mock replicates" = length(igg_ids) %in% c(2, 3),
+    "Expected 3 sictrl RNA replicates"    = length(rna_ids) == 3
+  )
+
+  igg_cts <- rip_counts[, grep(paste(igg_ids, collapse = "|"), colnames(rip_counts)), drop = FALSE]
+  rna_cts <- rna_counts[, grep(paste(rna_ids, collapse = "|"), colnames(rna_counts)), drop = FALSE]
+  stopifnot(
+    "grep on IgG-mock sample IDs did not resolve to the expected column count" =
+      ncol(igg_cts) == length(igg_ids),
+    "grep on RNA sample IDs did not resolve to exactly 3 columns" = ncol(rna_cts) == 3
+  )
+
+  rna_covered <- rowSums(rna_cts) > 0
+  n_dropped   <- sum(!rna_covered)
+  if (n_dropped > 0) {
+    cat("  Dropping", n_dropped, "genes with zero RNA coverage across all sictrl reps ( igg_mock",
+        timepoint, ")\n")
+  }
+  igg_cts <- igg_cts[rna_covered, , drop = FALSE]
+  rna_cts <- rna_cts[rna_covered, , drop = FALSE]
+
+  combined_cts <- round(cbind(igg_cts, rna_cts))
+
+  seq_type <- factor(c(rep("igg_mock", ncol(igg_cts)), rep("rna", ncol(rna_cts))),
+                      levels = c("rna", "igg_mock"))
+  col_data <- data.frame(seq_type = seq_type, row.names = colnames(combined_cts))
+
+  dds  <- DESeqDataSetFromMatrix(combined_cts, col_data, design = ~ seq_type)
+  dds  <- DESeq(dds, quiet = TRUE)
+  result_names <- resultsNames(dds)
+  coef <- result_names[grep("igg_mock", result_names)]
+  stopifnot("Expected exactly one matching DESeq2 coefficient" = length(coef) == 1)
+  res  <- as.data.frame(lfcShrink(dds, coef = coef, type = "apeglm"))
+
+  res |>
+    rownames_to_column("gene_id") |>
+    mutate(
+      gene_id_clean     = sub("\\..*", "", gene_id),
+      ip_type           = "igg_mock",
+      timepoint         = timepoint,
+      log2_igg_over_rna = log2FoldChange
+    ) |>
+    dplyr::select(gene_id_clean, ip_type, timepoint, baseMean, log2_igg_over_rna, padj)
+}
+
+enrichment_igg_rna <- purrr::pmap_dfr(tp_map, function(timepoint, condition, hours) {
+  run_deseq_igg_vs_rna(timepoint, condition, hours)
+}) |>
+  mutate(timepoint = factor(timepoint, levels = tp_levels))
+
+cat("\nGenes with IgG/RNA enrichment per timepoint:\n")
+enrichment_igg_rna |>
+  group_by(timepoint) |>
+  summarise(n = n(), .groups = "drop") |>
+  print()
+```
+
+```{r sanity_igg_vs_rna}
+# IgG-mock has no bait protein, so there is no "self-enrichment" spot check
+# analogous to the flag_eif3d / eif4e top-hit checks above. Instead: (a) confirm
+# replicate counts resolved exactly as expected per timepoint, and (b) confirm
+# gene coverage doesn't vary wildly across timepoints (a large swing would signal
+# a broken join/filter rather than real biology).
+rep_counts_igg <- rip_meta |>
+  filter(ip_type == "igg_mock", !grepl(OUTLIER_ID, id)) |>
+  dplyr::count(condition, hours)
+print(rep_counts_igg)
+
+stopifnot(
+  "normoxia_1hr IgG-mock must have exactly 2 replicates after excluding NM2026_0077" =
+    rep_counts_igg$n[rep_counts_igg$condition == "normoxia" & rep_counts_igg$hours == "1"] == 2,
+  "hypoxia IgG-mock timepoints must retain all 3 replicates" =
+    all(rep_counts_igg$n[rep_counts_igg$condition == "hypoxia"] == 3)
+)
+
+n_per_tp_igg <- enrichment_igg_rna |> dplyr::count(timepoint) |> pull(n)
+stopifnot(
+  "IgG/RNA enrichment table must cover all 4 timepoints" =
+    length(unique(enrichment_igg_rna$timepoint)) == 4,
+  "gene coverage should not vary by more than ~20% across timepoints" =
+    (max(n_per_tp_igg) - min(n_per_tp_igg)) / max(n_per_tp_igg) < 0.2
+)
+cat("IgG/RNA sanity checks passed\n")
+```
+
+## Save IgG/RNA enrichment table
+
+```{r save_igg_enrichment}
+out_table_igg <- enrichment_igg_rna |>
+  left_join(dplyr::select(gene_anno, gene_id_clean, symbol), by = "gene_id_clean") |>
+  dplyr::select(gene_id_clean, symbol, ip_type, timepoint, baseMean, log2_igg_over_rna, padj)
+
+write_csv(out_table_igg, here("ripseq", "output", "18_igg_over_rna_enrichment.csv"))
+cat("Saved:", here("ripseq", "output", "18_igg_over_rna_enrichment.csv"), "\n")
 ```
 
 ---

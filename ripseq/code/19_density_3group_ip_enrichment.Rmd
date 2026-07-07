@@ -1,0 +1,593 @@
+---
+title: "RIP-seq: eIF3d/eIF4E IP enrichment by gene group (positive / negative control / other)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+CDF plots comparing three gene groups -- the eIF3d TE-promoted positive set,
+the shared negative-control set, and all other genes -- across both IP baits
+(FLAG-eIF3d and eIF4E) and both enrichment metrics (IP/IgG and IP/RNA), for each
+hypoxia RIP-seq timepoint (1hr, 4hr, 24hr) and normoxia (1hr) separately as
+standalone (non-faceted) plots. That's 2 baits x 2 metrics x 4 timepoints = 16 plots,
+plus 4 additional IgG-mock/RNA background-reference plots (no bait dimension -- IgG-mock
+is a single pseudo-bait, not split eIF3d/eIF4E), one per timepoint. 20 plots total.
+
+All values are read directly from `output/predictive_modeling/feature_matrix_ripseq.rds`
+-- the exact same RIP-seq feature matrix loaded by
+`code/predictive_modeling/07_rf_classification_eif3d_targets_no_boruta.Rmd` via
+`feature_matrix_path = "feature_matrix_ripseq.rds"` -- so these plots show the
+identical values and gene universe used by the predictive model, not an independent
+re-derivation.
+
+**Gene sets match exactly what's used in predictive modeling** (not per-RIP-seq-timepoint
+sets): the hypoxia positive set is `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` (the
+standard `condition="hypoxia", timepoint="1hr"` run), applied uniformly across all
+three hypoxia RIP-seq timepoints (1hr, 4hr, 24hr) -- i.e. we're asking "where do
+IP enrichment values for the same fixed hypoxia_1hr-defined target set fall at each
+RIP-seq timepoint," not redefining the target set per RIP-seq timepoint. The normoxia
+positive set is built from the same "1and4hr" time-regressed DESeq2 model used by
+`07_rf_classification_eif3d_targets_no_boruta.Rmd` when `timepoint="1and4hr"`:
+`translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv` filtered to
+`te_lfc > 0.5 & te_padj < 0.05` (see notebook 07's `create_target` chunk for the
+identical filter). The negative-control set is the **size-matched** random subsample
+notebook 07 actually trains against -- not the full `negative_control_genes.csv`
+pool. This is reconstructed exactly: same `feature_matrix_ripseq.rds` gene universe,
+same `set.seed(9)`, same `sample()` call as notebook 07's `create_target` chunk, run
+once for the hypoxia positive-set size and once for the normoxia positive-set size
+(the two conditions draw different-sized subsamples since their positive sets differ
+in size).
+
+**Caveat on the IP/RNA columns** (`*_rna_lfc_*`): RIP-seq (2026 sequencing batch) and
+RNA-seq (2025 batch) share no spike-in, so the IP-vs-RNA contrast is fully confounded
+with sequencing batch -- DESeq2 normalization cannot separate true IP enrichment from
+batch/library-prep composition differences. Treat these columns as noisier / less
+directly interpretable than the IP/IgG columns.
+
+**Caveat on the IgG/RNA plots**: `log2_igg_over_rna` is loaded directly from
+`ripseq/output/18_igg_over_rna_enrichment.csv` (produced by
+`code/18_ip_input_normalization.Rmd`), not from `feature_matrix_ripseq.rds` -- it is a
+background/nonspecific-binding reference, not a predictive-modeling feature. It carries
+the same RIP-seq (2026) vs RNA-seq (2025) batch-confound caveat as the IP/RNA columns
+above (no shared spike-in). It also has one fewer replicate at normoxia_1hr: sample
+`NM2026_0077` (a confirmed outlier, normoxia_1hr IgG-mock rep "c") is excluded from the
+IgG-mock numerator, leaving 2 IgG-mock replicates at normoxia_1hr vs 3 at every hypoxia
+timepoint. `NM2026_0078` (hypoxia_1hr IgG-mock, a different sample) is unaffected and
+retained. The gene sets used for these plots are identical to the rest of this notebook
+-- no new positive/negative-control sets are defined for IgG/RNA.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Constants
+
+```{r constants}
+library(here)
+library(tidyverse)
+
+CONDITIONS <- c("hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr", "normoxia_1hr")
+
+group_colors <- c(
+  "Positive"         = "#E69F00",
+  "Negative control" = "#000000",  # intentional override of the repo's default
+                                    # "grey40" for negative control, per request
+  "Other"            = "grey80"
+)
+```
+
+---
+
+# Section 1: Load RIP-seq feature matrix
+
+```{r load_feature_matrix}
+fm_ripseq <- readRDS(here("output", "predictive_modeling", "feature_matrix_ripseq.rds")) |>
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+cat("Feature matrix loaded:", nrow(fm_ripseq), "unique genes\n")
+
+value_cols <- c(
+  paste0("ripseq_eif3d_igg_lfc_", CONDITIONS),
+  paste0("eif4e_ip_igg_lfc_", CONDITIONS),
+  paste0("ripseq_eif3d_rna_lfc_", CONDITIONS),
+  paste0("eif4e_ip_rna_lfc_", CONDITIONS)
+)
+
+stopifnot(
+  "all 16 required RIP-seq columns must be present" =
+    all(value_cols %in% colnames(fm_ripseq)),
+  "required columns must be finite where non-NA" = all(sapply(
+    value_cols,
+    function(col) all(is.finite(fm_ripseq[[col]][!is.na(fm_ripseq[[col]])]))
+  ))
+)
+cat("Feature matrix column checks passed\n")
+```
+
+---
+
+# Section 1b: Load IgG/RNA background-reference enrichment
+
+IgG/RNA is a background/nonspecific-binding reference metric, not a predictive-modeling
+feature -- it is not part of `feature_matrix_ripseq.rds` and is instead loaded directly
+from its long-format CSV output (one row per gene x timepoint, unlike `fm_ripseq`'s one
+row per gene).
+
+```{r load_igg_rna}
+igg_rna_long <- read_csv(
+  here("ripseq", "output", "18_igg_over_rna_enrichment.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(timepoint = factor(timepoint, levels = CONDITIONS))
+
+cat("IgG/RNA enrichment loaded:", nrow(igg_rna_long), "rows across",
+    length(unique(igg_rna_long$timepoint)), "timepoints\n")
+
+stopifnot(
+  "required columns must be present in igg_rna_long" =
+    all(c("gene_id_clean", "timepoint", "log2_igg_over_rna") %in% colnames(igg_rna_long)),
+  "log2_igg_over_rna must be finite where non-NA" =
+    all(is.finite(igg_rna_long$log2_igg_over_rna[!is.na(igg_rna_long$log2_igg_over_rna)])),
+  "all 4 CONDITIONS timepoints must be present" =
+    all(CONDITIONS %in% as.character(igg_rna_long$timepoint))
+)
+cat("IgG/RNA column checks passed\n")
+```
+
+---
+
+# Section 2: Load gene sets
+
+```{r load_genesets}
+# Hypoxia positive set: the standard hypoxia_1hr TE-promoted set, reused as-is
+# across all hypoxia RIP-seq timepoints (matches predictive modeling; we are not
+# redefining the target set per RIP-seq timepoint).
+promotes_hyp <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+) |> pull(ensembl_gene)
+
+# Normoxia positive set: built from the same "1and4hr" time-regressed DESeq2 model
+# used by 07_rf_classification_eif3d_targets_no_boruta.Rmd when timepoint="1and4hr"
+# -- identical filter as that notebook's create_target chunk.
+promotes_nor <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+  show_col_types = FALSE
+) |>
+  dplyr::filter(te_lfc > 0.5, te_padj < 0.05) |>
+  dplyr::mutate(ensembl_gene = sub("\\..*", "", gene_id)) |>
+  pull(ensembl_gene)
+
+negctrl_clean <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) |>
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  pull(gene_id_clean)
+
+# Size-matched negative control: exactly replicates the sampling in notebook 07's
+# create_target chunk (feature_set="ripseq"), so "Negative control" here is
+# identical to what the RF model actually trains against, not the full
+# negative_control_genes.csv pool. Same feature-matrix universe (fm_ripseq),
+# same set.seed(9), same sample() call, same order of operations.
+neg_in_features <- negctrl_clean[negctrl_clean %in% fm_ripseq$gene_id_clean]
+
+pos_in_features_hyp <- promotes_hyp[promotes_hyp %in% fm_ripseq$gene_id_clean]
+number_to_match_hyp <- min(length(pos_in_features_hyp), length(neg_in_features))
+set.seed(9)
+neg_hyp <- sample(neg_in_features, number_to_match_hyp)
+
+pos_in_features_nor <- promotes_nor[promotes_nor %in% fm_ripseq$gene_id_clean]
+number_to_match_nor <- min(length(pos_in_features_nor), length(neg_in_features))
+set.seed(9)
+neg_nor <- sample(neg_in_features, number_to_match_nor)
+
+# Same hypoxia positive/negative sets apply to all three hypoxia RIP-seq
+# timepoints; normoxia_1hr is the only RIP-seq normoxia timepoint.
+pos_sets <- list(
+  hypoxia_1hr  = promotes_hyp,
+  hypoxia_4hr  = promotes_hyp,
+  hypoxia_24hr = promotes_hyp,
+  normoxia_1hr = promotes_nor
+)
+neg_sets <- list(
+  hypoxia_1hr  = neg_hyp,
+  hypoxia_4hr  = neg_hyp,
+  hypoxia_24hr = neg_hyp,
+  normoxia_1hr = neg_nor
+)
+
+cat("Positive set (hypoxia, all timepoints):", length(promotes_hyp), "genes\n")
+cat("Positive set (normoxia, 1and4hr time-regressed):", length(promotes_nor), "genes\n")
+cat("Size-matched negative control (hypoxia):", length(neg_hyp), "genes\n")
+cat("Size-matched negative control (normoxia):", length(neg_nor), "genes\n")
+
+stopifnot(
+  "positive (hypoxia) and negative-control sets must be mutually exclusive" =
+    length(intersect(promotes_hyp, neg_hyp)) == 0,
+  "positive (normoxia) and negative-control sets must be mutually exclusive" =
+    length(intersect(promotes_nor, neg_nor)) == 0
+)
+cat("Gene set mutual-exclusivity checks passed\n")
+```
+
+---
+
+# Section 3: Group-assignment helper
+
+```{r build_group_df}
+build_group_df <- function(fm, value_col, timepoint_val) {
+  positive_set <- pos_sets[[timepoint_val]]
+  negative_set <- neg_sets[[timepoint_val]]
+  fm |>
+    dplyr::filter(is.finite(.data[[value_col]])) |>
+    dplyr::mutate(
+      group = dplyr::case_when(
+        gene_id_clean %in% positive_set  ~ "Positive",
+        gene_id_clean %in% negative_set  ~ "Negative control",
+        TRUE                              ~ "Other"
+      ),
+      group = factor(group, levels = c("Positive", "Negative control", "Other"))
+    )
+}
+```
+
+For the **eIF4E-bait** panels, "Positive" is still the eIF3d TE-promoted gene set --
+this tests whether eIF3d-dependent translational targets are also enriched in the
+eIF4E (cap-binding) IP, not an eIF4E-specific gene set.
+
+---
+
+# Section 4: Validation
+
+```{r validation_computational}
+for (tp in CONDITIONS) {
+  for (col in value_cols[grepl(tp, value_cols)]) {
+    d <- build_group_df(fm_ripseq, col, tp)
+    stopifnot(
+      "group column must have no NA" = !any(is.na(d$group)),
+      "Positive group must be non-empty" = sum(d$group == "Positive") > 0,
+      "Negative control group must be non-empty" = sum(d$group == "Negative control") > 0,
+      "values must be finite" = all(is.finite(d[[col]]))
+    )
+  }
+}
+cat("Computational checks passed\n")
+```
+
+```{r validation_computational_igg}
+for (tp in CONDITIONS) {
+  d <- igg_rna_long |>
+    dplyr::filter(timepoint == tp) |>
+    build_group_df("log2_igg_over_rna", tp)
+  stopifnot(
+    "group column must have no NA (IgG/RNA)" = !any(is.na(d$group)),
+    "Positive group must be non-empty (IgG/RNA)" = sum(d$group == "Positive") > 0,
+    "Negative control group must be non-empty (IgG/RNA)" =
+      sum(d$group == "Negative control") > 0,
+    "values must be finite (IgG/RNA)" = all(is.finite(d$log2_igg_over_rna))
+  )
+}
+cat("IgG/RNA computational checks passed\n")
+```
+
+```{r validation_biological}
+eif3d_self <- fm_ripseq |>
+  dplyr::filter(symbol == "EIF3D") |>
+  pull(ripseq_eif3d_igg_lfc_hypoxia_1hr)
+stopifnot(
+  "EIF3D self-enrichment in flag_eif3d IP/IgG must be strongly positive" =
+    length(eif3d_self) > 0 && all(eif3d_self > 2, na.rm = TRUE)
+)
+cat("EIF3D self-enrichment (hypoxia_1hr, IP/IgG):", eif3d_self, "\n")
+
+eif4e_self <- fm_ripseq |>
+  dplyr::filter(symbol == "EIF4E") |>
+  pull(eif4e_ip_igg_lfc_hypoxia_1hr)
+stopifnot(
+  "EIF4E self-enrichment in eif4e IP/IgG must be positive" =
+    length(eif4e_self) > 0 && all(eif4e_self > 0, na.rm = TRUE)
+)
+cat("EIF4E self-enrichment (hypoxia_1hr, IP/IgG):", eif4e_self, "\n")
+
+cat("Biological spot-checks passed\n")
+```
+
+---
+
+# Section 5: Plotting helper
+
+```{r make_cdf_plot}
+make_cdf_plot <- function(df, value_col, positive_label, x_label, plot_title, out_name,
+                           width = 7, height = 5.5) {
+  n_labels <- c(
+    "Positive"         = paste0(positive_label, " (n=", sum(df$group == "Positive"), ")"),
+    "Negative control" = paste0("Negative control (n=", sum(df$group == "Negative control"), ")"),
+    "Other"            = paste0("All other genes (n=", sum(df$group == "Other"), ")")
+  )
+
+  wt_pos_other <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Other"])
+  wt_pos_neg   <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Negative control"])
+  cat(plot_title, "\n")
+  cat("  Positive vs Other p =", signif(wt_pos_other$p.value, 3), "\n")
+  cat("  Positive vs Negative p =", signif(wt_pos_neg$p.value, 3), "\n")
+
+  n_label <- paste0(
+    "Positive n=", sum(df$group == "Positive"), "\n",
+    "Negative control n=", sum(df$group == "Negative control"), "\n",
+    "Other n=", sum(df$group == "Other")
+  )
+
+  p <- ggplot(df, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    annotate("text", x = Inf, y = 0, hjust = 1.1, vjust = -0.4, label = n_label, size = 3.5) +
+    scale_color_manual(values = group_colors, breaks = names(group_colors), labels = n_labels) +
+    coord_cartesian(xlim = c(-2, 2)) +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL, title = plot_title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(here("ripseq", "plots", out_name), p, width = width, height = height)
+  p
+}
+```
+
+---
+
+# Section 6: Generate plots
+
+## eIF3d IP/IgG
+
+```{r plot_eif3d_igg_hypoxia_1hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_igg_lfc_hypoxia_1hr", "hypoxia_1hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_igg_lfc_hypoxia_1hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF3d IP / IgG, hypoxia 1hr)",
+  plot_title = "eIF3d hypoxia-promoted targets: IP/IgG CDF (hypoxia 1hr)",
+  out_name   = "19_cdf_eif3d_igg_hypoxia_1hr.pdf"
+)
+```
+
+```{r plot_eif3d_igg_hypoxia_4hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_igg_lfc_hypoxia_4hr", "hypoxia_4hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_igg_lfc_hypoxia_4hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF3d IP / IgG, hypoxia 4hr)",
+  plot_title = "eIF3d hypoxia-promoted targets: IP/IgG CDF (hypoxia 4hr)",
+  out_name   = "19_cdf_eif3d_igg_hypoxia_4hr.pdf"
+)
+```
+
+```{r plot_eif3d_igg_hypoxia_24hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_igg_lfc_hypoxia_24hr", "hypoxia_24hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_igg_lfc_hypoxia_24hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF3d IP / IgG, hypoxia 24hr)",
+  plot_title = "eIF3d hypoxia-promoted targets: IP/IgG CDF (hypoxia 24hr)",
+  out_name   = "19_cdf_eif3d_igg_hypoxia_24hr.pdf"
+)
+```
+
+```{r plot_eif3d_igg_normoxia_1hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_igg_lfc_normoxia_1hr", "normoxia_1hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_igg_lfc_normoxia_1hr",
+  positive_label = "eIF3d normoxia promotes",
+  x_label    = "log2FC (eIF3d IP / IgG, normoxia 1hr)",
+  plot_title = "eIF3d normoxia-promoted targets: IP/IgG CDF (normoxia 1hr)",
+  out_name   = "19_cdf_eif3d_igg_normoxia_1hr.pdf"
+)
+```
+
+## eIF3d IP/RNA
+
+```{r plot_eif3d_iprna_hypoxia_1hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_rna_lfc_hypoxia_1hr", "hypoxia_1hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_rna_lfc_hypoxia_1hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF3d IP / sictrl RNA, DESeq2, hypoxia 1hr)",
+  plot_title = "eIF3d hypoxia-promoted targets: IP/RNA CDF (hypoxia 1hr)",
+  out_name   = "19_cdf_eif3d_iprna_hypoxia_1hr.pdf"
+)
+```
+
+```{r plot_eif3d_iprna_hypoxia_4hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_rna_lfc_hypoxia_4hr", "hypoxia_4hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_rna_lfc_hypoxia_4hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF3d IP / sictrl RNA, DESeq2, hypoxia 4hr)",
+  plot_title = "eIF3d hypoxia-promoted targets: IP/RNA CDF (hypoxia 4hr)",
+  out_name   = "19_cdf_eif3d_iprna_hypoxia_4hr.pdf"
+)
+```
+
+```{r plot_eif3d_iprna_hypoxia_24hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_rna_lfc_hypoxia_24hr", "hypoxia_24hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_rna_lfc_hypoxia_24hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF3d IP / sictrl RNA, DESeq2, hypoxia 24hr)",
+  plot_title = "eIF3d hypoxia-promoted targets: IP/RNA CDF (hypoxia 24hr)",
+  out_name   = "19_cdf_eif3d_iprna_hypoxia_24hr.pdf"
+)
+```
+
+```{r plot_eif3d_iprna_normoxia_1hr}
+df <- build_group_df(fm_ripseq, "ripseq_eif3d_rna_lfc_normoxia_1hr", "normoxia_1hr")
+make_cdf_plot(
+  df, "ripseq_eif3d_rna_lfc_normoxia_1hr",
+  positive_label = "eIF3d normoxia promotes",
+  x_label    = "log2FC (eIF3d IP / sictrl RNA, DESeq2, normoxia 1hr)",
+  plot_title = "eIF3d normoxia-promoted targets: IP/RNA CDF (normoxia 1hr)",
+  out_name   = "19_cdf_eif3d_iprna_normoxia_1hr.pdf"
+)
+```
+
+## eIF4E IP/IgG
+
+```{r plot_eif4e_igg_hypoxia_1hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_igg_lfc_hypoxia_1hr", "hypoxia_1hr")
+make_cdf_plot(
+  df, "eif4e_ip_igg_lfc_hypoxia_1hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF4E IP / IgG, hypoxia 1hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in eIF4E IP: IP/IgG CDF (hypoxia 1hr)",
+  out_name   = "19_cdf_eif4e_igg_hypoxia_1hr.pdf"
+)
+```
+
+```{r plot_eif4e_igg_hypoxia_4hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_igg_lfc_hypoxia_4hr", "hypoxia_4hr")
+make_cdf_plot(
+  df, "eif4e_ip_igg_lfc_hypoxia_4hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF4E IP / IgG, hypoxia 4hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in eIF4E IP: IP/IgG CDF (hypoxia 4hr)",
+  out_name   = "19_cdf_eif4e_igg_hypoxia_4hr.pdf"
+)
+```
+
+```{r plot_eif4e_igg_hypoxia_24hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_igg_lfc_hypoxia_24hr", "hypoxia_24hr")
+make_cdf_plot(
+  df, "eif4e_ip_igg_lfc_hypoxia_24hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF4E IP / IgG, hypoxia 24hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in eIF4E IP: IP/IgG CDF (hypoxia 24hr)",
+  out_name   = "19_cdf_eif4e_igg_hypoxia_24hr.pdf"
+)
+```
+
+```{r plot_eif4e_igg_normoxia_1hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_igg_lfc_normoxia_1hr", "normoxia_1hr")
+make_cdf_plot(
+  df, "eif4e_ip_igg_lfc_normoxia_1hr",
+  positive_label = "eIF3d normoxia promotes",
+  x_label    = "log2FC (eIF4E IP / IgG, normoxia 1hr)",
+  plot_title = "eIF3d normoxia-promoted targets in eIF4E IP: IP/IgG CDF (normoxia 1hr)",
+  out_name   = "19_cdf_eif4e_igg_normoxia_1hr.pdf"
+)
+```
+
+## eIF4E IP/RNA
+
+```{r plot_eif4e_iprna_hypoxia_1hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_rna_lfc_hypoxia_1hr", "hypoxia_1hr")
+make_cdf_plot(
+  df, "eif4e_ip_rna_lfc_hypoxia_1hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF4E IP / sictrl RNA, DESeq2, hypoxia 1hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in eIF4E IP: IP/RNA CDF (hypoxia 1hr)",
+  out_name   = "19_cdf_eif4e_iprna_hypoxia_1hr.pdf"
+)
+```
+
+```{r plot_eif4e_iprna_hypoxia_4hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_rna_lfc_hypoxia_4hr", "hypoxia_4hr")
+make_cdf_plot(
+  df, "eif4e_ip_rna_lfc_hypoxia_4hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF4E IP / sictrl RNA, DESeq2, hypoxia 4hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in eIF4E IP: IP/RNA CDF (hypoxia 4hr)",
+  out_name   = "19_cdf_eif4e_iprna_hypoxia_4hr.pdf"
+)
+```
+
+```{r plot_eif4e_iprna_hypoxia_24hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_rna_lfc_hypoxia_24hr", "hypoxia_24hr")
+make_cdf_plot(
+  df, "eif4e_ip_rna_lfc_hypoxia_24hr",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (eIF4E IP / sictrl RNA, DESeq2, hypoxia 24hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in eIF4E IP: IP/RNA CDF (hypoxia 24hr)",
+  out_name   = "19_cdf_eif4e_iprna_hypoxia_24hr.pdf"
+)
+```
+
+```{r plot_eif4e_iprna_normoxia_1hr}
+df <- build_group_df(fm_ripseq, "eif4e_ip_rna_lfc_normoxia_1hr", "normoxia_1hr")
+make_cdf_plot(
+  df, "eif4e_ip_rna_lfc_normoxia_1hr",
+  positive_label = "eIF3d normoxia promotes",
+  x_label    = "log2FC (eIF4E IP / sictrl RNA, DESeq2, normoxia 1hr)",
+  plot_title = "eIF3d normoxia-promoted targets in eIF4E IP: IP/RNA CDF (normoxia 1hr)",
+  out_name   = "19_cdf_eif4e_iprna_normoxia_1hr.pdf"
+)
+```
+
+## IgG-mock / RNA (background reference)
+
+No bait dimension here -- IgG-mock is a single pseudo-bait shared across baits, not
+split eIF3d/eIF4E. "Positive" is still the eIF3d TE-promoted gene set (same convention
+as the eIF4E panels above): this tests whether eIF3d-dependent translational targets
+show any background/nonspecific enrichment in the IgG-mock pulldown, which they should
+not if IP/IgG and IP/RNA enrichment in the bait IPs reflects real binding rather than
+shared RNA-abundance artifacts.
+
+```{r plot_igg_rna_hypoxia_1hr}
+df <- igg_rna_long |>
+  dplyr::filter(timepoint == "hypoxia_1hr") |>
+  build_group_df("log2_igg_over_rna", "hypoxia_1hr")
+make_cdf_plot(
+  df, "log2_igg_over_rna",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (IgG-mock / sictrl RNA, DESeq2, hypoxia 1hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in IgG-mock background: IgG/RNA CDF (hypoxia 1hr)",
+  out_name   = "19_cdf_igg_rna_hypoxia_1hr.pdf"
+)
+```
+
+```{r plot_igg_rna_hypoxia_4hr}
+df <- igg_rna_long |>
+  dplyr::filter(timepoint == "hypoxia_4hr") |>
+  build_group_df("log2_igg_over_rna", "hypoxia_4hr")
+make_cdf_plot(
+  df, "log2_igg_over_rna",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (IgG-mock / sictrl RNA, DESeq2, hypoxia 4hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in IgG-mock background: IgG/RNA CDF (hypoxia 4hr)",
+  out_name   = "19_cdf_igg_rna_hypoxia_4hr.pdf"
+)
+```
+
+```{r plot_igg_rna_hypoxia_24hr}
+df <- igg_rna_long |>
+  dplyr::filter(timepoint == "hypoxia_24hr") |>
+  build_group_df("log2_igg_over_rna", "hypoxia_24hr")
+make_cdf_plot(
+  df, "log2_igg_over_rna",
+  positive_label = "eIF3d hypoxia promotes",
+  x_label    = "log2FC (IgG-mock / sictrl RNA, DESeq2, hypoxia 24hr)",
+  plot_title = "eIF3d hypoxia-promoted targets in IgG-mock background: IgG/RNA CDF (hypoxia 24hr)",
+  out_name   = "19_cdf_igg_rna_hypoxia_24hr.pdf"
+)
+```
+
+```{r plot_igg_rna_normoxia_1hr}
+df <- igg_rna_long |>
+  dplyr::filter(timepoint == "normoxia_1hr") |>
+  build_group_df("log2_igg_over_rna", "normoxia_1hr")
+make_cdf_plot(
+  df, "log2_igg_over_rna",
+  positive_label = "eIF3d normoxia promotes",
+  x_label    = "log2FC (IgG-mock / sictrl RNA, DESeq2, normoxia 1hr; n=2 IgG-mock reps)",
+  plot_title = "eIF3d normoxia-promoted targets in IgG-mock background: IgG/RNA CDF (normoxia 1hr)",
+  out_name   = "19_cdf_igg_rna_normoxia_1hr.pdf"
+)
+```
