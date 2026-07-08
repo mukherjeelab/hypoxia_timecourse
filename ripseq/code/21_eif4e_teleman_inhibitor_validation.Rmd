@@ -1,0 +1,413 @@
+---
+title: "RIP-seq: eIF4E IP validation against published Teleman eIF4E-IP (inhibitor-treated)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Sanity check: does our own eIF4E RIP-seq recapitulate the published Teleman-lab eIF4E-IP
+enrichment/depletion under their **inhibitor-treated** condition (as opposed to the
+"vehicle"/normal condition used in `ripseq/code/20_eif4e_teleman_validation.Rmd`)?
+Three-group CDF plots (Positive / Negative control / Other), faceted per RIP-seq
+timepoint, mirroring the design in `ripseq/code/19_density_3group_ip_enrichment.Rmd` and
+`ripseq/code/20_eif4e_teleman_validation.Rmd` -- but restricted to the eIF4E bait only
+(both IgG and RNA denominators), plus the bait-independent IgG-mock/RNA background
+reference.
+
+**Gene sets**: "Positive" is the Teleman eIF4E-enriched set under inhibitor treatment
+(Okabe-Ito red/vermillion `#D55E00`, distinguishing it from notebook 20's vehicle-based
+pink `#CC79A7`). "Negative control" is the inverse -- the biologically meaningful set of
+genes Teleman found significantly *depleted* from the eIF4E-IP under the same inhibitor
+condition (mirrors the enriched-set definition, just the opposite tail), not a random
+size-matched sample. Both sets come from `res_eif4e_ip_inhibitor_only.csv`, the
+inhibitor-treated companion to the "vehicle" file notebook 20 uses (both already
+referenced in `ripseq/code/03_eif4e_rip_analysis.Rmd`'s Teleman comparison), with the
+identical thresholds established there (`log2FoldChange > 1.0 & padj < 0.05` for
+enriched; `log2FoldChange < -1.0 & padj < 0.05` for depleted). Unlike notebook 19, there
+is only one gene-set choice here (Teleman), not two, and only one bait (eIF4E), so this
+notebook does not need the generic multi-geneset/multi-bait machinery notebook 19 uses.
+
+**Caveats** (same as notebooks 19/20): the IP/RNA and IgG/RNA columns carry the RIP-seq
+(2026 batch) vs RNA-seq (2025 batch) no-shared-spike-in batch confound; the IgG-mock/RNA
+metric has 2 replicates at normoxia_1hr (sample `NM2026_0077` excluded as a confirmed
+outlier) vs 3 at every hypoxia timepoint.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Constants
+
+```{r constants}
+library(here)
+library(tidyverse)
+library(patchwork)
+
+CONDITIONS <- c("hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr", "normoxia_1hr")
+
+timepoint_labels <- c(
+  hypoxia_1hr  = "hypoxia 1hr",
+  hypoxia_4hr  = "hypoxia 4hr",
+  hypoxia_24hr = "hypoxia 24hr",
+  normoxia_1hr = "normoxia 1hr"
+)
+
+# Display column order for composite grids: normoxia first, then hypoxia 1/4/24hr.
+col_order   <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+col_headers <- c("Norm", "Hyp - 1", "Hyp - 4", "Hyp - 24")
+
+TELEMAN_LFC_CUTOFF  <- 1.0
+TELEMAN_PADJ_CUTOFF <- 0.05
+
+group_colors <- c(
+  "Positive"         = "#D55E00",  # Okabe-Ito vermillion/red
+  "Negative control" = "#000000",
+  "Other"            = "grey80"
+)
+```
+
+---
+
+# Section 1: Load RIP-seq feature matrix
+
+```{r load_feature_matrix}
+fm_ripseq <- readRDS(here("output", "predictive_modeling", "feature_matrix_ripseq.rds")) |>
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+cat("Feature matrix loaded:", nrow(fm_ripseq), "unique genes\n")
+
+value_cols <- c(
+  paste0("eif4e_ip_igg_lfc_", CONDITIONS),
+  paste0("eif4e_ip_rna_lfc_", CONDITIONS)
+)
+
+stopifnot(
+  "all 8 required eIF4E RIP-seq columns must be present" =
+    all(value_cols %in% colnames(fm_ripseq)),
+  "required columns must be finite where non-NA" = all(sapply(
+    value_cols,
+    function(col) all(is.finite(fm_ripseq[[col]][!is.na(fm_ripseq[[col]])]))
+  ))
+)
+cat("Feature matrix column checks passed\n")
+```
+
+---
+
+# Section 1b: Load IgG/RNA background-reference enrichment
+
+```{r load_igg_rna}
+igg_rna_long <- read_csv(
+  here("ripseq", "output", "18_igg_over_rna_enrichment.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(timepoint = factor(timepoint, levels = CONDITIONS))
+
+cat("IgG/RNA enrichment loaded:", nrow(igg_rna_long), "rows across",
+    length(unique(igg_rna_long$timepoint)), "timepoints\n")
+
+stopifnot(
+  "required columns must be present in igg_rna_long" =
+    all(c("gene_id_clean", "timepoint", "log2_igg_over_rna") %in% colnames(igg_rna_long)),
+  "log2_igg_over_rna must be finite where non-NA" =
+    all(is.finite(igg_rna_long$log2_igg_over_rna[!is.na(igg_rna_long$log2_igg_over_rna)])),
+  "all 4 CONDITIONS timepoints must be present" =
+    all(CONDITIONS %in% as.character(igg_rna_long$timepoint))
+)
+cat("IgG/RNA column checks passed\n")
+```
+
+---
+
+# Section 2: Load Teleman eIF4E-IP (inhibitor-treated) gene sets
+
+```{r load_teleman}
+teleman_inhibitor <- read_csv(
+  "/Users/katematlin/github/mpra_preliminary/res_eif4e_ip_inhibitor_only.csv",
+  show_col_types = FALSE
+) |>
+  dplyr::filter(!is.na(symbol)) |>
+  dplyr::group_by(symbol) |>
+  dplyr::slice_max(order_by = baseMean, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+cat("Teleman inhibitor-treated genes loaded:", nrow(teleman_inhibitor), "\n")
+
+teleman_enriched_symbols <- teleman_inhibitor |>
+  dplyr::filter(log2FoldChange > TELEMAN_LFC_CUTOFF, padj < TELEMAN_PADJ_CUTOFF) |>
+  dplyr::pull(symbol)
+teleman_depleted_symbols <- teleman_inhibitor |>
+  dplyr::filter(log2FoldChange < -TELEMAN_LFC_CUTOFF, padj < TELEMAN_PADJ_CUTOFF) |>
+  dplyr::pull(symbol)
+
+cat("Teleman-enriched (LFC >", TELEMAN_LFC_CUTOFF, ", padj <", TELEMAN_PADJ_CUTOFF, "):",
+    length(teleman_enriched_symbols), "\n")
+cat("Teleman-depleted (LFC < -", TELEMAN_LFC_CUTOFF, ", padj <", TELEMAN_PADJ_CUTOFF, "):",
+    length(teleman_depleted_symbols), "\n")
+
+# Map Teleman symbols onto our gene_id_clean universe via fm_ripseq's own symbol column.
+positive_set <- fm_ripseq |>
+  dplyr::filter(symbol %in% teleman_enriched_symbols) |>
+  dplyr::pull(gene_id_clean)
+negative_set <- fm_ripseq |>
+  dplyr::filter(symbol %in% teleman_depleted_symbols) |>
+  dplyr::pull(gene_id_clean)
+
+cat("Teleman-enriched genes in our universe (Positive):", length(positive_set), "\n")
+cat("Teleman-depleted genes in our universe (Negative control):", length(negative_set), "\n")
+
+stopifnot(
+  "too few Teleman-enriched genes after join -- check file path or symbol matching" =
+    length(positive_set) > 50,
+  "too few Teleman-depleted genes after join -- check file path or symbol matching" =
+    length(negative_set) > 50,
+  "Teleman enriched and depleted sets must be mutually exclusive" =
+    length(intersect(positive_set, negative_set)) == 0
+)
+cat("Teleman gene set checks passed\n")
+```
+
+---
+
+# Section 3: Group-assignment helper
+
+```{r build_group_df}
+build_group_df <- function(fm, value_col) {
+  fm |>
+    dplyr::filter(is.finite(.data[[value_col]])) |>
+    dplyr::mutate(
+      group = dplyr::case_when(
+        gene_id_clean %in% positive_set ~ "Positive",
+        gene_id_clean %in% negative_set ~ "Negative control",
+        TRUE                             ~ "Other"
+      ),
+      group = factor(group, levels = c("Positive", "Negative control", "Other"))
+    )
+}
+```
+
+Only one gene-set choice exists in this notebook (Teleman enriched/depleted), so unlike
+notebook 19's `build_group_df()`, this version takes no `geneset`/`timepoint_val`
+argument -- `positive_set`/`negative_set` are fixed module-level constants from Section 2.
+
+---
+
+# Section 4: Validation
+
+```{r validation_computational}
+for (tp in CONDITIONS) {
+  d_igg <- build_group_df(fm_ripseq, paste0("eif4e_ip_igg_lfc_", tp))
+  d_rna <- build_group_df(fm_ripseq, paste0("eif4e_ip_rna_lfc_", tp))
+  d_iggrna <- igg_rna_long |>
+    dplyr::filter(timepoint == tp) |>
+    build_group_df("log2_igg_over_rna")
+  for (d in list(d_igg, d_rna, d_iggrna)) {
+    stopifnot(
+      "group column must have no NA" = !any(is.na(d$group)),
+      "Positive group must be non-empty" = sum(d$group == "Positive") > 0,
+      "Negative control group must be non-empty" = sum(d$group == "Negative control") > 0
+    )
+  }
+}
+cat("Computational checks passed\n")
+```
+
+```{r validation_biological}
+eif4e_self <- fm_ripseq |>
+  dplyr::filter(symbol == "EIF4E") |>
+  pull(eif4e_ip_igg_lfc_hypoxia_1hr)
+stopifnot(
+  "EIF4E self-enrichment in eif4e IP/IgG must be positive" =
+    length(eif4e_self) > 0 && all(eif4e_self > 0, na.rm = TRUE)
+)
+cat("EIF4E self-enrichment (hypoxia_1hr, IP/IgG):", eif4e_self, "\n")
+cat("Biological spot-check passed\n")
+```
+
+---
+
+# Section 5: Plotting helper
+
+```{r make_cdf_plot}
+make_cdf_plot <- function(df, value_col, x_label, plot_title, out_name,
+                           width = 7, height = 5.5) {
+  n_labels <- c(
+    "Positive"         = paste0("Teleman eIF4E enriched, inhibitor (n=", sum(df$group == "Positive"), ")"),
+    "Negative control" = paste0("Teleman eIF4E depleted, inhibitor (n=", sum(df$group == "Negative control"), ")"),
+    "Other"            = paste0("All other genes (n=", sum(df$group == "Other"), ")")
+  )
+
+  wt_pos_other <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Other"])
+  wt_pos_neg   <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Negative control"])
+  cat(plot_title, "\n")
+  cat("  Positive vs Other p =", signif(wt_pos_other$p.value, 3), "\n")
+  cat("  Positive vs Negative p =", signif(wt_pos_neg$p.value, 3), "\n")
+
+  n_label <- paste0(
+    "Positive n=", sum(df$group == "Positive"), "\n",
+    "Negative control n=", sum(df$group == "Negative control"), "\n",
+    "Other n=", sum(df$group == "Other")
+  )
+
+  p <- ggplot(df, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    annotate("text", x = Inf, y = 0, hjust = 1.1, vjust = -0.4, label = n_label, size = 3.5) +
+    scale_color_manual(values = group_colors, breaks = names(group_colors), labels = n_labels) +
+    coord_cartesian(xlim = c(-2, 2)) +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL, title = plot_title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(here("ripseq", "plots", out_name), p, width = width, height = height)
+  p
+}
+```
+
+---
+
+# Section 6: Generate plots
+
+```{r plot_registry_init}
+plot_registry <- list()
+```
+
+## eIF4E IP/IgG and IP/RNA vs Teleman enriched/depleted
+
+```{r plots_eif4e}
+for (tp in CONDITIONS) {
+  df_igg <- build_group_df(fm_ripseq, paste0("eif4e_ip_igg_lfc_", tp))
+  p_igg <- make_cdf_plot(
+    df_igg, paste0("eif4e_ip_igg_lfc_", tp),
+    x_label    = paste0("log2FC (eIF4E IP / IgG, ", timepoint_labels[[tp]], ")"),
+    plot_title = paste0("Teleman eIF4E-enriched/depleted (inhibitor) targets in eIF4E IP: IP/IgG CDF (",
+                         timepoint_labels[[tp]], ")"),
+    out_name   = paste0("21_cdf_eif4e_igg_", tp, "_teleman_inhibitor.pdf")
+  )
+  plot_registry[[paste("eif4e", "igg", tp, sep = "_")]] <- p_igg
+  print(p_igg)
+
+  df_rna <- build_group_df(fm_ripseq, paste0("eif4e_ip_rna_lfc_", tp))
+  p_rna <- make_cdf_plot(
+    df_rna, paste0("eif4e_ip_rna_lfc_", tp),
+    x_label    = paste0("log2FC (eIF4E IP / sictrl RNA, DESeq2, ", timepoint_labels[[tp]], ")"),
+    plot_title = paste0("Teleman eIF4E-enriched/depleted (inhibitor) targets in eIF4E IP: IP/RNA CDF (",
+                         timepoint_labels[[tp]], ")"),
+    out_name   = paste0("21_cdf_eif4e_iprna_", tp, "_teleman_inhibitor.pdf")
+  )
+  plot_registry[[paste("eif4e", "rna", tp, sep = "_")]] <- p_rna
+  print(p_rna)
+}
+```
+
+## IgG-mock / RNA (background reference) vs Teleman enriched/depleted
+
+```{r plots_igg_rna}
+for (tp in CONDITIONS) {
+  tp_label_x <- timepoint_labels[[tp]]
+  if (tp == "normoxia_1hr") tp_label_x <- paste0(tp_label_x, "; n=2 IgG-mock reps")
+
+  df_iggrna <- igg_rna_long |>
+    dplyr::filter(timepoint == tp) |>
+    build_group_df("log2_igg_over_rna")
+  p_iggrna <- make_cdf_plot(
+    df_iggrna, "log2_igg_over_rna",
+    x_label    = paste0("log2FC (IgG-mock / sictrl RNA, DESeq2, ", tp_label_x, ")"),
+    plot_title = paste0("Teleman eIF4E-enriched/depleted (inhibitor) targets in IgG-mock background: IgG/RNA CDF (",
+                         timepoint_labels[[tp]], ")"),
+    out_name   = paste0("21_cdf_igg_rna_", tp, "_teleman_inhibitor.pdf")
+  )
+  plot_registry[[paste("iggrna", tp, sep = "_")]] <- p_iggrna
+  print(p_iggrna)
+}
+```
+
+---
+
+# Section 7: Composite grids (patchwork)
+
+Assembles the individual plots above into two composite figures: eIF4E IP (IgG row +
+RNA row, 4 timepoint columns) and the bait-independent IgG-mock/RNA background (single
+row, 4 columns). Same decluttered-panel + shared-legend + header/row-label design as
+`ripseq/code/19_density_3group_ip_enrichment.Rmd`'s and
+`ripseq/code/20_eif4e_teleman_validation.Rmd`'s Section 7.
+
+```{r composite_helper}
+make_text_panel <- function(label, angle = 0, size = 5) {
+  ggplot() +
+    theme_void() +
+    annotate("text", x = 0, y = 0, label = label, size = size, fontface = "bold", angle = angle)
+}
+
+strip_for_composite <- function(p) {
+  p + labs(title = NULL, x = "log2FC") + theme(legend.position = "none")
+}
+
+make_composite_grid <- function(bait, title, out_name) {
+  if (bait == "iggrna") {
+    row_labels <- "IgG/RNA"
+    row_keys   <- list(paste("iggrna", col_order, sep = "_"))
+  } else {
+    row_labels <- c("IP/IgG", "IP/RNA")
+    row_keys   <- list(
+      paste(bait, "igg", col_order, sep = "_"),
+      paste(bait, "rna", col_order, sep = "_")
+    )
+  }
+  n_rows <- length(row_labels)
+  stopifnot("all requested plots must exist in plot_registry" =
+    all(unlist(row_keys) %in% names(plot_registry)))
+
+  cells <- c(list(make_text_panel("")), lapply(col_headers, make_text_panel))
+  for (r in seq_len(n_rows)) {
+    cells <- c(cells,
+               list(make_text_panel(row_labels[r], angle = 90)),
+               lapply(plot_registry[row_keys[[r]]], strip_for_composite))
+  }
+
+  main_grid <- patchwork::wrap_plots(
+    cells, ncol = 5,
+    widths  = c(0.15, 1, 1, 1, 1),
+    heights = c(0.15, rep(1, n_rows))
+  )
+
+  legend_src <- plot_registry[[row_keys[[1]][1]]] +
+    scale_color_manual(values = group_colors, breaks = names(group_colors)) +
+    theme(legend.position = "bottom")
+  legend_grob <- cowplot::get_legend(legend_src)
+
+  full <- (main_grid / patchwork::wrap_elements(legend_grob)) +
+    patchwork::plot_layout(heights = c(1, 0.06)) +
+    patchwork::plot_annotation(title = title)
+
+  ggsave(here("ripseq", "plots", out_name), full,
+         width = 4 * 4.2 + 1, height = n_rows * 4 + 2, limitsize = FALSE)
+  full
+}
+```
+
+```{r composite_eif4e, fig.width=18, fig.height=9}
+make_composite_grid(
+  "eif4e",
+  title    = "eIF4E IP: Teleman eIF4E-enriched/depleted (inhibitor) targets, all timepoints",
+  out_name = "21_grid_eif4e_teleman_inhibitor.pdf"
+)
+```
+
+```{r composite_iggrna, fig.width=18, fig.height=5}
+make_composite_grid(
+  "iggrna",
+  title    = "IgG-mock background: Teleman eIF4E-enriched/depleted (inhibitor) targets, all timepoints",
+  out_name = "21_grid_iggrna_teleman_inhibitor.pdf"
+)
+```

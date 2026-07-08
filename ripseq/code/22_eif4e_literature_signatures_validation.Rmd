@@ -1,0 +1,457 @@
+---
+title: "RIP-seq: eIF4E IP validation against literature translation signatures"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Sanity check: do published literature-curated translation-regulation gene sets show
+enrichment in our own eIF4E RIP-seq? Three-group CDF plots (Positive / Negative control
+/ Other), faceted per RIP-seq timepoint, mirroring the design in
+`ripseq/code/19_density_3group_ip_enrichment.Rmd` / `20_eif4e_teleman_validation.Rmd` /
+`21_eif4e_teleman_inhibitor_validation.Rmd` -- restricted to the eIF4E bait only (both
+IgG and RNA denominators), plus the bait-independent IgG-mock/RNA background reference.
+
+**Gene sets** (both from `accessories/translation_signatures_literature.csv`, column
+`gs_name`, joined onto our gene universe by `db_gene_symbol` -- `ensembl_gene` in that
+file is mostly NA and cannot be used for joining):
+
+- **"TOP motif mRNAs"** (Okabe-Ito bluish green `#009E73`) -- 105 genes (PMID 32094190),
+  the classic 5' terminal oligopyrimidine (TOP) motif mRNA class, a well-established
+  translation-regulation signature.
+- **"eIF4E activated translation"** (Okabe-Ito sky blue `#56B4E9`, matching the color
+  already used for eIF4E in `ripseq/code/03_eif4e_rip_analysis.Rmd`'s density plots) --
+  1186 genes (PMID 41102449), the "4E set."
+
+Neither of these literature sets has a matched "opposite" (unlike Teleman's
+enriched/depleted pair in notebooks 20/21), so **"Negative control" is a size-matched
+random sample** -- same approach as notebook 19's hypoxia/normoxia sets: drawn from
+`negative_control_genes.csv`, `set.seed(9)`, one independent draw per gene set (sized to
+each gene set's own membership count in our universe, matching notebook 07's
+`create_target` sampling exactly).
+
+**Known, expected overlap**: "eIF4E activated translation" (a Teleman-derived
+classification, unrelated to the si3d TE axis that defines `negative_control_genes.csv`)
+has 208 genes that are also in the negative-control pool -- this is not a data bug (the
+two classifications are orthogonal), so the mutual-exclusivity check below is a soft
+warning, not a hard failure (same precedent as the normoxia gene set in notebook 19).
+Since group assignment checks "Positive" before "Negative control", no gene is
+double-counted -- a handful of genes end up in fewer than the intended
+`number_to_match` random draw for that reason.
+
+**Caveats** (same as notebooks 19/20/21): the IP/RNA and IgG/RNA columns carry the
+RIP-seq (2026 batch) vs RNA-seq (2025 batch) no-shared-spike-in batch confound; the
+IgG-mock/RNA metric has 2 replicates at normoxia_1hr (sample `NM2026_0077` excluded as a
+confirmed outlier) vs 3 at every hypoxia timepoint.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Constants
+
+```{r constants}
+library(here)
+library(tidyverse)
+library(patchwork)
+
+CONDITIONS <- c("hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr", "normoxia_1hr")
+
+timepoint_labels <- c(
+  hypoxia_1hr  = "hypoxia 1hr",
+  hypoxia_4hr  = "hypoxia 4hr",
+  hypoxia_24hr = "hypoxia 24hr",
+  normoxia_1hr = "normoxia 1hr"
+)
+
+col_order   <- c("normoxia_1hr", "hypoxia_1hr", "hypoxia_4hr", "hypoxia_24hr")
+col_headers <- c("Norm", "Hyp - 1", "Hyp - 4", "Hyp - 24")
+
+# Two independent gene-set choices, each with its own color and its own
+# size-matched negative control (built in Section 2).
+geneset_defs <- tibble::tibble(
+  geneset        = c("top_motif", "eif4e_activated"),
+  gs_name        = c("TOP motif mRNAs", "eIF4E activated translation"),
+  positive_label = c("TOP motif mRNAs", "eIF4E activated translation"),
+  color          = c("#009E73", "#56B4E9"),
+  tag            = c("topmotif", "eif4eactivated")
+)
+```
+
+---
+
+# Section 1: Load RIP-seq feature matrix
+
+```{r load_feature_matrix}
+fm_ripseq <- readRDS(here("output", "predictive_modeling", "feature_matrix_ripseq.rds")) |>
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+cat("Feature matrix loaded:", nrow(fm_ripseq), "unique genes\n")
+
+value_cols <- c(
+  paste0("eif4e_ip_igg_lfc_", CONDITIONS),
+  paste0("eif4e_ip_rna_lfc_", CONDITIONS)
+)
+
+stopifnot(
+  "all 8 required eIF4E RIP-seq columns must be present" =
+    all(value_cols %in% colnames(fm_ripseq)),
+  "required columns must be finite where non-NA" = all(sapply(
+    value_cols,
+    function(col) all(is.finite(fm_ripseq[[col]][!is.na(fm_ripseq[[col]])]))
+  ))
+)
+cat("Feature matrix column checks passed\n")
+```
+
+---
+
+# Section 1b: Load IgG/RNA background-reference enrichment
+
+```{r load_igg_rna}
+igg_rna_long <- read_csv(
+  here("ripseq", "output", "18_igg_over_rna_enrichment.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(timepoint = factor(timepoint, levels = CONDITIONS))
+
+cat("IgG/RNA enrichment loaded:", nrow(igg_rna_long), "rows across",
+    length(unique(igg_rna_long$timepoint)), "timepoints\n")
+
+stopifnot(
+  "required columns must be present in igg_rna_long" =
+    all(c("gene_id_clean", "timepoint", "log2_igg_over_rna") %in% colnames(igg_rna_long)),
+  "log2_igg_over_rna must be finite where non-NA" =
+    all(is.finite(igg_rna_long$log2_igg_over_rna[!is.na(igg_rna_long$log2_igg_over_rna)])),
+  "all 4 CONDITIONS timepoints must be present" =
+    all(CONDITIONS %in% as.character(igg_rna_long$timepoint))
+)
+cat("IgG/RNA column checks passed\n")
+```
+
+---
+
+# Section 2: Load literature gene sets and build size-matched negative controls
+
+```{r load_literature_sets}
+lit_sigs <- read_csv(
+  here("accessories", "translation_signatures_literature.csv"),
+  show_col_types = FALSE
+)
+
+negctrl_clean <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) |>
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  dplyr::pull(gene_id_clean)
+neg_in_features <- negctrl_clean[negctrl_clean %in% fm_ripseq$gene_id_clean]
+
+pos_sets <- list()
+neg_sets <- list()
+
+for (i in seq_len(nrow(geneset_defs))) {
+  gs   <- geneset_defs$geneset[i]
+  name <- geneset_defs$gs_name[i]
+
+  symbols <- lit_sigs |>
+    dplyr::filter(gs_name == name) |>
+    dplyr::pull(db_gene_symbol)
+
+  pos_genes <- fm_ripseq |>
+    dplyr::filter(symbol %in% symbols) |>
+    dplyr::pull(gene_id_clean)
+
+  number_to_match <- min(length(pos_genes), length(neg_in_features))
+  set.seed(9)
+  neg_genes <- sample(neg_in_features, number_to_match)
+
+  pos_sets[[gs]] <- pos_genes
+  neg_sets[[gs]] <- neg_genes
+
+  cat(name, "-- raw genes:", length(symbols),
+      " | in our universe (Positive):", length(pos_genes),
+      " | size-matched negative control:", length(neg_genes), "\n")
+
+  overlap <- intersect(pos_genes, neg_genes)
+  if (length(overlap) > 0) {
+    cat("  NOTE:", length(overlap), "genes fall in both the positive set and the",
+        "negative-control draw for", name, "-- these are labeled Positive",
+        "(case_when checks Positive first), so the realized negative-control group",
+        "for this set will be", length(neg_genes) - length(overlap), "genes in practice.\n")
+  }
+}
+
+stopifnot(
+  "both gene sets must have a non-empty Positive group" =
+    all(sapply(pos_sets, length) > 0),
+  "both gene sets must have a non-empty Negative control group" =
+    all(sapply(neg_sets, length) > 0)
+)
+cat("\nLiterature gene set checks passed\n")
+```
+
+---
+
+# Section 3: Group-assignment helper
+
+```{r build_group_df}
+build_group_df <- function(fm, value_col, geneset) {
+  positive_set <- pos_sets[[geneset]]
+  negative_set <- neg_sets[[geneset]]
+  fm |>
+    dplyr::filter(is.finite(.data[[value_col]])) |>
+    dplyr::mutate(
+      group = dplyr::case_when(
+        gene_id_clean %in% positive_set ~ "Positive",
+        gene_id_clean %in% negative_set ~ "Negative control",
+        TRUE                             ~ "Other"
+      ),
+      group = factor(group, levels = c("Positive", "Negative control", "Other"))
+    )
+}
+```
+
+---
+
+# Section 4: Validation
+
+```{r validation_computational}
+for (tp in CONDITIONS) {
+  for (gs in geneset_defs$geneset) {
+    d_igg <- build_group_df(fm_ripseq, paste0("eif4e_ip_igg_lfc_", tp), gs)
+    d_rna <- build_group_df(fm_ripseq, paste0("eif4e_ip_rna_lfc_", tp), gs)
+    d_iggrna <- igg_rna_long |>
+      dplyr::filter(timepoint == tp) |>
+      build_group_df("log2_igg_over_rna", gs)
+    for (d in list(d_igg, d_rna, d_iggrna)) {
+      stopifnot(
+        "group column must have no NA" = !any(is.na(d$group)),
+        "Positive group must be non-empty" = sum(d$group == "Positive") > 0,
+        "Negative control group must be non-empty" = sum(d$group == "Negative control") > 0
+      )
+    }
+  }
+}
+cat("Computational checks passed\n")
+```
+
+```{r validation_biological}
+eif4e_self <- fm_ripseq |>
+  dplyr::filter(symbol == "EIF4E") |>
+  pull(eif4e_ip_igg_lfc_hypoxia_1hr)
+stopifnot(
+  "EIF4E self-enrichment in eif4e IP/IgG must be positive" =
+    length(eif4e_self) > 0 && all(eif4e_self > 0, na.rm = TRUE)
+)
+cat("EIF4E self-enrichment (hypoxia_1hr, IP/IgG):", eif4e_self, "\n")
+cat("Biological spot-check passed\n")
+```
+
+---
+
+# Section 5: Plotting helper
+
+```{r make_cdf_plot}
+make_cdf_plot <- function(df, value_col, positive_label, x_label, plot_title, out_name,
+                           colors, width = 7, height = 5.5) {
+  n_labels <- c(
+    "Positive"         = paste0(positive_label, " (n=", sum(df$group == "Positive"), ")"),
+    "Negative control" = paste0("Negative control (n=", sum(df$group == "Negative control"), ")"),
+    "Other"            = paste0("All other genes (n=", sum(df$group == "Other"), ")")
+  )
+
+  wt_pos_other <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Other"])
+  wt_pos_neg   <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Negative control"])
+  cat(plot_title, "\n")
+  cat("  Positive vs Other p =", signif(wt_pos_other$p.value, 3), "\n")
+  cat("  Positive vs Negative p =", signif(wt_pos_neg$p.value, 3), "\n")
+
+  n_label <- paste0(
+    "Positive n=", sum(df$group == "Positive"), "\n",
+    "Negative control n=", sum(df$group == "Negative control"), "\n",
+    "Other n=", sum(df$group == "Other")
+  )
+
+  p <- ggplot(df, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    annotate("text", x = Inf, y = 0, hjust = 1.1, vjust = -0.4, label = n_label, size = 3.5) +
+    scale_color_manual(values = colors, breaks = names(colors), labels = n_labels) +
+    coord_cartesian(xlim = c(-2, 2)) +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL, title = plot_title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(here("ripseq", "plots", out_name), p, width = width, height = height)
+  p
+}
+```
+
+---
+
+# Section 6: Generate plots
+
+```{r plot_registry_init}
+plot_registry <- list()
+```
+
+```{r plots_all}
+for (i in seq_len(nrow(geneset_defs))) {
+  gs        <- geneset_defs$geneset[i]
+  pos_label <- geneset_defs$positive_label[i]
+  gs_colors <- c("Positive" = geneset_defs$color[i], "Negative control" = "#000000", "Other" = "grey80")
+  gs_tag    <- geneset_defs$tag[i]
+
+  for (tp in CONDITIONS) {
+    df_igg <- build_group_df(fm_ripseq, paste0("eif4e_ip_igg_lfc_", tp), gs)
+    p_igg <- make_cdf_plot(
+      df_igg, paste0("eif4e_ip_igg_lfc_", tp),
+      positive_label = pos_label,
+      x_label    = paste0("log2FC (eIF4E IP / IgG, ", timepoint_labels[[tp]], ")"),
+      plot_title = paste0(pos_label, " targets in eIF4E IP: IP/IgG CDF (", timepoint_labels[[tp]], ")"),
+      out_name   = paste0("22_cdf_eif4e_igg_", tp, "_", gs_tag, ".pdf"),
+      colors     = gs_colors
+    )
+    plot_registry[[paste("eif4e", "igg", tp, gs, sep = "_")]] <- p_igg
+    print(p_igg)
+
+    df_rna <- build_group_df(fm_ripseq, paste0("eif4e_ip_rna_lfc_", tp), gs)
+    p_rna <- make_cdf_plot(
+      df_rna, paste0("eif4e_ip_rna_lfc_", tp),
+      positive_label = pos_label,
+      x_label    = paste0("log2FC (eIF4E IP / sictrl RNA, DESeq2, ", timepoint_labels[[tp]], ")"),
+      plot_title = paste0(pos_label, " targets in eIF4E IP: IP/RNA CDF (", timepoint_labels[[tp]], ")"),
+      out_name   = paste0("22_cdf_eif4e_iprna_", tp, "_", gs_tag, ".pdf"),
+      colors     = gs_colors
+    )
+    plot_registry[[paste("eif4e", "rna", tp, gs, sep = "_")]] <- p_rna
+    print(p_rna)
+
+    tp_label_x <- timepoint_labels[[tp]]
+    if (tp == "normoxia_1hr") tp_label_x <- paste0(tp_label_x, "; n=2 IgG-mock reps")
+    df_iggrna <- igg_rna_long |>
+      dplyr::filter(timepoint == tp) |>
+      build_group_df("log2_igg_over_rna", gs)
+    p_iggrna <- make_cdf_plot(
+      df_iggrna, "log2_igg_over_rna",
+      positive_label = pos_label,
+      x_label    = paste0("log2FC (IgG-mock / sictrl RNA, DESeq2, ", tp_label_x, ")"),
+      plot_title = paste0(pos_label, " targets in IgG-mock background: IgG/RNA CDF (", timepoint_labels[[tp]], ")"),
+      out_name   = paste0("22_cdf_igg_rna_", tp, "_", gs_tag, ".pdf"),
+      colors     = gs_colors
+    )
+    plot_registry[[paste("iggrna", tp, gs, sep = "_")]] <- p_iggrna
+    print(p_iggrna)
+  }
+}
+```
+
+---
+
+# Section 7: Composite grids (patchwork)
+
+Assembles the individual plots above into four composite figures: eIF4E IP (IgG row +
+RNA row, 4 timepoint columns) and the bait-independent IgG-mock/RNA background (single
+row, 4 columns), one pair per gene set. Same decluttered-panel + shared-legend +
+header/row-label design as notebooks 19/20/21's Section 7.
+
+```{r composite_helper}
+make_text_panel <- function(label, angle = 0, size = 5) {
+  ggplot() +
+    theme_void() +
+    annotate("text", x = 0, y = 0, label = label, size = size, fontface = "bold", angle = angle)
+}
+
+strip_for_composite <- function(p) {
+  p + labs(title = NULL, x = "log2FC") + theme(legend.position = "none")
+}
+
+make_composite_grid <- function(bait, geneset, colors, title, out_name) {
+  if (bait == "iggrna") {
+    row_labels <- "IgG/RNA"
+    row_keys   <- list(paste("iggrna", col_order, geneset, sep = "_"))
+  } else {
+    row_labels <- c("IP/IgG", "IP/RNA")
+    row_keys   <- list(
+      paste(bait, "igg", col_order, geneset, sep = "_"),
+      paste(bait, "rna", col_order, geneset, sep = "_")
+    )
+  }
+  n_rows <- length(row_labels)
+  stopifnot("all requested plots must exist in plot_registry" =
+    all(unlist(row_keys) %in% names(plot_registry)))
+
+  cells <- c(list(make_text_panel("")), lapply(col_headers, make_text_panel))
+  for (r in seq_len(n_rows)) {
+    cells <- c(cells,
+               list(make_text_panel(row_labels[r], angle = 90)),
+               lapply(plot_registry[row_keys[[r]]], strip_for_composite))
+  }
+
+  main_grid <- patchwork::wrap_plots(
+    cells, ncol = 5,
+    widths  = c(0.15, 1, 1, 1, 1),
+    heights = c(0.15, rep(1, n_rows))
+  )
+
+  legend_src <- plot_registry[[row_keys[[1]][1]]] +
+    scale_color_manual(values = colors, breaks = names(colors)) +
+    theme(legend.position = "bottom")
+  legend_grob <- cowplot::get_legend(legend_src)
+
+  full <- (main_grid / patchwork::wrap_elements(legend_grob)) +
+    patchwork::plot_layout(heights = c(1, 0.06)) +
+    patchwork::plot_annotation(title = title)
+
+  ggsave(here("ripseq", "plots", out_name), full,
+         width = 4 * 4.2 + 1, height = n_rows * 4 + 2, limitsize = FALSE)
+  full
+}
+```
+
+```{r composite_top_motif_eif4e, fig.width=18, fig.height=9}
+gs_colors_top <- c("Positive" = geneset_defs$color[geneset_defs$geneset == "top_motif"],
+                    "Negative control" = "#000000", "Other" = "grey80")
+make_composite_grid(
+  "eif4e", "top_motif", gs_colors_top,
+  title    = "eIF4E IP: TOP motif mRNAs, all timepoints",
+  out_name = "22_grid_eif4e_topmotif.pdf"
+)
+```
+
+```{r composite_top_motif_iggrna, fig.width=18, fig.height=5}
+make_composite_grid(
+  "iggrna", "top_motif", gs_colors_top,
+  title    = "IgG-mock background: TOP motif mRNAs, all timepoints",
+  out_name = "22_grid_iggrna_topmotif.pdf"
+)
+```
+
+```{r composite_eif4e_activated_eif4e, fig.width=18, fig.height=9}
+gs_colors_4e <- c("Positive" = geneset_defs$color[geneset_defs$geneset == "eif4e_activated"],
+                   "Negative control" = "#000000", "Other" = "grey80")
+make_composite_grid(
+  "eif4e", "eif4e_activated", gs_colors_4e,
+  title    = "eIF4E IP: eIF4E activated translation, all timepoints",
+  out_name = "22_grid_eif4e_eif4eactivated.pdf"
+)
+```
+
+```{r composite_eif4e_activated_iggrna, fig.width=18, fig.height=5}
+make_composite_grid(
+  "iggrna", "eif4e_activated", gs_colors_4e,
+  title    = "IgG-mock background: eIF4E activated translation, all timepoints",
+  out_name = "22_grid_iggrna_eif4eactivated.pdf"
+)
+```
