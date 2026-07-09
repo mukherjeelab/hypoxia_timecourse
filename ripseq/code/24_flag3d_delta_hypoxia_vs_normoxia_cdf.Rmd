@@ -1,0 +1,606 @@
+---
+title: "RIP-seq: FLAG-eIF3d binding delta (hypoxia vs normoxia) -- CDFs for eIF3d hypoxia-promoted targets"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+This notebook is the FLAG-eIF3d counterpart to `23_eif4e_delta_hypoxia_vs_normoxia_cdf.Rmd`:
+it looks at how FLAG-eIF3d RIP-seq binding **changes** between hypoxia (each timepoint)
+and normoxia, rather than raw IP/IgG enrichment at each timepoint separately (that's
+`19_density_3group_ip_enrichment.Rmd`). Only the bait-specific delta (nb23 Section 3
+equivalent) is recomputed here -- the IgG-mock/RNA background delta-delta (nb23 Section 4)
+is not bait-specific, so it is not re-derived; see `23_eif4e_delta_hypoxia_vs_normoxia_cdf.Rmd`
+Section 4 / `23_iggrna_hypoxia_*hr_vs_normoxia_delta.csv` for that reference.
+
+**Delta definition:**
+
+- `delta_flag3d_lfc` = log2(FLAG3d_hyp_Xhr / IgG_hyp_Xhr) - log2(FLAG3d_nor_1hr / IgG_nor_1hr).
+  Positive = FLAG-eIF3d binding increases in hypoxia relative to normoxia.
+
+**Staleness note:** the FLAG-3d delta CSVs notebook 09 wrote (`ripseq_deseq_flag3d_hypoxia_*hr_vs_normoxia_delta.csv`)
+predate the current `ripseq_allCounts_raw.rds`, so they're recomputed fresh here rather
+than reused. This notebook writes new `24_`-prefixed output files and does **not**
+overwrite the old nb09 files.
+
+**Replicate-count caveat:** normoxia_1hr IgG-mock drops from 3 to 2 replicates after
+excluding outlier sample `NM2026_0077` (same exclusion as notebooks 01/09/18/23); all
+hypoxia timepoints keep 3 IgG-mock replicates.
+
+**Validation strategy:** same three-layer approach as nb23: (1) computational range/finite
+checks, (2) a *consistency* check against the same interaction-model methodology run
+previously (the old nb09 CSV) -- useful for catching gross recompute errors, but not
+independent, since it shares the same pipeline, and (3) an *independent cross-check*
+against a structurally different DESeq2 design (two separate per-condition fits
+reconstructed as `hyp - nor`, rather than one joint interaction fit) -- this is the check
+that actually catches a bug specific to the interaction-model approach itself.
+
+**Gene-highlight note:** Grid 2 marks four genes of interest (RPP25, COL12A1, TXNIP,
+CDKN2B) on the FLAG-3d delta CDFs with a vertical line + label per gene. CDKN2B is not
+present in either the RIP-seq or RNA-seq count matrices in this repo (confirmed absent
+upstream, not a filtering artifact), so it is dropped from the highlight grid; only
+RPP25, COL12A1, and TXNIP are plotted.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Section 1: Load inputs
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(patchwork)
+library(cowplot)
+library(ggrepel)
+```
+
+```{r constants}
+OUTLIER_ID <- "0077"
+HYP_HOURS  <- c("1", "4", "24")
+
+col_headers <- c("Hyp - 1", "Hyp - 4", "Hyp - 24")
+
+group_colors <- c(
+  "Positive"         = "#E69F00",
+  "Negative control" = "#000000",  # intentional override of the repo's default
+                                    # "grey40" for negative control, per request
+  "Other"            = "grey80"
+)
+
+highlight_genes <- c("RPP25", "COL12A1", "TXNIP")
+```
+
+```{r gene_anno}
+gene_anno_all <- read_tsv(
+  here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("gene_id", "symbol", "biotype", "species", "version"),
+  show_col_types = FALSE
+) |>
+  dplyr::filter(species == "human") |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+gene_anno <- gene_anno_all |>
+  arrange(gene_id_clean, desc(biotype == "protein_coding")) |>
+  distinct(gene_id_clean, .keep_all = TRUE) |>
+  dplyr::select(gene_id_clean, symbol)
+
+# A gene is protein-coding if ANY transcript row has biotype "protein_coding"
+# (same any-transcript rule as 18_ip_input_normalization.Rmd / 23).
+pc_genes <- gene_anno_all |>
+  dplyr::filter(biotype == "protein_coding") |>
+  distinct(gene_id_clean) |>
+  pull(gene_id_clean)
+```
+
+```{r load_rip}
+allCounts <- readRDS(here("ripseq", "output", "ripseq_allCounts_raw.rds"))
+metadata  <- read_csv(here("ripseq", "output", "ripseq_metadata_clean.csv"),
+                      show_col_types = FALSE) |>
+  mutate(
+    condition = factor(condition, levels = c("normoxia", "hypoxia")),
+    ip_type   = factor(ip_type,   levels = c("igg_mock", "flag_eif3d", "eif4e")),
+    hours     = factor(hours)
+  )
+
+metadata_filt  <- metadata  |> dplyr::filter(!grepl(OUTLIER_ID, id))
+allCounts_filt <- allCounts[, !grepl(OUTLIER_ID, colnames(allCounts))]
+
+# Belt-and-suspenders protein-coding filter (same rationale as
+# 18_ip_input_normalization.Rmd / 23): allCounts is already pc-filtered
+# upstream in 00_ripseq_qc.Rmd, so this is a no-op in practice, but guards
+# against that upstream assumption silently changing.
+allCounts_gene_id_clean <- sub("\\..*", "", rownames(allCounts_filt))
+allCounts_filt <- allCounts_filt[allCounts_gene_id_clean %in% pc_genes, , drop = FALSE]
+
+cat("RIP-seq counts after outlier removal + protein-coding filter:",
+    nrow(allCounts_filt), "genes x", ncol(allCounts_filt), "samples\n")
+```
+
+---
+
+# Section 2: Gene sets
+
+Identical construction to `23_eif4e_delta_hypoxia_vs_normoxia_cdf.Rmd` Section 2 /
+`19_density_3group_ip_enrichment.Rmd` Section 2 (same as notebook 07's `create_target`
+chunk) -- only the hypoxia-defined positive set is needed here.
+
+```{r load_genesets}
+promotes_hyp <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+) |> pull(ensembl_gene)
+
+fm_ripseq <- readRDS(here("output", "predictive_modeling", "feature_matrix_ripseq.rds")) |>
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+negctrl_clean <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  pull(gene_id_clean)
+
+neg_in_features     <- negctrl_clean[negctrl_clean %in% fm_ripseq$gene_id_clean]
+pos_in_features_hyp <- promotes_hyp[promotes_hyp %in% fm_ripseq$gene_id_clean]
+number_to_match_hyp <- min(length(pos_in_features_hyp), length(neg_in_features))
+set.seed(9)
+neg_hyp <- sample(neg_in_features, number_to_match_hyp)
+
+cat("Positive set (hypoxia-promoted):", length(promotes_hyp), "genes\n")
+cat("Size-matched negative control:", length(neg_hyp), "genes\n")
+
+stopifnot("positive and negative-control sets must be mutually exclusive" =
+  length(intersect(promotes_hyp, neg_hyp)) == 0)
+cat("Gene set mutual-exclusivity check passed\n")
+```
+
+---
+
+# Section 3: FLAG-eIF3d IP/IgG delta (recomputed)
+
+Adapted from `23_eif4e_delta_hypoxia_vs_normoxia_cdf.Rmd`'s `deseq_4e_delta` chunk, with
+`flag_eif3d` in place of `eif4e`. Design: `~ condition + ip_type + condition:ip_type`,
+igg_mock vs flag_eif3d, per hypoxia timepoint vs normoxia_1hr; the interaction
+coefficient is the delta.
+
+```{r deseq_flag3d_delta}
+res_flag3d_list <- list()
+
+for (hyp_hr in HYP_HOURS) {
+  meta_sub <- metadata_filt |>
+    dplyr::filter((condition == "normoxia" & hours == "1") |
+                  (condition == "hypoxia"  & hours == hyp_hr),
+                  ip_type %in% c("flag_eif3d", "igg_mock")) |>
+    mutate(ip_type = droplevels(factor(ip_type, levels = c("igg_mock", "flag_eif3d")))) |>
+    as.data.frame()
+
+  stopifnot(
+    "Expected 5 normoxia (2 igg_mock + 3 flag_eif3d) and 6 hypoxia (3 igg_mock + 3 flag_eif3d) samples" =
+      sum(meta_sub$condition == "normoxia") == 5 &&
+      sum(meta_sub$condition == "hypoxia")  == 6
+  )
+
+  # Build cts_sub one sample at a time, in meta_sub row order, with an
+  # explicit per-sample column-count check -- catches an id that resolves to
+  # zero or multiple columns before it can silently misalign counts with
+  # metadata (same rationale as 18_ip_input_normalization.Rmd / 23).
+  cts_cols <- lapply(meta_sub$id, function(x) {
+    hits <- grep(x, colnames(allCounts_filt))
+    stopifnot("each sample id must resolve to exactly one count-matrix column" =
+      length(hits) == 1)
+    allCounts_filt[, hits, drop = FALSE]
+  })
+  cts_sub <- do.call(cbind, cts_cols)
+  rownames(meta_sub) <- colnames(cts_sub)
+
+  dds <- DESeqDataSetFromMatrix(cts_sub, meta_sub,
+                                 design = ~ condition + ip_type + condition:ip_type)
+  dds <- DESeq(dds, quiet = TRUE)
+
+  coef_int <- grep("\\.", resultsNames(dds), value = TRUE)
+  stopifnot("Expected exactly one interaction coefficient" = length(coef_int) == 1)
+
+  res <- as.data.frame(lfcShrink(dds, coef = coef_int, type = "apeglm")) |>
+    rownames_to_column("gene_id") |>
+    mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    left_join(gene_anno, by = "gene_id_clean") |>
+    dplyr::rename(delta_flag3d_lfc = log2FoldChange, delta_flag3d_padj = padj) |>
+    mutate(timepoint = paste0("hypoxia_", hyp_hr, "hr_vs_normoxia"))
+
+  res_flag3d_list[[hyp_hr]] <- res
+
+  write_csv(res, here("ripseq", "output",
+                       paste0("24_flag3d_hypoxia_", hyp_hr, "hr_vs_normoxia_delta.csv")))
+  cat(hyp_hr, "hr: samples =", ncol(cts_sub), "| genes =", nrow(res),
+      "| padj<0.05 =", sum(res$delta_flag3d_padj < 0.05, na.rm = TRUE), "\n")
+}
+```
+
+```{r validate_flag3d_delta}
+for (hyp_hr in HYP_HOURS) {
+  res <- res_flag3d_list[[hyp_hr]]
+  stopifnot(
+    "delta_flag3d_lfc must be finite where non-NA" =
+      all(is.finite(res$delta_flag3d_lfc[!is.na(res$delta_flag3d_lfc)])),
+    "gene count should be in a reasonable range" = nrow(res) > 5000
+  )
+}
+cat("FLAG-eIF3d delta computational checks passed\n")
+```
+
+**Consistency check** (not a biological check -- see below): Spearman correlation
+between the freshly recomputed delta and the old (stale) nb09 CSV. This only confirms
+the recompute is a refinement of the same interaction-model methodology, not a break --
+it would *not* catch a bug shared by both runs (e.g. the same wrong reference factor
+level), since both use the identical `~ condition + ip_type + condition:ip_type`
+pipeline.
+
+```{r consistency_check_flag3d_delta}
+old_paths <- setNames(
+  here("ripseq", "output",
+       paste0("ripseq_deseq_flag3d_hypoxia_", HYP_HOURS, "hr_vs_normoxia_delta.csv")),
+  HYP_HOURS
+)
+
+for (hyp_hr in HYP_HOURS) {
+  stopifnot("expected old nb09 delta CSV to exist for comparison" =
+    file.exists(old_paths[[hyp_hr]]))
+
+  old <- read_csv(old_paths[[hyp_hr]], show_col_types = FALSE) |>
+    dplyr::select(gene_id_clean, delta_flag3d_lfc_old = delta_flag3d_lfc)
+
+  cmp <- res_flag3d_list[[hyp_hr]] |>
+    dplyr::select(gene_id_clean, delta_flag3d_lfc) |>
+    inner_join(old, by = "gene_id_clean") |>
+    dplyr::filter(is.finite(delta_flag3d_lfc), is.finite(delta_flag3d_lfc_old))
+
+  rho <- cor(cmp$delta_flag3d_lfc, cmp$delta_flag3d_lfc_old, method = "spearman")
+  cat(hyp_hr, "hr: Spearman rho vs old nb09 delta (same methodology) =", round(rho, 3),
+      "(n =", nrow(cmp), ")\n")
+  stopifnot("recomputed FLAG-eIF3d delta should correlate strongly with the prior (stale) run" =
+    rho > 0.7)
+}
+cat("FLAG-eIF3d delta consistency check passed\n")
+```
+
+**Independent cross-check**: this is the check that actually stands in for a biological
+spot-check here. Rather than asserting an invariant about one specific gene (there is
+no clean a priori expectation for how *any individual* gene's FLAG-eIF3d binding should
+change between conditions), this validates the interaction-model delta against a
+*structurally independent* computation: notebook 01's "final" per-timepoint
+FLAG-eIF3d-vs-IgG two-group DESeq2 model, saved to
+`ripseq_deseq_{tp}_flag_eif3d_vs_igg.csv`, reconstructed as `lfc_hyp - lfc_nor`. Unlike
+the consistency check above, this uses an entirely different DESeq2 design (two separate
+two-group fits vs. one joint interaction fit), so a bug specific to the interaction-model
+approach (e.g. a flipped reference level in the `condition:ip_type` term) would show up
+here even if it also existed in the old nb09 file.
+
+```{r independent_crosscheck_flag3d_delta}
+nor_1hr_igg <- read_csv(
+  here("ripseq", "output", "ripseq_deseq_normoxia_1hr_flag_eif3d_vs_igg.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  dplyr::select(gene_id_clean, lfc_nor = log2FoldChange)
+
+for (hyp_hr in HYP_HOURS) {
+  hyp_igg <- read_csv(
+    here("ripseq", "output", paste0("ripseq_deseq_hypoxia_", hyp_hr, "hr_flag_eif3d_vs_igg.csv")),
+    show_col_types = FALSE
+  ) |>
+    mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    dplyr::select(gene_id_clean, lfc_hyp = log2FoldChange)
+
+  cmp <- res_flag3d_list[[hyp_hr]] |>
+    dplyr::select(gene_id_clean, delta_flag3d_lfc) |>
+    inner_join(hyp_igg, by = "gene_id_clean") |>
+    inner_join(nor_1hr_igg, by = "gene_id_clean") |>
+    mutate(reconstructed = lfc_hyp - lfc_nor) |>
+    dplyr::filter(is.finite(delta_flag3d_lfc), is.finite(reconstructed))
+
+  rho <- cor(cmp$delta_flag3d_lfc, cmp$reconstructed, method = "spearman")
+  cat(hyp_hr, "hr: Spearman rho vs independently-reconstructed two-model delta =",
+      round(rho, 3), "(n =", nrow(cmp), ")\n")
+  stopifnot("interaction-model delta should correlate strongly with the independently reconstructed delta" =
+    rho > 0.7)
+}
+cat("FLAG-eIF3d delta independent cross-check passed\n")
+```
+
+---
+
+# Section 4: Group-assignment + CDF helper
+
+```{r build_group_df}
+build_group_df <- function(df, value_col) {
+  df |>
+    dplyr::filter(is.finite(.data[[value_col]])) |>
+    mutate(
+      group = dplyr::case_when(
+        gene_id_clean %in% promotes_hyp ~ "Positive",
+        gene_id_clean %in% neg_hyp      ~ "Negative control",
+        TRUE                             ~ "Other"
+      ),
+      group = factor(group, levels = c("Positive", "Negative control", "Other"))
+    )
+}
+```
+
+```{r validation_groups}
+for (hyp_hr in HYP_HOURS) {
+  d1 <- build_group_df(res_flag3d_list[[hyp_hr]], "delta_flag3d_lfc")
+  stopifnot(
+    "Positive group must be non-empty (FLAG-eIF3d)" = sum(d1$group == "Positive") > 0,
+    "Negative control group must be non-empty (FLAG-eIF3d)" = sum(d1$group == "Negative control") > 0
+  )
+}
+cat("Group-assignment checks passed\n")
+```
+
+```{r make_cdf_plot}
+make_cdf_plot <- function(df, value_col, x_label, plot_title, out_name,
+                           width = 7, height = 5.5) {
+  n_labels <- c(
+    "Positive"         = paste0("eIF3d hypoxia promotes (n=", sum(df$group == "Positive"), ")"),
+    "Negative control" = paste0("Negative control (n=", sum(df$group == "Negative control"), ")"),
+    "Other"            = paste0("All other genes (n=", sum(df$group == "Other"), ")")
+  )
+
+  wt_pos_other <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Other"])
+  wt_pos_neg   <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Negative control"])
+  cat(plot_title, "\n")
+  cat("  Positive vs Other p =", signif(wt_pos_other$p.value, 3), "\n")
+  cat("  Positive vs Negative p =", signif(wt_pos_neg$p.value, 3), "\n")
+
+  n_label <- paste0(
+    "Positive n=", sum(df$group == "Positive"), "\n",
+    "Negative control n=", sum(df$group == "Negative control"), "\n",
+    "Other n=", sum(df$group == "Other")
+  )
+
+  p <- ggplot(df, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    annotate("text", x = Inf, y = 0, hjust = 1.1, vjust = -0.4, label = n_label, size = 3.5) +
+    scale_color_manual(values = group_colors, breaks = names(group_colors), labels = n_labels) +
+    coord_cartesian(xlim = c(-2, 2)) +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL, title = plot_title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(here("ripseq", "plots", out_name), p, width = width, height = height)
+  p
+}
+```
+
+---
+
+# Section 5: Generate plots
+
+```{r plot_registry_init}
+plot_registry <- list()
+```
+
+## FLAG-eIF3d IP/IgG delta
+
+```{r plots_flag3d_delta}
+for (hyp_hr in HYP_HOURS) {
+  df <- build_group_df(res_flag3d_list[[hyp_hr]], "delta_flag3d_lfc")
+  p <- make_cdf_plot(
+    df, "delta_flag3d_lfc",
+    x_label    = paste0("FLAG-eIF3d binding change (log2FC, hypoxia ", hyp_hr, "hr vs normoxia 1hr)"),
+    plot_title = paste0("FLAG-eIF3d IP/IgG delta: eIF3d hypoxia-promoted targets (hypoxia ",
+                         hyp_hr, "hr vs normoxia)"),
+    out_name   = paste0("24_cdf_flag3d_delta_", hyp_hr, "hr.pdf")
+  )
+  plot_registry[[paste0("flag3d_", hyp_hr)]] <- p
+  print(p)
+}
+```
+
+---
+
+# Section 6: Composite grid (patchwork) -- Grid 1
+
+One row (delta) x 3 columns (hypoxia 1hr / 4hr / 24hr) -- no normoxia column, since
+delta is inherently relative to the normoxia_1hr baseline. Panels drop their individual
+title/legend/verbose axis label for the composite (redundant once there's a column
+header); one shared legend sits at the bottom.
+
+```{r composite_helper}
+make_text_panel <- function(label, angle = 0, size = 5) {
+  ggplot() +
+    theme_void() +
+    annotate("text", x = 0, y = 0, label = label, size = size, fontface = "bold", angle = angle)
+}
+
+strip_for_composite <- function(p) {
+  p + labs(title = NULL, subtitle = NULL, x = "log2FC") + theme(legend.position = "none")
+}
+
+make_composite_grid <- function(prefix, title, out_name, plots = plot_registry) {
+  keys <- paste0(prefix, "_", HYP_HOURS)
+  stopifnot("all requested plots must exist in plot registry" = all(keys %in% names(plots)))
+
+  cells <- c(list(make_text_panel("")), lapply(col_headers, make_text_panel))
+  cells <- c(cells,
+             list(make_text_panel("delta", angle = 90)),
+             lapply(plots[keys], strip_for_composite))
+
+  main_grid <- patchwork::wrap_plots(
+    cells, ncol = 4,
+    widths  = c(0.15, 1, 1, 1),
+    heights = c(0.15, 1)
+  )
+
+  legend_src <- plots[[keys[1]]] +
+    scale_color_manual(values = group_colors, breaks = names(group_colors)) +
+    theme(legend.position = "bottom")
+  legend_grob <- cowplot::get_legend(legend_src)
+
+  full <- (main_grid / patchwork::wrap_elements(legend_grob)) +
+    patchwork::plot_layout(heights = c(1, 0.06)) +
+    patchwork::plot_annotation(title = title)
+
+  ggsave(here("ripseq", "plots", out_name), full, width = 3 * 4.2 + 1, height = 6,
+         limitsize = FALSE)
+  full
+}
+```
+
+```{r composite_flag3d, fig.width=14, fig.height=6}
+make_composite_grid(
+  "flag3d",
+  title    = "FLAG-eIF3d IP/IgG binding delta: eIF3d hypoxia-promoted targets, all hypoxia timepoints",
+  out_name = "24_grid_flag3d_delta.pdf"
+)
+```
+
+---
+
+# Section 7: Gene-highlight composite grid -- Grid 2
+
+Same 3-group CDF background as Grid 1, but with RPP25, COL12A1, and TXNIP marked as
+points sitting directly on the "Other" curve at each gene's own `delta_flag3d_lfc`
+value/cumulative-fraction. CDKN2B is excluded (absent from both the RIP-seq and
+RNA-seq count matrices in this repo -- confirmed upstream, not a filtering artifact
+within this notebook).
+
+An earlier version of this plot marked genes with full-height vertical lines and
+on-plot text labels; with two of the three genes landing far outside the `[-2, 2]`
+display window at several timepoints, that approach needed increasingly elaborate
+stagger/repel logic to keep lines and labels from colliding or crossing, and still
+looked cluttered. Points-on-curve + a standard ggplot fill legend sidesteps all of
+that: a gene's marker is a filled circle if `delta_flag3d_lfc` falls inside `[-2, 2]`,
+or a triangle clamped to the near axis edge if it doesn't (its exact value is then
+printed in the subtitle instead of crowding the plot itself).
+
+```{r highlight_gene_lookup}
+highlight_ids <- gene_anno |>
+  dplyr::filter(symbol %in% highlight_genes) |>
+  distinct(symbol, .keep_all = TRUE)
+
+stopifnot("all highlight genes must resolve to a gene_id_clean" =
+  nrow(highlight_ids) == length(highlight_genes))
+cat("Highlight gene lookup:\n")
+print(highlight_ids)
+```
+
+```{r make_highlight_cdf_plot}
+highlight_colors <- setNames(
+  RColorBrewer::brewer.pal(max(3, length(highlight_genes)), "Dark2")[seq_along(highlight_genes)],
+  highlight_genes
+)
+
+make_highlight_cdf_plot <- function(df, value_col, x_label, plot_title, out_name,
+                                     width = 7, height = 5.5, xlim = c(-2, 2)) {
+  n_labels <- c(
+    "Positive"         = paste0("eIF3d hypoxia promotes (n=", sum(df$group == "Positive"), ")"),
+    "Negative control" = paste0("Negative control (n=", sum(df$group == "Negative control"), ")"),
+    "Other"            = paste0("All other genes (n=", sum(df$group == "Other"), ")")
+  )
+
+  # Each gene is placed exactly on the curve: x = its own delta (clamped into
+  # the display window if off-scale), y = the empirical CDF's actual
+  # cumulative fraction at that (unclamped) value. Off-scale genes get a
+  # triangle instead of a circle; their true value goes in the subtitle
+  # rather than as an on-plot label, so there is nothing left to collide.
+  # Two genes clamped to the same edge would otherwise land at (near-)
+  # identical points and hide one another -- stagger those ties slightly.
+  ecdf_fun <- ecdf(df[[value_col]])
+  gene_pts <- highlight_ids |>
+    left_join(dplyr::select(df, gene_id_clean, all_of(value_col)), by = "gene_id_clean") |>
+    dplyr::filter(is.finite(.data[[value_col]])) |>
+    dplyr::rename(raw_value = all_of(value_col)) |>
+    mutate(
+      off_scale  = raw_value < xlim[1] | raw_value > xlim[2],
+      clamp_side = dplyr::case_when(
+        raw_value < xlim[1] ~ "low",
+        raw_value > xlim[2] ~ "high",
+        TRUE                ~ "none"
+      ),
+      plot_y = ecdf_fun(raw_value)
+    ) |>
+    arrange(symbol) |>
+    group_by(clamp_side) |>
+    mutate(stagger_idx = row_number() - 1L) |>
+    ungroup() |>
+    mutate(plot_x = dplyr::case_when(
+      clamp_side == "low"  ~ xlim[1] + 0.05 + stagger_idx * 0.12,
+      clamp_side == "high" ~ xlim[2] - 0.05 - stagger_idx * 0.12,
+      TRUE                 ~ raw_value
+    ))
+
+  if (nrow(gene_pts) < nrow(highlight_ids)) {
+    missing <- setdiff(highlight_ids$symbol, gene_pts$symbol)
+    cat("  Note:", paste(missing, collapse = ", "),
+        "not finite/present for this timepoint -- omitted from plot\n")
+  }
+
+  subtitle_txt <- paste0(
+    paste0(gene_pts$symbol, " = ", round(gene_pts$raw_value, 2)), collapse = "   "
+  )
+  if (any(gene_pts$off_scale)) {
+    cat("  Off-scale (marker clamped to axis edge as a triangle, true value in subtitle):",
+        paste(gene_pts$symbol[gene_pts$off_scale], collapse = ", "), "\n")
+  }
+
+  p <- ggplot(df, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    geom_point(
+      data = gene_pts, aes(x = plot_x, y = plot_y, fill = symbol, shape = off_scale),
+      inherit.aes = FALSE, color = "black", size = 3, stroke = 0.6
+    ) +
+    scale_color_manual(values = group_colors, breaks = names(group_colors), labels = n_labels) +
+    scale_fill_manual(values = highlight_colors, breaks = highlight_genes, name = NULL) +
+    scale_shape_manual(values = c(`FALSE` = 21, `TRUE` = 24), guide = "none") +
+    guides(fill = guide_legend(override.aes = list(shape = 21))) +
+    coord_cartesian(xlim = xlim, ylim = c(0, 1), clip = "off") +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL,
+         title = plot_title, subtitle = subtitle_txt) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom", legend.box = "vertical")
+
+  ggsave(here("ripseq", "plots", out_name), p, width = width, height = height)
+  p
+}
+```
+
+```{r plots_highlight}
+highlight_registry <- list()
+
+for (hyp_hr in HYP_HOURS) {
+  df <- build_group_df(res_flag3d_list[[hyp_hr]], "delta_flag3d_lfc")
+  cat("FLAG-eIF3d delta,", hyp_hr, "hr -- gene highlight check:\n")
+  p <- make_highlight_cdf_plot(
+    df, "delta_flag3d_lfc",
+    x_label    = paste0("FLAG-eIF3d binding change (log2FC, hypoxia ", hyp_hr, "hr vs normoxia 1hr)"),
+    plot_title = paste0("FLAG-eIF3d delta with gene highlights (hypoxia ", hyp_hr, "hr vs normoxia)"),
+    out_name   = paste0("24_cdf_flag3d_delta_highlight_", hyp_hr, "hr.pdf")
+  )
+  highlight_registry[[paste0("flag3d_", hyp_hr)]] <- p
+  print(p)
+}
+```
+
+```{r composite_highlight, fig.width=14, fig.height=6}
+make_composite_grid(
+  "flag3d",
+  title    = "FLAG-eIF3d IP/IgG binding delta with gene highlights (RPP25, COL12A1, TXNIP)",
+  out_name = "24_grid_flag3d_delta_highlight.pdf",
+  plots    = highlight_registry
+)
+```
