@@ -138,6 +138,10 @@ Established examples (copy/adapt for new notebooks):
 
 Both check types must be present. `cat()` summaries are informative but are not substitutes for `stopifnot()`.
 
+## Reproducibility: Random Seed Convention
+
+**Always use `set.seed(9)`** immediately before any stochastic operation — GSEA/fgsea permutation testing, negative control gene sampling, Random Forest training, train/test splits, or any other call that depends on R's RNG. This is the project-wide standard seed; do not use `42` or other values in new code. (Existing `set.seed(42)` calls in `code/acute_to_long_hypoxic_response.Rmd` predate this convention and have not been retroactively changed, since doing so would shift already-reported results — flag before touching them.)
+
 ## Key Data Objects and Conventions
 
 **Gene identifiers** — three related columns always present together in feature matrices and output tables:
