@@ -1,0 +1,700 @@
+---
+title: "RIP-seq: eIF4E binding delta-delta (hypoxia vs normoxia) -- CDFs for eIF3d hypoxia-promoted targets"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+This notebook looks at how eIF4E RIP-seq binding **changes** between hypoxia (each
+timepoint) and normoxia, rather than raw IP/IgG enrichment at each timepoint separately
+(that's `19_density_3group_ip_enrichment.Rmd`). It reuses the DESeq2 interaction-model
+"delta-delta" approach `09_rip_delta_deseq_and_cdf.Rmd` introduced in May for eIF4E
+IP/IgG, recomputed fresh here, plus a new analogous delta-delta for the IgG/RNA
+background-reference metric (never previously computed). Both are genuinely
+double-difference ("delta-delta") quantities -- each side of the definition below
+(`eIF4E_Xhr / IgG_Xhr`, or `IgG-mock_Xhr / RNA_Xhr`) is already a first-order delta (IP
+enrichment over background within one condition/timepoint), and the notebook then takes
+the difference of that delta between hypoxia and normoxia. Both delta-deltas are
+plotted as 3-group CDFs -- the eIF3d hypoxia-promoted positive set (orange), its
+size-matched negative control (black), and all other genes (grey) -- across the three
+hypoxia timepoints, same convention as notebook 19.
+
+**Delta-delta definitions:**
+
+- `delta_eif4e_lfc` = log2(eIF4E_hyp_Xhr / IgG_hyp_Xhr) - log2(eIF4E_nor_1hr / IgG_nor_1hr).
+  Positive = eIF4E binding increases in hypoxia relative to normoxia. Computed as the
+  `condition:ip_type` interaction coefficient from a single joint DESeq2 fit (design
+  `~ condition + ip_type + condition:ip_type`), not as two separately-fit log2FCs
+  subtracted afterward -- see the independent cross-check below for why that
+  distinction matters.
+- `delta_igg_rna_lfc` = log2(IgG-mock_hyp_Xhr / RNA_hyp_Xhr) - log2(IgG-mock_nor_1hr / RNA_nor_1hr).
+  Background/nonspecific-binding reference: whether the negative-control pulldown shows
+  any systematic hypoxia-vs-normoxia shift. Same interaction-coefficient logic, with
+  `seq_type` (igg_mock vs. RNA) in place of `ip_type`.
+
+**Staleness note:** the eIF4E delta-delta CSVs notebook 09 wrote in May (`ripseq_deseq_eif4e_hypoxia_*hr_vs_normoxia_delta.csv`)
+predate the current `ripseq_allCounts_raw.rds` (regenerated in June), so they're
+recomputed fresh here rather than reused. This notebook writes new `23_`-prefixed output
+files and does **not** overwrite the old nb09 files, since notebooks 10, 12, and 13
+still read those old filenames directly.
+
+**Batch-confound note (IgG/RNA delta-delta):** RIP-seq (2026 batch) and RNA-seq (2025
+batch) share no spike-in, so a single-condition IgG/RNA contrast (as in
+`18_ip_input_normalization.Rmd`) is fully confounded with sequencing batch. Here,
+because both conditions (hypoxia and normoxia) draw from the same two batches, the
+`seq_type` batch effect largely cancels out in the `condition:seq_type` interaction
+term -- a real reduction in that caveat relative to the single-condition metric.
+
+**Replicate-count caveat:** normoxia_1hr IgG-mock drops from 3 to 2 replicates after
+excluding outlier sample `NM2026_0077` (same exclusion as notebooks 01/09/18); all
+hypoxia timepoints keep 3 IgG-mock replicates.
+
+**Validation strategy:** each delta-delta gets three layers of checking: (1) computational
+range/finite checks, (2) a *consistency* check against the same interaction-model
+methodology run previously (for eIF4E, the old nb09 CSV) -- useful for catching gross
+recompute errors, but not independent, since it shares the same pipeline, and (3) an
+*independent cross-check* against a structurally different DESeq2 design (two separate
+per-condition fits reconstructed as `hyp - nor`, rather than one joint interaction fit)
+-- this is the check that actually catches a bug specific to the interaction-model
+approach itself, and also the check that confirms the joint interaction coefficient and
+the naive two-step subtraction are measuring the same underlying quantity (they
+correlate strongly but are not numerically identical, since the joint fit shares
+dispersion/size-factor estimation across more samples and `apeglm` shrinkage is applied
+directly to the interaction term rather than to two terms subtracted afterward). There
+is no clean, literature-grounded expectation for how any single gene's RIP-seq binding
+*change* should behave a priori (unlike raw enrichment, where e.g. the bait's own
+self-enrichment is a reliable invariant), so the independent cross-check also stands in
+for a single-gene biological spot-check here.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Section 1: Load inputs
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(patchwork)
+library(cowplot)
+```
+
+```{r constants}
+OUTLIER_ID <- "0077"
+HYP_HOURS  <- c("1", "4", "24")
+
+col_headers <- c("Hyp - 1", "Hyp - 4", "Hyp - 24")
+
+group_colors <- c(
+  "Positive"         = "#E69F00",
+  "Negative control" = "#000000",  # intentional override of the repo's default
+                                    # "grey40" for negative control, per request
+  "Other"            = "grey80"
+)
+```
+
+```{r gene_anno}
+gene_anno_all <- read_tsv(
+  here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("gene_id", "symbol", "biotype", "species", "version"),
+  show_col_types = FALSE
+) |>
+  dplyr::filter(species == "human") |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+gene_anno <- gene_anno_all |>
+  arrange(gene_id_clean, desc(biotype == "protein_coding")) |>
+  distinct(gene_id_clean, .keep_all = TRUE) |>
+  dplyr::select(gene_id_clean, symbol)
+
+# A gene is protein-coding if ANY transcript row has biotype "protein_coding"
+# (same any-transcript rule as 18_ip_input_normalization.Rmd).
+pc_genes <- gene_anno_all |>
+  dplyr::filter(biotype == "protein_coding") |>
+  distinct(gene_id_clean) |>
+  pull(gene_id_clean)
+```
+
+```{r load_rip}
+allCounts <- readRDS(here("ripseq", "output", "ripseq_allCounts_raw.rds"))
+metadata  <- read_csv(here("ripseq", "output", "ripseq_metadata_clean.csv"),
+                      show_col_types = FALSE) |>
+  mutate(
+    condition = factor(condition, levels = c("normoxia", "hypoxia")),
+    ip_type   = factor(ip_type,   levels = c("igg_mock", "flag_eif3d", "eif4e")),
+    hours     = factor(hours)
+  )
+
+metadata_filt  <- metadata  |> dplyr::filter(!grepl(OUTLIER_ID, id))
+allCounts_filt <- allCounts[, !grepl(OUTLIER_ID, colnames(allCounts))]
+
+# Belt-and-suspenders protein-coding filter (same rationale as
+# 18_ip_input_normalization.Rmd): allCounts is already pc-filtered upstream in
+# 00_ripseq_qc.Rmd, so this is a no-op in practice, but guards against that
+# upstream assumption silently changing.
+allCounts_gene_id_clean <- sub("\\..*", "", rownames(allCounts_filt))
+allCounts_filt <- allCounts_filt[allCounts_gene_id_clean %in% pc_genes, , drop = FALSE]
+
+cat("RIP-seq counts after outlier removal + protein-coding filter:",
+    nrow(allCounts_filt), "genes x", ncol(allCounts_filt), "samples\n")
+```
+
+```{r load_rna}
+rna_counts_all <- read_csv(
+  here("output", "human_allCounts_raw.csv"),
+  col_select = c(gene_id, matches("sictrl.*_rna_")),
+  show_col_types = FALSE
+) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+rna_meta <- read_csv(here("output", "metadata_clean.csv"), show_col_types = FALSE) |>
+  dplyr::filter(library == "rna", treatment == "sictrl") |>
+  mutate(hours = as.character(hours), condition = as.character(condition))
+
+stopifnot("RIP-seq genes must be a subset of RNA-seq genes" =
+  all(rownames(allCounts_filt) %in% rownames(rna_counts_all)))
+rna_counts <- rna_counts_all[rownames(allCounts_filt), , drop = FALSE]
+
+cat("sictrl RNA-seq counts (subset to RIP-seq genes):", nrow(rna_counts), "genes x",
+    ncol(rna_counts), "samples\n")
+```
+
+---
+
+# Section 2: Gene sets
+
+Identical construction to `19_density_3group_ip_enrichment.Rmd` Section 2 (same as
+notebook 07's `create_target` chunk) -- only the hypoxia-defined positive set is needed
+here.
+
+```{r load_genesets}
+promotes_hyp <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+) |> pull(ensembl_gene)
+
+fm_ripseq <- readRDS(here("output", "predictive_modeling", "feature_matrix_ripseq.rds")) |>
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+negctrl_clean <- read_csv(
+  here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  pull(gene_id_clean)
+
+neg_in_features     <- negctrl_clean[negctrl_clean %in% fm_ripseq$gene_id_clean]
+pos_in_features_hyp <- promotes_hyp[promotes_hyp %in% fm_ripseq$gene_id_clean]
+number_to_match_hyp <- min(length(pos_in_features_hyp), length(neg_in_features))
+set.seed(9)
+neg_hyp <- sample(neg_in_features, number_to_match_hyp)
+
+cat("Positive set (hypoxia-promoted):", length(promotes_hyp), "genes\n")
+cat("Size-matched negative control:", length(neg_hyp), "genes\n")
+
+stopifnot("positive and negative-control sets must be mutually exclusive" =
+  length(intersect(promotes_hyp, neg_hyp)) == 0)
+cat("Gene set mutual-exclusivity check passed\n")
+```
+
+---
+
+# Section 3: eIF4E IP/IgG delta-delta (recomputed)
+
+Adapted from `09_rip_delta_deseq_and_cdf.Rmd`'s `deseq_4e` chunk, run fresh against the
+current `ripseq_allCounts_raw.rds`. Design: `~ condition + ip_type + condition:ip_type`,
+igg_mock vs eif4e, per hypoxia timepoint vs normoxia_1hr; the interaction coefficient is
+the delta-delta.
+
+```{r deseq_4e_delta}
+res_4e_list <- list()
+
+for (hyp_hr in HYP_HOURS) {
+  meta_sub <- metadata_filt |>
+    dplyr::filter((condition == "normoxia" & hours == "1") |
+                  (condition == "hypoxia"  & hours == hyp_hr),
+                  ip_type %in% c("eif4e", "igg_mock")) |>
+    mutate(ip_type = droplevels(factor(ip_type, levels = c("igg_mock", "eif4e")))) |>
+    as.data.frame()
+
+  stopifnot(
+    "Expected 5 normoxia (2 igg_mock + 3 eif4e) and 6 hypoxia (3 igg_mock + 3 eif4e) samples" =
+      sum(meta_sub$condition == "normoxia") == 5 &&
+      sum(meta_sub$condition == "hypoxia")  == 6
+  )
+
+  # Build cts_sub one sample at a time, in meta_sub row order, with an
+  # explicit per-sample column-count check -- catches an id that resolves to
+  # zero or multiple columns before it can silently misalign counts with
+  # metadata (same rationale as 18_ip_input_normalization.Rmd's explicit
+  # ncol(...) == n checks after grep-based column selection).
+  cts_cols <- lapply(meta_sub$id, function(x) {
+    hits <- grep(x, colnames(allCounts_filt))
+    stopifnot("each sample id must resolve to exactly one count-matrix column" =
+      length(hits) == 1)
+    allCounts_filt[, hits, drop = FALSE]
+  })
+  cts_sub <- do.call(cbind, cts_cols)
+  rownames(meta_sub) <- colnames(cts_sub)
+
+  dds <- DESeqDataSetFromMatrix(cts_sub, meta_sub,
+                                 design = ~ condition + ip_type + condition:ip_type)
+  dds <- DESeq(dds, quiet = TRUE)
+
+  coef_int <- grep("\\.", resultsNames(dds), value = TRUE)
+  stopifnot("Expected exactly one interaction coefficient" = length(coef_int) == 1)
+
+  res <- as.data.frame(lfcShrink(dds, coef = coef_int, type = "apeglm")) |>
+    rownames_to_column("gene_id") |>
+    mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    left_join(gene_anno, by = "gene_id_clean") |>
+    dplyr::rename(delta_eif4e_lfc = log2FoldChange, delta_eif4e_padj = padj) |>
+    mutate(timepoint = paste0("hypoxia_", hyp_hr, "hr_vs_normoxia"))
+
+  res_4e_list[[hyp_hr]] <- res
+
+  write_csv(res, here("ripseq", "output",
+                       paste0("23_eif4e_hypoxia_", hyp_hr, "hr_vs_normoxia_delta.csv")))
+  cat(hyp_hr, "hr: samples =", ncol(cts_sub), "| genes =", nrow(res),
+      "| padj<0.05 =", sum(res$delta_eif4e_padj < 0.05, na.rm = TRUE), "\n")
+}
+```
+
+```{r validate_4e_delta}
+for (hyp_hr in HYP_HOURS) {
+  res <- res_4e_list[[hyp_hr]]
+  stopifnot(
+    "delta_eif4e_lfc must be finite where non-NA" =
+      all(is.finite(res$delta_eif4e_lfc[!is.na(res$delta_eif4e_lfc)])),
+    "gene count should be in a reasonable range" = nrow(res) > 5000
+  )
+}
+cat("eIF4E delta-delta computational checks passed\n")
+```
+
+**Consistency check** (not a biological check -- see below): Spearman correlation
+between the freshly recomputed delta-delta and the old (stale) nb09 CSV. This only confirms
+the recompute is a refinement of the same interaction-model methodology, not a break --
+it would *not* catch a bug shared by both runs (e.g. the same wrong reference factor
+level), since both use the identical `~ condition + ip_type + condition:ip_type`
+pipeline.
+
+```{r consistency_check_4e_delta}
+old_paths <- setNames(
+  here("ripseq", "output",
+       paste0("ripseq_deseq_eif4e_hypoxia_", HYP_HOURS, "hr_vs_normoxia_delta.csv")),
+  HYP_HOURS
+)
+
+for (hyp_hr in HYP_HOURS) {
+  stopifnot("expected old nb09 delta-delta CSV to exist for comparison" =
+    file.exists(old_paths[[hyp_hr]]))
+
+  old <- read_csv(old_paths[[hyp_hr]], show_col_types = FALSE) |>
+    dplyr::select(gene_id_clean, delta_eif4e_lfc_old = delta_eif4e_lfc)
+
+  cmp <- res_4e_list[[hyp_hr]] |>
+    dplyr::select(gene_id_clean, delta_eif4e_lfc) |>
+    inner_join(old, by = "gene_id_clean") |>
+    dplyr::filter(is.finite(delta_eif4e_lfc), is.finite(delta_eif4e_lfc_old))
+
+  rho <- cor(cmp$delta_eif4e_lfc, cmp$delta_eif4e_lfc_old, method = "spearman")
+  cat(hyp_hr, "hr: Spearman rho vs old nb09 delta-delta (same methodology) =", round(rho, 3),
+      "(n =", nrow(cmp), ")\n")
+  stopifnot("recomputed eIF4E delta-delta should correlate strongly with the prior (stale) run" =
+    rho > 0.7)
+}
+cat("eIF4E delta-delta consistency check passed\n")
+```
+
+**Independent cross-check**: this is the check that actually stands in for a biological
+spot-check here. Rather than asserting an invariant about one specific gene (there is
+no clean a priori expectation for how *any individual* gene's eIF4E binding should
+change between conditions), this validates the interaction-model delta-delta against a
+*structurally independent* computation: `deseq_results_4e_final` (notebook 01's
+"final" per-timepoint eIF4E-vs-IgG two-group DESeq2 model, saved to
+`ripseq_deseq_{tp}_eif4e_vs_igg.csv`) reconstructed as
+`lfc_hyp - lfc_nor`. Unlike the consistency check above, this uses an entirely
+different DESeq2 design (two separate two-group fits vs. one joint interaction fit),
+so a bug specific to the interaction-model approach (e.g. a flipped reference level in
+the `condition:ip_type` term) would show up here even if it also existed in the old
+nb09 file.
+
+```{r independent_crosscheck_4e_delta}
+nor_1hr_igg <- read_csv(
+  here("ripseq", "output", "ripseq_deseq_normoxia_1hr_eif4e_vs_igg.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+  dplyr::select(gene_id_clean, lfc_nor = log2FoldChange)
+
+for (hyp_hr in HYP_HOURS) {
+  hyp_igg <- read_csv(
+    here("ripseq", "output", paste0("ripseq_deseq_hypoxia_", hyp_hr, "hr_eif4e_vs_igg.csv")),
+    show_col_types = FALSE
+  ) |>
+    mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    dplyr::select(gene_id_clean, lfc_hyp = log2FoldChange)
+
+  cmp <- res_4e_list[[hyp_hr]] |>
+    dplyr::select(gene_id_clean, delta_eif4e_lfc) |>
+    inner_join(hyp_igg, by = "gene_id_clean") |>
+    inner_join(nor_1hr_igg, by = "gene_id_clean") |>
+    mutate(reconstructed = lfc_hyp - lfc_nor) |>
+    dplyr::filter(is.finite(delta_eif4e_lfc), is.finite(reconstructed))
+
+  rho <- cor(cmp$delta_eif4e_lfc, cmp$reconstructed, method = "spearman")
+  cat(hyp_hr, "hr: Spearman rho vs independently-reconstructed two-model delta-delta =",
+      round(rho, 3), "(n =", nrow(cmp), ")\n")
+  stopifnot("interaction-model delta-delta should correlate strongly with the independently reconstructed delta-delta" =
+    rho > 0.7)
+}
+cat("eIF4E delta-delta independent cross-check passed\n")
+```
+
+---
+
+# Section 4: IgG/RNA delta-delta (new)
+
+Same interaction-model structure as Section 3, but with `seq_type` (igg_mock vs sictrl
+RNA) in place of `ip_type`, combining `18_ip_input_normalization.Rmd`'s IgG/RNA counts
+setup (igg_mock counts + sictrl RNA counts, zero-RNA-coverage guard) with the
+`condition:seq_type` interaction design from Section 3. Per hypoxia timepoint: igg_mock
+hyp_Xhr (3 reps) + igg_mock nor_1hr (2 reps, outlier `0077` excluded) + sictrl RNA
+hyp_Xhr (3 reps) + sictrl RNA nor_1hr (3 reps) = 11 samples.
+
+```{r deseq_iggrna_delta}
+res_iggrna_list <- list()
+
+for (hyp_hr in HYP_HOURS) {
+  igg_meta <- metadata_filt |>
+    dplyr::filter(ip_type == "igg_mock",
+                  (condition == "normoxia" & hours == "1") |
+                  (condition == "hypoxia"  & hours == hyp_hr)) |>
+    mutate(condition = as.character(condition), seq_type = "igg_mock") |>
+    dplyr::select(id, condition, seq_type)
+
+  rna_meta_sub <- rna_meta |>
+    dplyr::filter((condition == "normoxia" & hours == "1") |
+                  (condition == "hypoxia"  & hours == hyp_hr)) |>
+    mutate(seq_type = "rna") |>
+    dplyr::select(id, condition, seq_type)
+
+  stopifnot(
+    "Expected 2 normoxia + 3 hypoxia IgG-mock replicates" =
+      sum(igg_meta$condition == "normoxia") == 2 && sum(igg_meta$condition == "hypoxia") == 3,
+    "Expected 3 normoxia + 3 hypoxia sictrl RNA replicates" =
+      sum(rna_meta_sub$condition == "normoxia") == 3 && sum(rna_meta_sub$condition == "hypoxia") == 3
+  )
+
+  col_data <- bind_rows(igg_meta, rna_meta_sub) |> as.data.frame()
+
+  # Build combined counts one sample at a time, in col_data's row order, so
+  # column order is guaranteed to match col_data (igg_mock samples come from
+  # allCounts_filt, rna samples from rna_counts). Explicit per-sample
+  # column-count check catches an id resolving to zero or multiple columns
+  # before it can silently misalign counts with metadata.
+  cts_list <- lapply(seq_len(nrow(col_data)), function(i) {
+    src  <- if (col_data$seq_type[i] == "igg_mock") allCounts_filt else rna_counts
+    hits <- grep(col_data$id[i], colnames(src))
+    stopifnot("each sample id must resolve to exactly one count-matrix column" =
+      length(hits) == 1)
+    src[, hits, drop = FALSE]
+  })
+  combined_cts <- do.call(cbind, cts_list)
+  rownames(col_data) <- colnames(combined_cts)
+
+  # Zero-RNA-coverage guard, same rationale as 18_ip_input_normalization.Rmd:
+  # genes with no RNA counts across all sictrl reps have no real denominator.
+  rna_covered <- rowSums(combined_cts[, col_data$seq_type == "rna", drop = FALSE]) > 0
+  n_dropped   <- sum(!rna_covered)
+  if (n_dropped > 0) {
+    cat("  Dropping", n_dropped, "genes with zero RNA coverage (igg_mock", hyp_hr, "hr)\n")
+  }
+  combined_cts <- round(combined_cts[rna_covered, , drop = FALSE])
+
+  col_data <- col_data |>
+    mutate(
+      condition = factor(condition, levels = c("normoxia", "hypoxia")),
+      seq_type  = factor(seq_type,  levels = c("rna", "igg_mock"))
+    )
+
+  dds <- DESeqDataSetFromMatrix(combined_cts, col_data,
+                                 design = ~ condition + seq_type + condition:seq_type)
+  dds <- DESeq(dds, quiet = TRUE)
+
+  coef_int <- grep("\\.", resultsNames(dds), value = TRUE)
+  stopifnot("Expected exactly one interaction coefficient" = length(coef_int) == 1)
+
+  res <- as.data.frame(lfcShrink(dds, coef = coef_int, type = "apeglm")) |>
+    rownames_to_column("gene_id") |>
+    mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+    left_join(gene_anno, by = "gene_id_clean") |>
+    dplyr::rename(delta_igg_rna_lfc = log2FoldChange, delta_igg_rna_padj = padj) |>
+    mutate(timepoint = paste0("hypoxia_", hyp_hr, "hr_vs_normoxia"))
+
+  res_iggrna_list[[hyp_hr]] <- res
+
+  write_csv(res, here("ripseq", "output",
+                       paste0("23_iggrna_hypoxia_", hyp_hr, "hr_vs_normoxia_delta.csv")))
+  cat(hyp_hr, "hr: samples =", ncol(combined_cts), "| genes =", nrow(res),
+      "| padj<0.05 =", sum(res$delta_igg_rna_padj < 0.05, na.rm = TRUE), "\n")
+}
+```
+
+```{r validate_iggrna_delta}
+for (hyp_hr in HYP_HOURS) {
+  res <- res_iggrna_list[[hyp_hr]]
+  stopifnot(
+    "delta_igg_rna_lfc must be finite where non-NA" =
+      all(is.finite(res$delta_igg_rna_lfc[!is.na(res$delta_igg_rna_lfc)]))
+  )
+}
+
+n_per_tp <- sapply(res_iggrna_list, nrow)
+stopifnot("gene coverage should not vary by more than ~20% across timepoints" =
+  (max(n_per_tp) - min(n_per_tp)) / max(n_per_tp) < 0.2)
+
+# IgG-mock has no bait protein, so there is no self-enrichment spot check
+# (same reasoning as 18_ip_input_normalization.Rmd). This distributional
+# plausibility check confirms the background reference doesn't show a large
+# systematic hypoxia-vs-normoxia shift -- useful, but loose (up to 2-fold) and
+# insensitive to a per-gene misalignment that leaves the median near zero.
+# The independent cross-check below is the stronger validation.
+for (hyp_hr in HYP_HOURS) {
+  med <- median(res_iggrna_list[[hyp_hr]]$delta_igg_rna_lfc, na.rm = TRUE)
+  cat(hyp_hr, "hr: median delta_igg_rna_lfc =", round(med, 3), "\n")
+  stopifnot("background-reference delta-delta should not show a large systematic shift" =
+    abs(med) < 1)
+}
+cat("IgG/RNA delta-delta computational + distributional-plausibility checks passed\n")
+```
+
+**Independent cross-check**: same rationale as the eIF4E delta-delta's independent
+cross-check above. `18_ip_input_normalization.Rmd`'s single-condition IgG/RNA DESeq2
+model (`18_igg_over_rna_enrichment.csv`) uses a structurally different design (one
+condition per fit, no interaction term) from this notebook's `condition:seq_type`
+interaction model, so reconstructing `delta_igg_rna_lfc` as
+`val_hyp - val_nor` from that independent computation and checking correlation
+catches a bug specific to this notebook's interaction-model approach.
+
+```{r independent_crosscheck_iggrna_delta}
+igg_rna_single <- read_csv(
+  here("ripseq", "output", "18_igg_over_rna_enrichment.csv"),
+  show_col_types = FALSE
+)
+
+nor_1hr_iggrna <- igg_rna_single |>
+  dplyr::filter(timepoint == "normoxia_1hr") |>
+  dplyr::select(gene_id_clean, val_nor = log2_igg_over_rna)
+
+for (hyp_hr in HYP_HOURS) {
+  hyp_iggrna <- igg_rna_single |>
+    dplyr::filter(timepoint == paste0("hypoxia_", hyp_hr, "hr")) |>
+    dplyr::select(gene_id_clean, val_hyp = log2_igg_over_rna)
+
+  cmp <- res_iggrna_list[[hyp_hr]] |>
+    dplyr::select(gene_id_clean, delta_igg_rna_lfc) |>
+    inner_join(hyp_iggrna, by = "gene_id_clean") |>
+    inner_join(nor_1hr_iggrna, by = "gene_id_clean") |>
+    mutate(reconstructed = val_hyp - val_nor) |>
+    dplyr::filter(is.finite(delta_igg_rna_lfc), is.finite(reconstructed))
+
+  rho <- cor(cmp$delta_igg_rna_lfc, cmp$reconstructed, method = "spearman")
+  cat(hyp_hr, "hr: Spearman rho vs independently-reconstructed two-model delta-delta =",
+      round(rho, 3), "(n =", nrow(cmp), ")\n")
+  stopifnot("interaction-model IgG/RNA delta-delta should correlate strongly with the independently reconstructed delta-delta" =
+    rho > 0.7)
+}
+cat("IgG/RNA delta-delta independent cross-check passed\n")
+```
+
+---
+
+# Section 5: Group-assignment + CDF helper
+
+```{r build_group_df}
+build_group_df <- function(df, value_col) {
+  df |>
+    dplyr::filter(is.finite(.data[[value_col]])) |>
+    mutate(
+      group = dplyr::case_when(
+        gene_id_clean %in% promotes_hyp ~ "Positive",
+        gene_id_clean %in% neg_hyp      ~ "Negative control",
+        TRUE                             ~ "Other"
+      ),
+      group = factor(group, levels = c("Positive", "Negative control", "Other"))
+    )
+}
+```
+
+```{r validation_groups}
+for (hyp_hr in HYP_HOURS) {
+  d1 <- build_group_df(res_4e_list[[hyp_hr]], "delta_eif4e_lfc")
+  d2 <- build_group_df(res_iggrna_list[[hyp_hr]], "delta_igg_rna_lfc")
+  stopifnot(
+    "Positive group must be non-empty (eIF4E)" = sum(d1$group == "Positive") > 0,
+    "Negative control group must be non-empty (eIF4E)" = sum(d1$group == "Negative control") > 0,
+    "Positive group must be non-empty (IgG/RNA)" = sum(d2$group == "Positive") > 0,
+    "Negative control group must be non-empty (IgG/RNA)" = sum(d2$group == "Negative control") > 0
+  )
+}
+cat("Group-assignment checks passed\n")
+```
+
+```{r make_cdf_plot}
+make_cdf_plot <- function(df, value_col, x_label, plot_title, out_name,
+                           width = 7, height = 5.5) {
+  n_labels <- c(
+    "Positive"         = paste0("eIF3d hypoxia promotes (n=", sum(df$group == "Positive"), ")"),
+    "Negative control" = paste0("Negative control (n=", sum(df$group == "Negative control"), ")"),
+    "Other"            = paste0("All other genes (n=", sum(df$group == "Other"), ")")
+  )
+
+  wt_pos_other <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Other"])
+  wt_pos_neg   <- wilcox.test(df[[value_col]][df$group == "Positive"],
+                               df[[value_col]][df$group == "Negative control"])
+  cat(plot_title, "\n")
+  cat("  Positive vs Other p =", signif(wt_pos_other$p.value, 3), "\n")
+  cat("  Positive vs Negative p =", signif(wt_pos_neg$p.value, 3), "\n")
+
+  n_label <- paste0(
+    "Positive n=", sum(df$group == "Positive"), "\n",
+    "Negative control n=", sum(df$group == "Negative control"), "\n",
+    "Other n=", sum(df$group == "Other")
+  )
+
+  p <- ggplot(df, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    annotate("text", x = Inf, y = 0, hjust = 1.1, vjust = -0.4, label = n_label, size = 3.5) +
+    scale_color_manual(values = group_colors, breaks = names(group_colors), labels = n_labels) +
+    coord_cartesian(xlim = c(-2, 2)) +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL, title = plot_title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(here("ripseq", "plots", out_name), p, width = width, height = height)
+  p
+}
+```
+
+---
+
+# Section 6: Generate plots
+
+```{r plot_registry_init}
+plot_registry <- list()
+```
+
+## eIF4E IP/IgG delta-delta
+
+```{r plots_eif4e_delta}
+for (hyp_hr in HYP_HOURS) {
+  df <- build_group_df(res_4e_list[[hyp_hr]], "delta_eif4e_lfc")
+  p <- make_cdf_plot(
+    df, "delta_eif4e_lfc",
+    x_label    = paste0("eIF4E binding change (log2FC, hypoxia ", hyp_hr, "hr vs normoxia 1hr)"),
+    plot_title = paste0("eIF4E IP/IgG delta-delta: eIF3d hypoxia-promoted targets (hypoxia ",
+                         hyp_hr, "hr vs normoxia)"),
+    out_name   = paste0("23_cdf_eif4e_delta_", hyp_hr, "hr.pdf")
+  )
+  plot_registry[[paste0("eif4e_", hyp_hr)]] <- p
+  print(p)
+}
+```
+
+## IgG/RNA delta-delta
+
+```{r plots_iggrna_delta}
+for (hyp_hr in HYP_HOURS) {
+  df <- build_group_df(res_iggrna_list[[hyp_hr]], "delta_igg_rna_lfc")
+  p <- make_cdf_plot(
+    df, "delta_igg_rna_lfc",
+    x_label    = paste0("IgG-mock/RNA background change (log2FC, hypoxia ", hyp_hr,
+                         "hr vs normoxia 1hr)"),
+    plot_title = paste0("IgG-mock/RNA delta-delta: eIF3d hypoxia-promoted targets (hypoxia ",
+                         hyp_hr, "hr vs normoxia)"),
+    out_name   = paste0("23_cdf_iggrna_delta_", hyp_hr, "hr.pdf")
+  )
+  plot_registry[[paste0("iggrna_", hyp_hr)]] <- p
+  print(p)
+}
+```
+
+---
+
+# Section 7: Composite grids (patchwork)
+
+One row (delta-delta) x 3 columns (hypoxia 1hr / 4hr / 24hr) -- no normoxia column,
+since delta-delta is inherently relative to the normoxia_1hr baseline. Panels drop
+their individual title/legend/verbose axis label for the composite (redundant once
+there's a column header); one shared legend sits at the bottom.
+
+```{r composite_helper}
+make_text_panel <- function(label, angle = 0, size = 5) {
+  ggplot() +
+    theme_void() +
+    annotate("text", x = 0, y = 0, label = label, size = size, fontface = "bold", angle = angle)
+}
+
+strip_for_composite <- function(p) {
+  p + labs(title = NULL, x = "log2FC") + theme(legend.position = "none")
+}
+
+make_composite_grid <- function(prefix, title, out_name) {
+  keys <- paste0(prefix, "_", HYP_HOURS)
+  stopifnot("all requested plots must exist in plot_registry" = all(keys %in% names(plot_registry)))
+
+  cells <- c(list(make_text_panel("")), lapply(col_headers, make_text_panel))
+  cells <- c(cells,
+             list(make_text_panel("delta-delta", angle = 90)),
+             lapply(plot_registry[keys], strip_for_composite))
+
+  main_grid <- patchwork::wrap_plots(
+    cells, ncol = 4,
+    widths  = c(0.15, 1, 1, 1),
+    heights = c(0.15, 1)
+  )
+
+  legend_src <- plot_registry[[keys[1]]] +
+    scale_color_manual(values = group_colors, breaks = names(group_colors)) +
+    theme(legend.position = "bottom")
+  legend_grob <- cowplot::get_legend(legend_src)
+
+  full <- (main_grid / patchwork::wrap_elements(legend_grob)) +
+    patchwork::plot_layout(heights = c(1, 0.06)) +
+    patchwork::plot_annotation(title = title)
+
+  ggsave(here("ripseq", "plots", out_name), full, width = 3 * 4.2 + 1, height = 6,
+         limitsize = FALSE)
+  full
+}
+```
+
+```{r composite_eif4e, fig.width=14, fig.height=6}
+make_composite_grid(
+  "eif4e",
+  title    = "eIF4E IP/IgG binding delta-delta: eIF3d hypoxia-promoted targets, all hypoxia timepoints",
+  out_name = "23_grid_eif4e_delta.pdf"
+)
+```
+
+```{r composite_iggrna, fig.width=14, fig.height=6}
+make_composite_grid(
+  "iggrna",
+  title    = "IgG-mock/RNA delta-delta (background reference): eIF3d hypoxia-promoted targets, all hypoxia timepoints",
+  out_name = "23_grid_iggrna_delta.pdf"
+)
+```
