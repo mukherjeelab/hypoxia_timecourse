@@ -25,7 +25,7 @@ Check here before writing new helpers. Three key functions:
 
 - **`deFunction(mode, ...)`** — main DESeq2 wrapper; modes: `"TE"` (interaction design for translation efficiency), `"RNA"` (RNA-seq only), `"RIBO"` (ribosome profiling only). Two-stage spike-in handling: spike-ins are used to estimate size factors, then **removed from the count matrix before fitting** to avoid inflating gene counts. Contains fallback logic for DESeq2 coefficient naming convention changes.
 - **`deFunction_time_normalized()`** — extends `deFunction()` by adding `hours` as a batch covariate; design becomes `~ hours + Condition + SeqType + Condition:SeqType`.
-- **`categorize_translation_changes()`** — classifies genes into Forwarded / Exclusive / Buffered / TE_only categories. Default LFC cutoff is `log2(1.5) ≈ 0.585`, **not** 0.5 — do not confuse with the TE gene set cutoff of 0.5.
+- **`categorize_translation_changes()`** — classifies genes into Forwarded / Exclusive / Buffered / TE_only categories. The function's own default parameter is `lfc_cutoff = log2(1.5) ≈ 0.585`, but this default is never actually used — every call site in the codebase (`rna_ribo_te_analysis.Rmd`, `timecourse_qc.Rmd`, `eif3e_eif3d_normoxia_and_hypoxia.Rmd`, 39 calls total) explicitly overrides it to `lfc_cutoff = 0.0`, so the `category` column reflects significance by `padj` alone with no magnitude filter. **The project's real fold-change standard is 0.5** (used for gene sets, negative controls, and everywhere else) — it's applied as a separate filter directly on `te_lfc`/`te_padj` *after* this function runs, not through its `lfc_cutoff` argument. Don't read the `log2(1.5)` default as "the project convention"; it isn't exercised anywhere.
 - **`createNormMatrix()`** — DESeq2 normalization with optional spike-in support; uses the TE interaction design.
 
 ## Repository Structure
@@ -180,12 +180,14 @@ Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size
 **Namespace conventions:**
 - Always use `dplyr::select()`, never bare `select()` — avoids conflicts with `MASS`, `Biostrings`, and other packages that export `select`
 - Always use `dplyr::rename()`, never bare `rename()` — same conflict risk
+- Always use `dplyr::count()`, never bare `count()` — same conflict risk (e.g. `plyr`/other packages exporting `count()`); bare `count()` has failed with `Error in count(): Argument 'x' is not a vector: list` on an otherwise-valid tibble
 
 **Plot conventions:**
 - Save to `plots/` via `here("plots", "notebooknum_description.pdf")`
 - `theme_classic(base_size = 12)`, density `alpha = 0.15`, `linewidth = 0.8`
 - Wilcoxon tests annotated with `x = Inf, y = Inf, hjust = 1.1, vjust = 1.4`
 - Do not use em dashes (`—`) in axis labels — they render as `...` in PDF output. Use plain text only.
+- Diverging heatmaps (e.g. `pheatmap` NES/enrichment heatmaps): Okabe-Ito dark blue `#0072B2` (low) to white to Okabe-Ito vermillion/red-orange `#D55E00` (high) — `colorRampPalette(c("#0072B2", "white", "#D55E00"))`. Used in `gsea_si3d_vs_sictrl.Rmd` / `gsea_si3e_vs_sictrl.Rmd`.
 
 ## Reference Files
 
