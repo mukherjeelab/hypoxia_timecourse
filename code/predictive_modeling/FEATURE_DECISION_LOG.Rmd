@@ -1,0 +1,705 @@
+---
+title: "Feature Set Decision Log: eIF3d Hypoxia RF Classifier (Notebook 07)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(here)
+# NOTE: `pm` intentionally shadows lubridate::pm() (checks AM/PM) for the rest of this
+# notebook -- it's the shorthand used throughout for output/predictive_modeling/ paths.
+pm <- function(f) here("output", "predictive_modeling", f)
+```
+
+# Purpose
+
+Notebook 07 (`07_rf_classification_eif3d_targets_no_boruta.Rmd`) is parameterized over a
+`feature_set` string that selects one of ~10 different feature matrices built by the
+`01_`-`01n_`/`22_`/`23_` extraction notebooks. This document is a decision log for that
+feature space: what each feature group is, why it was added, why some things were
+deliberately left out, and why `external_stability` is the current default.
+
+**This is a self-checking notebook, not a static writeup.** The tables below are computed
+live from the actual feature matrices and saved model files in `output/predictive_modeling/`
+every time this is knit — if a documented column disappears or an undocumented one shows up,
+the checks in Section 7 will fail or warn rather than silently going stale. That protection
+exists because two real staleness bugs were caught and fixed while writing this document
+(see the changelog in Section 8) — the pipeline's file-based caching (each notebook reads a
+previous notebook's saved `.rds` and overwrites/extends it) has no built-in guarantee that
+every step has actually been re-run since its upstream inputs last changed.
+
+---
+
+# Executive Summary: The Decision Narrative
+
+The short version, in the order decisions were actually made (not the order notebooks are
+numbered). Each row links to the section with the full evidence/rationale.
+
+| Step | New named `feature_set` created here? | Decision | Reasoning |
+|---|---|---|---|
+| 1. Start simple | **`targeted`** (`01b_`) | Built targeted: lengths, GC%, CLIP, literature signatures | Baseline, cheap and interpretable features first |
+| 2. Tried k-mers/RBP motifs | **`combined`** (`01c_`) -- exists, but excluded from the lineage below | Tried adding k-mers/RBP motifs on top of `targeted`; excluded going forward | "Really crowded out signal" -- too many low-signal columns drowned out the real predictors (Sec. 4) |
+| 3. Added RNA structure | **`structure`** (`01d_`) | Added 5'UTR accessibility/structure features on top of `targeted` | Incremental addition, not independently compared against `targeted` (Sec. 2) |
+| 4. Split the CLIP count | **`clip_split`** (`01e_`) | Split the single aggregate `clip_evidence_count` into eIF3-specific (`clip_eif3_count`) vs cap-binding-specific (`clip_cap_binding_count`) counts | Incremental addition, not independently compared against `structure` (Sec. 2) |
+| 5. Added TE features | **`te_lfc`** (`01f_`) | Added own-condition TE LFC features (`indiv_te_*`, `delta_te_*`) | Incremental addition, not independently compared against `clip_split` (Sec. 2) -- this is the feature group flagged circular in step 8 below |
+| 6. Added codon optimality | **`codon_optimality`** (`01g_`) | Added CAI/tAI/CSC/FOP | Incremental addition, not independently compared against `te_lfc` (Sec. 2) |
+| 7. Added Kozak features | **`kozak`** (`01h_`) | Added Kozak PWM features | Incremental addition, not independently compared against `codon_optimality` (Sec. 2). Steps 3-7 as a whole: **not a designed ablation** -- "otherwise it felt like i was just adding more features in" |
+| 8. Deleted circular feature | *(no new name -- decision about `te_lfc`'s existing columns from step 5)* | Recognized `te_lfc`'s own-condition TE features as circular | The TE measurements are close to the same values used to define positive/negative gene sets, which motivated the `exclude_own_te_features` guard in 07 (Sec. 5) |
+| 9. Added more CDS features after noticing CDS importance increasing | *(no new name yet -- the observation itself; the resulting build is steps 11-12)* | `cds_gc`/`cds_length` kept surfacing as top-importance features across nearly every fit | Signal, not noise -- worth digging into CDS biology further rather than adding unrelated feature groups |
+| 10. **`external_stability` is created here** | **`external_stability`** (`01i_`) -- this is the step where the name/file first exists | `01i_` reads `feature_matrix_cnot3.rds` and adds SLAM-seq half-lives + selective ribosome profiling occupancy from Zhu 2024 (CNOT3 KO), Hia 2026 (DHX29), and Karner 2026 (MDA-MB-231 SLAM-seq) | Literature-grounded, experimentally-measured mRNA stability signal, not just internally-derived features (Sec. 3.9) |
+| 11. Acted on the CDS pattern (step 9), part one | *(same name -- `01j_` overwrites **`external_stability`** in place)* | Added positional codon optimality (`01j_`: first-75-codon + CDS-quartile CSC) | Directly follows from step 9 -- doubled down on the codon-optimality feature family that was already showing signal (Sec. 3.3) |
+| 12. Acted on the CDS pattern (step 9), part two | *(same name -- `01k_` overwrites **`external_stability`** in place again)* | Added CDS/3'UTR RNA structure (`01k_`), retiring the 5'UTR-only RNAfold columns | A separate decision from step 11 -- extended the same CDS-focused reasoning to structure instead of codon optimality; both landed in the same matrix file but were distinct additions (Sec. 3.5) |
+| 13. `external_stability` becomes the default | *(no new name -- the file has been called `external_stability` since step 10; this step is just notebook 07 treating it as the go-to choice)* | Not a separate build chosen over alternatives -- `external_stability` **is** the cumulative endpoint of steps 3-12 stacked in one lineage (structure + clip_split + te_lfc + codon_optimality + kozak + cnot3/dhx29/karner + positional CSC + CDS/3'UTR structure). It became the default simply by being the latest, most complete state of that chain, not by winning a bake-off against `structure`/`clip_split` | Retrospectively, its OOB error isn't actually better than the earlier stages it was built on top of -- but no such comparison drove the decision at the time. **Not driven by OOB error**; biological coverage/signal was the actual reason for continuing to build on this lineage, and the metric is presented only as secondary evidence (Sec. 2 quantitative snapshot) |
+| 14. Forked: per-codon detail | **`codon_features`** (`01l_`, reads the by-then-current `external_stability`) | Adds 62 bg-corrected RSCU columns (per-codon usage bias relative to the tRNA-gene-copy-number background, `human_trna_gcn.csv`) + 59 raw codon frequency columns -- built as a separate `feature_set`, not folded into the default. Originally built 2026-04-23 off an older `external_stability` base (which is why it went stale, Sec. 8) and refreshed 2026-07-17 during this document's creation | Shows per-individual-codon signal, not just a single aggregate score -- lets the model test whether specific codon identities matter, beyond the whole-gene CAI/tAI/CSC/FOP already in `external_stability`. Full rationale for not merging still pending (Sec. 6) |
+| 15. Forked: own RIP-seq data | **`ripseq`** (`01n_`, reads the by-then-current `external_stability`) | Adds 16 eIF3d/eIF4E RIP-seq IP/IgG and IP/RNA log2FC columns across 4 timepoints -- built as a separate `feature_set`, not folded into the default | This is the lab's **own** RIP-seq data, not a literature dataset like step 10's CNOT3/DHX29/Karner additions -- the goal was to check whether directly-measured own-data binding evidence showed up as strongly as the external literature signal did, once it was available. Full rationale for not merging still pending (Sec. 6) |
+
+**Note on step 13 -- "the default" isn't the whole matrix as-is.** Being `external_stability`'s
+"default" status describes which `.rds` file gets loaded, not what actually reaches the model.
+Notebook 07 still strips several groups out of it at fit time (Sec. 5 has the live-checked
+detail): k-mer/RBP motifs (never present in this matrix to begin with, Sec. 4);
+`bg_rscu_`/`codon_freq_` columns (`external_stability`-mode-specific, to stay comparable with
+MCF7-SIX1); own-data TE features `indiv_te_*`/`delta_te_*`/`sig_*` when
+`exclude_own_te_features = TRUE` (the recommended default, and the direct consequence of step 8);
+raw length columns in favor of their log2 versions; and any feature below the 50% non-NA
+sparsity threshold. `eif4e_ip_*` is additionally removed if `exclude_4e_features = TRUE`, though
+that flag is off by default and, per Sec. 3.7, doesn't catch the rest of the eIF4E/DAP5-related
+columns anyway.
+
+**Net effect:** `external_stability` is not the result of a clean "best model wins" ablation.
+It's biology-driven feature curation (aggressively cutting noisy feature families like k-mers,
+and doubling down on ones showing real signal like CDS-level properties) layered on top of
+mostly-incremental feature engineering, with one clearly-identified leakage risk (`te_lfc`)
+guarded against via a toggle rather than a hard removal.
+
+---
+
+# Full Feature Inventory
+
+Every column in `feature_matrix_external_stability.rds`, what it is, which notebook
+introduced it, and whether it's actually used by notebook 07 today. **Included/Excluded is
+not asserted -- it's computed live** by replicating 07's exact default filtering logic
+(`feature_set="external_stability"`, `clip_mode="aggregate"`, `exclude_own_te_features=TRUE`,
+`exclude_4e_features=FALSE`) against the real positive/negative gene sets for the standard
+hypoxia/3d/promotes/1hr/lfc0.5 comparison, including the sparsity check (which depends on the
+actual ~2,800-gene modeling subset, not the full 10,172-row matrix). Included features are
+listed first; excluded features are grouped at the bottom, with the specific reason each was
+dropped.
+
+```{r feature_inventory_setup}
+fm_inv <- readRDS(pm("feature_matrix_external_stability.rds"))
+
+# Replicate 07's default positive/negative gene-set join exactly (Sec. "Create Binary Target")
+pos_genes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"), show_col_types = FALSE)
+neg_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+set.seed(9)
+pos_in_features <- pos_genes %>% filter(ensembl_gene %in% fm_inv$gene_id_clean)
+neg_in_features  <- neg_genes %>% filter(gene_id_clean %in% fm_inv$gene_id_clean)
+number_to_match  <- min(nrow(pos_in_features), nrow(neg_in_features))
+
+model_genes <- fm_inv %>%
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% pos_genes$ensembl_gene ~ "promotes",
+    gene_id_clean %in% sample(neg_in_features$gene_id_clean, number_to_match) ~ "does_not_promote",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(eif3d_target))
+cat("Replicated 07 default modeling subset:", nrow(model_genes), "genes (",
+    sum(model_genes$eif3d_target == "promotes"), "positive,",
+    sum(model_genes$eif3d_target == "does_not_promote"), "negative)\n")
+```
+
+```{r feature_inventory_filter}
+# ---- Replicate 07's filter_features chunk exactly, default params ----
+id_cols_base <- c("gene_id", "gene_id_clean", "transcript_id", "transcript_id_clean", "symbol",
+                   "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+all_cols <- colnames(model_genes)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols <- unique(c(id_cols_base, id_pattern_cols))
+step1 <- setdiff(all_cols, id_cols)
+
+aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                         "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                         "clip_lee_glu_vs_cm_enrichment")
+regional_clip <- step1[str_detect(step1, "^clip_") & !(step1 %in% aggregate_clip_cols)]
+step2 <- setdiff(step1, regional_clip)
+
+kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+kmer_present <- step2[str_detect(step2, kmer_motif_pattern)]
+step3 <- setdiff(step2, kmer_present)
+
+codon_detail_cols <- step3[str_detect(step3, "^bg_rscu_|^codon_freq_")]
+step4 <- setdiff(step3, codon_detail_cols)
+
+# exclude_4e_features = FALSE (07's actual default) -> nothing removed at this step
+
+own_te_cols <- step4[str_detect(step4, "^indiv_te_|^delta_te_|^sig_")]
+step5 <- setdiff(step4, own_te_cols)  # exclude_own_te_features = TRUE (recommended default)
+
+raw_length_cols <- step5[str_detect(step5, "^(utr5|utr3|cds|total)_length$")]
+step6 <- setdiff(step5, raw_length_cols)
+
+sparsity_threshold <- 0.5
+sparse_cols <- step6[sapply(step6, function(f) mean(!is.na(unlist(model_genes[[f]]))) < sparsity_threshold)]
+feature_cols_final <- setdiff(step6, sparse_cols)
+
+cat("Included under default config:", length(feature_cols_final), "of", ncol(fm_inv), "total columns\n")
+```
+
+```{r feature_inventory_table, results='asis'}
+describe_col <- function(col) {
+  case_when(
+    col %in% c("transcript_id","transcript_id_clean","gene_id","gene_id_clean","symbol") ~ "Gene/transcript key column",
+    col == "te_lfc" ~ "TE log2FC (sictrl/si3d) for the model's own condition -- target-adjacent, always excluded as an id-like column",
+    col == "te_padj" ~ "TE adjusted p-value for the model's own condition -- always excluded as an id-like column",
+    col == "te_lfc_bin" ~ "Binned TE_LFC category -- always excluded as an id-like column",
+    str_detect(col, "^utr5_length$|^utr3_length$|^cds_length$|^total_length$") ~ "Raw region length (nt)",
+    str_detect(col, "^log2_") ~ paste0("Log2 of ", sub("^log2_", "", col)),
+    col == "utr5_gc" ~ "5'UTR GC%", col == "utr3_gc" ~ "3'UTR GC%", col == "cds_gc" ~ "CDS GC%",
+    col == "transcript_gc" ~ "Whole-transcript GC%", col == "gc3" ~ "3rd-codon-position GC%",
+    col == "is_4e_resistant" ~ "Literature flag: translation reported eIF4E-inhibition-resistant",
+    col == "is_4e_sensitive" ~ "Literature flag: translation reported eIF4E-inhibition-sensitive",
+    col == "is_dap5_repressed" ~ "Literature flag: translation reported DAP5-repressed",
+    col == "is_dap5_promoted" ~ "Literature flag: translation reported DAP5-promoted",
+    str_detect(col, "^sig_") ~ "Own-data TE significance/direction flag for a specific gene/condition/timepoint (see name)",
+    str_detect(col, "^clip_lee_parclip_") ~ "Regional eIF3-PAR-CLIP binding flag (Lee et al.), per-dataset",
+    str_detect(col, "^clip_cate_") ~ "Regional eIF3-CLIP binding flag (Cate et al. NPC differentiation), per-dataset",
+    col == "clip_lee_int_stress_bound" | col == "clip_lee_complete_media_bound" | col == "clip_lee_glu_dep_bound" ~ "Per-dataset CLIP binding flag under a specific metabolic condition (Lee et al.)",
+    col == "struct_accessibility_cap_proximal" ~ "RNAplfold unpaired probability, cap-proximal 5'UTR",
+    col == "struct_accessibility_aug_context" ~ "RNAplfold unpaired probability, AUG context",
+    str_detect(col, "^struct_accessibility_utr5_") ~ "RNAplfold unpaired probability summary, 5'UTR",
+    col == "struct_num_structured_regions" ~ "Count of highly-structured 30-nt windows, 5'UTR",
+    col == "te_4e_resistance_lfc" ~ "eIF4E-inhibitor resistance score (own/lit-derived LFC)",
+    col == "dap5_weber_lfc" ~ "DAP5-dependence LFC (Weber et al.)",
+    col == "dap5_polysome_lfc" ~ "DAP5 polysome-association LFC",
+    str_detect(col, "^eif4e_ip_") ~ "eIF4E RIP/IP log2FC under a specific drug/vehicle condition",
+    str_detect(col, "^clip_eif3_count$|^clip_cap_binding_count$") ~ "Aggregate CLIP evidence count, split by binding-protein category (eIF3 vs cap-binding)",
+    str_detect(col, "^clip_lee_.*_lfc$|^clip_lee_glu_vs_cm_enrichment$") ~ "Aggregate CLIP enrichment LFC under a specific metabolic condition (Lee et al.)",
+    str_detect(col, "^indiv_te_") ~ "Own-condition TE log2FC at a specific condition/timepoint -- circular relative to TE-defined gene sets",
+    str_detect(col, "^delta_te_") ~ "Change in own-condition TE log2FC between timepoints -- circular relative to TE-defined gene sets",
+    col == "cai" ~ "Codon Adaptation Index (whole CDS)", col == "tai" ~ "tRNA Adaptation Index (whole CDS)",
+    col == "csc" ~ "Codon Stability Coefficient (whole CDS)", col == "fop" ~ "Frequency of Optimal Codons (whole CDS)",
+    col == "kozak_score" ~ "Kozak consensus match score", col == "kozak_optimal" ~ "Binary: optimal Kozak context",
+    col == "kozak_pwm_score" ~ "Kozak position-weight-matrix score",
+    col == "cnot3_ribo_enrichment" ~ "CNOT3 KO riboseq enrichment (Zhu et al. 2024)",
+    col == "cnot3_weighted_codon_score" ~ "CNOT3-weighted codon stability score (Zhu et al. 2024)",
+    col == "zhu2024_ctrl_halflife" ~ "SLAM-seq control mRNA half-life (Zhu et al. 2024)",
+    col == "zhu2024_cnot3ko_halflife_logfc" ~ "SLAM-seq half-life log2FC, CNOT3 KO vs ctrl (Zhu et al. 2024)",
+    col == "hia2026_ctrl_halflife" ~ "SLAM-seq control mRNA half-life (Hia et al. 2026)",
+    col == "hia2026_dhx29_halflife_logfc" ~ "SLAM-seq half-life log2FC, DHX29 KO vs ctrl (Hia et al. 2026)",
+    col == "hia2026_dhx29_occupancy" ~ "Selective ribosome profiling occupancy score, DHX29 (Hia et al. 2026)",
+    col == "karner2026_mda231_log2_ct" ~ "SLAM-seq C-to-T conversion ratio, transcription-rate proxy (Karner et al. 2026, MDA-MB-231)",
+    str_detect(col, "^csc_q[1-4]$") ~ "Codon Stability Coefficient for a CDS quartile (positional)",
+    col == "csc_first75" ~ "Codon Stability Coefficient, first 75 codons only",
+    str_detect(col, "^struct_accessibility_") & str_detect(col, "cds") ~ "RNAplfold unpaired probability summary, CDS",
+    str_detect(col, "^struct_accessibility_") & str_detect(col, "utr3") ~ "RNAplfold unpaired probability summary, 3'UTR",
+    col == "struct_num_structured_regions_cds" ~ "Count of highly-structured 30-nt windows, CDS",
+    col == "struct_num_structured_regions_utr3" ~ "Count of highly-structured 30-nt windows, 3'UTR",
+    TRUE ~ "(description not yet catalogued -- doc needs updating)"
+  )
+}
+
+source_map <- c(
+  te_lfc="01_ (base)", te_padj="01_ (base)", te_lfc_bin="01_ (base)",
+  transcript_id="01_ (base)", transcript_id_clean="01_ (base)", gene_id="01_ (base)",
+  gene_id_clean="01_ (base)", symbol="01_ (base)",
+  utr5_length="01_ (base)", utr3_length="01_ (base)", cds_length="01_ (base)",
+  log2_utr5_length="01_ (base)", log2_utr3_length="01_ (base)", log2_cds_length="01_ (base)",
+  total_length="01_ (base)", log2_total_length="01_ (base)",
+  utr5_gc="01_ (base)", utr3_gc="01_ (base)", cds_gc="01_ (base)", transcript_gc="01_ (base)", gc3="01_ (base)",
+  is_4e_resistant="01_ (base)", is_4e_sensitive="01_ (base)",
+  is_dap5_repressed="01_ (base)", is_dap5_promoted="01_ (base)",
+  struct_accessibility_cap_proximal="01d_", struct_accessibility_aug_context="01d_",
+  struct_accessibility_utr5_mean="01d_", struct_accessibility_utr5_min="01d_", struct_accessibility_utr5_sd="01d_",
+  struct_num_structured_regions="01d_",
+  te_4e_resistance_lfc="01d_", dap5_weber_lfc="01d_", dap5_polysome_lfc="01d_",
+  eif4e_ip_vehicle_lfc="01d_", eif4e_ip_inhibitor_only_lfc="01d_", eif4e_ip_inhib_vs_vehicle_lfc="01d_",
+  clip_eif3_count="01e_", clip_cap_binding_count="01e_",
+  clip_lee_int_stress_lfc="01e_", clip_lee_complete_media_lfc="01e_", clip_lee_glu_dep_lfc="01e_",
+  clip_lee_glu_vs_cm_enrichment="01e_",
+  indiv_te_normoxia_1hr="01f_", indiv_te_hypoxia_1hr="01f_", indiv_te_normoxia_4hr="01f_",
+  indiv_te_hypoxia_4hr="01f_", indiv_te_normoxia_24hr="01f_", indiv_te_hypoxia_24hr="01f_",
+  delta_te_4hr="01f_", delta_te_24hr="01f_",
+  cai="01g_", tai="01g_", csc="01g_", fop="01g_",
+  kozak_score="01h_", kozak_optimal="01h_", kozak_pwm_score="01h_",
+  cnot3_ribo_enrichment="22_", cnot3_weighted_codon_score="22_",
+  zhu2024_ctrl_halflife="22_, renamed 01i_", zhu2024_cnot3ko_halflife_logfc="22_, renamed 01i_",
+  hia2026_ctrl_halflife="01i_ (from 23_ standalone output)",
+  hia2026_dhx29_halflife_logfc="01i_ (from 23_ standalone output)",
+  hia2026_dhx29_occupancy="01i_ (from 23_ standalone output)",
+  karner2026_mda231_log2_ct="01i_",
+  csc_first75="01j_", csc_q1="01j_", csc_q2="01j_", csc_q3="01j_", csc_q4="01j_",
+  struct_accessibility_start_proximal_cds="01k_", struct_accessibility_stop_proximal_cds="01k_",
+  struct_accessibility_cds_mean="01k_", struct_accessibility_cds_min="01k_", struct_accessibility_cds_sd="01k_",
+  struct_num_structured_regions_cds="01k_",
+  struct_accessibility_stop_proximal_utr3="01k_", struct_accessibility_distal_utr3="01k_",
+  struct_accessibility_utr3_mean="01k_", struct_accessibility_utr3_min="01k_", struct_accessibility_utr3_sd="01k_",
+  struct_num_structured_regions_utr3="01k_"
+)
+source_col <- function(col) {
+  if (col %in% names(source_map)) return(unname(source_map[col]))
+  case_when(
+    str_detect(col, "^sig_") ~ "01_ (base, TE-significance gene-set flags)",
+    str_detect(col, "^clip_lee_parclip_|^clip_cate_") ~ "01_/01b_ (base, per-dataset CLIP)",
+    col %in% c("clip_lee_int_stress_bound","clip_lee_complete_media_bound","clip_lee_glu_dep_bound") ~ "01_/01b_ (base, per-dataset CLIP)",
+    TRUE ~ "(source not yet catalogued)"
+  )
+}
+
+reason_col <- function(col) {
+  case_when(
+    col %in% id_cols ~ "Identifier / target-adjacent column -- not a candidate feature at all",
+    col %in% kmer_present ~ "k-mer/RBP-motif column (Sec. 4)",
+    col %in% codon_detail_cols ~ "bg_rscu_/codon_freq_ detail column (external_stability mode)",
+    col %in% regional_clip ~ "Regional per-dataset CLIP column (clip_mode=\"aggregate\" keeps only aggregate counts)",
+    col %in% own_te_cols ~ "Own-data TE feature, dropped via exclude_own_te_features=TRUE (Sec. 5)",
+    col %in% raw_length_cols ~ "Raw length column, log2 version kept instead (Sec. 5)",
+    col %in% sparse_cols ~ paste0("Below 50% non-NA in the current modeling subset (",
+                                  round(100 * mean(!is.na(unlist(model_genes[[col]]))), 1), "% coverage)"),
+    TRUE ~ ""
+  )
+}
+
+inventory <- tibble(feature = colnames(fm_inv)) %>%
+  mutate(
+    what_it_is = map_chr(feature, describe_col),
+    source     = map_chr(feature, source_col),
+    status     = if_else(feature %in% feature_cols_final, "Included", "Excluded"),
+    reason     = if_else(status == "Excluded", map_chr(feature, reason_col), "")
+  ) %>%
+  arrange(status == "Excluded", feature)
+
+knitr::kable(inventory, col.names = c("Feature", "What it is", "Source", "Status", "Reason if excluded"))
+```
+
+```{r feature_inventory_selfcheck}
+uncatalogued <- inventory %>% filter(str_detect(what_it_is, "not yet catalogued") | str_detect(source, "not yet catalogued"))
+if (nrow(uncatalogued) > 0) {
+  cat("WARNING -- these columns are missing a description or source and need the lookup tables above updated:\n")
+  print(uncatalogued$feature)
+} else {
+  cat("OK -- every column in feature_matrix_external_stability.rds has a description and source.\n")
+}
+```
+
+---
+
+# 1. Pipeline Architecture
+
+The default feature matrix, `feature_matrix_external_stability.rds`, is built by a chain of
+notebooks that each read the previous stage's `.rds` and add columns:
+
+```
+01_  (lengths, GC%, k-mers, RBP motifs)  ─┐
+01b_ (eIF3 CLIP binding, 7 conditions)   ─┴─▶ 01d_ (structure)  *reads 01_ + 01b_ directly,
+                                                                  skips 01c_/k-mers — see Sec. 4*
+      01d_ ─▶ 01e_ (clip_split: eIF3 vs cap-binding CLIP)
+      01e_ ─▶ 01f_ (te_lfc: own-condition TE LFCs — later flagged circular, see Sec. 5)
+      01f_ ─▶ 01g_ (codon_optimality: CAI/tAI/CSC/FOP)
+      01g_ ─▶ 01h_ (kozak: Kozak PWM features)
+      01h_ ─▶ 22_  (cnot3: Zhu 2024 CNOT3 KO half-life/riboseq)      ─▶ feature_matrix_cnot3.rds
+      cnot3 ─▶ 01i_ (+ standalone DHX29 half-life/occupancy from 23_, + Karner 2026 stability)
+      01i_ ─▶ 01j_ (positional codon stability: first-75-codon + CDS-quartile CSC)  [overwrites in place]
+      01j_ ─▶ 01k_ (CDS/3'UTR RNA structure; drops deprecated 5'UTR RNAfold cols)   [overwrites in place]
+                                                                 ─▶ feature_matrix_external_stability.rds
+```
+
+**The name "external_stability" undersells what this matrix actually is.** It reads as
+"just mRNA stability features," but it's really the cumulative superset of nearly every
+feature group in the project — sequence, CLIP, structure, codon optimality, Kozak, and
+literature-derived stability data — with exactly one deliberate omission: k-mer/RBP motif
+features (Section 4).
+
+**A wrinkle in the real ancestry** (not in the CLAUDE.md summary): `01i_` does **not** read
+`feature_matrix_dhx29.rds`. It reads `feature_matrix_cnot3.rds` directly, plus three small
+standalone files (`dhx29_slamseq_halflives.rds`, `dhx29_riboseq_occupancy.rds`, and the Karner
+CSV) that `23_dhx29_riboseq_slamseq.Rmd` also happens to save alongside its own (unused
+downstream) full-matrix snapshot. `feature_matrix_dhx29.rds` is an orphaned artifact — no
+notebook reads it — and it is currently stale (last built before the `01c_`-skip fix, so it
+still carries thousands of k-mer columns). It's harmless because nothing loads it, but it's
+confusing to find on disk; see Section 8.
+
+```{r architecture_live_check}
+chain_files <- c(
+  "feature_matrix_1hr.rds", "feature_matrix_1hr_targeted.rds",
+  "feature_matrix_1hr_structure.rds", "feature_matrix_1hr_clip_split.rds",
+  "feature_matrix_te_lfc.rds", "feature_matrix_codon_optimality.rds",
+  "feature_matrix_kozak.rds", "feature_matrix_cnot3.rds",
+  "feature_matrix_external_stability.rds"
+)
+for (f in chain_files) stopifnot("chain file missing" = file.exists(pm(f)))
+cat("All", length(chain_files), "pipeline files present.\n")
+```
+
+---
+
+# 2. Chronology of feature_set Options
+
+Per the person who built this (2026-07-17 conversation): the progression from `structure`
+through `kozak` was **not** a designed ablation series — "otherwise it felt like i was just
+adding more features in." Two decisions in this stretch *were* deliberate, though, and matter
+for interpreting the feature set:
+
+- **k-mers/RBP motifs (01c_) were deliberately excluded** — "really crowded out signal."
+  This is the one clear subtractive decision in the whole chronology (Section 4).
+- **`te_lfc` (01f_) was recognized as adding a circular feature** — the own-condition TE LFC
+  values are close to the same measurements used to define the positive/negative gene sets
+  in the first place. This is why `exclude_own_te_features` exists in notebook 07 (Section 5);
+  the feature was kept in the matrix (for cases where it's *not* circular, e.g. cross-gene
+  contrasts) but is excluded by default whenever gene sets are TE-defined.
+
+The one clear *positive* signal-driven decision: CDS-level features (`cds_gc`, `cds_length`)
+kept showing up as top-importance features across nearly every fit (see the table in this
+section). That empirical pattern motivated deliberately adding more CDS-focused feature
+groups afterward — positional codon optimality (`01j_`: first-75-codon and CDS-quartile CSC)
+and CDS/3'UTR RNA structure (`01k_`) — rather than continuing to add unrelated feature groups.
+
+## Feature count by stage
+
+```{r chronology_table}
+stages <- tribble(
+  ~stage,               ~notebook, ~file,
+  "targeted",           "01b_",    "feature_matrix_1hr_targeted.rds",
+  "structure",          "01d_",    "feature_matrix_1hr_structure.rds",
+  "clip_split",         "01e_",    "feature_matrix_1hr_clip_split.rds",
+  "te_lfc",             "01f_",    "feature_matrix_te_lfc.rds",
+  "codon_optimality",   "01g_",    "feature_matrix_codon_optimality.rds",
+  "kozak",              "01h_",    "feature_matrix_kozak.rds",
+  "cnot3 (intermediate)","22_",    "feature_matrix_cnot3.rds",
+  "external_stability", "01i_/01j_/01k_", "feature_matrix_external_stability.rds"
+)
+stages <- stages %>%
+  mutate(
+    exists = file.exists(pm(file)),
+    n_cols = map_dbl(file, ~ if (file.exists(pm(.x))) ncol(readRDS(pm(.x))) else NA_real_),
+    n_rows = map_dbl(file, ~ if (file.exists(pm(.x))) nrow(readRDS(pm(.x))) else NA_real_)
+  )
+print(stages %>% dplyr::select(stage, notebook, n_rows, n_cols))
+```
+
+## Quantitative snapshot (secondary evidence only — see caveats)
+
+These are **real, already-saved** numbers pulled from `rf_classifier_*.rds` model objects for
+the standard hypoxia/3d/promotes/1hr/lfc0.5 comparison — not re-fit for this document (OOB
+`prediction.error` is ranger's built-in out-of-bag Brier score; `variable.importance` is
+impurity importance). **Caveats, in order of importance:**
+
+1. `exclude_own_te_features` differs across rows (flagged explicitly below) — rows with it
+   `TRUE` dropped the circular TE features that rows with it `FALSE` kept, so this is not an
+   apples-to-apples comparison of feature *content* alone.
+2. OOB Brier error conflates discrimination and calibration and is computed on training data,
+   not the held-out test set that 07 reports as its headline AUC.
+3. Single 500-tree fits, no repeated CV/seeds — differences under ~0.02 should not be read as
+   meaningfully different.
+4. **This table did not drive the choice of `external_stability`.** The actual driver was
+   biological signal/coverage, not this metric — see the narrative above. It's included for
+   transparency, not as justification.
+
+```{r quant_snapshot}
+model_files <- tribble(
+  ~feature_set,          ~excl_own_te, ~file,
+  "targeted",            FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_targeted_clipaggregate_no_boruta.rds",
+  "combined",            FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_combined_clipaggregate.rds",
+  "structure",           FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_structure_clipaggregate_no_boruta.rds",
+  "clip_split",          FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_clip_split_clipaggregate_no_boruta.rds",
+  "te_lfc",              FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_te_lfc_clipaggregate_no_boruta.rds",
+  "codon_optimality",    FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_codon_optimality_clipaggregate_no_boruta.rds",
+  "kozak",               FALSE, "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_kozak_clipaggregate_no_boruta.rds",
+  "external_stability",  TRUE,  "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_external_stability_clipaggregate_no_boruta_noOwnTE.rds",
+  "codon_features",      TRUE,  "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_codon_features_clipaggregate_no_boruta_noOwnTE.rds",
+  "ripseq",              TRUE,  "rf_classifier_eif33d_promotes_hypoxia_1hr_lfc0.5_ripseq_clipaggregate_no_boruta_noOwnTE.rds"
+)
+
+snapshot <- model_files %>%
+  mutate(exists = file.exists(pm(file))) %>%
+  filter(exists) %>%
+  mutate(
+    model = map(file, ~ readRDS(pm(.x))),
+    n_features = map_dbl(model, "num.independent.variables"),
+    oob_pred_error = map_dbl(model, "prediction.error"),
+    top_feature = map_chr(model, ~ names(sort(.x$variable.importance, decreasing = TRUE))[1])
+  ) %>%
+  dplyr::select(feature_set, excl_own_te, n_features, oob_pred_error, top_feature) %>%
+  arrange(oob_pred_error)
+
+print(snapshot)
+cat("\nNote: codon_features and dhx29-derived numbers above predate the",
+    Sys.Date(), "data-freshness fixes in Section 8 and should be treated as provisional",
+    "until 07 is re-run on the corrected matrix.\n")
+```
+
+---
+
+# 3. Current Feature Dictionary (`external_stability`)
+
+```{r load_current_matrix}
+fm <- readRDS(pm("feature_matrix_external_stability.rds"))
+cat("Current feature_matrix_external_stability.rds:", nrow(fm), "rows x", ncol(fm), "cols\n")
+```
+
+## 3.1 Identifiers (not model features)
+
+`transcript_id`, `transcript_id_clean`, `gene_id`, `gene_id_clean`, `symbol` — the standard
+gene/transcript key columns. Always excluded from `feature_cols` in 07 via `id_cols`/
+`id_pattern_cols` regardless of `feature_set`.
+
+## 3.2 Sequence length & GC content (`01_`)
+
+Raw and log2 UTR5/UTR3/CDS/total length, plus GC% per region and `gc3` (3rd-codon-position
+GC). **Raw length columns are dropped by 07 itself** (Section 5) — log2 versions are kept
+because length is right-skewed and keeping both splits importance across two correlated
+columns.
+
+```{r seq_length_cols}
+seq_cols <- grep("length|_gc$|^gc3$|^transcript_gc$", colnames(fm), value = TRUE)
+cat(length(seq_cols), "columns:\n"); cat(paste(seq_cols, collapse = ", "), "\n")
+stopifnot("ACTB-range GC% sanity check failed" =
+  all(fm$cds_gc >= 0 & fm$cds_gc <= 100, na.rm = TRUE))
+```
+
+## 3.3 Codon optimality (`01g_`, `01j_`)
+
+Whole-CDS CAI/tAI/CSC/FOP (`01g_`), plus positional codon stability added after CDS features
+kept surfacing as top predictors: `csc_first75` (first 75 codons) and `csc_q1`-`csc_q4`
+(CDS quartiles).
+
+```{r codon_opt_cols}
+codon_cols <- grep("^cai$|^tai$|^csc|^fop$", colnames(fm), value = TRUE)
+cat(length(codon_cols), "columns:\n"); cat(paste(codon_cols, collapse = ", "), "\n")
+stopifnot("CAI/tAI/FOP must be in [0,1]" =
+  all(fm$cai >= 0 & fm$cai <= 1, na.rm = TRUE),
+  all(fm$tai >= 0 & fm$tai <= 1, na.rm = TRUE),
+  all(fm$fop >= 0 & fm$fop <= 1, na.rm = TRUE))
+```
+
+## 3.4 Kozak context (`01h_`)
+
+```{r kozak_cols}
+kozak_cols <- grep("^kozak_", colnames(fm), value = TRUE)
+cat(length(kozak_cols), "columns:", paste(kozak_cols, collapse = ", "), "\n")
+```
+
+## 3.5 RNA secondary structure (`01d_`, `01k_`)
+
+5'UTR accessibility (`01d_`; 3 columns retained — cap-proximal, AUG-context, and UTR5 mean/
+min/sd accessibility), plus CDS and 3'UTR accessibility added by `01k_` after the 5'UTR-only
+RNAfold thermodynamic columns (`struct_mfe_utr5`, `struct_ensemble_free_energy`, etc.) were
+dropped as deprecated.
+
+```{r structure_cols}
+struct_cols <- grep("^struct_", colnames(fm), value = TRUE)
+cat(length(struct_cols), "columns:\n"); cat(paste(struct_cols, collapse = ", "), "\n")
+stopifnot("Deprecated 5'UTR RNAfold columns should be gone" =
+  !any(c("struct_mfe_utr5", "struct_ensemble_free_energy") %in% colnames(fm)))
+stopifnot("CDS/3'UTR structure columns should be present" =
+  all(c("struct_accessibility_cds_mean", "struct_accessibility_utr3_mean") %in% colnames(fm)))
+```
+
+## 3.6 CLIP binding — eIF3 (`01b_`, `01e_`)
+
+Aggregate counts (`clip_eif3_count`, `clip_cap_binding_count`) plus per-dataset LFC/binary
+columns (Lee et al. glucose/stress conditions, Cate et al. NPC differentiation). Notebook 07's
+`clip_mode` param controls whether the aggregate or per-dataset columns are used (Section 5).
+
+```{r clip_cols}
+clip_cols <- grep("^clip_", colnames(fm), value = TRUE)
+cat(length(clip_cols), "columns:\n"); cat(paste(clip_cols, collapse = ", "), "\n")
+```
+
+## 3.7 eIF4E / cap-binding features
+
+`te_4e_resistance_lfc`, `dap5_weber_lfc`, `dap5_polysome_lfc`, `eif4e_ip_*`,
+`is_4e_resistant`/`is_4e_sensitive`/`is_dap5_repressed`/`is_dap5_promoted` — all thematically
+related to eIF4E/cap-binding biology, grouped here for documentation purposes.
+
+**Only `eif4e_ip_*` is actually removed by `exclude_4e_features = TRUE`.** 07's regex is
+`^4e_resistance|^eif4e_ip` plus 5 exact `lit_*eIF4E*` names (Section 5) — `te_4e_resistance_lfc`
+doesn't match because it starts with `te_`, not `4e_resistance`, and none of the `dap5_*`/
+`is_4e_*`/`is_dap5_*` columns match either pattern. Confirmed live below. Whether that's an
+intentional scope decision (only the direct IP-binding data is "circular," not the derived
+resistance/DAP5 scores) or a gap in the regex is an open question — flagged in Section 8
+rather than assumed either way.
+
+```{r eif4e_cols}
+eif4e_cols <- grep("^4e_resistance|^eif4e_ip|^is_4e_|^is_dap5_|^dap5_|^te_4e_", colnames(fm), value = TRUE)
+cat(length(eif4e_cols), "columns:", paste(eif4e_cols, collapse = ", "), "\n")
+
+circular_regex_check <- "^4e_resistance|^eif4e_ip"
+actually_excluded <- eif4e_cols[str_detect(eif4e_cols, circular_regex_check)]
+not_excluded <- setdiff(eif4e_cols, actually_excluded)
+cat("Actually removed by exclude_4e_features:", paste(actually_excluded, collapse = ", "), "\n")
+cat("NOT removed despite thematic similarity:", paste(not_excluded, collapse = ", "), "\n")
+```
+
+## 3.8 Own-data TE features (`01f_`) — excluded by default
+
+`te_lfc`, `te_padj`, `te_lfc_bin`, `indiv_te_*`, `delta_te_*`, and the `sig_*` gene-set flags.
+Flagged as circular because these are close to the same TE measurements used to define
+positive/negative gene sets. Removed whenever `exclude_own_te_features = TRUE`
+(07's recommended default for TE-defined comparisons).
+
+```{r own_te_cols}
+own_te_cols <- grep("^indiv_te_|^delta_te_|^sig_|^te_lfc|^te_padj", colnames(fm), value = TRUE)
+cat(length(own_te_cols), "columns (", length(grep('^sig_', own_te_cols)), "are sig_* gene-set flags)\n")
+```
+
+## 3.9 External literature stability data (`22_`, `23_`/`01i_`)
+
+- **Zhu et al. 2024** (CNOT3 KO): `cnot3_ribo_enrichment`, `cnot3_weighted_codon_score`,
+  `zhu2024_ctrl_halflife`, `zhu2024_cnot3ko_halflife_logfc`
+- **Hia et al. 2026** (DHX29): `hia2026_ctrl_halflife`, `hia2026_dhx29_halflife_logfc`,
+  `hia2026_dhx29_occupancy`
+- **Karner et al. 2026** (MDA-MB-231 SLAM-seq): `karner2026_mda231_log2_ct`
+
+```{r external_lit_cols}
+ext_cols <- grep("^cnot3_|^zhu2024_|^hia2026_|^karner2026_", colnames(fm), value = TRUE)
+cat(length(ext_cols), "columns:", paste(ext_cols, collapse = ", "), "\n")
+stopifnot("Half-life columns must be positive" =
+  all(fm$zhu2024_ctrl_halflife > 0, na.rm = TRUE),
+  all(fm$hia2026_ctrl_halflife > 0, na.rm = TRUE))
+```
+
+---
+
+# 4. Excluded Feature Group: k-mers & RBP Motifs
+
+`01_` and `01c_` compute ~900-6,000 k-mer (`utr5_4mer_*`, `utr3_4mer_*`, `cds_4mer_*`,
+`utr5_5mer_*`, `utr5_6mer_*`) and RBP motif (`rbns_*`, `cisbp_*`) columns. These are
+**deliberately excluded** from `external_stability` and most other feature sets — per the
+project owner, "really crowded out signal." `01d_` (the first stage in the
+`external_stability` lineage) reads `01_` + `01b_` directly rather than `01c_`'s combined
+output, so these columns never enter the chain at all. Notebook 07 also independently strips
+any k-mer/motif columns that do make it into a matrix, for the feature_sets listed in its
+`kmer_motif_pattern` filter.
+
+```{r kmer_exclusion_check}
+kmer_cols_present <- grep("^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^rbns_|^cisbp_", colnames(fm), value = TRUE)
+stopifnot("k-mer/RBP motif columns should not be in external_stability" =
+  length(kmer_cols_present) == 0)
+cat("Confirmed: 0 k-mer/RBP motif columns in the current external_stability matrix.\n")
+```
+
+---
+
+# 5. Selection Logic Inside Notebook 07
+
+Beyond which `.rds` file gets loaded, notebook 07 itself applies several filters to
+`feature_cols` before fitting — these are documented in-line in the notebook and reproduced
+here since they're as much a "feature decision" as anything upstream.
+
+| Param / step | Behavior | Rationale (from 07's own code comments) |
+|---|---|---|
+| `clip_mode = "aggregate"` (default) | Keeps only the 7 aggregate CLIP columns, drops per-dataset regional ones | Simpler, recommended default |
+| `clip_mode = "individual"` | Keeps per-dataset regional binary features, drops aggregates | For dataset-specific analyses |
+| k-mer/motif strip | Removes `utr5_4mer_`/`rbns_`/`cisbp_`-pattern columns for a specific list of feature_sets (including `external_stability`) | Redundant safety net on top of Section 4's upstream exclusion |
+| `external_stability`-only: drop `bg_rscu_`/`codon_freq_` | Removes per-codon detail columns | "these live in the MCF7-SIX1 external_stability matrix but are not present in the MDA-MB-231 external_stability matrix — keeps feature space consistent across cell lines" |
+| `exclude_4e_features = TRUE` | Drops `4e_resistance*`, `eif4e_ip*`, and 5 exact `lit_*eIF4E*` columns | "remove circular eIF4E features (to enable fair cross-model comparison)" |
+| `exclude_own_te_features = TRUE` (recommended default) | Drops `indiv_te_*`, `delta_te_*`, `sig_*` | "recommended when pos/neg sets are defined by TE changes" — these are the features flagged circular in Section 2 |
+| Raw length drop (always applied) | Drops `utr5_length`/`utr3_length`/`cds_length`/`total_length`, keeps log2 versions | "log2 versions are always present and preferred (right-skewed distributions; keeping both splits feature importance across two correlated cols)" |
+| Sparsity filter (always applied, threshold 0.5) | Drops any feature with <50% non-NA values | "sparse features inflate impurity importance via median imputation creating a spurious split between real vs imputed values" |
+
+```{r selection_logic_live_check}
+# Confirm the circular eIF4E list and own-TE regex still match real columns in the current matrix
+circular_regex <- "^4e_resistance|^eif4e_ip"
+circular_lit_exact <- c(
+  "lit_eIF4E_activated_translation", "lit_phospho_eIF4E_activated_translation",
+  "lit_phospho_eIF4E_suppressed_translation", "lit_translation_is_sensitive_to_4E_inhibition",
+  "lit_translation_is_resistant_to_4E_inhibition"
+)
+matched_circular <- colnames(fm)[str_detect(colnames(fm), circular_regex) | colnames(fm) %in% circular_lit_exact]
+cat("exclude_4e_features would currently drop", length(matched_circular), "columns:",
+    paste(matched_circular, collapse = ", "), "\n")
+
+own_te_matched <- colnames(fm)[str_detect(colnames(fm), "^indiv_te_|^delta_te_|^sig_")]
+cat("exclude_own_te_features would currently drop", length(own_te_matched), "columns.\n")
+```
+
+---
+
+# 6. Forked Experimental Extensions: `codon_features` & `ripseq`
+
+Both fork off `external_stability` as separate `feature_set` options rather than being merged
+into the default:
+
+- **`codon_features`** (`01l_`): adds 62 bg-corrected RSCU columns (per-codon usage bias
+  relative to the tRNA-gene-copy-number background, `human_trna_gcn.csv`) + 59 raw codon
+  frequency columns (121 total) on top of `external_stability`'s 134. Where `cai`/`tai`/`csc`/
+  `fop` (already in `external_stability`) collapse codon usage into one aggregate score per
+  gene, `codon_features` exposes usage at the level of each individual codon — the question
+  it's built to answer is whether specific codon identities carry signal beyond what the
+  aggregate scores capture, not just "is this gene codon-optimized."
+- **`ripseq`** (`01n_`): adds 16 eIF3d/eIF4E RIP-seq IP/IgG and IP/RNA log2FC columns across 4
+  timepoints on top of `external_stability`. Unlike step 10's CNOT3/DHX29/Karner additions,
+  this is the lab's **own** RIP-seq data, not a literature dataset — it was built to test
+  whether directly-measured own-data binding evidence showed up as strongly as the external
+  literature signal did, once that own data was available.
+
+Both are currently framed as **experimental extensions, not adopted into the default** — why
+neither one displaced `external_stability` as the baseline is still an open question
+(Section 8).
+
+---
+
+# 7. Self-Check Summary
+
+```{r final_self_check}
+expected_current_cols <- c(
+  seq_cols, codon_cols, kozak_cols, struct_cols, clip_cols, eif4e_cols, own_te_cols, ext_cols,
+  "transcript_id", "transcript_id_clean", "gene_id", "gene_id_clean", "symbol"
+)
+undocumented <- setdiff(colnames(fm), expected_current_cols)
+if (length(undocumented) > 0) {
+  cat("WARNING — columns present in feature_matrix_external_stability.rds but not documented",
+      "in any section above (doc needs an update):\n")
+  cat(paste(" ", undocumented, collapse = "\n"), "\n")
+} else {
+  cat("OK — every column in the current matrix is accounted for in this document.\n")
+}
+missing_documented <- setdiff(expected_current_cols, colnames(fm))
+stopifnot("A documented column has disappeared from the matrix" = length(missing_documented) == 0)
+```
+
+---
+
+# 8. Open Questions / Known Gaps / Changelog
+
+**Fixed while writing this document (2026-07-17):**
+
+- `feature_matrix_codon_features.rds` was stale — built (2026-04-23) from an
+  `external_stability` base that predated later fixes to `feature_matrix_external_stability.rds`
+  (2026-04-29), and carried 256 leftover `utr5_4mer_*` k-mer columns (6,537 cols total instead
+  of the expected ~250). Fixed by re-running `01l_`; now 250 columns, 0 k-mer columns.
+- `01k_` (CDS/3'UTR structure) had apparently never been run against the current
+  `feature_matrix_external_stability.rds` — the file still had the deprecated 5'UTR RNAfold
+  columns and zero CDS/3'UTR structure columns, even though `01k_`'s cluster-precomputed
+  RNAplfold inputs were present and complete. Fixed by running `01k_`; the matrix is now 134
+  columns (was 129), with 7 deprecated columns dropped and 12 CDS/3'UTR columns added.
+
+**Not fixed, flagged only:**
+
+- `feature_matrix_dhx29.rds` (6,404 cols, includes stale k-mer columns) is an orphaned
+  artifact of `23_dhx29_riboseq_slamseq.Rmd` that no downstream notebook reads. Harmless but
+  confusing; candidate for deletion.
+- Any `rf_classifier_*.rds` for `codon_features` predates today's fix and should be
+  considered stale until 07 is re-run on the corrected matrix.
+
+**Genuinely open (need more input to fill in):**
+
+- Whether `exclude_4e_features` is intentionally scoped to only `eif4e_ip_*` (Section 3.7),
+  leaving `dap5_*`/`is_4e_*`/`is_dap5_*`/`te_4e_resistance_lfc` in the model even when the
+  flag is set, or whether the regex should be widened to catch those too.
+- Why `codon_features` and `ripseq` weren't adopted as the new default over
+  `external_stability` (Section 6).
+- No formal, controlled ablation exists across `structure` → `clip_split` → `te_lfc` →
+  `codon_optimality` → `kozak` — per the project owner, this stretch was incremental
+  development, not a designed comparison. Noted here rather than inventing a rationale.
+
+```{r session_info}
+sessionInfo()
+```
