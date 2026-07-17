@@ -651,3 +651,19 @@ categorize_translation_changes <- function(res_rna, res_ribo, res_te,
     summary_table = cat_table
   )
 }
+
+#' Build PROGENy Pathway Network in decoupleR Long Format
+#'
+#' Wraps `progeny::getModel()` (offline, bundled model - no OmnipathR/internet
+#' dependency, unlike `decoupleR::get_progeny()`) into the long-format
+#' source/target/mor edge list expected by `decoupleR::run_mlm()`.
+#'
+#' @param top Number of top-weighted genes per pathway to retain (progeny's own
+#'   default; see `progeny::getModel()`)
+#' @return Tibble with columns `source` (pathway), `target` (gene), `mor` (weight)
+build_progeny_network <- function(top = 100) {
+  progeny::getModel(organism = "Human", top = top) %>%
+    tibble::rownames_to_column("target") %>%
+    tidyr::pivot_longer(-target, names_to = "source", values_to = "mor") %>%
+    dplyr::filter(mor != 0)
+}
