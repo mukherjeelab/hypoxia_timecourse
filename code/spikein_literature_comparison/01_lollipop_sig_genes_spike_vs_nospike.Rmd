@@ -1,0 +1,379 @@
+---
+title: "Spike-in vs No Spike-in: Significant mRNA Counts (Diverging Bar Charts)"
+author: "Kate"
+date: "2026-07-20"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+First notebook in the spike-in vs literature comparison subsection. Counts how
+many genes are significantly up- and down-regulated (sictrl hypoxia vs
+normoxia, |log2FC| >= 0.5 and padj < 0.05) at each timepoint (1/4/24hr), for
+RNA, Ribo, and TE separately, comparing spike-in-normalized DESeq2 size
+factors against standard (no spike-in) size factors. Each of RNA/Ribo/TE gets
+its own bar chart, faceted by timepoint, with Up and Down shown as separate
+bars (both plotted as positive counts) grouped by direction and dodged by
+spike-in status, styled after the eIF3e/eIF3d TE reference figure. Later
+notebooks in this subsection will bring in published literature values for
+comparison.
+
+**With-spike-in results are not recomputed here.** `rna_ribo_te_analysis.Rmd`
+already ran `deFunction(mode = c("RNA","RIBO","TE"))` with spike-in
+normalization for the sictrl hypoxia-vs-normoxia contrast at all three
+timepoints and saved `rna_lfc`/`ribo_lfc`/`te_lfc` and matching `*_padj`
+columns to `output/translation_categories_{1,4,24}hr.csv` (see lines 92-141,
+197-246, 302-351 of that notebook) — those are loaded directly below, for all
+three modes.
+
+**TE no-spike-in results are also not recomputed.** `timecourse_qc.Rmd` already
+saved these to `output/deseq_results_{1,4,24}hr_nospike.csv`
+(control=normoxia, test=hypoxia, treatment=sictrl, mode="TE", spikeInMatrix =
+NULL). That file is filtered to `!is.na(symbol)`, but the annotation table
+(`accessories/human/gene_anno_hs_dm_v49_r111.tsv`) has zero NA symbols, and
+row counts were verified to match `translation_categories_*hr.csv` exactly at
+all three timepoints (11,879 genes each) — so the filter is a no-op here and
+this file is a safe, complete source.
+
+**RNA and Ribo no-spike-in results have no saved file anywhere in the repo**
+(confirmed by exhaustive grep for `nospike`/`no_spike` across all `.Rmd`/`.R`
+files and `find` for matching filenames — the only other no-spike-in files
+are TE-mode si3d/si3e-vs-sictrl contrasts in `si3e_si3d_normoxia_1and4hr_timecourse.Rmd`
+and external MDA-MB-231/MCF7-SIX1 TE files from a different repo in
+`eif3d_geneset_cellline_comparison.Rmd`, none of which are the sictrl
+hypoxia-vs-normoxia RNA/Ribo contrast needed here). `analyzing_spikeins.Rmd`
+hits the same gap and recomputes RNA/Ribo no-spike itself for that reason. We
+follow the same approach: only RNA and Ribo no-spike-in are computed fresh,
+from the same count matrix and metadata per timepoint.
+
+```{r load_libraries}
+library(here)
+library(tidyverse)
+library(DESeq2)
+```
+
+```{r load_functions}
+source(here("code/functions.R"))
+cat("Loaded deFunction, createNormMatrix\n")
+```
+
+# Load With-Spike-In Results (precomputed, RNA/Ribo/TE)
+
+```{r load_with_spike_results}
+translation_categories_files <- c(
+  "1hr" = here("output", "translation_categories_1hr.csv"),
+  "4hr" = here("output", "translation_categories_4hr.csv"),
+  "24hr" = here("output", "translation_categories_24hr.csv")
+)
+stopifnot("translation_categories_*hr.csv missing" = all(file.exists(translation_categories_files)))
+
+modes <- c("RNA", "Ribo", "TE")
+mode_cols <- list(
+  RNA  = c(lfc = "rna_lfc",  padj = "rna_padj"),
+  Ribo = c(lfc = "ribo_lfc", padj = "ribo_padj"),
+  TE   = c(lfc = "te_lfc",   padj = "te_padj")
+)
+
+with_spike_results <- lapply(translation_categories_files, function(f) {
+  raw <- read_csv(f, show_col_types = FALSE)
+  setNames(lapply(modes, function(m) {
+    cols <- mode_cols[[m]]
+    raw %>% dplyr::select(gene_id, log2FoldChange = all_of(cols[["lfc"]]), padj = all_of(cols[["padj"]]))
+  }), modes)
+})
+
+for (tp in names(with_spike_results)) {
+  for (m in modes) {
+    cat(tp, m, "with-spike results loaded:", nrow(with_spike_results[[tp]][[m]]), "genes\n")
+  }
+}
+```
+
+# Load No-Spike-In TE Results (precomputed)
+
+```{r load_te_nospike}
+te_nospike_files <- c(
+  "1hr" = here("output", "deseq_results_1hr_nospike.csv"),
+  "4hr" = here("output", "deseq_results_4hr_nospike.csv"),
+  "24hr" = here("output", "deseq_results_24hr_nospike.csv")
+)
+stopifnot("deseq_results_*hr_nospike.csv missing" = all(file.exists(te_nospike_files)))
+
+te_nospike_results <- lapply(te_nospike_files, function(f) {
+  read_csv(f, show_col_types = FALSE) %>%
+    dplyr::select(gene_id, log2FoldChange, padj)
+})
+
+for (tp in names(te_nospike_results)) {
+  stopifnot(
+    "TE no-spike gene universe does not match with-spike gene universe" =
+      nrow(te_nospike_results[[tp]]) == nrow(with_spike_results[[tp]][["TE"]])
+  )
+  cat(tp, "TE no-spike results loaded:", nrow(te_nospike_results[[tp]]), "genes\n")
+}
+```
+
+# Compute No-Spike-In RNA/Ribo/TE Results
+
+No saved file covers RNA/Ribo no-spike-in, so all three modes (RNA, Ribo, and
+TE) are computed here using `createNormMatrix(..., spikein = NULL)` +
+`deFunction(mode = ..., spikeInMatrix = NULL)`, matching the pattern in
+`analyzing_spikeins.Rmd`. TE is recomputed as well, purely as a sanity check
+against the saved `deseq_results_*hr_nospike.csv` loaded above — the plotted
+TE no-spike numbers still come from the saved file, not this recomputation.
+
+```{r load_raw_counts_for_nospike}
+allCounts <- read_csv(here("output", "human_allCounts_raw.csv")) %>%
+  column_to_rownames("gene_id")
+
+metadata <- read_csv(here("output", "metadata_clean.csv"))
+
+cat("allCounts:", dim(allCounts), "\n")
+cat("Metadata:", nrow(metadata), "samples\n")
+```
+
+```{r run_nospike_de}
+timepoints <- c(1, 4, 24)
+
+run_de_nospike <- function(hours_val) {
+  metadata_tp <- metadata %>%
+    filter(treatment == "sictrl", hours == hours_val) %>%
+    mutate(comparison_variable = condition)
+
+  sample_cols <- metadata_tp$sample_name
+  counts_tp <- allCounts[, sample_cols]
+
+  normMatrix_noSpike <- createNormMatrix(
+    allCounts = counts_tp,
+    metadata = metadata_tp,
+    control_condition = "normoxia",
+    spikein = NULL,
+    keepSpikes = NULL
+  )
+
+  setNames(lapply(c("RNA", "RIBO", "TE"), function(m) {
+    deFunction(
+      countsMatrix = counts_tp,
+      allCounts_Norm = normMatrix_noSpike,
+      metadata = metadata_tp,
+      control_condition = "normoxia",
+      test_condition = "hypoxia",
+      spikeInMatrix = NULL,
+      keepSpikes = NULL,
+      mode = m
+    )
+  }), c("RNA", "Ribo", "TE"))
+}
+
+no_spike_results_fresh <- setNames(lapply(timepoints, run_de_nospike), paste0(timepoints, "hr"))
+cat("Fresh no-spike-in RNA/Ribo/TE computed for:", paste(names(no_spike_results_fresh), collapse = ", "), "\n")
+```
+
+## Sanity check: fresh TE no-spike vs saved TE no-spike
+
+```{r sanity_check_te_nospike}
+validate_te_nospike <- function(saved_df, fresh_df, label) {
+  cat("\n---", label, "---\n")
+  cat("Saved genes:", nrow(saved_df), " Fresh genes:", nrow(fresh_df), "\n")
+
+  stopifnot(
+    "Gene ID sets differ between saved and freshly-recomputed TE no-spike results" =
+      setequal(saved_df$gene_id, fresh_df$gene_id)
+  )
+
+  joined <- inner_join(
+    saved_df %>% dplyr::select(gene_id, saved_lfc = log2FoldChange, saved_padj = padj),
+    fresh_df %>% dplyr::select(gene_id, fresh_lfc = log2FoldChange, fresh_padj = padj),
+    by = "gene_id"
+  )
+  stopifnot("Join on gene_id dropped rows unexpectedly" = nrow(joined) == nrow(saved_df))
+
+  lfc_cor <- cor(joined$saved_lfc, joined$fresh_lfc, use = "complete.obs")
+  cat("LFC correlation (saved vs fresh):", round(lfc_cor, 6), "\n")
+
+  stopifnot(
+    "LFC values do not match saved TE no-spike results within tolerance" =
+      isTRUE(all.equal(joined$saved_lfc, joined$fresh_lfc, tolerance = 1e-8)),
+    "padj values do not match saved TE no-spike results within tolerance" =
+      isTRUE(all.equal(joined$saved_padj, joined$fresh_padj, tolerance = 1e-8))
+  )
+
+  cat("PASSED: fresh TE no-spike recomputation matches saved deseq_results_*hr_nospike.csv\n")
+  invisible(TRUE)
+}
+
+for (tp in names(te_nospike_results)) {
+  validate_te_nospike(te_nospike_results[[tp]], no_spike_results_fresh[[tp]][["TE"]], tp)
+}
+
+cat("\n✓ SANITY CHECK PASSED: saved TE no-spike results match a fresh recomputation at all timepoints\n")
+```
+
+```{r assemble_de_results}
+no_spike_results <- lapply(names(with_spike_results), function(tp) {
+  list(
+    RNA  = no_spike_results_fresh[[tp]][["RNA"]],
+    Ribo = no_spike_results_fresh[[tp]][["Ribo"]],
+    TE   = te_nospike_results[[tp]]
+  )
+})
+names(no_spike_results) <- names(with_spike_results)
+
+de_results <- lapply(names(with_spike_results), function(tp) {
+  setNames(lapply(modes, function(m) {
+    list(with_spike = with_spike_results[[tp]][[m]], no_spike = no_spike_results[[tp]][[m]])
+  }), modes)
+})
+names(de_results) <- names(with_spike_results)
+cat("DE ready for timepoints:", paste(names(de_results), collapse = ", "), "\n")
+```
+
+## Computational checks
+
+```{r checks}
+for (tp in names(de_results)) {
+  for (m in modes) {
+    for (spike_status in c("with_spike", "no_spike")) {
+      res <- de_results[[tp]][[m]][[spike_status]]
+      stopifnot(
+        "log2FoldChange must be finite" =
+          all(is.finite(res$log2FoldChange[!is.na(res$log2FoldChange)])),
+        "padj must be within [0, 1]" =
+          all(res$padj >= 0 & res$padj <= 1, na.rm = TRUE)
+      )
+    }
+  }
+}
+cat("All log2FoldChange/padj range checks passed\n")
+```
+
+# Count significant genes (|log2FC| >= 0.5, padj < 0.05)
+
+```{r count_sig_genes}
+lfc_cutoff <- 0.5
+padj_cutoff <- 0.05
+
+count_sig <- function(res) {
+  sig <- res %>% filter(!is.na(padj), padj < padj_cutoff, abs(log2FoldChange) >= lfc_cutoff)
+  tibble(
+    Up = sum(sig$log2FoldChange > 0),
+    Down = sum(sig$log2FoldChange < 0)
+  )
+}
+
+sig_counts <- map_dfr(names(de_results), function(tp) {
+  map_dfr(modes, function(m) {
+    map_dfr(c(with_spike = "with_spike", no_spike = "no_spike"), function(spike_status) {
+      count_sig(de_results[[tp]][[m]][[spike_status]])
+    }, .id = "spike_status") %>%
+      mutate(Mode = m)
+  }) %>%
+    mutate(Timepoint = tp)
+})
+
+sig_counts_long <- sig_counts %>%
+  pivot_longer(cols = c(Up, Down), names_to = "Direction", values_to = "n") %>%
+  mutate(
+    spike_status = recode(spike_status,
+                           with_spike = "With spike-in",
+                           no_spike = "No spike-in"),
+    Timepoint = factor(Timepoint, levels = c("1hr", "4hr", "24hr")),
+    Direction = factor(Direction, levels = c("Up", "Down")),
+    Mode = factor(Mode, levels = c("RNA", "Ribo", "TE"))
+  )
+
+print(sig_counts_long)
+```
+
+# Bar charts (one per mode: RNA, Ribo, TE)
+
+Up and Down are both plotted as positive bar heights (no sign flip), grouped
+side by side under their own Direction tick and dodged by spike-in status,
+faceted by timepoint (one panel per 1/4/24hr) — following the
+labeled-bar-chart concept from the eIF3e/eIF3d TE reference figure. Direction
+sets the base hue (Up = Okabe-Ito vermillion, Down = Okabe-Ito dark blue);
+spike-in status sets the shade (with spike-in = full saturation, no spike-in
+= a lighter tint of the same hue), mirroring how the reference figure shades
+pre- vs. post-spike-in bars of the same gene. Each bar is additionally
+labeled "Pre"/"Post" (spike-in normalization), matching the "Pre spike-in" /
+"Post spike-in" terminology already used elsewhere in this repo (e.g.
+`analyzing_spikeins.Rmd`, `si3e_si3d_normoxia_1and4hr_timecourse.Rmd`): Pre =
+no spike-in, Post = with spike-in.
+
+```{r diverging_bar_plots, fig.width=7, fig.height=4.5}
+up_dark <- "#D55E00"
+down_dark <- "#0072B2"
+lighten <- function(hex, amount = 0.55) colorRampPalette(c(hex, "white"))(101)[round(amount * 100) + 1]
+up_light <- lighten(up_dark)
+down_light <- lighten(down_dark)
+
+fill_values <- c(
+  "Up - With spike-in" = up_dark,
+  "Up - No spike-in" = up_light,
+  "Down - With spike-in" = down_dark,
+  "Down - No spike-in" = down_light
+)
+
+make_diverging_bar <- function(df, mode_label) {
+  plot_df <- df %>%
+    mutate(
+      fill_group = factor(paste(Direction, spike_status, sep = " - "), levels = names(fill_values)),
+      spike_status = factor(spike_status, levels = c("No spike-in", "With spike-in")),
+      prepost_label = if_else(spike_status == "With spike-in", "Post", "Pre")
+    )
+
+  dodge <- position_dodge(width = 0.8)
+  y_max <- 9000
+  label_y <- -0.06 * y_max
+
+  ggplot(plot_df, aes(x = Direction, y = n, fill = fill_group, group = spike_status)) +
+    geom_col(width = 0.7, position = dodge) +
+    geom_text(aes(label = n), position = dodge, vjust = -0.4, size = 3.5, fontface = "bold") +
+    geom_text(aes(label = prepost_label, y = label_y), position = dodge,
+              size = 3, fontface = "bold", color = "grey30") +
+    geom_hline(yintercept = 0, linewidth = 1) +
+    scale_fill_manual(values = fill_values) +
+    scale_y_continuous(limits = c(label_y * 1.3, y_max * 1.15)) +
+    facet_wrap(~Timepoint, nrow = 1) +
+    labs(title = paste0(mode_label, " sig genes: sictrl hypoxia vs normoxia"),
+         x = NULL, y = "# sig genes (padj < 0.05, |log2FC| > 0.5)", fill = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none",
+          axis.line = element_line(linewidth = 0.9),
+          axis.ticks = element_line(linewidth = 0.9),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 15))
+}
+
+diverging_bar_plots <- setNames(lapply(modes, function(m) {
+  make_diverging_bar(sig_counts_long %>% filter(Mode == m), m)
+}), modes)
+
+diverging_bar_plots[["RNA"]]
+ggsave(here("plots/01_divergingbar_sig_rna_spike_vs_nospike.pdf"), plot = diverging_bar_plots[["RNA"]], width = 7, height = 4.5)
+
+diverging_bar_plots[["Ribo"]]
+ggsave(here("plots/01_divergingbar_sig_ribo_spike_vs_nospike.pdf"), plot = diverging_bar_plots[["Ribo"]], width = 7, height = 4.5)
+
+diverging_bar_plots[["TE"]]
+ggsave(here("plots/01_divergingbar_sig_te_spike_vs_nospike.pdf"), plot = diverging_bar_plots[["TE"]], width = 7, height = 4.5)
+```
+
+# Save results
+
+```{r save_results}
+write_csv(sig_counts_long, here("output/spikein_literature_comparison/01_sig_gene_counts_spike_vs_nospike.csv"))
+cat("Saved significant gene counts (RNA/Ribo/TE) to output/spikein_literature_comparison/\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

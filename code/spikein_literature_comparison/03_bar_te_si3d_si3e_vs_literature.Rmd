@@ -1,0 +1,544 @@
+---
+title: "eIF3d/eIF3e Knockdown TE Changes vs Literature"
+author: "Kate"
+date: "2026-07-21"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+Third notebook in the spike-in vs literature comparison subsection. Very
+similar analysis to `01_lollipop_sig_genes_spike_vs_nospike.Rmd` /
+`02_lollipop_sig_genes_spike_vs_nospike_and_literature.Rmd`, but the
+comparison is **si3d vs sictrl** and **si3e vs sictrl** (eIF3d/eIF3e
+knockdown effect on TE), in **normoxia** — not the sictrl hypoxia-vs-normoxia
+comparison those notebooks used.
+
+**All our comparisons in this notebook use the 1+4hr time-regressed data**,
+not the three separate 1/4/24hr timepoints. `deFunction_time_normalized()`
+(hours as a covariate, `~ hours + Condition + SeqType + Condition:SeqType`)
+combines the 1hr and 4hr samples into one regression per treatment, giving a
+single, more highly powered si3d-vs-sictrl and si3e-vs-sictrl TE estimate —
+this is also the timepoint choice suggested on the original eIF3e/eIF3d TE
+reference figure this whole subsection was built from ("perhaps change to
+using 1_4hr time regression"). Since we're now using one combined estimate
+per treatment, **the three separate normoxia timepoints are not shown** in
+this notebook.
+
+**No DESeq2 is run in this notebook.** Per Kate: these si3d-vs-sictrl /
+si3e-vs-sictrl TE comparisons are already computed and saved (spike-in
+normalized, time-regressed) — reuse them as-is, don't recompute.
+
+- **si3d vs sictrl, normoxia, 1+4hr time-regressed:**
+  `output/translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv`
+- **si3e vs sictrl, normoxia, 1+4hr time-regressed:**
+  `output/te_si3e_vs_sictrl_normoxia_1and4hr.csv` (TE-only columns; note the
+  different filename pattern from si3d's — both produced by the same
+  `eif3e_eif3d_normoxia_and_hypoxia.Rmd` "1+4hr (time-regressed)" sections,
+  confirmed via `deFunction_time_normalized(..., mode = "TE")` with spike-in).
+
+**Sign convention** (per `CLAUDE.md`): despite the filenames, the underlying
+DESeq2 contrast runs **sictrl as `test_condition`, si3d/si3e as
+`control_condition`** — the extracted coefficient is log2(sictrl / si3d) or
+log2(sictrl / si3e). So **positive `te_lfc` = sictrl TE > knockdown TE =
+knockdown reduces TE = eIF3d/eIF3e promotes that gene's translation**;
+negative = eIF3d/eIF3e inhibits. "Up" in this notebook therefore means
+"eIF3d/eIF3e-promoted", not literally "translation went up in the knockdown."
+
+```{r load_libraries}
+library(here)
+library(tidyverse)
+library(ggtext)
+```
+
+# Load si3d/si3e vs sictrl TE (normoxia, 1+4hr time-regressed, spike-in normalized, precomputed)
+
+```{r load_si3d_si3e_te}
+te_files <- tribble(
+  ~treatment, ~file,
+  "si3d", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "si3e", "te_si3e_vs_sictrl_normoxia_1and4hr.csv"
+)
+
+stopifnot("One or more si3d/si3e 1+4hr TE files missing" =
+  all(file.exists(here("output", te_files$file))))
+
+te_data <- pmap(te_files, function(treatment, file) {
+  read_csv(here("output", file), show_col_types = FALSE) %>%
+    dplyr::select(gene_id, log2FoldChange = te_lfc, padj = te_padj) %>%
+    mutate(treatment = treatment)
+}) %>% list_rbind()
+
+for (i in seq_len(nrow(te_files))) {
+  n <- sum(te_data$treatment == te_files$treatment[i])
+  cat(te_files$treatment[i], "1+4hr TE rows:", n, "\n")
+}
+```
+
+## Computational checks
+
+```{r checks}
+stopifnot(
+  "log2FoldChange must be finite" =
+    all(is.finite(te_data$log2FoldChange[!is.na(te_data$log2FoldChange)])),
+  "padj must be within [0, 1]" =
+    all(te_data$padj >= 0 & te_data$padj <= 1, na.rm = TRUE)
+)
+cat("log2FoldChange/padj range checks passed\n")
+```
+
+# Count significant genes (|log2FC| >= 0.5, padj < 0.05)
+
+```{r count_sig_genes}
+lfc_cutoff <- 0.5
+padj_cutoff <- 0.05
+
+sig_counts_si3d_si3e <- te_data %>%
+  filter(!is.na(padj), padj < padj_cutoff, abs(log2FoldChange) >= lfc_cutoff) %>%
+  mutate(Direction = if_else(log2FoldChange > 0, "Up", "Down")) %>%
+  dplyr::count(treatment, Direction, name = "n") %>%
+  mutate(
+    Direction = factor(Direction, levels = c("Up", "Down")),
+    treatment = factor(treatment, levels = c("si3d", "si3e"))
+  )
+
+print(sig_counts_si3d_si3e)
+```
+
+# Bar chart: si3d vs si3e TE changes (1+4hr time-regressed)
+
+Direction on the y-axis (Up = Okabe-Ito vermillion = eIF3d/eIF3e-promoted;
+Down = Okabe-Ito dark blue = eIF3d/eIF3e-inhibited), dodged by treatment
+(si3d vs si3e) — same visual language as notebooks 01/02, with treatment
+taking the place spike-in status held there.
+
+```{r plot_si3d_si3e_bar, fig.width=6, fig.height=3.5}
+up_dark <- "#D55E00"
+down_dark <- "#0072B2"
+lighten <- function(hex, amount = 0.55) colorRampPalette(c(hex, "white"))(101)[round(amount * 100) + 1]
+up_light <- lighten(up_dark)
+down_light <- lighten(down_dark)
+
+color_values <- c(
+  "Up - si3d" = up_dark,
+  "Up - si3e" = up_light,
+  "Down - si3d" = down_dark,
+  "Down - si3e" = down_light
+)
+
+plot_df <- sig_counts_si3d_si3e %>%
+  mutate(color_group = factor(paste(Direction, treatment, sep = " - "), levels = names(color_values)))
+
+dodge <- position_dodge(width = 0.7)
+x_max <- max(plot_df$n) * 1.15
+
+p_si3d_si3e <- ggplot(plot_df, aes(y = Direction, x = n, fill = color_group)) +
+  geom_col(position = dodge, width = 0.6) +
+  geom_text(aes(label = n), position = dodge, hjust = -0.2, size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = 0, linewidth = 1) +
+  scale_fill_manual(values = color_values) +
+  scale_x_continuous(limits = c(0, x_max)) +
+  labs(title = "eIF3d/eIF3e knockdown TE changes: si3d/si3e vs sictrl, normoxia (1+4hr)",
+       x = "# sig genes (padj < 0.05, |log2FC| >= 0.5)", y = NULL, fill = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        axis.line.x = element_line(linewidth = 0.9),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+p_si3d_si3e
+ggsave(here("plots/03_bar_te_si3d_si3e_normoxia.pdf"), plot = p_si3d_si3e, width = 6, height = 3.5)
+```
+
+# Save results
+
+```{r save_results}
+write_csv(sig_counts_si3d_si3e, here("output/spikein_literature_comparison/03_sig_te_counts_si3d_si3e.csv"))
+cat("Saved si3d/si3e TE sig gene counts to output/spikein_literature_comparison/\n")
+```
+
+# Literature comparison: Lin et al. 2020 (MCF-10A, eIF3e knockdown)
+
+Lin Y, et al. "eIF3 Associates with 80S Ribosomes to Promote Translation
+Elongation, Mitochondrial Homeostasis, and Muscle Health." *Molecular Cell*
+2020. DOI: 10.1016/j.molcel.2020.06.003. Ribosome profiling data: GEO
+GSE131074.
+
+- **Cell type:** MCF-10A (human non-tumorigenic breast epithelial cell
+  line) — not a hypoxia experiment; this is a baseline (normoxic) eIF3e
+  knockdown, so it compares against our si3e-vs-sictrl normoxia (1+4hr)
+  number above, not a hypoxia condition.
+- **Knockdown:** si-eIF3e (siRNA), 72h, vs si-Ctrl, triplicate.
+- **Method:** ribosome profiling (RPF) + total RNA-seq (matched design to
+  our RNA/Ribo/TE setup).
+- **Their significance criteria** (results text, quoted directly by Kate
+  from the paper): "several hundred significant changes in translational
+  efficiency (TE) defined as changes in ribosome protected fragments (RPFs,
+  p < 0.01) but not in total mRNA (p > 0.01)." **No log2FC magnitude
+  threshold** and **raw p, not padj/FDR** — a materially different, more
+  idiosyncratic scheme than ours (`padj < 0.05, |log2FC| >= 0.5`) or
+  Hettiarachchi/Shen's (padj/FDR + |log2FC| magnitude cutoffs). Counts below
+  are their own reported totals, not recomputed under our thresholds.
+- **Group identity, confirmed from Figure 1C itself** (Kate provided the
+  actual figure image): y-axis = `log2 RPF (si-eIF3e/si-Ctrl)`. The
+  **orange group is "220 up"** (positive y = RPF higher in the KD),
+  enriched for Transmembrane/Mitochondrion/Glycoprotein/ER-Golgi
+  transport/Translation. The **blue group is "240 down"** (negative y =
+  RPF lower in the KD), enriched for Cell-cell adhesion/mRNA
+  processing/Pentose phosphate pathway/Exonuclease/Ubiquitin ligase
+  activity. This matches the paper's results-text prose, not the
+  figure-legend-style text Kate found earlier (which had misattributed
+  240↔orange and 220↔blue relative to the actual figure).
+- **Why this is not a simple reciprocal sign-flip.** A naive flip (their
+  fold change is KD-over-control, ours is control-over-KD, so just negate)
+  would call the 220 "up-in-RPF" mitochondrial/transmembrane group
+  eIF3e-**inhibited**. But the paper's own results section is explicitly
+  titled *"Loss of eIF3e Curbs the Synthesis of Mitochondrial Proteins
+  Despite Paradoxical Effects on Ribosome Occupancy"* — i.e., RPF
+  occupancy going **up** for this group in the KD is a documented
+  **paradox** caused by ribosome stalling/queueing during defective
+  elongation, not increased productive translation. The paper validates
+  this with pulsed-SILAC: actual mitochondrial protein *synthesis*
+  **decreases** in the KD, confirming eIF3e **promotes** this group,
+  the opposite of what the raw RPF-ratio sign alone would suggest. The
+  paper's Highlights state this directly: "eIF3-via eIF3e-promotes mRNA
+  selective early translation elongation" of "membrane, secretory, and
+  organelle targeted proteins" — exactly the 220/orange group.
+- **Mapping used here:**
+  - **220 mRNAs** (orange, "up" in RPF, mitochondrial/transmembrane) =
+    eIF3e-**promoted** per the paper's SILAC-validated conclusion = our
+    **Up**.
+  - **240 mRNAs** (blue, "down" in RPF, cell adhesion/mRNA processing) =
+    our **Down** (eIF3e-inhibited/not part of the elongation-promoted
+    group).
+
+```{r combine_si3e_and_lin}
+lin_groups <- tribble(
+  ~source, ~Direction, ~n,
+  "Lin et al. 2020<br>(MCF-10A, si-eIF3e 72h, RPF p<0.01 & mRNA p>0.01)", "Up", 220,
+  "Lin et al. 2020<br>(MCF-10A, si-eIF3e 72h, RPF p<0.01 & mRNA p>0.01)", "Down", 240
+)
+
+our_si3e <- sig_counts_si3d_si3e %>%
+  filter(treatment == "si3e") %>%
+  transmute(source = "**si3e (1+4hr)**", Direction, n = n)
+
+si3e_source_levels <- c(
+  "**si3e (1+4hr)**",
+  "Lin et al. 2020<br>(MCF-10A, si-eIF3e 72h, RPF p<0.01 & mRNA p>0.01)"
+)
+
+si3e_vs_lin <- bind_rows(our_si3e, lin_groups) %>%
+  mutate(Direction = factor(Direction, levels = c("Up", "Down")),
+         source = factor(source, levels = si3e_source_levels))
+
+print(si3e_vs_lin)
+```
+
+```{r plot_si3e_vs_lin, fig.width=7.5, fig.height=3.5}
+dodge2 <- position_dodge(width = 0.7)
+x_pad3 <- 0.15 * max(si3e_vs_lin$n)
+
+p_si3e_vs_lin <- ggplot(si3e_vs_lin, aes(y = source, x = n, fill = Direction)) +
+  geom_col(position = dodge2, width = 0.6) +
+  geom_text(aes(label = n), position = dodge2, hjust = -0.25, size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = 0, linewidth = 1) +
+  scale_fill_manual(values = c(Up = up_dark, Down = down_dark)) +
+  scale_x_continuous(limits = c(0, max(si3e_vs_lin$n) + x_pad3)) +
+  scale_y_discrete(limits = rev(si3e_source_levels)) +
+  labs(title = "eIF3e TE changes: ours (si3e vs sictrl, normoxia, 1+4hr) vs Lin et al. 2020 (MCF-10A)",
+       subtitle = "Ours uses OUR cutoffs (padj < 0.05, |log2FC| >= 0.5). Lin et al. counts are their own reported totals (RPF p < 0.01, mRNA p > 0.01, no LFC threshold), sign-flipped to match our eIF3e-promotes convention.",
+       x = "# sig genes", y = NULL, fill = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(color = "grey40", size = 8),
+        axis.line.x = element_line(linewidth = 0.9),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_markdown(size = 9.5))
+
+p_si3e_vs_lin
+ggsave(here("plots/03_bar_si3e_vs_lin.pdf"), plot = p_si3e_vs_lin, width = 7.5, height = 3.5)
+```
+
+# Literature comparison: Okubo et al. 2025 (human iPSC, EIF3D knockdown)
+
+Okubo C, et al. "EIF3D safeguards the homeostasis of key signaling pathways
+in human primed pluripotency." *Science Advances* 2025;11:eadq5484. PMC
+PMC11980838.
+
+- **Cell type:** human iPSC lines **WTB6** and **1B4** (CRISPRi Gen 1 clone
+  4 derived from WTB6) — not a hypoxia experiment; baseline (normoxic)
+  EIF3D loss-of-function, so it compares against our si3d-vs-sictrl
+  normoxia (1+4hr) number, not a hypoxia condition.
+- **Knockdown:** CRISPRi (doxycycline-inducible), harvested day 3
+  post-doxycycline.
+- **No spike-in normalization used** — confirmed directly: "Read counting
+  and normalization were performed using fp-count and DESeq2,
+  respectively" (standard library-size normalization, no ERCC or
+  exogenous spike-ins).
+- **Their cutoffs:** padj < 0.05 AND |log2FC| > 1 — same padj threshold as
+  ours, but double the LFC magnitude (ours is |log2FC| >= 0.5).
+- **Sign convention — flipped to match ours.** Their fold-change formula,
+  quoted directly from methods: `Fold change_i = TE_i(sgEIF3D) /
+  TE_i(control)` — i.e., **KD-over-control**, confirmed explicit (not a
+  paradox case like Lin et al. above — no stalling/occupancy caveat noted
+  in this paper). Ours is `log2(sictrl / si3d)` (control-over-KD), the
+  reciprocal direction. So:
+  - Their **402 genes, increased in the KD** = TE higher in sgEIF3D = our
+    `te_lfc < 0` = our **Down** (eIF3d-inhibited).
+  - Their **919 genes, decreased in the KD** = TE lower in sgEIF3D = our
+    `te_lfc > 0` = our **Up** (eIF3d-promoted).
+
+```{r combine_si3d_and_okubo}
+okubo_groups <- tribble(
+  ~source, ~Direction, ~n,
+  "Okubo et al. 2025<br>(human iPSC, EIF3D CRISPRi day 3, padj<0.05 & |log2FC|>1)", "Down", 402,
+  "Okubo et al. 2025<br>(human iPSC, EIF3D CRISPRi day 3, padj<0.05 & |log2FC|>1)", "Up", 919
+)
+
+our_si3d <- sig_counts_si3d_si3e %>%
+  filter(treatment == "si3d") %>%
+  transmute(source = "**si3d (1+4hr)**", Direction, n = n)
+
+si3d_source_levels <- c(
+  "**si3d (1+4hr)**",
+  "Okubo et al. 2025<br>(human iPSC, EIF3D CRISPRi day 3, padj<0.05 & |log2FC|>1)"
+)
+
+si3d_vs_okubo <- bind_rows(our_si3d, okubo_groups) %>%
+  mutate(Direction = factor(Direction, levels = c("Up", "Down")),
+         source = factor(source, levels = si3d_source_levels))
+
+print(si3d_vs_okubo)
+```
+
+```{r plot_si3d_vs_okubo, fig.width=7.5, fig.height=3.5}
+dodge3 <- position_dodge(width = 0.7)
+x_pad4 <- 0.15 * max(si3d_vs_okubo$n)
+
+p_si3d_vs_okubo <- ggplot(si3d_vs_okubo, aes(y = source, x = n, fill = Direction)) +
+  geom_col(position = dodge3, width = 0.6) +
+  geom_text(aes(label = n), position = dodge3, hjust = -0.25, size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = 0, linewidth = 1) +
+  scale_fill_manual(values = c(Up = up_dark, Down = down_dark)) +
+  scale_x_continuous(limits = c(0, max(si3d_vs_okubo$n) + x_pad4)) +
+  scale_y_discrete(limits = rev(si3d_source_levels)) +
+  labs(title = "eIF3d TE changes: ours (si3d vs sictrl, normoxia, 1+4hr) vs Okubo et al. 2025 (human iPSC)",
+       subtitle = "Ours uses OUR cutoffs (padj < 0.05, |log2FC| >= 0.5). Okubo et al. counts are their own reported totals (padj < 0.05, |log2FC| > 1), sign-flipped to match our eIF3d-promotes convention.",
+       x = "# sig genes", y = NULL, fill = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(color = "grey40", size = 8),
+        axis.line.x = element_line(linewidth = 0.9),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_markdown(size = 9.5))
+
+p_si3d_vs_okubo
+ggsave(here("plots/03_bar_si3d_vs_okubo.pdf"), plot = p_si3d_vs_okubo, width = 7.5, height = 3.5)
+```
+
+# Literature comparison: Herrmannová et al. 2024 (HeLa, eIF3d and eIF3e knockdown)
+
+Herrmannová A, et al. "Perturbations in eIF3 subunit stoichiometry alter
+expression of ribosomal proteins and key components of the MAPK signaling
+pathways." *eLife* 2024;13:e95846. DOI: 10.7554/eLife.95846. PMC PMC11534336.
+
+- **Cell type:** HeLa cells — not a hypoxia experiment; baseline (normoxic)
+  siRNA knockdown, so it compares against our si3d/si3e-vs-sictrl normoxia
+  (1+4hr) numbers.
+- **Knockdown:** siRNA against eIF3d or eIF3e (also eIF3h, not used here),
+  vs non-targeting (NT) control; duration not explicitly stated in the
+  text retrieved (16-32-fold mRNA knockdown efficiency by qPCR).
+- **No spike-in normalization found** in the methods text retrieved — DESeq2
+  standard library-size normalization ("Using the R DESeq2 package, we
+  identified transcripts with significantly altered TE"). The full methods
+  section could not be completely retrieved, so this is reported with
+  slightly less confidence than the explicit statements for Lin et al. and
+  Okubo et al. above.
+- **Their cutoffs:** padj < 0.05 only — **no log2FC magnitude threshold**
+  stated, unlike ours (`padj < 0.05, |log2FC| >= 0.5`).
+- **Sign convention — flipped to match ours.** "Up"/"down" in their reported
+  DTEG (differential TE gene) counts refer to increased/decreased TE **in
+  the knockdown relative to the NT control** (confirmed directly), the same
+  KD-over-control direction as Okubo et al. above (no stalling/paradox
+  caveat noted for this paper). So:
+  - Their **eIF3e-KD: 1180 DTEGs total (622 down, 558 up in the KD).**
+    558 up-in-KD → our `te_lfc < 0` → our **Down** = 558. 622 down-in-KD →
+    our `te_lfc > 0` → our **Up** = 622.
+  - Their **eIF3d-KD: 1971 DTEGs total (1040 down, 931 up in the KD).**
+    931 up-in-KD → our **Down** = 931. 1040 down-in-KD → our **Up** = 1040.
+
+```{r combine_si3d_si3e_and_herrmannova}
+herrmannova_groups <- tribble(
+  ~source, ~target, ~Direction, ~n,
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3D, padj<0.05, no LFC threshold)", "eIF3d", "Up", 1040,
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3D, padj<0.05, no LFC threshold)", "eIF3d", "Down", 931,
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3E, padj<0.05, no LFC threshold)", "eIF3e", "Up", 622,
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3E, padj<0.05, no LFC threshold)", "eIF3e", "Down", 558
+)
+
+our_si3d_si3e_labeled <- sig_counts_si3d_si3e %>%
+  mutate(
+    target = recode(as.character(treatment), si3d = "eIF3d", si3e = "eIF3e"),
+    source = paste0("**", as.character(treatment), " (1+4hr)**")
+  ) %>%
+  dplyr::select(source, target, Direction, n)
+
+target_levels <- c("eIF3d", "eIF3e")
+si3d_si3e_source_levels <- c(
+  "**si3d (1+4hr)**", "Herrmannova et al. 2024<br>(HeLa, siEIF3D, padj<0.05, no LFC threshold)",
+  "**si3e (1+4hr)**", "Herrmannova et al. 2024<br>(HeLa, siEIF3E, padj<0.05, no LFC threshold)"
+)
+
+si3d_si3e_vs_herrmannova <- bind_rows(our_si3d_si3e_labeled, herrmannova_groups) %>%
+  mutate(
+    Direction = factor(Direction, levels = c("Up", "Down")),
+    target = factor(target, levels = target_levels),
+    source = factor(source, levels = si3d_si3e_source_levels)
+  )
+
+print(si3d_si3e_vs_herrmannova)
+```
+
+```{r plot_si3d_si3e_vs_herrmannova, fig.width=7.5, fig.height=5.5}
+dodge4 <- position_dodge(width = 0.7)
+x_pad5 <- 0.15 * max(si3d_si3e_vs_herrmannova$n)
+
+p_si3d_si3e_vs_herrmannova <- ggplot(si3d_si3e_vs_herrmannova, aes(y = source, x = n, fill = Direction)) +
+  geom_col(position = dodge4, width = 0.6) +
+  geom_text(aes(label = n), position = dodge4, hjust = -0.25, size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = 0, linewidth = 1) +
+  scale_fill_manual(values = c(Up = up_dark, Down = down_dark)) +
+  scale_x_continuous(limits = c(0, max(si3d_si3e_vs_herrmannova$n) + x_pad5)) +
+  scale_y_discrete(limits = rev(si3d_si3e_source_levels)) +
+  facet_wrap(~target, ncol = 1, scales = "free_y") +
+  labs(title = "eIF3d/eIF3e TE changes: ours (normoxia, 1+4hr) vs Herrmannova et al. 2024 (HeLa)",
+       subtitle = "Ours uses OUR cutoffs (padj < 0.05, |log2FC| >= 0.5). Herrmannova et al. counts are their own reported totals (padj < 0.05, no LFC threshold), sign-flipped to match our eIF3d/eIF3e-promotes convention.",
+       x = "# sig genes", y = NULL, fill = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(color = "grey40", size = 8),
+        axis.line.x = element_line(linewidth = 0.9),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_markdown(size = 9.5),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", size = 13))
+
+p_si3d_si3e_vs_herrmannova
+ggsave(here("plots/03_bar_si3d_si3e_vs_herrmannova.pdf"), plot = p_si3d_si3e_vs_herrmannova, width = 7.5, height = 5.5)
+```
+
+# Combined plot: all sources, separate plots for eIF3d and eIF3e
+
+Everything from this notebook, as two separate figures (one per target) —
+ours (si3d/si3e, 1+4hr) plus Lin et al. 2020, Okubo et al. 2025, and
+Herrmannova et al. 2024. Each source's own caveats (cutoffs, spike-in
+status, sign-flip logic) are documented in the sections above; these plots
+do not repeat them, only the comparison itself.
+
+```{r combine_all_sources}
+lin_groups_labeled <- lin_groups %>% mutate(target = "eIF3e")
+okubo_groups_labeled <- okubo_groups %>% mutate(target = "eIF3d")
+
+all_source_levels <- c(
+  "**si3d (1+4hr)**",
+  "Okubo et al. 2025<br>(human iPSC, EIF3D CRISPRi day 3, padj<0.05 & |log2FC|>1)",
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3D, padj<0.05, no LFC threshold)",
+  "**si3e (1+4hr)**",
+  "Lin et al. 2020<br>(MCF-10A, si-eIF3e 72h, RPF p<0.01 & mRNA p>0.01)",
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3E, padj<0.05, no LFC threshold)"
+)
+
+all_vs_literature <- bind_rows(
+  our_si3d_si3e_labeled,
+  lin_groups_labeled,
+  okubo_groups_labeled,
+  herrmannova_groups
+) %>%
+  mutate(
+    Direction = factor(Direction, levels = c("Up", "Down")),
+    target = factor(target, levels = target_levels),
+    source = factor(source, levels = all_source_levels)
+  )
+
+print(all_vs_literature)
+```
+
+Color now maps to **source/dataset** (Okabe-Ito palette) instead of
+Direction, so it's immediately visible whose data each bar is: ours (si3d =
+orange, si3e = sky blue) vs. each literature source in its own remaining
+Okabe-Ito color. Since color no longer distinguishes Up from Down, that's
+carried by transparency instead (Up = solid, Down = faded) plus the value
+labels.
+
+```{r plot_all_vs_literature, fig.width=8, fig.height=4}
+source_colors <- c(
+  "**si3d (1+4hr)**" = "#E69F00",
+  "**si3e (1+4hr)**" = "#56B4E9",
+  "Okubo et al. 2025<br>(human iPSC, EIF3D CRISPRi day 3, padj<0.05 & |log2FC|>1)" = "#009E73",
+  "Lin et al. 2020<br>(MCF-10A, si-eIF3e 72h, RPF p<0.01 & mRNA p>0.01)" = "#CC79A7",
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3D, padj<0.05, no LFC threshold)" = "#D55E00",
+  "Herrmannova et al. 2024<br>(HeLa, siEIF3E, padj<0.05, no LFC threshold)" = "#D55E00"
+)
+
+make_target_plot <- function(df, target_label) {
+  df <- droplevels(df)
+  source_levels_local <- intersect(all_source_levels, levels(df$source))
+  dodge_local <- position_dodge(width = 0.7)
+  x_pad_local <- 0.15 * max(df$n)
+
+  ggplot(df, aes(y = source, x = n, fill = source, group = Direction)) +
+    geom_col(position = dodge_local, width = 0.6) +
+    geom_text(aes(label = n, color = Direction), position = dodge_local,
+              hjust = -0.25, size = 3.5, fontface = "bold", key_glyph = "point") +
+    geom_vline(xintercept = 0, linewidth = 1) +
+    scale_fill_manual(values = source_colors, guide = "none") +
+    scale_color_manual(values = c(Up = up_dark, Down = down_dark), name = NULL) +
+    scale_x_continuous(limits = c(0, max(df$n) + x_pad_local)) +
+    scale_y_discrete(limits = rev(source_levels_local)) +
+    guides(color = guide_legend(override.aes = list(size = 4))) +
+    labs(title = paste0(target_label, " TE changes: ours (normoxia, 1+4hr) vs all literature comparisons"),
+         subtitle = "Ours uses OUR cutoffs (padj < 0.05, |log2FC| >= 0.5). Each literature source uses its own reported totals and cutoffs (see sections above), sign-flipped to match our promotes convention. Bar color = source; label color = Up (vermillion) / Down (blue).",
+         x = "# sig genes", y = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top",
+          plot.subtitle = element_text(color = "grey40", size = 8),
+          axis.line.x = element_line(linewidth = 0.9),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_markdown(size = 9.5))
+}
+
+p_all_vs_literature_eif3d <- make_target_plot(all_vs_literature %>% filter(target == "eIF3d"), "eIF3d")
+p_all_vs_literature_eif3d
+ggsave(here("plots/03_bar_all_vs_literature_eif3d.pdf"), plot = p_all_vs_literature_eif3d, width = 8, height = 4)
+
+p_all_vs_literature_eif3e <- make_target_plot(all_vs_literature %>% filter(target == "eIF3e"), "eIF3e")
+p_all_vs_literature_eif3e
+ggsave(here("plots/03_bar_all_vs_literature_eif3e.pdf"), plot = p_all_vs_literature_eif3e, width = 8, height = 4)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
