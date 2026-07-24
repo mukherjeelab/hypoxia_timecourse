@@ -303,20 +303,65 @@ cat("CTG pooled RSCU — hypoxia:", round(rscu_hyp["CTG"], 3),
 ```
 
 ```{r bootstrap}
-cat("Running bootstrap with", n_boot, "iterations...\n")
-set.seed(seed)
+# The bootstrap is the slow step in this notebook, and its CIs feed build_results
+# and three downstream error-bar plots, so it cannot simply be skipped. Instead the
+# resampled matrices are cached to RDS: the first run computes and saves them, every
+# later run loads them. Delete the cache file (or change n_boot / seed / either gene
+# set) to force a recompute -- the stored key below detects those changes for you.
+boot_cache_path <- here("output", "predictive_modeling", "54_bootstrap_pooled_rscu.rds")
+# as.integer throughout: identical() is type-strict, so a key field arriving as
+# double in one run and integer in another (e.g. if the YAML params block above is
+# re-enabled) would spuriously invalidate an otherwise-valid cache.
+boot_key <- list(n_boot   = as.integer(n_boot),
+                 seed     = as.integer(seed),
+                 n_hyp_tx = as.integer(length(hyp_tx)),
+                 n_nor_tx = as.integer(length(nor_tx)),
+                 n_codons = as.integer(ncol(counts_mat0)))
 
-boot_list <- lapply(seq_len(n_boot), function(i) {
-  b_hyp  <- sample(hyp_tx, length(hyp_tx), replace = TRUE)
-  b_nor  <- sample(nor_tx, length(nor_tx), replace = TRUE)
-  rscu_h <- compute_pooled_rscu(b_hyp, counts_mat0, bg_props_pooled)
-  rscu_n <- compute_pooled_rscu(b_nor, counts_mat0, bg_props_pooled)
-  list(hyp = rscu_h, nor = rscu_n, delta = rscu_h - rscu_n)
-})
+boot_cache <- NULL
+if (file.exists(boot_cache_path)) {
+  cached <- readRDS(boot_cache_path)
+  if (identical(cached$key, boot_key)) {
+    boot_cache <- cached
+    cat("Loaded cached bootstrap (", n_boot, "iterations ) from",
+        basename(boot_cache_path), "\n")
+  } else {
+    cat("Bootstrap cache found but inputs changed -- recomputing.\n")
+  }
+}
 
-boot_delta_mat <- do.call(cbind, lapply(boot_list, `[[`, "delta"))
-boot_hyp_mat   <- do.call(cbind, lapply(boot_list, `[[`, "hyp"))
-boot_nor_mat   <- do.call(cbind, lapply(boot_list, `[[`, "nor"))
+if (is.null(boot_cache)) {
+  cat("Running bootstrap with", n_boot, "iterations...\n")
+  set.seed(seed)
+
+  boot_list <- lapply(seq_len(n_boot), function(i) {
+    b_hyp  <- sample(hyp_tx, length(hyp_tx), replace = TRUE)
+    b_nor  <- sample(nor_tx, length(nor_tx), replace = TRUE)
+    rscu_h <- compute_pooled_rscu(b_hyp, counts_mat0, bg_props_pooled)
+    rscu_n <- compute_pooled_rscu(b_nor, counts_mat0, bg_props_pooled)
+    list(hyp = rscu_h, nor = rscu_n, delta = rscu_h - rscu_n)
+  })
+
+  boot_cache <- list(
+    key       = boot_key,
+    delta_mat = do.call(cbind, lapply(boot_list, `[[`, "delta")),
+    hyp_mat   = do.call(cbind, lapply(boot_list, `[[`, "hyp")),
+    nor_mat   = do.call(cbind, lapply(boot_list, `[[`, "nor"))
+  )
+  saveRDS(boot_cache, boot_cache_path)
+  cat("Bootstrap cached to", basename(boot_cache_path), "\n")
+}
+
+boot_delta_mat <- boot_cache$delta_mat
+boot_hyp_mat   <- boot_cache$hyp_mat
+boot_nor_mat   <- boot_cache$nor_mat
+
+stopifnot(
+  "cached bootstrap has wrong number of iterations" = ncol(boot_delta_mat) == n_boot,
+  "cached bootstrap matrices disagree on codon count" =
+    nrow(boot_delta_mat) == nrow(boot_hyp_mat) &&
+    nrow(boot_hyp_mat)   == nrow(boot_nor_mat)
+)
 
 delta_ci_lo <- apply(boot_delta_mat, 1, quantile, 0.025, na.rm = TRUE)
 delta_ci_hi <- apply(boot_delta_mat, 1, quantile, 0.975, na.rm = TRUE)
@@ -1188,13 +1233,13 @@ cat("Genes per quantile bin:\n"); print(bin_medians)
 lfc_q_all <- bind_rows(hyp_q, nor_q) %>%
   mutate(
     quantile_bin = factor(quantile_bin),
-    condition    = factor(condition, levels = c("Hypoxia 1hr", "Normoxia 1+4hr"))
+    condition    = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr"))
   )
 
 bin_medians_fct <- bin_medians %>%
   mutate(
     quantile_bin = factor(quantile_bin),
-    condition    = factor(condition, levels = c("Hypoxia 1hr", "Normoxia 1+4hr"))
+    condition    = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr"))
   )
 
 bg_gc3_median <- gc3_gene %>%
@@ -1289,13 +1334,13 @@ cat("Genes per GC3 quantile bin:\n"); print(gc3_bin_medians)
 gc3q_all <- bind_rows(hyp_gc3q, nor_gc3q) %>%
   mutate(
     gc3_bin   = factor(gc3_bin),
-    condition = factor(condition, levels = c("Hypoxia 1hr", "Normoxia 1+4hr"))
+    condition = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr"))
   )
 
 gc3_bin_medians_fct <- gc3_bin_medians %>%
   mutate(
     gc3_bin   = factor(gc3_bin),
-    condition = factor(condition, levels = c("Hypoxia 1hr", "Normoxia 1+4hr"))
+    condition = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr"))
   )
 
 p_te_gc3_quantile <- ggplot(gc3q_all,
@@ -1339,7 +1384,7 @@ dot_df <- bind_rows(hyp_gc3q, nor_gc3q) %>%
     n       = n(),
     .groups = "drop"
   ) %>%
-  mutate(condition = factor(condition, levels = c("Hypoxia 1hr", "Normoxia 1+4hr")))
+  mutate(condition = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr")))
 
 stopifnot(
   "dot_df should have 16 rows (8 bins x 2 conditions)" = nrow(dot_df) == 16,
@@ -1378,7 +1423,7 @@ lfc_df_all <- bind_rows(
   inner_join(gc3_gene %>% dplyr::select(ensembl_gene, gc3_frac, group),
              by = c("gene_id_clean" = "ensembl_gene")) %>%
   filter(!is.na(te_lfc), !is.na(gc3_frac)) %>%
-  mutate(condition = factor(condition, levels = c("Hypoxia 1hr", "Normoxia 1+4hr")))
+  mutate(condition = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr")))
 
 stopifnot(
   "lfc_df_all has no rows"            = nrow(lfc_df_all) > 100,
@@ -1411,10 +1456,153 @@ p_te_gc3_scatter <- ggplot(lfc_df_all,
     x        = "GC3 content (%)",
     y        = "TE LFC (positive = eIF3d promotes)"
   ) +
-  theme_classic(base_size = 12)+
-  ylim(-1,2)
+  theme_classic(base_size = 12) +
+  # coord_cartesian, not ylim: ylim() would drop out-of-range rows before
+  # stat_smooth runs, fitting the line to a truncated sample while rho uses all genes.
+  coord_cartesian(ylim = c(-1, 2))
 p_te_gc3_scatter
 ggsave(here("plots", "54_te_lfc_gc3_scatter.pdf"), p_te_gc3_scatter, width = 8, height = 4)
+```
+
+```{r te_lfc_gc_region_scatter, fig.width=12, fig.height=6}
+# Same scatter as above, but for GC content of each mRNA region instead of GC3.
+# GC columns come straight from the feature matrix (01_) and are already in percent.
+# Ordered 5' -> 3' along the transcript; "Whole mRNA" is plotted separately below.
+gc_region_cols <- c(
+  "Whole mRNA" = "transcript_gc",
+  "5' UTR"     = "utr5_gc",
+  "CDS"        = "cds_gc",
+  "3' UTR"     = "utr3_gc"
+)
+stopifnot("GC region columns missing from feature matrix" =
+            all(gc_region_cols %in% colnames(feature_matrix)))
+
+gc_region_gene <- feature_matrix %>%
+  dplyr::select(gene_id_clean, dplyr::all_of(unname(gc_region_cols))) %>%
+  distinct(gene_id_clean, .keep_all = TRUE) %>%
+  pivot_longer(-gene_id_clean, names_to = "gc_col", values_to = "gc_pct") %>%
+  # factor() maps column name -> facet label in one step; an unmatched column
+  # would become NA and trip the "not all 4 GC regions present" check below
+  mutate(gc_region = factor(gc_col,
+                            levels = unname(gc_region_cols),
+                            labels = names(gc_region_cols)))
+
+# transcript_gc is NA on exactly the rows where utr3_gc is NA (genes with no
+# annotated 3'UTR), so those two panels carry fewer genes than 5'UTR / CDS.
+n_dropped_gc <- gc_region_gene %>%
+  filter(is.na(gc_pct)) %>%
+  dplyr::count(gc_region, name = "n_missing")
+cat("Genes dropped per GC region (no annotated UTR):\n"); print(n_dropped_gc)
+
+gc_region_gene <- gc_region_gene %>% filter(!is.na(gc_pct))
+
+stopifnot(
+  "GC percentages out of [0,100]" = all(gc_region_gene$gc_pct >= 0 &
+                                        gc_region_gene$gc_pct <= 100),
+  "not all 4 GC regions present"  = n_distinct(gc_region_gene$gc_region) == 4,
+  "unmapped GC column (NA facet label)" = !any(is.na(gc_region_gene$gc_region))
+)
+
+# Biological spot-check: guards against a column/label swap, which range checks
+# cannot catch. Human mRNAs are GC-rich at the 5' end and AT-rich at the 3' end,
+# so median GC must order 5'UTR > CDS > 3'UTR.
+gc_region_medians <- gc_region_gene %>%
+  group_by(gc_region) %>%
+  summarise(med = median(gc_pct), .groups = "drop")
+cat("Median GC% per region:\n"); print(gc_region_medians %>% mutate(med = round(med, 1)))
+
+med_by <- setNames(gc_region_medians$med, as.character(gc_region_medians$gc_region))
+stopifnot(
+  "5'UTR GC should exceed CDS GC" = med_by[["5' UTR"]] > med_by[["CDS"]],
+  "CDS GC should exceed 3'UTR GC" = med_by[["CDS"]]   > med_by[["3' UTR"]],
+  "whole-mRNA GC should sit between 3'UTR and 5'UTR medians" =
+    med_by[["Whole mRNA"]] > med_by[["3' UTR"]] & med_by[["Whole mRNA"]] < med_by[["5' UTR"]]
+)
+
+lfc_gc_region <- bind_rows(
+  tc_nor_clean %>% dplyr::select(gene_id_clean, te_lfc, symbol) %>% mutate(condition = "Normoxia"),
+  tc_hyp       %>% dplyr::select(gene_id_clean, te_lfc, symbol) %>% mutate(condition = "Hypoxia 1hr")
+) %>%
+  # one row per gene per condition joined to 4 GC-region rows per gene
+  inner_join(gc_region_gene, by = "gene_id_clean", relationship = "many-to-many") %>%
+  filter(!is.na(te_lfc)) %>%
+  mutate(condition = factor(condition, levels = c("Normoxia", "Hypoxia 1hr")))
+
+stopifnot(
+  "lfc_gc_region has no rows"          = nrow(lfc_gc_region) > 100,
+  "both conditions not present"        = n_distinct(lfc_gc_region$condition) == 2,
+  "non-finite te_lfc in lfc_gc_region" = all(is.finite(lfc_gc_region$te_lfc))
+)
+
+cor_gc_region <- lfc_gc_region %>%
+  group_by(condition, gc_region) %>%
+  summarise(
+    rho     = round(cor(gc_pct, te_lfc, method = "spearman", use = "complete.obs"), 3),
+    n       = n(),
+    .groups = "drop"
+  )
+cat("Spearman rho (regional GC vs TE LFC, all genes):\n"); print(cor_gc_region)
+
+# Shared layer stack: the whole-mRNA plot and the per-region plot differ only in
+# which rows they draw and how they facet.
+# coord_cartesian, not ylim: ylim() drops out-of-range rows before stat_smooth
+# runs, which would fit the line to a truncated sample while rho above uses all
+# genes. This zooms the axis instead, leaving the fit on the full data.
+gc_scatter_layers <- list(
+  geom_hline(yintercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.5),
+  geom_point(size = 0.5, alpha = 0.2, colour = "grey40"),
+  geom_smooth(method = "lm", se = FALSE, colour = "#E69F00", linewidth = 0.9),
+  theme_classic(base_size = 12),
+  theme(strip.text = element_text(face = "bold")),
+  coord_cartesian(ylim = c(-1, 2))
+)
+# Wrapped onto two lines so it fits the narrower whole-mRNA panel (8in wide).
+gc_scatter_subtitle <- paste0("One dot per mRNA; line = lm fit; Spearman rho per panel\n",
+                             "Normoxia = 1+4hr, time regressed; hypoxia = 1hr")
+
+# --- Plot 1: whole mRNA, on its own ---
+p_te_gc_whole <- ggplot(lfc_gc_region %>% filter(gc_region == "Whole mRNA"),
+                        aes(x = gc_pct, y = te_lfc)) +
+  gc_scatter_layers +
+  geom_text(data = cor_gc_region %>% filter(gc_region == "Whole mRNA"),
+            aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
+            colour = "black", hjust = 1.1, vjust = 1.3, size = 3.5,
+            inherit.aes = FALSE) +
+  facet_wrap(~ condition, nrow = 1) +
+  labs(
+    title    = "TE LFC vs whole-mRNA GC content (MDA-MB-231, all expressed genes)",
+    subtitle = gc_scatter_subtitle,
+    x        = "Whole mRNA GC content (%)",
+    y        = "TE LFC (positive = eIF3d promotes)"
+  )
+p_te_gc_whole
+ggsave(here("plots", "54_te_lfc_gc_whole_mrna_scatter.pdf"), p_te_gc_whole,
+       width = 8, height = 4)
+
+# --- Plot 2: 5'UTR / CDS / 3'UTR ---
+sub_regions <- c("5' UTR", "CDS", "3' UTR")
+
+p_te_gc_region <- ggplot(lfc_gc_region %>%
+                           filter(gc_region %in% sub_regions) %>%
+                           mutate(gc_region = droplevels(gc_region)),
+                         aes(x = gc_pct, y = te_lfc)) +
+  gc_scatter_layers +
+  geom_text(data = cor_gc_region %>%
+              filter(gc_region %in% sub_regions) %>%
+              mutate(gc_region = droplevels(gc_region)),
+            aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
+            colour = "black", hjust = 1.1, vjust = 1.3, size = 3,
+            inherit.aes = FALSE) +
+  facet_grid(condition ~ gc_region) +
+  labs(
+    title    = "TE LFC vs GC content by mRNA region (MDA-MB-231, all expressed genes)",
+    subtitle = gc_scatter_subtitle,
+    x        = "GC content (%)",
+    y        = "TE LFC (positive = eIF3d promotes)"
+  )
+p_te_gc_region
+ggsave(here("plots", "54_te_lfc_gc_by_region_scatter.pdf"), p_te_gc_region,
+       width = 10, height = 6)
 ```
 
 ```{r aa_codon_proportion, fig.width=7, fig.height=4}
