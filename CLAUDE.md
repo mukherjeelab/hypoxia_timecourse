@@ -28,24 +28,6 @@ Check here before writing new helpers. Three key functions:
 - **`categorize_translation_changes()`** — classifies genes into Forwarded / Exclusive / Buffered / TE_only categories. The function's own default parameter is `lfc_cutoff = log2(1.5) ≈ 0.585`, but this default is never actually used — every call site in the codebase (`rna_ribo_te_analysis.Rmd`, `timecourse_qc.Rmd`, `eif3e_eif3d_normoxia_and_hypoxia.Rmd`, 39 calls total) explicitly overrides it to `lfc_cutoff = 0.0`, so the `category` column reflects significance by `padj` alone with no magnitude filter. **The project's real fold-change standard is 0.5** (used for gene sets, negative controls, and everywhere else) — it's applied as a separate filter directly on `te_lfc`/`te_padj` *after* this function runs, not through its `lfc_cutoff` argument. Don't read the `log2(1.5)` default as "the project convention"; it isn't exercised anywhere.
 - **`createNormMatrix()`** — DESeq2 normalization with optional spike-in support; uses the TE interaction design.
 
-## Repository Structure
-
-```
-code/                        # All analysis notebooks
-  functions.R                # Shared utility functions — check here before writing new helpers
-  predictive_modeling/       # Feature extraction + ML pipeline (numbered 01–40)
-output/                      # Generated CSVs and RDS files
-  predictive_modeling/       # Feature matrices and RF model outputs
-  genesets/                  # Gene signature CSVs (e.g. hypoxia_3d_promotes_TE_1hr_lfc0.5.csv)
-accessories/
-  human/                     # GENCODE v49 GTF, txdb SQLite, gene annotation table
-  translation_signatures_literature.csv
-  csc_data/                  # CLIP-seq datasets
-plots/                       # All generated PDFs (~01j_*, rscu_*, etc.)
-counts/                      # Raw RNA-seq / ribosome profiling read counts
-cluster_scripts/             # ViennaRNA scripts for secondary structure computation
-```
-
 ## Predictive Modeling Pipeline
 
 The `code/predictive_modeling/` notebooks form a sequential pipeline:
@@ -65,7 +47,7 @@ The `code/predictive_modeling/` notebooks form a sequential pipeline:
 | `01h_` | `feature_matrix_kozak.rds` | Kozak sequence features |
 | `22_cnot3_riboseq_slamseq` | `feature_matrix_cnot3.rds` | Zhu 2024 SLAM-seq half-lives + CNOT3 KO riboseq |
 | `23_dhx29_riboseq_slamseq` | `feature_matrix_dhx29.rds` | Hia 2026 DHX29 SLAM-seq + riboseq occupancy |
-| `01i_` | `feature_matrix_external_stability.rds` | Karner 2026 MDA-MB-231 SLAM-seq (reads `feature_matrix_dhx29.rds`) |
+| `01i_` | `feature_matrix_external_stability.rds` | Karner 2026 MDA-MB-231 SLAM-seq (reads `feature_matrix_cnot3.rds` as its base, then re-joins the DHX29 columns directly from `dhx29_slamseq_halflives.rds` + `dhx29_riboseq_occupancy.rds` — so `23_` must still run first, but `feature_matrix_dhx29.rds` itself is not consumed by this pipeline) |
 | `01j_` | overwrites `feature_matrix_external_stability.rds` | Positional CSC (full CDS + quarters + first 75 codons) |
 | `01k_` | overwrites `feature_matrix_external_stability.rds` | CDS/3'UTR structure features (drops 5'UTR RNAfold cols) |
 | `01l_` | `feature_matrix_codon_features.rds` | bg-corrected RSCU + raw codon frequencies, 121 features (reads `feature_matrix_external_stability.rds`) |
@@ -87,8 +69,6 @@ The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvi
   - `exclude_own_te_features` — removes `indiv_te_*`, `delta_te_*`, `sig_*` columns; set TRUE when pos/neg sets are defined by TE
 - `09_cross_condition_importance_comparison.Rmd` — compare feature importance across two 07 runs; key params:
   - `condition_hyp`, `condition_nor` — condition strings used to construct the 07 output file suffixes (default `"hypoxia"` / `"normoxia"`; set to e.g. `"mcf7six1_hypoxia"` for MCF7-SIX1)
-
-**Analysis notebooks (11–43):** Feature-specific deep dives, external validations, regression models, and MCF7-SIX1 analyses.
 
 ## Integrating External Data from Papers
 
