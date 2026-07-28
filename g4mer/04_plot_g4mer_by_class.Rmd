@@ -1,0 +1,261 @@
+---
+title: "04 - G4mer rG4 scores by gene class and mRNA region"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Plot G4mer rG4 scores by gene class, for each mRNA region.
+
+Classes:
+
+- **All mRNAs** - every scored transcript. Note this background *includes* the
+  promoted set rather than excluding it, so it differs from the "All other genes"
+  category used elsewhere in the project. It takes the same grey80 colour slot.
+- **eIF3d hypoxia promotes** - `output/genesets/hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`
+  (1604 genes)
+- **Negative control** - size-matched to the promoted set within each region,
+  `set.seed(9)`
+
+Reads `output/predictive_modeling/feature_matrix_g4mer.rds`, written by
+`code/predictive_modeling/01u_feature_extraction_g4mer.Rmd`.
+
+Per-region panels use the native `g4mer_max` (stride 10 for the 5'UTR, stride 20 for
+CDS and 3'UTR). Within a panel the stride is constant, so it cancels out of any
+between-class comparison. The final cross-region plot uses `g4mer_max_harmonized`,
+which places all three regions on a stride-20 grid.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+
+set.seed(9)
+```
+
+```{r conventions}
+group_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "grey40",
+  "All mRNAs"              = "grey80"
+)
+
+region_labels <- c(utr5 = "5'UTR", cds = "CDS", utr3 = "3'UTR")
+```
+
+# Load Scores
+
+```{r load_scores}
+fm_path <- here("output", "predictive_modeling", "feature_matrix_g4mer.rds")
+stopifnot("feature_matrix_g4mer.rds not found - knit 01u_ first" = file.exists(fm_path))
+
+g4_wide <- readRDS(fm_path)
+
+g4_long <- g4_wide %>%
+  pivot_longer(
+    cols          = matches("_(utr5|cds|utr3)$"),
+    names_to      = c(".value", "region"),
+    names_pattern = "(.*)_(utr5|cds|utr3)$"
+  ) %>%
+  filter(!is.na(g4mer_max))
+
+stopifnot("expected columns missing after reshape" =
+  all(c("g4mer_max", "g4mer_max_harmonized", "gc_pct", "region_length") %in%
+      colnames(g4_long)))
+stopifnot("g4mer_max outside [0,1]" =
+  all(g4_long$g4mer_max >= 0 & g4_long$g4mer_max <= 1))
+
+cat("Scored transcript-region rows:", nrow(g4_long), "\n")
+g4_long %>% dplyr::count(region)
+```
+
+# Define Gene Classes
+
+```{r gene_classes}
+promotes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE) %>%
+  pull(ensembl_gene) %>% unique()
+
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = length(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes in geneset:", length(promotes), "\n")
+
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  pull(gene_id_clean) %>% unique()
+cat("Negative control pool:", length(neg_pool), "genes\n")
+
+# Size-match within each region: the number of promoted genes carrying an
+# annotated region differs between regions.
+set.seed(9)
+matched_neg <- g4_long %>%
+  group_by(region) %>%
+  group_modify(function(d, key) {
+    n_pos     <- sum(d$gene_id_clean %in% promotes)
+    available <- intersect(neg_pool, d$gene_id_clean)
+    tibble(gene_id_clean = sample(available, min(n_pos, length(available))))
+  }) %>%
+  ungroup()
+
+dat <- g4_long %>%
+  left_join(matched_neg %>% mutate(is_neg = TRUE),
+            by = c("region", "gene_id_clean")) %>%
+  mutate(
+    is_neg = replace_na(is_neg, FALSE),
+    class  = case_when(
+      gene_id_clean %in% promotes ~ "eIF3d hypoxia promotes",
+      is_neg                      ~ "Negative control",
+      TRUE                        ~ NA_character_
+    )
+  )
+
+# "All mRNAs" overlaps the other two classes, so it is stacked on rather than
+# assigned exclusively.
+plot_dat <- bind_rows(
+  dat %>% filter(!is.na(class)),
+  dat %>% mutate(class = "All mRNAs")
+) %>%
+  mutate(
+    class      = factor(class, levels = names(group_colors)),
+    region_lab = factor(region_labels[region], levels = region_labels)
+  )
+
+plot_dat %>% dplyr::count(region_lab, class)
+```
+
+# Statistics
+
+```{r statistics}
+stats_tbl <- plot_dat %>%
+  group_by(region_lab) %>%
+  group_modify(function(d, key) {
+    pos <- d$g4mer_max[d$class == "eIF3d hypoxia promotes"]
+    neg <- d$g4mer_max[d$class == "Negative control"]
+    all <- d$g4mer_max[d$class == "All mRNAs"]
+    tibble(
+      n_pos        = length(pos),
+      n_neg        = length(neg),
+      n_all        = length(all),
+      med_pos      = median(pos),
+      med_neg      = median(neg),
+      med_all      = median(all),
+      p_pos_vs_neg = wilcox.test(pos, neg)$p.value,
+      p_pos_vs_all = wilcox.test(pos, all)$p.value
+    )
+  }) %>% ungroup()
+
+stats_tbl %>%
+  mutate(across(starts_with("med_"), ~ round(.x, 4)),
+         across(starts_with("p_"), ~ format.pval(.x, digits = 3))) %>%
+  print(width = Inf)
+
+# Annotation label carries n, per project convention
+annot <- stats_tbl %>%
+  mutate(label = sprintf("promotes vs neg ctrl p = %s\nn = %d vs %d",
+                         format.pval(p_pos_vs_neg, digits = 3), n_pos, n_neg))
+```
+
+```{r base_theme}
+base_theme <- theme_classic(base_size = 12) + theme(legend.position = "bottom")
+```
+
+# Density
+
+```{r plot_density, fig.width = 9, fig.height = 4.5}
+p_density <- ggplot(plot_dat, aes(x = g4mer_max, fill = class, colour = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ region_lab) +
+  scale_fill_manual(values = group_colors) +
+  scale_colour_manual(values = group_colors) +
+  geom_text(data = annot, inherit.aes = FALSE,
+            aes(x = Inf, y = Inf, label = label),
+            hjust = 1.1, vjust = 1.4, size = 2.8) +
+  labs(x = "G4mer max rG4 probability", y = "Density",
+       fill = NULL, colour = NULL,
+       title = "rG4 propensity by gene class and mRNA region") +
+  base_theme
+
+print(p_density)
+ggsave(here("plots", "g4mer_04_density_by_class.pdf"), p_density,
+       width = 9, height = 4.5)
+```
+
+# Violin and Box
+
+```{r plot_violin, fig.width = 9, fig.height = 5}
+p_violin <- ggplot(plot_dat, aes(x = class, y = g4mer_max, fill = class)) +
+  geom_violin(alpha = 0.35, linewidth = 0.8, scale = "width") +
+  geom_boxplot(width = 0.15, outlier.shape = NA, linewidth = 0.8, fill = "white") +
+  facet_wrap(~ region_lab) +
+  scale_fill_manual(values = group_colors) +
+  geom_text(data = annot, inherit.aes = FALSE,
+            aes(x = Inf, y = Inf, label = label),
+            hjust = 1.1, vjust = 1.4, size = 2.8) +
+  labs(x = NULL, y = "G4mer max rG4 probability", fill = NULL,
+       title = "rG4 propensity by gene class and mRNA region") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(p_violin)
+ggsave(here("plots", "g4mer_04_violin_by_class.pdf"), p_violin,
+       width = 9, height = 5)
+```
+
+# ECDF
+
+These distributions are strongly bimodal, with most transcripts near 0 and a cluster
+near 1. An ECDF avoids the bandwidth smoothing that can hide that structure in a
+density plot.
+
+```{r plot_ecdf, fig.width = 9, fig.height = 4.5}
+p_ecdf <- ggplot(plot_dat, aes(x = g4mer_max, colour = class)) +
+  stat_ecdf(linewidth = 0.8) +
+  facet_wrap(~ region_lab) +
+  scale_colour_manual(values = group_colors) +
+  geom_text(data = annot, inherit.aes = FALSE,
+            aes(x = Inf, y = -Inf, label = label),
+            hjust = 1.1, vjust = -0.4, size = 2.8) +
+  labs(x = "G4mer max rG4 probability", y = "Cumulative fraction",
+       colour = NULL,
+       title = "rG4 propensity by gene class and mRNA region") +
+  base_theme
+
+print(p_ecdf)
+ggsave(here("plots", "g4mer_04_ecdf_by_class.pdf"), p_ecdf, width = 9, height = 4.5)
+```
+
+# Cross-Region at Matched Stride
+
+The 5'UTR was scored at stride 10 and CDS/3'UTR at stride 20, so only the harmonized
+score is comparable across regions. The plots above compare classes *within* a
+region, where stride is constant and cancels.
+
+```{r plot_cross_region, fig.width = 8, fig.height = 5}
+p_harm <- ggplot(plot_dat, aes(x = region_lab, y = g4mer_max_harmonized,
+                               fill = class)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.2, linewidth = 0.8) +
+  scale_fill_manual(values = group_colors) +
+  labs(x = NULL, y = "G4mer max rG4 probability (stride 20, matched)",
+       fill = NULL,
+       title = "rG4 propensity across regions at matched stride") +
+  base_theme
+
+print(p_harm)
+ggsave(here("plots", "g4mer_04_cross_region_matched_stride.pdf"), p_harm,
+       width = 8, height = 5)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

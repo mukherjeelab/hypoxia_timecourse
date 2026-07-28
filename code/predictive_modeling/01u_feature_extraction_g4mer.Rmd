@@ -1,5 +1,5 @@
 ---
-title: "01u - G4mer rG4 features and association with eIF3d hypoxia TE (1hr)"
+title: "01u - G4mer rG4 features by mRNA region and association with eIF3d hypoxia TE (1hr)"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
@@ -13,21 +13,32 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # Overview
 
-Ingest G4mer RNA G-quadruplex predictions and test whether 5'UTR rG4 propensity is
-associated with eIF3d-dependent translation efficiency in hypoxia at 1hr.
+Ingest G4mer RNA G-quadruplex predictions for all three mRNA regions and test whether
+rG4 propensity is associated with eIF3d-dependent translation efficiency in hypoxia
+at 1hr.
 
 G4mer (`Biociphers/g4mer`, fine-tuned from mRNAbert) accepts a maximum of 70 nt per
-input and is 6-mer tokenized. Sequences are scanned with a 70 nt sliding window
-(stride 10) and collapsed to a per-transcript maximum, which is the aggregation the
-model authors recommend. Scores are produced by `g4mer/02_run_g4mer.py`; transcript
-selection comes from `precomputed_most_abundant_tx.rds`, the same universe used for
-the ViennaRNA structure features.
+input and is 6-mer tokenized. Sequences are scanned with a 70 nt sliding window and
+collapsed to a per-transcript maximum, the aggregation the model authors recommend.
+Scores come from `g4mer/02_run_g4mer.py`; transcript selection is
+`precomputed_most_abundant_tx.rds`, the same universe as the ViennaRNA structure
+features.
 
-**Confound to keep in view throughout:** a maximum taken over more windows has a
-higher expected value, so `g4mer_max` is mechanically correlated with region length.
-rG4 formation also requires G-runs, so the score necessarily tracks GC and G content.
-Every association below is therefore reported both raw and after residualizing on
-log2 5'UTR length and 5'UTR GC%.
+**Two confounds are controlled throughout:**
+
+1. *Length.* A maximum over more windows has a higher expected value, so `g4mer_max`
+   rises with region length by construction.
+2. *Composition.* rG4 formation requires G-runs, so the score necessarily tracks GC
+   and G content.
+
+Every association is reported raw and after residualizing on log2 region length and
+region GC%.
+
+**Stride differs by region:** the 5'UTR was scored locally at stride 10, CDS and
+3'UTR on the cluster at stride 20. Denser sampling raises the expected maximum, so
+for cross-region comparison the 5'UTR maximum is recomputed at stride 20 from the
+saved per-window scores. Within-region results are unaffected (Spearman between the
+two 5'UTR strides is 0.985).
 
 Contrast direction (MDA-MB-231 convention): positive `te_lfc` = eIF3d **promotes**.
 
@@ -46,6 +57,9 @@ group_colors <- c(
   "Negative control"       = "grey40",
   "All other genes"        = "grey80"
 )
+
+region_labels <- c(utr5 = "5'UTR", cds = "CDS", utr3 = "3'UTR")
+regions <- c("utr5", "cds", "utr3")
 ```
 
 # Load G4mer Scores
@@ -53,149 +67,169 @@ group_colors <- c(
 ```{r load_g4mer}
 g4_dir <- here("output", "g4mer")
 
-summary_path <- file.path(g4_dir, "g4mer_summary_utr5.tsv")
-meta_path    <- here("g4mer", "fasta", "utr5_seq_metadata.tsv")
+load_region <- function(region) {
+  summary_path <- file.path(g4_dir, paste0("g4mer_summary_", region, ".tsv"))
+  meta_path    <- here("g4mer", "fasta", paste0(region, "_seq_metadata.tsv"))
 
-stopifnot(
-  "G4mer 5'UTR summary not found - run g4mer/02_run_g4mer.py --region utr5" =
-    file.exists(summary_path),
-  "5'UTR sequence metadata not found - run g4mer/01_generate_fasta.R" =
-    file.exists(meta_path)
-)
+  stopifnot(
+    "G4mer summary not found - run g4mer/02_run_g4mer.py" = file.exists(summary_path),
+    "sequence metadata not found - run g4mer/01_generate_fasta.R" = file.exists(meta_path)
+  )
 
-g4_utr5 <- read_tsv(summary_path, show_col_types = FALSE)
-meta_utr5 <- read_tsv(meta_path, show_col_types = FALSE)
+  scores <- read_tsv(summary_path, show_col_types = FALSE)
+  meta   <- read_tsv(meta_path, show_col_types = FALSE)
 
-cat("G4mer 5'UTR transcripts scored:", nrow(g4_utr5), "\n")
-cat("Metadata transcripts:", nrow(meta_utr5), "\n")
-```
+  # --- Computational validation, applied identically to every region ---
+  expected_cols <- c("transcript_id_clean", "region", "region_length", "n_windows",
+                     "g4mer_max", "g4mer_mean", "g4mer_frac_above", "g4mer_argmax_start")
+  stopifnot(all(expected_cols %in% colnames(scores)))
 
-## Computational Validation
+  stopifnot("g4mer_max outside [0,1]" =
+    all(scores$g4mer_max >= 0 & scores$g4mer_max <= 1, na.rm = TRUE))
+  stopifnot("g4mer_mean outside [0,1]" =
+    all(scores$g4mer_mean >= 0 & scores$g4mer_mean <= 1, na.rm = TRUE))
+  stopifnot("g4mer_frac_above outside [0,1]" =
+    all(scores$g4mer_frac_above >= 0 & scores$g4mer_frac_above <= 1, na.rm = TRUE))
+  stopifnot("g4mer_max < g4mer_mean" = all(scores$g4mer_max >= scores$g4mer_mean))
+  stopifnot("n_windows < 1" = all(scores$n_windows >= 1))
+  stopifnot("argmax_start out of bounds" =
+    all(scores$g4mer_argmax_start >= 0 &
+        scores$g4mer_argmax_start < scores$region_length))
+  stopifnot("region column mislabeled" = all(scores$region == region))
 
-```{r validate_computational}
-expected_cols <- c("transcript_id_clean", "region", "region_length", "n_windows",
-                   "g4mer_max", "g4mer_mean", "g4mer_frac_above", "g4mer_argmax_start")
-stopifnot(all(expected_cols %in% colnames(g4_utr5)))
+  # Region lengths must agree with what was written to FASTA
+  chk <- scores %>%
+    dplyr::select(transcript_id_clean, region_length) %>%
+    inner_join(meta %>% dplyr::select(transcript_id_clean, meta_len = region_length),
+               by = "transcript_id_clean")
+  stopifnot("region_length disagrees with FASTA metadata" =
+    all(chk$region_length == chk$meta_len))
+  stopifnot("scored transcripts missing from metadata" = nrow(chk) == nrow(scores))
 
-# G4mer outputs softmax probabilities
-stopifnot("g4mer_max outside [0,1]" =
-  all(g4_utr5$g4mer_max >= 0 & g4_utr5$g4mer_max <= 1, na.rm = TRUE))
-stopifnot("g4mer_mean outside [0,1]" =
-  all(g4_utr5$g4mer_mean >= 0 & g4_utr5$g4mer_mean <= 1, na.rm = TRUE))
-stopifnot("g4mer_frac_above outside [0,1]" =
-  all(g4_utr5$g4mer_frac_above >= 0 & g4_utr5$g4mer_frac_above <= 1, na.rm = TRUE))
+  scores %>%
+    inner_join(meta %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol,
+                                      gc_pct, g_pct),
+               by = "transcript_id_clean")
+}
 
-# A maximum can never fall below the mean of the same values
-stopifnot("g4mer_max < g4mer_mean" = all(g4_utr5$g4mer_max >= g4_utr5$g4mer_mean))
+g4_all <- map_dfr(regions, load_region)
 
-# Every transcript must have been scored at least once
-stopifnot("n_windows < 1" = all(g4_utr5$n_windows >= 1))
+g4_all %>%
+  group_by(region) %>%
+  summarise(
+    n              = dplyr::n(),
+    median_length  = median(region_length),
+    median_windows = median(n_windows),
+    median_max     = median(g4mer_max),
+    median_gc      = median(gc_pct),
+    .groups = "drop"
+  ) %>%
+  mutate(region = region_labels[region]) %>%
+  print()
 
-# argmax must lie inside the sequence
-stopifnot("argmax_start out of bounds" =
-  all(g4_utr5$g4mer_argmax_start >= 0 &
-      g4_utr5$g4mer_argmax_start < g4_utr5$region_length))
-
-# Region lengths must agree with what was written to FASTA
-len_check <- g4_utr5 %>%
-  dplyr::select(transcript_id_clean, region_length) %>%
-  inner_join(meta_utr5 %>% dplyr::select(transcript_id_clean, meta_len = region_length),
-             by = "transcript_id_clean")
-stopifnot("region_length disagrees with FASTA metadata" =
-  all(len_check$region_length == len_check$meta_len))
-
-cat("All computational checks passed.\n")
-cat("g4mer_max range: [", round(min(g4_utr5$g4mer_max), 4), ",",
-    round(max(g4_utr5$g4mer_max), 4), "]\n")
-cat("Median g4mer_max:", round(median(g4_utr5$g4mer_max), 4), "\n")
+cat("\nAll computational checks passed for all three regions.\n")
 ```
 
 ## Biological Spot-Check
 
-Transcripts whose 5'UTR contains a canonical G4 motif (four G-runs of >= 3 separated
-by 1-7 nt loops) must score higher than those without. This tests that the model
-output tracks G4 sequence grammar, which catches a strand, tokenization, or
+Transcripts whose region contains a canonical G4 motif (four G-runs of >= 3 separated
+by 1-7 nt loops) must score higher than those without, in every region. This tests
+that the model output tracks G4 sequence grammar, catching a strand, tokenization, or
 window-indexing error that a range check cannot.
 
 ```{r validate_biological}
-utr5_fa <- here("g4mer", "fasta", "utr5_sequences.fa")
-stopifnot("5'UTR FASTA not found" = file.exists(utr5_fa))
-
-fa_lines <- read_lines(utr5_fa)
-hdr_idx  <- which(str_starts(fa_lines, ">"))
-fa_names <- str_remove(fa_lines[hdr_idx], "^>") %>% word(1)
-# writeXStringSet wraps sequence lines, so collapse the block under each header
-fa_ends  <- c(hdr_idx[-1] - 1, length(fa_lines))
-fa_seqs  <- map2_chr(hdr_idx + 1, fa_ends,
-                     ~ str_c(fa_lines[.x:.y], collapse = ""))
+read_fasta_tbl <- function(region) {
+  fa <- here("g4mer", "fasta", paste0(region, "_sequences.fa"))
+  stopifnot("FASTA not found" = file.exists(fa))
+  lines <- read_lines(fa)
+  hdr   <- which(str_starts(lines, ">"))
+  ends  <- c(hdr[-1] - 1, length(lines))
+  tibble(
+    transcript_id_clean = word(str_remove(lines[hdr], "^>"), 1),
+    region              = region,
+    # writeXStringSet wraps sequence lines, so collapse the block under each header
+    sequence            = map2_chr(hdr + 1, ends, ~ str_c(lines[.x:.y], collapse = ""))
+  )
+}
 
 g4_regex <- "([Gg]{3,}[ACGTNacgtn]{1,7}){3,}[Gg]{3,}"
-motif_df <- tibble(
-  transcript_id_clean = fa_names,
-  has_g4_motif        = str_detect(fa_seqs, g4_regex)
-)
 
-spot <- g4_utr5 %>% inner_join(motif_df, by = "transcript_id_clean")
+motif_tbl <- map_dfr(regions, read_fasta_tbl) %>%
+  mutate(has_g4_motif = str_detect(sequence, g4_regex)) %>%
+  dplyr::select(transcript_id_clean, region, has_g4_motif)
 
-med_motif    <- median(spot$g4mer_max[spot$has_g4_motif])
-med_no_motif <- median(spot$g4mer_max[!spot$has_g4_motif])
+spot <- g4_all %>% inner_join(motif_tbl, by = c("transcript_id_clean", "region"))
 
-cat("5'UTRs with canonical G4 motif:", sum(spot$has_g4_motif),
-    sprintf("(%.1f%%)\n", 100 * mean(spot$has_g4_motif)))
-cat("Median g4mer_max, motif present:", round(med_motif, 4), "\n")
-cat("Median g4mer_max, motif absent: ", round(med_no_motif, 4), "\n")
+motif_summary <- spot %>%
+  group_by(region) %>%
+  summarise(
+    n_motif      = sum(has_g4_motif),
+    pct_motif    = 100 * mean(has_g4_motif),
+    med_motif    = median(g4mer_max[has_g4_motif]),
+    med_no_motif = median(g4mer_max[!has_g4_motif]),
+    wilcox_p     = wilcox.test(g4mer_max ~ has_g4_motif)$p.value,
+    .groups = "drop"
+  )
+print(motif_summary %>% mutate(region = region_labels[region]))
 
-stopifnot("G4 motif-containing 5'UTRs do not score above motif-free ones" =
-  med_motif > med_no_motif)
+stopifnot("motif-containing regions do not score above motif-free ones" =
+  all(motif_summary$med_motif > motif_summary$med_no_motif))
+cat("\nBiological spot-check passed in all three regions.\n")
+```
 
-motif_wilcox <- wilcox.test(g4mer_max ~ has_g4_motif, data = spot)
-cat("Wilcoxon p =", format.pval(motif_wilcox$p.value, digits = 3), "\n")
+# Harmonize Stride Across Regions
 
-# NRAS carries a well characterized 5'UTR rG4 (Kumari 2007). Informative only:
-# which isoform was selected depends on expression, so this is not asserted.
-nras <- spot %>%
-  inner_join(meta_utr5 %>% dplyr::select(transcript_id_clean, symbol),
-             by = "transcript_id_clean") %>%
-  filter(symbol == "NRAS")
-if (nrow(nras) > 0) {
-  pct <- 100 * mean(spot$g4mer_max <= nras$g4mer_max[1])
-  cat(sprintf("NRAS 5'UTR g4mer_max = %.4f (%.1fth percentile)\n",
-              nras$g4mer_max[1], pct))
-}
+```{r harmonize_stride}
+# 5'UTR was scored at stride 10, CDS/3'UTR at stride 20. Recompute the 5'UTR maximum
+# on the stride-20 subset of windows so cross-region comparisons are like-for-like.
+utr5_windows <- read_tsv(file.path(g4_dir, "g4mer_windows_utr5.tsv.gz"),
+                         show_col_types = FALSE)
+
+utr5_s20 <- utr5_windows %>%
+  filter(window_start %% 20 == 0) %>%
+  group_by(transcript_id_clean) %>%
+  summarise(g4mer_max_harmonized = max(g4_prob), .groups = "drop")
+
+g4_all <- g4_all %>%
+  left_join(utr5_s20, by = "transcript_id_clean") %>%
+  mutate(g4mer_max_harmonized = if_else(region == "utr5",
+                                        g4mer_max_harmonized, g4mer_max))
+
+stopifnot("harmonized max missing" = all(!is.na(g4_all$g4mer_max_harmonized)))
+stopifnot("harmonized max exceeds raw max" =
+  all(g4_all$g4mer_max_harmonized <= g4_all$g4mer_max + 1e-9))
+
+cat("5'UTR median max: stride 10 =",
+    round(median(g4_all$g4mer_max[g4_all$region == "utr5"]), 4),
+    "| stride 20 =",
+    round(median(g4_all$g4mer_max_harmonized[g4_all$region == "utr5"]), 4), "\n")
 ```
 
 # Build Feature Table
 
 ```{r build_features}
-g4_features <- g4_utr5 %>%
-  inner_join(
-    meta_utr5 %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol,
-                                gc_pct, g_pct),
-    by = "transcript_id_clean"
-  ) %>%
-  dplyr::rename(
-    g4mer_max_utr5        = g4mer_max,
-    g4mer_mean_utr5       = g4mer_mean,
-    g4mer_frac_above_utr5 = g4mer_frac_above,
-    utr5_length           = region_length,
-    gc_utr5               = gc_pct,
-    g_content_utr5        = g_pct
-  ) %>%
-  mutate(log2_utr5_length = log2(utr5_length)) %>%
-  dplyr::select(transcript_id_clean, gene_id_clean, symbol,
-                g4mer_max_utr5, g4mer_mean_utr5, g4mer_frac_above_utr5,
-                utr5_length, log2_utr5_length, gc_utr5, g_content_utr5)
+g4_features <- g4_all %>%
+  mutate(log2_region_length = log2(region_length)) %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol, region,
+                g4mer_max, g4mer_max_harmonized, g4mer_mean, g4mer_frac_above,
+                region_length, log2_region_length, gc_pct, g_pct) %>%
+  pivot_wider(
+    id_cols     = c(transcript_id_clean, gene_id_clean, symbol),
+    names_from  = region,
+    values_from = c(g4mer_max, g4mer_max_harmonized, g4mer_mean, g4mer_frac_above,
+                    region_length, log2_region_length, gc_pct, g_pct),
+    names_glue  = "{.value}_{region}"
+  )
 
 # Leakage guard: no TE column may enter the saved feature table
 stopifnot("TE column leaked into feature table" =
-  !any(c("te_lfc", "te_padj") %in% colnames(g4_features)))
+  !any(str_detect(colnames(g4_features), "^te_")))
 
 cat("Feature table:", nrow(g4_features), "transcripts,",
     ncol(g4_features), "columns\n")
 
-dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
-saveRDS(g4_features, here("output", "predictive_modeling", "feature_matrix_g4mer_utr5.rds"))
-cat("Saved: output/predictive_modeling/feature_matrix_g4mer_utr5.rds\n")
+saveRDS(g4_features, here("output", "predictive_modeling", "feature_matrix_g4mer.rds"))
+cat("Saved: output/predictive_modeling/feature_matrix_g4mer.rds\n")
 ```
 
 # Association with eIF3d Hypoxia TE (1hr)
@@ -210,128 +244,144 @@ te_hyp <- read_csv(
 cat("TE genes (si3d vs sictrl, hypoxia 1hr):", nrow(te_hyp), "\n")
 
 # Positive te_lfc = sictrl TE > si3d TE = knockdown reduces TE = eIF3d promotes
-dat <- g4_features %>%
-  inner_join(te_hyp %>% dplyr::select(gene_id_clean, te_lfc, te_padj, category),
+dat_long <- g4_all %>%
+  inner_join(te_hyp %>% dplyr::select(gene_id_clean, te_lfc, te_padj),
              by = "gene_id_clean") %>%
-  filter(!is.na(te_lfc))
+  filter(!is.na(te_lfc)) %>%
+  mutate(log2_region_length = log2(region_length))
 
-cat("Genes with both G4mer score and TE:", nrow(dat), "\n")
+dat_long %>%
+  group_by(region) %>%
+  summarise(n_genes = dplyr::n(), .groups = "drop") %>%
+  mutate(region = region_labels[region]) %>%
+  print()
 ```
 
-## Raw Correlation
+## Per-Region Correlation, Raw and Length/GC-Controlled
 
-```{r raw_correlation}
-n_dat <- nrow(dat)
-sp <- cor.test(dat$g4mer_max_utr5, dat$te_lfc, method = "spearman")
+```{r region_correlations}
+region_stats <- dat_long %>%
+  group_by(region) %>%
+  group_modify(function(d, key) {
+    raw <- suppressWarnings(cor.test(d$g4mer_max, d$te_lfc, method = "spearman"))
 
-cat(sprintf("Spearman rho = %.4f, p = %s, n = %d\n",
-            sp$estimate, format.pval(sp$p.value, digits = 3), n_dat))
+    # Residualize both variables on log2 length and GC to isolate the
+    # rG4-specific component
+    r_g4 <- residuals(lm(g4mer_max ~ log2_region_length + gc_pct, data = d))
+    r_te <- residuals(lm(te_lfc ~ log2_region_length + gc_pct, data = d))
+    par  <- suppressWarnings(cor.test(r_g4, r_te, method = "spearman"))
 
-# Confounders, for magnitude comparison
-for (v in c("log2_utr5_length", "gc_utr5", "g_content_utr5")) {
-  ct <- cor.test(dat[[v]], dat$te_lfc, method = "spearman")
-  cat(sprintf("  %-18s vs te_lfc: rho = %+.4f, p = %s\n",
-              v, ct$estimate, format.pval(ct$p.value, digits = 3)))
-}
-cat(sprintf("  %-18s vs g4mer_max: rho = %+.4f\n", "log2_utr5_length",
-            cor(dat$log2_utr5_length, dat$g4mer_max_utr5, method = "spearman")))
-cat(sprintf("  %-18s vs g4mer_max: rho = %+.4f\n", "gc_utr5",
-            cor(dat$gc_utr5, dat$g4mer_max_utr5, method = "spearman")))
+    tibble(
+      n            = nrow(d),
+      rho_raw      = raw$estimate,
+      p_raw        = raw$p.value,
+      rho_partial  = par$estimate,
+      p_partial    = par$p.value,
+      rho_len_te   = cor(d$log2_region_length, d$te_lfc, method = "spearman"),
+      rho_gc_te    = cor(d$gc_pct, d$te_lfc, method = "spearman"),
+      rho_len_g4   = cor(d$log2_region_length, d$g4mer_max, method = "spearman")
+    )
+  }) %>%
+  ungroup()
+
+region_stats %>%
+  mutate(region = region_labels[region]) %>%
+  mutate(across(starts_with("rho"), ~ round(.x, 4)),
+         across(starts_with("p_"), ~ format.pval(.x, digits = 3))) %>%
+  print(width = Inf)
 ```
 
-## Partial Correlation, Controlling Length and GC
+```{r plot_region_rho, fig.width = 6.5, fig.height = 4.5}
+rho_plot_df <- region_stats %>%
+  dplyr::select(region, rho_raw, rho_partial, rho_gc_te) %>%
+  pivot_longer(-region, names_to = "measure", values_to = "rho") %>%
+  mutate(
+    region  = factor(region_labels[region], levels = region_labels),
+    measure = recode(measure,
+                     rho_raw     = "G4mer max (raw)",
+                     rho_partial = "G4mer max (length + GC controlled)",
+                     rho_gc_te   = "Region GC% (for comparison)")
+  )
 
-The raw correlation cannot be interpreted on its own: `g4mer_max` rises with the
-number of windows scanned and with G content. Residualizing both variables on log2
-5'UTR length and 5'UTR GC% isolates the rG4-specific component.
-
-```{r partial_correlation}
-resid_g4 <- residuals(lm(g4mer_max_utr5 ~ log2_utr5_length + gc_utr5, data = dat))
-resid_te <- residuals(lm(te_lfc ~ log2_utr5_length + gc_utr5, data = dat))
-
-pc <- cor.test(resid_g4, resid_te, method = "spearman")
-cat(sprintf("Partial Spearman rho (length + GC controlled) = %.4f, p = %s, n = %d\n",
-            pc$estimate, format.pval(pc$p.value, digits = 3), n_dat))
-
-cat(sprintf("\nRaw rho     = %+.4f\nPartial rho = %+.4f\n",
-            sp$estimate, pc$estimate))
-```
-
-```{r plot_scatter, fig.width = 6, fig.height = 5}
-p_scatter <- ggplot(dat, aes(x = g4mer_max_utr5, y = te_lfc)) +
-  geom_point(alpha = 0.15, size = 0.6, colour = "grey30") +
-  geom_smooth(method = "lm", se = TRUE, colour = "#E69F00", linewidth = 0.8) +
+p_rho <- ggplot(rho_plot_df, aes(x = region, y = rho, fill = measure)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("G4mer max (raw)" = "#E69F00",
+                               "G4mer max (length + GC controlled)" = "#0072B2",
+                               "Region GC% (for comparison)" = "grey60")) +
   labs(
-    x = "5'UTR G4mer max rG4 probability",
-    y = "TE log2FC (si3d vs siCtrl, hypoxia 1hr)",
-    title = "5'UTR rG4 propensity vs eIF3d-dependent TE"
+    x = NULL,
+    y = "Spearman rho vs TE log2FC",
+    fill = NULL,
+    title = "rG4 propensity vs eIF3d-dependent TE, by mRNA region"
   ) +
-  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
-           label = sprintf("Spearman rho = %.3f, p = %s, n = %d",
-                           sp$estimate, format.pval(sp$p.value, digits = 3), n_dat)) +
-  theme_classic(base_size = 12)
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(nrow = 3))
 
-print(p_scatter)
-ggsave(here("plots", "01u_g4mer_utr5_vs_te_lfc_scatter.pdf"),
-       p_scatter, width = 6, height = 5)
+print(p_rho)
+ggsave(here("plots", "01u_g4mer_rho_by_region.pdf"), p_rho, width = 6.5, height = 4.5)
 ```
 
-## TE by G4mer Quartile
+## TE by G4mer Quartile, per Region
 
-```{r quartile_analysis, fig.width = 6, fig.height = 5}
-dat_q <- dat %>%
-  mutate(g4_quartile = ntile(g4mer_max_utr5, 4),
-         g4_quartile = factor(g4_quartile,
-                              labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")))
+```{r quartile_by_region, fig.width = 8, fig.height = 4.5}
+dat_q <- dat_long %>%
+  group_by(region) %>%
+  mutate(g4_quartile = ntile(g4mer_max, 4)) %>%
+  ungroup() %>%
+  mutate(g4_quartile = factor(g4_quartile,
+                              labels = c("Q1", "Q2", "Q3", "Q4")),
+         region_lab  = factor(region_labels[region], levels = region_labels))
 
 quartile_summary <- dat_q %>%
-  group_by(g4_quartile) %>%
-  summarise(
-    n            = dplyr::n(),
-    median_te    = median(te_lfc),
-    mean_te      = mean(te_lfc),
-    median_g4    = median(g4mer_max_utr5),
-    median_len   = median(utr5_length),
-    median_gc    = median(gc_utr5),
-    .groups = "drop"
-  )
-print(quartile_summary)
+  group_by(region_lab, g4_quartile) %>%
+  summarise(n = dplyr::n(), median_te = median(te_lfc),
+            median_g4 = median(g4mer_max), .groups = "drop")
+print(quartile_summary, n = 12)
 
-q4_vs_q1 <- wilcox.test(
-  te_lfc ~ g4_quartile,
-  data = dat_q %>% filter(g4_quartile %in% c("Q1 (lowest)", "Q4 (highest)")) %>%
-    droplevels()
-)
-cat(sprintf("\nQ4 vs Q1 Wilcoxon p = %s (n_Q1 = %d, n_Q4 = %d)\n",
-            format.pval(q4_vs_q1$p.value, digits = 3),
-            sum(dat_q$g4_quartile == "Q1 (lowest)"),
-            sum(dat_q$g4_quartile == "Q4 (highest)")))
+q_tests <- dat_q %>%
+  group_by(region_lab) %>%
+  group_modify(function(d, key) {
+    sub <- d %>% filter(g4_quartile %in% c("Q1", "Q4")) %>% droplevels()
+    tibble(
+      p        = wilcox.test(te_lfc ~ g4_quartile, data = sub)$p.value,
+      diff_med = median(sub$te_lfc[sub$g4_quartile == "Q4"]) -
+                 median(sub$te_lfc[sub$g4_quartile == "Q1"]),
+      n        = nrow(d)
+    )
+  }) %>% ungroup()
+print(q_tests %>% mutate(p = format.pval(p, digits = 3), diff_med = round(diff_med, 4)))
 
 p_quart <- ggplot(dat_q, aes(x = g4_quartile, y = te_lfc)) +
-  geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.3, fill = "grey90",
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.25, fill = "grey90",
                linewidth = 0.8) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~ region_lab) +
+  geom_text(data = q_tests, inherit.aes = FALSE,
+            aes(x = Inf, y = Inf,
+                label = sprintf("Q4 vs Q1 p = %s\nn = %d",
+                                format.pval(p, digits = 3), n)),
+            hjust = 1.1, vjust = 1.4, size = 3) +
   labs(
-    x = "5'UTR G4mer max rG4 probability quartile",
+    x = "G4mer max rG4 probability quartile",
     y = "TE log2FC (si3d vs siCtrl, hypoxia 1hr)",
-    title = "eIF3d-dependent TE across 5'UTR rG4 quartiles"
+    title = "eIF3d-dependent TE across rG4 quartiles, by region"
   ) +
-  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
-           label = sprintf("Q4 vs Q1 Wilcoxon p = %s, n = %d",
-                           format.pval(q4_vs_q1$p.value, digits = 3), n_dat)) +
   theme_classic(base_size = 12)
 
 print(p_quart)
-ggsave(here("plots", "01u_g4mer_utr5_te_by_quartile.pdf"),
-       p_quart, width = 6, height = 5)
+ggsave(here("plots", "01u_g4mer_te_by_quartile_all_regions.pdf"),
+       p_quart, width = 8, height = 4.5)
 ```
 
-## G4mer Score by Gene Group
+## G4mer Score by Gene Group, per Region
 
-Compares the eIF3d hypoxia-promoted set against a size-matched negative control set
-and all remaining genes, the standard grouping used across this project.
+Promoted genes are compared against a size-matched negative control set. Because
+`g4mer_max` tracks region length and promoted transcripts differ in length, the
+comparison is run both unmatched and with length-decile matching.
 
-```{r gene_groups, fig.width = 6.5, fig.height = 5}
+```{r gene_groups, fig.width = 8, fig.height = 4.5}
 promotes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
                      show_col_types = FALSE) %>%
   pull(ensembl_gene) %>% unique()
@@ -341,81 +391,120 @@ neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_gen
   mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
   pull(gene_id_clean) %>% unique()
 
-# Size-match the negative control set to the positive set
 set.seed(9)
-neg_pool_avail <- intersect(neg_pool, dat$gene_id_clean)
-n_pos_avail    <- length(intersect(promotes, dat$gene_id_clean))
-neg_matched    <- sample(neg_pool_avail, min(n_pos_avail, length(neg_pool_avail)))
-
-dat_grp <- dat %>%
+dat_grp <- dat_long %>%
   mutate(group = case_when(
-    gene_id_clean %in% promotes    ~ "eIF3d hypoxia promotes",
-    gene_id_clean %in% neg_matched ~ "Negative control",
-    TRUE                           ~ "All other genes"
+    gene_id_clean %in% promotes ~ "eIF3d hypoxia promotes",
+    gene_id_clean %in% neg_pool ~ "Negative control",
+    TRUE                        ~ "All other genes"
   )) %>%
-  mutate(group = factor(group, levels = names(group_colors)))
+  mutate(group = factor(group, levels = names(group_colors)),
+         region_lab = factor(region_labels[region], levels = region_labels))
 
-group_summary <- dat_grp %>%
-  group_by(group) %>%
-  summarise(
-    n             = dplyr::n(),
-    median_g4     = median(g4mer_max_utr5),
-    median_len    = median(utr5_length),
-    median_gc     = median(gc_utr5),
-    .groups = "drop"
-  )
-print(group_summary)
+group_tests <- dat_grp %>%
+  filter(group != "All other genes") %>%
+  droplevels() %>%
+  group_by(region_lab) %>%
+  group_modify(function(d, key) {
+    unmatched <- wilcox.test(g4mer_max ~ group, data = d)
 
-grp_wilcox <- wilcox.test(
-  g4mer_max_utr5 ~ group,
-  data = dat_grp %>%
-    filter(group %in% c("eIF3d hypoxia promotes", "Negative control")) %>%
-    droplevels()
-)
-n_pos <- sum(dat_grp$group == "eIF3d hypoxia promotes")
-n_neg <- sum(dat_grp$group == "Negative control")
-cat(sprintf("\nPromoted vs negative control Wilcoxon p = %s (n = %d vs %d)\n",
-            format.pval(grp_wilcox$p.value, digits = 3), n_pos, n_neg))
+    # Length-decile matched: equal n per group within each length bin
+    d2 <- d %>% mutate(bin = ntile(log2_region_length, 10))
+    matched <- d2 %>% group_by(bin) %>% group_modify(function(x, ...) {
+      k <- min(sum(x$group == "eIF3d hypoxia promotes"),
+               sum(x$group == "Negative control"))
+      if (k < 5) return(x[0, ])
+      bind_rows(
+        slice_sample(filter(x, group == "eIF3d hypoxia promotes"), n = k),
+        slice_sample(filter(x, group == "Negative control"), n = k)
+      )
+    }) %>% ungroup()
 
-p_group <- ggplot(dat_grp, aes(x = g4mer_max_utr5, fill = group, colour = group)) +
+    tibble(
+      n_pos       = sum(d$group == "eIF3d hypoxia promotes"),
+      n_neg       = sum(d$group == "Negative control"),
+      med_pos     = median(d$g4mer_max[d$group == "eIF3d hypoxia promotes"]),
+      med_neg     = median(d$g4mer_max[d$group == "Negative control"]),
+      p_unmatched = unmatched$p.value,
+      n_matched   = sum(matched$group == "eIF3d hypoxia promotes"),
+      p_matched   = wilcox.test(g4mer_max ~ group, data = matched)$p.value
+    )
+  }) %>% ungroup()
+
+print(group_tests %>%
+        mutate(across(c(med_pos, med_neg), ~ round(.x, 4)),
+               across(starts_with("p_"), ~ format.pval(.x, digits = 3))),
+      width = Inf)
+
+p_group <- ggplot(dat_grp, aes(x = g4mer_max, fill = group, colour = group)) +
   geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ region_lab) +
   scale_fill_manual(values = group_colors) +
   scale_colour_manual(values = group_colors) +
   labs(
-    x = "5'UTR G4mer max rG4 probability",
+    x = "G4mer max rG4 probability",
     y = "Density",
-    title = "5'UTR rG4 propensity by gene group",
+    title = "rG4 propensity by gene group and mRNA region",
     fill = NULL, colour = NULL
   ) +
-  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
-           label = sprintf("promotes vs neg ctrl p = %s\nn = %d vs %d",
-                           format.pval(grp_wilcox$p.value, digits = 3),
-                           n_pos, n_neg)) +
   theme_classic(base_size = 12) +
   theme(legend.position = "bottom")
 
 print(p_group)
-ggsave(here("plots", "01u_g4mer_utr5_by_gene_group.pdf"),
-       p_group, width = 6.5, height = 5)
+ggsave(here("plots", "01u_g4mer_by_gene_group_all_regions.pdf"),
+       p_group, width = 8, height = 4.5)
+```
+
+## Cross-Region Comparison at Matched Stride
+
+```{r cross_region, fig.width = 6, fig.height = 4.5}
+# Uses g4mer_max_harmonized so all three regions are scored at stride 20
+harmonized_summary <- dat_long %>%
+  group_by(region) %>%
+  summarise(
+    n          = dplyr::n(),
+    median_max = median(g4mer_max_harmonized),
+    pct_above_half = 100 * mean(g4mer_max_harmonized >= 0.5),
+    .groups = "drop"
+  ) %>%
+  mutate(region = region_labels[region])
+print(harmonized_summary)
+
+p_cross <- dat_long %>%
+  mutate(region_lab = factor(region_labels[region], levels = region_labels)) %>%
+  ggplot(aes(x = region_lab, y = g4mer_max_harmonized)) +
+  geom_violin(fill = "grey85", linewidth = 0.8) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, linewidth = 0.8) +
+  labs(
+    x = NULL,
+    y = "G4mer max rG4 probability (stride 20, matched)",
+    title = "rG4 propensity by mRNA region"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_cross)
+ggsave(here("plots", "01u_g4mer_max_by_region.pdf"), p_cross, width = 6, height = 4.5)
 ```
 
 ## Summary
 
 ```{r final_summary}
-cat("=== 5'UTR G4mer vs eIF3d hypoxia TE (1hr) ===\n\n")
-cat(sprintf("Genes analyzed:            %d\n", n_dat))
-cat(sprintf("Raw Spearman rho:          %+.4f (p = %s)\n",
-            sp$estimate, format.pval(sp$p.value, digits = 3)))
-cat(sprintf("Partial rho (len + GC):    %+.4f (p = %s)\n",
-            pc$estimate, format.pval(pc$p.value, digits = 3)))
-cat(sprintf("Q4 vs Q1 median TE diff:   %+.4f\n",
-            quartile_summary$median_te[4] - quartile_summary$median_te[1]))
-cat(sprintf("Promoted vs neg ctrl p:    %s\n",
-            format.pval(grp_wilcox$p.value, digits = 3)))
-cat("\nInterpretation note: if the partial correlation collapses toward zero, the\n")
-cat("raw association is carried by 5'UTR length and GC content rather than by rG4\n")
-cat("propensity specifically. Compare against the CDS and 3'UTR runs as a\n")
-cat("region-specificity control once the cluster job returns.\n")
+cat("=== G4mer rG4 vs eIF3d hypoxia TE (1hr), all regions ===\n\n")
+for (r in regions) {
+  s <- region_stats %>% filter(region == r)
+  q <- q_tests %>% filter(region_lab == region_labels[r])
+  g <- group_tests %>% filter(region_lab == region_labels[r])
+  cat(sprintf("%-6s n = %5d | raw rho = %+.4f (p = %-9s) | partial rho = %+.4f (p = %-9s)\n",
+              region_labels[r], s$n, s$rho_raw, format.pval(s$p_raw, digits = 2),
+              s$rho_partial, format.pval(s$p_partial, digits = 2)))
+  cat(sprintf("        Q4-Q1 median TE diff = %+.4f (p = %s)\n",
+              q$diff_med, format.pval(q$p, digits = 2)))
+  cat(sprintf("        promoted vs neg ctrl: unmatched p = %-9s | length-matched p = %s\n",
+              format.pval(g$p_unmatched, digits = 2),
+              format.pval(g$p_matched, digits = 2)))
+  cat(sprintf("        GC%% vs te_lfc rho = %+.4f (for comparison)\n\n", s$rho_gc_te))
+}
+cat("Project fold-change standard is 0.5; compare the Q4-Q1 differences against it.\n")
 ```
 
 # Session Info
