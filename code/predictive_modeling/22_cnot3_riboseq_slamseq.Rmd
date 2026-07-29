@@ -77,7 +77,9 @@ ribo_gene <- ribo_raw %>%
   group_by(Gene_ID, Gene_Name) %>%
   summarise(
     n_positions        = n(),
-    min_fdr            = min(FDR, na.rm = TRUE),          # most significant position per gene
+    # Guard all-NA genes: min(na.rm = TRUE) would return Inf and propagate a -Inf
+    # enrichment all the way to the section 6 range assertion.
+    min_fdr            = if (all(is.na(FDR))) NA_real_ else min(FDR, na.rm = TRUE),
     mean_neg_log10_fdr = mean(-log10(FDR + 1e-300), na.rm = TRUE),
     n_sig              = sum(FDR < 0.01, na.rm = TRUE),
     frac_sig           = n_sig / n_positions,
@@ -91,6 +93,15 @@ ribo_gene <- ribo_raw %>%
 cat("Genes in riboseq data:", nrow(ribo_gene), "\n")
 cat("Summary of -log10(min FDR):\n")
 print(summary(ribo_gene$neg_log10_min_fdr))
+
+stopifnot(
+  "neg_log10_min_fdr must be finite or NA" =
+    all(is.finite(ribo_gene$neg_log10_min_fdr) | is.na(ribo_gene$neg_log10_min_fdr)),
+  "neg_log10_min_fdr must be >= 0 (-log10 of a probability)" =
+    all(ribo_gene$neg_log10_min_fdr >= 0, na.rm = TRUE),
+  "ensembl_gene must be unique in ribo_gene (join key for section 6)" =
+    !any(duplicated(ribo_gene$ensembl_gene))
+)
 ```
 
 ```{r riboseq_annotate_groups}
@@ -101,54 +112,80 @@ ribo_gene <- ribo_gene %>%
     TRUE                             ~ "All other genes"
   ))
 
-ribo_gene %>% count(group)
+ribo_gene %>% dplyr::count(group)
+```
+
+```{r plot_annotation_helper}
+set_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "grey40",
+  "All other genes"        = "grey80"
+)
+
+# Build the corner annotation carrying the test result and all three group sizes,
+# so each figure is self-contained.
+stat_label <- function(p_value, x_promotes, x_neg, x_other) {
+  paste0(
+    "Wilcoxon p = ", signif(p_value, 3),
+    "\nn promotes = ", sum(!is.na(x_promotes)),
+    "\nn neg ctrl = ", sum(!is.na(x_neg)),
+    "\nn other = ",    sum(!is.na(x_other))
+  )
+}
 ```
 
 ```{r riboseq_density_plot}
-set_colors <- c(
-  "eIF3d hypoxia promotes" = "#E69F00",
-  "Negative control"       = "black"
-)
-
-bg_ribo <- ribo_gene %>% filter(group == "All other genes")
-fg_ribo <- ribo_gene %>% filter(group != "All other genes")
+bg_ribo <- ribo_gene %>% dplyr::filter(group == "All other genes")
+fg_ribo <- ribo_gene %>% dplyr::filter(group != "All other genes")
 
 median_ribo <- fg_ribo %>%
   group_by(group) %>%
   summarise(med = median(neg_log10_min_fdr, na.rm = TRUE), .groups = "drop")
 
+promotes_ribo <- ribo_gene %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>% pull(neg_log10_min_fdr)
+neg_ribo      <- ribo_gene %>% dplyr::filter(group == "Negative control")       %>% pull(neg_log10_min_fdr)
+
+wt_ribo <- wilcox.test(promotes_ribo, neg_ribo, alternative = "two.sided")
+
 p_ribo <- ggplot() +
   geom_density(
     data = bg_ribo,
     aes(x = neg_log10_min_fdr),
-    color = NA, fill = "grey80", alpha = 0.6
+    color = NA, fill = set_colors[["All other genes"]], alpha = 0.6
   ) +
   geom_density(
-    data = fg_ribo %>% filter(group == "Negative control"),
+    data = fg_ribo %>% dplyr::filter(group == "Negative control"),
     aes(x = neg_log10_min_fdr, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_density(
-    data = fg_ribo %>% filter(group == "eIF3d hypoxia promotes"),
+    data = fg_ribo %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
     aes(x = neg_log10_min_fdr, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_vline(
     data = median_ribo,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = stat_label(wt_ribo$p.value, promotes_ribo, neg_ribo,
+                              bg_ribo$neg_log10_min_fdr)) +
   scale_color_manual(values = set_colors) +
   scale_fill_manual(values  = set_colors) +
   labs(
     title    = "CNOT3 riboseq enrichment: eIF3d-promoted genes (hypoxia 1hr)",
-    subtitle = "Lead: -log10(min FDR) per gene; secondary: frac. positions with FDR < 0.01 (paper threshold)\nGrey = all other genes; dashed = median",
+    subtitle = "-log10(min FDR) per gene\nGrey = all other genes; dashed = median",
     x = "-log10(min FDR)", y = "Density",
     color = NULL, fill = NULL
   ) +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "top")+
-  xlim(0,10)
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  # coord_cartesian, not xlim(): xlim() drops observations before the density is
+  # estimated, which reshapes the curves and desynchronises them from the medians
+  # and Wilcoxon result reported alongside.
+  coord_cartesian(xlim = c(0, 10))
 
 p_ribo
 ggsave(here("plots", "22_cnot3_riboseq_enrichment_by_group.pdf"),
@@ -157,10 +194,6 @@ cat("Saved: plots/22_cnot3_riboseq_enrichment_by_group.pdf\n")
 ```
 
 ```{r riboseq_wilcoxon}
-promotes_ribo <- ribo_gene %>% filter(group == "eIF3d hypoxia promotes") %>% pull(neg_log10_min_fdr)
-neg_ribo      <- ribo_gene %>% filter(group == "Negative control")       %>% pull(neg_log10_min_fdr)
-
-wt_ribo <- wilcox.test(promotes_ribo, neg_ribo, alternative = "two.sided")
 cat("Wilcoxon promotes vs neg ctrl (-log10 min FDR):\n")
 cat("  W =", wt_ribo$statistic, ", p =", signif(wt_ribo$p.value, 3), "\n")
 cat("  Median promotes:", round(median(promotes_ribo, na.rm = TRUE), 3), "\n")
@@ -186,7 +219,7 @@ ribo_codon <- ribo_raw %>%
   summarise(mean_enrichment = mean(enrichment, na.rm = TRUE), .groups = "drop")
 
 cat("Codons per site:\n")
-print(ribo_codon %>% count(site))
+print(ribo_codon %>% dplyr::count(site))
 ```
 
 ```{r riboseq_codon_dot_plot}
@@ -216,7 +249,7 @@ p_codon <- ggplot(ribo_codon_plot, aes(x = codon, y = mean_enrichment)) +
     subtitle = "Reproduces Figure 1F; codons ordered by P-site enrichment",
     x = "Codon", y = "Mean CNOT3-IP / Input"
   ) +
-  theme_bw(base_size = 11) +
+  theme_classic(base_size = 11) +
   theme(
     axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5),
     legend.position  = "top",
@@ -271,14 +304,18 @@ cat("Timepoints found:", paste(sort(unique(slam_long$timepoint)), collapse = ", 
 cat("Conditions:", paste(unique(slam_long$condition), collapse = ", "), "\n")
 ```
 
-average replicates to get. mean conversion reates
+Average the two replicates to get a mean C-to-T conversion rate per gene, condition and timepoint.
+
 ```{r slamseq_average_reps}
 slam_mean <- slam_long %>%
   group_by(Gene_Name, Gene_ID, condition, timepoint) %>%
   summarise(mean_conv = mean(conversion, na.rm = TRUE), .groups = "drop")
 ```
 
-remove timepoint 0 = 0 to get rid of anything that doesn't have c to t conversions 
+Normalise each timepoint to its own t=0 baseline. Genes with no C-to-T conversion at t=0
+divide to `Inf` and are dropped by the `is.finite()` filter, which is how genes without
+detectable labelling are removed.
+
 ```{r slamseq_normalize_t0}
 t0 <- slam_mean %>%
   filter(timepoint == 0) %>%
@@ -305,25 +342,41 @@ cat("Genes lost (low/noisy t=0):", n_before - n_after, "\n")
 ```
 
 ```{r slamseq_fit_halflives}
+# Chase timepoints are 0, 1, 2, 4, 8, 12 h, so a gene retained at every post-t0
+# timepoint contributes 5 points. Require at least 3: a 2-point "fit" is exact by
+# construction and carries no residual, so its half-life is unfalsifiable noise.
+MIN_TIMEPOINTS <- 3
+
 fit_halflife <- function(df) {
+  na_result <- tibble(halflife = NA_real_, fit_r2 = NA_real_, n_points = nrow(df))
+  if (nrow(df) < MIN_TIMEPOINTS) return(na_result)
   fit <- tryCatch(
     lm(log(fraction_remaining) ~ timepoint, data = df),
     error = function(e) NULL
   )
-  if (is.null(fit)) return(NA_real_)
+  if (is.null(fit)) return(na_result)
   lambda <- -coef(fit)[["timepoint"]]
-  if (is.na(lambda) || lambda <= 0) return(NA_real_)
-  log(2) / lambda
+  r2     <- summary(fit)$r.squared
+  if (is.na(lambda) || lambda <= 0) {
+    return(tibble(halflife = NA_real_, fit_r2 = r2, n_points = nrow(df)))
+  }
+  tibble(halflife = log(2) / lambda, fit_r2 = r2, n_points = nrow(df))
 }
 
 halflife_df <- slam_norm %>%
   group_by(Gene_Name, Gene_ID, condition) %>%
-  group_modify(~ tibble(halflife = fit_halflife(.x))) %>%
+  group_modify(~ fit_halflife(.x)) %>%
   ungroup()
 
 cat("Total gene × condition rows:", nrow(halflife_df), "\n")
-cat("NA half-lives (fit failed or lambda <= 0):",
+cat("NA half-lives (too few timepoints, fit failed, or lambda <= 0):",
     sum(is.na(halflife_df$halflife)), "\n")
+cat("  of which too few timepoints (<", MIN_TIMEPOINTS, "):",
+    sum(halflife_df$n_points < MIN_TIMEPOINTS), "\n")
+cat("Timepoints per fit:\n")
+print(halflife_df %>% dplyr::count(n_points))
+cat("Fit R-squared distribution (fits with a positive decay rate):\n")
+print(summary(halflife_df$fit_r2[!is.na(halflife_df$halflife)]))
 ```
 
 ```{r slamseq_filter_unreliable}
@@ -336,11 +389,15 @@ cat("Excluded halflife > 100h:", n_excluded, "\n")
 cat("Surviving gene × condition rows:", nrow(halflife_filt), "\n")
 
 cat("\nSurviving counts per condition:\n")
-print(halflife_filt %>% count(condition))
+print(halflife_filt %>% dplyr::count(condition))
 ```
 
 ```{r slamseq_pivot_wide}
+# Drop the per-fit QC columns before pivoting: they differ between sgNT and sgCNOT3,
+# so leaving them in would make pivot_wider treat them as id columns and emit two
+# half-populated rows per gene instead of one.
 halflife_wide <- halflife_filt %>%
+  dplyr::select(Gene_Name, Gene_ID, condition, halflife) %>%
   pivot_wider(names_from = condition, values_from = halflife,
               names_glue = "{condition}_halflife",
               values_fn  = mean) %>%
@@ -358,6 +415,22 @@ n_cnot3_only <- sum(is.na(halflife_wide$sgNT_halflife)     & !is.na(halflife_wid
 cat("Genes with BOTH half-lives (available for log2_ratio):", n_both, "\n")
 cat("Genes with sgNT only:", n_nt_only, "\n")
 cat("Genes with sgCNOT3 only:", n_cnot3_only, "\n")
+
+# Paper replication check, run before these half-lives are used anywhere downstream.
+# Zhu 2024 report a median control mRNA half-life of a few hours (Fig 2B); our
+# re-derivation from the deposited conversion ratios gives ~4.5 h.
+med_nt <- median(halflife_wide$sgNT_halflife, na.rm = TRUE)
+cat("\nMedian sgNT half-life:", round(med_nt, 2), "h (Zhu 2024 report a few hours)\n")
+stopifnot(
+  "Zhu2024 median sgNT half-life outside expected range" =
+    dplyr::between(med_nt, 2.5, 6.0),
+  "sgNT half-lives must be positive" =
+    all(halflife_wide$sgNT_halflife > 0, na.rm = TRUE),
+  "log2_ratio must be finite where not NA" =
+    all(is.finite(halflife_wide$log2_ratio[!is.na(halflife_wide$log2_ratio)])),
+  "ensembl_gene must be unique in halflife_wide (join key for section 6)" =
+    !any(duplicated(halflife_wide$ensembl_gene))
+)
 ```
 
 ```{r slamseq_annotate_groups}
@@ -369,7 +442,7 @@ halflife_wide <- halflife_wide %>%
   ))
 
 cat("\nGenes per group (log2_ratio available):\n")
-print(halflife_wide %>% filter(!is.na(log2_ratio)) %>% count(group))
+print(halflife_wide %>% dplyr::filter(!is.na(log2_ratio)) %>% dplyr::count(group))
 ```
 
 ### Headline plot: log2(sgCNOT3/sgNT) half-life ratio by group
@@ -379,37 +452,46 @@ normally promotes its decay. If 3d-promoted genes are genuine CNOT3 targets, the
 shift rightward.
 
 ```{r slamseq_log2ratio_plot}
-ratio_df <- halflife_wide %>% filter(!is.na(log2_ratio))
+ratio_df <- halflife_wide %>% dplyr::filter(!is.na(log2_ratio))
 
-bg_ratio <- ratio_df %>% filter(group == "All other genes")
-fg_ratio <- ratio_df %>% filter(group != "All other genes")
+bg_ratio <- ratio_df %>% dplyr::filter(group == "All other genes")
+fg_ratio <- ratio_df %>% dplyr::filter(group != "All other genes")
 
 median_ratio <- fg_ratio %>%
   group_by(group) %>%
   summarise(med = median(log2_ratio, na.rm = TRUE), .groups = "drop")
 
+promotes_ratio <- ratio_df %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>% pull(log2_ratio)
+neg_ratio      <- ratio_df %>% dplyr::filter(group == "Negative control")       %>% pull(log2_ratio)
+
+wt_ratio <- wilcox.test(promotes_ratio, neg_ratio, alternative = "two.sided")
+
 p_ratio <- ggplot() +
   geom_density(
     data = bg_ratio,
     aes(x = log2_ratio),
-    color = NA, fill = "grey80", alpha = 0.6
+    color = NA, fill = set_colors[["All other genes"]], alpha = 0.6
   ) +
   geom_density(
-    data = fg_ratio %>% filter(group == "Negative control"),
+    data = fg_ratio %>% dplyr::filter(group == "Negative control"),
     aes(x = log2_ratio, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_density(
-    data = fg_ratio %>% filter(group == "eIF3d hypoxia promotes"),
+    data = fg_ratio %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
     aes(x = log2_ratio, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
-  geom_vline(xintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", linewidth = 0.5) +
   geom_vline(
     data = median_ratio,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = stat_label(wt_ratio$p.value, promotes_ratio, neg_ratio,
+                              bg_ratio$log2_ratio)) +
   scale_color_manual(values = set_colors) +
   scale_fill_manual(values  = set_colors) +
   labs(
@@ -418,9 +500,9 @@ p_ratio <- ggplot() +
     x = "log2(sgCNOT3 / sgNT) half-life ratio", y = "Density",
     color = NULL, fill = NULL
   ) +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "top")+
-  xlim(-3,3.5)
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  coord_cartesian(xlim = c(-3, 3.5))
 
 p_ratio
 ggsave(here("plots", "22_slamseq_halflife_log2ratio_by_group.pdf"),
@@ -429,10 +511,6 @@ cat("Saved: plots/22_slamseq_halflife_log2ratio_by_group.pdf\n")
 ```
 
 ```{r slamseq_log2ratio_wilcoxon}
-promotes_ratio <- ratio_df %>% filter(group == "eIF3d hypoxia promotes") %>% pull(log2_ratio)
-neg_ratio      <- ratio_df %>% filter(group == "Negative control")       %>% pull(log2_ratio)
-
-wt_ratio <- wilcox.test(promotes_ratio, neg_ratio, alternative = "two.sided")
 cat("Wilcoxon log2_ratio (promotes vs neg ctrl):\n")
 cat("  W =", wt_ratio$statistic, ", p =", signif(wt_ratio$p.value, 3), "\n")
 cat("  Median promotes:", round(median(promotes_ratio, na.rm = TRUE), 3), "\n")
@@ -442,46 +520,54 @@ cat("  Median neg ctrl:", round(median(neg_ratio, na.rm = TRUE), 3), "\n")
 ### Baseline sgNT half-life by group
 
 ```{r slamseq_sgnt_halflife_plot}
-nt_df <- halflife_wide %>% filter(!is.na(sgNT_halflife))
+nt_df <- halflife_wide %>% dplyr::filter(!is.na(sgNT_halflife))
 
-bg_nt <- nt_df %>% filter(group == "All other genes")
-fg_nt <- nt_df %>% filter(group != "All other genes")
+bg_nt <- nt_df %>% dplyr::filter(group == "All other genes")
+fg_nt <- nt_df %>% dplyr::filter(group != "All other genes")
 
 median_nt <- fg_nt %>%
   group_by(group) %>%
   summarise(med = median(sgNT_halflife, na.rm = TRUE), .groups = "drop")
 
+promotes_nt <- nt_df %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>% pull(sgNT_halflife)
+neg_nt      <- nt_df %>% dplyr::filter(group == "Negative control")       %>% pull(sgNT_halflife)
+
+wt_nt <- wilcox.test(promotes_nt, neg_nt, alternative = "two.sided")
+
 p_nt <- ggplot() +
   geom_density(
     data = bg_nt,
     aes(x = sgNT_halflife),
-    color = NA, fill = "grey80", alpha = 0.6
+    color = NA, fill = set_colors[["All other genes"]], alpha = 0.6
   ) +
   geom_density(
-    data = fg_nt %>% filter(group == "Negative control"),
+    data = fg_nt %>% dplyr::filter(group == "Negative control"),
     aes(x = sgNT_halflife, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_density(
-    data = fg_nt %>% filter(group == "eIF3d hypoxia promotes"),
+    data = fg_nt %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
     aes(x = sgNT_halflife, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_vline(
     data = median_nt,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = stat_label(wt_nt$p.value, promotes_nt, neg_nt, bg_nt$sgNT_halflife)) +
   scale_color_manual(values = set_colors) +
   scale_fill_manual(values  = set_colors) +
   labs(
     title    = "Baseline mRNA half-life (sgNT): eIF3d-promoted genes (hypoxia 1hr)",
-    subtitle = "Half-lives estimated from SLAM-seq exponential decay fit (≤ 100h)\nGrey = all other genes; dashed = median",
+    subtitle = "Half-lives estimated from SLAM-seq exponential decay fit (<= 100h)\nGrey = all other genes; dashed = median",
     x = "sgNT mRNA half-life (hours)", y = "Density",
     color = NULL, fill = NULL
   ) +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "top")+
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
   coord_cartesian(xlim = c(0, 45))
 
 p_nt
@@ -491,10 +577,6 @@ cat("Saved: plots/22_slamseq_halflife_sgNT_by_group.pdf\n")
 ```
 
 ```{r slamseq_sgnt_wilcoxon}
-promotes_nt <- nt_df %>% filter(group == "eIF3d hypoxia promotes") %>% pull(sgNT_halflife)
-neg_nt      <- nt_df %>% filter(group == "Negative control")       %>% pull(sgNT_halflife)
-
-wt_nt <- wilcox.test(promotes_nt, neg_nt, alternative = "two.sided")
 cat("Wilcoxon sgNT halflife (promotes vs neg ctrl):\n")
 cat("  W =", wt_nt$statistic, ", p =", signif(wt_nt$p.value, 3), "\n")
 cat("  Median promotes:", round(median(promotes_nt, na.rm = TRUE), 2), "h\n")
@@ -520,6 +602,17 @@ cat("Fraction with positive log2_ratio:",
     round(mean(mrp_genes$log2_ratio > 0, na.rm = TRUE), 3), "\n")
 cat("Median log2_ratio:", round(median(mrp_genes$log2_ratio, na.rm = TRUE), 3), "\n\n")
 print(mrp_genes %>% dplyr::select(Gene_Name, sgNT_halflife, sgCNOT3_halflife, log2_ratio))
+
+# Positive control asserted, not just reported: MRPL/MRPS are CNOT3 decay targets in
+# the paper, so they must come out stabilized upon CNOT3 KD. Observed: ~99% positive,
+# median log2_ratio ~0.86.
+stopifnot(
+  "Too few MRPL/MRPS genes recovered to validate" = nrow(mrp_genes) >= 40,
+  "MRPL/MRPS not stabilized upon CNOT3 KD (paper positive control failed)" =
+    median(mrp_genes$log2_ratio, na.rm = TRUE) > 0,
+  "MRPL/MRPS majority not positive (paper positive control failed)" =
+    mean(mrp_genes$log2_ratio > 0, na.rm = TRUE) > 0.8
+)
 ```
 
 ### 4b: CGG/CGA/AGG codon frequency score → CDF plot (reproduce paper panel A)
@@ -559,7 +652,11 @@ weight_vec <- setNames(psite_weights$weight, psite_weights$codon)
 
 # Negative control codons (CGC/AGA/CGU) — decoded by different tRNAs, not CNOT3-recruiting.
 # Scored unweighted (equal weight of 1) since we have no enrichment prior for these.
-neg_ctrl_codons <- c("CGC", "AGA", "CGU")
+# DNA notation: CDS sequences come from BSgenome, so CGU is spelled CGT. Matching on
+# "CGU" here silently reduced this to a two-codon set.
+neg_ctrl_codons <- c("CGC", "AGA", "CGT")
+stopifnot("neg_ctrl_codons must be in DNA notation to match CDS sequences" =
+  !any(grepl("U", neg_ctrl_codons)))
 
 score_cds <- function(seq_char) {
   n_codons <- nchar(seq_char) / 3
@@ -600,8 +697,18 @@ codon_score_df <- tibble(
 cat("Genes with codon score:", nrow(codon_score_df), "\n")
 cat("Summary of weighted CGG/CGA/AGG score:\n")
 print(summary(codon_score_df$weighted_score))
-cat("Summary of CGC/AGA/CGU score:\n")
+cat("Summary of CGC/AGA/CGT score:\n")
 print(summary(codon_score_df$neg_ctrl_score))
+
+stopifnot(
+  "ensembl_gene must be unique in codon_score_df (join key for section 6)" =
+    !any(duplicated(codon_score_df$ensembl_gene)),
+  "codon frequency scores must be in [0, 1]" =
+    all(codon_score_df$neg_ctrl_score >= 0 & codon_score_df$neg_ctrl_score <= 1,
+        na.rm = TRUE),
+  "weighted codon score must be non-negative" =
+    all(codon_score_df$weighted_score >= 0, na.rm = TRUE)
+)
 ```
 
 ```{r codon_cdf_plot}
@@ -629,20 +736,25 @@ top_neg_ctrl <- codon_ratio_df %>%
 cat("Top CGG/CGA/AGG set:", length(top_cnot3), "genes\n")
 cat("Top CGC/AGA/CGU set:", length(top_neg_ctrl), "genes (non-overlapping)\n")
 
+# Labels carry the actual group size rather than a hardcoded "Top 1000", which is
+# wrong whenever n_group falls back to floor(nrow / 3).
+lab_cnot3   <- paste0("Top ", n_group, ": CGG/CGA/AGG\n(CNOT3-recruiting)")
+lab_negctrl <- paste0("Top ", n_group, ": CGC/AGA/CGT\n(negative control)")
+lab_other   <- "All other genes"
+
 codon_cdf_df <- codon_ratio_df %>%
   mutate(codon_group = case_when(
-    ensembl_gene %in% top_cnot3    ~ "Top 1000: CGG/CGA/AGG\n(CNOT3-recruiting)",
-    ensembl_gene %in% top_neg_ctrl ~ "Top 1000: CGC/AGA/CGU\n(negative control)",
-    TRUE                            ~ "All other genes"
+    ensembl_gene %in% top_cnot3    ~ lab_cnot3,
+    ensembl_gene %in% top_neg_ctrl ~ lab_negctrl,
+    TRUE                            ~ lab_other
   ))
 
 cat("\nGroup sizes:\n")
-print(codon_cdf_df %>% count(codon_group))
+print(codon_cdf_df %>% dplyr::count(codon_group))
 
-cdf_colors <- c(
-  "Top 1000: CGG/CGA/AGG\n(CNOT3-recruiting)"  = "#E69F00",
-  "Top 1000: CGC/AGA/CGU\n(negative control)"  = "#56B4E9",
-  "All other genes"                              = "grey60"
+cdf_colors <- setNames(
+  c("#E69F00", "#56B4E9", "grey60"),
+  c(lab_cnot3, lab_negctrl, lab_other)
 )
 
 p_cdf <- ggplot(codon_cdf_df, aes(x = log2_ratio, color = codon_group)) +
@@ -656,7 +768,7 @@ p_cdf <- ggplot(codon_cdf_df, aes(x = log2_ratio, color = codon_group)) +
     x = "log2(sgCNOT3 / sgNT) half-life ratio", y = "Empirical CDF",
     color = NULL
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_cdf
@@ -665,9 +777,9 @@ ggsave(here("plots", "22_codon_cdf_log2ratio.pdf"),
 cat("Saved: plots/22_codon_cdf_log2ratio.pdf\n")
 
 # Wilcoxon tests
-cnot3_ratio   <- codon_cdf_df %>% filter(codon_group == "Top 1000: CGG/CGA/AGG\n(CNOT3-recruiting)") %>% pull(log2_ratio)
-negctrl_ratio <- codon_cdf_df %>% filter(codon_group == "Top 1000: CGC/AGA/CGU\n(negative control)") %>% pull(log2_ratio)
-other_ratio   <- codon_cdf_df %>% filter(codon_group == "All other genes") %>% pull(log2_ratio)
+cnot3_ratio   <- codon_cdf_df %>% dplyr::filter(codon_group == lab_cnot3)   %>% pull(log2_ratio)
+negctrl_ratio <- codon_cdf_df %>% dplyr::filter(codon_group == lab_negctrl) %>% pull(log2_ratio)
+other_ratio   <- codon_cdf_df %>% dplyr::filter(codon_group == lab_other)   %>% pull(log2_ratio)
 
 wt1 <- wilcox.test(cnot3_ratio, negctrl_ratio, alternative = "two.sided")
 wt2 <- wilcox.test(cnot3_ratio, other_ratio,   alternative = "two.sided")
@@ -708,13 +820,31 @@ codon_freq_long <- tibble(
   ) %>%
   dplyr::select(-seq) %>%
   unnest(codons) %>%
-  filter(!codons %in% stop_codons) %>%
-  count(ensembl_gene, n_codons, codons, name = "codon_count") %>%
+  dplyr::filter(!codons %in% stop_codons) %>%
+  dplyr::count(ensembl_gene, n_codons, codons, name = "codon_count") %>%
+  # count() emits rows only for codons a gene actually contains. Without completing
+  # the grid, a gene lacking CGA is dropped from the CGA correlation below instead of
+  # contributing freq = 0, so each codon is scored on a different, presence-selected
+  # subset of genes. That biases the rare codons most, which is where CGA/AGG sit.
+  tidyr::complete(
+    tidyr::nesting(ensembl_gene, n_codons),
+    codons,
+    fill = list(codon_count = 0)
+  ) %>%
   mutate(freq = codon_count / n_codons) %>%
   dplyr::select(ensembl_gene, codons, freq)
 
 cat("Codon-gene frequency rows:", nrow(codon_freq_long), "\n")
 cat("Unique sense codons observed:", n_distinct(codon_freq_long$codons), "\n")
+cat("Genes in codon frequency table:", n_distinct(codon_freq_long$ensembl_gene), "\n")
+
+stopifnot(
+  "Codon grid must be complete: every gene scored for every observed sense codon" =
+    nrow(codon_freq_long) ==
+      n_distinct(codon_freq_long$ensembl_gene) * n_distinct(codon_freq_long$codons),
+  "Codon frequencies must be in [0, 1]" =
+    all(codon_freq_long$freq >= 0 & codon_freq_long$freq <= 1, na.rm = TRUE)
+)
 # Note: CDS sequences are in DNA notation, so CGU (RNA) appears as CGT in this frequency
 # table. All codon lookups below use DNA notation consistently (e.g. CGT not CGU).
 ```
@@ -742,8 +872,22 @@ print(codon_spearman %>% filter(codons %in% c("CGG", "CGA", "AGG")) %>%
         dplyr::select(codons, rank, spearman_r))
 
 cat("\nRanks of negative-control codons:\n")
-print(codon_spearman %>% filter(codons %in% c("CGC", "AGA", "CGT")) %>%
+print(codon_spearman %>% dplyr::filter(codons %in% c("CGC", "AGA", "CGT")) %>%
         dplyr::select(codons, rank, spearman_r))
+
+# Assert the paper's directional claim rather than only reporting it: CGG is the
+# headline CNOT3-recruiting codon and must rank at the very top, and all three
+# CNOT3-recruiting codons must correlate positively with stabilization upon KD.
+cnot3_codon_stats <- codon_spearman %>%
+  dplyr::filter(codons %in% c("CGG", "CGA", "AGG"))
+
+stopifnot(
+  "All 61 sense codons must be scored" = nrow(codon_spearman) == 61,
+  "CGG must rank in the top 5 CNOT3-sensitivity codons" =
+    codon_spearman$rank[codon_spearman$codons == "CGG"] <= 5,
+  "CGG/CGA/AGG must all correlate positively with stabilization upon CNOT3 KD" =
+    all(cnot3_codon_stats$spearman_r > 0)
+)
 ```
 
 ```{r cnot3_codon_stability_plot}
@@ -811,7 +955,7 @@ p_codon_scores <- ggplot(codon_plot_df,
     subtitle = "Spearman r(codon frequency, log2 sgCNOT3/sgNT half-life) across genes\nPositive = codon presence predicts stabilization upon CNOT3 KD",
     x = "Rank (1 = most positive)", y = "Spearman r"
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_codon_scores
@@ -866,6 +1010,12 @@ cnot3_features <- ribo_gene %>%
   )
 
 cat("CNOT3 feature table:", nrow(cnot3_features), "genes\n")
+
+# A duplicated key here fans the left_join below out and silently adds rows to the
+# feature matrix, so fail loudly instead of reporting it after the fact.
+stopifnot("cnot3_features must be one row per gene before joining" =
+  !any(duplicated(cnot3_features$ensembl_gene)))
+
 cat("Genes with riboseq enrichment:", sum(!is.na(cnot3_features$cnot3_ribo_enrichment)), "\n")
 cat("Genes with SLAM-seq halflife: ", sum(!is.na(cnot3_features$cnot3_slamseq_sgNT_halflife)), "\n")
 cat("Genes with SLAM-seq ratio:    ", sum(!is.na(cnot3_features$cnot3_slamseq_log2_ratio)), "\n")
@@ -875,14 +1025,23 @@ cat("Genes with codon score:       ", sum(!is.na(cnot3_features$cnot3_weighted_c
 ```{r join_to_feature_matrix}
 fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds"))
 
-cat("Feature matrix loaded:", nrow(fm), "genes ×", ncol(fm), "columns\n")
+# The feature matrix is transcript-keyed; the CNOT3 features are gene-level and
+# broadcast across a gene's transcripts.
+cat("Feature matrix loaded:", nrow(fm), "transcripts ×", ncol(fm), "columns\n")
 
 # Join on versionless Ensembl ID; feature matrix uses gene_id_clean
 fm_cnot3 <- fm %>%
   left_join(cnot3_features, by = c("gene_id_clean" = "ensembl_gene"))
 
-cat("After join:", nrow(fm_cnot3), "genes ×", ncol(fm_cnot3), "columns\n")
+cat("After join:", nrow(fm_cnot3), "transcripts ×", ncol(fm_cnot3), "columns\n")
 cat("New columns added:", ncol(fm_cnot3) - ncol(fm), "\n")
+
+stopifnot(
+  "Join must not change the number of feature matrix rows" =
+    nrow(fm_cnot3) == nrow(fm),
+  "Join must add exactly the 4 CNOT3 feature columns" =
+    ncol(fm_cnot3) - ncol(fm) == 4
+)
 
 cat("\nCoverage within feature matrix genes:\n")
 cat("  cnot3_ribo_enrichment:      ",
@@ -894,18 +1053,26 @@ cat("  cnot3_slamseq_log2_ratio:   ",
 cat("  cnot3_weighted_codon_score: ",
     sum(!is.na(fm_cnot3$cnot3_weighted_codon_score)), "/", nrow(fm_cnot3), "\n")
 
+expected_cnot3_cols <- c("cnot3_ribo_enrichment", "cnot3_slamseq_sgNT_halflife",
+                         "cnot3_slamseq_log2_ratio", "cnot3_weighted_codon_score")
+
 stopifnot(
-  "cnot3_ribo_enrichment must be ≥ 0 (-log10 of a probability)" =
+  "All 4 CNOT3 feature columns must be present" =
+    all(expected_cnot3_cols %in% colnames(fm_cnot3)),
+  "cnot3_ribo_enrichment must be >= 0 (-log10 of a probability)" =
     all(fm_cnot3$cnot3_ribo_enrichment >= 0, na.rm = TRUE),
   "cnot3_slamseq_sgNT_halflife must be > 0 (half-lives are positive)" =
-    all(fm_cnot3$cnot3_slamseq_sgNT_halflife > 0, na.rm = TRUE)
+    all(fm_cnot3$cnot3_slamseq_sgNT_halflife > 0, na.rm = TRUE),
+  "cnot3_slamseq_sgNT_halflife must respect the 100h ceiling" =
+    all(fm_cnot3$cnot3_slamseq_sgNT_halflife <= 100, na.rm = TRUE),
+  "cnot3_slamseq_log2_ratio must be finite where not NA (log-fold change)" =
+    all(is.finite(fm_cnot3$cnot3_slamseq_log2_ratio[
+      !is.na(fm_cnot3$cnot3_slamseq_log2_ratio)])),
+  "cnot3_weighted_codon_score must be non-negative" =
+    all(fm_cnot3$cnot3_weighted_codon_score >= 0, na.rm = TRUE)
 )
 cat("CNOT3 value range checks passed\n")
 
 saveRDS(fm_cnot3, here("output", "predictive_modeling", "feature_matrix_cnot3.rds"))
 cat("\nSaved: output/predictive_modeling/feature_matrix_cnot3.rds\n")
-```
-
-```{r}
-
 ```

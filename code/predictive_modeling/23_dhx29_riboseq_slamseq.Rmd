@@ -31,6 +31,7 @@ library(ggplot2)
 library(ggrepel)
 library(GenomicFeatures)
 library(BSgenome.Hsapiens.UCSC.hg38)
+library(iCodon)
 ```
 
 ---
@@ -88,7 +89,7 @@ s8_bar <- s8 %>%
 
 bar_colors <- c("CES > 1 (enriched)" = "#D55E00", "CES < 1 (depleted)" = "#0072B2")
 
-ggplot(s8_bar, aes(x = codon, y = Fold_Change, fill = enriched)) +
+p_ces_bar <- ggplot(s8_bar, aes(x = codon, y = Fold_Change, fill = enriched)) +
   geom_col(width = 0.7) +
   geom_hline(yintercept = 1, linetype = "dashed", color = "grey40", linewidth = 0.5) +
   scale_fill_manual(values = bar_colors, name = NULL) +
@@ -103,7 +104,8 @@ ggplot(s8_bar, aes(x = codon, y = Fold_Change, fill = enriched)) +
     legend.position = "top"
   )
 
-ggsave(here("plots", "23_ces_per_codon_qc.pdf"), width = 12, height = 4)
+p_ces_bar
+ggsave(here("plots", "23_ces_per_codon_qc.pdf"), p_ces_bar, width = 12, height = 4)
 ```
 
 ```{r load_cds_for_occupancy}
@@ -133,14 +135,18 @@ stop_codons <- c("TAA", "TAG", "TGA")
 ces_vec     <- setNames(s8$Fold_Change, s8$codon)
 
 # Per-gene DHX29 occupancy = weighted mean of CES values, weighted by codon frequency
-# = sum(CES[c] × count_c) / n_codons  (equivalent to paper's sum(CES × freq) / CDS_length)
+# = sum(CES[c] × count_c) / n_sense_codons
+# Denominator is the number of codons actually scored (stop codon removed), matching
+# compute_csc_score below. Dividing by the pre-removal n_codons instead deflates the
+# score by n/(n+1), which is a length-dependent artifact in an RF feature.
 compute_occupancy <- function(seq_char) {
   n_codons <- nchar(seq_char) / 3
   if (n_codons < 10) return(NA_real_)
   starts <- seq(1, nchar(seq_char) - 2, by = 3)
   codons <- substring(seq_char, starts, starts + 2)
   codons <- codons[!codons %in% stop_codons]
-  sum(ces_vec[codons], na.rm = TRUE) / n_codons
+  if (length(codons) == 0) return(NA_real_)
+  sum(ces_vec[codons], na.rm = TRUE) / length(codons)
 }
 
 occupancy_scores <- vapply(cds_char, compute_occupancy, numeric(1))
@@ -174,7 +180,8 @@ compute_occupancy_v2 <- function(seq_char) {
   if (n_codons < 10) return(NA_real_)
   codons <- str_extract_all(seq_char, "...")[[1]]   # "..." matches exactly 3 chars, non-overlapping
   codons <- codons[!codons %in% stop_codons]
-  sum(ces_vec[codons], na.rm = TRUE) / n_codons
+  if (length(codons) == 0) return(NA_real_)
+  sum(ces_vec[codons], na.rm = TRUE) / length(codons)
 }
 
 occupancy_v2 <- vapply(cds_char, compute_occupancy_v2, numeric(1))
@@ -196,23 +203,42 @@ dhx29_occupancy <- dhx29_occupancy %>%
   )
 
 cat("Group counts:\n")
-print(table(dhx29_occupancy$group))
+print(dhx29_occupancy %>% dplyr::count(group))
+```
 
-print(dhx29_occupancy %>% count(group))
+```{r plot_annotation_helper}
+set_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "grey40",
+  "All other genes"        = "grey80"
+)
+
+# Corner annotation carrying the test result and all three group sizes, so each
+# figure is self-contained.
+stat_label <- function(p_value, x_promotes, x_neg, x_other) {
+  paste0(
+    "Wilcoxon p = ", signif(p_value, 3),
+    "\nn promotes = ", sum(!is.na(x_promotes)),
+    "\nn neg ctrl = ", sum(!is.na(x_neg)),
+    "\nn other = ",    sum(!is.na(x_other))
+  )
+}
 ```
 
 ```{r dhx29_occupancy_density_plot}
-set_colors <- c(
-  "eIF3d hypoxia promotes" = "#E69F00",
-  "Negative control"       = "black"
-)
-
-bg_occ <- dhx29_occupancy %>% filter(group == "All other genes")
-fg_occ <- dhx29_occupancy %>% filter(group != "All other genes")
+bg_occ <- dhx29_occupancy %>% dplyr::filter(group == "All other genes")
+fg_occ <- dhx29_occupancy %>% dplyr::filter(group != "All other genes")
 
 median_occ <- fg_occ %>%
   group_by(group) %>%
   summarise(med = median(dhx29_occupancy_score, na.rm = TRUE), .groups = "drop")
+
+promotes_occ <- dhx29_occupancy %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>%
+  pull(dhx29_occupancy_score)
+neg_occ      <- dhx29_occupancy %>% dplyr::filter(group == "Negative control") %>%
+  pull(dhx29_occupancy_score)
+
+wt_occ <- wilcox.test(promotes_occ, neg_occ, alternative = "two.sided")
 
 p_occ <- ggplot() +
   geom_density(
@@ -221,20 +247,24 @@ p_occ <- ggplot() +
     color = "grey60", fill = NA, linewidth = 0.9
   ) +
   geom_density(
-    data = fg_occ %>% filter(group == "Negative control"),
+    data = fg_occ %>% dplyr::filter(group == "Negative control"),
     aes(x = dhx29_occupancy_score, color = group),
-    fill = NA, linewidth = 0.9
+    fill = NA, linewidth = 0.8
   ) +
   geom_density(
-    data = fg_occ %>% filter(group == "eIF3d hypoxia promotes"),
+    data = fg_occ %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
     aes(x = dhx29_occupancy_score, color = group),
-    fill = NA, linewidth = 0.9
+    fill = NA, linewidth = 0.8
   ) +
   geom_vline(
     data = median_occ,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = stat_label(wt_occ$p.value, promotes_occ, neg_occ,
+                              bg_occ$dhx29_occupancy_score)) +
   scale_color_manual(values = set_colors) +
   labs(
     title    = "DHX29 ribosome occupancy: eIF3d-promoted genes (hypoxia 1hr)",
@@ -252,12 +282,6 @@ cat("Saved: plots/23_dhx29_riboseq_occupancy_by_group.pdf\n")
 ```
 
 ```{r dhx29_occupancy_wilcoxon}
-promotes_occ <- dhx29_occupancy %>% filter(group == "eIF3d hypoxia promotes") %>%
-  pull(dhx29_occupancy_score)
-neg_occ      <- dhx29_occupancy %>% filter(group == "Negative control") %>%
-  pull(dhx29_occupancy_score)
-
-wt_occ <- wilcox.test(promotes_occ, neg_occ, alternative = "two.sided")
 cat("Wilcoxon promotes vs neg ctrl (occupancy):\n")
 cat("  W =", wt_occ$statistic, ", p =", signif(wt_occ$p.value, 3), "\n")
 cat("  Median promotes:", round(median(promotes_occ, na.rm = TRUE), 4), "\n")
@@ -376,7 +400,7 @@ p_ces <- ggplot(s8_plot, aes(x = rank, y = Fold_Change, color = codon_class)) +
     subtitle = "Fold_Change = IP_Avg / Input_Avg (Thor-Ribo-seq); reproduces Figure 4D\nAU3 = ends in A/T; GC3 = ends in G/C",
     x = "Rank (1 = highest enrichment)", y = "CES (IP / Input)"
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_ces
@@ -417,6 +441,18 @@ spot <- s6_raw %>%
   mutate(log2_computed = round(log2(KO_Half_life / Ctrl_Half_life), 3))
 cat("\nlogFC verification (logFC = log2(KO/Ctrl)):\n")
 print(spot %>% dplyr::select(gene_name, Ctrl_Half_life, KO_Half_life, logFC, log2_computed))
+
+# Assert the published column really is log2(KO/Ctrl) before anything downstream uses
+# it. Checked across the whole table, not just the printed 3 rows.
+logfc_check <- s6_raw %>%
+  filter(!is.na(Ctrl_Half_life), !is.na(KO_Half_life), !is.na(logFC),
+         Ctrl_Half_life > 0, KO_Half_life > 0)
+stopifnot(
+  "Hia2026 logFC is not log2(KO/Ctrl)" =
+    max(abs(logfc_check$logFC - log2(logfc_check$KO_Half_life /
+                                     logfc_check$Ctrl_Half_life)), na.rm = TRUE) < 0.01
+)
+cat("Verified logFC = log2(KO/Ctrl) across", nrow(logfc_check), "rows\n")
 ```
 
 ```{r s6_filter}
@@ -442,24 +478,47 @@ s6_mapped <- s6_filt %>%
   mutate(transcript_id_clean = str_extract(gene_name, "ENST\\d+")) %>%
   filter(!is.na(transcript_id_clean))
 
-# Join to most_abundant_tx to get gene ID
+# Map ENST -> gene through the FULL GENCODE annotation, not through most_abundant_tx.
+# Joining to most_abundant_tx additionally required Hia's QuantSeq transcript to be the
+# very isoform we picked as most abundant in MDA-MB-231, which discarded ~61% of the
+# table (5599 -> 2189 genes) for no scientific reason: a gene-level half-life does not
+# require isoform agreement. Mapping through the full annotation retains ~99%.
+tx2gene_all <- transcripts(txdb, columns = c("tx_name", "gene_id")) %>%
+  mcols() %>%
+  as_tibble() %>%
+  transmute(
+    transcript_id_clean = sub("\\..*", "", as.character(tx_name)),
+    ensembl_gene = sub("\\..*", "", vapply(
+      gene_id,
+      function(x) if (length(x)) as.character(x)[[1]] else NA_character_,
+      character(1)
+    ))
+  ) %>%
+  filter(!is.na(ensembl_gene)) %>%
+  distinct()
+
+# Gene symbols from the project gene annotation (file has no header row)
+gene_anno <- read_tsv(
+  here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+  col_names = c("gene_id", "symbol", "biotype", "species", "source"),
+  show_col_types = FALSE
+) %>%
+  transmute(ensembl_gene = sub("\\..*", "", gene_id), symbol) %>%
+  distinct(ensembl_gene, .keep_all = TRUE)
+
 s6_gene <- s6_mapped %>%
-  inner_join(
-    tx_gene %>% dplyr::select(transcript_id_clean, ensembl_gene, symbol),
-    by = "transcript_id_clean"
-  )
+  inner_join(tx2gene_all, by = "transcript_id_clean") %>%
+  left_join(gene_anno, by = "ensembl_gene")
 
 n_matched  <- nrow(s6_gene)
 pct_matched <- round(100 * n_matched / nrow(s6_filt), 1)
-cat("Transcripts with ENST match in most_abundant_tx:",
+cat("Transcripts with ENST match in GENCODE v49:",
     n_matched, "/", nrow(s6_filt), "(", pct_matched, "%)\n")
 
-if (pct_matched < 50) {
-  cat("WARNING: fewer than 50% of S6 transcripts mapped.\n",
-      "QuantSeq 3'UTR data was built from a different transcript annotation than\n",
-      "most_abundant_tx — low coverage is expected. Downstream analyses will\n",
-      "reflect only the subset of genes with matched half-life data.\n")
-}
+stopifnot(
+  "S6 transcript mapping coverage collapsed - check the annotation build" =
+    pct_matched >= 90
+)
 
 # Where multiple transcripts map to the same gene, take mean half-lives and logFC
 halflife_wide <- s6_gene %>%
@@ -474,6 +533,20 @@ halflife_wide <- s6_gene %>%
 
 cat("Unique genes after deduplication:", nrow(halflife_wide), "\n")
 cat("Genes with >1 transcript:", sum(halflife_wide$n_transcripts > 1), "\n")
+
+med_ctrl <- median(halflife_wide$Ctrl_Half_life, na.rm = TRUE)
+cat("Median Ctrl half-life:", round(med_ctrl, 2), "h\n")
+
+stopifnot(
+  "Hia2026 median Ctrl half-life outside expected range" =
+    dplyr::between(med_ctrl, 2.0, 6.0),
+  "Ctrl/KO half-lives must be positive" =
+    all(halflife_wide$Ctrl_Half_life > 0 & halflife_wide$KO_Half_life > 0, na.rm = TRUE),
+  "logFC must be finite where not NA" =
+    all(is.finite(halflife_wide$logFC[!is.na(halflife_wide$logFC)])),
+  "ensembl_gene must be unique in halflife_wide (join key for section 8)" =
+    !any(duplicated(halflife_wide$ensembl_gene))
+)
 ```
 
 ```{r s6_annotate_groups}
@@ -485,7 +558,7 @@ halflife_wide <- halflife_wide %>%
   ))
 
 cat("Gene group counts (SLAM-seq):\n")
-print(halflife_wide %>% count(group))
+print(halflife_wide %>% dplyr::count(group))
 ```
 
 ### Headline: log2(KO/Ctrl) half-life ratio by group
@@ -493,35 +566,43 @@ print(halflife_wide %>% count(group))
 Positive logFC = mRNA stabilized when DHX29 is knocked out = DHX29 normally promotes its decay.
 
 ```{r dhx29_logfc_density_plot}
-bg_fc <- halflife_wide %>% filter(group == "All other genes")
-fg_fc <- halflife_wide %>% filter(group != "All other genes")
+bg_fc <- halflife_wide %>% dplyr::filter(group == "All other genes")
+fg_fc <- halflife_wide %>% dplyr::filter(group != "All other genes")
 
 median_fc <- fg_fc %>%
   group_by(group) %>%
   summarise(med = median(logFC, na.rm = TRUE), .groups = "drop")
 
+promotes_fc <- halflife_wide %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>% pull(logFC)
+neg_fc      <- halflife_wide %>% dplyr::filter(group == "Negative control")       %>% pull(logFC)
+
+wt_fc <- wilcox.test(promotes_fc, neg_fc, alternative = "two.sided")
+
 p_fc <- ggplot() +
   geom_density(
     data = bg_fc,
     aes(x = logFC),
-    color = NA, fill = "grey80", alpha = 0.6
+    color = NA, fill = set_colors[["All other genes"]], alpha = 0.6
   ) +
   geom_density(
-    data = fg_fc %>% filter(group == "Negative control"),
+    data = fg_fc %>% dplyr::filter(group == "Negative control"),
     aes(x = logFC, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_density(
-    data = fg_fc %>% filter(group == "eIF3d hypoxia promotes"),
+    data = fg_fc %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
     aes(x = logFC, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
-  geom_vline(xintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", linewidth = 0.5) +
   geom_vline(
     data = median_fc,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = stat_label(wt_fc$p.value, promotes_fc, neg_fc, bg_fc$logFC)) +
   scale_color_manual(values = set_colors) +
   scale_fill_manual(values  = set_colors) +
   labs(
@@ -530,7 +611,7 @@ p_fc <- ggplot() +
     x = "log2(KO / Ctrl) half-life ratio", y = "Density",
     color = NULL, fill = NULL
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_fc
@@ -540,10 +621,6 @@ cat("Saved: plots/23_dhx29_slamseq_log2ratio_by_group.pdf\n")
 ```
 
 ```{r dhx29_logfc_wilcoxon}
-promotes_fc <- halflife_wide %>% filter(group == "eIF3d hypoxia promotes") %>% pull(logFC)
-neg_fc      <- halflife_wide %>% filter(group == "Negative control")       %>% pull(logFC)
-
-wt_fc <- wilcox.test(promotes_fc, neg_fc, alternative = "two.sided")
 cat("Wilcoxon logFC (promotes vs neg ctrl):\n")
 cat("  W =", wt_fc$statistic, ", p =", signif(wt_fc$p.value, 3), "\n")
 cat("  Median promotes:", round(median(promotes_fc, na.rm = TRUE), 3), "\n")
@@ -553,44 +630,54 @@ cat("  Median neg ctrl:", round(median(neg_fc, na.rm = TRUE), 3), "\n")
 ### Baseline Ctrl half-life by group
 
 ```{r dhx29_ctrl_halflife_density_plot}
-bg_hl <- halflife_wide %>% filter(group == "All other genes")
-fg_hl <- halflife_wide %>% filter(group != "All other genes")
+bg_hl <- halflife_wide %>% dplyr::filter(group == "All other genes")
+fg_hl <- halflife_wide %>% dplyr::filter(group != "All other genes")
 
 median_hl <- fg_hl %>%
   group_by(group) %>%
   summarise(med = median(Ctrl_Half_life, na.rm = TRUE), .groups = "drop")
 
+promotes_hl <- halflife_wide %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>%
+  pull(Ctrl_Half_life)
+neg_hl      <- halflife_wide %>% dplyr::filter(group == "Negative control") %>%
+  pull(Ctrl_Half_life)
+
+wt_hl <- wilcox.test(promotes_hl, neg_hl, alternative = "two.sided")
+
 p_hl <- ggplot() +
   geom_density(
     data = bg_hl,
     aes(x = Ctrl_Half_life),
-    color = NA, fill = "grey80", alpha = 0.6
+    color = NA, fill = set_colors[["All other genes"]], alpha = 0.6
   ) +
   geom_density(
-    data = fg_hl %>% filter(group == "Negative control"),
+    data = fg_hl %>% dplyr::filter(group == "Negative control"),
     aes(x = Ctrl_Half_life, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_density(
-    data = fg_hl %>% filter(group == "eIF3d hypoxia promotes"),
+    data = fg_hl %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
     aes(x = Ctrl_Half_life, color = group, fill = group),
-    alpha = 0.25, linewidth = 0.8
+    alpha = 0.15, linewidth = 0.8
   ) +
   geom_vline(
     data = median_hl,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = stat_label(wt_hl$p.value, promotes_hl, neg_hl, bg_hl$Ctrl_Half_life)) +
   scale_color_manual(values = set_colors) +
   scale_fill_manual(values  = set_colors) +
   coord_cartesian(xlim = c(1, 6.5)) +
   labs(
     title    = "Baseline mRNA half-life (Ctrl): eIF3d-promoted genes (hypoxia 1hr)",
-    subtitle = "Ctrl half-life from DHX29 KO SLAM-seq (Hia et al.)\nGrey = all other genes; dashed = median; x-axis clipped at 45h",
+    subtitle = "Ctrl half-life from DHX29 KO SLAM-seq (Hia et al.)\nGrey = all other genes; dashed = median; x-axis zoomed to 1-6.5h",
     x = "Ctrl mRNA half-life (hours)", y = "Density",
     color = NULL, fill = NULL
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_hl
@@ -600,12 +687,6 @@ cat("Saved: plots/23_dhx29_slamseq_halflife_ctrl_by_group.pdf\n")
 ```
 
 ```{r dhx29_ctrl_halflife_wilcoxon}
-promotes_hl <- halflife_wide %>% filter(group == "eIF3d hypoxia promotes") %>%
-  pull(Ctrl_Half_life)
-neg_hl      <- halflife_wide %>% filter(group == "Negative control") %>%
-  pull(Ctrl_Half_life)
-
-wt_hl <- wilcox.test(promotes_hl, neg_hl, alternative = "two.sided")
 cat("Wilcoxon Ctrl halflife (promotes vs neg ctrl):\n")
 cat("  W =", wt_hl$statistic, ", p =", signif(wt_hl$p.value, 3), "\n")
 cat("  Median promotes:", round(median(promotes_hl, na.rm = TRUE), 2), "h\n")
@@ -666,12 +747,25 @@ gc3_binned <- gc3_logfc %>%
                        include.lowest = TRUE, right = FALSE))
 
 cat("\nGenes per GC3 bin:\n")
-print(gc3_binned %>% count(gc3_bin))
+print(gc3_binned %>% dplyr::count(gc3_bin))
 
 gc3_medians <- gc3_binned %>%
   group_by(gc3_bin) %>%
   summarise(median_logFC = median(logFC, na.rm = TRUE),
             n = n(), .groups = "drop")
+
+# Figure 1H replication asserted, not just plotted: AU3-rich (low GC3) genes must be
+# more stabilized upon DHX29 KO than GC3-rich genes.
+cat("\nMedian logFC per GC3 bin:\n")
+print(gc3_medians)
+gc3_lowest  <- gc3_medians$median_logFC[gc3_medians$gc3_bin == "<40%"]
+gc3_highest <- gc3_medians$median_logFC[gc3_medians$gc3_bin == ">80%"]
+stopifnot(
+  "GC3 bins must all be populated to validate Fig 1H" =
+    all(!is.na(gc3_medians$median_logFC)),
+  "Fig 1H replication failed: low-GC3 genes not more stabilized than high-GC3 genes" =
+    gc3_lowest > gc3_highest
+)
 
 p_gc3 <- ggplot(gc3_binned, aes(x = gc3_bin, y = logFC)) +
   geom_boxplot(fill = "grey80", outlier.size = 0.5, outlier.alpha = 0.3) +
@@ -684,7 +778,7 @@ p_gc3 <- ggplot(gc3_binned, aes(x = gc3_bin, y = logFC)) +
     subtitle = "Reproduces Figure 1H; low GC3 (AU3-rich) genes expected most stabilized",
     x = "GC3 content bin", y = "log2(KO / Ctrl) half-life"
   ) +
-  theme_bw(base_size = 12)
+  theme_classic(base_size = 12)
 
 p_gc3
 ggsave(here("plots", "23_dhx29_gc3_halflife_validation.pdf"),
@@ -738,9 +832,12 @@ p_cdf <- ggplot(cdf_df, aes(x = logFC, color = occ_group)) +
     x = "log2(KO / Ctrl) half-life ratio", y = "Empirical CDF",
     color = NULL
   ) +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "top")+
-  xlim(-0.5,0.5)
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  # coord_cartesian, not xlim(): xlim() drops genes outside the range before stat_ecdf
+  # runs, so each curve would be renormalised over its own truncated subset and would
+  # disagree with the Wilcoxon tests below, which use the full data.
+  coord_cartesian(xlim = c(-0.5, 0.5))
 
 p_cdf
 ggsave(here("plots", "23_dhx29_occupancy_cdf_log2ratio.pdf"),
@@ -786,14 +883,33 @@ codon_freq_long_dhx <- tibble(
   ) %>%
   dplyr::select(-seq) %>%
   unnest(codons) %>%
-  filter(!codons %in% stop_codons) %>%
-  count(ensembl_gene, n_codons, codons, name = "codon_count") %>%
+  dplyr::filter(!codons %in% stop_codons) %>%
+  dplyr::count(ensembl_gene, n_codons, codons, name = "codon_count") %>%
+  # count() emits rows only for codons a gene actually contains. Without completing the
+  # grid, a gene lacking a codon is dropped from that codon's correlation instead of
+  # contributing freq = 0, so every codon is scored on a different, presence-selected
+  # subset of genes.
+  tidyr::complete(
+    tidyr::nesting(ensembl_gene, n_codons),
+    codons,
+    fill = list(codon_count = 0)
+  ) %>%
   mutate(freq = codon_count / n_codons) %>%
   dplyr::select(ensembl_gene, codons, freq)
 
 # Note: CDS sequences are in DNA notation — CGU (RNA) appears as CGT here.
 cat("Codon-gene frequency rows:", nrow(codon_freq_long_dhx), "\n")
 cat("Unique sense codons observed:", n_distinct(codon_freq_long_dhx$codons), "\n")
+cat("Genes in codon frequency table:", n_distinct(codon_freq_long_dhx$ensembl_gene), "\n")
+
+stopifnot(
+  "Codon grid must be complete: every gene scored for every observed sense codon" =
+    nrow(codon_freq_long_dhx) ==
+      n_distinct(codon_freq_long_dhx$ensembl_gene) *
+      n_distinct(codon_freq_long_dhx$codons),
+  "Codon frequencies must be in [0, 1]" =
+    all(codon_freq_long_dhx$freq >= 0 & codon_freq_long_dhx$freq <= 1, na.rm = TRUE)
+)
 ```
 
 ```{r dhx29_codon_spearman}
@@ -814,13 +930,25 @@ cat("Codons scored:", nrow(codon_spearman_dhx), "\n\n")
 
 # Report ranks of key codons
 cat("Representative AU3 codon ranks:\n")
-print(codon_spearman_dhx %>% filter(codons %in% c("AAA","AAT","ATA","AGA","TAT","TAA")) %>%
-        filter(!codons %in% stop_codons) %>%
+print(codon_spearman_dhx %>%
+        dplyr::filter(codons %in% c("AAA", "AAT", "ATA", "AGA", "TAT")) %>%
         dplyr::select(codons, rank, spearman_r))
 
 cat("\nRepresentative GC3 codon ranks:\n")
-print(codon_spearman_dhx %>% filter(codons %in% c("GGC","GCC","CGC","GGG","CCG")) %>%
+print(codon_spearman_dhx %>%
+        dplyr::filter(codons %in% c("GGC", "GCC", "CGC", "GGG", "CCG")) %>%
         dplyr::select(codons, rank, spearman_r))
+
+# Figure 4D replication asserted: AU3 codons (3rd base A/T) must rank above GC3 codons.
+au3_ranks <- codon_spearman_dhx$rank[str_sub(codon_spearman_dhx$codons, 3, 3) %in% c("A", "T")]
+gc3_ranks <- codon_spearman_dhx$rank[str_sub(codon_spearman_dhx$codons, 3, 3) %in% c("G", "C")]
+cat("\nMean rank - AU3:", round(mean(au3_ranks), 1),
+    "| GC3:", round(mean(gc3_ranks), 1), "\n")
+stopifnot(
+  "All 61 sense codons must be scored" = nrow(codon_spearman_dhx) == 61,
+  "Fig 4D replication failed: AU3 codons do not rank above GC3 codons" =
+    mean(au3_ranks) < mean(gc3_ranks)
+)
 ```
 
 ```{r dhx29_codon_stability_plot}
@@ -861,7 +989,7 @@ p_codon_dhx <- ggplot(codon_plot_dhx, aes(x = rank, y = spearman_r, color = codo
     subtitle = "Spearman r(codon frequency, log2 KO/Ctrl half-life) across genes\nAU3 = ends in A/T (expect top); GC3 = ends in G/C (expect bottom)",
     x = "Rank (1 = most positive)", y = "Spearman r"
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_codon_dhx
@@ -940,8 +1068,10 @@ plot_ecdf_quintiles <- function(plot_df, score_col, title, subtitle, file_name,
     summarise(n = n(), .groups = "drop") %>%
     mutate(label = paste0(quintile, " (n=", n, ")"))
 
-  # RdBu: Q1 (low CSC, AU3-rich) = warm red; Q5 (high CSC, GC3-rich) = cool blue
-  pal <- RColorBrewer::brewer.pal(5, "RdBu")
+  # Project diverging hues (Okabe-Ito blue -> vermillion). Q1 (low CSC, AU3-rich) =
+  # vermillion; Q5 (high CSC, GC3-rich) = blue. Mid-point is grey rather than white so
+  # the Q3 line stays visible on a white panel, unlike brewer RdBu.
+  pal <- rev(colorRampPalette(c("#0072B2", "grey70", "#D55E00"))(5))
 
   p <- ggplot(plot_df, aes(x = logFC, color = quintile)) +
     stat_ecdf(linewidth = 0.8) +
@@ -954,10 +1084,12 @@ plot_ecdf_quintiles <- function(plot_df, score_col, title, subtitle, file_name,
     coord_cartesian(xlim = xlim_range) +
     labs(title = title, subtitle = subtitle,
          x = "logFC (DHX29-KO / Control half-life)", y = "Empirical CDF") +
-    theme_bw(base_size = 12) +
+    theme_classic(base_size = 12) +
     theme(legend.position = "right")
 
-  p
+  # print(), not a bare `p`: auto-printing only happens at top level, so a bare `p`
+  # inside a function saves the PDF but renders nothing in the knitted document.
+  print(p)
   ggsave(here("plots", file_name), p, width = 7, height = 5)
   cat("Saved:", file_name, "\n")
 
@@ -1043,7 +1175,7 @@ p_grp <- ggplot() +
   labs(title    = "eIF3d gene groups vs DHX29-KO logFC",
        subtitle = "Grey = all other genes; dashed = group median; logFC = log2(KO/Ctrl half-life)",
        x = "logFC (DHX29-KO / Control half-life)", y = "Empirical CDF") +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_grp
@@ -1067,8 +1199,6 @@ Are codons with high DHX29 ribosome occupancy (high CES) also destabilizing by C
 This scatterplot compares the two orthogonal per-codon scores directly.
 
 ```{r ces_vs_csc_scatter, fig.width=6, fig.height=6}
-library(iCodon)
-
 # iCodon per-codon weights — RNA notation → convert to DNA
 icodon_codon_csc <- tibble(
   rna_codon  = iCodon::human_optimality$codon,
@@ -1117,7 +1247,7 @@ p_ces_csc <- ggplot(ces_vs_csc, aes(x = CES, y = csc_weight, color = codon_class
     x = "DHX29 CES (IP / Input)",
     y = "iCodon CSC weight (human_optimality)"
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
 
 p_ces_csc
@@ -1159,6 +1289,11 @@ dhx29_features <- dhx29_occupancy %>%
 cat("DHX29 feature table:", nrow(dhx29_features), "genes\n")
 cat("Genes with occupancy score:", sum(!is.na(dhx29_features$dhx29_occupancy_score)), "\n")
 cat("Genes with SLAM-seq data:  ", sum(!is.na(dhx29_features$dhx29_slamseq_logFC)), "\n")
+
+# A duplicated key here fans the left_join below out and silently adds rows to the
+# feature matrix, so fail loudly instead of reporting it after the fact.
+stopifnot("dhx29_features must be one row per gene before joining" =
+  !any(duplicated(dhx29_features$ensembl_gene)))
 ```
 
 ```{r join_dhx29_to_feature_matrix}
@@ -1170,13 +1305,22 @@ fm_path <- if (file.exists(here("output", "predictive_modeling",
 
 cat("Loading feature matrix from:", basename(fm_path), "\n")
 fm <- readRDS(fm_path)
-cat("Feature matrix:", nrow(fm), "genes ×", ncol(fm), "columns\n")
+# The feature matrix is transcript-keyed; DHX29 features are gene-level and broadcast
+# across a gene's transcripts.
+cat("Feature matrix:", nrow(fm), "transcripts ×", ncol(fm), "columns\n")
 
 fm_dhx29 <- fm %>%
   left_join(dhx29_features, by = c("gene_id_clean" = "ensembl_gene"))
 
-cat("After join:", nrow(fm_dhx29), "genes ×", ncol(fm_dhx29), "columns\n")
+cat("After join:", nrow(fm_dhx29), "transcripts ×", ncol(fm_dhx29), "columns\n")
 cat("New columns added:", ncol(fm_dhx29) - ncol(fm), "\n")
+
+stopifnot(
+  "Join must not change the number of feature matrix rows" =
+    nrow(fm_dhx29) == nrow(fm),
+  "Join must add exactly the 3 DHX29 feature columns" =
+    ncol(fm_dhx29) - ncol(fm) == 3
+)
 
 cat("\nCoverage within feature matrix genes:\n")
 cat("  dhx29_occupancy_score:      ",
@@ -1186,23 +1330,43 @@ cat("  dhx29_slamseq_ctrl_halflife:",
 cat("  dhx29_slamseq_logFC:        ",
     sum(!is.na(fm_dhx29$dhx29_slamseq_logFC)), "/", nrow(fm_dhx29), "\n")
 
-# Sanity check: scores in feature matrix match dhx29_occupancy source
-check_genes <- intersect(fm_dhx29$gene_id_clean, dhx29_occupancy$ensembl_gene)
-fm_scores  <- fm_dhx29 %>%
-  filter(gene_id_clean %in% check_genes) %>%
-  arrange(gene_id_clean) %>%
-  pull(dhx29_occupancy_score)
-src_scores <- dhx29_occupancy %>%
-  filter(ensembl_gene %in% check_genes) %>%
-  arrange(ensembl_gene) %>%
-  pull(dhx29_occupancy_score)
-stopifnot(isTRUE(all.equal(fm_scores, src_scores)))
-cat("Sanity check passed: feature matrix occupancy scores match source (", length(check_genes), "genes).\n")
+# Sanity check: scores in the feature matrix match the dhx29_occupancy source.
+# Compared via a join on the key, not by position: the feature matrix is transcript-
+# keyed, so several rows can share a gene_id_clean and the two positionally-arranged
+# vectors need not have the same length or ordering.
+score_check <- fm_dhx29 %>%
+  dplyr::select(gene_id_clean, fm_score = dhx29_occupancy_score) %>%
+  inner_join(
+    dhx29_occupancy %>% dplyr::select(gene_id_clean = ensembl_gene,
+                                      src_score = dhx29_occupancy_score),
+    by = "gene_id_clean"
+  )
+
+stopifnot(
+  "No overlap between feature matrix and occupancy source" = nrow(score_check) > 0,
+  "Feature matrix occupancy scores do not match source" =
+    isTRUE(all.equal(score_check$fm_score, score_check$src_score))
+)
+cat("Sanity check passed: occupancy scores match source (",
+    n_distinct(score_check$gene_id_clean), "genes ).\n")
+
+expected_dhx29_cols <- c("dhx29_occupancy_score", "dhx29_slamseq_ctrl_halflife",
+                         "dhx29_slamseq_logFC")
+stopifnot(
+  "All 3 DHX29 feature columns must be present" =
+    all(expected_dhx29_cols %in% colnames(fm_dhx29)),
+  "dhx29_slamseq_ctrl_halflife must be > 0 (half-lives are positive)" =
+    all(fm_dhx29$dhx29_slamseq_ctrl_halflife > 0, na.rm = TRUE),
+  "dhx29_slamseq_ctrl_halflife must respect the 100h ceiling" =
+    all(fm_dhx29$dhx29_slamseq_ctrl_halflife <= 100, na.rm = TRUE),
+  "dhx29_slamseq_logFC must be finite where not NA (log-fold change)" =
+    all(is.finite(fm_dhx29$dhx29_slamseq_logFC[!is.na(fm_dhx29$dhx29_slamseq_logFC)])),
+  "dhx29_occupancy_score must be finite where not NA" =
+    all(is.finite(fm_dhx29$dhx29_occupancy_score[!is.na(fm_dhx29$dhx29_occupancy_score)]))
+)
+cat("DHX29 value range checks passed\n")
 
 saveRDS(fm_dhx29, here("output", "predictive_modeling", "feature_matrix_dhx29.rds"))
 cat("\nSaved: output/predictive_modeling/feature_matrix_dhx29.rds\n")
 ```
 
-```{r}
-
-```

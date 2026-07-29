@@ -73,6 +73,13 @@ unique_seqs <- unique(cds_char)
 cat("Unique sequences:", length(unique_seqs), "\n")
 
 unique_scores        <- predict_human(unique_seqs)
+
+# predict_stability() returns a bare vector, so mapping scores back to sequences relies
+# entirely on it preserving input order and length. Assert that before naming.
+stopifnot(
+  "predict_stability() did not return one score per input sequence" =
+    length(unique_scores) == length(unique_seqs)
+)
 names(unique_scores) <- unique_seqs
 
 csc_scores        <- unique_scores[cds_char]
@@ -81,18 +88,28 @@ names(csc_scores) <- names(cds_sequences)
 cat("CSC summary:\n")
 print(summary(csc_scores))
 
+stopifnot(
+  "CSC scores must be finite" = all(is.finite(csc_scores)),
+  "One CSC score per CDS" = length(csc_scores) == length(cds_sequences)
+)
+
 inspect_df <- tibble(
   transcript_id_clean = names(csc_scores),
   csc                 = as.numeric(csc_scores),
-  cds_sequence        = cds_char
+  cds_length          = nchar(cds_char),
+  cds_start           = substr(cds_char, 1, 30)
 ) %>%
   left_join(most_abundant_tx %>% dplyr::select(transcript_id_clean, symbol), by = "transcript_id_clean")
 
+# Print a CDS preview, not the full sequences: the previous version dumped 12 complete
+# coding sequences into the knitted HTML.
 cat("\nLowest CSC (least stable):\n")
-print(slice_min(inspect_df, csc, n = 6) %>% dplyr::select(symbol, csc, cds_sequence))
+print(slice_min(inspect_df, csc, n = 6) %>%
+        dplyr::select(symbol, csc, cds_length, cds_start))
 
 cat("\nHighest CSC (most stable):\n")
-print(slice_max(inspect_df, csc, n = 6) %>% dplyr::select(symbol, csc, cds_sequence))
+print(slice_max(inspect_df, csc, n = 6) %>%
+        dplyr::select(symbol, csc, cds_length, cds_start))
 ```
 
 ```{r build_table}
@@ -142,32 +159,46 @@ cat("Saved RDS\n")
 ```{r density_plot}
 set_colors <- c(
   "eIF3d hypoxia promotes" = "#E69F00",   # Okabe-Ito orange
-  "Negative control"       = "black"
+  "Negative control"       = "grey40",
+  "All other genes"        = "grey80"
 )
 
-bg_df <- csc_table %>% filter(group == "All other genes")
-fg_df <- csc_table %>% filter(group != "All other genes")
+bg_df <- csc_table %>% dplyr::filter(group == "All other genes")
+fg_df <- csc_table %>% dplyr::filter(group != "All other genes")
 
 median_lines <- fg_df %>%
   group_by(group) %>%
   summarise(med = median(csc, na.rm = TRUE), .groups = "drop")
 
+promotes_csc <- csc_table %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>% pull(csc)
+neg_ctrl_csc <- csc_table %>% dplyr::filter(group == "Negative control")       %>% pull(csc)
+
+wt <- wilcox.test(promotes_csc, neg_ctrl_csc, alternative = "two.sided")
+
 p_csc <- ggplot() +
   geom_density(
     data = bg_df,
     aes(x = csc),
-    color = "grey60", fill = NA, linewidth = 0.9
+    color = set_colors[["All other genes"]], fill = NA, linewidth = 0.8
   ) +
   geom_density(
     data = fg_df,
     aes(x = csc, color = group),
-    fill = NA, linewidth = 0.9
+    fill = NA, linewidth = 0.8
   ) +
   geom_vline(
     data = median_lines,
     aes(xintercept = med, color = group),
     linetype = "dashed", linewidth = 0.6
   ) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = paste0(
+             "Wilcoxon p = ", signif(wt$p.value, 3),
+             "\nn promotes = ", sum(!is.na(promotes_csc)),
+             "\nn neg ctrl = ", sum(!is.na(neg_ctrl_csc)),
+             "\nn other = ",    sum(!is.na(bg_df$csc))
+           )) +
   scale_color_manual(values = set_colors) +
   labs(
     title    = "CSC-derived mRNA stability: eIF3d-promoted genes (hypoxia 1hr)",
@@ -185,11 +216,11 @@ cat("Saved: plots/csc_mrna_stability_eif3d_hypoxia_1hr.pdf\n")
 ```
 
 ```{r wilcoxon_test}
-promotes_csc <- csc_table %>% filter(group == "eIF3d hypoxia promotes") %>% pull(csc)
-neg_ctrl_csc <- csc_table %>% filter(group == "Negative control")       %>% pull(csc)
-
-wt <- wilcox.test(promotes_csc, neg_ctrl_csc, alternative = "two.sided")
-
+# print(), not a bare assignment: the previous version computed `wt` and never
+# displayed it, so the notebook's headline comparison shipped with no p-value.
+print(wt)
+cat("Median promotes:", round(median(promotes_csc, na.rm = TRUE), 4), "\n")
+cat("Median neg ctrl:", round(median(neg_ctrl_csc, na.rm = TRUE), 4), "\n")
 ```
 
 ## Validation: iCodon CSC vs ORFeome mRNA Half-Life (Narula et al.)
@@ -201,9 +232,20 @@ narula_s2 <- read_csv(
   skip = 7, show_col_types = FALSE
 ) %>%
   dplyr::select(gene_symbol = Gene.Name, orfeome_halflife = `Pool 1 and 4`) %>%
-  filter(!is.na(gene_symbol), !is.na(orfeome_halflife))
+  filter(!is.na(gene_symbol), !is.na(orfeome_halflife)) %>%
+  # gene_symbol is the join key downstream; a duplicate would fan the join out
+  distinct(gene_symbol, .keep_all = TRUE)
 
 cat("Narula ORFeome genes with half-life data:", nrow(narula_s2), "\n")
+
+# Narula et al. report ORFeome half-lives in hours (stated in the file header).
+stopifnot(
+  "Narula S2 half-lives must be positive" =
+    all(narula_s2$orfeome_halflife > 0),
+  "gene_symbol must be unique in narula_s2" =
+    !any(duplicated(narula_s2$gene_symbol))
+)
+cat("Median ORFeome half-life:", round(median(narula_s2$orfeome_halflife), 2), "h\n")
 ```
 
 ```{r match_icodon_orfeome}
@@ -217,12 +259,18 @@ csc_with_symbol <- csc_table %>%
     by = "transcript_id_clean"
   )
 
-# Filter to promotes group, join with Narula
+# NOTE: this is ALL genes, not the eIF3d-promoted subset. The promotes-only filter is
+# deliberately not applied: only 7 promoted genes intersect Narula S2, too few to fit a
+# line through. The plot titles, console output and saved filenames below therefore all
+# say "all genes" — they previously said "promotes", which misdescribed the figure.
 scatter_df <- csc_with_symbol %>%
-  # filter(group == "eIF3d hypoxia promotes", !is.na(csc)) %>%
-  inner_join(narula_s2, by = c("symbol" = "gene_symbol"))
+  filter(!is.na(csc)) %>%
+  inner_join(narula_s2, by = c("symbol" = "gene_symbol"),
+             relationship = "many-to-one")
 
-cat("Genes matched (promotes × Narula):", nrow(scatter_df), "\n")
+cat("Genes matched (all genes × Narula S2):", nrow(scatter_df), "\n")
+cat("  of which eIF3d hypoxia promotes:",
+    sum(scatter_df$group == "eIF3d hypoxia promotes"), "\n")
 ```
 
 ```{r scatter_icodon_vs_orfeome}
@@ -233,53 +281,59 @@ p_scatter <- ggplot(scatter_df, aes(x = csc, y = orfeome_halflife)) +
   geom_point(alpha = 0.6, color = "black") +
   geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
-           label = paste0("r = ", round(r, 3)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           label = paste0("r = ", round(r, 3), "\nn = ", nrow(scatter_df)),
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
-    title    = "iCodon CSC vs ORFeome mRNA half-life",
+    title    = "iCodon CSC vs ORFeome mRNA half-life (all genes)",
     subtitle = "ORFeome from Narula et al. Pool 1 & 4",
     x = "iCodon CSC (computational)",
     y = "ORFeome mRNA half-life (hours)"
   ) +
-  theme_bw(base_size = 12)
+  theme_classic(base_size = 12)
 
 p_scatter
-ggsave(here("plots", "icodon_vs_orfeome_halflife_promotes.pdf"),
+ggsave(here("plots", "icodon_vs_orfeome_halflife_allgenes.pdf"),
        p_scatter, width = 6, height = 5)
-cat("r =", round(r, 4), "\n")
-cat("Saved: plots/icodon_vs_orfeome_halflife_promotes.pdf\n")
+cat("r =", round(r, 4), " n =", nrow(scatter_df), "\n")
+cat("Saved: plots/icodon_vs_orfeome_halflife_allgenes.pdf\n")
 ```
 
-if i remove the one outlier
+The same relationship with the single extreme half-life removed.
 
-```{r}
-scatter_df_no_out <- scatter_df |> 
-  filter(orfeome_halflife < 1500)
+```{r scatter_icodon_vs_orfeome_no_outlier}
+# Named threshold rather than a bare magic number. Removes the single ORFeome
+# half-life above 1500 h, which otherwise sets the regression slope on its own.
+ORFEOME_OUTLIER_CUTOFF <- 1500
 
+scatter_df_no_out <- scatter_df %>%
+  filter(orfeome_halflife < ORFEOME_OUTLIER_CUTOFF)
 
+cat("Removed as outliers (>", ORFEOME_OUTLIER_CUTOFF, "h):",
+    nrow(scatter_df) - nrow(scatter_df_no_out), "\n")
 
-fit <- lm(orfeome_halflife ~ csc, data = scatter_df_no_out)
-r   <- sign(coef(fit)[["csc"]]) * sqrt(summary(fit)$r.squared)
+fit_no_out <- lm(orfeome_halflife ~ csc, data = scatter_df_no_out)
+r_no_out   <- sign(coef(fit_no_out)[["csc"]]) * sqrt(summary(fit_no_out)$r.squared)
 
-p_scatter <- ggplot(scatter_df_no_out, aes(x = csc, y = orfeome_halflife, color=group)) +
+p_scatter_no_out <- ggplot(scatter_df_no_out, aes(x = csc, y = orfeome_halflife)) +
   geom_point(alpha = 0.6, color = "black") +
   geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
-           label = paste0("r = ", round(r, 3)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           label = paste0("r = ", round(r_no_out, 3), "\nn = ", nrow(scatter_df_no_out)),
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
-    title    = "iCodon CSC vs ORFeome mRNA half-life",
-    subtitle = "ORFeome from Narula et al. Pool 1 & 4",
+    title    = "iCodon CSC vs ORFeome mRNA half-life (all genes, no outlier)",
+    subtitle = paste0("ORFeome from Narula et al. Pool 1 & 4; half-life < ",
+                      ORFEOME_OUTLIER_CUTOFF, " h"),
     x = "iCodon CSC (computational)",
     y = "ORFeome mRNA half-life (hours)"
   ) +
-  theme_bw(base_size = 12)
+  theme_classic(base_size = 12)
 
-p_scatter
-ggsave(here("plots", "icodon_vs_orfeome_halflife_promotes_no_outlier.pdf"),
-       p_scatter, width = 6, height = 5)
-cat("r =", round(r, 4), "\n")
-cat("Saved: plots/icodon_vs_orfeome_halflife_promotes.pdf\n")
+p_scatter_no_out
+ggsave(here("plots", "icodon_vs_orfeome_halflife_allgenes_no_outlier.pdf"),
+       p_scatter_no_out, width = 6, height = 5)
+cat("r =", round(r_no_out, 4), " n =", nrow(scatter_df_no_out), "\n")
+cat("Saved: plots/icodon_vs_orfeome_halflife_allgenes_no_outlier.pdf\n")
 ```
 
 ## Endogenous mRNA half-life validation (Narula et al. Table S1)
@@ -297,17 +351,45 @@ narula_s1 <- read_csv(
     halflife_cl56 = `Cell lines 5 and 6`
   ) %>%
   filter(!is.na(gene_symbol)) %>%
+  distinct(gene_symbol, .keep_all = TRUE)
+
+# The three cell-line-pair columns sit on very different scales (medians ~8.1 / 1.6 /
+# 1.7 h, i.e. ~5x apart). Averaging them with na.rm = TRUE made a gene's half-life
+# depend on WHICH columns happened to be non-NA: a cl14-only gene landed ~5x higher
+# than a cl23-only gene for purely technical reasons, and the < 100 h outlier cutoff
+# below then meant different things for different genes. Restricting the mean to genes
+# measured in all three pairs keeps the y-axis a single consistent quantity.
+cat("Narula S1 median half-life per cell-line pair:\n")
+cat("  cl14:", round(median(narula_s1$halflife_cl14, na.rm = TRUE), 2), "h",
+    "| cl23:", round(median(narula_s1$halflife_cl23, na.rm = TRUE), 2), "h",
+    "| cl56:", round(median(narula_s1$halflife_cl56, na.rm = TRUE), 2), "h\n")
+
+n_before_complete <- nrow(narula_s1)
+
+narula_s1 <- narula_s1 %>%
+  filter(!is.na(halflife_cl14), !is.na(halflife_cl23), !is.na(halflife_cl56)) %>%
   mutate(
-    mean_halflife = rowMeans(cbind(halflife_cl14, halflife_cl23, halflife_cl56), na.rm = TRUE)
+    mean_halflife = rowMeans(cbind(halflife_cl14, halflife_cl23, halflife_cl56))
   ) %>%
   filter(is.finite(mean_halflife))
 
-cat("Narula endogenous genes with half-life data:", nrow(narula_s1), "\n")
+cat("Narula endogenous genes with half-life data:", nrow(narula_s1),
+    "(complete cases only; dropped", n_before_complete - nrow(narula_s1),
+    "genes missing >= 1 cell-line pair)\n")
+
+stopifnot(
+  "Narula S1 half-lives must be positive" =
+    all(narula_s1$mean_halflife > 0),
+  "gene_symbol must be unique in narula_s1" =
+    !any(duplicated(narula_s1$gene_symbol))
+)
 ```
 
 ```{r match_icodon_endogenous}
 scatter_s1_df <- csc_with_symbol %>%
-  inner_join(narula_s1, by = c("symbol" = "gene_symbol"))
+  filter(!is.na(csc)) %>%
+  inner_join(narula_s1, by = c("symbol" = "gene_symbol"),
+             relationship = "many-to-one")
 
 cat("Genes matched (all × Narula S1):", nrow(scatter_s1_df), "\n")
 ```
@@ -320,15 +402,15 @@ p_scatter_s1 <- ggplot(scatter_s1_df, aes(x = csc, y = mean_halflife)) +
   geom_point(alpha = 0.4, color = "black", size = 0.8) +
   geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
-           label = paste0("r = ", round(r_s1, 3)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           label = paste0("r = ", round(r_s1, 3), "\nn = ", nrow(scatter_s1_df)),
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
     title    = "iCodon CSC vs mean endogenous mRNA half-life",
     subtitle = "Endogenous from Narula et al. Table S1 (mean across cell line pairs)",
     x = "iCodon CSC (computational)",
     y = "Endogenous mRNA half-life (hours)"
   ) +
-  theme_bw(base_size = 12)
+  theme_classic(base_size = 12)
 
 p_scatter_s1
 ggsave(here("plots", "icodon_vs_endogenous_halflife.pdf"),
@@ -350,15 +432,15 @@ p_scatter_s1b <- ggplot(scatter_s1_no_out, aes(x = csc, y = mean_halflife)) +
   geom_point(alpha = 0.4, color = "black", size = 0.8) +
   geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
-           label = paste0("r = ", round(r_s1b, 3)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           label = paste0("r = ", round(r_s1b, 3), "\nn = ", nrow(scatter_s1_no_out)),
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
     title    = "iCodon CSC vs mean endogenous mRNA half-life (no outliers)",
     subtitle = "Endogenous from Narula et al. Table S1 (half-life < 100 h)",
     x = "iCodon CSC (computational)",
     y = "Endogenous mRNA half-life (hours)"
   ) +
-  theme_bw(base_size = 12)
+  theme_classic(base_size = 12)
 
 p_scatter_s1b
 ggsave(here("plots", "icodon_vs_endogenous_halflife_no_outlier.pdf"),
@@ -378,7 +460,7 @@ cl_vars <- c(
 
 for (cl_label in names(cl_vars)) {
   cl_col <- cl_vars[[cl_label]]
-  cl_tag <- gsub(" ", "", cl_col)  # e.g. "halflife_cl14"
+  cl_tag <- cl_col  # already a safe filename fragment, e.g. "halflife_cl14"
 
   df_cl <- scatter_s1_df %>%
     filter(!is.na(.data[[cl_col]]), is.finite(.data[[cl_col]]),
@@ -391,15 +473,15 @@ for (cl_label in names(cl_vars)) {
     geom_point(alpha = 0.4, color = "black", size = 0.8) +
     geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
     annotate("text", x = Inf, y = Inf,
-             label = paste0("r = ", round(r_cl, 3)),
-             hjust = 1.1, vjust = 1.5, size = 4) +
+             label = paste0("r = ", round(r_cl, 3), "\nn = ", nrow(df_cl)),
+             hjust = 1.1, vjust = 1.4, size = 4) +
     labs(
       title    = paste0("iCodon CSC vs endogenous mRNA half-life\n(", cl_label, ")"),
       subtitle = "Narula et al. Table S1 (half-life < 100 h)",
       x = "iCodon CSC (computational)",
       y = "Endogenous mRNA half-life (hours)"
     ) +
-    theme_bw(base_size = 12)
+    theme_classic(base_size = 12)
 
   out_file <- paste0("plots/icodon_vs_endogenous_halflife_", cl_tag, ".pdf")
   ggsave(here(out_file), p_cl, width = 6, height = 5)
@@ -443,47 +525,87 @@ zhu_long <- zhu_ctrl %>%
   group_by(gene_symbol, gene_id, timepoint) %>%
   summarise(mean_ratio = mean(tc_ratio, na.rm = TRUE), .groups = "drop")
 
-# Normalize each gene to its t=0 value, then fit exponential decay
+# Normalize each gene to its t=0 value, then fit exponential decay.
+#
+# Log-linear lm, NOT bounded nls. The previous version used
+# nls(..., algorithm = "port", lower = list(lambda = 1e-6)); genes whose decay is flat
+# or increasing converged onto that lower bound and emerged as half-lives of
+# log(2)/1e-6 = 693,147 h. The downstream filter only removed non-finite and
+# non-positive values, so 768 of 12,472 genes (6.2%) entered the analysis as
+# "immortal" transcripts and dominated every subsequent lm(). Reported correlation
+# against iCodon CSC was r ~ 0.07 instead of ~ 0.3.
+#
+# This is the same method used in notebook 22 (`slamseq_fit_halflives`): fit
+# log(fraction_remaining) ~ timepoint and return NA when the decay rate is not
+# positive, so a flat gene is dropped rather than pinned to a bound.
+MIN_TIMEPOINTS <- 3
+
 fit_halflife <- function(df) {
+  na_result <- tibble(halflife_zhu = NA_real_, fit_r2 = NA_real_, n_points = 0L)
+
   t0_ratio <- df$mean_ratio[df$timepoint == 0]
-  if (length(t0_ratio) == 0 || is.na(t0_ratio) || t0_ratio <= 0) return(NA_real_)
+  if (length(t0_ratio) == 0 || is.na(t0_ratio) || t0_ratio <= 0) return(na_result)
 
   df_norm <- df %>%
     mutate(fraction_remaining = mean_ratio / t0_ratio) %>%
     filter(timepoint > 0, fraction_remaining > 0, is.finite(fraction_remaining))
 
-  if (nrow(df_norm) < 3) return(NA_real_)
+  na_result$n_points <- nrow(df_norm)
+  if (nrow(df_norm) < MIN_TIMEPOINTS) return(na_result)
 
   fit <- tryCatch(
-    nls(
-      fraction_remaining ~ exp(-lambda * timepoint),
-      data    = df_norm,
-      start   = list(lambda = 0.1),
-      algorithm = "port",
-      lower   = list(lambda = 1e-6),
-      upper   = list(lambda = 10),
-      control = nls.control(maxiter = 200, warnOnly = TRUE)
-    ),
+    lm(log(fraction_remaining) ~ timepoint, data = df_norm),
     error = function(e) NULL
   )
+  if (is.null(fit)) return(na_result)
 
-  if (is.null(fit)) return(NA_real_)
-  lambda_hat <- coef(fit)[["lambda"]]
-  if (!is.finite(lambda_hat) || lambda_hat <= 0) return(NA_real_)
-  log(2) / lambda_hat
+  lambda <- -coef(fit)[["timepoint"]]
+  r2     <- summary(fit)$r.squared
+  if (is.na(lambda) || lambda <= 0) {
+    return(tibble(halflife_zhu = NA_real_, fit_r2 = r2, n_points = nrow(df_norm)))
+  }
+  tibble(halflife_zhu = log(2) / lambda, fit_r2 = r2, n_points = nrow(df_norm))
 }
 
 zhu_halflives_raw <- zhu_long %>%
   group_by(gene_symbol, gene_id) %>%
-  group_modify(~ tibble(halflife_zhu = fit_halflife(.x))) %>%
+  group_modify(~ fit_halflife(.x)) %>%
   ungroup()
 
-zhu_halflife <- zhu_halflives_raw %>%
-  filter(!is.na(halflife_zhu), is.finite(halflife_zhu), halflife_zhu > 0)
+# Exclude half-lives > 100h (near-zero decay rate = unreliable flat fit), matching the
+# cutoff used in notebook 22.
+MAX_HALFLIFE <- 100
 
-cat("Genes with fitted half-life:", nrow(zhu_halflife), "\n")
+zhu_halflife <- zhu_halflives_raw %>%
+  filter(!is.na(halflife_zhu), is.finite(halflife_zhu),
+         halflife_zhu > 0, halflife_zhu <= MAX_HALFLIFE) %>%
+  # Symbol is the join key for every downstream scatter; a duplicated symbol would
+  # fan those joins out.
+  distinct(gene_symbol, .keep_all = TRUE)
+
+n_excluded <- sum(zhu_halflives_raw$halflife_zhu > MAX_HALFLIFE, na.rm = TRUE)
+cat("Genes fitted:", nrow(zhu_halflives_raw), "\n")
+cat("Excluded halflife >", MAX_HALFLIFE, "h:", n_excluded, "\n")
+cat("Genes with usable half-life:", nrow(zhu_halflife), "\n")
 cat("Half-life summary (hours):\n")
 print(summary(zhu_halflife$halflife_zhu))
+cat("Fit R-squared summary:\n")
+print(summary(zhu_halflife$fit_r2))
+
+# Paper replication check, asserted before these half-lives are joined to anything.
+# Zhu 2024 report a median control mRNA half-life of a few hours (Fig 2B). This is the
+# check that would have caught the lambda-at-bound defect above: the old code gave a
+# median of 6.2 h with a mean of 42,696 h.
+med_zhu <- median(zhu_halflife$halflife_zhu, na.rm = TRUE)
+cat("Median sgNT half-life:", round(med_zhu, 2), "h\n")
+stopifnot(
+  "Zhu2024 median sgNT half-life outside expected range" =
+    dplyr::between(med_zhu, 2.5, 6.0),
+  "Half-lives must be positive and bounded" =
+    all(zhu_halflife$halflife_zhu > 0 & zhu_halflife$halflife_zhu <= MAX_HALFLIFE),
+  "gene_symbol must be unique (join key for the scatter plots)" =
+    !any(duplicated(zhu_halflife$gene_symbol))
+)
 ```
 
 ```{r scatter_icodon_vs_zhu}
@@ -500,8 +622,8 @@ p_zhu <- ggplot(zhu_scatter_df, aes(x = csc, y = halflife_zhu)) +
   geom_point(alpha = 0.3, size = 0.8, color = "black") +
   geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
-           label = paste0("r = ", round(r_zhu, 3)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           label = paste0("r = ", round(r_zhu, 3), "\nn = ", nrow(zhu_scatter_df)),
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
     title    = "iCodon CSC vs. Zhu SLAMseq mRNA half-life",
     subtitle = "Control (sgNT) conditions, Zhu et al. Science 2024",
@@ -532,8 +654,8 @@ p_zhu_b <- ggplot(zhu_scatter_no_out, aes(x = csc, y = halflife_zhu)) +
   geom_point(alpha = 0.3, size = 0.8, color = "black") +
   geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
-           label = paste0("r = ", round(r_zhu_b, 3)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           label = paste0("r = ", round(r_zhu_b, 3), "\nn = ", nrow(zhu_scatter_no_out)),
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
     title    = "iCodon CSC vs. Zhu SLAMseq mRNA half-life (no outliers)",
     subtitle = paste0("Control (sgNT), Zhu et al. 2024; half-life < ", round(cutoff, 1), " h"),
@@ -570,6 +692,16 @@ cat("Range:", round(range(w_vec), 4), "\n")
 cat("Head:\n")
 print(head(sort(w_vec)))
 print(tail(sort(w_vec)))
+
+# iCodon's human_optimality table is in DNA notation (T, not U), which is what makes
+# w_vec[codons] match against BSgenome-derived CDS. If a package update switched it to
+# RNA notation every lookup would silently return NA and kate_csc would collapse to a
+# mean over only the T-free codons, with no error raised.
+stopifnot(
+  "iCodon human_optimality must be in DNA notation (T, not U)" =
+    !any(grepl("U", names(w_vec))),
+  "Expected 64 codons in human_optimality" = length(w_vec) == 64
+)
 ```
 
 ```{r compute_kate_csc}
@@ -584,14 +716,28 @@ compute_kate_csc <- function(seq_char, w_vec) {
   mean(weights, na.rm = TRUE)
 }
 
-# cds_sequences is the filtered DNAStringSet already in the environment
-cds_char <- as.character(cds_sequences)
+# cds_char is already in the environment from the compute_csc chunk above.
 kate_csc  <- vapply(cds_char, compute_kate_csc, numeric(1), w_vec = w_vec)
 names(kate_csc) <- names(cds_sequences)
 
 cat("Kate CSC summary:\n")
 print(summary(kate_csc))
 cat("Non-NA:", sum(!is.na(kate_csc)), "of", length(kate_csc), "\n")
+
+# Guard the codon lookup rate: if weights stopped matching, mean(weights, na.rm = TRUE)
+# would quietly average whatever handful of codons still resolved.
+match_rate <- mean(!is.na(w_vec[unlist(
+  lapply(head(cds_char, 200), function(s) {
+    n <- nchar(s) %/% 3
+    substring(s, seq(1, n * 3 - 2, by = 3), seq(3, n * 3, by = 3))
+  })
+)]))
+cat("Codon lookup match rate (first 200 CDS):", round(match_rate, 4), "\n")
+stopifnot(
+  "Codon weight lookup is failing for most codons" = match_rate > 0.9,
+  "Kate CSC must be finite where computed" =
+    all(is.finite(kate_csc[!is.na(kate_csc)]))
+)
 ```
 
 ```{r compare_csc_table}
@@ -636,14 +782,17 @@ p_kate <- ggplot() +
               method = "lm", se = TRUE, color = "steelblue", linewidth = 0.8) +
   annotate("text", x = Inf, y = Inf,
            label = paste0("r = ", round(r_k, 3), "\nn = ", nrow(compare_df)),
-           hjust = 1.1, vjust = 1.5, size = 4) +
+           hjust = 1.1, vjust = 1.4, size = 4) +
   labs(
     title    = "Kate CSC vs iCodon predict_stability()",
     subtitle = "Orange = eIF3d hypoxia promotes; Kate CSC = arithmetic mean of per-codon human_optimality",
     x = "Kate CSC (arithmetic mean of per-codon weights)",
-    y = "iCodon CSC (predict_stability decay rate)"
+    # Higher predict_stability() score = MORE stable, so this is a stability score, not
+    # a decay rate. (iCodon's own documentation calls it a decay rate, which inverts the
+    # reading of this panel.)
+    y = "iCodon CSC (predict_stability stability score)"
   ) +
-  theme_bw(base_size = 12)
+  theme_classic(base_size = 12)
 
 p_kate
 ggsave(here("plots", "kate_csc_vs_icodon_csc.pdf"), p_kate, width = 6, height = 5)
@@ -664,12 +813,22 @@ sense_codons <- names(w_vec)[!names(w_vec) %in% stop_codons]
 # Join ORFeome half-lives to CDS sequences via gene symbol
 orfeome_join <- csc_with_symbol %>%
   filter(!is.na(ensembl_gene)) %>%
-  inner_join(narula_s2, by = c("symbol" = "gene_symbol")) %>%
+  inner_join(narula_s2, by = c("symbol" = "gene_symbol"),
+             relationship = "many-to-one") %>%
   filter(!is.na(orfeome_halflife), is.finite(orfeome_halflife)) %>%
   mutate(seq_char = cds_char[transcript_id_clean]) %>%
   filter(!is.na(seq_char))
 
 cat("Genes for ORFeome CSC weight computation:", nrow(orfeome_join), "\n")
+
+# These 61 codon weights are estimated from a small intersection (Narula S2 has 355
+# genes with Pool 1 and 4 half-lives; only a fraction have a scored CDS here). At this
+# n the |rho| needed for nominal p < 0.05 is roughly 0.21, so the saved weights are
+# noisy and should not be read as individually significant. p-values and n are saved
+# alongside them below so downstream users can judge.
+stopifnot(
+  "Too few genes to estimate per-codon ORFeome CSC weights" = nrow(orfeome_join) >= 50
+)
 
 # Per-gene codon frequency matrix (genes × 61 sense codons)
 get_codon_freq <- function(seq_char, codons_list) {
@@ -683,21 +842,52 @@ get_codon_freq <- function(seq_char, codons_list) {
 freq_mat <- do.call(rbind, lapply(orfeome_join$seq_char, get_codon_freq,
                                   codons_list = sense_codons))
 
-# Spearman r per codon
-orfeome_csc_weights <- vapply(seq_along(sense_codons), function(i) {
-  cor(freq_mat[, i], orfeome_join$orfeome_halflife,
-      method = "spearman", use = "complete.obs")
-}, numeric(1))
-names(orfeome_csc_weights) <- sense_codons
+# get_codon_freq iterates the full sense_codons list, so zero-count codons correctly
+# get a frequency of 0 rather than being dropped -- every codon is scored on the same
+# set of genes.
+stopifnot(
+  "Codon frequency matrix must be genes x 61 sense codons" =
+    ncol(freq_mat) == length(sense_codons) && nrow(freq_mat) == nrow(orfeome_join),
+  "Per-gene sense codon frequencies must sum to 1" =
+    all(abs(rowSums(freq_mat) - 1) < 1e-9),
+  "Codon frequencies must be in [0, 1]" =
+    all(freq_mat >= 0 & freq_mat <= 1)
+)
 
+# Spearman r per codon, with p-value and n retained for diagnostics
+orfeome_csc_stats <- purrr::map_dfr(seq_along(sense_codons), function(i) {
+  ct <- suppressWarnings(cor.test(freq_mat[, i], orfeome_join$orfeome_halflife,
+                                  method = "spearman", use = "complete.obs"))
+  tibble(codon = sense_codons[i], spearman_r = unname(ct$estimate),
+         p_value = ct$p.value, n_genes = nrow(orfeome_join))
+}) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+orfeome_csc_weights <- setNames(orfeome_csc_stats$spearman_r, orfeome_csc_stats$codon)
+
+cat("Codons scored:", nrow(orfeome_csc_stats),
+    "| n genes:", nrow(orfeome_join),
+    "| codons with BH p_adj < 0.05:", sum(orfeome_csc_stats$p_adj < 0.05), "\n")
 cat("Top 10 stabilizing codons (highest Spearman r):\n")
 print(head(sort(orfeome_csc_weights, decreasing = TRUE), 10))
 cat("Top 10 destabilizing codons (lowest Spearman r):\n")
 print(head(sort(orfeome_csc_weights, decreasing = FALSE), 10))
 
+stopifnot(
+  "All 61 sense codons must be weighted" = length(orfeome_csc_weights) == 61,
+  "Spearman weights must lie in [-1, 1]" =
+    all(orfeome_csc_weights >= -1 & orfeome_csc_weights <= 1, na.rm = TRUE),
+  "Codon names must be unique" = !any(duplicated(names(orfeome_csc_weights)))
+)
+
+# Saved as a named numeric vector for backward compatibility -- notebook 23 indexes it
+# directly as weight_vec[codons]. Diagnostics go to a separate file.
 saveRDS(orfeome_csc_weights,
         here("output", "predictive_modeling", "orfeome_csc_weights.rds"))
+saveRDS(orfeome_csc_stats,
+        here("output", "predictive_modeling", "orfeome_csc_weights_stats.rds"))
 cat("Saved: output/predictive_modeling/orfeome_csc_weights.rds\n")
+cat("Saved: output/predictive_modeling/orfeome_csc_weights_stats.rds\n")
 ```
 
 ```{r save_icodon_per_gene}
@@ -709,12 +899,14 @@ icodon_per_gene <- csc_table %>%
   summarise(csc = mean(csc, na.rm = TRUE), .groups = "drop")
 
 cat("iCodon per-gene scores:", nrow(icodon_per_gene), "genes\n")
+
+stopifnot(
+  "ensembl_gene must be unique in icodon_per_gene (join key downstream)" =
+    !any(duplicated(icodon_per_gene$ensembl_gene)),
+  "Per-gene CSC scores must be finite" = all(is.finite(icodon_per_gene$csc))
+)
+
 saveRDS(icodon_per_gene,
         here("output", "predictive_modeling", "icodon_csc_per_gene.rds"))
 cat("Saved: output/predictive_modeling/icodon_csc_per_gene.rds\n")
-```
-
-
-```{r}
-
 ```
