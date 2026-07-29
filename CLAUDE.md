@@ -146,6 +146,25 @@ group_colors <- c(
   "All other genes"        = "grey80"
 )
 ```
+
+**eIF3d / eIF3e color convention (required in all new plots):**
+```r
+kd_colors <- c(
+  "si3d" = "#E69F00",  # Okabe-Ito orange       -> always eIF3d / si3d
+  "si3e" = "#56B4E9"   # Okabe-Ito light blue   -> always eIF3e / si3e
+)
+```
+- eIF3d / si3d and eIF3d-defined gene sets: Okabe-Ito orange `#E69F00`
+- eIF3e / si3e and eIF3e-defined gene sets: Okabe-Ito light (sky) blue `#56B4E9`
+- Negative control set: `black`
+- Rest of the transcriptome / all other genes: grey (`grey70`)
+
+These two hues are reserved for the two factors. When a plot also needs up/down or
+significance colors, pick from the remaining Okabe-Ito hues (e.g. `#0072B2` dark blue,
+`#CC79A7` reddish purple) so nothing else in the figure reads as eIF3d or eIF3e.
+Applied in `code/predictive_modeling/66_rna_changes_si3d_si3e.Rmd`. The older
+`group_colors` block above keeps `grey40`/`grey80` for backward compatibility with
+already-generated figures; new plots should use `black` / `grey70`.
 Positive gene set: `output/genesets/hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` → column `ensembl_gene`; also `db_gene_symbol` for notebook 09 Venn diagrams.
 Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size-matched with `set.seed(9)`.
 

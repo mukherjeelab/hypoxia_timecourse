@@ -1,0 +1,516 @@
+---
+title: "67 - RNA vs ribosome footprint changes, sictrl/si3d, with gene-set overlay"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+RNA log2FC on the x axis, ribosome footprint log2FC on the y axis, for the
+sictrl/si3d contrast, with the eIF3d hypoxia TE-promoted set and its size-matched
+negative control set drawn on top of the full transcriptome.
+
+Two existing plots already cover the plain version of these axes:
+
+- `plots/si3d_vs_sictrl_*.pdf` (from `categorize_translation_changes()` in
+  `code/functions.R`) - colored by translation category, but drops
+  `category == "Not_sig"`, so the grey bulk of the transcriptome is missing.
+- `plots/66_rna_vs_ribo_scatter.pdf` - full transcriptome, all contrasts, but no
+  category or gene-set coloring.
+
+What is new here is the gene-set overlay: whether the eIF3d-promoted mRNAs sit off
+the diagonal in ribosome footprints without a matching move in RNA.
+
+**Direction convention.** Every contrast is log2(sictrl / si3d) - the source notebook
+`eif3e_eif3d_normoxia_and_hypoxia.Rmd` runs DESeq2 with `control_condition = "si3d"`
+and `test_condition = "sictrl"`, so the knockdown is the reference. Positive on either
+axis = lower in si3d than in sictrl = eIF3d knockdown reduces it. This is asserted
+below, not assumed.
+
+**How to read it.** Reference lines are drawn at x = 0 and y = 0, so each quadrant is
+read directly: right of x = 0 the mRNA is lower in si3d, above y = 0 the footprints are
+lower in si3d.
+
+These contrasts are spike-in normalized, so knockdown lowers total mRNA and total
+footprints per cell; that global loss pushes the whole cloud away from the origin along
+y = x and is not gene-specific. The quantity that isolates translation is therefore
+still the displacement relative to y = x, even though that line is not drawn:
+
+- on y = x = the RNA change is fully forwarded to the ribosome (no TE change)
+- above y = x = footprints drop more than mRNA = TE falls in si3d = eIF3d promotes
+- below y = x = mRNA drops more than footprints = TE rises in si3d
+
+That displacement is reported per group as `median(ribo_lfc - rna_lfc)` on each panel
+and plotted in full as a CDF in the last section.
+
+`ribo_lfc - rna_lfc` is used as that displacement. It is a *proxy* for `te_lfc`, not a
+restatement of it: the three columns come from **three separate DESeq2 fits on
+different sample sets** (see provenance below), so the two correlate (r = 0.56 to 0.90
+across these four contrasts, checked below) but are not identical.
+
+**Panels.** Normoxia is the time-regressed 1+4hr contrast (`hours` as batch covariate,
+`deFunction_time_normalized()`); hypoxia is shown per timepoint.
+
+# Input Provenance (verified against the producing script)
+
+All four inputs are written by `code/eif3e_eif3d_normoxia_and_hypoxia.Rmd`, which was
+read directly to confirm the following rather than inferring it from file names.
+
+| Panel | Source chunk | metadata filter | Fit function |
+|---|---|---|---|
+| normoxia 1+4hr | `rna/ribo/te_si3d_norm_1and4hr` | `condition == "normoxia"`, `hours %in% c(1, 4)`, `treatment %in% c("sictrl", "si3d")`, `hours` as factor | `deFunction_time_normalized()` |
+| hypoxia 1hr | `rna/ribo/te_si3d_hyp_1hr` | `condition == "hypoxia"`, `hours == 1`, same treatments | `deFunction()` |
+| hypoxia 4hr | `rna/ribo/te_si3d_hyp_4hr` | `hours == 4` | `deFunction()` |
+| hypoxia 24hr | `rna/ribo/te_si3d_hyp_24hr` | `hours == 24` | `deFunction()` |
+
+Confirmed identical across all four panels:
+
+- `control_condition = "si3d"`, `test_condition = "sictrl"` on **all three legs**. In
+  `deFunction()` (`code/functions.R:242`) this becomes
+  `Condition = factor(comparison_variable, levels = c(control_condition, test_condition))`,
+  so si3d is the DESeq2 reference level and every coefficient is log2(sictrl / si3d).
+  The axes are therefore oriented by construction, independent of the `EIF3D`
+  spot-check below.
+- `spikeInMatrix = spikein_filtered`, `keepSpikes = top500_ids` on all three legs -
+  size factors come from the top-500 spike-ins, and spike-ins are dropped before
+  fitting.
+- The three columns are three different models, not one model re-expressed:
+  - `rna_lfc` - `mode = "RNA"`: RNA libraries only (`library == "rna"`), design `~ Condition`
+  - `ribo_lfc` - `mode = "RIBO"`: ribo libraries only (`library == "ribo"`), design `~ Condition`
+  - `te_lfc` - `mode = "TE"`: both library types, design
+    `~ Condition + SeqType + Condition:SeqType`
+  (the 1+4hr panel adds `hours` to each design). The x and y axes of this plot are thus
+  fit on **disjoint sample sets**, which is the reason `ribo_lfc - rna_lfc` only
+  approximates `te_lfc`.
+- `categorize_translation_changes(padj_cutoff = 0.05, lfc_cutoff = 0.0)` assembles the
+  saved table. It intersects gene IDs across the three fits, sorts, asserts
+  `identical(res_rna$gene_id, res_ribo$gene_id)`, then takes the three
+  `log2FoldChange` vectors positionally (`code/functions.R:604`) - so the column labels
+  are trustworthy and all four files share one 11,879-gene universe (re-checked below).
+- Note `lfc_cutoff = 0.0` means the `category` column reflects `padj` significance
+  alone, with no magnitude filter (as documented in CLAUDE.md). This notebook applies
+  its own 0.5 threshold where needed and does not rely on `category`.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(patchwork)
+```
+
+# Parameters
+
+```{r params}
+# Project convention: eIF3d = Okabe-Ito orange, negative controls black,
+# rest of the transcriptome grey
+group_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "black",
+  "All other genes"        = "grey70"
+)
+
+LFC_CUTOFF  <- 0.5
+PADJ_CUTOFF <- 0.05
+
+si3d_files <- c(
+  "normoxia 1+4hr" = "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "hypoxia 1hr"    = "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "hypoxia 4hr"    = "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv",
+  "hypoxia 24hr"   = "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv"
+)
+PANEL_LEVELS <- names(si3d_files)
+```
+
+# Load si3d Contrasts
+
+```{r load_data}
+paths <- here("output", si3d_files)
+stopifnot("Missing translation_categories input file" = all(file.exists(paths)))
+
+rr <- tibble(contrast = PANEL_LEVELS, path = paths) %>%
+  mutate(data = map(path, ~ read_csv(.x, show_col_types = FALSE) %>%
+                      dplyr::select(gene_id, symbol, rna_lfc, rna_padj,
+                                    ribo_lfc, ribo_padj, te_lfc, te_padj,
+                                    category))) %>%
+  dplyr::select(-path) %>%
+  unnest(data) %>%
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    contrast      = factor(contrast, levels = PANEL_LEVELS),
+    # Displacement perpendicular to y = x: proxy for the TE change
+    off_diag      = ribo_lfc - rna_lfc
+  )
+
+cat("Loaded", nrow(rr), "rows across", n_distinct(rr$contrast), "si3d contrasts\n")
+print(rr %>% dplyr::count(contrast))
+```
+
+# Validation
+
+## Computational checks
+
+```{r checks_computational}
+expected_cols <- c("gene_id", "gene_id_clean", "symbol", "contrast",
+                   "rna_lfc", "ribo_lfc", "te_lfc", "off_diag")
+stopifnot(all(expected_cols %in% colnames(rr)))
+
+# Log-fold changes finite where present
+for (col in c("rna_lfc", "ribo_lfc", "te_lfc")) {
+  v <- rr[[col]]
+  stopifnot("Non-finite log-fold change" = all(is.finite(v[!is.na(v)])))
+}
+
+# Adjusted p-values are probabilities
+for (col in c("rna_padj", "ribo_padj", "te_padj")) {
+  v <- rr[[col]]
+  stopifnot("padj outside [0,1]" = all(v >= 0 & v <= 1, na.rm = TRUE))
+}
+
+# Same gene universe in every panel
+panel_n <- rr %>% dplyr::count(contrast)
+stopifnot("Unequal gene universe across panels" = n_distinct(panel_n$n) == 1)
+
+cat("All computational checks passed;", unique(panel_n$n), "genes per panel\n")
+```
+
+## Biological spot-checks
+
+`EIF3D` mRNA must be strongly depleted in every si3d contrast. Under
+log2(sictrl / si3d) that is a large **positive** `rna_lfc`, which is what fixes the
+orientation of both axes.
+
+```{r checks_directionality}
+eif3d_check <- rr %>%
+  filter(symbol == "EIF3D") %>%
+  dplyr::select(contrast, rna_lfc, rna_padj, ribo_lfc)
+
+print(eif3d_check)
+
+stopifnot("Contrast is not oriented sictrl/si3d" =
+  nrow(eif3d_check) == length(PANEL_LEVELS) &&
+  all(eif3d_check$rna_lfc > 2) &&
+  all(eif3d_check$rna_padj < 0.01))
+
+cat("Directionality confirmed: log2(sictrl / si3d) in all",
+    nrow(eif3d_check), "panels\n")
+```
+
+The off-diagonal displacement must track the independently fit `te_lfc`. They are not
+arithmetically identical (separate DESeq2 fit), so this asserts a positive
+correlation rather than equality.
+
+```{r checks_off_diag}
+off_diag_cor <- rr %>%
+  filter(!is.na(off_diag), !is.na(te_lfc)) %>%
+  group_by(contrast) %>%
+  summarise(r = cor(off_diag, te_lfc),
+            median_off_diag = median(off_diag),
+            median_te_lfc = median(te_lfc),
+            n = dplyr::n(), .groups = "drop")
+
+print(off_diag_cor)
+
+stopifnot("ribo_lfc - rna_lfc does not track te_lfc" = all(off_diag_cor$r > 0.5))
+stopifnot("off-diagonal and te_lfc medians disagree in sign" =
+  all(sign(off_diag_cor$median_off_diag) == sign(off_diag_cor$median_te_lfc)))
+
+cat("Off-diagonal displacement tracks te_lfc in all panels (r =",
+    paste(round(off_diag_cor$r, 2), collapse = ", "), ")\n")
+```
+
+# Gene Sets
+
+```{r load_genesets}
+promotes <- read_csv(here("output", "genesets",
+                          "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+neg_pool <- read_csv(here("output", "predictive_modeling",
+                          "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+universe     <- unique(rr$gene_id_clean)
+promotes_ids <- intersect(unique(promotes$ensembl_gene), universe)
+neg_pool_ids <- intersect(setdiff(unique(neg_pool$gene_id_clean),
+                                  promotes_ids), universe)
+
+# Size-matched negative control set (project convention: set.seed(9))
+set.seed(9)
+neg_ids <- sample(neg_pool_ids, min(length(promotes_ids), length(neg_pool_ids)))
+
+cat("Promoted genes in universe:", length(promotes_ids), "\n")
+cat("Negative control pool:", length(neg_pool_ids),
+    "-> size-matched to", length(neg_ids), "\n")
+
+stopifnot("Gene sets overlap" = length(intersect(promotes_ids, neg_ids)) == 0)
+stopifnot("Promoted gene set is not the expected ~1604 mRNAs" =
+  between(length(promotes_ids), 1500, 1700))
+stopifnot("Negative control set not size-matched" =
+  length(neg_ids) == length(promotes_ids))
+
+rr <- rr %>%
+  mutate(group = case_when(
+    gene_id_clean %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    gene_id_clean %in% neg_ids      ~ "Negative control",
+    TRUE                            ~ "All other genes"
+  )) %>%
+  mutate(group = factor(group, levels = names(group_colors)))
+
+print(rr %>% dplyr::count(contrast, group))
+```
+
+# Group Medians
+
+```{r group_medians}
+grp_med <- rr %>%
+  filter(!is.na(rna_lfc), !is.na(ribo_lfc)) %>%
+  group_by(contrast, group) %>%
+  summarise(median_rna  = median(rna_lfc),
+            median_ribo = median(ribo_lfc),
+            median_off_diag = median(off_diag),
+            n = dplyr::n(), .groups = "drop")
+
+print(grp_med, n = 20)
+write_csv(grp_med, here("output", "67_rna_vs_ribo_group_medians.csv"))
+```
+
+# Main Figure: RNA vs Ribo with Gene-Set Overlay
+
+Grey = rest of the transcriptome, black = size-matched negative controls, orange =
+eIF3d hypoxia TE-promoted set. Dashed reference lines at x = 0 and y = 0. Group medians
+are annotated on each panel and tabulated above rather than drawn on the points.
+
+Each panel carries marginal histograms on both axes, built explicitly with
+`patchwork` rather than `ggExtra::ggMarginal()`. Two reasons: `ggMarginal()` cannot
+attach margins to a faceted plot, and its margins ignore `coord_cartesian()` limits,
+which silently misaligns them against the main panel. Building them by hand also lets
+the top margin be **density-scaled** - the gene sets are 1,604 genes against 8,671
+others, so count-scaled margins bury them under the grey.
+
+The top (RNA) margin is split by group; the side (ribo) margin is a single histogram
+pooled over all genes in the panel.
+
+Axis limits are set with scale limits (not `coord_cartesian()`) so the margins and the
+main panel share one range; that drops the few points outside the window, so the number
+dropped is reported per panel rather than passing silently.
+
+```{r marginal_helper}
+XLIM  <- c(-2.5, 3)
+YLIM  <- c(-2.5, 3)
+NBINS <- 60
+
+# Point size and transparency per group: the grey background is small and faint,
+# the two gene sets are larger and more opaque so they stay visible on top
+PT_SIZE  <- c("eIF3d hypoxia promotes" = 0.7, "Negative control" = 0.7,
+              "All other genes" = 0.4)
+PT_ALPHA <- c("eIF3d hypoxia promotes" = 0.6, "Negative control" = 0.6,
+              "All other genes" = 0.25)
+
+# Build one scatter with marginal histograms. Points are drawn grey -> black ->
+# orange (via arrange(desc(group))) so the gene sets sit on top of the background.
+marginal_panel <- function(df, panel_title, show_legend = FALSE,
+                           base_size = 12, label_size = 2.5, annot = NULL) {
+
+  n_out <- sum(df$rna_lfc  < XLIM[1] | df$rna_lfc  > XLIM[2] |
+               df$ribo_lfc < YLIM[1] | df$ribo_lfc > YLIM[2])
+  log_name <- if (is.null(panel_title) || !nzchar(panel_title)) {
+    as.character(unique(df$contrast))[1]
+  } else panel_title
+  cat(sprintf("%-15s %d genes plotted, %d outside the %g..%g window (dropped)\n",
+              log_name, nrow(df) - n_out, n_out, XLIM[1], XLIM[2]))
+
+  df  <- df %>% arrange(desc(group))
+  sx  <- scale_x_continuous(limits = XLIM, expand = expansion(mult = 0.01))
+  sy  <- scale_y_continuous(limits = YLIM, expand = expansion(mult = 0.01))
+
+  leg_labels <- df %>%
+    dplyr::count(group) %>%
+    mutate(lab = sprintf("%s (n = %s)", group,
+                         format(n, big.mark = ",", trim = TRUE)))
+
+  main <- ggplot(df, aes(x = rna_lfc, y = ribo_lfc, color = group)) +
+    geom_vline(xintercept = 0, linetype = "dashed",
+               color = "grey30", linewidth = 0.4) +
+    geom_hline(yintercept = 0, linetype = "dashed",
+               color = "grey30", linewidth = 0.4) +
+    geom_point(aes(size = group, alpha = group)) +
+    scale_color_manual(values = group_colors,
+                       breaks = names(group_colors),
+                       labels = setNames(leg_labels$lab,
+                                         as.character(leg_labels$group))[names(group_colors)]) +
+    scale_size_manual(values = PT_SIZE) +
+    scale_alpha_manual(values = PT_ALPHA) +
+    guides(size = "none", alpha = "none",
+           color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+    sx + sy +
+    labs(x = "RNA log2FC (sictrl / si3d)",
+         y = "Ribo log2FC (sictrl / si3d)", color = NULL) +
+    theme_classic(base_size = base_size)
+
+  if (show_legend) {
+    main <- main +
+      theme(legend.position = "inside",
+            legend.position.inside = c(0.02, 0.98),
+            legend.justification = c(0, 1),
+            legend.background = element_blank(),
+            legend.key.size = unit(0.8, "lines"),
+            legend.text = element_text(size = rel(0.7)))
+  } else {
+    main <- main + theme(legend.position = "none")
+  }
+
+  if (!is.null(annot)) {
+    main <- main +
+      annotate("text", x = Inf, y = -Inf, label = annot,
+               hjust = 1.05, vjust = -0.25, size = label_size)
+  }
+
+  # Density-scaled marginals so the 1,604-gene sets are comparable to the 8,671 others
+  top <- ggplot(df, aes(x = rna_lfc, fill = group, color = group)) +
+    geom_histogram(aes(y = after_stat(density)), bins = NBINS,
+                   position = "identity", alpha = 0.35, linewidth = 0.25) +
+    scale_fill_manual(values = group_colors) +
+    scale_color_manual(values = group_colors) +
+    sx +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    labs(title = panel_title) +
+    theme_void(base_size = base_size) +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, size = rel(0.9)))
+
+  # Side (ribo) margin is NOT split by group: one histogram over all genes in the
+  # panel, so it reads as the overall footprint-change distribution
+  right <- ggplot(df, aes(y = ribo_lfc)) +
+    geom_histogram(bins = NBINS, fill = "grey70", color = "grey40",
+                   linewidth = 0.25, orientation = "y") +
+    sy +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+    theme_void(base_size = base_size) +
+    theme(legend.position = "none")
+
+  (top + plot_spacer() + main + right) +
+    plot_layout(ncol = 2, widths = c(4, 1), heights = c(1, 4))
+}
+```
+
+```{r plot_scatter_facets, fig.width = 14, fig.height = 4.2}
+plot_dat <- rr %>% filter(!is.na(rna_lfc), !is.na(ribo_lfc))
+
+panel_lab <- grp_med %>%
+  filter(group != "All other genes") %>%
+  dplyr::select(contrast, group, median_off_diag) %>%
+  pivot_wider(names_from = group, values_from = median_off_diag) %>%
+  left_join(grp_med %>% filter(group == "eIF3d hypoxia promotes") %>%
+              dplyr::select(contrast, n_pos = n), by = "contrast") %>%
+  mutate(label = sprintf("median(ribo - rna)\npromoted %.2f / neg ctrl %.2f\nn = %d each",
+                         `eIF3d hypoxia promotes`, `Negative control`, n_pos))
+
+# Legend shown on the first panel only, so the row keeps a single legend
+panels <- imap(PANEL_LEVELS, function(ct, i) {
+  marginal_panel(
+    plot_dat %>% filter(contrast == ct),
+    panel_title  = ct,
+    show_legend  = (i == 1),
+    base_size    = 10,
+    label_size   = 2.1,
+    annot        = panel_lab$label[panel_lab$contrast == ct]
+  )
+})
+
+p_scatter <- wrap_plots(panels, nrow = 1) +
+  plot_annotation(
+    title = "RNA vs ribosome footprint changes upon eIF3d knockdown",
+    subtitle = "Dashed lines at 0; top margin by group (density), side margin pooled",
+    theme = theme(plot.title = element_text(size = 13),
+                  plot.subtitle = element_text(size = 10)))
+
+print(p_scatter)
+ggsave(here("plots", "67_rna_vs_ribo_si3d_genesets.pdf"), p_scatter,
+       width = 14, height = 4.2)
+```
+
+## Single large panel, hypoxia 1hr
+
+```{r plot_scatter_hyp1hr, fig.width = 6, fig.height = 5.8}
+# panel_title is left empty here: the title belongs to the composite, not to the
+# marginal histogram strip, so it is set through plot_annotation() instead
+p_hyp1 <- marginal_panel(
+  plot_dat %>% filter(contrast == "hypoxia 1hr"),
+  panel_title = NULL,
+  show_legend = TRUE,
+  base_size   = 12,
+  label_size  = 2.8,
+  annot       = panel_lab$label[panel_lab$contrast == "hypoxia 1hr"]
+) +
+  plot_annotation(
+    title = "RNA vs ribosome footprints, si3d, 1hr hypoxia",
+    subtitle = "Dashed lines at 0; top margin by group (density), side margin pooled",
+    theme = theme(plot.title = element_text(size = 13),
+                  plot.subtitle = element_text(size = 9)))
+
+print(p_hyp1)
+ggsave(here("plots", "67_rna_vs_ribo_si3d_hypoxia_1hr.pdf"), p_hyp1,
+       width = 6, height = 5.8)
+```
+
+# Displacement Off the Diagonal (statistics)
+
+Quantifies the same comparison numerically instead of as a second figure:
+`ribo_lfc - rna_lfc`, where zero = the RNA change is fully forwarded to the ribosome and
+positive = footprints fall further than mRNA in si3d. Promoted set vs size-matched
+negative controls, per panel. These p-values feed the summary table below and the
+per-panel annotations on the scatter.
+
+```{r off_diag_stats}
+off_dat <- rr %>% filter(!is.na(off_diag))
+
+off_wilcox <- off_dat %>%
+  filter(group != "All other genes") %>%
+  group_by(contrast) %>%
+  summarise(
+    p = wilcox.test(off_diag[group == "eIF3d hypoxia promotes"],
+                    off_diag[group == "Negative control"])$p.value,
+    n_pos = sum(group == "eIF3d hypoxia promotes"),
+    n_neg = sum(group == "Negative control"),
+    med_pos = median(off_diag[group == "eIF3d hypoxia promotes"]),
+    med_neg = median(off_diag[group == "Negative control"]),
+    .groups = "drop"
+  ) %>%
+  # Wilcoxon p underflows to exactly 0 in the strongest panels; report the
+  # double-precision floor rather than printing "p = 0"
+  mutate(p_label = if_else(p == 0,
+                           sprintf("p < %.1g", .Machine$double.xmin),
+                           sprintf("p = %.2g", p)),
+         label = sprintf("Wilcoxon %s\nmedian %.2f vs %.2f\nn = %d vs %d",
+                         p_label, med_pos, med_neg, n_pos, n_neg))
+
+print(off_wilcox %>% dplyr::select(contrast, p, p_label, med_pos, med_neg,
+                                  n_pos, n_neg))
+```
+
+# Summary Table
+
+```{r summary_table}
+summary_tbl <- grp_med %>%
+  left_join(off_wilcox %>% dplyr::select(contrast, wilcox_p_vs_neg = p),
+            by = "contrast") %>%
+  mutate(wilcox_p_vs_neg = if_else(group == "eIF3d hypoxia promotes",
+                                   wilcox_p_vs_neg, NA_real_))
+
+print(summary_tbl, n = 20)
+write_csv(summary_tbl, here("output", "67_rna_vs_ribo_summary.csv"))
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
