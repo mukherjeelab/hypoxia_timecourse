@@ -1,0 +1,1777 @@
+---
+title: "`r paste0('Random Forest SHAP Values: eIF', params$gene, ' Target Prediction (', tools::toTitleCase(params$condition), ', ', params$direction, ', ', params$timepoint, ', LFC ', params$lfc, ', ', params$feature_set, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set: "external_stability"
+  clip_mode: "aggregate"
+  exclude_4e_features: false
+  exclude_own_te_features: true
+  neg_geneset_csv: ""
+  feature_matrix_path: ""
+  waterfall_genes: ""
+  run_interactions: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+# SHAP (Shapley value) decomposition of the notebook 07 classifier.
+# Params must match the notebook 07 run being explained — the suffix is built the
+# same way, and the saved 07 model is loaded and asserted against (Section 2).
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    condition = "hypoxia",
+    gene      = "3d",
+    direction = "promotes",
+    timepoint = "1hr",
+    lfc       = "0.5",
+    feature_set = "external_stability",
+    clip_mode   = "aggregate",
+    exclude_4e_features     = FALSE,
+    exclude_own_te_features = TRUE,
+    neg_geneset_csv = "",
+    feature_matrix_path = "",
+    waterfall_genes = "",  # "" = auto-select 1 confident TP, 1 borderline, 1 confident error.
+                           # Otherwise a comma-separated list of gene symbols, e.g. "VEGFA,CA9"
+    run_interactions = TRUE  # TreeSHAP interaction values scale with the number of features:
+                             # ~10 min at 56 features on 200 genes, far longer at 209.
+                             # Set FALSE for large feature sets (e.g. codon_features).
+  )
+}
+
+geneset_csv <- if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
+  paste0("translation_categories_si", params$gene, "_vs_sictrl_", params$condition, "_", params$timepoint, ".csv")
+} else {
+  paste0(params$condition, "_", params$gene, "_", params$direction,
+         "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
+}
+feature_matrix_rds <- if (params$feature_set == "te_lfc") {
+  "feature_matrix_te_lfc.rds"
+} else if (params$feature_set == "codon_optimality") {
+  "feature_matrix_codon_optimality.rds"
+} else if (params$feature_set == "kozak") {
+  "feature_matrix_kozak.rds"
+} else if (params$feature_set == "cnot3") {
+  "feature_matrix_cnot3.rds"
+} else if (params$feature_set == "ripseq") {
+  "feature_matrix_ripseq.rds"
+} else if (params$feature_set == "external_stability") {
+  "feature_matrix_external_stability.rds"
+} else if (params$feature_set == "codon_features") {
+  "feature_matrix_codon_features.rds"
+} else if (params$feature_set == "codon_only") {
+  "feature_matrix_codon_only.rds"
+} else if (params$feature_set == "clip_split") {
+  paste0("feature_matrix_", params$timepoint, "_clip_split.rds")
+} else if (params$feature_set == "structure") {
+  paste0("feature_matrix_", params$timepoint, "_structure.rds")
+} else {
+  paste0("feature_matrix_", params$timepoint, "_combined.rds")
+}
+if (!is.null(params$feature_matrix_path) && nchar(params$feature_matrix_path) > 0) {
+  feature_matrix_rds <- params$feature_matrix_path
+}
+suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 params$condition, "_", params$timepoint, "_lfc", params$lfc,
+                 "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta",
+                 if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
+                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
+suffix_shap <- paste0(suffix, "_shap")
+
+pos_label  <- params$direction
+neg_label  <- paste0("does_not_", sub("s$", "", params$direction))
+gene_label <- paste0("eIF", params$gene)
+
+cat("Gene set CSV:", geneset_csv, "\n")
+cat("Feature matrix:", feature_matrix_rds, "\n")
+cat("07 model suffix:", suffix, "\n")
+cat("Output suffix (shap):", suffix_shap, "\n")
+```
+
+# Overview
+
+Shapley (SHAP) decomposition of the notebook 07 Random Forest classifier. Where impurity
+importance (07) and permutation importance (07b) give a single non-negative number per
+feature, SHAP gives a **signed contribution per gene per feature**, additive to that gene's
+predicted probability. That buys three things the other two cannot give:
+
+1. **Direction and magnitude in one view** (beeswarm), without the univariate proxy that
+   the 07 signed-importance lollipop uses.
+2. **Exact grouping.** SHAP values are additive, so summing them within a feature family is
+   an exact operation. This resolves credit-splitting across the correlated blocks in this
+   feature set (`csc` / `csc_first75` / `csc_q1`-`csc_q4`, the eight `struct_accessibility_*`
+   families, the length and GC families), which impurity importance structurally cannot do.
+3. **Per-gene explanations** (waterfall), for interpreting individual candidate genes.
+
+## TreeSHAP and the surrogate forest
+
+`treeshap::ranger.unify()` does not support ranger **probability** forests (it errors on a
+missing `pred.1` column). It does support a **regression** forest fit to the 0/1 target,
+whose terminal-node predictions are the same class proportion a probability forest stores.
+
+So this notebook fits a surrogate regression forest on the identical training rows, with
+`mtry`, `min.node.size` and `num.trees` **read off the saved 07 model** rather than assumed,
+and then verifies the surrogate reproduces 07's predictions before explaining it
+(Section "Surrogate fidelity"). Gini splitting on a binary target and variance splitting on
+the same target as 0/1 select the same splits up to tie-breaking, so the two forests agree
+to ~7e-3 in predicted probability but are not bit-identical.
+
+- **Positive class ("`r pos_label`")**: `` `r geneset_csv` ``
+- **Negative class ("`r neg_label`")**: `negative_control_genes.csv` (or custom via `neg_geneset_csv`)
+
+# Setup
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+library(cowplot)
+library(treeshap)
+library(ggbeeswarm)
+```
+
+```{r table_helper}
+# Summary tables are printed with knitr::kable(format = "simple") so they render as aligned
+# tables in the console when chunks are run interactively, and identically in the knit HTML.
+# Plain print(as.data.frame(x)) wraps wide tables across several blocks and is hard to read.
+print_table <- function(df, digits = 4, caption = NULL) {
+  print(knitr::kable(as.data.frame(df), format = "simple", digits = digits, caption = caption))
+  invisible(df)
+}
+```
+
+# Load Data
+
+```{r load_data}
+features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
+cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
+
+if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
+  positive_genes <- read_csv(here("output", geneset_csv)) %>%
+    filter(te_lfc > as.numeric(params$lfc), te_padj < 0.05) %>%
+    mutate(ensembl_gene = sub("\\..*", "", gene_id))
+} else {
+  positive_genes <- read_csv(here("output", "genesets", geneset_csv))
+}
+cat("Positive genes:", nrow(positive_genes), "\n")
+
+if (params$neg_geneset_csv != "") {
+  negative_control_genes <- read_csv(
+    here("output", "genesets", params$neg_geneset_csv),
+    show_col_types = FALSE
+  ) %>%
+    mutate(gene_id_clean = ensembl_gene)
+} else {
+  neg_csv <- if (params$gene == "3e") {
+    "negative_control_genes_si3e.csv"
+  } else {
+    "negative_control_genes.csv"
+  }
+  negative_control_genes <- read_csv(
+    here("output", "predictive_modeling", neg_csv),
+    show_col_types = FALSE
+  ) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id))
+}
+cat("Negative genes:", nrow(negative_control_genes), "\n")
+```
+
+# Create Binary Target
+
+Identical to notebook 07: same seed, same sampling, so the labelled set matches that run.
+
+```{r create_target}
+set.seed(9)
+
+pos_in_features <- positive_genes %>%
+  filter(ensembl_gene %in% features$gene_id_clean)
+cat("Positive genes in feature matrix:", nrow(pos_in_features), "\n")
+
+neg_in_features <- negative_control_genes %>%
+  filter(gene_id_clean %in% features$gene_id_clean)
+cat("Negative control genes in feature matrix:", nrow(neg_in_features), "\n")
+
+number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+
+features <- features %>%
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+    gene_id_clean %in% sample(neg_in_features$gene_id_clean, number_to_match) ~ neg_label,
+    TRUE ~ NA_character_
+  ))
+
+model_genes <- features %>%
+  filter(!is.na(eif3d_target)) %>%
+  mutate(eif3d_target = factor(eif3d_target, levels = c(neg_label, pos_label)))
+
+cat("Positive (", pos_label, "):", sum(model_genes$eif3d_target == pos_label), "\n")
+cat("Negative (", neg_label, "):", sum(model_genes$eif3d_target == neg_label), "\n")
+cat("Total:", nrow(model_genes), "\n")
+```
+
+# Preprocessing
+
+```{r filter_features}
+id_cols <- c("gene_id", "gene_id_clean", "gene_id.x", "gene_id.y",
+             "transcript_id", "transcript_id_clean", "transcript_id_raw",
+             "symbol", "te_lfc", "te_padj", "te_lfc_bin", "eif3d_target")
+all_cols <- colnames(model_genes)
+id_pattern_cols <- all_cols[str_detect(all_cols, "gene_id|transcript_id|^symbol$")]
+id_cols <- unique(c(id_cols, id_pattern_cols))
+feature_cols <- setdiff(colnames(model_genes), id_cols)
+cat("Initial feature count:", length(feature_cols), "\n")
+
+if (params$clip_mode == "aggregate") {
+  aggregate_clip_cols <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                           "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc", "clip_lee_glu_dep_lfc",
+                           "clip_lee_glu_vs_cm_enrichment")
+  regional_clip <- feature_cols[str_detect(feature_cols, "^clip_") & !(feature_cols %in% aggregate_clip_cols)]
+  feature_cols <- setdiff(feature_cols, regional_clip)
+  cat("CLIP mode: aggregate — dropped", length(regional_clip), "regional features\n")
+} else if (params$clip_mode == "individual") {
+  feature_cols <- setdiff(feature_cols, c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                                          "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                                          "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment"))
+  cat("CLIP mode: individual\n")
+} else {
+  cat("CLIP mode: both\n")
+}
+
+if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality",
+                               "kozak", "cnot3", "external_stability", "codon_features")) {
+  kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
+  excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
+  feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
+  cat("Targeted mode: removed", length(excluded), "k-mer/motif columns\n")
+}
+
+if (params$feature_set == "external_stability") {
+  codon_detail_cols <- feature_cols[str_detect(feature_cols, "^bg_rscu_|^codon_freq_")]
+  if (length(codon_detail_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, codon_detail_cols)
+    cat("external_stability mode: removed", length(codon_detail_cols), "bg_rscu_/codon_freq_ columns\n")
+  }
+}
+
+if (isTRUE(params$exclude_4e_features)) {
+  circular_regex <- "^4e_resistance|^eif4e_ip"
+  circular_lit_exact <- c(
+    "lit_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_activated_translation",
+    "lit_phospho_eIF4E_suppressed_translation",
+    "lit_translation_is_sensitive_to_4E_inhibition",
+    "lit_translation_is_resistant_to_4E_inhibition"
+  )
+  circular_cols <- feature_cols[str_detect(feature_cols, circular_regex) |
+                                feature_cols %in% circular_lit_exact]
+  if (length(circular_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, circular_cols)
+    cat("Removed", length(circular_cols), "circular eIF4E features\n")
+  }
+}
+
+if (isTRUE(params$exclude_own_te_features)) {
+  own_te_cols <- feature_cols[str_detect(feature_cols, "^indiv_te_|^delta_te_|^sig_")]
+  if (length(own_te_cols) > 0) {
+    feature_cols <- setdiff(feature_cols, own_te_cols)
+    cat("Removed", length(own_te_cols), "own-data TE features\n")
+  }
+}
+
+raw_length_cols <- feature_cols[str_detect(feature_cols, "^(utr5|utr3|cds|total)_length$")]
+if (length(raw_length_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, raw_length_cols)
+  cat("Removed", length(raw_length_cols), "raw length columns:", paste(raw_length_cols, collapse = ", "), "\n")
+}
+
+sparsity_threshold <- 0.5
+sparse_cols <- feature_cols[
+  sapply(feature_cols, function(f) mean(!is.na(unlist(model_genes[[f]]))) < sparsity_threshold)
+]
+if (length(sparse_cols) > 0) {
+  feature_cols <- setdiff(feature_cols, sparse_cols)
+  cat("Removed", length(sparse_cols), "features with <", sparsity_threshold * 100, "% non-NA values\n")
+}
+
+cat("Feature count after filtering:", length(feature_cols), "\n")
+
+list_cols <- feature_cols[sapply(feature_cols, function(f) is.list(model_genes[[f]]))]
+if (length(list_cols) > 0) {
+  cat("Coercing", length(list_cols), "list columns to numeric\n")
+  for (col in list_cols) model_genes[[col]] <- as.numeric(unlist(model_genes[[col]]))
+}
+
+# Leakage guard: the target must never appear among the predictors
+stopifnot("target column leaked into feature_cols" = !"eif3d_target" %in% feature_cols)
+```
+
+# Prepare Modeling Data
+
+```{r prepare_data}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols))
+
+cat("Final dataset:", nrow(model_data), "genes x", length(feature_cols), "features\n")
+print(table(model_data$eif3d_target))
+```
+
+# Train/Test Split
+
+```{r train_test_split}
+set.seed(9)
+
+train_idx <- createDataPartition(model_data$eif3d_target, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+
+# createDataPartition stratifies by the outcome, so both splits keep the 50/50 balance of
+# the labelled set. Printed rather than assumed: the SHAP baseline is the TRAINING base
+# rate, so if the test set's balance ever drifted from it, the beeswarm cloud would sit
+# off-centre for reasons unrelated to any feature.
+cat("Training set:", nrow(train_data), "\n")
+print(table(train_data$eif3d_target))
+cat("  positive fraction:", round(mean(train_data$eif3d_target == pos_label), 4), "\n")
+cat("\nTest set:", nrow(test_data), "\n")
+print(table(test_data$eif3d_target))
+cat("  positive fraction:", round(mean(test_data$eif3d_target == pos_label), 4), "\n")
+
+train_medians <- train_data %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~median(., na.rm = TRUE)))
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) {
+    df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  }
+  df
+}
+
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+
+# Full labelled set, imputed with the same training medians (used for export only)
+full_data <- impute_with_medians(model_data, train_medians)
+
+cat("Remaining NAs in train:", sum(is.na(train_data[, feature_cols])), "\n")
+cat("Remaining NAs in test:",  sum(is.na(test_data[, feature_cols])),  "\n")
+```
+
+# Fit the SHAP-Compatible Surrogate Forest
+
+The surrogate is a regression forest on the 0/1 target. Its hyperparameters are **read off
+the saved notebook 07 probability forest** rather than hardcoded, because ranger's defaults
+differ by tree type (`min.node.size` is 10 for probability forests but 1 for classification
+and 5 for regression; `mtry` is `floor(sqrt(p))` for probability but `floor(p/3)` for
+regression). Hardcoding either would silently fit a differently-shaped forest and the SHAP
+values would explain the wrong model.
+
+```{r fit_surrogate}
+rf_prob_path <- here("output", "predictive_modeling", paste0("rf_classifier_", suffix, ".rds"))
+stopifnot("notebook 07 model RDS not found - knit 07 with matching params first" =
+            file.exists(rf_prob_path))
+rf_prob <- readRDS(rf_prob_path)
+
+cat("Loaded 07 model:", basename(rf_prob_path), "\n")
+cat("  treetype:", rf_prob$treetype, "| num.trees:", rf_prob$num.trees,
+    "| mtry:", rf_prob$mtry, "| min.node.size:", rf_prob$min.node.size, "\n")
+
+set.seed(9)
+rf_shap <- ranger(
+  x             = train_data[, feature_cols],
+  y             = as.numeric(train_data$eif3d_target == pos_label),
+  num.trees     = rf_prob$num.trees,
+  mtry          = rf_prob$mtry,           # matches 07's probability-forest setting
+  min.node.size = rf_prob$min.node.size,  # matches 07's probability-forest setting
+  seed          = 9
+)
+
+# --- Check A: structural config match, asserted at the input -------------------
+# Deterministic and independent of any prediction-agreement tolerance.
+stopifnot(
+  "07 model is not a probability forest"          = rf_prob$treetype == "Probability estimation",
+  "surrogate is not a regression forest"          = rf_shap$treetype == "Regression",
+  "surrogate mtry does not match 07"              = rf_shap$mtry == rf_prob$mtry,
+  "surrogate min.node.size does not match 07"     = rf_shap$min.node.size == rf_prob$min.node.size,
+  "surrogate num.trees does not match 07"         = rf_shap$num.trees == rf_prob$num.trees,
+  "surrogate feature set/order does not match 07" =
+    identical(rf_shap$forest$independent.variable.names,
+              rf_prob$forest$independent.variable.names)
+)
+cat("Check A passed: surrogate config matches the 07 model structurally\n")
+```
+
+## Surrogate fidelity (test set)
+
+**Check B**, complementary to Check A: Check A guards the configuration, this certifies the
+resulting predictions. Both the gate and the reported number are computed on the **held-out
+test set**, never on training rows, since training rows were seen by both forests and can
+agree more tightly than held-out ones.
+
+The `0.02` bound is calibrated, not arbitrary. Measured max |delta| on this dataset:
+matched config `0.0068`; `min.node.size = 1` `0.0798`; `min.node.size = 5` `0.0863`;
+`mtry = floor(p/3)` `0.163`. So `0.02` sits ~3x above a correct run and ~4x below the
+nearest misconfiguration. The residual `0.0068` is gini-vs-variance split tie-breaking,
+not a modelling difference.
+
+```{r check_fidelity}
+p_prob_test <- predict(rf_prob, test_data[, feature_cols])$predictions[, pos_label]
+p_reg_test  <- predict(rf_shap, test_data[, feature_cols])$predictions
+
+max_abs_diff_test <- max(abs(p_reg_test - p_prob_test))
+r_test <- cor(p_reg_test, p_prob_test)
+
+auc_prob <- as.numeric(auc(roc(test_data$eif3d_target, p_prob_test,
+                               levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)))
+auc_reg  <- as.numeric(auc(roc(test_data$eif3d_target, p_reg_test,
+                               levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)))
+
+cat("Surrogate fidelity on TEST SET (n =", nrow(test_data), "):\n")
+cat("  max |delta prob|:", format(max_abs_diff_test, digits = 3), "  <- gated\n")
+cat("  Pearson r:", round(r_test, 6), "(context only)\n")
+cat("  AUC 07 probability forest:", round(auc_prob, 5), "(context only)\n")
+cat("  AUC surrogate regression forest:", round(auc_reg, 5), "(context only)\n")
+cat("  AUC delta:", format(abs(auc_prob - auc_reg), digits = 3), "(context only)\n")
+
+stopifnot("surrogate does not reproduce the 07 model on the test set" =
+            max_abs_diff_test < 0.02)
+cat("Check B passed: surrogate reproduces 07 test-set predictions within 0.02\n")
+
+# Reported separately, and deliberately not gated: training rows were seen by both
+# forests during fitting, so this number is not comparable to the test-set figure above.
+p_prob_full <- predict(rf_prob, full_data[, feature_cols])$predictions[, pos_label]
+p_reg_full  <- predict(rf_shap, full_data[, feature_cols])$predictions
+cat("\nFor reference only, ALL labelled genes (n =", nrow(full_data),
+    ", includes training rows): max |delta prob| =",
+    format(max(abs(p_reg_full - p_prob_full)), digits = 3), "\n")
+```
+
+# Compute Exact TreeSHAP
+
+The unify data is the **training set**, so the SHAP baseline is the mean surrogate
+prediction over training rows, i.e. the training base rate. This matters for reading
+waterfall plots: the baseline anchor is a train-set number (~0.5 here, since classes are
+balanced), not the test-set base rate.
+
+```{r compute_shap}
+unified <- ranger.unify(rf_shap, train_data[, feature_cols])
+
+# Baseline the decomposition expands around: mean surrogate output over the unify data
+shap_baseline <- mean(predict(rf_shap, train_data[, feature_cols])$predictions)
+cat("SHAP baseline (mean surrogate prediction over training rows):",
+    round(shap_baseline, 5), "\n")
+
+# Test set: used for all rankings and figures (held out, so no memorisation artefacts)
+cat("Computing TreeSHAP on test set (", nrow(test_data), "genes)...\n")
+shap_test_obj <- treeshap(unified, test_data[, feature_cols], verbose = FALSE)
+shap_test <- as.data.frame(shap_test_obj$shaps)[, feature_cols]
+
+# Full labelled set: export only, so any gene can be looked up later
+cat("Computing TreeSHAP on all labelled genes (", nrow(full_data), "genes)...\n")
+shap_full_obj <- treeshap(unified, full_data[, feature_cols], verbose = FALSE)
+shap_full <- as.data.frame(shap_full_obj$shaps)[, feature_cols]
+
+stopifnot(
+  "SHAP matrix dims do not match test set"  = all(dim(shap_test) == c(nrow(test_data), length(feature_cols))),
+  "SHAP matrix dims do not match full set"  = all(dim(shap_full) == c(nrow(full_data), length(feature_cols))),
+  "SHAP column names do not match features" = identical(colnames(shap_test), feature_cols),
+  "test and full SHAP objects are the same size - one was overwritten" =
+    nrow(shap_test) != nrow(shap_full)
+)
+
+# Every figure below is labelled "test set" and reports n as nrow(shap_test), read from the
+# SHAP object itself rather than from test_data. A copy-paste that swapped in shap_full would
+# therefore show n = 2872 in the caption instead of silently mislabelling 2872 genes as the
+# test set. It is written inline in each figure chunk rather than stored in a variable here,
+# so that chunks stay runnable individually in the console.
+stopifnot("figure n does not match the test set" = nrow(shap_test) == nrow(test_data))
+cat("Figures will report n =", nrow(shap_test), "genes (test set)\n")
+
+# Local accuracy: SHAP values plus baseline must reconstruct the model output exactly
+recon_test <- rowSums(shap_test) + shap_baseline
+recon_full <- rowSums(shap_full) + shap_baseline
+cat("Local accuracy, max |reconstruction error|:\n")
+cat("  test set:", format(max(abs(recon_test - p_reg_test)), digits = 3), "\n")
+cat("  full set:", format(max(abs(recon_full - p_reg_full)), digits = 3), "\n")
+stopifnot(
+  "SHAP local accuracy violated on test set" = max(abs(recon_test - p_reg_test)) < 1e-6,
+  "SHAP local accuracy violated on full set" = max(abs(recon_full - p_reg_full)) < 1e-6
+)
+cat("Local accuracy check passed\n")
+```
+
+# Feature Categories and Display Names
+
+Every feature is assigned to a named category. Notebook 07's own `case_when` drops
+`is_4e_*`, `te_4e_resistance_lfc` and `is_dap5_*` into "Other"; that is not carried over
+here, since an "Other" bucket in the grouped-SHAP panel would hide three named feature
+families inside what reads as miscellany. The bucket is asserted empty rather than assumed
+empty, and membership is printed below so the grouping is auditable.
+
+```{r feature_categories_map}
+categorize_feature <- function(f) {
+  case_when(
+    str_detect(f, "^bg_rscu_")                             ~ "Codon usage (RSCU)",
+    str_detect(f, "^codon_freq_")                          ~ "Codon frequency",
+    str_detect(f, "^log2_.*_length$")                      ~ "Region lengths",
+    str_detect(f, "_gc$|^gc3$")                            ~ "GC content",
+    str_detect(f, "^struct_") & str_detect(f, "cds")       ~ "RNA structure (CDS)",
+    str_detect(f, "^struct_") & str_detect(f, "utr3")      ~ "RNA structure (3'UTR)",
+    str_detect(f, "^struct_")                              ~ "RNA structure (5'UTR)",
+    str_detect(f, "^clip_")                                ~ "eIF3 CLIP binding",
+    str_detect(f, "^is_4e_|^te_4e_|^eif4e_ip_")            ~ "eIF4E sensitivity",
+    str_detect(f, "^is_dap5_|^dap5_")                      ~ "DAP5 dependence",
+    str_detect(f, "^kozak_")                               ~ "Kozak context",
+    str_detect(f, "^cai$|^tai$|^csc|^fop$|weighted_codon") ~ "Codon optimality",
+    str_detect(f, "^zhu2024_|^karner2026_")                ~ "mRNA stability",
+    str_detect(f, "ribo_enrichment|_occupancy$")           ~ "Ribosome occupancy (external)",
+    TRUE                                                   ~ "Other"
+  )
+}
+
+feature_meta <- tibble(feature = feature_cols) %>%
+  mutate(category = categorize_feature(feature))
+
+# Category palette, defined here with the map so every plot that colours by category shares
+# it. Deliberately avoids #E69F00 and #56B4E9, which the project reserves for eIF3d/si3d and
+# eIF3e/si3e, so no category reads as one of those factors. The three RNA structure
+# categories share a purple ramp so related groups look related.
+category_colors <- c(
+  "GC content"                    = "#0072B2",
+  "Codon optimality"              = "#009E73",
+  "Region lengths"                = "#CC79A7",
+  "RNA structure (5'UTR)"         = "#C2A5CF",
+  "RNA structure (CDS)"           = "#9970AB",
+  "RNA structure (3'UTR)"         = "#762A83",
+  "eIF4E sensitivity"             = "#D55E00",
+  "DAP5 dependence"               = "#D668C6",
+  "eIF3 CLIP binding"             = "#8C510A",
+  "mRNA stability"                = "#35978F",
+  "Ribosome occupancy (external)" = "#404040",
+  "Kozak context"                 = "#999999",
+  "Codon usage (RSCU)"            = "#66A61E",
+  "Codon frequency"               = "#B2182B",
+  "Positional GC"                 = "#3690C0"
+)
+stopifnot("a feature category has no assigned colour - extend category_colors" =
+            all(unique(feature_meta$category) %in% names(category_colors)))
+
+# Some entanglement diagnostics are written around a specific named trio. They are skipped
+# (chunk eval = FALSE) when a feature matrix does not contain all three, so this notebook can
+# be pointed at other matrices without editing. The GC3 screen needs only gc3 and runs either way.
+pair_diag_feats <- c("cds_gc", "csc", "hia2026_dhx29_occupancy")
+run_pair_diag   <- all(pair_diag_feats %in% feature_cols)
+run_gc3_screen  <- "gc3" %in% feature_cols
+run_interactions <- isTRUE(params$run_interactions) && run_pair_diag
+cat("Entanglement diagnostics enabled?  pair diagnostics:", run_pair_diag,
+    "| GC3 screen:", run_gc3_screen, "| interactions:", run_interactions, "\n")
+if (!run_pair_diag)
+  cat("  (missing:", paste(setdiff(pair_diag_feats, feature_cols), collapse = ", "), ")\n")
+
+uncategorized <- feature_meta %>% filter(category == "Other") %>% pull(feature)
+if (length(uncategorized) > 0) {
+  cat("UNCATEGORIZED FEATURES:\n"); cat(paste(" ", uncategorized, collapse = "\n"), "\n")
+}
+stopifnot("features fell into the 'Other' bucket - extend categorize_feature()" =
+            length(uncategorized) == 0)
+
+cat("Category membership (", n_distinct(feature_meta$category), "categories,",
+    nrow(feature_meta), "features):\n")
+feature_meta %>%
+  group_by(category) %>%
+  summarise(n = n(), features = paste(feature, collapse = ", "), .groups = "drop") %>%
+  arrange(desc(n)) %>%
+  as.data.frame() %>%
+  print(right = FALSE)
+```
+
+```{r feature_display_names}
+clean_feature_name <- function(f) {
+  f %>%
+    str_replace("^log2_", "log2 ") %>%
+    str_replace("_length$", " length") %>%
+    str_replace("^utr5", "5'UTR") %>%
+    str_replace("^utr3", "3'UTR") %>%
+    str_replace("^cds", "CDS") %>%
+    str_replace("_gc$", " GC%") %>%
+    str_replace("^gc3$", "GC3") %>%
+    str_replace("^struct_accessibility_", "Accessibility: ") %>%
+    str_replace("^struct_num_structured_regions", "Structured regions") %>%
+    str_replace("^clip_eif3_count", "CLIP: eIF3 datasets") %>%
+    str_replace("^clip_cap_binding_count", "CLIP: cap-binding datasets") %>%
+    str_replace("^cai$", "CAI") %>%
+    str_replace("^tai$", "tAI") %>%
+    str_replace("^csc$", "CSC (full CDS)") %>%
+    str_replace("^fop$", "FOP") %>%
+    str_replace("^csc_first75$", "CSC (first 75 codons)") %>%
+    str_replace("^csc_q([1-4])$", "CSC (quarter \\1)") %>%
+    str_replace("^kozak_", "Kozak: ") %>%
+    str_replace("^zhu2024_", "Zhu 2024: ") %>%
+    str_replace("^karner2026_", "Karner 2026: ") %>%
+    str_replace("^hia2026_", "Hia 2026: ") %>%
+    str_replace("^cnot3_", "CNOT3: ") %>%
+    str_replace("^is_4e_", "4E-") %>%
+    str_replace("^te_4e_resistance_lfc$", "4E resistance TE LFC") %>%
+    str_replace("^eif4e_ip_", "eIF4E IP: ") %>%
+    str_replace("^is_dap5_", "DAP5-") %>%
+    str_replace("^dap5_polysome_lfc$", "DAP5 polysome LFC") %>%
+    str_replace_all("_", " ")
+}
+
+feature_meta <- feature_meta %>% mutate(feature_clean = clean_feature_name(feature))
+```
+
+# SHAP Importance
+
+```{r shap_importance}
+# shap_value_cor is the directional summary: the correlation between a feature's VALUE and
+# its SHAP value across genes. Positive = high feature values push toward the positive class.
+# This is the correct directional quantity; mean_signed_shap is NOT a measure of direction
+# (it is the average net push, which is near zero by construction and is dominated by the
+# offset between the explain-set mean prediction and the training baseline). It is retained
+# in the export for completeness but is deliberately not used for direction anywhere.
+shap_value_cor <- map_dbl(feature_cols, function(f) {
+  v <- test_data[[f]]; s <- shap_test[[f]]
+  if (sd(v, na.rm = TRUE) == 0 || sd(s, na.rm = TRUE) == 0) return(NA_real_)
+  cor(v, s, use = "complete.obs")
+})
+
+shap_importance <- tibble(
+  feature          = feature_cols,
+  mean_abs_shap    = colMeans(abs(shap_test)),
+  shap_value_cor   = shap_value_cor,
+  mean_signed_shap = colMeans(shap_test),
+  sd_shap          = apply(shap_test, 2, sd)
+) %>%
+  left_join(feature_meta, by = "feature") %>%
+  arrange(desc(mean_abs_shap)) %>%
+  mutate(rank_shap = row_number())
+
+cat("Top 20 features by mean |SHAP| (test set, n =", nrow(shap_test), "):\n")
+print_table(shap_importance %>% head(20) %>%
+              dplyr::select(rank_shap, feature, mean_abs_shap, shap_value_cor, category),
+            caption = "Top 20 features by mean |SHAP|")
+```
+
+## Agreement with notebook 07 impurity importance
+
+```{r compare_impurity}
+imp07_path <- here("output", "predictive_modeling",
+                   paste0("rf_classification_importance_", suffix, ".csv"))
+
+if (file.exists(imp07_path)) {
+  imp07 <- read_csv(imp07_path, show_col_types = FALSE) %>%
+    dplyr::select(feature, impurity = importance) %>%
+    mutate(rank_impurity = rank(-impurity))
+
+  cmp <- shap_importance %>%
+    dplyr::select(feature, feature_clean, category, mean_abs_shap, rank_shap) %>%
+    inner_join(imp07, by = "feature")
+
+  rho <- cor(cmp$mean_abs_shap, cmp$impurity, method = "spearman")
+  cat("Spearman rho, mean |SHAP| vs 07 impurity importance:",
+      round(rho, 3), ", n =", nrow(cmp), "\n")
+
+  p_cmp <- ggplot(cmp, aes(x = impurity, y = mean_abs_shap)) +
+    geom_point(color = "#E69F00", size = 2, alpha = 0.8) +
+    ggrepel::geom_text_repel(
+      data = cmp %>% head(10),
+      aes(label = feature_clean), size = 3, max.overlaps = 20
+    ) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+             label = paste0("Spearman rho = ", round(rho, 3), ", n = ", nrow(cmp))) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0("SHAP vs impurity importance: ", gene_label, " targets"),
+      subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                        " | SHAP on held-out test set"),
+      x = "Impurity importance (notebook 07)",
+      y = "Mean |SHAP| (test set)"
+    )
+
+  print(p_cmp)
+  ggsave(here("plots", paste0("shap_vs_impurity_", suffix_shap, ".pdf")),
+         plot = p_cmp, width = 7, height = 6)
+} else {
+  cat("07 importance CSV not found, skipping comparison:", basename(imp07_path), "\n")
+  rho <- NA_real_
+}
+```
+
+## Direction agreement with the 07 univariate directionality
+
+Reported, **not asserted**. Direction here is `shap_value_cor` (feature value vs its own
+SHAP value), the conditional multivariate analogue of the 07 `correlation` column, which is
+univariate. They legitimately disagree where suppression or interaction effects are present,
+which is expected given the correlated `csc*`, `struct_accessibility_*` and GC blocks. A flip
+is a result to inspect, not a failure.
+
+```{r compare_direction}
+dir07_path <- here("output", "predictive_modeling",
+                   paste0("rf_classification_directionality_", suffix, ".csv"))
+
+if (file.exists(dir07_path)) {
+  dir07 <- read_csv(dir07_path, show_col_types = FALSE) %>%
+    dplyr::select(feature, correlation)
+
+  sign_cmp <- shap_importance %>%
+    dplyr::select(feature, feature_clean, shap_value_cor, rank_shap) %>%
+    inner_join(dir07, by = "feature") %>%
+    filter(!is.na(correlation), correlation != 0, !is.na(shap_value_cor), shap_value_cor != 0) %>%
+    mutate(agrees = sign(shap_value_cor) == sign(correlation))
+
+  top20 <- sign_cmp %>% arrange(rank_shap) %>% head(20)
+  cat("Sign agreement (SHAP vs 07 univariate correlation):\n")
+  cat("  all features: ", round(100 * mean(sign_cmp$agrees), 1), "% (n = ", nrow(sign_cmp), ")\n", sep = "")
+  cat("  top 20 by |SHAP|: ", round(100 * mean(top20$agrees), 1), "% (n = ", nrow(top20), ")\n", sep = "")
+
+  disagreements <- sign_cmp %>% filter(!agrees) %>% arrange(rank_shap)
+  if (nrow(disagreements) > 0) {
+    cat("\nFeatures where SHAP direction differs from univariate correlation",
+        "(inspect for suppression / interaction effects):\n")
+    disagreements %>%
+      dplyr::select(rank_shap, feature, shap_value_cor, correlation) %>%
+      as.data.frame() %>%
+      print(right = FALSE)
+  } else {
+    cat("\nNo direction disagreements.\n")
+  }
+} else {
+  cat("07 directionality CSV not found, skipping:", basename(dir07_path), "\n")
+}
+```
+
+# Beeswarm Plot
+
+Each point is one test-set gene. Position on x is that gene's SHAP value for the feature
+(signed contribution to predicted probability). Color is the gene's **feature value**, which
+is a low-to-high quantity with no meaningful midpoint, so the scale is sequential (viridis),
+and is min-max scaled **within each feature** because the 56 features are on different units.
+
+```{r beeswarm, fig.width=10, fig.height=10}
+n_display <- 30
+top_features <- shap_importance %>% head(n_display) %>% pull(feature)
+
+# Winsorise at the 2nd/98th percentile before scaling so single outliers do not
+# compress the colour range for the rest of the genes.
+scale01 <- function(x) {
+  lo <- quantile(x, 0.02, na.rm = TRUE); hi <- quantile(x, 0.98, na.rm = TRUE)
+  if (!is.finite(lo) || !is.finite(hi) || hi <= lo) return(rep(0.5, length(x)))
+  pmin(pmax((x - lo) / (hi - lo), 0), 1)
+}
+
+bee_df <- map_dfr(top_features, function(f) {
+  tibble(
+    feature      = f,
+    shap         = shap_test[[f]],
+    value_scaled = scale01(test_data[[f]])
+  )
+}) %>%
+  left_join(shap_importance %>% dplyr::select(feature, feature_clean, mean_abs_shap),
+            by = "feature") %>%
+  mutate(feature_clean = fct_reorder(feature_clean, mean_abs_shap))
+
+p_bee <- ggplot(bee_df, aes(x = shap, y = feature_clean, color = value_scaled)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_quasirandom(groupOnX = FALSE, size = 0.7, alpha = 0.6, width = 0.35) +
+  scale_color_viridis_c(
+    name   = "Feature value",
+    breaks = c(0, 1), labels = c("Low", "High")
+  ) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = paste0("SHAP beeswarm, top ", n_display, " features: ", gene_label, " targets"),
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | test set, n = ", nrow(shap_test), " genes"),
+    x = paste0("SHAP value (contribution to P(", pos_label, "))"),
+    y = ""
+  )
+
+print(p_bee)
+ggsave(here("plots", paste0("shap_beeswarm_", suffix_shap, ".pdf")),
+       plot = p_bee, width = 10, height = 10)
+```
+
+# Mean |SHAP| Bar Plot
+
+```{r shap_bar, fig.width=9, fig.height=10}
+p_bar <- shap_importance %>%
+  head(n_display) %>%
+  ggplot(aes(x = reorder(feature_clean, mean_abs_shap), y = mean_abs_shap)) +
+  geom_col(fill = "#E69F00") +
+  coord_flip() +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = paste0("Mean |SHAP|, top ", n_display, " features: ", gene_label, " targets"),
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | test set, n = ", nrow(shap_test), " genes"),
+    x = "", y = "Mean |SHAP| (probability units)"
+  )
+
+print(p_bar)
+ggsave(here("plots", paste0("shap_importance_bar_", suffix_shap, ".pdf")),
+       plot = p_bar, width = 9, height = 10)
+```
+
+# Directional Importance
+
+Signed importance, following the notebook 07 lollipop convention
+(`importance * sign(correlation)`): bar length is mean |SHAP| and the sign comes from
+`shap_value_cor`, so bars extend right when high feature values push a gene toward
+`r pos_label` and left when they push it away. Bars are coloured by feature category.
+
+Signed this way rather than as `mean_signed_shap`, which is **not** a directional quantity:
+it averages to near zero for every feature (contributions cancel across genes) and its
+residual offset reflects the gap between the explain-set mean prediction and the training
+baseline. It is ~1000x smaller than mean |SHAP| and would render as a flat, near-empty
+panel. It remains in the exported CSV for anyone who wants it.
+
+```{r shap_directional_bar, fig.width=10, fig.height=10}
+n_display <- 30   # category_colors is defined with the category map
+
+signed_df <- shap_importance %>%
+  head(n_display) %>%
+  mutate(
+    signed_importance = mean_abs_shap * sign(shap_value_cor),
+    feature_clean     = fct_reorder(feature_clean, signed_importance)
+  )
+
+signed_lim <- max(abs(signed_df$signed_importance)) * 1.05
+
+p_signed <- signed_df %>%
+  ggplot(aes(x = feature_clean, y = signed_importance, fill = category)) +
+  geom_col() +
+  geom_hline(yintercept = 0, color = "grey30", linewidth = 0.4) +
+  coord_flip() +
+  scale_y_continuous(limits = c(-signed_lim, signed_lim)) +
+  scale_fill_manual(values = category_colors, name = NULL) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = paste0("Signed importance, top ", n_display, " features: ",
+                      gene_label, " targets"),
+    subtitle = paste0("Mean |SHAP| signed by direction; right = higher values push toward ",
+                      pos_label, " | test set, n = ", nrow(shap_test), " genes"),
+    x = "", y = "Signed mean |SHAP| (probability units)"
+  )
+
+print(p_signed)
+ggsave(here("plots", paste0("shap_directional_bar_", suffix_shap, ".pdf")),
+       plot = p_signed, width = 10, height = 10)
+```
+
+# Dependence Plots
+
+```{r dependence, fig.width=11, fig.height=7}
+dep_features <- shap_importance %>% head(6) %>% pull(feature)
+
+dep_df <- map_dfr(dep_features, function(f) {
+  tibble(feature = f, value = test_data[[f]], shap = shap_test[[f]])
+}) %>%
+  left_join(shap_importance %>% dplyr::select(feature, feature_clean, rank_shap), by = "feature") %>%
+  mutate(feature_clean = fct_reorder(feature_clean, rank_shap))
+
+p_dep <- ggplot(dep_df, aes(x = value, y = shap)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(color = "#E69F00", alpha = 0.5, size = 1.2) +
+  geom_smooth(method = "loess", se = FALSE, color = "#0072B2", linewidth = 0.8) +
+  facet_wrap(~ feature_clean, scales = "free_x", nrow = 2) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = paste0("SHAP dependence, top 6 features: ", gene_label, " targets"),
+    subtitle = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
+                      " | test set, n = ", nrow(shap_test), " genes"),
+    x = "Feature value", y = paste0("SHAP value (contribution to P(", pos_label, "))")
+  )
+
+print(p_dep)
+ggsave(here("plots", paste0("shap_dependence_top6_", suffix_shap, ".pdf")),
+       plot = p_dep, width = 11, height = 7)
+```
+
+# Entanglement Diagnostics: GC Content vs Codon Optimality
+
+The top of the importance ranking contains an apparent opposition: **low** CDS GC% pushes
+toward `r pos_label` while **high** CSC pushes toward `r pos_label`. Since GC3 is
+mechanistically the bridge between bulk GC content and codon optimality, the two could be
+trading credit for one shared signal rather than acting as two effects. Four diagnostics,
+cheapest first. Each has a stated decision rule so the answer does not depend on
+eyeballing.
+
+## 1. How correlated are they?
+
+```{r entangle_correlation, fig.width=8, fig.height=7, eval=run_pair_diag}
+# Derived from categorize_feature() rather than restated as literal lists, so that editing
+# the category map cannot leave these diagnostics silently grouping by a stale definition.
+gc_block    <- feature_meta %>% filter(category == "GC content")      %>% pull(feature)
+codon_block <- feature_meta %>% filter(category == "Codon optimality") %>% pull(feature)
+comp_block  <- c(gc_block, codon_block)
+
+stopifnot(
+  "GC content category is empty - check categorize_feature()"      = length(gc_block) > 0,
+  "Codon optimality category is empty - check categorize_feature()" = length(codon_block) > 0,
+  "cds_gc is not in the GC content category"                        = "cds_gc" %in% gc_block,
+  "csc is not in the Codon optimality category"                     = "csc" %in% codon_block
+)
+cat("GC content block (", length(gc_block), "):", paste(gc_block, collapse = ", "), "\n")
+cat("Codon optimality block (", length(codon_block), "):", paste(codon_block, collapse = ", "), "\n\n")
+
+cat("Spearman correlation, GC and codon-optimality features (training set, n =",
+    nrow(train_data), "):\n\n")
+print(round(cor(train_data[, comp_block], method = "spearman"), 2))
+
+rho_gc_csc <- cor(train_data$cds_gc, train_data$csc, method = "spearman")
+rho_gc_gc3 <- cor(train_data$cds_gc, train_data$gc3, method = "spearman")
+rho_gc3_csc <- cor(train_data$gc3,   train_data$csc, method = "spearman")
+# partial correlation of GC and CSC controlling for GC3, the proposed bridge
+rho_partial <- (rho_gc_csc - rho_gc_gc3 * rho_gc3_csc) /
+  sqrt((1 - rho_gc_gc3^2) * (1 - rho_gc3_csc^2))
+
+cat("\nHeadline pairs:\n")
+cat("  rho(cds_gc, csc)        :", round(rho_gc_csc, 3), "\n")
+cat("  rho(cds_gc, gc3)        :", round(rho_gc_gc3, 3), "\n")
+cat("  rho(gc3, csc)           :", round(rho_gc3_csc, 3), "\n")
+cat("  rho(cds_gc, csc | gc3)  :", round(rho_partial, 3), "(partial, controlling GC3)\n")
+cat("\nDecision rule: |rho| <~ 0.4 means credit-splitting concern is small;\n")
+cat("               |rho| >~ 0.7 means GC and CSC cannot be separated by attribution alone.\n")
+```
+
+Each codon-category feature scored against GC3 (the bridge) and against CSC. This is where
+the category's internal heterogeneity shows up:
+
+`pct_imputed` is the share of training genes whose value was NA before median imputation.
+Those genes all sit at exactly the median, which attenuates the correlations slightly; the
+effect here is at most 0.01 (checked against complete cases), so the classification is
+unaffected, but it is what produces the flat stripes in the figure below.
+
+The `behaves_as` cutoffs (0.6 / 0.4) are a labelling convenience, not principled constants.
+They are safe here only because the data is cleanly bimodal: there is a 0.35 gap below `fop`
+and a 0.25 gap below `cnot3_weighted_codon_score`, so the GC-driven call is identical for any
+cutoff between 0.50 and 0.80. Note the rule reads `rho_gc3` only, so "GC-independent" means
+"not GC-driven", it does not assert the feature is a good CSC proxy.
+
+```{r entangle_codon_membership, eval=run_pair_diag}
+# model_data is pre-imputation, so NAs there identify the median-imputed rows
+pre_impute_train <- model_data[train_idx, ]
+
+codon_profile <- tibble(feature = codon_block) %>%
+  mutate(
+    rho_gc3     = map_dbl(feature, ~cor(train_data[[.x]], train_data$gc3, method = "spearman")),
+    rho_csc     = map_dbl(feature, ~cor(train_data[[.x]], train_data$csc, method = "spearman")),
+    pct_imputed = map_dbl(feature, ~100 * mean(is.na(pre_impute_train[[.x]]))),
+    behaves_as  = case_when(
+      abs(rho_gc3) > 0.6 ~ "GC-driven",
+      abs(rho_gc3) > 0.4 ~ "intermediate",
+      TRUE               ~ "GC-independent"
+    )
+  ) %>%
+  arrange(desc(rho_gc3))
+
+print_table(codon_profile, caption = "Codon optimality features: GC3 vs CSC entanglement")
+
+cat("\nNote: rho(csc, csc) = 1 is self-correlation, not a result.\n")
+```
+
+## 1b. The same comparison, plotted
+
+Reading down a column answers "is this feature measuring GC or measuring codon stability?".
+A tight cloud in the top row with a diffuse one below means the feature is really a GC
+measure. Grey points are median-imputed and carry no information; they form the flat stripes.
+
+```{r entangle_facets, fig.width=20, fig.height=6.5, eval=run_pair_diag}
+codon_ord <- codon_profile$feature
+
+facet_df <- expand_grid(feature = codon_ord, reference = c("gc3", "csc")) %>%
+  mutate(
+    rho  = map2_dbl(feature, reference,
+                    ~cor(train_data[[.x]], train_data[[.y]], method = "spearman")),
+    data = map2(feature, reference, ~tibble(
+      x        = train_data[[.y]],
+      y        = train_data[[.x]],
+      imputed  = is.na(pre_impute_train[[.x]]) | is.na(pre_impute_train[[.y]])
+    ))
+  ) %>%
+  left_join(codon_profile %>% dplyr::select(feature, behaves_as), by = "feature") %>%
+  mutate(
+    ref_lab = ifelse(reference == "gc3", "vs GC3", "vs CSC"),
+    f_lab   = feature_meta$feature_clean[match(feature, feature_meta$feature)],
+    panel   = factor(paste0(f_lab, "\n", ref_lab),
+                     levels = c(paste0(feature_meta$feature_clean[match(codon_ord, feature_meta$feature)], "\nvs GC3"),
+                                paste0(feature_meta$feature_clean[match(codon_ord, feature_meta$feature)], "\nvs CSC")))
+  ) %>%
+  unnest(data)
+
+facet_ann <- facet_df %>%
+  distinct(panel, rho, feature, reference) %>%
+  mutate(txt = ifelse(feature == "csc" & reference == "csc",
+                      "self (rho = 1)", paste0("rho = ", sprintf("%.2f", rho))))
+
+behaves_colors <- c("GC-driven" = "#D55E00", "intermediate" = "#CC79A7",
+                    "GC-independent" = "#009E73")
+
+p_facets <- ggplot() +
+  geom_point(data = facet_df %>% filter(imputed), aes(x, y),
+             color = "grey65", size = 0.35, alpha = 0.35) +
+  geom_point(data = facet_df %>% filter(!imputed), aes(x, y, color = behaves_as),
+             size = 0.35, alpha = 0.18) +
+  geom_smooth(data = facet_df %>% filter(!imputed), aes(x, y),
+              method = "lm", se = FALSE, linewidth = 0.7, color = "grey20") +
+  geom_text(data = facet_ann, aes(x = Inf, y = Inf, label = txt),
+            hjust = 1.08, vjust = 1.5, size = 3) +
+  facet_wrap(~panel, scales = "free", nrow = 2) +
+  scale_color_manual(values = behaves_colors, name = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size = 9, lineheight = 0.9),
+        legend.position = "top") +
+  labs(
+    title = "Codon optimality features: what are they actually measuring?",
+    subtitle = paste0("Top row: each feature vs GC3 (the proposed GC bridge). Bottom row: ",
+                      "same feature vs CSC. Grey = median-imputed. Training set, n = ",
+                      nrow(train_data), " genes"),
+    x = "Reference feature value", y = "Codon feature value"
+  )
+
+print(p_facets)
+ggsave(here("plots", paste0("shap_codon_gc_facets_", suffix_shap, ".pdf")),
+       plot = p_facets, width = 20, height = 6.5)
+```
+
+## 1c. GC3 entanglement across every feature
+
+The codon table asks the question of 10 features. GC3 is not specific to codon usage,
+though, so the same screen is worth running across the whole feature set: **which features,
+in any category, are really restating GC3?**
+
+`gc3` itself is excluded (self-correlation) along with any zero-variance feature.
+
+```{r gc3_screen_all, fig.width=9, fig.height=11, eval=run_gc3_screen}
+zero_var <- feature_cols[map_dbl(feature_cols, ~sd(train_data[[.x]])) == 0]
+if (length(zero_var) > 0) {
+  cat("Excluded", length(zero_var), "zero-variance features (constant, carry no information):\n")
+  cat(paste("  ", zero_var, collapse = "\n"), "\n\n")
+}
+screen_features <- setdiff(feature_cols, c("gc3", zero_var))
+
+gc3_screen <- tibble(feature = screen_features) %>%
+  mutate(rho_gc3 = map_dbl(feature, ~cor(train_data[[.x]], train_data$gc3, method = "spearman"))) %>%
+  left_join(feature_meta, by = "feature") %>%
+  arrange(desc(abs(rho_gc3)))
+
+cat("Features with |rho| > 0.4 against GC3:", sum(abs(gc3_screen$rho_gc3) > 0.4),
+    "of", nrow(gc3_screen), "\n\n")
+print_table(gc3_screen %>% filter(abs(rho_gc3) > 0.4) %>%
+              dplyr::select(feature, rho_gc3, category),
+            caption = "Features with |rho| > 0.4 against GC3")
+
+p_gc3_screen <- gc3_screen %>%
+  mutate(feature_clean = fct_reorder(feature_clean, rho_gc3)) %>%
+  ggplot(aes(rho_gc3, feature_clean, fill = category)) +
+  geom_col() +
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.4) +
+  geom_vline(xintercept = c(-0.4, 0.4), linetype = "dashed", color = "grey55") +
+  scale_fill_manual(values = category_colors, name = NULL) +
+  scale_x_continuous(limits = c(-1, 1)) +
+  theme_classic(base_size = 10) +
+  labs(
+    title    = "GC3 entanglement across every feature",
+    subtitle = paste0("Spearman rho vs GC3. Dashed lines at +/-0.4. Training set, n = ",
+                      nrow(train_data), " genes"),
+    x = "Spearman rho with GC3", y = ""
+  )
+
+print(p_gc3_screen)
+ggsave(here("plots", paste0("shap_gc3_screen_all_", suffix_shap, ".pdf")),
+       plot = p_gc3_screen, width = 9, height = 11)
+```
+
+The same screen as scatter panels, one per feature, ordered by |rho|. The bar chart above
+gives the ranking; this shows the shape behind each number, which is where you can see that
+some low-|rho| features are binary or floored at zero and so a correlation is not really the
+right summary for them.
+
+```{r gc3_facets_all, fig.width=19, fig.height=22, eval=run_gc3_screen}
+gc3_all_df <- gc3_screen %>%
+  mutate(
+    panel = factor(paste0(feature_clean, "\nrho = ", sprintf("%.2f", rho_gc3)),
+                   levels = paste0(feature_clean, "\nrho = ", sprintf("%.2f", rho_gc3))),
+    data  = map(feature, ~tibble(
+      x       = train_data$gc3,
+      y       = train_data[[.x]],
+      imputed = is.na(pre_impute_train[[.x]]) | is.na(pre_impute_train[["gc3"]])
+    ))
+  ) %>%
+  unnest(data)
+
+p_gc3_all <- ggplot() +
+  geom_point(data = gc3_all_df %>% filter(imputed), aes(x, y),
+             color = "grey70", size = 0.22, alpha = 0.30) +
+  geom_point(data = gc3_all_df %>% filter(!imputed), aes(x, y, color = category),
+             size = 0.22, alpha = 0.16) +
+  geom_smooth(data = gc3_all_df %>% filter(!imputed), aes(x, y),
+              method = "lm", se = FALSE, linewidth = 0.5, color = "grey15") +
+  facet_wrap(~panel, scales = "free_y", ncol = 7) +
+  scale_color_manual(values = category_colors, name = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1), nrow = 2)) +
+  theme_classic(base_size = 9) +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size = 7, lineheight = 0.9),
+        legend.position = "top", axis.text = element_text(size = 6.5)) +
+  labs(
+    title    = "Every feature vs GC3, ordered by |Spearman rho|",
+    subtitle = paste0("Grey points = median-imputed. Training set, n = ", nrow(train_data),
+                      " genes. gc3 itself and ", length(zero_var),
+                      " constant features excluded."),
+    x = "GC3 (%)", y = "Feature value"
+  )
+
+print(p_gc3_all)
+ggsave(here("plots", paste0("shap_gc3_facets_all_", suffix_shap, ".pdf")),
+       plot = p_gc3_all, width = 19, height = 22, limitsize = FALSE)
+```
+
+Scatter panels for just the features clearing the threshold, same construction as 1b:
+
+```{r gc3_driven_facets, fig.width=16, fig.height=7, eval=run_gc3_screen}
+gc3_driven <- gc3_screen %>% filter(abs(rho_gc3) > 0.4)
+
+gc3_facet_df <- gc3_driven %>%
+  mutate(
+    panel = factor(paste0(feature_clean, "\nrho = ", sprintf("%.2f", rho_gc3)),
+                   levels = paste0(feature_clean, "\nrho = ", sprintf("%.2f", rho_gc3))),
+    data  = map(feature, ~tibble(
+      x       = train_data$gc3,
+      y       = train_data[[.x]],
+      imputed = is.na(pre_impute_train[[.x]]) | is.na(pre_impute_train[["gc3"]])
+    ))
+  ) %>%
+  unnest(data)
+
+p_gc3_driven <- ggplot() +
+  geom_point(data = gc3_facet_df %>% filter(imputed), aes(x, y),
+             color = "grey65", size = 0.35, alpha = 0.35) +
+  geom_point(data = gc3_facet_df %>% filter(!imputed), aes(x, y, color = category),
+             size = 0.35, alpha = 0.18) +
+  geom_smooth(data = gc3_facet_df %>% filter(!imputed), aes(x, y),
+              method = "lm", se = FALSE, linewidth = 0.7, color = "grey20") +
+  facet_wrap(~panel, scales = "free_y", nrow = 2) +
+  scale_color_manual(values = category_colors, name = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank(), legend.position = "top") +
+  labs(
+    title    = "GC3-driven features (|rho| > 0.4)",
+    subtitle = paste0("Every feature whose value tracks GC3, any category. ",
+                      "Grey = median-imputed. Training set, n = ", nrow(train_data), " genes"),
+    x = "GC3 (%)", y = "Feature value"
+  )
+
+print(p_gc3_driven)
+ggsave(here("plots", paste0("shap_gc3_driven_facets_", suffix_shap, ".pdf")),
+       plot = p_gc3_driven, width = 16, height = 7)
+
+# Cross-reference against SHAP importance: a GC3-driven feature that also ranks high is
+# where the redundancy actually matters for interpretation.
+cat("\nGC3-driven features cross-referenced with SHAP importance rank:\n")
+print_table(gc3_driven %>%
+              left_join(shap_importance %>% dplyr::select(feature, rank_shap, mean_abs_shap),
+                        by = "feature") %>%
+              dplyr::select(feature, rho_gc3, rank_shap, mean_abs_shap, category) %>%
+              arrange(rank_shap),
+            caption = "GC3-driven features vs their SHAP importance rank")
+```
+
+### Synthesis: signed importance coloured by GC3 entanglement
+
+The signed importance bar from earlier, but filled by each feature's correlation with GC3
+instead of by category. This is the plot that answers "how much of the model's ranking is
+GC3 in disguise?" in one view: strongly coloured bars near the top are important features
+that are largely restating GC3, pale bars are important features carrying independent signal.
+
+`gc3` itself is shown with rho = 1 by definition. Bars are outlined because a feature with
+rho near 0 fills white and would otherwise vanish against the panel.
+
+```{r shap_signed_by_gc3, fig.width=10, fig.height=10, eval=run_gc3_screen}
+n_display_gc3 <- 30
+
+rho_gc3_all <- tibble(feature = feature_cols) %>%
+  mutate(rho_gc3 = map_dbl(feature, ~{
+    if (.x == "gc3") return(1)                       # self-correlation, shown for reference
+    if (sd(train_data[[.x]]) == 0) return(NA_real_)  # constant features
+    cor(train_data[[.x]], train_data$gc3, method = "spearman")
+  }))
+
+signed_gc3_df <- shap_importance %>%
+  left_join(rho_gc3_all, by = "feature") %>%
+  head(n_display_gc3) %>%
+  mutate(
+    signed_importance = mean_abs_shap * sign(shap_value_cor),
+    feature_clean     = fct_reorder(feature_clean, signed_importance)
+  )
+
+gc3_lim <- max(abs(signed_gc3_df$signed_importance)) * 1.05
+
+p_signed_gc3 <- signed_gc3_df %>%
+  ggplot(aes(x = feature_clean, y = signed_importance, fill = rho_gc3)) +
+  geom_col(color = "grey40", linewidth = 0.2) +
+  geom_hline(yintercept = 0, color = "grey30", linewidth = 0.4) +
+  coord_flip() +
+  scale_y_continuous(limits = c(-gc3_lim, gc3_lim)) +
+  scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00",
+                       midpoint = 0, limits = c(-1, 1), na.value = "grey85",
+                       name = "Spearman rho\nwith GC3") +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = paste0("Signed importance coloured by GC3 entanglement: ", gene_label, " targets"),
+    subtitle = paste0("Bar = mean |SHAP| signed by direction; right = higher values push toward ",
+                      pos_label, "\nFill = how much the feature restates GC3 | test set, n = ",
+                      nrow(shap_test), " genes"),
+    x = "", y = "Signed mean |SHAP| (probability units)"
+  )
+
+print(p_signed_gc3)
+ggsave(here("plots", paste0("shap_signed_by_gc3_", suffix_shap, ".pdf")),
+       plot = p_signed_gc3, width = 10, height = 10)
+
+cat("Share of top-", n_display_gc3, " signed importance carried by features with |rho(GC3)| > 0.4: ",
+    round(100 * sum(abs(signed_gc3_df$mean_abs_shap[abs(signed_gc3_df$rho_gc3) > 0.4]), na.rm = TRUE) /
+            sum(signed_gc3_df$mean_abs_shap), 1), "%\n", sep = "")
+```
+
+## 2. SHAP interaction values
+
+The most targeted test: TreeSHAP interaction values split each attribution into a main
+effect (diagonal) and pairwise cross terms (off-diagonal). If the GC x CSC cross term is
+small relative to the two main effects, the opposition is two independent main effects.
+
+This is roughly `length(feature_cols)` times more expensive than plain TreeSHAP (~10 min on
+a 200-gene subsample here, ~29 min on the full test set), so it runs on a subsample and is
+cached to disk. Delete the cache file or set `force_recompute_interactions = TRUE` to redo it.
+
+```{r shap_interactions, eval=run_interactions}
+n_inter_genes <- 200
+force_recompute_interactions <- FALSE
+inter_path <- here("output", "predictive_modeling",
+                   paste0("shap_interactions_", suffix_shap, ".rds"))
+
+set.seed(9)
+inter_idx <- sample(seq_len(nrow(shap_test)), min(n_inter_genes, nrow(shap_test)))
+
+if (file.exists(inter_path) && !force_recompute_interactions) {
+  cached <- readRDS(inter_path)
+  interactions <- cached$interactions
+  inter_idx    <- cached$inter_idx
+  cat("Loaded cached interaction values:", basename(inter_path), "\n")
+} else {
+  cat("Computing SHAP interaction values on", length(inter_idx), "genes (expect ~10 min)...\n")
+  t_start <- Sys.time()
+  ti <- treeshap(unified, test_data[inter_idx, feature_cols], interactions = TRUE, verbose = FALSE)
+  interactions <- ti$interactions
+  cat("  elapsed:", round(as.numeric(difftime(Sys.time(), t_start, units = "mins")), 1), "min\n")
+  saveRDS(list(interactions = interactions, inter_idx = inter_idx), inter_path)
+}
+
+# Orientation check: the array is [feature, feature, gene] and each feature's row must sum
+# to that gene's SHAP value. Asserted rather than assumed, since indexing a transposed
+# array would silently return the wrong cross terms.
+recon_inter <- t(apply(interactions, 3, rowSums))
+stopifnot(
+  "interaction array is not [feature, feature, gene]" =
+    all(dim(interactions) == c(length(feature_cols), length(feature_cols), length(inter_idx))),
+  "interaction rows do not sum to SHAP values - check array orientation" =
+    max(abs(recon_inter - as.matrix(shap_test[inter_idx, dimnames(interactions)[[1]]]))) < 1e-8
+)
+cat("Orientation confirmed: interactions[i, j, gene], rows sum to SHAP\n\n")
+
+main_gc  <- mean(abs(interactions["cds_gc", "cds_gc", ]))
+main_csc <- mean(abs(interactions["csc", "csc", ]))
+# the pair's cross term is split across the (i,j) and (j,i) cells, so the total is 2x one cell
+cross_gc_csc <- 2 * mean(abs(interactions["cds_gc", "csc", ]))
+inter_fraction <- cross_gc_csc / mean(c(main_gc, main_csc))
+
+cat("GC x CSC interaction (n =", length(inter_idx), "genes):\n")
+cat("  GC main effect     :", round(main_gc, 6), "\n")
+cat("  CSC main effect    :", round(main_csc, 6), "\n")
+cat("  GC x CSC cross term:", round(cross_gc_csc, 6), "\n")
+cat("  cross / mean(mains):", round(inter_fraction, 4), "\n")
+cat("\nDecision rule: small cross term relative to mains = two independent main effects;\n")
+cat("               comparable or larger = the two features are trading credit.\n\n")
+
+cat("Largest cross terms involving cds_gc or csc (for context):\n")
+cross_tbl <- map_dfr(c("cds_gc", "csc"), function(a) {
+  tibble(f1 = a, f2 = setdiff(feature_cols, a),
+         cross = map_dbl(setdiff(feature_cols, a), ~2 * mean(abs(interactions[a, .x, ]))))
+}) %>% arrange(desc(cross)) %>% head(8)
+print_table(cross_tbl, digits = 6, caption = "Largest cross terms involving cds_gc or csc")
+```
+
+## 2b. The same pair diagnostics for DHX29 occupancy vs CDS GC%
+
+The GC3 screen flagged `hia2026_dhx29_occupancy` as more GC-entangled than any codon feature
+(rho = -0.94 against `cds_gc`) while ranking 4th by SHAP importance, so it gets the same
+treatment. The contrast with GC/CSC is the point: two features can both be "entangled with
+GC" and yet be entangled in completely different ways.
+
+```{r pair_diagnostics, eval=run_interactions}
+pair_diagnostics <- function(a, b) {
+  ma <- mean(abs(interactions[a, a, ]))
+  mb <- mean(abs(interactions[b, b, ]))
+  cr <- 2 * mean(abs(interactions[a, b, ]))
+  tibble(
+    pair          = paste(a, "x", b),
+    rho_value     = cor(train_data[[a]], train_data[[b]], method = "spearman"),
+    cor_shap      = cor(shap_test[[a]], shap_test[[b]]),
+    main_a        = ma,
+    main_b        = mb,
+    cross         = cr,
+    cross_frac    = cr / mean(c(ma, mb)),
+    merged_net    = mean(abs(shap_test[[a]] + shap_test[[b]])),
+    sum_of_parts  = mean(abs(shap_test[[a]])) + mean(abs(shap_test[[b]]))
+  )
+}
+
+pairs_tbl <- bind_rows(
+  pair_diagnostics("cds_gc", "csc"),
+  pair_diagnostics("gc3",    "csc"),
+  pair_diagnostics("cds_gc", "hia2026_dhx29_occupancy"),
+  pair_diagnostics("gc3",    "hia2026_dhx29_occupancy"),
+  pair_diagnostics("cds_gc", "gc3"),
+  pair_diagnostics("hia2026_dhx29_occupancy", "csc")
+)
+print_table(pairs_tbl, caption = "Pair entanglement diagnostics (interactions on 200 genes)")
+
+cat("\nReading this table:\n")
+cat("  cor_shap near 0  -> independent contributions (two real effects)\n")
+cat("  cor_shap near +1 -> duplicated contributions (one signal, counted twice)\n")
+cat("  merged_net << sum_of_parts -> the pair cancels (credit-trading)\n")
+cat("  merged_net ~= sum_of_parts -> the pair adds (same-direction duplication)\n")
+```
+
+```{r colored_dependence_helpers, eval=run_pair_diag}
+# Defined here because sections 2b and 3 both use it. Colours each point by a second
+# feature's value: if the trend stratifies into arms the effect is an interaction, if the
+# colour scatters randomly the two features act independently.
+colored_dependence <- function(v, color_var) {
+  # scale01 is local so this chunk runs standalone in the console
+  scale01 <- function(x) {
+    lo <- quantile(x, 0.02, na.rm = TRUE); hi <- quantile(x, 0.98, na.rm = TRUE)
+    if (!is.finite(lo) || !is.finite(hi) || hi <= lo) return(rep(0.5, length(x)))
+    pmin(pmax((x - lo) / (hi - lo), 0), 1)
+  }
+  v_lab  <- feature_meta$feature_clean[match(v, feature_meta$feature)]
+  cv_lab <- feature_meta$feature_clean[match(color_var, feature_meta$feature)]
+  tibble(value = test_data[[v]], shap = shap_test[[v]],
+         color = scale01(test_data[[color_var]])) %>%
+    ggplot(aes(value, shap, color = color)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(size = 1.3, alpha = 0.75) +
+    scale_color_viridis_c(name = cv_lab, breaks = c(0, 1), labels = c("Low", "High")) +
+    theme_classic(base_size = 12) +
+    labs(x = v_lab, y = paste0("SHAP value for ", v_lab))
+}
+
+# Residual test: after removing the main trend, does the other feature explain what is left?
+resid_cor <- function(v, color_var) {
+  fit <- loess(shap_test[[v]] ~ test_data[[v]], span = 0.75)
+  cor(residuals(fit), test_data[[color_var]], method = "spearman")
+}
+```
+
+```{r dhx29_gc_dependence, fig.width=12, fig.height=5.5, eval=run_pair_diag}
+cat("Residual correlation after removing the main trend:\n")
+cat("  cds_gc residual SHAP vs DHX29 value:", round(resid_cor("cds_gc", "hia2026_dhx29_occupancy"), 3), "\n")
+cat("  DHX29 residual SHAP vs cds_gc value:", round(resid_cor("hia2026_dhx29_occupancy", "cds_gc"), 3), "\n")
+
+p_dh <- cowplot::plot_grid(
+  colored_dependence("cds_gc", "hia2026_dhx29_occupancy"),
+  colored_dependence("hia2026_dhx29_occupancy", "cds_gc"),
+  nrow = 1, labels = c("A", "B")
+)
+print(p_dh)
+ggsave(here("plots", paste0("shap_colored_dependence_gc_dhx29_", suffix_shap, ".pdf")),
+       plot = p_dh, width = 12, height = 5.5)
+```
+
+### Ablation refit: is DHX29 occupancy carrying anything GC does not?
+
+Attribution alone cannot answer this, because both features can receive credit for one
+shared signal. Refitting without each feature is the causal test. Each refit is technically a
+different model, so this is a redundancy statement, not a re-explanation of the same forest.
+
+```{r ablation_refit, eval=run_pair_diag}
+y_train_num <- as.numeric(train_data$eif3d_target == pos_label)
+
+ablation_auc <- function(drop_cols) {
+  fs <- setdiff(feature_cols, drop_cols)
+  set.seed(9)
+  m <- ranger(x = train_data[, fs], y = y_train_num, num.trees = rf_prob$num.trees,
+              mtry = min(rf_prob$mtry, length(fs)),
+              min.node.size = rf_prob$min.node.size, seed = 9)
+  p <- predict(m, test_data[, fs])$predictions
+  as.numeric(auc(roc(test_data$eif3d_target, p, levels = c(neg_label, pos_label),
+                     direction = "<", quiet = TRUE)))
+}
+
+auc_base <- ablation_auc(character(0))
+dh <- "hia2026_dhx29_occupancy"
+
+# GC3 is included alongside CDS GC% throughout: the two are themselves 0.94 correlated, so
+# dropping one alone leaves the other standing in, and only the joint drops are informative.
+ablations <- list(
+  "drop DHX29"              = dh,
+  "drop cds_gc"             = "cds_gc",
+  "drop gc3"                = "gc3",
+  "drop cds_gc + gc3"       = c("cds_gc", "gc3"),
+  "drop DHX29 + cds_gc"     = c(dh, "cds_gc"),
+  "drop DHX29 + gc3"        = c(dh, "gc3"),
+  "drop DHX29 + cds_gc + gc3" = c(dh, "cds_gc", "gc3"),
+  "drop csc"                = "csc",
+  "drop csc + cds_gc"       = c("csc", "cds_gc"),
+  "drop csc + gc3"          = c("csc", "gc3"),
+  "drop whole GC block"     = gc_block,
+  "drop GC block + DHX29"   = c(gc_block, dh)
+)
+
+ablation_tbl <- bind_rows(
+  tibble(ablation = "full model", n_dropped = 0L, auc = auc_base, delta = NA_real_),
+  tibble(ablation = names(ablations)) %>%
+    mutate(n_dropped = map_int(ablations, length),
+           auc       = map_dbl(ablations, ablation_auc),
+           delta     = auc - auc_base)
+)
+
+print_table(ablation_tbl,
+            caption = paste0("Ablation refit, held-out AUC (test set, n = ", nrow(test_data), ")"))
+
+cat("\nCaution: the AUC bootstrap 95% CI on this test set spans roughly +/-0.03,\n")
+cat("so deltas of ~0.005 are within noise. Read the PATTERN (does dropping both cost\n")
+cat("the same as dropping one?), not the individual numbers.\n")
+```
+
+## 3. Colored dependence
+
+The visual form of the same question. If the trend stratifies into arms by the other
+feature's value, the effect is an interaction; if the color scatters randomly across the
+trend, the two act independently.
+
+```{r colored_dependence, fig.width=12, fig.height=5, eval=run_pair_diag}
+# colored_dependence() and resid_cor() are defined in the helpers chunk above
+rc1 <- resid_cor("cds_gc", "csc")
+rc2 <- resid_cor("csc", "cds_gc")
+cat("Residual correlation after removing the main trend:\n")
+cat("  cds_gc residual SHAP vs csc value:", round(rc1, 3), "\n")
+cat("  csc residual SHAP vs cds_gc value:", round(rc2, 3), "\n")
+
+p_cd <- cowplot::plot_grid(
+  colored_dependence("cds_gc", "csc"),
+  colored_dependence("csc", "cds_gc"),
+  nrow = 1, labels = c("A", "B")
+)
+p_cd_titled <- cowplot::plot_grid(
+  cowplot::ggdraw() + cowplot::draw_label(
+    paste0("GC and CSC entanglement: rho = ", round(rho_gc_csc, 3),
+           ", GC x CSC interaction = ", round(100 * inter_fraction, 1),
+           "% of main effects (n = ", nrow(shap_test), " genes)"),
+    fontface = "plain", size = 12, hjust = 0.5),
+  p_cd, ncol = 1, rel_heights = c(0.08, 1)
+)
+
+print(p_cd_titled)
+ggsave(here("plots", paste0("shap_colored_dependence_gc_csc_", suffix_shap, ".pdf")),
+       plot = p_cd_titled, width = 12, height = 5.5)
+```
+
+## 4. Merged-group net effect
+
+Category grouping fixes credit-splitting *within* a block but not opposition *across* blocks.
+If GC and codon optimality were reshuffling one shared signal, merging them should cancel:
+the merged net would be far below the sum of the parts.
+
+```{r merged_group_net, eval=run_pair_diag}
+net_gc    <- rowSums(shap_test[, gc_block,    drop = FALSE])
+net_codon <- rowSums(shap_test[, codon_block, drop = FALSE])
+net_comp  <- rowSums(shap_test[, comp_block,  drop = FALSE])
+
+cat("Block net effects (test set, n =", nrow(shap_test), "genes):\n")
+cat("  GC block        : mean|net| =", round(mean(abs(net_gc)), 5),
+    " sum of parts =", round(sum(colMeans(abs(shap_test[, gc_block]))), 5), "\n")
+cat("  Codon block     : mean|net| =", round(mean(abs(net_codon)), 5),
+    " sum of parts =", round(sum(colMeans(abs(shap_test[, codon_block]))), 5), "\n")
+cat("  MERGED composite: mean|net| =", round(mean(abs(net_comp)), 5),
+    " sum of parts =", round(sum(colMeans(abs(shap_test[, comp_block]))), 5), "\n")
+cat("  merged vs sum of the two block nets:", round(mean(abs(net_comp)), 5),
+    "vs", round(mean(abs(net_gc)) + mean(abs(net_codon)), 5), "\n\n")
+cat("  cor(net_gc, net_codon) across genes:", round(cor(net_gc, net_codon), 3), "\n")
+cat("  Decision rule: strongly negative = the blocks cancel gene-by-gene (one shared signal);\n")
+cat("                 near zero or positive = they are not merely trading credit.\n\n")
+
+# Does reassigning the GC-driven codon features change the category ranking?
+gc_driven <- codon_profile %>% filter(behaves_as == "GC-driven") %>% pull(feature)
+if (length(gc_driven) > 0) {
+  cat("Sensitivity of the category panel to reassigning", paste(gc_driven, collapse = "/"),
+      "from Codon optimality to GC content:\n")
+  cat("  Codon optimality as grouped :", round(mean(abs(net_codon)), 5), "\n")
+  cat("  Codon optimality without them:",
+      round(mean(abs(rowSums(shap_test[, setdiff(codon_block, gc_driven), drop = FALSE]))), 5), "\n")
+  cat("  GC content as grouped        :", round(mean(abs(net_gc)), 5), "\n")
+  cat("  GC content with them         :",
+      round(mean(abs(rowSums(shap_test[, c(gc_block, gc_driven), drop = FALSE]))), 5), "\n")
+}
+```
+
+# Grouped SHAP by Category
+
+SHAP values are additive, so summing within a category is exact. This is the one view that
+resolves credit-splitting across the correlated blocks: `csc` / `csc_first75` / `csc_q1`-`q4`
+each carry a fraction of the codon-optimality signal individually, but their per-gene sum is
+the category's true contribution.
+
+```{r grouped_shap, fig.width=9, fig.height=6}
+# Per-gene category totals (exact, by additivity)
+cat_per_gene <- map_dfr(unique(feature_meta$category), function(cc) {
+  fs <- feature_meta %>% filter(category == cc) %>% pull(feature)
+  tibble(category = cc, gene_row = seq_len(nrow(shap_test)),
+         shap_sum = rowSums(shap_test[, fs, drop = FALSE]))
+})
+
+category_importance <- cat_per_gene %>%
+  group_by(category) %>%
+  summarise(
+    mean_abs_shap = mean(abs(shap_sum)),
+    .groups = "drop"
+  ) %>%
+  left_join(feature_meta %>% dplyr::count(category, name = "n_features"), by = "category") %>%
+  left_join(
+    shap_importance %>% group_by(category) %>%
+      slice_max(mean_abs_shap, n = 1) %>%
+      dplyr::select(category, top_feature = feature),
+    by = "category"
+  ) %>%
+  arrange(desc(mean_abs_shap))
+
+cat("Grouped SHAP by category (test set, n =", nrow(shap_test), "genes):\n")
+print_table(category_importance, caption = "Grouped SHAP by feature category")
+
+# Audit: no category should be masking a high-ranking feature inside a vague bucket
+cat("\nTop 15 features by mean |SHAP| and their categories:\n")
+print_table(shap_importance %>% head(15) %>% dplyr::select(rank_shap, feature, category),
+            caption = "Top 15 features and their categories")
+
+p_cat <- category_importance %>%
+  ggplot(aes(x = reorder(category, mean_abs_shap), y = mean_abs_shap)) +
+  geom_col(fill = "#E69F00") +
+  geom_text(aes(label = paste0("n=", n_features)), hjust = -0.2, size = 3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = paste0("Grouped SHAP by feature category: ", gene_label, " targets"),
+    subtitle = paste0("Per-gene sum within category, exact by additivity | test set, n = ",
+                      nrow(shap_test), " genes"),
+    x = "", y = "Mean |summed SHAP| (probability units)"
+  )
+
+print(p_cat)
+ggsave(here("plots", paste0("shap_by_category_", suffix_shap, ".pdf")),
+       plot = p_cat, width = 9, height = 6)
+```
+
+# Waterfall Plots
+
+Per-gene decompositions. Defaults deliberately span the range of model behaviour rather
+than showing three saturated predictions: one confident correct positive, one borderline
+call near the decision boundary, and one confident error. Saturated cases tend to have the
+least informative decompositions, with every feature pushing the same way.
+
+Note the baseline anchor is the **training** base rate (see the TreeSHAP section), not the
+test-set base rate.
+
+```{r select_waterfall_genes}
+test_pred_df <- tibble(
+  gene_row = seq_len(nrow(test_data)),
+  symbol   = test_data$symbol,
+  gene_id  = test_data$gene_id_clean,
+  actual   = as.character(test_data$eif3d_target),
+  prob     = p_reg_test
+) %>%
+  mutate(predicted = ifelse(prob >= 0.5, pos_label, neg_label),
+         correct   = predicted == actual)
+
+if (nchar(params$waterfall_genes) > 0) {
+  wanted <- str_trim(str_split(params$waterfall_genes, ",")[[1]])
+  waterfall_rows <- test_pred_df %>% filter(symbol %in% wanted)
+  missing_genes <- setdiff(wanted, waterfall_rows$symbol)
+  if (length(missing_genes) > 0) {
+    cat("Requested genes not in the test set:", paste(missing_genes, collapse = ", "), "\n")
+  }
+  waterfall_rows <- waterfall_rows %>% mutate(role = "requested")
+} else {
+  confident_tp <- test_pred_df %>%
+    filter(actual == pos_label, correct) %>% slice_max(prob, n = 1) %>% mutate(role = "confident correct positive")
+  borderline <- test_pred_df %>%
+    slice_min(abs(prob - 0.5), n = 1) %>% mutate(role = "borderline call")
+  confident_error <- test_pred_df %>%
+    filter(!correct) %>% slice_max(abs(prob - 0.5), n = 1) %>% mutate(role = "confident error")
+  waterfall_rows <- bind_rows(confident_tp, borderline, confident_error) %>%
+    distinct(gene_row, .keep_all = TRUE)
+}
+
+cat("Waterfall genes:\n")
+print_table(waterfall_rows %>% dplyr::select(symbol, actual, predicted, prob, role),
+            caption = "Genes selected for waterfall plots")
+```
+
+```{r waterfall_plots, fig.width=9, fig.height=6}
+make_waterfall <- function(row_i, info, n_top = 12) {
+  contrib <- tibble(feature = feature_cols, shap = as.numeric(shap_test[row_i, ])) %>%
+    left_join(feature_meta %>% dplyr::select(feature, feature_clean), by = "feature") %>%
+    arrange(desc(abs(shap)))
+
+  top <- contrib %>% head(n_top)
+  rest_sum <- sum(contrib$shap[-seq_len(min(n_top, nrow(contrib)))])
+  if (abs(rest_sum) > 0) {
+    top <- bind_rows(top, tibble(
+      feature = "__other__",
+      shap = rest_sum,
+      feature_clean = paste0(nrow(contrib) - n_top, " other features")
+    ))
+  }
+
+  # Cumulative positions, starting from the baseline
+  top <- top %>%
+    mutate(
+      order_i = row_number(),
+      end     = shap_baseline + cumsum(shap),
+      start   = end - shap,
+      sign    = ifelse(shap >= 0, paste0("Toward ", pos_label), paste0("Toward ", neg_label)),
+      feature_clean = fct_rev(fct_inorder(feature_clean))
+    )
+
+  final_pred <- shap_baseline + sum(contrib$shap)
+
+  ggplot(top, aes(y = feature_clean)) +
+    geom_vline(xintercept = shap_baseline, linetype = "dashed", color = "grey50") +
+    geom_segment(aes(x = start, xend = end, yend = feature_clean, color = sign),
+                 linewidth = 4, lineend = "butt") +
+    scale_color_manual(values = setNames(c("#D55E00", "#0072B2"),
+                                         c(paste0("Toward ", pos_label),
+                                           paste0("Toward ", neg_label))),
+                       name = NULL) +
+    theme_classic(base_size = 12) +
+    labs(
+      title    = paste0(info$symbol, " (", info$role, ")"),
+      subtitle = paste0("actual = ", info$actual, " | predicted P(", pos_label, ") = ",
+                        round(final_pred, 3),
+                        " | baseline (training base rate) = ", round(shap_baseline, 3)),
+      x = paste0("Predicted P(", pos_label, ")"), y = ""
+    )
+}
+
+for (i in seq_len(nrow(waterfall_rows))) {
+  info <- waterfall_rows[i, ]
+  p_wf <- make_waterfall(info$gene_row, info)
+  print(p_wf)
+  ggsave(here("plots", paste0("shap_waterfall_", info$symbol, "_", suffix_shap, ".pdf")),
+         plot = p_wf, width = 9, height = 6)
+}
+```
+
+# Export Results
+
+```{r export_results}
+output_dir <- here("output", "predictive_modeling")
+
+# Surrogate model
+saveRDS(rf_shap, file.path(output_dir, paste0("rf_classifier_", suffix_shap, ".rds")))
+
+# Per-gene SHAP values, all labelled genes (train + test)
+shap_values_export <- bind_cols(
+  tibble(
+    gene_id   = full_data$gene_id_clean,
+    symbol    = full_data$symbol,
+    actual    = as.character(full_data$eif3d_target),
+    in_train  = seq_len(nrow(full_data)) %in% as.integer(train_idx),
+    prob_pos  = p_reg_full,
+    baseline  = shap_baseline
+  ),
+  shap_full
+)
+write_csv(shap_values_export,
+          file.path(output_dir, paste0("shap_values_", suffix_shap, ".csv")))
+
+# Feature-level SHAP importance (test set)
+write_csv(shap_importance,
+          file.path(output_dir, paste0("shap_importance_", suffix_shap, ".csv")))
+
+# Category-level grouped SHAP (test set)
+write_csv(category_importance,
+          file.path(output_dir, paste0("shap_category_importance_", suffix_shap, ".csv")))
+
+cat("Exported:\n")
+cat("  rf_classifier_", suffix_shap, ".rds\n", sep = "")
+cat("  shap_values_", suffix_shap, ".csv (", nrow(shap_values_export), " genes x ",
+    length(feature_cols), " features)\n", sep = "")
+cat("  shap_importance_", suffix_shap, ".csv\n", sep = "")
+cat("  shap_category_importance_", suffix_shap, ".csv\n", sep = "")
+```
+
+# Summary
+
+```{r summary}
+cat("========================================\n")
+cat(paste0("SHAP SUMMARY (", tools::toTitleCase(params$condition), ")\n"))
+cat("========================================\n\n")
+
+cat("Parameters:\n")
+cat("  Condition:", params$condition, "\n")
+cat("  Gene:", gene_label, "\n")
+cat("  Direction:", params$direction, "\n")
+cat("  Timepoint:", params$timepoint, "\n")
+cat("  LFC threshold:", params$lfc, "\n")
+cat("  Feature set:", params$feature_set, "\n")
+cat("  Features:", length(feature_cols), "\n\n")
+
+cat("Surrogate fidelity vs notebook 07 (test set, n =", nrow(shap_test), "):\n")
+cat("  max |delta prob|:", format(max_abs_diff_test, digits = 3), "(gate: < 0.02)\n")
+cat("  Pearson r:", round(r_test, 6), "\n")
+cat("  AUC:", round(auc_prob, 4), "(07) vs", round(auc_reg, 4), "(surrogate)\n")
+if (!is.na(rho)) cat("  Spearman rho vs impurity importance:", round(rho, 3), "\n")
+cat("\nSHAP baseline (training base rate):", round(shap_baseline, 4), "\n\n")
+
+cat("Top 10 features by mean |SHAP|:\n")
+for (i in 1:10) {
+  cat("  ", i, ". ", shap_importance$feature[i],
+      " (", round(shap_importance$mean_abs_shap[i], 5), ", ",
+      shap_importance$category[i], ")\n", sep = "")
+}
+
+cat("\nTop 5 categories by mean |summed SHAP|:\n")
+for (i in 1:min(5, nrow(category_importance))) {
+  cat("  ", i, ". ", category_importance$category[i],
+      " (", round(category_importance$mean_abs_shap[i], 5), ", n=",
+      category_importance$n_features[i], ")\n", sep = "")
+}
+
+cat("========================================\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,316 @@
+---
+title: "01v - Positional GC Features (GC1 / GC2 / GC3)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  drop_aggregate_gc: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r derived_values}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    drop_aggregate_gc = TRUE
+  )
+}
+```
+
+# Overview
+
+Adds **positional GC content** to the feature matrix: GC1, GC2 and GC3, the GC fraction at
+each of the three codon positions.
+
+The motivation is that `cds_gc` and `gc3` are 0.935 correlated in this dataset and are
+mutually redundant in the model (notebook 07c, ablation section: dropping either alone costs
+essentially nothing). Neither can distinguish two very different biological claims:
+
+- *"eIF3d targets have GC-rich coding sequences"* - a bulk composition effect, which is
+  partly amino-acid composition and therefore partly protein-level.
+- *"eIF3d prefers particular synonymous codons"* - a wobble-position effect, which is free to
+  vary without changing the encoded protein.
+
+Splitting CDS GC by codon position separates them. **GC3 is the synonymous position**: it can
+change without changing the amino acid in most codon families. **GC1 and GC2 are largely
+amino-acid-determined** - changing them usually changes the protein. So if the eIF3d signal
+is synonymous codon preference, GC3 should carry it while GC1 and GC2 should not.
+
+## Design note: this notebook drops the aggregate GC columns
+
+With `drop_aggregate_gc = TRUE` (the default) the output matrix **removes `cds_gc` and
+`transcript_gc`**. This is deliberate. `cds_gc` is approximately the mean of GC1/GC2/GC3, so
+leaving it in gives the forest an aggregate to fall back on and the positional split never
+gets tested - it would simply reproduce the redundancy already documented in 07c. Removing it
+forces the model to choose among positions, which is the entire point of the comparison.
+
+Set `drop_aggregate_gc = FALSE` to keep them (useful if you want to run the ablation
+comparisons in 07c, which reference `cds_gc` by name).
+
+## Inputs and outputs
+
+- Reads `feature_matrix_external_stability.rds` (unmodified)
+- Writes `feature_matrix_positional_gc.rds`
+
+**No existing feature matrix is modified.** This notebook only creates a new one.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+```
+
+# Load Base Feature Matrix
+
+```{r load_base}
+features <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+cat("Base feature matrix:", nrow(features), "transcripts x", ncol(features), "columns\n")
+
+stopifnot(
+  "base matrix is missing transcript_id_clean" = "transcript_id_clean" %in% colnames(features),
+  "base matrix is missing gc3 (needed for the validation check)" = "gc3" %in% colnames(features),
+  "base matrix is missing cds_gc" = "cds_gc" %in% colnames(features)
+)
+```
+
+# Extract CDS Sequences
+
+Same construction as `01_feature_extraction.Rmd` so transcript identity matches exactly.
+
+```{r extract_cds}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_sequences <- extractTranscriptSeqs(genome, cds) %>% as.data.frame()
+
+cds_seq <- cds_sequences %>%
+  rownames_to_column("transcript_id_raw") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", transcript_id_raw)) %>%
+  dplyr::rename("cds_sequence" = "x") %>%
+  dplyr::select(transcript_id_clean, cds_sequence)
+
+cat("Extracted CDS sequences:", nrow(cds_seq), "transcripts\n")
+```
+
+# Compute Positional GC
+
+`calculate_gc_at_position()` generalises `calculate_gc3()` from `01_feature_extraction.Rmd`
+to any codon position, so GC3 computed here is directly comparable to the existing column.
+
+```{r compute_positional_gc}
+calculate_gc_at_position <- function(seqs, position) {
+  stopifnot("position must be 1, 2 or 3" = position %in% 1:3)
+  seqs <- str_to_upper(seqs)
+  vapply(seqs, function(seq) {
+    if (is.na(seq) || nchar(seq) < 3L) return(NA_real_)
+    n_codons <- nchar(seq) %/% 3L
+    starts   <- seq.int(position, n_codons * 3L, 3L)
+    bases    <- substr(rep.int(seq, n_codons), starts, starts)
+    sum(bases %in% c("G", "C")) * 100 / n_codons
+  }, numeric(1L), USE.NAMES = FALSE)
+}
+
+positional_gc <- cds_seq %>%
+  mutate(
+    gc1        = calculate_gc_at_position(cds_sequence, 1),
+    gc2        = calculate_gc_at_position(cds_sequence, 2),
+    gc3_recomp = calculate_gc_at_position(cds_sequence, 3)
+  ) %>%
+  dplyr::select(transcript_id_clean, gc1, gc2, gc3_recomp)
+
+cat("Computed positional GC for", nrow(positional_gc), "transcripts\n")
+cat("  Median GC1:", round(median(positional_gc$gc1, na.rm = TRUE), 2), "%\n")
+cat("  Median GC2:", round(median(positional_gc$gc2, na.rm = TRUE), 2), "%\n")
+cat("  Median GC3:", round(median(positional_gc$gc3_recomp, na.rm = TRUE), 2), "%\n")
+```
+
+## Computational checks
+
+```{r checks_computational}
+stopifnot(
+  "gc1 out of [0, 100]" = all(positional_gc$gc1 >= 0 & positional_gc$gc1 <= 100, na.rm = TRUE),
+  "gc2 out of [0, 100]" = all(positional_gc$gc2 >= 0 & positional_gc$gc2 <= 100, na.rm = TRUE),
+  "gc3 out of [0, 100]" = all(positional_gc$gc3_recomp >= 0 & positional_gc$gc3_recomp <= 100, na.rm = TRUE),
+  "gc3 median not in expected range [40, 65]" =
+    between(median(positional_gc$gc3_recomp, na.rm = TRUE), 40, 65)
+)
+cat("Range checks passed\n")
+```
+
+## Reproduction check against the existing GC3 column
+
+The strongest available correctness test: GC3 recomputed here must reproduce the `gc3`
+column already in the feature matrix, which was computed independently in `01_`. If the
+codon-position indexing were off by one, this would fail immediately.
+
+```{r checks_reproduce_gc3}
+gc3_compare <- features %>%
+  dplyr::select(transcript_id_clean, gc3_existing = gc3) %>%
+  inner_join(positional_gc, by = "transcript_id_clean") %>%
+  filter(!is.na(gc3_existing), !is.na(gc3_recomp))
+
+max_diff <- max(abs(gc3_compare$gc3_recomp - gc3_compare$gc3_existing))
+r_gc3    <- cor(gc3_compare$gc3_recomp, gc3_compare$gc3_existing)
+
+cat("GC3 reproduction check (n =", nrow(gc3_compare), "transcripts):\n")
+cat("  max |recomputed - existing|:", format(max_diff, digits = 3), "\n")
+cat("  Pearson r:", round(r_gc3, 8), "\n")
+
+stopifnot(
+  "recomputed GC3 does not match the existing gc3 column - check codon position indexing" =
+    max_diff < 1e-8
+)
+cat("GC3 reproduction check passed: positional indexing is correct\n")
+```
+
+## Biological spot-checks
+
+GC1 > GC2 is a well-established feature of coding sequences: position 1 is enriched for G
+in many amino acid families (all four-fold GG* and GA* families start with G), while position
+2 carries the hydrophobicity signal and is A/T-rich for hydrophobic residues. GC3 is the most
+variable across genes because it is the least constrained.
+
+```{r checks_biological}
+med_gc1 <- median(positional_gc$gc1, na.rm = TRUE)
+med_gc2 <- median(positional_gc$gc2, na.rm = TRUE)
+med_gc3 <- median(positional_gc$gc3_recomp, na.rm = TRUE)
+sd_gc1  <- sd(positional_gc$gc1, na.rm = TRUE)
+sd_gc2  <- sd(positional_gc$gc2, na.rm = TRUE)
+sd_gc3  <- sd(positional_gc$gc3_recomp, na.rm = TRUE)
+
+cat("Median GC by codon position:  GC1 =", round(med_gc1, 1),
+    "| GC2 =", round(med_gc2, 1), "| GC3 =", round(med_gc3, 1), "\n")
+cat("SD by codon position:         GC1 =", round(sd_gc1, 1),
+    "| GC2 =", round(sd_gc2, 1), "| GC3 =", round(sd_gc3, 1), "\n")
+
+stopifnot(
+  "GC1 should exceed GC2 in human coding sequence" = med_gc1 > med_gc2,
+  "GC3 should be the most variable position (least constrained)" =
+    sd_gc3 > sd_gc1 && sd_gc3 > sd_gc2
+)
+cat("Biological spot-checks passed\n")
+
+# ACTB CDS GC, the established spot-check from 01_, recomputed as a positional mean
+actb <- features %>%
+  filter(symbol == "ACTB") %>%
+  dplyr::select(transcript_id_clean, cds_gc) %>%
+  inner_join(positional_gc, by = "transcript_id_clean") %>%
+  slice(1)
+if (nrow(actb) == 1) {
+  actb_mean_pos <- mean(c(actb$gc1, actb$gc2, actb$gc3_recomp))
+  cat("ACTB: cds_gc =", round(actb$cds_gc, 1),
+      "| mean(GC1,GC2,GC3) =", round(actb_mean_pos, 1), "\n")
+  stopifnot(
+    "ACTB CDS GC outside expected 50-70%" = between(actb$cds_gc, 50, 70),
+    "mean of positional GC should approximate cds_gc" =
+      abs(actb_mean_pos - actb$cds_gc) < 2
+  )
+  cat("ACTB spot-check passed\n")
+}
+```
+
+# GC3 Residual: the Synonymous Component Beyond Bulk GC
+
+A single-feature version of the same idea. Regressing GC3 on `cds_gc` and keeping the
+residual isolates *"GC3 beyond what bulk CDS GC already predicts"*. Because it is orthogonal
+to `cds_gc` by construction, it can sit alongside the aggregate columns without the
+redundancy problem, so it is retained even when `drop_aggregate_gc = TRUE`.
+
+```{r gc3_residual}
+resid_input <- features %>%
+  dplyr::select(transcript_id_clean, cds_gc) %>%
+  inner_join(positional_gc, by = "transcript_id_clean") %>%
+  filter(!is.na(cds_gc), !is.na(gc3_recomp))
+
+gc3_fit <- lm(gc3_recomp ~ cds_gc, data = resid_input)
+resid_input$gc3_residual <- residuals(gc3_fit)
+
+cat("GC3 ~ cds_gc:  R^2 =", round(summary(gc3_fit)$r.squared, 4),
+    "| residual SD =", round(sd(resid_input$gc3_residual), 3), "\n")
+cat("So", round(100 * summary(gc3_fit)$r.squared, 1),
+    "% of GC3 variance is explained by bulk CDS GC;",
+    "the residual is the remaining synonymous-specific component.\n")
+
+stopifnot(
+  "gc3_residual must be orthogonal to cds_gc by construction" =
+    abs(cor(resid_input$gc3_residual, resid_input$cds_gc)) < 1e-8,
+  "gc3_residual is not finite" = all(is.finite(resid_input$gc3_residual))
+)
+cat("Orthogonality check passed\n")
+
+positional_gc <- positional_gc %>%
+  left_join(resid_input %>% dplyr::select(transcript_id_clean, gc3_residual),
+            by = "transcript_id_clean")
+```
+
+# Assemble the Output Matrix
+
+```{r assemble}
+new_cols <- c("gc1", "gc2", "gc3_residual")
+
+features_out <- features %>%
+  left_join(positional_gc %>% dplyr::select(transcript_id_clean, all_of(new_cols)),
+            by = "transcript_id_clean")
+
+stopifnot(
+  "join changed the row count" = nrow(features_out) == nrow(features),
+  "new feature columns are missing" = all(new_cols %in% colnames(features_out))
+)
+
+dropped <- character(0)
+if (isTRUE(params$drop_aggregate_gc)) {
+  dropped <- intersect(c("cds_gc", "transcript_gc"), colnames(features_out))
+  features_out <- features_out %>% dplyr::select(-all_of(dropped))
+  cat("Dropped aggregate GC columns so the positional split is actually tested:",
+      paste(dropped, collapse = ", "), "\n")
+} else {
+  cat("Kept aggregate GC columns (drop_aggregate_gc = FALSE)\n")
+}
+
+cat("\nCoverage of the new features:\n")
+for (f in new_cols) {
+  cat(sprintf("  %-14s %5.1f%% non-NA\n", f, 100 * mean(!is.na(features_out[[f]]))))
+}
+
+cat("\nCorrelations among the CDS GC family (complete cases):\n")
+gc_fam <- intersect(c("gc1", "gc2", "gc3", "gc3_residual", "cds_gc", "transcript_gc"),
+                    colnames(features_out))
+print(round(cor(features_out[, gc_fam], method = "spearman", use = "complete.obs"), 3))
+
+cat("\nOutput matrix:", nrow(features_out), "transcripts x", ncol(features_out), "columns\n")
+cat("  (base had", ncol(features), "columns; +", length(new_cols), "added, -",
+    length(dropped), "dropped)\n")
+```
+
+# Export
+
+```{r export}
+out_path <- here("output", "predictive_modeling", "feature_matrix_positional_gc.rds")
+saveRDS(features_out, out_path)
+cat("Wrote", basename(out_path), "\n")
+
+# Confirm the base matrix was not touched
+base_path <- here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+base_check <- readRDS(base_path)
+stopifnot(
+  "base feature matrix was modified - it must be left untouched" =
+    identical(dim(base_check), dim(features)) && identical(colnames(base_check), colnames(features))
+)
+cat("Verified feature_matrix_external_stability.rds is unchanged\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
