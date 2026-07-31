@@ -254,7 +254,8 @@ if (params$clip_mode == "aggregate") {
 }
 
 if (params$feature_set %in% c("targeted", "structure", "clip_split", "te_lfc", "codon_optimality",
-                               "kozak", "cnot3", "external_stability", "codon_features")) {
+                               "kozak", "cnot3", "external_stability", "codon_features",
+                               "positional_gc")) {
   kmer_motif_pattern <- "^utr5_4mer_|^utr3_4mer_|^cds_4mer_|^utr5_5mer_|^utr5_6mer_|^rbns_|^cisbp_"
   excluded <- feature_cols[str_detect(feature_cols, kmer_motif_pattern)]
   feature_cols <- feature_cols[!str_detect(feature_cols, kmer_motif_pattern)]
@@ -368,6 +369,10 @@ test_data  <- impute_with_medians(test_data,  train_medians)
 # Full labelled set, imputed with the same training medians (used for export only)
 full_data <- impute_with_medians(model_data, train_medians)
 
+# Pre-imputation training rows: NAs here identify which values were median-filled.
+# Defined in this ungated chunk because several independently-gated figure chunks use it.
+pre_impute_train <- model_data[train_idx, ]
+
 cat("Remaining NAs in train:", sum(is.na(train_data[, feature_cols])), "\n")
 cat("Remaining NAs in test:",  sum(is.na(test_data[, feature_cols])),  "\n")
 ```
@@ -430,6 +435,11 @@ nearest misconfiguration. The residual `0.0068` is gini-vs-variance split tie-br
 not a modelling difference.
 
 ```{r check_fidelity}
+# Calibrated on the 56-feature external_stability set (see prose above). Other feature sets
+# have not been calibrated against a deliberate misconfiguration, so for those this acts as a
+# sanity bound rather than a tuned one.
+fidelity_tol <- 0.02
+
 p_prob_test <- predict(rf_prob, test_data[, feature_cols])$predictions[, pos_label]
 p_reg_test  <- predict(rf_shap, test_data[, feature_cols])$predictions
 
@@ -449,8 +459,8 @@ cat("  AUC surrogate regression forest:", round(auc_reg, 5), "(context only)\n")
 cat("  AUC delta:", format(abs(auc_prob - auc_reg), digits = 3), "(context only)\n")
 
 stopifnot("surrogate does not reproduce the 07 model on the test set" =
-            max_abs_diff_test < 0.02)
-cat("Check B passed: surrogate reproduces 07 test-set predictions within 0.02\n")
+            max_abs_diff_test < fidelity_tol)
+cat("Check B passed: surrogate reproduces 07 test-set predictions within", fidelity_tol, "\n")
 
 # Reported separately, and deliberately not gated: training rows were seen by both
 # forests during fitting, so this number is not comparable to the test-set figure above.
@@ -526,6 +536,7 @@ empty, and membership is printed below so the grouping is auditable.
 ```{r feature_categories_map}
 categorize_feature <- function(f) {
   case_when(
+    str_detect(f, "^gc[12]$|^gc3_residual$")               ~ "Positional GC",
     str_detect(f, "^bg_rscu_")                             ~ "Codon usage (RSCU)",
     str_detect(f, "^codon_freq_")                          ~ "Codon frequency",
     str_detect(f, "^log2_.*_length$")                      ~ "Region lengths",
@@ -570,6 +581,9 @@ category_colors <- c(
 )
 stopifnot("a feature category has no assigned colour - extend category_colors" =
             all(unique(feature_meta$category) %in% names(category_colors)))
+
+# Codon-position tests need per-codon features, which only some matrices carry.
+run_codon_tests <- any(grepl("^bg_rscu_[A-Z]{3}$", feature_cols))
 
 # Some entanglement diagnostics are written around a specific named trio. They are skipped
 # (chunk eval = FALSE) when a feature matrix does not contain all three, so this notebook can
@@ -965,9 +979,6 @@ cutoff between 0.50 and 0.80. Note the rule reads `rho_gc3` only, so "GC-indepen
 "not GC-driven", it does not assert the feature is a good CSC proxy.
 
 ```{r entangle_codon_membership, eval=run_pair_diag}
-# model_data is pre-imputation, so NAs there identify the median-imputed rows
-pre_impute_train <- model_data[train_idx, ]
-
 codon_profile <- tibble(feature = codon_block) %>%
   mutate(
     rho_gc3     = map_dbl(feature, ~cor(train_data[[.x]], train_data$gc3, method = "spearman")),
@@ -1485,8 +1496,10 @@ p_cd <- cowplot::plot_grid(
 p_cd_titled <- cowplot::plot_grid(
   cowplot::ggdraw() + cowplot::draw_label(
     paste0("GC and CSC entanglement: rho = ", round(rho_gc_csc, 3),
-           ", GC x CSC interaction = ", round(100 * inter_fraction, 1),
-           "% of main effects (n = ", nrow(shap_test), " genes)"),
+           if (exists("inter_fraction"))
+             paste0(", GC x CSC interaction = ", round(100 * inter_fraction, 1),
+                    "% of main effects") else "",
+           " (n = ", nrow(shap_test), " genes)"),
     fontface = "plain", size = 12, hjust = 0.5),
   p_cd, ncol = 1, rel_heights = c(0.08, 1)
 )
@@ -1532,6 +1545,204 @@ if (length(gc_driven) > 0) {
   cat("  GC content with them         :",
       round(mean(abs(rowSums(shap_test[, c(gc_block, gc_driven), drop = FALSE]))), 5), "\n")
 }
+```
+
+# Synonymous Codon Preference vs Amino-Acid Composition
+
+Runs only when the feature matrix carries per-codon features (`feature_set = "codon_rscu"`),
+skipped otherwise.
+
+Aggregate GC3 cannot answer whether eIF3d prefers particular **synonymous** codons. It is
+0.93-correlated with bulk `cds_gc`, 0.66-correlated with GC1 through genome-wide isochore
+structure, and it is a net measure across all amino-acid families, so within-family
+preferences that run in opposite directions cancel inside it.
+
+Nor can raw codon **frequency**: `codon_freq_AAA` and `codon_freq_AAG` both rise with lysine
+content, so their attributions are dominated by amino-acid composition. A family-direction
+test built on frequency features will report "same direction" whether or not a synonymous
+preference exists, and is therefore uninformative for this question.
+
+**bg-RSCU is the right instrument.** It is normalised within each synonymous family by
+construction, so amino-acid content is divided out and the remaining signal is the wobble
+choice. The two tests below use it.
+
+```{r codon_setup, eval=run_codon_tests}
+genetic_code <- Biostrings::GENETIC_CODE
+gc_count <- function(x) map_dbl(x, ~sum(strsplit(.x, "")[[1]] %in% c("G", "C")))
+
+codon_shap <- shap_importance %>%
+  filter(str_detect(feature, "^(bg_rscu|codon_freq)_[A-Z]{3}$")) %>%
+  mutate(
+    kind      = ifelse(str_detect(feature, "^bg_rscu_"), "bg-RSCU (AA-normalised)",
+                                                          "codon frequency (raw)"),
+    codon     = str_remove(feature, "^(bg_rscu|codon_freq)_"),
+    aminoacid = genetic_code[codon],
+    gc12      = gc_count(substr(codon, 1, 2)),   # positions 1-2: amino-acid identity
+    gc3_pos   = gc_count(substr(codon, 3, 3)),   # position 3: synonymous / wobble
+    ending    = ifelse(gc3_pos == 0, "AT-ending", "GC-ending")
+  ) %>%
+  filter(!is.na(aminoacid), aminoacid != "*")
+
+stopifnot(
+  "codon features did not parse into amino acids" = nrow(codon_shap) > 0,
+  "third-position classification is wrong" =
+    all(codon_shap$ending == ifelse(substr(codon_shap$codon, 3, 3) %in% c("A", "T"),
+                                    "AT-ending", "GC-ending"))
+)
+cat("Parsed", nrow(codon_shap), "per-codon features across",
+    n_distinct(codon_shap$aminoacid), "amino acids\n")
+```
+
+## Test 1: do AT-ending and GC-ending synonymous codons push opposite ways?
+
+```{r codon_at_gc_test, eval=run_codon_tests}
+rscu <- codon_shap %>% filter(str_detect(kind, "bg-RSCU"))
+
+print_table(
+  rscu %>% group_by(ending) %>%
+    summarise(n = n(),
+              median_direction = median(shap_value_cor, na.rm = TRUE),
+              frac_positive    = mean(shap_value_cor > 0, na.rm = TRUE),
+              median_rank      = median(rank_shap), .groups = "drop"),
+  caption = "bg-RSCU SHAP direction by third-codon-position identity")
+
+w_end <- wilcox.test(shap_value_cor ~ ending, data = rscu)
+cat("\nWilcoxon, AT-ending vs GC-ending SHAP direction: p =",
+    format.pval(w_end$p.value, digits = 3), " n =", nrow(rscu), "\n")
+cat("Positive direction = more of this codon (relative to its synonymous family)\n")
+cat("pushes a gene toward '", pos_label, "'.\n", sep = "")
+```
+
+Within-family view: for each two-fold degenerate amino acid, the AT-ending and GC-ending
+codon are the same amino acid, so any direction difference between them is purely
+synonymous.
+
+```{r codon_family_pairs, eval=run_codon_tests}
+two_fold <- rscu %>%
+  group_by(aminoacid) %>%
+  filter(n() == 2, n_distinct(ending) == 2) %>%
+  summarise(
+    at_codon  = codon[ending == "AT-ending"],
+    at_dir    = shap_value_cor[ending == "AT-ending"],
+    gc_codon  = codon[ending == "GC-ending"],
+    gc_dir    = shap_value_cor[ending == "GC-ending"],
+    .groups   = "drop"
+  ) %>%
+  mutate(opposite = sign(at_dir) != sign(gc_dir)) %>%
+  arrange(desc(at_dir - gc_dir))
+
+print_table(two_fold, caption = "Two-fold degenerate families: AT-ending vs GC-ending direction")
+cat("\nFamilies splitting in opposite directions:", sum(two_fold$opposite),
+    "of", nrow(two_fold), "\n")
+```
+
+```{r codon_at_gc_plot, fig.width=11, fig.height=8, eval=run_codon_tests}
+ending_colors <- c("AT-ending" = "#D55E00", "GC-ending" = "#0072B2")
+
+p_codon_dir <- rscu %>%
+  mutate(codon_lab = fct_reorder(paste0(codon, " (", aminoacid, ")"), shap_value_cor)) %>%
+  ggplot(aes(shap_value_cor, codon_lab, color = ending)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_segment(aes(x = 0, xend = shap_value_cor, yend = codon_lab), linewidth = 0.4) +
+  geom_point(size = 2) +
+  scale_color_manual(values = ending_colors, name = NULL) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "top") +
+  labs(
+    title    = "Synonymous codon preference: bg-RSCU SHAP direction",
+    subtitle = paste0("Amino-acid normalised, so this is wobble choice only. Right = pushes toward ",
+                      pos_label, " | test set, n = ", nrow(shap_test), " genes"),
+    x = "SHAP direction (correlation of feature value with its SHAP value)", y = ""
+  )
+print(p_codon_dir)
+ggsave(here("plots", paste0("shap_codon_at_gc_direction_", suffix_shap, ".pdf")),
+       plot = p_codon_dir, width = 11, height = 8)
+
+p_pairs <- two_fold %>%
+  dplyr::select(aminoacid, at_dir, gc_dir) %>%
+  pivot_longer(c(at_dir, gc_dir), names_to = "ending", values_to = "direction") %>%
+  mutate(ending = recode(ending, at_dir = "AT-ending", gc_dir = "GC-ending")) %>%
+  ggplot(aes(ending, direction, group = aminoacid)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(color = "grey60", linewidth = 0.6) +
+  geom_point(aes(color = ending), size = 3) +
+  ggrepel::geom_text_repel(
+    data = ~dplyr::filter(.x, ending == "GC-ending"),
+    aes(label = aminoacid), size = 3, nudge_x = 0.15, direction = "y") +
+  scale_color_manual(values = ending_colors, guide = "none") +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = "Within-family synonymous flip",
+    subtitle = "Each line is one two-fold degenerate amino acid",
+    x = "", y = "SHAP direction"
+  )
+print(p_pairs)
+ggsave(here("plots", paste0("shap_codon_family_pairs_", suffix_shap, ".pdf")),
+       plot = p_pairs, width = 6, height = 6)
+```
+
+## Test 2: positions 1-2 vs position 3 dissociation
+
+Why aggregate GC1, GC2 and GC3 all rank similarly in the `positional_gc` model despite the
+synonymous effect being specific to position 3. Two distinct effects run in the same
+direction:
+
+- **Positions 1-2 carry amino-acid identity.** If the favoured amino acids are themselves
+  AT-coded, GC1 and GC2 drop for a protein-composition reason with no wobble involvement.
+- **Position 3 carries synonymous choice**, visible only after amino-acid normalisation.
+
+Raw frequency features should track positions 1-2 (they contain amino-acid identity);
+bg-RSCU features should track position 3 only (identity has been divided out).
+
+```{r codon_position_dissociation, eval=run_codon_tests}
+dissoc <- codon_shap %>%
+  group_by(kind) %>%
+  summarise(
+    n                       = n(),
+    rho_positions_1_2       = cor(gc12,    shap_value_cor, method = "spearman", use = "complete.obs"),
+    rho_position_3          = cor(gc3_pos, shap_value_cor, method = "spearman", use = "complete.obs"),
+    .groups = "drop"
+  )
+print_table(dissoc, caption = "Which codon position predicts SHAP direction, by feature type")
+
+cat("\nRaw frequency, direction grouped by GC content of positions 1-2:\n")
+print_table(
+  codon_shap %>% filter(str_detect(kind, "frequency")) %>%
+    group_by(gc12) %>%
+    summarise(n = n(), median_direction = median(shap_value_cor),
+              frac_positive = mean(shap_value_cor > 0), .groups = "drop"),
+  caption = "Amino-acid-level composition effect (positions 1-2)")
+
+cat("\nAmino acids ranked by mean direction (from raw frequency features):\n")
+print_table(
+  codon_shap %>% filter(str_detect(kind, "frequency")) %>%
+    group_by(aminoacid) %>%
+    summarise(n_codons = n(), mean_direction = mean(shap_value_cor),
+              gc_at_positions_1_2 = first(gc12), .groups = "drop") %>%
+    arrange(desc(mean_direction)),
+  caption = "Amino-acid preference and the GC content of its codons' first two positions")
+```
+
+```{r codon_position_plot, fig.width=11, fig.height=5, eval=run_codon_tests}
+p_dissoc <- codon_shap %>%
+  dplyr::select(kind, shap_value_cor, `positions 1-2` = gc12, `position 3` = gc3_pos) %>%
+  pivot_longer(c(`positions 1-2`, `position 3`), names_to = "position", values_to = "gc") %>%
+  ggplot(aes(factor(gc), shap_value_cor)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_boxplot(outlier.shape = NA, fill = "grey92", width = 0.6) +
+  geom_jitter(width = 0.15, size = 1.1, alpha = 0.6, color = "#0072B2") +
+  facet_grid(kind ~ position, scales = "free_x") +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank()) +
+  labs(
+    title    = "Amino-acid composition and synonymous choice are separable",
+    subtitle = paste0("Raw frequency tracks positions 1-2 (amino-acid identity); ",
+                      "bg-RSCU tracks position 3 only | n = ", nrow(shap_test), " genes"),
+    x = "Number of G/C bases at these codon positions", y = "SHAP direction"
+  )
+print(p_dissoc)
+ggsave(here("plots", paste0("shap_codon_position_dissociation_", suffix_shap, ".pdf")),
+       plot = p_dissoc, width = 11, height = 5)
 ```
 
 # Grouped SHAP by Category
@@ -1747,14 +1958,15 @@ cat("  Feature set:", params$feature_set, "\n")
 cat("  Features:", length(feature_cols), "\n\n")
 
 cat("Surrogate fidelity vs notebook 07 (test set, n =", nrow(shap_test), "):\n")
-cat("  max |delta prob|:", format(max_abs_diff_test, digits = 3), "(gate: < 0.02)\n")
+cat("  max |delta prob|:", format(max_abs_diff_test, digits = 3),
+    paste0("(gate: < ", fidelity_tol, ")\n"))
 cat("  Pearson r:", round(r_test, 6), "\n")
 cat("  AUC:", round(auc_prob, 4), "(07) vs", round(auc_reg, 4), "(surrogate)\n")
 if (!is.na(rho)) cat("  Spearman rho vs impurity importance:", round(rho, 3), "\n")
 cat("\nSHAP baseline (training base rate):", round(shap_baseline, 4), "\n\n")
 
 cat("Top 10 features by mean |SHAP|:\n")
-for (i in 1:10) {
+for (i in seq_len(min(10, nrow(shap_importance)))) {
   cat("  ", i, ". ", shap_importance$feature[i],
       " (", round(shap_importance$mean_abs_shap[i], 5), ", ",
       shap_importance$category[i], ")\n", sep = "")
