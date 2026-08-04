@@ -13,6 +13,7 @@ library(tidyverse)
 library(here)
 library(ggplot2)
 library(ggvenn)
+library(ggrepel)
 ```
 
 ## Section 1: Load Data
@@ -104,13 +105,17 @@ ggsave(here("plots/24_all_genes_corr.pdf"), p_all_zoom, width=5, height=4)
 # Every gene is plotted regardless of significance; the padj/lfc thresholds are used
 # only to pick which points are colored red.
 # Hypoxia-specific promoted genes: promoted in hypoxia at the project-standard
-# lfc 0.5 / padj 0.05 threshold, and NOT promoted in normoxia at the same threshold.
-# NA padj (DESeq2 independent filtering) counts as not-promoted, not as NA.
+# lfc 0.5 / padj 0.05 threshold, AND in normoxia both non-significant (padj >= 0.05)
+# and below the lfc cutoff (lfc < 0.5). Both normoxia conditions must hold — the
+# weaker !(sig & lfc>0.5) form would keep genes with a large normoxia effect that
+# merely missed significance.
+# NA padj (DESeq2 independent filtering) counts as not-significant.
 plot_df_hyp <- plot_df %>%
   mutate(
-    hyp_promoted = !is.na(te_padj_hypoxia)  & te_padj_hypoxia  < 0.05 & te_lfc_hypoxia  > 0.5,
-    nor_promoted = !is.na(te_padj_normoxia) & te_padj_normoxia < 0.05 & te_lfc_normoxia > 0.5,
-    hyp_group    = if_else(hyp_promoted & !nor_promoted,
+    hyp_promoted = !is.na(te_padj_hypoxia) & te_padj_hypoxia < 0.05 & te_lfc_hypoxia > 0.5,
+    nor_notsig   = is.na(te_padj_normoxia) | te_padj_normoxia >= 0.05,
+    nor_small    = !is.na(te_lfc_normoxia) & te_lfc_normoxia < 0.5,
+    hyp_group    = if_else(hyp_promoted & nor_notsig & nor_small,
                            "Hypoxia-specific promoted", "All other genes")
   ) %>%
   # draw the red points last so they are not buried under the grey cloud
@@ -123,16 +128,22 @@ n_hyp_specific <- sum(plot_df_hyp$hyp_group == "Hypoxia-specific promoted")
 cat("Genes plotted:", nrow(plot_df_hyp),
     "| hypoxia-specific promoted:", n_hyp_specific, "\n")
 
-# The red group must reproduce the canonical hypoxia-specific geneset exactly. If this
-# fails, the thresholds here have drifted from the ones used to build that CSV.
+# The red group here uses a stricter normoxia exclusion than the canonical geneset CSV
+# (which is built in section 10b as setdiff(hyp_promoted, nor_promoted)), so it must be
+# a strict SUBSET of that CSV. If it is not, the hypoxia-side thresholds have drifted
+# from the ones used to build the CSV.
 hyp_specific_ref <- read_csv(
   here("output/genesets/hypoxia_3d_promotes_TE_hypoxia_specific_lfc0.5.csv"),
   show_col_types = FALSE)
+red_ids <- sub("\\..*", "", plot_df_hyp$gene_id[plot_df_hyp$hyp_group == "Hypoxia-specific promoted"])
+ref_ids <- sub("\\..*", "", hyp_specific_ref$ensembl_gene)
 stopifnot(
-  "red group does not match hypoxia_3d_promotes_TE_hypoxia_specific_lfc0.5.csv" =
-    setequal(sub("\\..*", "", plot_df_hyp$gene_id[plot_df_hyp$hyp_group == "Hypoxia-specific promoted"]),
-             sub("\\..*", "", hyp_specific_ref$ensembl_gene))
+  "red group is not a subset of hypoxia_3d_promotes_TE_hypoxia_specific_lfc0.5.csv" =
+    all(red_ids %in% ref_ids)
 )
+cat("canonical hypoxia-specific set:", length(ref_ids),
+    "| after requiring normoxia padj >= 0.05 AND lfc < 0.5:", length(red_ids),
+    "| dropped:", length(setdiff(ref_ids, red_ids)), "\n")
 
 p_sig <- ggplot(plot_df_hyp, aes(te_lfc_normoxia, te_lfc_hypoxia, color = hyp_group)) +
   geom_point(alpha = 0.5, size = 1) +
@@ -157,6 +168,78 @@ p_sig <- ggplot(plot_df_hyp, aes(te_lfc_normoxia, te_lfc_hypoxia, color = hyp_gr
 p_sig
 
 ggsave(here("plots/24_sig_genes_corr.pdf"), p_sig, width = 7, height = 5)
+```
+
+### Plot 2b: Reporter construct candidates highlighted
+
+Same scatter, but only the 12 reporter constructs are colored: the 9 hypoxia-specific
+candidates in vermillion and the 3 controls (PAN2, DXO, ADAT3) in Okabe-Ito dark blue.
+
+```{r plot-construct-genes, fig.width=7, fig.height=5}
+construct_candidates <- c("CLIC1", "EIF4G2", "FUT8", "IWS1", "LAPTM4B",
+                          "PIGBOS1", "PIP5K1A", "SERTAD2", "STYXL1")
+construct_controls   <- c("PAN2", "DXO", "ADAT3")
+
+plot_df_con <- plot_df %>%
+  mutate(
+    con_group = case_when(
+      symbol %in% construct_candidates ~ "Reporter construct",
+      symbol %in% construct_controls   ~ "Control construct",
+      TRUE                             ~ "All other genes"
+    ),
+    con_group = factor(con_group,
+                       levels = c("All other genes", "Reporter construct", "Control construct"))
+  ) %>%
+  # draw the highlighted points last so they are not buried under the grey cloud
+  arrange(con_group)
+
+# Every construct must resolve to exactly one point; a symbol that fails to match
+# (alias, or filtered out of one of the two DESeq2 tables) would silently plot nothing.
+con_counts <- plot_df_con %>%
+  filter(con_group != "All other genes") %>%
+  dplyr::count(symbol)
+stopifnot(
+  "not all construct symbols matched exactly one gene" =
+    setequal(con_counts$symbol, c(construct_candidates, construct_controls)) &&
+    all(con_counts$n == 1)
+)
+
+con_group_colors <- c("All other genes"    = "grey70",
+                      "Reporter construct" = "#D55E00",   # Okabe-Ito vermillion
+                      "Control construct"  = "#0072B2")   # Okabe-Ito dark blue
+
+# Base plot has no gene labels; the labeled version adds geom_text_repel on top, so the
+# two versions cannot drift apart in points, colors, scales or limits.
+p_con_nolab <- ggplot(plot_df_con, aes(te_lfc_normoxia, te_lfc_hypoxia, color = con_group)) +
+  geom_point(data = ~ filter(.x, con_group == "All other genes"),
+             alpha = 0.5, size = 1) +
+  geom_point(data = ~ filter(.x, con_group != "All other genes"),
+             size = 2.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = con_group_colors, breaks = names(con_group_colors)) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+           label = sprintf("%s, n = %d", fmt_cor(cor_all), nrow(plot_df_con)),
+           size = 3) +
+  labs(
+    x     = "TE LFC normoxia (sictrl/si3d)",
+    y     = "TE LFC 1hr hypoxia (sictrl/si3d)",
+    color = NULL,
+    title = "Reporter construct candidates"
+  ) +
+  theme_classic(base_size = 12) +
+  coord_cartesian(xlim = c(-1, 3.5), ylim = c(-1, 3.5))
+
+p_con <- p_con_nolab +
+  geom_text_repel(data = ~ filter(.x, con_group != "All other genes"),
+                  aes(label = symbol), size = 3, min.segment.length = 0,
+                  box.padding = 0.4, max.overlaps = Inf, show.legend = FALSE)
+
+p_con
+p_con_nolab
+
+ggsave(here("plots/24_construct_genes_corr.pdf"), p_con, width = 7, height = 5)
+ggsave(here("plots/24_construct_genes_corr_nolabels.pdf"), p_con_nolab, width = 7, height = 5)
 ```
 
 ### Plot 1b: All genes, colored by regression residual
