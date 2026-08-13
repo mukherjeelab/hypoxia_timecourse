@@ -13,6 +13,9 @@ params:
   feature_set: "external_stability"
   clip_mode: "aggregate"
   source_model: "no_boruta"
+  exclude_4e_features: false
+  exclude_own_te_features: true
+  neg_geneset_csv: ""
 editor_options:
   chunk_output_type: console
 ---
@@ -36,20 +39,33 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     lfc       = "0.5",
     feature_set = "external_stability", #targeted, combined, structure, clip_split, te_lfc, codon_optimality, or kozak or external_stability
     clip_mode   = "aggregate", # "individual", "aggregate", or "both"
-    source_model = "no_boruta" # "no_boruta" (07) or "boruta" (06)
+    source_model = "no_boruta", # "no_boruta" (07) or "boruta" (06)
+    # These three must match the notebook 07 run being analysed: the first two
+    # enter the suffix, and the third selects the negative set rebuilt below.
+    exclude_4e_features     = FALSE,
+    exclude_own_te_features = TRUE,
+    neg_geneset_csv         = ""
   )
 }
 
 # Derived file paths and labels from params
 readout <- if (is.null(params$readout) || !nzchar(params$readout)) "TE" else params$readout
 stopifnot("readout must be 'TE' or 'RNA'" = readout %in% c("TE", "RNA"))
-if (readout != "TE" && params$timepoint %in% c("alltimepoints", "1and4hr")) {
-  stop("readout='", readout, "' is not supported with timepoint='", params$timepoint,
-       "' - that branch filters te_lfc directly.")
+# Mirrors notebook 07: the alltimepoints/1and4hr shortcut filters te_lfc inline so
+# it is TE-only, but non-TE readouts have pre-built gene sets in output/genesets/
+# and are routed there rather than refused.
+use_full_de_table <- readout == "TE" &&
+  params$timepoint %in% c("alltimepoints", "1and4hr")
+
+# A non-TE readout must supply its own negative set - the default below is
+# TE-defined and says nothing about RNA (see notebook 07 for the numbers).
+if (readout != "TE" && !nzchar(params$neg_geneset_csv)) {
+  stop("readout='", readout, "' requires an explicit neg_geneset_csv; the default ",
+       "negative_control_genes.csv is TE-defined. Build one with notebook 70.")
 }
-geneset_csv <- if (params$timepoint == "alltimepoints") {
+geneset_csv <- if (use_full_de_table && params$timepoint == "alltimepoints") {
   paste0("translation_categories_si", params$gene, "_vs_sictrl_", params$condition, "_alltimepoints.csv")
-} else if (params$timepoint == "1and4hr") {
+} else if (use_full_de_table && params$timepoint == "1and4hr") {
   paste0("translation_categories_si", params$gene, "_vs_sictrl_", params$condition, "_1and4hr.csv")
 } else {
   paste0(params$condition, "_", params$gene, "_", params$direction,
@@ -69,15 +85,17 @@ feature_matrix_rds <- if (params$feature_set == "te_lfc") {
   paste0("feature_matrix_", params$timepoint, "_combined.rds")
 }
 # Suffix matches 06 (boruta) or 07 (no_boruta) output naming
-if (params$source_model == "no_boruta") {
-  suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
-                   params$condition, "_", params$timepoint, "_lfc", params$lfc,
-                   "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta")
-} else {
-  suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
-                   params$condition, "_", params$timepoint, "_lfc", params$lfc,
-                   "_", params$feature_set, "_clip", params$clip_mode)
-}
+# Suffix must reproduce notebook 07's EXACTLY or this notebook loads a different
+# model's importance table. It carries the readout (only when not "TE", matching
+# 07) and the exclude_* flags, both of which were previously missing - an RNA run
+# would otherwise resolve a same-named TE run and overwrite its outputs.
+suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 if (readout != "TE") paste0(tolower(readout), "_") else "",
+                 params$condition, "_", params$timepoint, "_lfc", params$lfc,
+                 "_", params$feature_set, "_clip", params$clip_mode,
+                 if (params$source_model == "no_boruta") "_no_boruta" else "",
+                 if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
+                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
 pos_label <- params$direction
 neg_label <- paste0("does_not_", sub("s$", "", params$direction))
 gene_label <- paste0("eIF", params$gene)
@@ -120,7 +138,26 @@ if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
 cat("Positive genes:", nrow(positive_genes), "\n")
 
 # Negative class: genes not regulated by eIF3d in any condition
-negative_control_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv")) %>%
+# Same negative-set resolution as notebook 07, including its readout-provenance
+# guard. Previously this hardcoded the TE controls, so any 07 run that used
+# neg_geneset_csv (every RNA run, and the contrastive TE runs) was analysed here
+# against a DIFFERENT negative class than it was trained on.
+negative_control_genes <- if (nzchar(params$neg_geneset_csv)) {
+  read_csv(here("output", "genesets", params$neg_geneset_csv), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = ensembl_gene)
+} else {
+  read_csv(here("output", "predictive_modeling",
+                if (params$gene == "3e") "negative_control_genes_si3e.csv"
+                else "negative_control_genes.csv"), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id))
+}
+neg_readout <- if ("readout" %in% colnames(negative_control_genes)) {
+  unique(negative_control_genes$readout)
+} else "TE"
+if (!identical(neg_readout, readout)) {
+  stop("readout mismatch: run is readout='", readout,
+       "' but the negative set was built for readout='", neg_readout, "'.")
+}
   mutate(gene_id_clean = sub("\\..*", "", gene_id))
 cat("Negative control genes:", nrow(negative_control_genes), "\n")
 
@@ -133,7 +170,7 @@ cat("Features in importance table:", nrow(importance_df), "\n")
 
 # Recreate Binary Target
 
-Identical logic and seed to 07 so that the same gene sets are used.
+Identical logic, params and seed to 07 so that the same gene sets are rebuilt.
 
 ```{r create_target}
 set.seed(9)
