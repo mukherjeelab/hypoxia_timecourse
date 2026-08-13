@@ -1,0 +1,917 @@
+---
+title: "`r paste0('74 - Overlap of eIF3d-promoted genes at the TE vs RNA level (', params$condition, ' ', params$timepoint, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  timepoint: "1hr"
+  lfc_cut: 0.5
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Do the mRNAs eIF3d promotes **translationally** overlap the ones it promotes at the
+level of **abundance**? Both sets come from the same contrast, si3d vs sictrl at
+hypoxia 1hr:
+
+- TE set: `te_lfc > 0.5 & te_padj < 0.05`
+- RNA set: `rna_lfc > 0.5 & rna_padj < 0.05`
+
+**Both sets use the same cutoff and are derived inline from the same file**, so
+neither gets treatment the other does not. The TE derivation is asserted to
+reproduce the canonical `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` exactly.
+
+**Headline: the two sets overlap *less* than chance.** 352 shared genes against
+~643 expected, Fisher odds ratio 0.37 (depletion p = 3e-61). They are strongly
+anti-associated, not two views of one target list.
+
+(Medians quoted in the caveats below are for hypoxia 1hr; the notebook recomputes
+them for whichever contrast it is run on.)
+
+**Direction convention.** Every column is log2(sictrl / si3d) - the producing
+notebook runs DESeq2 with the knockdown as the reference, so the coefficient is
+`Condition_sictrl_vs_si3d` regardless of the `si3d_vs_sictrl` filename. Positive =
+knockdown reduces it = eIF3d promotes. Asserted below against EIF3D.
+
+**Two caveats that decide how much the depletion means.** Both are tested rather
+than assumed, in their own sections below:
+
+1. **A matched nominal cutoff is not a matched stringency.** The two
+   distributions sit at different medians (`te_lfc` 0.289, `rna_lfc` 0.409), so a
+   shared 0.5 bar lands 0.211 above the TE median but only 0.091 above the RNA
+   median - it is a far laxer cut on RNA, which is why the RNA set comes out at
+   ~4,760 genes (40% of the transcriptome; EIF3D is excluded, so the printed
+   count is one lower) against the TE set's 1,604. The overlap
+   is therefore also reported centred on each median, and swept across a grid of
+   both cutoffs.
+2. **`te_lfc` and `rna_lfc` are not independent measurements.** They come from
+   different DESeq2 fits, but TE is a ribosome-footprint-to-RNA quantity, so noise
+   in RNA propagates into TE with the opposite sign. Some mutual depletion is
+   expected even under null biology, and the size of that artifact needs bounding
+   before the depletion is called biological.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ggvenn)
+```
+
+# Parameters
+
+```{r params}
+# Defaults for interactive use; YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(condition = "hypoxia",  # "hypoxia" | "normoxia"
+                 timepoint = "1hr",
+                 lfc_cut   = 0.5)
+}
+CONDITION <- params$condition
+TIMEPOINT <- params$timepoint
+
+CONTRAST_FILE <- paste0("translation_categories_si3d_vs_sictrl_",
+                        CONDITION, "_", TIMEPOINT, ".csv")
+# Canonical TE gene set for this contrast, used only to validate the inline
+# derivation below.
+TE_SET_FILE <- paste0(CONDITION, "_3d_promotes_TE_", TIMEPOINT, "_lfc0.5.csv")
+
+# Every output carries the contrast, so running a second condition cannot
+# overwrite the first.
+SUFFIX <- paste0(CONDITION, TIMEPOINT)
+
+# One shared cutoff applied to both readouts, so the comparison is not confounded
+# by threshold choice. See the stringency section for why a matched NOMINAL cut is
+# still not a matched stringency here.
+LFC_CUT <- params$lfc_cut
+PADJ    <- 0.05
+
+
+cat("Contrast :", CONTRAST_FILE, "\n")
+cat("TE check :", TE_SET_FILE, "\n")
+cat("Suffix   :", SUFFIX, "\n")
+
+# Both sets are eIF3d-defined. The TE set keeps the established eIF3d amber;
+# the RNA set takes Okabe-Ito vermillion, matching nb71. Neither uses the eIF3e
+# sky blue (#56B4E9), which the project reserves for that factor.
+set_colors <- c("TE promoted" = "#E69F00", "RNA promoted" = "#D55E00")
+```
+
+# Load Data
+
+```{r load}
+de <- read_csv(here("output", CONTRAST_FILE), show_col_types = FALSE) %>%
+  dplyr::select(gene_id, symbol, rna_lfc, rna_padj, ribo_lfc, ribo_padj,
+                te_lfc, te_padj) %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id))
+
+# Universe = genes actually testable on BOTH readouts. Rows with NA padj can never
+# enter either set, so counting them inflates U, deflates `expected`, and biases
+# obs/exp upward - i.e. toward the depletion this notebook reports.
+U <- de %>% filter(!is.na(te_padj), !is.na(rna_padj)) %>% pull(ensembl_gene) %>% unique()
+cat("Universe restricted to jointly tested genes:", length(U),
+    "of", nrow(de), "rows\n")
+
+# EIF3D is the siRNA's own target; nb70 excludes it from the RNA set for that
+# reason and the same logic applies here, so it is dropped from BOTH sets rather
+# than from one. (It does not qualify for the TE set anyway - te_lfc is negative.)
+eif3d_id <- de$ensembl_gene[de$symbol == "EIF3D"]
+
+promoted <- function(lfc_col, padj_col, cut) {
+  de %>%
+    filter(.data[[lfc_col]] > cut, .data[[padj_col]] < PADJ) %>%
+    pull(ensembl_gene) %>%
+    setdiff(eif3d_id) %>%
+    unique()
+}
+
+TE  <- promoted("te_lfc",  "te_padj",  LFC_CUT)
+RNA <- promoted("rna_lfc", "rna_padj", LFC_CUT)
+
+cat("Universe:", length(U), "genes\n")
+cat("TE promoted  (te_lfc  >", LFC_CUT, "):", length(TE), "\n")
+cat("RNA promoted (rna_lfc >", LFC_CUT, "):", length(RNA), "\n")
+
+# The inline TE derivation must reproduce the canonical project gene set, which is
+# what makes deriving both sets here rather than reading one from disk safe.
+te_path <- here("output", "genesets", TE_SET_FILE)
+if (isTRUE(all.equal(LFC_CUT, 0.5)) && file.exists(te_path)) {
+  te_canonical <- read_csv(te_path, show_col_types = FALSE)$ensembl_gene %>%
+    unique() %>% intersect(U)
+  stopifnot("inline TE derivation does not reproduce the canonical TE gene set" =
+    setequal(TE, setdiff(te_canonical, eif3d_id)))
+  cat("Inline TE set reproduces", TE_SET_FILE, "exactly: PASS\n")
+} else {
+  cat("No canonical TE set to check against at lfc", LFC_CUT,
+      "- inline derivation used as-is.\n")
+}
+```
+
+## Validation
+
+```{r checks}
+stopifnot("duplicate genes in the contrast" = !anyDuplicated(de$ensembl_gene))
+stopifnot("ids are not version-stripped" = all(grepl("^ENSG[0-9]+$", c(TE, RNA))))
+stopifnot("a set is empty" = length(TE) > 0 && length(RNA) > 0)
+
+# Direction: EIF3D is the knockdown target, so its own mRNA must be depleted
+e <- de %>% filter(symbol == "EIF3D")
+stopifnot("EIF3D not found" = nrow(e) == 1)
+stopifnot("EIF3D rna_lfc not positive - direction may have flipped" = e$rna_lfc > 0.5)
+cat("EIF3D rna_lfc =", round(e$rna_lfc, 2), "-> log2(sictrl / si3d) confirmed\n")
+
+# EIF3D is dropped from both sets by construction above
+stopifnot("EIF3D should be absent from both sets" =
+  !e$ensembl_gene %in% c(TE, RNA))
+
+# The sets must actually satisfy their stated definitions
+te_chk  <- de %>% filter(ensembl_gene %in% TE)
+rna_chk <- de %>% filter(ensembl_gene %in% RNA)
+stopifnot("TE set violates its own threshold" =
+  all(te_chk$te_lfc > LFC_CUT & te_chk$te_padj < PADJ, na.rm = TRUE))
+stopifnot("RNA set violates its own threshold" =
+  all(rna_chk$rna_lfc > LFC_CUT & rna_chk$rna_padj < PADJ, na.rm = TRUE))
+cat("Both sets satisfy their stated definitions: PASS\n")
+```
+
+# Overlap and Enrichment
+
+```{r overlap}
+shared   <- intersect(TE, RNA)
+te_only  <- setdiff(TE, RNA)
+rna_only <- setdiff(RNA, TE)
+
+# Expected overlap under independence, used in four places below.
+overlap_stats <- function(a, b) {
+  a <- intersect(a, U); b <- intersect(b, U)
+  ov  <- length(intersect(a, b))
+  exp <- length(a) * length(b) / length(U)
+  list(observed = ov, expected = exp,
+       obs_exp = if (exp > 0) ov / exp else NA_real_,
+       n_a = length(a), n_b = length(b))
+}
+
+expected <- overlap_stats(TE, RNA)$expected
+
+cont <- matrix(c(length(shared),
+                 length(RNA) - length(shared),
+                 length(TE)  - length(shared),
+                 length(U) - length(TE) - length(RNA) + length(shared)),
+               nrow = 2)
+ft <- fisher.test(cont)
+
+# Hypergeometric tail probabilities. DEPLETION is the alternative of interest,
+# so the informative tail is P(X <= observed).
+p_enrich  <- phyper(length(shared) - 1, length(TE), length(U) - length(TE),
+                    length(RNA), lower.tail = FALSE)
+p_deplete <- phyper(length(shared), length(TE), length(U) - length(TE),
+                    length(RNA))
+
+overlap_tbl <- tibble(
+  metric = c("TE promoted", "RNA promoted", "Shared (observed)",
+             "Shared (expected by chance)", "Observed / expected",
+             "Fisher odds ratio", "P(overlap >= observed)", "P(overlap <= observed)",
+             "TE only", "RNA only", "Universe"),
+  value = c(length(TE), length(RNA), length(shared),
+            round(expected, 1), round(length(shared) / expected, 3),
+            round(unname(ft$estimate), 3), signif(p_enrich, 3), signif(p_deplete, 3),
+            length(te_only), length(rna_only), length(U))
+)
+print(as.data.frame(overlap_tbl), row.names = FALSE)
+
+stopifnot("region counts do not reconcile" =
+  length(shared) + length(te_only)  == length(TE) &&
+  length(shared) + length(rna_only) == length(RNA))
+
+if (length(shared) < expected) {
+  cat("\nThe sets overlap LESS than chance: obs/exp =",
+      round(length(shared) / expected, 2), ", depletion p =", signif(p_deplete, 3), "\n")
+}
+```
+
+```{r venn, fig.width=6.5, fig.height=5.5}
+p_venn <- ggvenn(
+  list(`TE promoted` = TE, `RNA promoted` = RNA),
+  fill_color      = unname(set_colors[c("TE promoted", "RNA promoted")]),
+  fill_alpha      = 0.45,
+  stroke_size     = 0.5,
+  stroke_color    = "grey30",
+  set_name_size   = 4.5,
+  text_size       = 4.5,
+  show_percentage = FALSE,
+  auto_scale      = FALSE
+) +
+  labs(title = paste0("eIF3d-promoted genes: TE level vs RNA level (", CONDITION, " ", TIMEPOINT, ")"),
+       subtitle = paste0("sictrl vs si3d. TE: te_lfc > ", LFC_CUT,
+                         "; RNA: rna_lfc > ", LFC_CUT, "; both padj < ", PADJ,
+                         ".\nShared = ", length(shared), " vs ", round(expected, 0),
+                         " expected by chance (Fisher OR ", round(unname(ft$estimate), 2), ").")) +
+  theme(plot.title    = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 9, colour = "grey30"))
+p_venn
+ggsave(here("plots", paste0("74_venn_te_vs_rna_promoted_", SUFFIX, ".pdf")),
+       p_venn, width = 6.5, height = 5.5)
+```
+
+# Stringency: a Shared Cutoff Is Not a Shared Stringency
+
+Both sets are now cut at the same number, which removes threshold choice as a
+confounder. It does not make the two cuts equally strict, because the two
+distributions are not centred in the same place.
+
+```{r stringency}
+med_te  <- median(de$te_lfc,  na.rm = TRUE)
+med_rna <- median(de$rna_lfc, na.rm = TRUE)
+
+# Cut each readout at its own median + the same offset, so both select from the
+# same position in their own distribution.
+offset <- LFC_CUT - med_te
+rna_centered <- de %>%
+  filter(rna_lfc - med_rna > offset, rna_padj < PADJ) %>%
+  pull(ensembl_gene) %>% setdiff(eif3d_id) %>% unique()
+
+stringency_tbl <- tibble(
+  readout = c("TE", "RNA (nominal cut)", "RNA (centred to TE stringency)"),
+  median  = round(c(med_te, med_rna, med_rna), 3),
+  cut     = c(LFC_CUT, LFC_CUT, round(med_rna + offset, 3)),
+  above_median = round(c(LFC_CUT - med_te, LFC_CUT - med_rna, offset), 3),
+  n_genes = c(length(TE), length(RNA), length(rna_centered))
+)
+print(as.data.frame(stringency_tbl), row.names = FALSE)
+
+ov_c  <- length(intersect(TE, rna_centered))
+exp_c <- length(TE) * length(rna_centered) / length(U)
+cat("\nOverlap with the quantile-matched RNA set:", ov_c, "vs", round(exp_c, 1),
+    "expected -> obs/exp", round(ov_c / exp_c, 2), "\n")
+# Reported, NOT asserted: whether the depletion holds is the finding this section
+# exists to measure. Asserting it would abort the knit on any contrast where the
+# answer is negative, so the analysis could never report one.
+if (!is.na(ov_c / exp_c) && ov_c / exp_c < 1) {
+  cat("-> depletion holds under stringency matching as well as nominal matching.\n")
+} else {
+  cat("-> NOTE: no depletion under stringency matching for this contrast.\n")
+}
+```
+
+# Caveat 1: Does the Depletion Survive the Thresholds?
+
+The two sets are cut at different stringencies, so the overlap is recomputed
+across a grid of both cutoffs. If the depletion is a threshold artifact it should
+disappear somewhere in the grid.
+
+```{r threshold_grid}
+grid <- expand_grid(te_cut = c(0.25, 0.5, 0.75, 1.0),
+                    rna_cut = c(0.5, 0.75, 1.0, 1.5))
+
+sens <- pmap_dfr(grid, function(te_cut, rna_cut) {
+  st <- overlap_stats(promoted("te_lfc",  "te_padj",  te_cut),
+                      promoted("rna_lfc", "rna_padj", rna_cut))
+  tibble(te_cut = te_cut, rna_cut = rna_cut,
+         n_te = st$n_a, n_rna = st$n_b, observed = st$observed,
+         expected = round(st$expected, 1),
+         obs_exp_raw = st$obs_exp, obs_exp = round(st$obs_exp, 2))
+})
+print(as.data.frame(sens), row.names = FALSE)
+
+cat("\nobs/exp across the whole grid: min =", round(min(sens$obs_exp_raw, na.rm = TRUE), 3),
+    " max =", round(max(sens$obs_exp_raw, na.rm = TRUE), 3), "\n")
+# Compare the UNROUNDED ratio - a true 0.996 rounds to 1.00 and would read as a
+# failure. Reported rather than asserted, for the same reason as above.
+n_below <- sum(sens$obs_exp_raw < 1, na.rm = TRUE)
+cat(n_below, "of", sum(!is.na(sens$obs_exp_raw)),
+    "grid cells are below 1.\n")
+if (n_below == sum(!is.na(sens$obs_exp_raw))) {
+  cat("-> the depletion is not an artifact of where the cuts sit.\n")
+}
+```
+
+```{r threshold_heat, fig.width=6.5, fig.height=4.5}
+p_sens <- ggplot(sens, aes(x = factor(te_cut), y = factor(rna_cut), fill = obs_exp)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = paste0(obs_exp, "\n(", observed, ")")), size = 3) +
+  scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00",
+                       midpoint = 1, limits = c(0, 2), name = "obs / exp") +
+  labs(title = "Overlap relative to chance across thresholds",
+       subtitle = "Value = observed/expected ratio; (n) = observed overlap. Below 1 = depleted.",
+       x = "TE lfc cutoff", y = "RNA lfc cutoff") +
+  theme_classic(base_size = 12)
+p_sens
+ggsave(here("plots", paste0("74_threshold_sensitivity_te_vs_rna_", SUFFIX, ".pdf")),
+       p_sens, width = 6.5, height = 4.5)
+```
+
+# Caveat 2: Are te_lfc and rna_lfc Independent?
+
+This is the load-bearing caveat. `te_lfc` is a ribosome-footprint-to-RNA quantity,
+so sampling noise in RNA enters TE with the opposite sign; two sets defined on
+"high RNA" and "high TE" would then avoid each other even with no biology at all.
+
+The three columns are fit by **three separate DESeq2 models on different sample
+sets** (`mode = "RNA"` on RNA libraries, `"RIBO"` on ribo libraries, `"TE"` on both
+with an interaction term). Being separate fits does **not** make them independent:
+`te_lfc` still tracks `ribo_lfc - rna_lfc` closely, which is quantified below and
+is the reason the RIBO control that follows cannot bound the artifact.
+
+```{r independence}
+# NOTE: the three columns come from three DESeq2 fits on different sample sets,
+# but that does NOT make them independent - te_lfc tracks ribo_lfc - rna_lfc very
+# closely (quantified in the next chunk).
+cor_te_rna  <- cor(de$te_lfc,  de$rna_lfc,  use = "complete.obs")
+cor_ribo_rna <- cor(de$ribo_lfc, de$rna_lfc, use = "complete.obs")
+cor_te_ribo <- cor(de$te_lfc,  de$ribo_lfc, use = "complete.obs")
+
+cat("Transcriptome-wide correlations:\n")
+cat("  te_lfc   vs rna_lfc :", round(cor_te_rna, 3), "\n")
+cat("  ribo_lfc vs rna_lfc :", round(cor_ribo_rna, 3), "\n")
+cat("  te_lfc   vs ribo_lfc:", round(cor_te_ribo, 3), "\n\n")
+
+cat("Interpretation:\n")
+cat("  ribo and rna are strongly POSITIVELY correlated (", round(cor_ribo_rna, 2),
+    "): mRNA loss is largely forwarded to the ribosome.\n", sep = "")
+cat("  te vs rna is NEGATIVE (", round(cor_te_rna, 2),
+    "), which is the source of the mutual depletion.\n", sep = "")
+```
+
+```{r independence_plot, fig.width=6.5, fig.height=5.5}
+plot_df <- de %>%
+  mutate(group = case_when(
+    ensembl_gene %in% shared   ~ "Shared RNA and TE",
+    ensembl_gene %in% te_only  ~ "TE promoted only",
+    ensembl_gene %in% rna_only ~ "RNA promoted only",
+    TRUE                       ~ "All other genes"
+  ) %>% factor(levels = c("All other genes", "TE promoted only",
+                          "RNA promoted only", "Shared RNA and TE")))
+
+p_scatter <- ggplot(plot_df %>% arrange(group), aes(x = rna_lfc, y = te_lfc)) +
+  geom_hline(yintercept = LFC_CUT,  linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  geom_vline(xintercept = LFC_CUT, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(colour = group, alpha = group), size = 0.4) +
+  scale_colour_manual(values = c("All other genes" = "grey75",
+                                 "TE promoted only" = "#E69F00",
+                                 "RNA promoted only" = "#D55E00",
+                                 "Shared RNA and TE" = "#0072B2"), name = NULL) +
+  # One size for every group: the shared genes are the smallest class, so scaling
+  # them up would exaggerate how much of the plot they occupy. Colour and the
+  # draw order (set via arrange(group)) are enough to pick them out.
+  scale_alpha_manual(values = c(0.2, 0.5, 0.5, 0.7), guide = "none") +
+  coord_cartesian(xlim = quantile(de$rna_lfc, c(0.005, 0.995), na.rm = TRUE),
+                  ylim = quantile(de$te_lfc,  c(0.005, 0.995), na.rm = TRUE)) +
+  labs(title = paste0("TE change vs RNA change, ", CONDITION, " ", TIMEPOINT),
+       subtitle = paste0("Dashed lines = the two set thresholds. Quadrant overlap is ",
+                         "the shared set.\nTranscriptome-wide r(te, rna) = ",
+                         round(cor_te_rna, 3), ", n = ", sum(complete.cases(de$te_lfc, de$rna_lfc))),
+       x = "rna_lfc, log2(sictrl / si3d)",
+       y = "te_lfc, log2(sictrl / si3d)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_scatter
+ggsave(here("plots", paste0("74_te_vs_rna_lfc_scatter_", SUFFIX, ".pdf")),
+       p_scatter, width = 6.5, height = 5.5)
+```
+
+## Bounding the artifact
+
+An earlier version of this section used `ribo_lfc` as a comparator, reasoning that
+a set built on it shares the RNA libraries' biology but is fit on the ribo
+libraries. **That control is not valid** and the section is kept only to record
+why: `te_lfc` is near-algebraically tied to `ribo_lfc - rna_lfc` (measured below),
+so an artifact model predicts the very pattern the control was meant to rule out.
+The numbers are reported, but they do not bound the artifact.
+
+```{r artifact_bound}
+ribo_set <- promoted("ribo_lfc", "ribo_padj", LFC_CUT)
+
+compare_to_te <- function(b, label) {
+  st <- overlap_stats(TE, b)
+  tibble(comparison = label, n_set = st$n_b, observed = st$observed,
+         expected = round(st$expected, 1), obs_exp = round(st$obs_exp, 2))
+}
+print(as.data.frame(bind_rows(
+  compare_to_te(RNA,      "TE set vs RNA-promoted"),
+  compare_to_te(ribo_set, "TE set vs RIBO-promoted (same lfc cut)")
+)), row.names = FALSE)
+
+# Measure how tightly TE is tied to ribo - rna before drawing any inference.
+lk <- de %>% filter(!is.na(te_lfc), !is.na(ribo_lfc), !is.na(rna_lfc))
+cat("\ncor(te_lfc, ribo_lfc - rna_lfc) =",
+    round(cor(lk$te_lfc, lk$ribo_lfc - lk$rna_lfc), 3),
+    " median |te - (ribo - rna)| =",
+    round(median(abs(lk$te_lfc - (lk$ribo_lfc - lk$rna_lfc))), 3), "\n\n")
+
+cat("INTERPRETATION - this control does NOT settle the question.\n")
+cat("TE is near-algebraically tied to ribo - rna (r ~ 0.9 above), so RNA enters TE\n")
+cat("with a negative sign and RIBO with a positive one. A pure-noise model therefore\n")
+cat("PREDICTS depletion against the RNA set and enrichment against the RIBO set -\n")
+cat("exactly the pattern observed. The RIBO comparison is consistent with the\n")
+cat("artifact rather than evidence against it, and the caveat stays open.\n")
+cat("Bounding it properly needs a TE estimate that does not share this RNA noise:\n")
+cat("split-replicate or permuted TE, not ribo_lfc.\n")
+```
+
+# Sequence Features by Quadrant
+
+The four groups from the scatter, profiled on the features the notebook 07
+classifiers ranked highest. Unlike the gene-set comparison in nb72, **these four
+groups are mutually exclusive by construction**, so an across-group Kruskal-Wallis
+test is valid here.
+
+Features are grouped by what they are and where they came up:
+
+- **GC block** - `cds_gc` was the top feature of the TE classifier; `utr5_gc` and
+  the GC block ranked 2-6 in the normoxia RNA classifier.
+- **Length** - `log2_utr5_length` was the top feature of both RNA classifiers.
+- **Codon / stability** - `csc`, `cai`, `zhu2024_ctrl_halflife` (iCodon weights and
+  external SLAM-seq half-lives; sequence-derived, not from this experiment).
+- **Other** - `hia2026_dhx29_occupancy` was 4th in the TE classifier.
+
+```{r feature_setup}
+features <- readRDS(here("output", "predictive_modeling",
+                         "feature_matrix_external_stability.rds"))
+stopifnot("feature matrix is not one row per gene" =
+  !anyDuplicated(features$gene_id_clean))
+
+FEATS <- c(
+  # regional lengths
+  "log2_utr5_length"              = "log2 5'UTR length",
+  "log2_cds_length"               = "log2 CDS length",
+  "log2_utr3_length"              = "log2 3'UTR length",
+  "log2_total_length"             = "log2 total length",
+  # regional GC
+  "utr5_gc"                       = "5'UTR GC%",
+  "cds_gc"                        = "CDS GC%",
+  "utr3_gc"                       = "3'UTR GC%",
+  "transcript_gc"                 = "Transcript GC%",
+  # coding / occupancy
+  "gc3"                           = "GC3",
+  "hia2026_dhx29_occupancy"       = "DHX29 occupancy (Hia 2026)",
+  "csc"                           = "CSC",
+  "struct_num_structured_regions" = "N structured regions",
+  # external half-life / stability
+  "zhu2024_ctrl_halflife"         = "Half-life, ctrl (Zhu 2024)",
+  "zhu2024_cnot3ko_halflife_logfc"= "Half-life logFC, CNOT3 KO (Zhu 2024)",
+  "hia2026_ctrl_halflife"         = "Half-life, ctrl (Hia 2026)",
+  "hia2026_dhx29_halflife_logfc"  = "Half-life logFC, DHX29 (Hia 2026)",
+  "karner2026_mda231_log2_ct"     = "log2 Ct, MDA-231 (Karner 2026)"
+)
+
+# Which features go in which figure
+GRP_LENGTH   <- c("log2_utr5_length", "log2_cds_length", "log2_utr3_length", "log2_total_length")
+GRP_GC       <- c("utr5_gc", "cds_gc", "utr3_gc", "transcript_gc")
+GRP_CODING   <- c("cds_gc", "gc3", "hia2026_dhx29_occupancy", "csc")
+GRP_HALFLIFE <- c("zhu2024_ctrl_halflife", "zhu2024_cnot3ko_halflife_logfc",
+                  "hia2026_ctrl_halflife", "hia2026_dhx29_halflife_logfc",
+                  "karner2026_mda231_log2_ct")
+
+stopifnot("expected feature columns missing" = all(names(FEATS) %in% colnames(features)))
+
+# The four scatter groups plus a RIBO-exclusive group.
+#
+# NAMING, because "only" means something different in each case:
+#   TE promoted only   = TE  \ RNA          (defined against RNA, may contain RIBO genes)
+#   RNA promoted only  = RNA \ TE           (same)
+#   Shared             = TE ∩ RNA
+#   RIBO promoted only = RIBO \ (TE ∪ RNA)  (strictly exclusive of BOTH others)
+# All five are mutually exclusive, so the Kruskal-Wallis below stays valid. But
+# the TE and RNA groups are exclusive only with respect to each other, whereas the
+# RIBO group is exclusive of everything - the TE set is 2x enriched for
+# RIBO-promoted genes, so many "TE promoted only" transcripts are also RIBO
+# promoted. Say "TE not RNA" rather than "TE alone" when describing them.
+quad_colors <- c("All other genes"    = "grey70",
+                 "TE promoted only"   = "#E69F00",
+                 "RIBO promoted only" = "#CC79A7",   # Okabe-Ito reddish purple / pink
+                 "RNA promoted only"  = "#D55E00",
+                 "Shared RNA and TE"             = "#0072B2")
+QUAD_LEVELS <- names(quad_colors)
+
+RIBO_SET  <- promoted("ribo_lfc", "ribo_padj", LFC_CUT)
+RIBO_ONLY <- setdiff(RIBO_SET, union(TE, RNA))
+cat("RIBO promoted (ribo_lfc >", LFC_CUT, "):",
+    length(promoted("ribo_lfc", "ribo_padj", LFC_CUT)),
+    "of which exclusive of TE and RNA:", length(RIBO_ONLY), "\n")
+
+quad <- plot_df %>%
+  dplyr::select(ensembl_gene, group) %>%
+  mutate(group = as.character(group),
+         group = if_else(ensembl_gene %in% RIBO_ONLY, "RIBO promoted only", group),
+         group = factor(group, levels = QUAD_LEVELS)) %>%
+  inner_join(features %>%
+               dplyr::select(ensembl_gene = gene_id_clean, all_of(names(FEATS))),
+             by = "ensembl_gene")
+
+stopifnot("group coercion produced NA" = !anyNA(quad$group))
+# RIBO_ONLY is carved out of "All other genes" only - it must not have absorbed a
+# gene that belonged to one of the TE/RNA groups.
+stopifnot("RIBO-only overlaps the TE/RNA groups" =
+  length(intersect(RIBO_ONLY, union(TE, RNA))) == 0)
+print(quad %>% dplyr::count(group))
+# .drop = FALSE: an empty factor level is otherwise ABSENT from count(), so
+# `all(n >= 50)` passes vacuously for a group with zero genes.
+grp_n <- dplyr::count(quad, group, .drop = FALSE)
+stopifnot("a quadrant is missing entirely" = nrow(grp_n) == length(QUAD_LEVELS))
+stopifnot("a quadrant has too few genes in the feature matrix" = all(grp_n$n >= 50))
+
+# STATISTICAL REFERENCE, separate from the display groups.
+#
+# The five display groups are mutually exclusive, which is what makes the omnibus
+# Kruskal-Wallis valid. But carving RIBO-only genes out of "All other genes" makes
+# that group a biased background for the vs-background tests: it removes ~2,150
+# translationally-up transcripts, which inflates every delta. Measured on hypoxia
+# 1hr, cds_gc for "TE promoted only" reads -7.56 against the carved background but
+# -4.78 against the true one, and log2_utr5_length goes from no shift (-0.009) to
+# -0.117. The vs-background comparisons below therefore use the UNCARVED
+# background: every gene in the feature matrix that is in neither the TE nor the
+# RNA set. RIBO-only genes are part of it, as they are part of the transcriptome.
+bg_ref <- features %>%
+  filter(!gene_id_clean %in% union(TE, RNA)) %>%
+  dplyr::select(ensembl_gene = gene_id_clean, all_of(names(FEATS)))
+cat("Statistical background (not in TE or RNA sets):", nrow(bg_ref), "genes\n")
+cat("  (the displayed 'All other genes' violin excludes RIBO-only:",
+    sum(quad$group == "All other genes"), "genes)\n")
+```
+
+```{r feature_tests}
+# TWO groupings are plotted, because they answer different questions:
+#   quad5 - RIBO-only split out as its own class. The five groups partition the
+#           universe, but "All other genes" then excludes ribo-promoted genes.
+#   quad4 - the original four groups, with RIBO-only folded back into the
+#           background so "All other genes" is the full untargeted transcriptome.
+# The vs-background statistics below are unaffected: they already use bg_ref,
+# which is the uncarved background in both cases.
+quad4 <- quad %>%
+  mutate(group = factor(if_else(as.character(group) == "RIBO promoted only",
+                                "All other genes", as.character(group)),
+                        levels = setdiff(QUAD_LEVELS, "RIBO promoted only")))
+stopifnot("folding RIBO back produced NA groups" = !anyNA(quad4$group))
+
+to_long <- function(q) {
+  q %>%
+    pivot_longer(-c(ensembl_gene, group), names_to = "feature", values_to = "value") %>%
+    filter(!is.na(value)) %>%
+    mutate(label = factor(unname(FEATS[feature]), levels = unname(FEATS)))
+}
+kw_of <- function(lg) {
+  lg %>%
+    group_by(label) %>%
+    summarise(p_kw = kruskal.test(value ~ group)$p.value, .groups = "drop") %>%
+    mutate(p_kw_adj = p.adjust(p_kw, method = "BH"),
+           txt = if_else(p_kw_adj < 0.001, "KW p < 0.001",
+                         paste0("KW p = ", signif(p_kw_adj, 2))))
+}
+
+#   quad6 - splits "TE promoted only" into the genes that move at the TE level and
+#           NOWHERE else (truly exclusive) versus those that also move in ribosome
+#           footprints. Still a partition, so Kruskal-Wallis stays valid.
+#           The exclusive class is small (54 genes at hypoxia 1hr, 3.4% of the TE
+#           set) - read its violins with that in mind, especially on the external
+#           half-life panels where roughly half the values are NA.
+TE_EXCLUSIVE <- setdiff(TE, union(RNA, RIBO_SET))
+TE_AND_RIBO  <- setdiff(intersect(TE, RIBO_SET), RNA)
+
+quad6_colors <- c("All other genes"    = "grey70",
+                  "TE exclusive"       = "#E69F00",   # eIF3d amber
+                  "TE and RIBO"        = "#B3760A",   # darker amber: same family on purpose
+                  "RIBO promoted only" = "#CC79A7",
+                  "RNA promoted only"  = "#D55E00",
+                  "Shared RNA and TE"  = "#0072B2")
+QUAD6_LEVELS <- names(quad6_colors)
+
+quad6 <- quad %>%
+  mutate(group = as.character(group),
+         group = case_when(
+           ensembl_gene %in% TE_EXCLUSIVE ~ "TE exclusive",
+           ensembl_gene %in% TE_AND_RIBO  ~ "TE and RIBO",
+           TRUE                           ~ group),
+         group = factor(group, levels = QUAD6_LEVELS))
+stopifnot("TE split produced NA groups" = !anyNA(quad6$group))
+stopifnot("TE split is not a partition of the old TE-only group" =
+  sum(quad6$group %in% c("TE exclusive", "TE and RIBO")) ==
+  sum(quad$group == "TE promoted only"))
+
+long  <- to_long(quad);  kw  <- kw_of(long)
+long4 <- to_long(quad4); kw4 <- kw_of(long4)
+long6 <- to_long(quad6); kw6 <- kw_of(long6)
+cat("6-group sizes (TE split by exclusivity):\n")
+print(dplyr::count(quad6, group, .drop = FALSE))
+cat("5-group sizes:\n"); print(dplyr::count(quad,  group, .drop = FALSE))
+cat("4-group sizes:\n"); print(dplyr::count(quad4, group, .drop = FALSE))
+
+# Each labelled group against the "All other genes" background
+bg_name <- "All other genes"
+vs_bg <- map_dfr(setdiff(QUAD_LEVELS, bg_name), function(g) {
+  map_dfr(names(FEATS), function(f) {
+    a <- quad   %>% filter(group == g) %>% pull(all_of(f))
+    b <- bg_ref %>% pull(all_of(f))            # uncarved reference, see above
+    a <- a[!is.na(a)]; b <- b[!is.na(b)]
+    # wilcox.test ERRORS (not warns) on an empty vector, so suppressWarnings does
+    # not cover it. Sparse external columns can empty a small group: at lfc_cut 1
+    # the Shared group drops to ~77 genes and hia2026_ctrl_halflife is ~50% NA.
+    p <- if (length(a) < 3 || length(b) < 3) NA_real_
+         else suppressWarnings(wilcox.test(a, b)$p.value)
+    tibble(group = g, feature = unname(FEATS[f]),
+           median_group = if (length(a)) median(a) else NA_real_,
+           median_bg = median(b),
+           delta = if (length(a)) median(a) - median(b) else NA_real_,
+           p = p, n_group = length(a))
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p, method = "BH"),
+         across(c(median_group, median_bg, delta), ~ round(.x, 3)),
+         across(c(p, p_adj), ~ signif(.x, 3)))
+
+cat("Largest shifts vs the background, by |delta|:\n")
+print(as.data.frame(vs_bg %>% arrange(desc(abs(delta))) %>% head(15)), row.names = FALSE)
+write_csv(vs_bg, here("output", paste0("74_quadrant_feature_comparison_", SUFFIX, ".csv")))
+```
+
+```{r violin_helper}
+library(patchwork)
+
+# Shared builder for the three faceted figures. (Per-feature y clipping is not
+# available here - facet_wrap cannot take per-panel limits - so the half-life
+# figure below is built as separate patchwork panels instead.)
+make_quad_violin <- function(feats, title, ncol = 4,
+                             dat = long, kw_tbl = kw, lvls = QUAD_LEVELS,
+                             fills = quad_colors) {
+  d <- dat %>% filter(feature %in% feats) %>%
+    mutate(label = factor(unname(FEATS[feature]), levels = unname(FEATS[feats])))
+  kw_f <- kw_tbl %>% filter(label %in% levels(d$label))
+  # One n per group, comma separated in the same left-to-right order the violins
+  # are drawn (QUAD_LEVELS). Counts can differ between panels because some
+  # features carry NAs, so this is computed per facet rather than once.
+  n_f  <- d %>%
+    dplyr::count(label, group, .drop = FALSE) %>%
+    complete(label, group = factor(lvls, levels = lvls),
+             fill = list(n = 0)) %>%
+    arrange(label, group) %>%
+    group_by(label) %>%
+    summarise(txt = paste0("n = ", paste(n, collapse = ", ")), .groups = "drop")
+
+  ggplot(d, aes(x = group, y = value, fill = group)) +
+    geom_violin(alpha = 0.5, linewidth = 0.4, trim = TRUE) +
+    geom_boxplot(width = 0.16, outlier.size = 0.2, linewidth = 0.35,
+                 fill = "white", alpha = 0.85) +
+    geom_text(data = kw_f, aes(x = Inf, y = Inf, label = txt), inherit.aes = FALSE,
+              hjust = 1.05, vjust = 1.4, size = 2.6, colour = "grey30") +
+    geom_text(data = n_f, aes(x = -Inf, y = Inf, label = txt), inherit.aes = FALSE,
+              hjust = -0.08, vjust = 1.4, size = 2.6, colour = "grey30") +
+    scale_fill_manual(values = fills, guide = "none") +
+    facet_wrap(~ label, ncol = ncol, scales = "free_y") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_classic(base_size = 11) +
+    theme(strip.text = element_text(face = "bold", size = 9),
+          axis.text.x = element_text(angle = 35, hjust = 1, size = 7))
+}
+```
+
+```{r violin_lengths, fig.width=11, fig.height=4}
+p_len <- make_quad_violin(GRP_LENGTH,
+  paste0("Regional lengths by TE/RNA quadrant (", CONDITION, " ", TIMEPOINT, ")"))
+p_len
+ggsave(here("plots", paste0("74_quadrant_lengths_", SUFFIX, ".pdf")),
+       p_len, width = 11, height = 4)
+
+# Same panels without the RIBO-only class, background un-carved
+p_len4 <- make_quad_violin(GRP_LENGTH,
+  paste0("Regional lengths by TE/RNA quadrant, no RIBO class (", CONDITION, " ", TIMEPOINT, ")"),
+  dat = long4, kw_tbl = kw4, lvls = levels(quad4$group))
+p_len4
+ggsave(here("plots", paste0("74_quadrant_lengths_noribo_", SUFFIX, ".pdf")),
+       p_len4, width = 11, height = 4)
+
+# TE split into exclusive vs also-RIBO
+p_len6 <- make_quad_violin(GRP_LENGTH,
+  paste0("Regional lengths, TE split by exclusivity (", CONDITION, " ", TIMEPOINT, ")"),
+  dat = long6, kw_tbl = kw6, lvls = QUAD6_LEVELS, fills = quad6_colors)
+p_len6
+ggsave(here("plots", paste0("74_quadrant_lengths_teexcl_", SUFFIX, ".pdf")),
+       p_len6, width = 12, height = 4)
+```
+
+```{r violin_gc, fig.width=11, fig.height=4}
+p_gc <- make_quad_violin(GRP_GC,
+  paste0("Regional GC content by TE/RNA quadrant (", CONDITION, " ", TIMEPOINT, ")"))
+p_gc
+ggsave(here("plots", paste0("74_quadrant_regional_gc_", SUFFIX, ".pdf")),
+       p_gc, width = 11, height = 4)
+
+# Same panels without the RIBO-only class, background un-carved
+p_gc4 <- make_quad_violin(GRP_GC,
+  paste0("Regional GC content by TE/RNA quadrant, no RIBO class (", CONDITION, " ", TIMEPOINT, ")"),
+  dat = long4, kw_tbl = kw4, lvls = levels(quad4$group))
+p_gc4
+ggsave(here("plots", paste0("74_quadrant_regional_gc_noribo_", SUFFIX, ".pdf")),
+       p_gc4, width = 11, height = 4)
+
+# TE split into exclusive vs also-RIBO
+p_gc6 <- make_quad_violin(GRP_GC,
+  paste0("Regional GC content, TE split by exclusivity (", CONDITION, " ", TIMEPOINT, ")"),
+  dat = long6, kw_tbl = kw6, lvls = QUAD6_LEVELS, fills = quad6_colors)
+p_gc6
+ggsave(here("plots", paste0("74_quadrant_regional_gc_teexcl_", SUFFIX, ".pdf")),
+       p_gc6, width = 12, height = 4)
+```
+
+```{r violin_coding, fig.width=11, fig.height=4}
+p_cod <- make_quad_violin(GRP_CODING,
+  paste0("CDS GC, GC3, DHX29 occupancy and CSC (", CONDITION, " ", TIMEPOINT, ")"))
+p_cod
+ggsave(here("plots", paste0("74_quadrant_coding_features_", SUFFIX, ".pdf")),
+       p_cod, width = 11, height = 4)
+
+# Same panels without the RIBO-only class, background un-carved
+p_cod4 <- make_quad_violin(GRP_CODING,
+  paste0("CDS GC, GC3, DHX29 occupancy and CSC by TE/RNA quadrant, no RIBO class (", CONDITION, " ", TIMEPOINT, ")"),
+  dat = long4, kw_tbl = kw4, lvls = levels(quad4$group))
+p_cod4
+ggsave(here("plots", paste0("74_quadrant_coding_features_noribo_", SUFFIX, ".pdf")),
+       p_cod4, width = 11, height = 4)
+
+# TE split into exclusive vs also-RIBO
+p_cod6 <- make_quad_violin(GRP_CODING,
+  paste0("CDS GC, GC3, DHX29 occupancy and CSC, TE split by exclusivity (", CONDITION, " ", TIMEPOINT, ")"),
+  dat = long6, kw_tbl = kw6, lvls = QUAD6_LEVELS, fills = quad6_colors)
+p_cod6
+ggsave(here("plots", paste0("74_quadrant_coding_features_teexcl_", SUFFIX, ".pdf")),
+       p_cod6, width = 12, height = 4)
+```
+
+```{r violin_halflife, fig.width=13, fig.height=4.5}
+# The half-life features span very different ranges, so each panel gets its own y
+# window. coord_cartesian only zooms, so the violins are still computed on all
+# genes - the tail is off screen, not dropped.
+#
+# Zhu control half-life needs a tighter window than the rest: it is strongly right
+# skewed (median 4.6 h, 98th percentile 42.3 h, max 99.7 h), so a 2-98% window
+# still squashes the bulk into the bottom fifth of the panel. Capping at the 90th
+# percentile (15.6 h) keeps ~88% of genes in view with the median centred.
+HL_Q_DEFAULT <- c(0.02, 0.98)
+HL_Q <- list("zhu2024_ctrl_halflife" = c(0.02, 0.90))
+
+# Unlike the other three figures, n is annotated PER VIOLIN here: the half-life
+# features carry thousands of NAs (Hia ~5,800; Karner ~3,200) and the missingness
+# is not even across the four groups, so a single range for the panel would hide
+# which group is actually thin.
+
+make_hl <- function(dat, lvls, fills = quad_colors) {
+  map(GRP_HALFLIFE, function(f) {
+    d   <- dat %>% filter(feature == f)
+    qs  <- if (!is.null(HL_Q[[f]])) HL_Q[[f]] else HL_Q_DEFAULT
+    lim <- quantile(d$value, qs, na.rm = TRUE)
+    n_g <- d %>% dplyr::count(group, .drop = FALSE) %>% mutate(y = lim[2])
+    ggplot(d, aes(x = group, y = value, fill = group)) +
+      geom_violin(alpha = 0.5, linewidth = 0.4, trim = TRUE) +
+      geom_boxplot(width = 0.16, outlier.size = 0.2, linewidth = 0.35,
+                   fill = "white", alpha = 0.85) +
+      geom_text(data = n_g, aes(x = group, y = y, label = n), inherit.aes = FALSE,
+                vjust = 1.2, size = 2.5, colour = "grey25") +
+      scale_fill_manual(values = fills, guide = "none") +
+      coord_cartesian(ylim = lim) +
+      labs(title = unname(FEATS[f]), x = NULL, y = NULL) +
+      theme_classic(base_size = 10) +
+      theme(plot.title = element_text(face = "bold", size = 9),
+            axis.text.x = element_text(angle = 35, hjust = 1, size = 7))
+  })
+}
+hl_plots  <- make_hl(long,  QUAD_LEVELS)
+hl_plots4 <- make_hl(long4, levels(quad4$group))
+hl_plots6 <- make_hl(long6, QUAD6_LEVELS, quad6_colors)
+
+p_hl <- wrap_plots(hl_plots, nrow = 1) +
+  plot_annotation(
+    title = paste0("mRNA stability features by TE/RNA quadrant (",
+                   CONDITION, " ", TIMEPOINT, ")"),
+    caption = paste0("Number above each violin = genes with a non-missing value in ",
+                     "that group. y axis trimmed per feature; ",
+                     "violins computed on all genes."),
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+p_hl
+ggsave(here("plots", paste0("74_quadrant_halflife_", SUFFIX, ".pdf")),
+       p_hl, width = 13, height = 4.5)
+
+p_hl4 <- wrap_plots(hl_plots4, nrow = 1) +
+  plot_annotation(
+    title = paste0("mRNA stability features by TE/RNA quadrant, no RIBO class (",
+                   CONDITION, " ", TIMEPOINT, ")"),
+    caption = paste0("Number above each violin = genes with a non-missing value in ",
+                     "that group. y axis trimmed per feature; ",
+                     "violins computed on all genes."),
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+p_hl4
+ggsave(here("plots", paste0("74_quadrant_halflife_noribo_", SUFFIX, ".pdf")),
+       p_hl4, width = 13, height = 4.5)
+
+p_hl6 <- wrap_plots(hl_plots6, nrow = 1) +
+  plot_annotation(
+    title = paste0("mRNA stability features, TE split by exclusivity (",
+                   CONDITION, " ", TIMEPOINT, ")"),
+    caption = paste0("Number above each violin = genes with a non-missing value. ",
+                     "The TE exclusive class is small - check its n before reading it."),
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+p_hl6
+ggsave(here("plots", paste0("74_quadrant_halflife_teexcl_", SUFFIX, ".pdf")),
+       p_hl6, width = 14, height = 4.5)
+```
+
+# Export
+
+```{r export}
+region_tbl <- bind_rows(
+  tibble(ensembl_gene = shared,   region = "shared"),
+  tibble(ensembl_gene = te_only,  region = "te_only"),
+  tibble(ensembl_gene = rna_only, region = "rna_only")
+) %>%
+  left_join(de %>% dplyr::select(ensembl_gene, symbol, rna_lfc, rna_padj,
+                                 ribo_lfc, te_lfc, te_padj), by = "ensembl_gene") %>%
+  arrange(region, desc(te_lfc))
+
+stopifnot("export lost or gained genes" =
+  nrow(region_tbl) == length(union(TE, RNA)))
+stopifnot("a gene landed in two regions" = !anyDuplicated(region_tbl$ensembl_gene))
+print(region_tbl %>% dplyr::count(region))
+
+write_csv(overlap_tbl, here("output", paste0("74_te_vs_rna_overlap_summary_", SUFFIX, ".csv")))
+write_csv(region_tbl,  here("output", paste0("74_te_vs_rna_overlap_genes_", SUFFIX, ".csv")))
+write_csv(sens,        here("output", paste0("74_te_vs_rna_threshold_sensitivity_", SUFFIX, ".csv")))
+
+cat("\nThe", length(shared), "shared genes (highest te_lfc first):\n")
+print(region_tbl %>% filter(region == "shared") %>%
+        dplyr::select(symbol, rna_lfc, ribo_lfc, te_lfc) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+        head(15))
+```
+
+# Summary
+
+```{r summary}
+cat("TE promoted (te_lfc >", LFC_CUT, "):", length(TE), "genes\n")
+cat("RNA promoted (rna_lfc >", LFC_CUT, "):", length(RNA), "genes\n")
+cat("Shared:", length(shared), "vs", round(expected, 1), "expected -> obs/exp",
+    round(length(shared) / expected, 2), "\n")
+cat("Fisher OR:", round(unname(ft$estimate), 3), " depletion p:", signif(p_deplete, 3), "\n\n")
+# Built from SUFFIX so the printed paths are the ones actually written.
+cat("Outputs (suffix =", SUFFIX, "):\n")
+for (f in c("output/74_te_vs_rna_overlap_summary_%s.csv",
+            "output/74_te_vs_rna_overlap_genes_%s.csv",
+            "output/74_te_vs_rna_threshold_sensitivity_%s.csv",
+            "output/74_quadrant_feature_comparison_%s.csv",
+            "plots/74_venn_te_vs_rna_promoted_%s.pdf",
+            "plots/74_threshold_sensitivity_te_vs_rna_%s.pdf",
+            "plots/74_te_vs_rna_lfc_scatter_%s.pdf",
+            "plots/74_quadrant_lengths_%s.pdf",
+            "plots/74_quadrant_regional_gc_%s.pdf",
+            "plots/74_quadrant_coding_features_%s.pdf",
+            "plots/74_quadrant_halflife_%s.pdf")) {
+  cat("  ", sprintf(f, SUFFIX), "\n", sep = "")
+}
+```

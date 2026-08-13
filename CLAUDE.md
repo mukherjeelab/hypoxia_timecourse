@@ -68,6 +68,7 @@ The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvi
   - `neg_geneset_csv` — custom negative control CSV from `output/genesets/` (default uses `negative_control_genes.csv`)
   - `feature_matrix_path` — override to load a named RDS from `output/predictive_modeling/` (e.g. for MCF7-SIX1)
   - `exclude_own_te_features` — removes `indiv_te_*`, `delta_te_*`, `sig_*` columns; set TRUE when pos/neg sets are defined by TE
+  - `readout` — `"TE"` (default) or `"RNA"`. Selects the gene set filename (`..._TE_...` vs `..._RNA_...`) and is appended to the output suffix **only when not "TE"**, so every pre-existing TE run keeps its filenames and 07c still resolves its saved models. Mirrored in 07b/07c/08/09. `"RNA"` requires an explicit `neg_geneset_csv` (the default `negative_control_genes.csv` is TE-defined and 307 of its genes satisfy the RNA positive definition) and is rejected with `timepoint="alltimepoints"/"1and4hr"` only for TE, since that shortcut filters `te_lfc` inline.
 - `09_cross_condition_importance_comparison.Rmd` — compare feature importance across two 07 runs; key params:
   - `condition_hyp`, `condition_nor` — condition strings used to construct the 07 output file suffixes (default `"hypoxia"` / `"normoxia"`; set to e.g. `"mcf7six1_hypoxia"` for MCF7-SIX1)
 
@@ -81,6 +82,27 @@ The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvi
   - `run_interactions` param — TreeSHAP interaction values scale with feature count (~10 min at 56 features on 200 genes, far longer at 177). Set FALSE for large feature sets. Results cache to `shap_interactions_{suffix}.rds` and reload on re-knit.
   - Sections that need the `cds_gc`/`csc`/`hia2026_dhx29_occupancy` trio, or per-codon features, are chunk-gated (`eval=run_pair_diag` / `run_codon_tests` / `run_gc3_screen`) and skip cleanly on matrices that lack them.
   - **Use a distinct `feature_set` label for a new matrix.** The output suffix is built from params, so reusing an existing label silently overwrites that run's outputs. Existing labels used with `feature_matrix_path`: `codon_rscu` (→ `feature_matrix_codon_features.rds`), `positional_gc` (→ `feature_matrix_positional_gc.rds`).
+
+**RNA-level (abundance) readout — notebooks 70–73.** Counterpart to the TE pipeline, asking which mRNAs *lose abundance* on si3d rather than which lose TE.
+
+- `70_rna_genesets_si3d.Rmd` — builds the RNA positive + negative gene sets. YAML-parameterized (`pos_condition`, `pos_timepoint`, `pos_lfc`, `neg_padj`); defaults reproduce the hypoxia 1hr configuration byte-identically. Excludes **EIF3D** from the positive set (the siRNA depleting its own target is not eIF3d-dependent biology) while asserting it *would* have qualified, which doubles as the direction check.
+- `71_gc_content_vs_rna_changes_transcriptome.Rmd` — GC/length vs RNA and TE change, whole transcriptome.
+- `72_rna_geneset_overlap_conditions.Rmd` — hypoxia vs normoxia RNA gene set overlap (Venn), plus a power/threshold decomposition.
+- `73_global_shift_rna_vs_te_by_timepoint.Rmd` — RNA vs TE LFC densities per timepoint.
+
+**The 0.5 LFC convention does NOT transfer to raw RNA.** These contrasts are spike-in normalized and si3d lowers total mRNA per cell, so `rna_lfc` is not centred on zero and the median drifts with time:
+
+| median `rna_lfc` | 1hr | 4hr | 24hr | 1+4hr regressed |
+|---|---|---|---|---|
+| normoxia | 0.368 | 0.587 | 0.838 | 0.505 |
+| hypoxia | 0.409 | 0.176 | 0.209 | — |
+
+TE medians stay near zero (normoxia 0.109 → 0.164) because the ratio cancels the per-cell loss. Consequences:
+
+- `rna_lfc > 0.5` at hypoxia 1hr selects 4,764 genes (~40% of the transcriptome) — essentially "above median". RNA gene sets use **`lfc > 1`**, and even that is only 0.50–0.63 above the median depending on contrast.
+- **Set sizes are not comparable across contrasts at a fixed raw threshold.** Normoxia 1+4hr yields 1,282 genes vs normoxia 1hr's 705 purely because its median is 0.137 higher; matched on a centred cut they are 888 vs 841. The `padj < 0.05` filter is entirely non-binding at `lfc > 1` — set size is set by the LFC cut alone.
+- **Notebook 07 keeps ALL positives and downsamples only the negative pool** to `min(n_pos, n_neg)`. Every TE run has negatives > positives so this balances silently; RNA runs can invert it. Check the negative pool clears the positive count (nb70 asserts this), and relax `neg_padj` (0.2 → 0.1) rather than the LFC bound, which is never binding.
+- The RNA negative set is **eIF3d-protected, not unaffected** — its median `rna_lfc` (~0.03) sits well *below* the transcriptome median, so those transcripts retained mRNA while the typical one lost 25–30%. Describe results as "eIF3d-dependent vs eIF3d-protected".
 
 **Codon analysis: use bg-RSCU, not raw codon frequency, to test synonymous preference.** `codon_freq_AAA` and `codon_freq_AAG` both rise with lysine content, so raw-frequency features are dominated by amino-acid composition and report "same direction" whether or not a synonymous preference exists. `bg_rscu_*` is normalized within each synonymous family, so its SHAP direction isolates wobble choice. In the si3d hypoxia 1hr contrast these dissociate cleanly: raw frequency tracks codon positions 1–2 (ρ = −0.39, amino-acid identity) while bg-RSCU tracks position 3 (ρ = −0.67, synonymous choice). Aggregate `gc3` cannot substitute — it is 0.93-correlated with `cds_gc`, 0.66 with `gc1` via isochore structure, and nets out opposing within-family preferences.
 
@@ -148,7 +170,22 @@ Both check types must be present. `cat()` summaries are informative but are not 
 
 **Translation efficiency (TE)** = log2(ribosome footprint / RNA) computed under si3d vs sictrl knockdown. Positive TE LFC = eIF3d promotes translation; negative = inhibits.
 
-**MDA-MB-231 DESeq2 contrast direction** — despite files being named `translation_categories_si3d_vs_sictrl_*.csv`, the DESeq2 call inside `eif3e_eif3d_normoxia_and_hypoxia.Rmd` runs **sictrl as `test_condition` and si3d as `control_condition` (reference)**. The extracted coefficient is therefore log2(sictrl / si3d). Positive te_lfc = sictrl TE > si3d TE = knockdown reduces TE = eIF3d promotes. The file naming describes the experiment ("si3d knockdown study vs sictrl"), not the DESeq2 numerator/denominator. Do not confuse with MCF7-SIX1 (below).
+**MDA-MB-231 DESeq2 contrast direction — the filenames are backwards. Read this before labelling any plot.**
+
+The DESeq2 call inside `eif3e_eif3d_normoxia_and_hypoxia.Rmd` runs **sictrl as `test_condition` and si3d as `control_condition` (reference)**. In `code/functions.R`:
+
+```r
+243:  Condition = factor(comparison_variable, levels = c(control_condition, test_condition))  # control = reference
+320:  coef_name <- paste0("Condition_", test_condition, "_vs_", control_condition)             # -> "Condition_sictrl_vs_si3d"
+```
+
+So the coefficient DESeq2 actually emits is named **`sictrl_vs_si3d`**, and every column in these files is **log2(sictrl / si3d)**. The files are nonetheless written as `translation_categories_si3d_vs_sictrl_*.csv` — **the filename states the ratio in the opposite order from the coefficient it contains.** This is a known wart, kept because ~350 reference sites across ~54 notebooks depend on the current names; it is not a claim about the direction.
+
+- Positive `te_lfc` / `rna_lfc` = sictrl > si3d = knockdown **reduces** it = eIF3d **promotes**.
+- **Plot titles and axis labels must say "sictrl vs si3d" (or "log2(sictrl / si3d)"), never "si3d vs sictrl".** Copying the filename into a caption produces a figure whose title contradicts its own axis. This was caught in notebooks 71/72/73 after the fact.
+- Verify empirically rather than trusting either name: **EIF3D's own `rna_lfc` must be strongly positive** (~+2.9 at hypoxia 1hr, ~87% knockdown), because the siRNA depletes its target. If it is negative, the direction has flipped. The same check on the si3e files puts EIF3E at ~+4.9. New notebooks reading these files should assert this (see nb70/71/72/73 for the pattern).
+
+Do not confuse with MCF7-SIX1 (below).
 
 **MCF7-SIX1 directionality differs:** DESeq2 contrast is log2(si3d / sictrl), so positive LFC = eIF3d **inhibits**. Always negate: `te_lfc = -log2FoldChange` so positive = promotes (matching MDA-MB-231 convention). MCF7-SIX1 TE data lives in a separate repo: `/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia/`. Salmon RNA-seq samples for transcript selection: `NM2023_0104`, `NM2023_0114`, `NM2023_0124` (sictrl normoxia, KAPA_RNAHyper). Matches MDA-MB-231 convention. Ribosome profiling samples are `NM2023_0037–0066` — do not use for transcript selection.
 

@@ -1,0 +1,638 @@
+---
+title: "72 - Overlap of eIF3d RNA-promoted gene sets: hypoxia vs normoxia"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+How much do the two **RNA-level** eIF3d-promoted gene sets built by notebook 70
+share? Both are `rna_lfc > 1 & padj < 0.05` on the sictrl vs si3d contrast, one at
+hypoxia 1hr and one at the time-regressed normoxia 1+4hr fit.
+
+- `output/genesets/hypoxia_3d_promotes_RNA_1hr_lfc1.csv`
+- `output/genesets/normoxia_3d_promotes_RNA_1and4hr_lfc1.csv`
+
+Nothing is refit or re-thresholded here; the sets are read as written.
+
+**Direction convention.** Both contrasts are log2(sictrl / si3d), so `rna_lfc > 0`
+means the knockdown reduced the mRNA, i.e. eIF3d promotes its abundance. EIF3D
+itself is excluded from both sets by notebook 70 (it qualifies overwhelmingly, but
+that is the siRNA depleting its own target rather than eIF3d-dependent biology).
+
+**The two contrasts are not equally powered, and that shapes the reading.** This
+is the point of the last section rather than a footnote:
+
+| | hypoxia 1hr | normoxia 1+4hr |
+|---|---|---|
+| fit | single timepoint, `deFunction()` | two timepoints, `hours` as batch covariate, `deFunction_time_normalized()` |
+| global median `rna_lfc` | 0.409 | 0.505 |
+
+Normoxia draws on more samples and carries a larger global shift, so a gene can
+land in the normoxia set and miss the hypoxia set purely on detection power. A
+Venn diagram alone cannot separate "condition-specific" from "underpowered", so
+the counts are followed by an explicit test of where the non-shared genes actually
+sit in the other contrast.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ggvenn)
+```
+
+# Parameters
+
+```{r params}
+SET_FILES <- c(
+  "Hypoxia 1hr"     = "hypoxia_3d_promotes_RNA_1hr_lfc1.csv",
+  "Normoxia 1+4hr"  = "normoxia_3d_promotes_RNA_1and4hr_lfc1.csv",
+  "Normoxia 1hr"    = "normoxia_3d_promotes_RNA_1hr_lfc1.csv"
+)
+
+# Source contrasts, used only for the power section
+CONTRAST_FILES <- c(
+  "Hypoxia 1hr"    = "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "Normoxia 1+4hr" = "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "Normoxia 1hr"   = "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv"
+)
+
+# The threshold both sets were built with (notebook 70)
+POS_LFC  <- 1.0
+POS_PADJ <- 0.05
+
+# Okabe-Ito vermillion (red-orange) for hypoxia, bluish green for normoxia.
+# Both sets are eIF3d-defined, so neither uses the reserved eIF3d amber (#E69F00)
+# or eIF3e sky blue (#56B4E9) - nothing here should read as one of those factors.
+set_colors <- c("Hypoxia 1hr"    = "#D55E00",
+                "Normoxia 1+4hr" = "#009E73",
+                "Normoxia 1hr"   = "#009E73")
+```
+
+# Load Gene Sets
+
+```{r load_sets}
+paths <- here("output", "genesets", SET_FILES)
+stopifnot("gene set file not found - run notebook 70 for both configurations" =
+  all(file.exists(paths)))
+
+sets <- map(set_names(seq_along(SET_FILES), names(SET_FILES)), function(i) {
+  read_csv(paths[i], show_col_types = FALSE) %>% pull(ensembl_gene) %>% unique()
+})
+
+walk2(names(sets), sets, ~ cat(.x, ":", length(.y), "genes\n"))
+```
+
+## Validation
+
+```{r checks}
+# Version-stripped ENSEMBL IDs, or the intersect below silently under-counts
+walk2(names(sets), sets, function(nm, ids) {
+  stopifnot("ids are not version-stripped ENSG" = all(grepl("^ENSG[0-9]+$", ids)))
+})
+cat("Both sets carry version-stripped ENSG ids: PASS\n")
+
+# unique() above would mask a duplicated file; check the raw column instead
+walk2(names(SET_FILES), paths, function(nm, p) {
+  raw <- read_csv(p, show_col_types = FALSE)$ensembl_gene
+  stopifnot("duplicate gene ids in a gene set file" = !anyDuplicated(raw))
+})
+cat("No duplicate ids within either file: PASS\n")
+
+# Notebook 70 excludes the knockdown target from both sets
+symbols <- map(paths, ~ read_csv(.x, show_col_types = FALSE)$db_gene_symbol)
+stopifnot("EIF3D should have been excluded by notebook 70" =
+  !any(map_lgl(symbols, ~ "EIF3D" %in% .x)))
+cat("EIF3D absent from both sets (excluded upstream): PASS\n")
+
+# Both sets must be non-trivial and must actually overlap
+stopifnot("a gene set is empty" = all(lengths(sets) > 0))
+stopifnot("the two sets do not overlap at all - check the ID space" =
+  length(intersect(sets[[1]], sets[[2]])) > 0)
+```
+
+# Overlap
+
+```{r overlap_counts}
+H <- sets[["Hypoxia 1hr"]]
+N <- sets[["Normoxia 1+4hr"]]
+
+shared       <- intersect(H, N)
+hypoxia_only <- setdiff(H, N)
+normoxia_only <- setdiff(N, H)
+
+overlap_tbl <- tibble(
+  region = c("Shared", "Hypoxia only", "Normoxia only",
+             "Hypoxia total", "Normoxia total", "Union"),
+  n = c(length(shared), length(hypoxia_only), length(normoxia_only),
+        length(H), length(N), length(union(H, N)))
+) %>%
+  # Percentages only mean something for the three disjoint regions; on the total
+  # and union rows they exceed 100 and read as an error.
+  mutate(pct_of_hypoxia  = if_else(region %in% c("Shared", "Hypoxia only", "Normoxia only"),
+                                   round(100 * n / length(H), 1), NA_real_),
+         pct_of_normoxia = if_else(region %in% c("Shared", "Hypoxia only", "Normoxia only"),
+                                   round(100 * n / length(N), 1), NA_real_))
+print(overlap_tbl)
+
+stopifnot("region counts do not reconcile with the set sizes" =
+  length(shared) + length(hypoxia_only) == length(H) &&
+  length(shared) + length(normoxia_only) == length(N))
+
+cat("\nThe overlap is asymmetric:\n")
+cat(sprintf("  %.0f%% of the hypoxia set is inside the normoxia set\n",
+            100 * length(shared) / length(H)))
+cat(sprintf("  %.0f%% of the normoxia set is inside the hypoxia set\n",
+            100 * length(shared) / length(N)))
+cat("  -> the hypoxia set is close to a subset of the normoxia set.\n")
+```
+
+```{r venn_helper}
+# ggvenn draws list elements left to right, so the normoxia set is passed first to
+# put it on the left. fill_color indexes set_colors BY NAME, so each hue stays
+# bound to its set rather than to a position - reordering cannot mis-colour it.
+make_venn <- function(venn_list, subtitle) {
+  stopifnot("a venn set has no colour defined" =
+    all(names(venn_list) %in% names(set_colors)))
+  ggvenn(
+    venn_list,
+    fill_color      = unname(set_colors[names(venn_list)]),
+    fill_alpha      = 0.45,
+    stroke_size     = 0.5,
+    stroke_color    = "grey30",
+    set_name_size   = 4.5,
+    text_size       = 4.5,
+    show_percentage = FALSE,
+    auto_scale      = FALSE
+  ) +
+    labs(title = "eIF3d RNA-promoted genes: normoxia vs hypoxia",
+         subtitle = subtitle) +
+    theme(plot.title    = element_text(face = "bold", size = 13),
+          plot.subtitle = element_text(size = 9, colour = "grey30"))
+}
+```
+
+```{r venn, fig.width=6.5, fig.height=5.5}
+venn_list <- list(`Normoxia 1+4hr` = N, `Hypoxia 1hr` = H)
+
+p_venn <- make_venn(
+  venn_list,
+  subtitle = paste0("sictrl vs si3d, rna_lfc > ", POS_LFC, " & padj < ", POS_PADJ,
+                    ". Union = ", length(union(H, N)), " genes.\n",
+                    "Contrasts differ in power (see below); set sizes are not ",
+                    "directly comparable.")
+)
+p_venn
+ggsave(here("plots", "72_rna_geneset_venn_hypoxia_vs_normoxia.pdf"),
+       p_venn, width = 6.5, height = 5.5)
+```
+
+## Matched timepoint: normoxia 1hr vs hypoxia 1hr
+
+The comparison above confounds condition with power: the normoxia 1+4hr fit uses
+two timepoints and carries a larger global shift (0.505 vs 0.409), so a fixed
+`rna_lfc > 1` bar admits more genes there. Repeating it against the **single
+timepoint** normoxia 1hr contrast removes that confound - both sides are then one
+timepoint, `deFunction()`, with near-identical global medians (0.368 vs 0.409).
+
+```{r venn_matched, fig.width=6.5, fig.height=5.5}
+N1 <- sets[["Normoxia 1hr"]]
+
+shared_1hr        <- intersect(H, N1)
+hypoxia_only_1hr  <- setdiff(H, N1)
+normoxia_only_1hr <- setdiff(N1, H)
+
+matched_tbl <- tibble(
+  region = c("Shared", "Hypoxia 1hr only", "Normoxia 1hr only",
+             "Hypoxia total", "Normoxia total", "Union"),
+  n = c(length(shared_1hr), length(hypoxia_only_1hr), length(normoxia_only_1hr),
+        length(H), length(N1), length(union(H, N1)))
+)
+print(matched_tbl)
+stopifnot("matched region counts do not reconcile" =
+  length(shared_1hr) + length(hypoxia_only_1hr) == length(H) &&
+  length(shared_1hr) + length(normoxia_only_1hr) == length(N1))
+
+p_venn_1hr <- make_venn(
+  list(`Normoxia 1hr` = N1, `Hypoxia 1hr` = H),
+  subtitle = paste0("Matched single timepoint. sictrl vs si3d, rna_lfc > ", POS_LFC,
+                    " & padj < ", POS_PADJ, ". Union = ",
+                    length(union(H, N1)), " genes.\n",
+                    "Global medians are comparable here (normoxia ",
+                    round(median(read_csv(here("output", CONTRAST_FILES[["Normoxia 1hr"]]),
+                                          show_col_types = FALSE)$rna_lfc, na.rm = TRUE), 2),
+                    ", hypoxia 0.41), so set sizes can be compared directly.")
+)
+p_venn_1hr
+ggsave(here("plots", "72_rna_geneset_venn_normoxia1hr_vs_hypoxia1hr.pdf"),
+       p_venn_1hr, width = 6.5, height = 5.5)
+
+write_csv(matched_tbl, here("output", "72_rna_geneset_overlap_matched_1hr.csv"))
+```
+
+The direction of the asymmetry flips once the timepoint is matched, which is the
+cleanest evidence that the first Venn was reporting a thresholding difference
+rather than condition-specific biology.
+
+# Correlation of RNA Changes: Normoxia vs Hypoxia
+
+Gene-by-gene, transcriptome-wide: normoxia `rna_lfc` on x, hypoxia `rna_lfc` on y.
+This is the continuous version of the Venn - it uses every gene rather than only
+those clearing a threshold, so it is not sensitive to where the cut was placed.
+
+Values are plotted **raw**, not centred, because the offset between the two
+contrasts is itself the thing to see: a cloud sitting parallel to but off the
+y = x line means the two conditions rank genes the same way while differing in
+overall magnitude. Each contrast's global median is drawn, and y = x is shown for
+reference.
+
+```{r correlation_data}
+de_all <- map(set_names(names(CONTRAST_FILES)), function(nm) {
+  read_csv(here("output", CONTRAST_FILES[[nm]]), show_col_types = FALSE) %>%
+    dplyr::select(gene_id, symbol, rna_lfc, rna_padj) %>%
+    mutate(ensembl_gene = sub("\\..*", "", gene_id))
+})
+
+# Drop EIF3D from the correlation: it is the siRNA target, sits at rna_lfc ~3 in
+# every contrast, and as a single extreme point in the corner it would inflate
+# Pearson noticeably while telling us nothing about eIF3d-dependent biology.
+build_pair <- function(norm_name) {
+  inner_join(
+    de_all[[norm_name]] %>% dplyr::select(ensembl_gene, symbol, x = rna_lfc),
+    de_all[["Hypoxia 1hr"]] %>% dplyr::select(ensembl_gene, y = rna_lfc),
+    by = "ensembl_gene"
+  ) %>%
+    filter(!is.na(x), !is.na(y), symbol != "EIF3D")
+}
+
+pairs_list <- list(
+  "Normoxia 1+4hr" = build_pair("Normoxia 1+4hr"),
+  "Normoxia 1hr"   = build_pair("Normoxia 1hr")
+)
+walk2(names(pairs_list), pairs_list, ~ cat(.x, "vs Hypoxia 1hr:", nrow(.y), "genes\n"))
+stopifnot("a correlation pair is empty" = all(map_int(pairs_list, nrow) > 8000))
+```
+
+```{r correlation_stats}
+cor_stats <- map_dfr(names(pairs_list), function(nm) {
+  d <- pairs_list[[nm]]
+  tibble(
+    comparison  = paste0(nm, " vs Hypoxia 1hr"),
+    pearson_r   = cor(d$x, d$y, method = "pearson"),
+    spearman_rho = cor(d$x, d$y, method = "spearman"),
+    slope       = unname(coef(lm(y ~ x, data = d))[2]),
+    median_x    = median(d$x),
+    median_y    = median(d$y),
+    n           = nrow(d)
+  )
+}) %>%
+  mutate(across(c(pearson_r, spearman_rho, slope, median_x, median_y), ~ round(.x, 3)))
+print(as.data.frame(cor_stats))
+write_csv(cor_stats, here("output", "72_normoxia_vs_hypoxia_correlation.csv"))
+```
+
+```{r correlation_plots, fig.width=6, fig.height=5.5}
+make_cor_plot <- function(nm) {
+  d  <- pairs_list[[nm]]
+  st <- cor_stats %>% filter(str_detect(comparison, fixed(nm)))
+  lim <- quantile(c(d$x, d$y), c(0.005, 0.995), na.rm = TRUE)
+
+  ggplot(d, aes(x = x, y = y)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "solid",
+                colour = "grey75", linewidth = 0.5) +
+    geom_vline(xintercept = st$median_x, linetype = "dashed",
+               colour = "#009E73", linewidth = 0.4) +
+    geom_hline(yintercept = st$median_y, linetype = "dashed",
+               colour = "#D55E00", linewidth = 0.4) +
+    geom_point(alpha = 0.15, size = 0.35, colour = "grey45") +
+    geom_smooth(method = "lm", formula = y ~ x, se = TRUE,
+                colour = "#0072B2", fill = "#0072B2", alpha = 0.25,
+                linewidth = 1) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.6, size = 3.2,
+             colour = "grey20",
+             label = paste0("Pearson R = ", st$pearson_r,
+                            "\nSpearman rho = ", st$spearman_rho,
+                            "\nslope = ", st$slope,
+                            "\nn = ", st$n)) +
+    coord_cartesian(xlim = lim, ylim = lim) +
+    labs(
+      title = paste0("RNA changes on eIF3d knockdown: ", nm, " vs hypoxia 1hr"),
+      subtitle = paste0("Grey line = y = x. Dashed = each contrast's global median ",
+                        "(x ", st$median_x, ", y ", st$median_y, ").\n",
+                        "Blue = linear fit with 95% CI, computed on all genes. ",
+                        "EIF3D excluded."),
+      x = paste0(nm, " rna_lfc, log2(sictrl / si3d)"),
+      y = "Hypoxia 1hr rna_lfc, log2(sictrl / si3d)"
+    ) +
+    theme_classic(base_size = 12)
+}
+
+p_cor_1and4 <- make_cor_plot("Normoxia 1+4hr")
+p_cor_1and4
+ggsave(here("plots", "72_cor_normoxia1and4hr_vs_hypoxia1hr.pdf"),
+       p_cor_1and4, width = 6, height = 5.5)
+
+p_cor_1hr <- make_cor_plot("Normoxia 1hr")
+p_cor_1hr
+ggsave(here("plots", "72_cor_normoxia1hr_vs_hypoxia1hr.pdf"),
+       p_cor_1hr, width = 6, height = 5.5)
+```
+
+# Export Gene Lists
+
+```{r export}
+sym_map <- map_dfr(paths, ~ read_csv(.x, show_col_types = FALSE) %>%
+                     dplyr::select(ensembl_gene, db_gene_symbol)) %>%
+  distinct(ensembl_gene, .keep_all = TRUE)
+
+region_tbl <- bind_rows(
+  tibble(ensembl_gene = shared,        region = "shared"),
+  tibble(ensembl_gene = hypoxia_only,  region = "hypoxia_only"),
+  tibble(ensembl_gene = normoxia_only, region = "normoxia_only")
+) %>%
+  left_join(sym_map, by = "ensembl_gene") %>%
+  dplyr::select(ensembl_gene, db_gene_symbol, region) %>%
+  arrange(region, db_gene_symbol)
+
+stopifnot("export lost or gained genes" =
+  nrow(region_tbl) == length(union(H, N)))
+stopifnot("a gene was assigned to more than one region" =
+  !anyDuplicated(region_tbl$ensembl_gene))
+
+print(region_tbl %>% dplyr::count(region))
+write_csv(overlap_tbl, here("output", "72_rna_geneset_overlap.csv"))
+write_csv(region_tbl,  here("output", "72_rna_geneset_overlap_genes.csv"))
+cat("\nWrote output/72_rna_geneset_overlap.csv and _genes.csv\n")
+```
+
+# Is the Asymmetry Power or Biology?
+
+602 genes are normoxia-only. Two explanations produce that count and the Venn
+cannot distinguish them:
+
+- **Power** - the gene behaves the same way in hypoxia but sits under the
+  threshold, because the single-timepoint hypoxia fit is noisier.
+- **Biology** - the gene is genuinely unaffected by si3d in hypoxia.
+
+These make opposite predictions about where the non-shared genes sit in the *other*
+contrast. A power-limited gene should still be shifted up, just short of the cut;
+a condition-specific gene should sit at that contrast's global median.
+
+```{r load_contrasts}
+de <- map(set_names(seq_along(CONTRAST_FILES), names(CONTRAST_FILES)), function(i) {
+  read_csv(here("output", CONTRAST_FILES[i]), show_col_types = FALSE) %>%
+    dplyr::select(gene_id, symbol, rna_lfc, rna_padj) %>%
+    mutate(ensembl_gene = sub("\\..*", "", gene_id))
+})
+
+medians <- map_dbl(de, ~ median(.x$rna_lfc, na.rm = TRUE))
+print(round(medians, 3))
+
+# Direction spot-check on both contrasts before drawing any conclusion from them
+walk2(names(de), de, function(nm, d) {
+  e <- d %>% filter(symbol == "EIF3D")
+  stopifnot("EIF3D missing from a contrast" = nrow(e) == 1)
+  stopifnot("EIF3D rna_lfc not positive - direction convention may have flipped" =
+    e$rna_lfc > 0.5)
+  cat(nm, ": EIF3D rna_lfc =", round(e$rna_lfc, 2), "-> log2(sictrl / si3d) confirmed\n")
+})
+```
+
+```{r power_test}
+# Where do the normoxia-only genes sit in the HYPOXIA contrast, and vice versa?
+describe_in_other <- function(ids, other, other_name, other_median) {
+  d <- other %>% filter(ensembl_gene %in% ids)
+  tibble(
+    group             = other_name,
+    n                 = nrow(d),
+    median_rna_lfc    = median(d$rna_lfc, na.rm = TRUE),
+    contrast_median   = other_median,
+    above_contrast_med = mean(d$rna_lfc > other_median, na.rm = TRUE),
+    above_half        = mean(d$rna_lfc > 0.5, na.rm = TRUE),
+    above_threshold   = mean(d$rna_lfc > POS_LFC, na.rm = TRUE),
+    sig_and_above     = mean(d$rna_lfc > POS_LFC & d$rna_padj < POS_PADJ, na.rm = TRUE)
+  )
+}
+
+power_tbl <- bind_rows(
+  describe_in_other(normoxia_only, de[["Hypoxia 1hr"]],
+                    "normoxia-only genes, scored in hypoxia", medians[["Hypoxia 1hr"]]),
+  describe_in_other(hypoxia_only, de[["Normoxia 1+4hr"]],
+                    "hypoxia-only genes, scored in normoxia", medians[["Normoxia 1+4hr"]]),
+  describe_in_other(shared, de[["Hypoxia 1hr"]],
+                    "shared genes, scored in hypoxia (reference)", medians[["Hypoxia 1hr"]]),
+  # background: all genes, to show what "no effect" looks like in each contrast
+  describe_in_other(de[["Hypoxia 1hr"]]$ensembl_gene, de[["Hypoxia 1hr"]],
+                    "all genes, hypoxia (background)", medians[["Hypoxia 1hr"]])
+) %>%
+  mutate(across(c(median_rna_lfc, contrast_median), ~ round(.x, 3)),
+         across(c(above_contrast_med, above_half, above_threshold, sig_and_above),
+                ~ round(100 * .x, 1)))
+print(as.data.frame(power_tbl))
+```
+
+`above_contrast_med` is the discriminating column. If the non-shared genes were
+condition-specific, roughly 50% of them would sit above the other contrast's
+median, matching background. A value well above 50% means they are shifted in the
+same direction there too and simply missed the cut.
+
+```{r power_verdict}
+norm_only_row <- power_tbl %>% filter(str_detect(group, "^normoxia-only"))
+bg_row        <- power_tbl %>% filter(str_detect(group, "background"))
+
+cat("normoxia-only genes above the hypoxia median:",
+    norm_only_row$above_contrast_med, "%\n")
+cat("background genes above the hypoxia median   :",
+    bg_row$above_contrast_med, "% (50% by construction)\n\n")
+
+if (norm_only_row$above_contrast_med > 65) {
+  cat("VERDICT: the normoxia-only genes are shifted in the same direction in\n",
+      "hypoxia as well, so the asymmetry is mostly DETECTION POWER, not a\n",
+      "hypoxia-specific loss of eIF3d dependence.\n")
+} else if (norm_only_row$above_contrast_med < 55) {
+  cat("VERDICT: the normoxia-only genes sit at the hypoxia background, so they\n",
+      "look genuinely NORMOXIA-SPECIFIC rather than underpowered.\n")
+} else {
+  cat("VERDICT: intermediate - partly power, partly condition-specific.\n")
+}
+```
+
+```{r plot_power, fig.width=8, fig.height=4.5}
+plot_dat <- bind_rows(
+  de[["Hypoxia 1hr"]] %>% filter(ensembl_gene %in% normoxia_only) %>%
+    mutate(group = "Normoxia only"),
+  de[["Hypoxia 1hr"]] %>% filter(ensembl_gene %in% shared) %>%
+    mutate(group = "Shared"),
+  de[["Hypoxia 1hr"]] %>% mutate(group = "All genes")
+) %>%
+  mutate(group = factor(group, levels = c("Shared", "Normoxia only", "All genes")))
+
+p_power <- ggplot(plot_dat, aes(x = rna_lfc, colour = group)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = medians[["Hypoxia 1hr"]], linetype = "dashed",
+             colour = "grey50", linewidth = 0.5) +
+  geom_vline(xintercept = POS_LFC, linetype = "dotted",
+             colour = "grey30", linewidth = 0.5) +
+  scale_colour_manual(values = c("Shared" = "grey20",
+                                 "Normoxia only" = "#009E73",
+                                 "All genes" = "grey65"), name = NULL) +
+  coord_cartesian(xlim = quantile(de[["Hypoxia 1hr"]]$rna_lfc,
+                                  c(0.005, 0.995), na.rm = TRUE)) +
+  labs(
+    title = "Where the non-shared genes sit in the hypoxia contrast",
+    subtitle = paste0("Dashed = hypoxia global median (",
+                      round(medians[["Hypoxia 1hr"]], 2),
+                      "); dotted = the lfc > ", POS_LFC, " threshold.\n",
+                      "If 'Normoxia only' tracks 'All genes' it is condition-specific; ",
+                      "if it sits between, it is underpowered."),
+    x = "rna_lfc in hypoxia 1hr, log2(sictrl / si3d)",
+    y = "Cumulative fraction of genes"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_power
+ggsave(here("plots", "72_normoxia_only_genes_in_hypoxia_ecdf.pdf"),
+       p_power, width = 8, height = 4.5)
+```
+
+# Are the Region-Specific Genes Mechanistically Different?
+
+The notebook 07 RNA classifiers ranked `log2_utr5_length` first in both conditions,
+with the GC block rising to ranks 2-6 in normoxia. If the hypoxia-only genes are a
+mechanistically distinct class rather than a threshold artifact, they should differ
+from the shared genes on those same features.
+
+Read the effect sizes, not the p-values: with hundreds of genes per region a
+sub-percentage-point GC difference reaches significance without meaning much.
+
+```{r region_features}
+features <- readRDS(here("output", "predictive_modeling",
+                         "feature_matrix_external_stability.rds"))
+stopifnot("feature matrix is not one row per gene" =
+  !anyDuplicated(features$gene_id_clean))
+
+FEATS <- c("log2_utr5_length" = "log2 5'UTR length",
+           "log2_cds_length"  = "log2 CDS length",
+           "utr5_gc"          = "5'UTR GC%",
+           "cds_gc"           = "CDS GC%",
+           "gc3"              = "GC3",
+           "csc"              = "CSC")
+stopifnot("expected feature columns missing" = all(names(FEATS) %in% colnames(features)))
+
+region_feat <- region_tbl %>%
+  inner_join(features %>% dplyr::select(ensembl_gene = gene_id_clean, all_of(names(FEATS))),
+             by = "ensembl_gene")
+
+# Background = everything in the matrix that is in neither set
+bg_feat <- features %>%
+  filter(!gene_id_clean %in% union(H, N)) %>%
+  dplyr::select(all_of(names(FEATS))) %>%
+  mutate(region = "background")
+
+feat_all <- bind_rows(region_feat %>% dplyr::select(region, all_of(names(FEATS))), bg_feat) %>%
+  mutate(region = factor(region, levels = c("shared", "hypoxia_only",
+                                            "normoxia_only", "background")))
+print(feat_all %>% dplyr::count(region))
+stopifnot("a region has no genes in the feature matrix" =
+  all(dplyr::count(feat_all, region)$n > 0))
+```
+
+```{r region_feature_table}
+# Median per region, plus each region tested against the shared set (the reference
+# class), since "is the region-specific fraction different from the core?" is the
+# question. Wilcoxon on medians; BH across all region x feature comparisons.
+med_tbl <- feat_all %>%
+  pivot_longer(-region, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  group_by(feature, region) %>%
+  summarise(median = median(value), n = dplyr::n(), .groups = "drop") %>%
+  mutate(label = unname(FEATS[feature]))
+
+wide_med <- med_tbl %>%
+  dplyr::select(label, region, median) %>%
+  pivot_wider(names_from = region, values_from = median) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+print(as.data.frame(wide_med))
+
+vs_shared <- map_dfr(names(FEATS), function(f) {
+  map_dfr(c("hypoxia_only", "normoxia_only", "background"), function(r) {
+    a <- feat_all %>% filter(region == r)        %>% pull(all_of(f))
+    b <- feat_all %>% filter(region == "shared") %>% pull(all_of(f))
+    a <- a[!is.na(a)]; b <- b[!is.na(b)]
+    tibble(feature = unname(FEATS[f]), region = r,
+           median_region = median(a), median_shared = median(b),
+           delta = median(a) - median(b),
+           p = suppressWarnings(wilcox.test(a, b)$p.value),
+           n_region = length(a))
+  })
+}) %>%
+  mutate(p_adj = p.adjust(p, method = "BH"),
+         across(c(median_region, median_shared, delta), ~ round(.x, 3)),
+         across(c(p, p_adj), ~ signif(.x, 3))) %>%
+  arrange(desc(abs(delta)))
+print(as.data.frame(vs_shared), row.names = FALSE)
+write_csv(vs_shared, here("output", "72_region_feature_comparison.csv"))
+```
+
+```{r plot_region_features, fig.width=10, fig.height=6}
+# Same hue assignment as the Venn: vermillion = hypoxia, green = normoxia.
+region_colors <- c("shared" = "grey30", "hypoxia_only" = "#D55E00",
+                   "normoxia_only" = "#009E73", "background" = "grey70")
+
+feat_long <- feat_all %>%
+  pivot_longer(-region, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(label = factor(unname(FEATS[feature]), levels = unname(FEATS)))
+
+facet_n <- feat_long %>%
+  dplyr::count(label, region) %>%
+  group_by(label) %>%
+  summarise(txt = paste0("n = ", min(n), " to ", max(n), " per region"), .groups = "drop")
+
+p_region <- ggplot(feat_long, aes(x = region, y = value, fill = region)) +
+  geom_boxplot(outlier.size = 0.3, linewidth = 0.4, alpha = 0.75) +
+  geom_text(data = facet_n, aes(x = Inf, y = Inf, label = txt),
+            inherit.aes = FALSE, hjust = 1.05, vjust = 1.4,
+            size = 2.8, colour = "grey30") +
+  scale_fill_manual(values = region_colors, guide = "none") +
+  facet_wrap(~ label, ncol = 3, scales = "free_y") +
+  labs(
+    title = "Sequence features by Venn region",
+    subtitle = "Do the condition-specific genes differ from the shared core? Tested against 'shared' in the table above.",
+    x = NULL, y = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 35, hjust = 1, size = 8))
+p_region
+ggsave(here("plots", "72_region_sequence_features.pdf"),
+       p_region, width = 10, height = 6)
+```
+
+# Summary
+
+```{r summary}
+cat("Hypoxia 1hr set     :", length(H), "genes\n")
+cat("Normoxia 1+4hr set  :", length(N), "genes\n")
+cat("Shared              :", length(shared),
+    sprintf("(%.0f%% of hypoxia, %.0f%% of normoxia)\n",
+            100 * length(shared) / length(H), 100 * length(shared) / length(N)))
+cat("Hypoxia only        :", length(hypoxia_only), "\n")
+cat("Normoxia only       :", length(normoxia_only), "\n")
+cat("Union               :", length(union(H, N)), "\n\n")
+cat("Outputs:\n")
+cat("  output/72_rna_geneset_overlap.csv\n")
+cat("  output/72_rna_geneset_overlap_genes.csv\n")
+cat("  output/72_region_feature_comparison.csv\n")
+cat("  plots/72_rna_geneset_venn_hypoxia_vs_normoxia.pdf\n")
+cat("  plots/72_normoxia_only_genes_in_hypoxia_ecdf.pdf\n")
+cat("  plots/72_region_sequence_features.pdf\n")
+```

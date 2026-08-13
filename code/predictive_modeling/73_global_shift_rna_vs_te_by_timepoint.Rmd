@@ -1,0 +1,260 @@
+---
+title: "73 - Global shift in RNA vs TE across si3d timepoints"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Distribution of sictrl vs si3d log2 fold changes at every timepoint, plotted for
+**RNA** and **TE** side by side, one figure per oxygen condition.
+
+The point is the contrast between the two readouts. These contrasts are spike-in
+normalized and eIF3d knockdown lowers total mRNA per cell, so the raw `rna_lfc`
+distribution is not centred on zero and drifts further from zero the longer the
+knockdown runs. TE is a ratio of ribosome footprints to RNA, so that per-cell loss
+largely cancels and the TE distribution stays put. Medians from the source files:
+
+| normoxia | med RNA | med TE |   | hypoxia | med RNA | med TE |
+|---|---|---|---|---|---|---|
+| 1hr  | 0.368 | 0.109 | | 1hr  | 0.409 | 0.289 |
+| 4hr  | 0.587 | 0.153 | | 4hr  | 0.176 | -0.006 |
+| 24hr | 0.838 | 0.164 | | 24hr | 0.209 | -0.034 |
+
+This is the reason the project's 0.5 LFC convention works on TE but not on raw RNA:
+at normoxia 24hr a fixed `rna_lfc > 1` cut sits only 0.16 above the median and
+selects ~35% of the transcriptome, while the same cut on TE is still far out in
+the tail.
+
+**Direction convention.** Every contrast is log2(sictrl / si3d) - the producing
+notebook `eif3e_eif3d_normoxia_and_hypoxia.Rmd` runs DESeq2 with the knockdown as
+the reference. Positive = knockdown reduces it = eIF3d promotes. Asserted below
+against EIF3D itself.
+
+Nothing is refit here; all values are read from the saved `translation_categories_*`
+files.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+# Parameters
+
+```{r params}
+CONDITIONS <- c("normoxia", "hypoxia")
+
+# Readouts in measurement order: RNA and RIBO are the two measured libraries, TE
+# is the derived ratio. All three legs are fit by the same producing notebook with
+# spikeInMatrix = spikein_filtered / keepSpikes = top500_ids and
+# control_condition = "si3d" / test_condition = "sictrl", so all three are
+# spike-in normalized log2(sictrl / si3d).
+READOUTS <- c("rna_lfc" = "RNA change", "ribo_lfc" = "RIBO change",
+              "te_lfc" = "TE change")
+TIMEPOINTS <- c("1hr", "4hr", "24hr")
+
+# Timepoint palette. Okabe-Ito hues that are NOT the reserved eIF3d amber
+# (#E69F00) or eIF3e sky blue (#56B4E9); ordered so the series reads as a
+# progression from early to late.
+tp_colors <- c("1hr" = "#0072B2", "4hr" = "#009E73", "24hr" = "#D55E00")
+
+# Display window. The LFC tails run past +/-5 on a handful of genes; clipping the
+# axis keeps the bulk of the distribution legible. Densities are estimated on the
+# full data, so the curves themselves are unaffected.
+X_LIM <- c(-1, 2)
+```
+
+# Load Contrasts
+
+```{r load_data}
+grid <- expand_grid(condition = CONDITIONS, timepoint = TIMEPOINTS) %>%
+  mutate(path = here("output", paste0("translation_categories_si3d_vs_sictrl_",
+                                      condition, "_", timepoint, ".csv")))
+stopifnot("missing a translation_categories input file" = all(file.exists(grid$path)))
+
+de <- grid %>%
+  # Only the LFC columns are used; padj is never read in this notebook.
+  mutate(data = map(path, ~ read_csv(.x, show_col_types = FALSE) %>%
+                      dplyr::select(gene_id, symbol, all_of(names(READOUTS))))) %>%
+  dplyr::select(-path) %>%
+  unnest(data) %>%
+  mutate(condition = factor(condition, levels = CONDITIONS),
+         timepoint = factor(timepoint, levels = TIMEPOINTS))
+
+cat("Loaded", nrow(de), "rows across", n_distinct(de$condition) * n_distinct(de$timepoint),
+    "contrasts\n")
+print(de %>% dplyr::count(condition, timepoint))
+```
+
+## Validation
+
+```{r checks}
+by_contrast <- de %>% group_by(condition, timepoint) %>% group_split()
+
+# 1. Same gene UNIVERSE, not merely the same gene count. Two files can both have
+#    11,879 rows and still cover different genes; comparing their densities would
+#    then be meaningless.
+n_per <- de %>% dplyr::count(condition, timepoint) %>% pull(n)
+stopifnot("contrasts do not share a common gene count" = n_distinct(n_per) == 1)
+ids <- lapply(by_contrast, function(d) sort(d$gene_id))
+stopifnot("contrasts share a gene count but not the same gene universe" =
+  all(vapply(ids[-1], identical, logical(1), ids[[1]])))
+
+# 2. No two contrasts are the same data. Catches a duplicated or mistyped path in
+#    the grid above, which the count and universe checks would both pass.
+stopifnot("two contrasts contain identical rna_lfc - check for a duplicated path" =
+  !any(duplicated(lapply(by_contrast, function(d) d$rna_lfc))))
+
+# LFCs must be finite where present
+for (v in names(READOUTS)) {
+  stopifnot(all(is.finite(de[[v]][!is.na(de[[v]])])))
+}
+cat("All LFCs finite, six contrasts of", unique(n_per), "genes each: PASS\n")
+
+# Direction convention: EIF3D is the knockdown target, so its own mRNA must be
+# depleted in si3d, i.e. strongly positive under log2(sictrl / si3d).
+eif3d <- de %>% filter(symbol == "EIF3D") %>%
+  dplyr::select(condition, timepoint, all_of(names(READOUTS)))
+print(eif3d)
+stopifnot("EIF3D rna_lfc not positive in every contrast - direction may have flipped" =
+  all(eif3d$rna_lfc > 0.5))
+cat("EIF3D rna_lfc positive in all six contrasts -> log2(sictrl / si3d) confirmed\n")
+
+# 3. Knockdown identity. The si3d and si3e filenames differ by one character, so
+#    loading the wrong set is an easy mistake and every other check would pass on
+#    them. In si3d files EIF3D is depleted (rna_lfc 2.7-4.7) and EIF3E only mildly
+#    so (0.1-1.0); in si3e files that reverses completely (EIF3D -0.6 to 0.4,
+#    EIF3E 4.5-6.8). The relative comparison is more robust than an absolute
+#    threshold on either gene alone.
+kd_ident <- de %>%
+  filter(symbol %in% c("EIF3D", "EIF3E")) %>%
+  dplyr::select(condition, timepoint, symbol, rna_lfc) %>%
+  pivot_wider(names_from = symbol, values_from = rna_lfc)
+print(kd_ident %>% mutate(across(where(is.numeric), ~ round(.x, 2))))
+stopifnot("EIF3D is not depleted more than EIF3E - are these si3e files?" =
+  all(kd_ident$EIF3D > kd_ident$EIF3E))
+cat("EIF3D depleted more than EIF3E in all six -> these are si3d contrasts\n")
+```
+
+# Medians
+
+```{r medians}
+# Long form built once here; both the median table and the density plots use it.
+lfc_long <- de %>%
+  pivot_longer(all_of(names(READOUTS)), names_to = "readout", values_to = "lfc") %>%
+  filter(!is.na(lfc)) %>%
+  mutate(readout = factor(unname(READOUTS[readout]), levels = unname(READOUTS)))
+
+med_tbl <- lfc_long %>%
+  group_by(condition, readout, timepoint) %>%
+  summarise(median = median(lfc), n = dplyr::n(), .groups = "drop")
+
+print(med_tbl %>%
+        dplyr::select(-n) %>%
+        pivot_wider(names_from = timepoint, values_from = median) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+# The headline claim of the notebook, asserted rather than asserted in prose:
+# in normoxia the RNA median grows with time while the TE median does not.
+pull_med <- function(cond, rd) {
+  med_tbl %>% filter(condition == cond, readout == rd) %>%
+    arrange(timepoint) %>% pull(median)
+}
+nor_rna  <- pull_med("normoxia", "RNA change")
+nor_ribo <- pull_med("normoxia", "RIBO change")
+nor_te   <- pull_med("normoxia", "TE change")
+
+# RIBO must drift with time alongside RNA - that parallel movement is what makes
+# the flat TE curve evidence of a shared per-cell loss rather than a TE effect.
+stopifnot("normoxia RIBO median is not monotonically increasing with time" =
+  all(diff(nor_ribo) > 0))
+stopifnot("normoxia RNA median is not monotonically increasing with time" =
+  all(diff(nor_rna) > 0))
+stopifnot("normoxia RNA drift should exceed TE drift by a wide margin" =
+  (max(nor_rna) - min(nor_rna)) > 3 * (max(nor_te) - min(nor_te)))
+cat("\nNormoxia median drift 1hr -> 24hr:  RNA", round(max(nor_rna) - min(nor_rna), 3),
+    " RIBO", round(max(nor_ribo) - min(nor_ribo), 3),
+    " TE", round(max(nor_te) - min(nor_te), 3), "\n")
+```
+
+# Density Plots
+
+Outline only, no fill: with three overlapping curves per panel a filled density
+hides whichever series is drawn underneath.
+
+```{r density_helper}
+make_density <- function(cond) {
+  d <- lfc_long %>% filter(condition == cond)
+  meds <- med_tbl %>% filter(condition == cond)
+  # n varies by a gene or two between timepoints (a handful are NA in one contrast
+  # only). unique(range()) gives one value when the counts agree and two when they
+  # do not, so this is always a single string - geom_text cannot stack labels.
+  n_lab <- d %>%
+    dplyr::count(readout, timepoint) %>%
+    group_by(readout) %>%
+    summarise(txt = paste0("n = ", paste(unique(range(n)), collapse = " to "),
+                           " per timepoint"), .groups = "drop")
+  stopifnot("n label must be one row per panel" = nrow(n_lab) == n_distinct(d$readout))
+
+  ggplot(d, aes(x = lfc, colour = timepoint)) +
+    # per-timepoint medians, same hue as their curve
+    geom_vline(data = meds, aes(xintercept = median, colour = timepoint),
+               linetype = "dashed", linewidth = 0.4, show.legend = FALSE) +
+    geom_density(fill = NA, linewidth = 0.8) +
+    scale_colour_manual(values = tp_colors, name = "Timepoint") +
+    geom_text(data = n_lab, aes(x = Inf, y = Inf, label = txt),
+              inherit.aes = FALSE, hjust = 1.05, vjust = 1.5,
+              size = 3, colour = "grey30") +
+    coord_cartesian(xlim = X_LIM) +
+    facet_wrap(~ readout, ncol = 3) +
+    labs(
+      title = paste0("sictrl vs si3d log2FC by timepoint: ", cond),
+      x = "log2FC (sictrl / si3d)",
+      y = "Density"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(strip.text = element_text(face = "bold"),
+          legend.position = "top")
+}
+```
+
+```{r density_normoxia, fig.width=13, fig.height=4.5}
+p_nor <- make_density("normoxia")
+p_nor
+ggsave(here("plots", "73_density_rna_vs_te_normoxia.pdf"), p_nor, width = 13, height = 4.5)
+```
+
+```{r density_hypoxia, fig.width=13, fig.height=4.5}
+p_hyp <- make_density("hypoxia")
+p_hyp
+ggsave(here("plots", "73_density_rna_vs_te_hypoxia.pdf"), p_hyp, width = 13, height = 4.5)
+```
+
+# Summary
+
+```{r summary}
+write_csv(med_tbl, here("output", "73_median_lfc_by_timepoint.csv"))
+
+hyp_rna <- pull_med("hypoxia", "RNA change")
+hyp_te  <- pull_med("hypoxia", "TE change")
+
+# first()/last() rather than [1]/[3], so this does not mis-report if TIMEPOINTS changes
+cat("Normoxia: RNA median moves", round(first(nor_rna), 3), "->", round(last(nor_rna), 3),
+    "while TE moves", round(first(nor_te), 3), "->", round(last(nor_te), 3), "\n")
+cat("Hypoxia : RNA median moves", round(first(hyp_rna), 3), "->", round(last(hyp_rna), 3),
+    "while TE moves", round(first(hyp_te), 3), "->", round(last(hyp_te), 3), "\n\n")
+
+cat("Outputs:\n")
+cat("  output/73_median_lfc_by_timepoint.csv\n")
+cat("  plots/73_density_rna_vs_te_normoxia.pdf\n")
+cat("  plots/73_density_rna_vs_te_hypoxia.pdf\n")
+```

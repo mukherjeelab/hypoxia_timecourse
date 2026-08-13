@@ -7,6 +7,7 @@ params:
   condition: "hypoxia"
   gene: "3d"
   direction: "promotes"
+  readout: "TE"
   timepoint: "1hr"
   lfc: "0.5"
   feature_set: "external_stability"
@@ -60,16 +61,26 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 #
 if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
-    condition = "hypoxia",        # "hypoxia" | "normoxia" | mcf7six1_hypoxia | mcf7six1_normoxia
+    condition = "normoxia",       # "hypoxia" | "normoxia" | mcf7six1_hypoxia | mcf7six1_normoxia
     gene      = "3d",             # "3d" | "3e"
     direction = "promotes",       # "promotes" | "inhibits"
-    timepoint = "1hr",            # "1hr" | "4hr" | "24hr" | "1and4hr" | "alltimepoints" |"1hr_not3e"
+    readout   = "TE",            # "TE"  — translation efficiency sets (default; all existing runs)
+                                  # "RNA" — mRNA-abundance sets from notebook 70
+                                  # Slots into the geneset filename in place of "TE" and is appended
+                                  # to the output suffix only when != "TE", so every existing TE run
+                                  # keeps its current filenames (07c looks up rf_classifier_{suffix}.rds).
+                                  # For "RNA" use lfc="1" and an explicit neg_geneset_csv — the RNA
+                                  # contrasts are spike-in shifted (median rna_lfc ~0.41 at hypoxia
+                                  # 1hr), so the 0.5 TE standard selects ~40% of the transcriptome.
+    timepoint = "1and4hr",            # "1hr" | "4hr" | "24hr" | "1and4hr" | "alltimepoints" |"1hr_not3e"
                                   # | "normoxia_specific" | "hypoxia_specific" | any custom string
                                   # Used to build positive geneset filename:
                                   #   {condition}_{gene}_{direction}_TE_{timepoint}_lfc{lfc}.csv
                                   # Note: "alltimepoints" / "1and4hr" load from output/ (full DESeq2 csv);
                                   #       all others load from output/genesets/ (pre-filtered csv)
-    lfc       = "0.5",            # LFC threshold string used in geneset filename: "0.5" | "1" | etc.
+    lfc       = "0.5",              # LFC threshold string used in geneset filename: "0.5" | "1" | etc.
+                                  # RNA readout needs "1": at these medians a 0.5 cut selects
+                                  # 35-40% of the transcriptome (see nb70 rationale).
     feature_set = "external_stability", # "external_stability" — mRNA stability features; after running 01j
                                         #                        also includes positional CSC (first 75 codons + 4 quarters)
                                         # "targeted"          — biological + lengths + GC + ORFquant + lit sigs
@@ -88,12 +99,16 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     exclude_4e_features     = FALSE, # TRUE = remove eIF4E circular features
     exclude_own_te_features = TRUE,  # TRUE = remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
                                      #        recommended when pos/neg sets are defined by TE changes
-    neg_geneset_csv = ""             # "" = use default negative_control_genes.csv (genes never regulated 
+    neg_geneset_csv = ""  # NOTE: the .csv extension is
+                                     #      required - this string is passed straight to read_csv()
+                                     # "" = use default negative_control_genes.csv (genes never regulated
                                      #      by eIF3 in any condition/timepoint — standard background)
                                      # "filename.csv" = load custom negative set from output/genesets/
                                      #      use for contrastive analyses, e.g. 3d-specific vs 3e-specific:
                                      #      "hypoxia_3e_promotes_TE_1hr_not3d_lfc0.5.csv"
                                      #      or for MCF7-SIX1: "mcf7six1_3d_negative_controls_lfc0.5.csv"
+                                     #      or for the RNA readout (nb70):
+                                     #      "si3d_rna_negative_controls_nor1and4_hyp1_hyp4.csv"
   ,
   feature_matrix_path = ""          # "" = load feature matrix from output/predictive_modeling/ using feature_set param
                                      # "filename.rds" = override: load this RDS from output/predictive_modeling/
@@ -103,11 +118,36 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
 }
 
 # Derived file paths and labels from params
-geneset_csv <- if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
+# readout defaults to "TE" so params lists written before this param existed still work
+readout <- if (is.null(params$readout) || !nzchar(params$readout)) "TE" else params$readout
+stopifnot("readout must be 'TE' or 'RNA'" = readout %in% c("TE", "RNA"))
+
+# The alltimepoints/1and4hr shortcut reads the FULL DESeq2 table from output/ and
+# filters te_lfc inline, so it is TE-specific. Non-TE readouts do not use it: their
+# gene sets are pre-built and validated by notebook 70 and live in output/genesets/
+# like every other timepoint. Route on the readout rather than refusing the run.
+use_full_de_table <- readout == "TE" &&
+  params$timepoint %in% c("alltimepoints", "1and4hr")
+
+# A non-TE readout MUST supply its own negative set. The default fallback below is
+# negative_control_genes.csv, selected on |te_lfc| < 0.5 & te_padj > 0.3 - a TE
+# criterion that says nothing about RNA. Against the hypoxia 1hr RNA contrast that
+# pool has median rna_lfc 0.466 (above the 0.409 global median, i.e. those genes lose
+# MORE mRNA than a typical transcript) and 307 of its 3319 genes satisfy the RNA
+# positive definition outright. Those overlapping genes would then be silently
+# relabelled positive by the case_when below (positive branch is evaluated first),
+# shrinking the negative class without any warning.
+if (readout != "TE" && !nzchar(params$neg_geneset_csv)) {
+  stop("readout='", readout, "' requires an explicit neg_geneset_csv - the default ",
+       "negative_control_genes.csv is defined on TE, not ", readout,
+       ". Build one with notebook 70.")
+}
+
+geneset_csv <- if (use_full_de_table) {
   paste0("translation_categories_si", params$gene, "_vs_sictrl_", params$condition, "_", params$timepoint, ".csv")
 } else {
   paste0(params$condition, "_", params$gene, "_", params$direction,
-         "_TE_", params$timepoint, "_lfc", params$lfc, ".csv")
+         "_", readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")
 }
 feature_matrix_rds <- if (params$feature_set == "te_lfc") {
   "feature_matrix_te_lfc.rds"
@@ -136,7 +176,10 @@ feature_matrix_rds <- if (params$feature_set == "te_lfc") {
 if (!is.null(params$feature_matrix_path) && nchar(params$feature_matrix_path) > 0) {
   feature_matrix_rds <- params$feature_matrix_path
 }
+# readout enters the suffix ONLY when it is not "TE", so every pre-existing run keeps
+# its current output filenames (07b/07c resolve saved models by this suffix).
 suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
+                 if (readout != "TE") paste0(tolower(readout), "_") else "",
                  params$condition, "_", params$timepoint, "_lfc", params$lfc,
                  "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta",
                  if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
@@ -145,6 +188,7 @@ pos_label <- params$direction
 neg_label <- paste0("does_not_", sub("s$", "", params$direction))
 gene_label <- paste0("eIF", params$gene)
 
+cat("Readout:", readout, "\n")
 cat("Gene set CSV:", geneset_csv, "\n")
 cat("Feature matrix:", feature_matrix_rds, "\n")
 cat("Output suffix:", suffix, "\n")
@@ -154,10 +198,16 @@ cat("Negative label:", neg_label, "\n")
 
 # Overview
 
-Binary classification without Boruta feature selection: does a gene's mRNA sequence predict whether `r gene_label` `r params$direction` its translation?
+Binary classification without Boruta feature selection: do a gene's mRNA features predict whether `r gene_label` `r params$direction` its `r if (readout == "RNA") "abundance" else "translation efficiency"`?
 
-- **Positive class ("`r pos_label`")**: Genes from `` `r geneset_csv` ``
-- **Negative class ("`r neg_label`")**: Genes from `negative_control_genes.csv` (not regulated by `r gene_label` in any condition/timepoint)
+- **Positive class ("`r pos_label`")**: Genes from `` `r geneset_csv` `` (`r readout` LFC > `r params$lfc`, padj < 0.05)
+- **Negative class ("`r neg_label`")**: Genes from `` `r if (nzchar(params$neg_geneset_csv)) params$neg_geneset_csv else if (params$gene == "3e") "negative_control_genes_si3e.csv" else "negative_control_genes.csv"` `` (full provenance is printed in the Classification Summary)
+
+Note the feature set is **not purely sequence-derived**: alongside length, GC and
+codon composition it carries measurements from other experiments (eIF4E RIP-seq,
+external SLAM-seq half-lives, DHX29 occupancy). Those routinely rank in the top
+10, so "predicted from features" is the accurate framing rather than "predicted
+from sequence".
 
 ## Parameters
 
@@ -192,12 +242,17 @@ features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds))
 cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
 
 # Positive class
-if (params$timepoint %in% c("alltimepoints", "1and4hr")) {
+if (use_full_de_table) {
   positive_genes <- read_csv(here("output", geneset_csv)) %>%
     filter(te_lfc > as.numeric(params$lfc), te_padj < 0.05) %>%
     mutate(ensembl_gene = sub("\\..*", "", gene_id))
 } else {
-  positive_genes <- read_csv(here("output", "genesets", geneset_csv))
+  pos_path <- here("output", "genesets", geneset_csv)
+  if (!file.exists(pos_path)) {
+    stop("positive gene set not found: ", geneset_csv,
+         if (readout != "TE") "\n  Build it with notebook 70 (params pos_condition / pos_timepoint)." else "")
+  }
+  positive_genes <- read_csv(pos_path, show_col_types = FALSE)
 }
 cat("Positive genes:", nrow(positive_genes), "\n")
 
@@ -225,6 +280,81 @@ if (params$neg_geneset_csv != "") {
     mutate(gene_id_clean = sub("\\..*", "", gene_id))
 }
 cat("Negative genes:", nrow(negative_control_genes), "\n")
+
+# The positive and negative sets must be disjoint. This is the catch-all for a
+# mismatched pairing: the readout guard above only fires when readout != "TE", so
+# a TE positive set combined with an RNA-defined neg_geneset_csv slips past it and
+# would train on genes labelled both ways (the case_when below silently resolves
+# them to positive, shrinking the negative class without warning).
+# Provenance check: the negative set records the readout it was built for (nb70
+# stamps a `readout` column). Legacy files predate the column and are TE by
+# definition. This is the only DETERMINISTIC pairing check - disjointness and
+# distribution checks both have blind spots:
+#   - TE positives + RNA negatives overlap, so disjointness catches it, but only
+#     because they happen to; and
+#   - RNA negatives sit BELOW the TE global median, so a distribution check passes
+#     them silently.
+neg_readout <- if ("readout" %in% colnames(negative_control_genes)) {
+  unique(negative_control_genes$readout)
+} else {
+  "TE"
+}
+stopifnot("negative set declares more than one readout" = length(neg_readout) == 1)
+if (!identical(neg_readout, readout)) {
+  stop("readout mismatch: this run is readout='", readout,
+       "' but the negative set '", if (nzchar(params$neg_geneset_csv))
+         params$neg_geneset_csv else neg_csv,
+       "' was built for readout='", neg_readout, "'.")
+}
+cat("Negative set readout (", neg_readout, ") matches the run: PASS\n")
+
+# Collect the negative set's provenance for the classification summary. nb70
+# stamps neg_contrasts / neg_lfc / neg_padj into the file it writes; the legacy TE
+# controls predate those columns, so fall back to naming the notebook that built
+# them rather than asserting criteria that are not actually in the file.
+neg_file <- if (nzchar(params$neg_geneset_csv)) {
+  file.path("output/genesets", params$neg_geneset_csv)
+} else {
+  file.path("output/predictive_modeling", neg_csv)
+}
+stamped <- function(col) {
+  if (col %in% colnames(negative_control_genes)) {
+    paste(unique(negative_control_genes[[col]]), collapse = ", ")
+  } else NA_character_
+}
+neg_provenance <- list(
+  file      = neg_file,
+  readout   = neg_readout,
+  n_total   = nrow(negative_control_genes),
+  contrasts = stamped("neg_contrasts"),
+  lfc       = stamped("neg_lfc"),
+  padj      = stamped("neg_padj"),
+  built_by  = if (nzchar(params$neg_geneset_csv)) "notebook 70" else
+              if (params$gene == "3e") "notebook 02b" else "notebook 02"
+)
+
+# Overlap is REPORTED, not fatal. A small overlap is legitimate whenever the
+# negative set is screened on different contrasts than the positive set: the nb02
+# TE controls are screened on normoxia alltimepoints + hypoxia 1/4/24hr, so a gene
+# regulated only at normoxia 1hr (e.g. ACOT1, PRRC2A) correctly belongs to both.
+# The case_when below resolves such genes to positive, which is the intended
+# behaviour. The readout check above is the deterministic mismatch guard; this is
+# a magnitude signal - the TE/RNA hybrid showed 40 overlapping genes against the
+# 7 seen in a correctly paired run.
+overlap_pos_neg <- intersect(positive_genes$ensembl_gene,
+                             negative_control_genes$gene_id_clean)
+n_overlap <- length(overlap_pos_neg)
+if (n_overlap > 0) {
+  cat("NOTE:", n_overlap, "genes are in both sets; they are assigned to the",
+      "positive class and dropped from the negative sampling pool.\n")
+  if (n_overlap > 0.05 * nrow(positive_genes)) {
+    warning(n_overlap, " genes (", round(100 * n_overlap / nrow(positive_genes), 1),
+            "% of the positive set) appear in BOTH sets - large overlaps usually ",
+            "mean the negative set does not belong with this positive set.")
+  }
+} else {
+  cat("Positive and negative sets are disjoint.\n")
+}
 ```
 
 # Create Binary Target
@@ -1028,6 +1158,7 @@ n_pos_total <- sum(model_genes$eif3d_target == pos_label)
 n_neg_total <- sum(model_genes$eif3d_target == neg_label)
 
 performance_df <- data.frame(
+  Readout = readout,   # TE or RNA - so the saved CSV is self-describing
   Metric = c("AUC", "Accuracy", "Balanced_Accuracy", "Sensitivity",
              "Specificity", "Precision", "F1", "N_pos", "N_neg",
              "AUC_CI_lower", "AUC_CI_upper", "permutation_pvalue"),
@@ -1079,10 +1210,13 @@ cat("Exported: model RDS, importance CSV, performance CSV, CV results CSV, predi
 
 ```{r summary}
 cat("========================================\n")
-cat(paste0("CLASSIFICATION SUMMARY (", tools::toTitleCase(params$condition), ")\n"))
+cat(paste0("CLASSIFICATION SUMMARY (", readout, ", ",
+           tools::toTitleCase(params$condition), ")\n"))
 cat("========================================\n\n")
 
 cat("Parameters:\n")
+cat("  Readout:", readout,
+    if (readout == "TE") "(translation efficiency)" else "(mRNA abundance)", "\n")
 cat("  Condition:", params$condition, "\n")
 cat("  Gene:", paste0("eIF", params$gene), "\n")
 cat("  Direction:", params$direction, "\n")
@@ -1090,6 +1224,32 @@ cat("  Timepoint:", params$timepoint, "\n")
 cat("  LFC threshold:", params$lfc, "\n")
 cat("  Feature set:", params$feature_set, "(no Boruta selection)\n")
 cat("  CLIP mode:", params$clip_mode, "\n\n")
+
+cat("Positive gene set:\n")
+cat("  File:", geneset_csv, "\n")
+cat("  Criteria:", readout, "LFC >", params$lfc, "& padj < 0.05,",
+    params$condition, params$timepoint, "\n\n")
+
+cat("Negative gene set:\n")
+cat("  File:", neg_provenance$file, "\n")
+cat("  Built by:", neg_provenance$built_by, "\n")
+cat("  Readout:", neg_provenance$readout, "\n")
+cat("  Pool size:", neg_provenance$n_total, "genes\n")
+if (!is.na(neg_provenance$contrasts)) {
+  cat("  Criteria: |LFC| <", neg_provenance$lfc, "& padj >", neg_provenance$padj, "\n")
+  cat("  Contrasts:", neg_provenance$contrasts, "\n")
+  # The modelled contrast need not be among them - the negative set is deliberately
+  # cross-contrast - but say so explicitly rather than leaving it to be assumed.
+  this_contrast <- paste0(params$condition, "_", params$timepoint)
+  cat("  Includes this run's contrast (", this_contrast, "):",
+      grepl(this_contrast, neg_provenance$contrasts, fixed = TRUE), "\n")
+} else {
+  cat("  Criteria: not recorded in the file (predates provenance stamping)\n")
+}
+cat("\n")
+
+cat("  Overlap with positive set:", n_overlap, "genes",
+    if (n_overlap > 0) "(assigned positive)" else "", "\n\n")
 
 cat("Classes:\n")
 cat("  Positive (", pos_label, "):", sum(model_data$eif3d_target == pos_label), "\n")

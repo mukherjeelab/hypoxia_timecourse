@@ -1,0 +1,559 @@
+---
+title: "`r paste0('70 - RNA-level gene sets for eIF3d classification (', params$pos_condition, ' ', params$pos_timepoint, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  pos_condition: "hypoxia"
+  pos_timepoint: "1hr"
+  pos_lfc: 1.0
+  neg_padj: 0.2
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Builds the positive and negative gene sets for an **RNA-level** version of the
+notebook 07 classifier: which mRNAs lose abundance when eIF3d is knocked down,
+as opposed to which lose translation efficiency (the TE sets built elsewhere).
+
+Everything is read from the pre-computed DESeq2 outputs
+`output/translation_categories_si3d_vs_sictrl_{condition}_{timepoint}.csv`
+(written by `code/eif3e_eif3d_normoxia_and_hypoxia.Rmd`); nothing is refit here.
+
+**Direction convention.** The source notebook runs DESeq2 with the knockdown as
+the reference (`control_condition = "si3d"`, `test_condition = "sictrl"`), so
+every coefficient is log2(sictrl / si3d):
+
+- `rna_lfc > 0` = sictrl RNA > si3d RNA = knockdown **reduces** the mRNA level
+  = eIF3d **promotes** that mRNA's abundance
+- `rna_lfc < 0` = knockdown increases the mRNA level
+
+This matches the TE convention (`te_lfc > 0` = eIF3d promotes translation), so
+`direction = "promotes"` means the same thing on both readouts.
+
+# Threshold rationale (read this before changing the cutoffs)
+
+These contrasts are **spike-in normalized**, and eIF3d knockdown lowers total
+mRNA per cell, so the `rna_lfc` distribution is not centered on zero. The median
+shift is large and varies by contrast:
+
+| contrast | median `rna_lfc` | genes with `\|rna_lfc\| < 0.5 & padj > 0.3` |
+|---|---|---|
+| normoxia 1+4hr (time-regressed) | 0.505 | 1,400 |
+| normoxia 1hr | 0.368 | 2,811 |
+| normoxia 4hr | 0.587 | 1,782 |
+| normoxia 24hr | 0.838 | 778 |
+| normoxia alltimepoints | 0.625 | 822 |
+| hypoxia 1hr | 0.409 | 2,725 |
+| hypoxia 4hr | 0.176 | 5,958 |
+| hypoxia 24hr | 0.209 | 5,228 |
+
+Two consequences drove the parameters below.
+
+**1. The positive threshold is LFC > 1, not the project-standard 0.5.** At
+hypoxia 1hr the median is 0.409, so `rna_lfc > 0.5` selects 4,764 genes — 40% of
+the transcriptome, i.e. essentially "above median". A classifier trained on that
+learns the global shift, not eIF3d dependence. `rna_lfc > 1` is equivalent to
+0.59 above the median and yields 850 genes, comparable to the TE sets
+(1,604 at LFC 0.5; 530 at LFC 1). The 0.5 standard is a TE convention and does
+not transfer to the raw RNA readout, where the per-cell mRNA loss is not
+divided out.
+
+**2. The negative set spans normoxia 1+4hr and hypoxia 1hr + 4hr — not 24hr,
+and not every contrast.** Requiring non-regulation everywhere collapses the set,
+because the heavily-shifted normoxia contrasts admit almost nothing (counts below
+at `padj > 0.3`):
+
+| negative scope | genes | in feature matrix |
+|---|---|---|
+| all 6 individual contrasts | 72 | 37 |
+| hypoxia 1/4/24hr + normoxia alltimepoints | 214 | 142 |
+| hypoxia 1/4/24hr only | 1,106 | 834 |
+| **normoxia 1+4hr + hypoxia 1/4hr (used here)** | 667 | 505 |
+| hypoxia 1/4hr only | 1,826 | 1,434 |
+
+Dropping 24hr is what makes this feasible; it is also the timepoint least
+informative about the 1hr positive set. Keeping normoxia in costs ~930 genes but
+makes the negative class eIF3d-independent regardless of oxygen, so features the
+model finds are about eIF3d dependence rather than about hypoxia. The normoxia
+leg uses the **time-regressed 1+4hr** fit (`deFunction_time_normalized()`), whose
+0.505 shift admits 1,400 genes, rather than the `alltimepoints` fit whose 0.625
+shift admits only 822 (505 vs 207 genes in the feature matrix).
+
+**3. The negative bar is `padj > 0.2`, not `0.3` — and the LFC filter is not what
+controls the size.** Notebook 07 keeps every positive gene but subsamples the
+negative pool to `min(n_pos, n_neg)`, so a negative pool smaller than the positive
+set produces an imbalanced model tilted toward the positives (the reverse of every
+TE run in this pipeline, where negatives always outnumber positives). At
+`padj > 0.3` the pool is 505 in the matrix against 752 positives — a 1.49:1
+imbalance.
+
+Relaxing the LFC bound does not fix this, because it is never binding. Every gene
+non-significant in all three contrasts already has a small effect size, so the pool
+is identical at every LFC threshold from 0.5 to 1.0:
+
+| `\|rna_lfc\| <` | genes | in matrix |
+|---|---|---|
+| 0.5 | 667 | 505 |
+| 0.8 | 667 | 505 |
+| 1.0 | 667 | 505 |
+
+`padj` is the only lever that moves it:
+
+| `padj >` | genes | in matrix | resulting class sizes |
+|---|---|---|---|
+| 0.30 | 667 | 505 | 752 / 505 (imbalanced) |
+| **0.20 (used here)** | **1,051** | **802** | **752 / 752 (balanced)** |
+| 0.15 | 1,319 | 1,027 | 752 / 752 |
+| 0.10 | 1,716 | 1,360 | 752 / 752 |
+
+`0.2` is the smallest relaxation that clears 752; looser bars buy no extra class
+size (the 752 positives are the cap) while weakening the non-regulation claim. The
+cost is small and bounded: the negative set's effect-size envelope widens only from
+±0.286 to ±0.362 across all three contrasts, still far below both the 0.5 guard and
+the 1.0 positive threshold, and no negative gene sits above the global median. The
+`|rna_lfc| < 0.5` filter is retained as a guard that would bind if the padj bar
+were ever relaxed further.
+
+**EIF3D is excluded from the positive set.** It qualifies overwhelmingly
+(`rna_lfc` 2.90, padj 1e-57 — si3d retains only 13% of sictrl's EIF3D mRNA), but
+that is the siRNA depleting its own target, not eIF3d-dependent mRNA biology.
+Training on it would ask the model to learn the sequence features of the
+transcript being knocked down by design. It is retained as the direction
+spot-check and asserted to qualify before being removed. EIF3E is *not* excluded:
+it is also significant (`rna_lfc` 0.561, padj 1.7e-4), but that reflects the known
+eIF3d/eIF3e stability interdependence — a genuine downstream consequence of losing
+eIF3d rather than the siRNA acting on it directly.
+
+**Interpretive caveat.** Because the null is 0.41, not 0, the negative class is
+not "unaffected" — its median `rna_lfc` is ~0.02, meaning these transcripts
+*retained* mRNA while the typical transcript lost ~25-30%. The contrast this
+model learns is therefore **eIF3d-dependent vs eIF3d-protected**, and should be
+described that way rather than as "regulated vs unaffected".
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+# Parameters
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+#   hypoxia 1hr  + neg_padj 0.2  -> 849 pos / 802 neg  (balanced 751/751)
+#   normoxia 1and4hr + neg_padj 0.1 -> 1281 pos / 1360 neg (balanced ~1103/1103)
+# The normoxia contrast has a larger global shift (median 0.505 vs 0.409) and so
+# yields more positives; neg_padj must be relaxed to keep the classes balanced,
+# because notebook 07 keeps ALL positives and downsamples only the negatives.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    pos_condition = "hypoxia",   # "hypoxia" | "normoxia"
+    pos_timepoint = "1hr",       # "1hr" | "4hr" | "24hr" | "1and4hr" | "alltimepoints"
+    pos_lfc       = 1.0,
+    neg_padj      = 0.2          # 0.2 for the hypoxia run, 0.1 for normoxia 1and4hr
+  )
+}
+
+POS_CONDITION <- params$pos_condition
+POS_TIMEPOINT <- params$pos_timepoint
+POS_LFC       <- params$pos_lfc   # NOT the project-standard 0.5 - see rationale above
+POS_PADJ      <- 0.05
+
+NEG_LFC       <- 0.5    # guard only - see the assertion below, which fails if it binds
+NEG_PADJ      <- params$neg_padj
+
+# Contrasts the negative set must be unregulated in
+NEG_CONTRASTS <- c(
+  normoxia_1and4hr = "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  hypoxia_1hr      = "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  hypoxia_4hr      = "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv"
+)
+
+POS_FILE <- paste0("translation_categories_si3d_vs_sictrl_",
+                   POS_CONDITION, "_", POS_TIMEPOINT, ".csv")
+
+# Output names follow the geneset convention with RNA in place of TE:
+#   {condition}_{gene}_{direction}_{readout}_{timepoint}_lfc{lfc}.csv
+POS_OUT <- paste0(POS_CONDITION, "_3d_promotes_RNA_", POS_TIMEPOINT,
+                  "_lfc", format(POS_LFC, trim = TRUE), ".csv")
+# The 0.2 file keeps its original name so the already-fitted hypoxia model still
+# resolves it; any other bar gets its own file rather than silently overwriting.
+NEG_OUT <- if (isTRUE(all.equal(NEG_PADJ, 0.2))) {
+  "si3d_rna_negative_controls_nor1and4_hyp1_hyp4.csv"
+} else {
+  # Keep the leading "0." - stripping it turns 0.1 into "padj1", which reads as
+  # padj > 1 rather than padj > 0.1.
+  paste0("si3d_rna_negative_controls_nor1and4_hyp1_hyp4_padj",
+         format(NEG_PADJ, trim = TRUE), ".csv")
+}
+
+cat("Positive source:", POS_FILE, "\n")
+cat("Positive output:", POS_OUT, "\n")
+cat("Negative output:", NEG_OUT, "\n")
+```
+
+# Load Data
+
+```{r load_data}
+all_files <- c(POS_FILE, NEG_CONTRASTS)
+paths <- here("output", all_files)
+stopifnot("Missing translation_categories input file" = all(file.exists(paths)))
+
+read_one <- function(p) {
+  read_csv(p, show_col_types = FALSE) %>%
+    dplyr::select(gene_id, symbol, rna_lfc, rna_padj, te_lfc, te_padj)
+}
+
+pos_data <- read_one(here("output", POS_FILE))
+neg_data <- map(NEG_CONTRASTS, ~ read_one(here("output", .x)))
+
+cat("Positive contrast:", nrow(pos_data), "genes\n")
+walk2(names(neg_data), neg_data,
+      ~ cat("Negative contrast", .x, ":", nrow(.y), "genes\n"))
+```
+
+## Provenance check: knockdown target direction
+
+The si3d knockdown target itself must sit at strongly positive `rna_lfc` under
+the log2(sictrl / si3d) convention. This is the spot-check that the columns are
+oriented as documented, rather than assumed from the file name.
+
+```{r check_direction}
+eif3d_row <- pos_data %>% filter(symbol == "EIF3D")
+stopifnot("EIF3D not found in the hypoxia 1hr contrast" = nrow(eif3d_row) == 1)
+cat("EIF3D rna_lfc =", round(eif3d_row$rna_lfc, 3),
+    " padj =", signif(eif3d_row$rna_padj, 3), "\n")
+stopifnot("EIF3D rna_lfc is not positive - direction convention may have flipped" =
+  eif3d_row$rna_lfc > 0.5)
+```
+
+## Global shift check
+
+Confirms the median shifts documented in the rationale above. If these drift, the
+LFC > 1 positive threshold needs to be revisited.
+
+```{r check_shift}
+shift_tbl <- tibble(
+  contrast = c(paste0(POS_CONDITION, "_", POS_TIMEPOINT), names(neg_data)),
+  median_rna_lfc = c(median(pos_data$rna_lfc, na.rm = TRUE),
+                     map_dbl(neg_data, ~ median(.x$rna_lfc, na.rm = TRUE)))
+)
+print(shift_tbl)
+
+# The whole reason for LFC > 1: the positive contrast's median must be well
+# above zero, and LFC 0.5 must therefore be near-meaningless as a cutoff.
+pos_median <- median(pos_data$rna_lfc, na.rm = TRUE)
+stopifnot("positive contrast median rna_lfc outside expected range" =
+  between(pos_median, 0.3, 0.6))
+cat("\n", POS_CONDITION, " ", POS_TIMEPOINT, " median rna_lfc = ", round(pos_median, 3), sep = "")
+cat("",
+    "-> LFC 1.0 is", round(1.0 - pos_median, 3), "above the median\n")
+cat("Genes at rna_lfc > 0.5 (rejected cutoff):",
+    sum(pos_data$rna_lfc > 0.5 & pos_data$rna_padj < POS_PADJ, na.rm = TRUE), "\n")
+cat("Genes at rna_lfc > 1.0 (used):",
+    sum(pos_data$rna_lfc > POS_LFC & pos_data$rna_padj < POS_PADJ, na.rm = TRUE), "\n")
+```
+
+# Positive Set: eIF3d promotes mRNA abundance
+
+```{r build_positive}
+positive_set_raw <- pos_data %>%
+  filter(rna_lfc > POS_LFC, rna_padj < POS_PADJ) %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id)) %>%
+  arrange(desc(rna_lfc))
+
+# EIF3D is the siRNA's own target. Its mRNA loss is the knockdown itself, not
+# eIF3d-dependent mRNA biology, so it must not train the classifier - the model
+# would be fitting the features of the transcript being depleted by design.
+# It is still used as the direction spot-check above and asserted below.
+#
+# EIF3E is deliberately NOT excluded: it is significant here (rna_lfc 0.561,
+# padj 1.7e-4) but that is the known eIF3d/eIF3e stability interdependence, i.e.
+# real downstream consequence of losing eIF3d, not the siRNA acting on it.
+EXCLUDE_SYMBOLS <- c("EIF3D")
+
+positive_set <- positive_set_raw %>% filter(!symbol %in% EXCLUDE_SYMBOLS)
+
+cat("Positive set before exclusions:", nrow(positive_set_raw), "genes\n")
+cat("Excluded knockdown target(s):",
+    paste(intersect(EXCLUDE_SYMBOLS, positive_set_raw$symbol), collapse = ", "), "\n")
+cat("Positive set:", nrow(positive_set), "genes\n")
+print(head(positive_set %>% dplyr::select(symbol, rna_lfc, rna_padj), 10))
+```
+
+# Negative Set: not RNA-regulated by eIF3d
+
+```{r build_negative}
+# Genes passing |rna_lfc| < NEG_LFC & padj > NEG_PADJ in each contrast.
+# NEG_PADJ is 0.2, not the nb02 convention of 0.3 - see rationale point 3. Reverting
+# it to 0.3 shrinks the pool to 505 in the feature matrix and silently reintroduces a
+# 1.49:1 class imbalance in notebook 07.
+passing <- map(neg_data, function(df) {
+  df %>% filter(abs(rna_lfc) < NEG_LFC, rna_padj > NEG_PADJ) %>% pull(gene_id)
+})
+
+cat("Genes passing per contrast:\n")
+walk2(names(passing), passing, ~ cat("  ", .x, ":", length(.y), "\n"))
+
+# Require presence in every contrast as well as passing in every contrast
+measured_in_all <- reduce(map(neg_data, ~ pull(.x, gene_id)), intersect)
+negative_ids <- intersect(reduce(passing, intersect), measured_in_all)
+cat("\nMeasured in all", length(neg_data), "contrasts:", length(measured_in_all), "\n")
+cat("Passing in all", length(neg_data), "contrasts:", length(negative_ids), "\n")
+
+# Annotate the negative set from a contrast it is guaranteed to be measured in.
+# Do NOT join this from pos_data: that is only complete because POS_FILE currently
+# happens to be the same file as NEG_CONTRASTS["hypoxia_1hr"]. POS_CONDITION and
+# POS_TIMEPOINT are knobs, so pointing the positive set at a normoxia contrast would
+# leave genes unmatched, silently emitting NA symbols and NA rna_lfc that the
+# na.rm = TRUE summaries below would quietly step over.
+neg_annot_source <- "hypoxia_1hr"
+stopifnot("negative annotation source is not one of the negative contrasts" =
+  neg_annot_source %in% names(neg_data))
+annot <- neg_data[[neg_annot_source]] %>%
+  dplyr::select(gene_id, symbol, rna_lfc, rna_padj) %>%
+  distinct(gene_id, .keep_all = TRUE)
+stopifnot("negative ids missing from the annotation contrast" =
+  all(negative_ids %in% annot$gene_id))
+
+negative_set <- tibble(gene_id = negative_ids) %>%
+  left_join(annot, by = "gene_id") %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id),
+         n_contrasts  = length(neg_data)) %>%
+  arrange(gene_id)
+
+# The reported rna_lfc/rna_padj describe the annotation contrast; make that explicit
+# rather than leaving the columns ambiguous in the exported CSV.
+stopifnot("negative annotation left NA values" =
+  !anyNA(negative_set$rna_lfc) && !anyNA(negative_set$symbol))
+cat("Negative set annotated from contrast:", neg_annot_source, "\n")
+
+cat("Negative set:", nrow(negative_set), "genes\n")
+```
+
+# Validation
+
+## Computational checks
+
+```{r checks_computational}
+# Threshold definitions hold by construction
+stopifnot("positive set violates rna_lfc threshold" =
+  all(positive_set$rna_lfc > POS_LFC))
+stopifnot("positive set violates padj threshold" =
+  all(positive_set$rna_padj < POS_PADJ))
+stopifnot("positive LFCs must be finite" =
+  all(is.finite(positive_set$rna_lfc)))
+
+# Negative set must violate the criteria in no contrast
+violations <- map_int(neg_data, function(df) {
+  df %>%
+    filter(gene_id %in% negative_ids) %>%
+    filter(abs(rna_lfc) >= NEG_LFC | rna_padj <= NEG_PADJ) %>%
+    nrow()
+})
+cat("Negative set violations per contrast:\n")
+print(violations)
+stopifnot("negative set violates its own criteria" = sum(violations) == 0)
+
+# The two sets must be disjoint
+stopifnot("positive and negative sets overlap" =
+  length(intersect(positive_set$gene_id, negative_set$gene_id)) == 0)
+
+# The LFC filter is documented as non-binding at this padj bar. Assert that, so
+# the claim in the rationale stays true if the inputs are ever regenerated: if
+# this fires, the padj bar has been relaxed far enough that NEG_LFC now matters
+# and the negative set is no longer padj-limited.
+max_abs_neg_lfc <- max(map_dbl(neg_data, function(df) {
+  max(abs(df$rna_lfc[df$gene_id %in% negative_ids]), na.rm = TRUE)
+}))
+cat("Max |rna_lfc| in the negative set across all contrasts:",
+    round(max_abs_neg_lfc, 3), "(NEG_LFC guard =", NEG_LFC, ")\n")
+stopifnot("NEG_LFC is now binding - negative set is no longer padj-limited" =
+  max_abs_neg_lfc < NEG_LFC)
+
+# Required output columns for notebook 07
+stopifnot("ensembl_gene missing from positive set" = "ensembl_gene" %in% colnames(positive_set))
+stopifnot("ensembl_gene missing from negative set" = "ensembl_gene" %in% colnames(negative_set))
+
+# IDs must be version-stripped ENSEMBL
+stopifnot("positive ensembl_gene ids are not version-stripped" =
+  all(grepl("^ENSG[0-9]+$", positive_set$ensembl_gene)))
+stopifnot("negative ensembl_gene ids are not version-stripped" =
+  all(grepl("^ENSG[0-9]+$", negative_set$ensembl_gene)))
+```
+
+## Biological spot-checks
+
+```{r checks_biological}
+# 1. EIF3D is the knockdown target. It must QUALIFY for the positive set (this is
+#    the strongest evidence the sign convention is right - the knocked-down gene's
+#    own mRNA is depleted), then be excluded from the exported set so it cannot
+#    train the model. Assert both halves: qualifying, and then removed.
+stopifnot("EIF3D does not qualify for the positive set - check the sign convention" =
+  "EIF3D" %in% positive_set_raw$symbol)
+stopifnot("EIF3D was not excluded from the exported positive set" =
+  !"EIF3D" %in% positive_set$symbol)
+stopifnot("EIF3D wrongly present in the negative set" =
+  !"EIF3D" %in% negative_set$symbol)
+stopifnot("exclusion removed an unexpected number of genes" =
+  nrow(positive_set_raw) - nrow(positive_set) == length(EXCLUDE_SYMBOLS))
+cat("EIF3D qualifies (rna_lfc =",
+    round(positive_set_raw$rna_lfc[positive_set_raw$symbol == "EIF3D"], 2),
+    "), excluded from the exported set, absent from negatives: PASS\n")
+
+# 2. The negative set must sit near zero while the positive set sits high, and
+#    critically the negative median must be BELOW the global median - this is the
+#    "protected, not unaffected" property described in the overview.
+global_median <- median(pos_data$rna_lfc, na.rm = TRUE)
+pos_median_set <- median(positive_set$rna_lfc, na.rm = TRUE)
+neg_median_set <- median(negative_set$rna_lfc, na.rm = TRUE)
+cat("\nmedian rna_lfc at hypoxia 1hr:\n")
+cat("  global      :", round(global_median, 3), "\n")
+cat("  positive set:", round(pos_median_set, 3), "\n")
+cat("  negative set:", round(neg_median_set, 3), "\n")
+stopifnot("positive set median is not above the global median" =
+  pos_median_set > global_median)
+stopifnot("negative set median is not below the global median" =
+  neg_median_set < global_median)
+
+# 3. This is an RNA readout, so it must NOT simply reproduce the TE gene set.
+#    Low overlap is the evidence that a separate model is worth fitting.
+# Built from params, not hardcoded: not every condition/timepoint has a matching
+# TE gene set on disk (there is no normoxia 1and4hr TE set), so skip rather than
+# fail when the comparison file does not exist.
+te_name <- paste0(POS_CONDITION, "_3d_promotes_TE_", POS_TIMEPOINT, "_lfc0.5.csv")
+te_path <- here("output", "genesets", te_name)
+if (file.exists(te_path)) {
+  te_set <- read_csv(te_path, show_col_types = FALSE)
+  ov <- length(intersect(positive_set$ensembl_gene, te_set$ensembl_gene))
+  cat("\nOverlap with", te_name, "(n =", nrow(te_set), "):", ov,
+      "of", nrow(positive_set),
+      paste0("(", round(100 * ov / nrow(positive_set), 1), "%)\n"))
+  stopifnot("RNA positive set is largely redundant with the TE set" =
+    ov / nrow(positive_set) < 0.25)
+} else {
+  cat("\nNo matching TE gene set on disk (", te_name,
+      ") - redundancy check skipped for this configuration.\n", sep = "")
+}
+```
+
+## Feature matrix coverage
+
+```{r check_coverage}
+features <- readRDS(here("output", "predictive_modeling",
+                         "feature_matrix_external_stability.rds"))
+n_pos_fm <- sum(positive_set$ensembl_gene %in% features$gene_id_clean)
+n_neg_fm <- sum(negative_set$ensembl_gene %in% features$gene_id_clean)
+
+cat("Feature matrix:", nrow(features), "genes\n")
+cat("Positive genes in matrix:", n_pos_fm, "of", nrow(positive_set), "\n")
+cat("Negative genes in matrix:", n_neg_fm, "of", nrow(negative_set), "\n")
+cat("Notebook 07 size-matches to min() =", min(n_pos_fm, n_neg_fm), "per class\n")
+
+# Both classes must be large enough for a ~130-feature model
+stopifnot("size-matched class too small for a useful model" =
+  min(n_pos_fm, n_neg_fm) >= 300)
+
+# Notebook 07 keeps ALL positives and subsamples the negative pool to
+# min(n_pos, n_neg). The classes are therefore only balanced when the negative
+# pool is at least as large as the positive set - which is the entire reason the
+# padj bar was relaxed to 0.2. Assert it rather than trusting the counts above.
+stopifnot("negative pool smaller than positive set - nb07 would train imbalanced" =
+  n_neg_fm >= n_pos_fm)
+cat("Negative pool >= positive set, so notebook 07 trains balanced at",
+    n_pos_fm, "per class\n")
+```
+
+# Write Gene Sets
+
+Positive set uses the msigdbr-style layout shared by the other files in
+`output/genesets/`. Negative set carries `ensembl_gene` because notebook 07's
+`neg_geneset_csv` branch reads that column directly.
+
+```{r write_sets}
+pos_export <- positive_set %>%
+  transmute(
+    db_gene_symbol = symbol,
+    ensembl_gene,
+    gs_name        = sub("\\.csv$", "", POS_OUT),
+    gs_description = paste0("genes whose mRNA abundance is promoted by eIF3d in ",
+                            POS_CONDITION, " at ", POS_TIMEPOINT,
+                            ", rna_lfc > ", POS_LFC, " and padj < ", POS_PADJ,
+                            ", in MDA-MB-231 cells, spike-in normalized"),
+    gs_source_species = "homo sapiens",
+    rna_lfc,
+    rna_padj
+  )
+
+neg_export <- negative_set %>%
+  transmute(
+    db_gene_symbol = symbol,
+    ensembl_gene,
+    # Provenance stamp. Notebook 07 asserts this against its `readout` param, so a
+    # negative set can never be silently paired with positives from the other
+    # readout. Filenames alone cannot carry this - neg_geneset_csv is free text.
+    readout = "RNA",
+    neg_contrasts = paste(names(NEG_CONTRASTS), collapse = "+"),
+    neg_lfc = NEG_LFC,
+    neg_padj = NEG_PADJ,
+    rna_lfc,
+    rna_padj,
+    n_contrasts
+  )
+
+write_csv(pos_export, here("output", "genesets", POS_OUT))
+write_csv(neg_export, here("output", "genesets", NEG_OUT))
+
+cat("Wrote", nrow(pos_export), "genes to output/genesets/", POS_OUT, "\n")
+cat("Wrote", nrow(neg_export), "genes to output/genesets/", NEG_OUT, "\n")
+```
+
+# Summary
+
+```{r summary}
+summary_tbl <- tibble(
+  set        = c("positive", "negative"),
+  definition = c(paste0("rna_lfc > ", POS_LFC, " & padj < ", POS_PADJ,
+                        " at ", POS_CONDITION, " ", POS_TIMEPOINT),
+                 paste0("|rna_lfc| < ", NEG_LFC, " & padj > ", NEG_PADJ,
+                        " in ", paste(names(NEG_CONTRASTS), collapse = ", "))),
+  n_genes    = c(nrow(positive_set), nrow(negative_set)),
+  n_in_matrix = c(n_pos_fm, n_neg_fm),
+  median_rna_lfc_h1 = c(round(pos_median_set, 3), round(neg_median_set, 3)),
+  file       = c(POS_OUT, NEG_OUT)
+)
+print(summary_tbl)
+write_csv(summary_tbl, here("output", "70_rna_geneset_summary.csv"))
+```
+
+Run notebook 07 against these with:
+
+```
+rmarkdown::render(
+  "code/predictive_modeling/07_rf_classification_eif3d_targets_no_boruta.Rmd",
+  params = list(
+    condition = "hypoxia", gene = "3d", direction = "promotes",
+    readout = "RNA", timepoint = "1hr", lfc = "1",
+    feature_set = "external_stability",
+    exclude_own_te_features = TRUE,
+    neg_geneset_csv = "si3d_rna_negative_controls_nor1and4_hyp1_hyp4.csv"
+  )
+)
+```
+
+`readout = "RNA"` selects the `_RNA_` gene set file and tags the output suffix so
+these results do not collide with the TE runs. `exclude_own_te_features = TRUE` is
+required: `te_lfc = ribo_lfc - rna_lfc` is fit on the same libraries as the labels,
+so the `indiv_te_*` / `delta_te_*` columns partially encode the target.

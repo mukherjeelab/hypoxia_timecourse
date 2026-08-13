@@ -1,0 +1,718 @@
+---
+title: "71 - GC content vs RNA-level changes across the transcriptome (si3d, hypoxia 1hr)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Does GC content predict how much an mRNA's **abundance** changes when eIF3d is
+knocked down? This is the RNA-level counterpart to the TE-level GC analyses in
+notebooks 62/63, run across the whole transcriptome rather than within gene sets.
+
+The short answer is no, and that is the point of the notebook. GC content is the
+strongest single predictor of eIF3d **TE** dependence (`cds_gc` is the top feature
+of the notebook 07 TE classifier) but is close to inert at the RNA level, where
+5'UTR *length* dominates instead. This notebook quantifies that dissociation on
+the full transcriptome three ways: Spearman correlation against both readouts,
+binned medians, and a per-feature TE-vs-RNA fit, plus a gene-set comparison of GC
+content against the background transcriptome.
+
+**Contrast.** sictrl vs si3d at hypoxia 1hr, read from the pre-computed
+`output/translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv`. Nothing is refit.
+This is the eIF3d-knockdown effect, *not* the hypoxia response (sictrl hypoxia vs
+normoxia), which is a different contrast and a different file.
+
+**Direction convention.** The source notebook runs DESeq2 with the knockdown as
+the reference (`control_condition = "si3d"`, `test_condition = "sictrl"`), so the
+coefficient is log2(sictrl / si3d) despite the file name:
+
+- `rna_lfc > 0` = knockdown **reduces** the mRNA = eIF3d promotes its abundance
+- `te_lfc > 0` = knockdown reduces TE = eIF3d promotes its translation
+
+Asserted below against EIF3D itself, whose own mRNA must drop in si3d.
+
+**Global shift.** These contrasts are spike-in normalized and eIF3d knockdown
+lowers total mRNA per cell, so the median `rna_lfc` is ~0.41, not 0. Every plot
+draws the observed median rather than a zero line, and "up" / "down" throughout
+means relative to that median, not to zero.
+
+**Effect sizes, not p-values.** n is ~10,000 genes, so a Spearman rho of 0.03 is
+"significant" at p = 0.002 while explaining 0.1% of the variance. Every
+correlation is reported with rho and n together, and the binned medians are shown
+so the magnitude is visible directly. Do not read the p column as evidence of a
+meaningful relationship.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+```
+
+# Parameters
+
+```{r params}
+CONTRAST_FILE <- "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+
+# GC features to test, in the order they are reported
+GC_FEATURES <- c(
+  "utr5_gc"       = "5'UTR GC%",
+  "cds_gc"        = "CDS GC%",
+  "utr3_gc"       = "3'UTR GC%",
+  "gc3"           = "GC3",
+  "transcript_gc" = "Transcript GC%"
+)
+
+# Length features, used as the positive control: the analysis must be able to
+# detect a real effect, and 5'UTR length is the one that is actually there.
+LEN_FEATURES <- c(
+  "log2_utr5_length" = "log2 5'UTR length",
+  "log2_cds_length"  = "log2 CDS length",
+  "log2_utr3_length" = "log2 3'UTR length"
+)
+
+N_BINS <- 10   # deciles for the binned view
+
+# Panel order for every faceted plot. Without an explicit factor, facet_wrap()
+# sorts labels alphabetically, which interleaves the GC and Length blocks and
+# strands "Transcript GC%" among the length panels. GC first, then Length.
+# There are 5 GC and 3 Length features, so faceting at ncol = 5 puts each block
+# on its own row.
+FEATURE_ORDER <- c(unname(GC_FEATURES), unname(LEN_FEATURES))
+
+# Gene-set names and order. (Colors retained as the canonical group definition;
+# the violin plots that consumed them have been removed.)
+#   Project convention reserves #E69F00 for eIF3d and #56B4E9 for eIF3e. Both
+#   positive sets here are eIF3d-defined, so the established TE set keeps
+#   #E69F00 (backward compatible with already-generated figures) and the newer
+#   RNA-defined set takes Okabe-Ito vermillion - a distinct hue that cannot be
+#   mistaken for the eIF3e blue.
+#   "eIF3d-protected (RNA)" is NOT called a negative control here. nb70 defines it
+#   as |rna_lfc| < 0.5 & padj > 0.2, i.e. relative to ZERO, while this notebook's
+#   null is the global median (~0.43). Those genes therefore RETAINED mRNA while
+#   the typical transcript lost ~25-30% - they are a regulated set in their own
+#   right, sitting ~0.39 log2 below the transcriptome median, not an unaffected
+#   background. nb70 says the same thing ("eIF3d-dependent vs eIF3d-protected");
+#   labelling it "negative control" in a GC plot would invite reading its GC
+#   shift as "even the control shows the effect".
+group_colors <- c(
+  "eIF3d TE promoted"      = "#E69F00",
+  "eIF3d RNA promoted"     = "#D55E00",
+  "Negative control (TE)"  = "black",
+  "eIF3d-protected (RNA)"  = "grey40",
+  "All other genes"        = "grey70"
+)
+GROUP_LEVELS <- names(group_colors)
+```
+
+# Load Data
+
+```{r load_contrast}
+contrast_path <- here("output", CONTRAST_FILE)
+stopifnot("contrast file not found" = file.exists(contrast_path))
+
+de <- read_csv(contrast_path, show_col_types = FALSE) %>%
+  dplyr::select(gene_id, symbol, rna_lfc, rna_padj, ribo_lfc, ribo_padj,
+                te_lfc, te_padj) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+cat("Contrast rows:", nrow(de), "\n")
+cat("Median rna_lfc:", round(median(de$rna_lfc, na.rm = TRUE), 3), "\n")
+cat("Median te_lfc :", round(median(de$te_lfc,  na.rm = TRUE), 3), "\n")
+```
+
+```{r load_features}
+features <- readRDS(here("output", "predictive_modeling",
+                         "feature_matrix_external_stability.rds"))
+
+# Feature matrices are transcript-keyed in general. This one happens to carry one
+# row per gene, but assert it rather than assume - a duplicated gene would double
+# -weight it in every correlation below.
+stopifnot("feature matrix is not one row per gene" =
+  !anyDuplicated(features$gene_id_clean))
+
+keep_cols <- c("gene_id_clean", "symbol", names(GC_FEATURES), names(LEN_FEATURES))
+stopifnot("expected feature columns missing from the matrix" =
+  all(keep_cols %in% colnames(features)))
+
+feat <- features %>% dplyr::select(all_of(keep_cols)) %>% dplyr::rename(symbol_fm = symbol)
+
+cat("Feature matrix:", nrow(feat), "genes x", ncol(feat), "columns\n")
+```
+
+```{r join}
+dat <- de %>%
+  inner_join(feat, by = "gene_id_clean")
+
+cat("Genes with both a contrast result and features:", nrow(dat), "\n")
+cat("  contrast only:", nrow(de) - nrow(dat), "\n")
+stopifnot("join produced duplicate genes" = !anyDuplicated(dat$gene_id_clean))
+stopifnot("join lost too many genes - check ID versioning" = nrow(dat) > 8000)
+
+GLOBAL_MEDIAN <- median(dat$rna_lfc, na.rm = TRUE)
+cat("Global median rna_lfc in the joined set:", round(GLOBAL_MEDIAN, 3), "\n")
+```
+
+# Validation
+
+## Computational checks
+
+```{r checks_computational}
+# GC percentages must be on a 0-100 scale
+for (v in names(GC_FEATURES)) {
+  stopifnot(all(dat[[v]] >= 0 & dat[[v]] <= 100, na.rm = TRUE))
+}
+cat("All GC features within [0, 100]: PASS\n")
+
+# Log-fold changes must be finite where present
+for (v in c("rna_lfc", "te_lfc")) {
+  stopifnot(all(is.finite(dat[[v]][!is.na(dat[[v]])])))
+}
+cat("rna_lfc / te_lfc finite: PASS\n")
+
+# Lengths are log2 of a positive quantity, so they must be finite and non-negative
+for (v in names(LEN_FEATURES)) {
+  stopifnot(all(is.finite(dat[[v]][!is.na(dat[[v]])])))
+}
+cat("Length features finite: PASS\n")
+
+# Leakage guard. This must run against the SOURCE objects, not against `dat`:
+# `dat` is assembled from explicit dplyr::select() calls on both sides, so a
+# stray label column could never survive into it and the check would be dead code
+# passing on every input.
+stopifnot("model label column present in the feature matrix" =
+  !"eif3d_target" %in% colnames(features))
+stopifnot("model label column present in the contrast table" =
+  !"eif3d_target" %in% colnames(de))
+cat("No model-label columns in either source table: PASS\n")
+```
+
+## Biological spot-checks
+
+```{r checks_biological}
+# 1. Direction convention. EIF3D is the knockdown target, so its own mRNA must be
+#    depleted in si3d, which under log2(sictrl / si3d) means strongly positive.
+eif3d <- dat %>% filter(symbol == "EIF3D")
+stopifnot("EIF3D not found in the joined data" = nrow(eif3d) == 1)
+stopifnot("EIF3D rna_lfc is not positive - direction convention may have flipped" =
+  eif3d$rna_lfc > 0.5)
+cat("EIF3D rna_lfc =", round(eif3d$rna_lfc, 2),
+    "-> log2(sictrl / si3d) confirmed\n")
+
+# 2. GC3 median must sit in the established 40-65% band (same check as 01_ / 43_)
+gc3_med <- median(dat$gc3, na.rm = TRUE)
+stopifnot("GC3 median outside the expected 40-65% band" =
+  between(gc3_med, 40, 65))
+cat("GC3 median:", round(gc3_med, 1), "%\n")
+
+# 3. cds_gc and gc3 are known to be ~0.93 correlated via isochore structure
+#    (documented in CLAUDE.md). They are NOT independent tests and must not be
+#    counted as two pieces of evidence.
+gc_collin <- cor(dat$cds_gc, dat$gc3, use = "complete.obs")
+cat("cor(cds_gc, gc3) =", round(gc_collin, 3),
+    "- these are one measurement, not two\n")
+stopifnot("cds_gc/gc3 collinearity outside the documented range" =
+  gc_collin > 0.85)
+```
+
+# Continuous Relationship
+
+```{r spearman_table}
+# Spearman rho for every GC and length feature against both readouts.
+# n is carried alongside rho throughout: at n ~ 10,000 the p-value is not the
+# quantity of interest and is reported only for completeness.
+cor_one <- function(x, y, feature, label, readout) {
+  ok <- complete.cases(x, y)
+  ct <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman"))
+  tibble(feature = feature, label = label, readout = readout,
+         rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+
+all_feats <- c(GC_FEATURES, LEN_FEATURES)
+cor_tbl <- map2_dfr(names(all_feats), unname(all_feats), function(f, lab) {
+  bind_rows(
+    cor_one(dat[[f]], dat$rna_lfc,  f, lab, "RNA"),
+    cor_one(dat[[f]], dat$ribo_lfc, f, lab, "RIBO"),
+    cor_one(dat[[f]], dat$te_lfc,   f, lab, "TE")
+  )
+}) %>%
+  mutate(kind = if_else(feature %in% names(GC_FEATURES), "GC", "Length"))
+
+cor_wide <- cor_tbl %>%
+  dplyr::select(kind, label, readout, rho, n) %>%
+  pivot_wider(names_from = readout, values_from = c(rho, n)) %>%
+  arrange(kind, desc(abs(rho_RNA)))
+
+print(cor_wide, n = 20)
+```
+
+The comparison that matters is the `rho_RNA` column against `rho_TE` within the GC
+block, and then the GC block against the Length block.
+
+```{r binned_medians}
+# Binned medians make the effect size visible in the units of the data, which a
+# correlation coefficient does not. Bootstrap CI on each bin median.
+set.seed(9)
+N_BOOT <- 1000
+
+boot_median_ci <- function(x, n_boot = N_BOOT) {
+  x <- x[!is.na(x)]
+  if (length(x) < 10) return(c(lo = NA_real_, hi = NA_real_))
+  bs <- replicate(n_boot, median(sample(x, length(x), replace = TRUE)))
+  q <- unname(quantile(bs, c(0.025, 0.975)))
+  c(lo = q[1], hi = q[2])
+}
+
+# Both bounds must come from ONE resample distribution. Calling boot_median_ci()
+# twice (once for [1], once for [2]) would draw the lower bound from one bootstrap
+# run and the upper from a different one - not a coherent interval, and in a
+# degenerate bin the two can cross and render an inverted errorbar.
+binned <- map_dfr(names(all_feats), function(f) {
+  d <- dat %>%
+    dplyr::select(value = all_of(f), rna_lfc) %>%
+    filter(!is.na(value), !is.na(rna_lfc)) %>%
+    mutate(bin = ntile(value, N_BINS))
+  d %>%
+    group_by(bin) %>%
+    summarise(
+      median_rna_lfc = median(rna_lfc),
+      ci = list(boot_median_ci(rna_lfc)),
+      n = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    mutate(ci_lo = map_dbl(ci, "lo"),
+           ci_hi = map_dbl(ci, "hi")) %>%
+    dplyr::select(-ci) %>%
+    mutate(feature = f,
+           label = factor(unname(all_feats[f]), levels = FEATURE_ORDER),
+           kind = if_else(f %in% names(GC_FEATURES), "GC", "Length"))
+})
+
+stopifnot("bootstrap interval bounds are inverted" =
+  all(binned$ci_lo <= binned$ci_hi, na.rm = TRUE))
+
+# n per feature, used to annotate panels: utr3_gc / transcript_gc carry 134 NAs,
+# so a single transcriptome-wide n would overstate three of the eight panels.
+feat_n <- binned %>% group_by(label) %>%
+  summarise(n_feat = sum(n), .groups = "drop") %>%
+  mutate(txt = paste0("n = ", n_feat))
+
+# Range of the binned medians = the effect size in log2FC units
+bin_range <- binned %>%
+  group_by(kind, label) %>%
+  summarise(span = max(median_rna_lfc) - min(median_rna_lfc), .groups = "drop") %>%
+  arrange(desc(span))
+print(bin_range)
+```
+
+```{r plot_binned, fig.width=10, fig.height=6}
+p_binned <- ggplot(binned, aes(x = bin, y = median_rna_lfc)) +
+  geom_hline(yintercept = GLOBAL_MEDIAN, linetype = "dashed",
+             colour = "grey50", linewidth = 0.5) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.2,
+                colour = "grey40", linewidth = 0.4) +
+  geom_point(aes(colour = kind), size = 1.8) +
+  geom_line(aes(colour = kind), linewidth = 0.8) +
+  geom_text(data = feat_n, aes(x = Inf, y = -Inf, label = txt),
+            inherit.aes = FALSE, hjust = 1.1, vjust = -0.8,
+            size = 2.8, colour = "grey30") +
+  scale_colour_manual(values = c("GC" = "#0072B2", "Length" = "#CC79A7"),
+                      name = NULL) +
+  scale_x_continuous(breaks = seq(1, N_BINS, 2)) +
+  # 5 GC + 3 Length features: ncol = 5 puts each block on its own row.
+  # x is the decile index in every panel, so it must NOT be free.
+  facet_wrap(~ label, ncol = 5) +
+  labs(
+    title = "RNA change by feature decile (sictrl vs si3d, hypoxia 1hr)",
+    subtitle = paste0("Dashed line = observed global median rna_lfc (",
+                      round(GLOBAL_MEDIAN, 2),
+                      "). Bars = bootstrap 95% CI on the bin median. n per panel."),
+    x = paste0("Feature decile (1 = lowest, ", N_BINS, " = highest)"),
+    y = "Median rna_lfc, log2(sictrl / si3d)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"),
+        legend.position = "top")
+p_binned
+ggsave(here("plots", "71_rna_change_by_feature_decile.pdf"),
+       p_binned, width = 10, height = 6)
+```
+
+```{r paired_data}
+# Paired TE-vs-RNA view: one row per feature, TE on the left, RNA on the right.
+#
+# The two readouts have different global medians (te_lfc 0.289, rna_lfc 0.409),
+# both non-zero because of the spike-in shift. Plotting raw LFC would put the two
+# columns on different baselines and make the within-row comparison misleading.
+# Each readout is therefore CENTRED on its own global median, so:
+#   y = 0 means "behaves like the typical transcript for this readout"
+# and the two columns become directly comparable on one shared axis.
+# Panel order left to right. RIBO is appended so the existing TE-left / RNA-right
+# layout is preserved. All three legs are spike-in normalized log2(sictrl / si3d)
+# from the same producing notebook.
+READOUTS <- c("te_lfc" = "TE change", "rna_lfc" = "RNA change",
+              "ribo_lfc" = "RIBO change")
+
+readout_medians <- map_dbl(names(READOUTS), ~ median(dat[[.x]], na.rm = TRUE))
+names(readout_medians) <- names(READOUTS)
+print(round(readout_medians, 3))
+
+# Panel order: feature (rows) x readout (columns), TE before RNA within each row.
+PANEL_LEVELS <- as.vector(t(outer(FEATURE_ORDER, unname(READOUTS),
+                                  function(a, b) paste0(a, "  |  ", b))))
+
+paired_long <- map_dfr(names(READOUTS), function(rc) {
+  dat %>%
+    dplyr::select(lfc = all_of(rc), all_of(names(all_feats))) %>%
+    pivot_longer(-lfc, names_to = "feature", values_to = "value") %>%
+    filter(!is.na(value), !is.na(lfc)) %>%
+    mutate(readout_col = rc,
+           readout = unname(READOUTS[rc]),
+           centered = lfc - readout_medians[[rc]],
+           label = unname(all_feats[feature]))
+}) %>%
+  mutate(panel = factor(paste0(label, "  |  ", readout), levels = PANEL_LEVELS),
+         kind  = if_else(feature %in% names(GC_FEATURES), "GC", "Length"))
+
+stopifnot("panel factor has unmatched levels" = !anyNA(paired_long$panel))
+
+# Binned medians per panel, on the centred scale
+paired_med <- paired_long %>%
+  group_by(panel) %>%
+  mutate(bin = ntile(value, N_BINS)) %>%
+  group_by(panel, kind, bin) %>%
+  summarise(x = median(value), y = median(centered), n = dplyr::n(), .groups = "drop")
+
+# rho + n annotation, matched to the panel it belongs to
+# cor_tbl already carries `feature`, which the per-feature plots filter on.
+# Map the short readout names in cor_tbl onto the panel labels. A lookup rather
+# than nested if_else, so adding a readout cannot silently mislabel a panel.
+READOUT_LABEL <- c("TE" = "TE change", "RNA" = "RNA change", "RIBO" = "RIBO change")
+rho_lab <- cor_tbl %>%
+  mutate(readout = unname(READOUT_LABEL[readout]),
+         panel = factor(paste0(label, "  |  ", readout), levels = PANEL_LEVELS),
+         txt = paste0("rho = ", sprintf("%+.3f", rho), "\nn = ", n))
+stopifnot("rho annotation did not match a panel" = !anyNA(rho_lab$panel))
+stopifnot("rho_lab is missing the feature column" = "feature" %in% colnames(rho_lab))
+
+# Shared y limits from the pooled centred values, clipped to 1-99% so a handful
+# of outliers cannot stretch the axis and flatten every trend (the within-decile
+# SD is ~0.39 while the raw range spans nearly 7 log2 units).
+Y_LIM <- quantile(paired_long$centered, c(0.01, 0.99), na.rm = TRUE)
+cat("shared y limits (centred):", round(Y_LIM, 2), "\n")
+```
+
+```{r plot_per_feature, fig.width=12, fig.height=4}
+# One figure per feature, each faceted TE (left) vs RNA (right).
+#
+# The trend is a straight least-squares fit, not the decile medians: the question
+# here is "how does this feature relate to each readout", and a single fitted line
+# per panel makes the left-right slope comparison immediate.
+#
+# coord_cartesian() only zooms the viewport - it does NOT drop rows before the
+# fit - so geom_smooth is computed on all genes even though the extreme 1% is off
+# screen. (scale_y_continuous(limits=) would have silently refit on the subset.)
+kind_colour <- c("GC" = "#D55E00", "Length" = "#CC79A7")
+
+feature_plots <- map(names(all_feats), function(f) {
+  lab  <- unname(all_feats[f])
+  kind <- if (f %in% names(GC_FEATURES)) "GC" else "Length"
+
+  pd <- paired_long %>%
+    filter(feature == f) %>%
+    mutate(readout_f = factor(readout, levels = unname(READOUTS)))
+
+  rl <- rho_lab %>%
+    filter(feature == f) %>%
+    mutate(readout_f = factor(readout, levels = unname(READOUTS)))
+  stopifnot("rho annotation missing a readout for this feature" =
+    nrow(rl) == length(READOUTS))
+
+  ggplot(pd, aes(x = value, y = centered)) +
+    geom_point(alpha = 0.15, size = 0.35, colour = "grey45") +
+    geom_hline(yintercept = 0, linetype = "dashed",
+               colour = "#0072B2", linewidth = 0.5) +
+    geom_smooth(method = "lm", formula = y ~ x, se = TRUE,
+                colour = kind_colour[[kind]], fill = kind_colour[[kind]],
+                alpha = 0.25, linewidth = 1) +
+    geom_text(data = rl, aes(x = Inf, y = Inf, label = txt),
+              inherit.aes = FALSE, hjust = 1.1, vjust = 1.4,
+              size = 3.2, colour = "grey20") +
+    coord_cartesian(ylim = Y_LIM) +
+    facet_wrap(~ readout_f, ncol = 3) +
+    labs(
+      title = paste0(lab, ": eIF3d-mediated TE change vs RNA change"),
+      subtitle = paste0("sictrl vs si3d, hypoxia 1hr. Facets centered on each ",
+                        "readout's global median; dashed = median.\n",
+                        "Line = linear fit with 95% CI, computed on all genes."),
+      x = lab,
+      y = "log2FC (sictrl / si3d), 1hr hypoxia"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(strip.text = element_text(face = "bold"))
+})
+names(feature_plots) <- names(all_feats)
+
+# Save one PDF per feature
+iwalk(feature_plots, function(p, f) {
+  ggsave(here("plots", paste0("71_te_vs_rna_", f, ".pdf")),
+         p, width = 12, height = 4)
+})
+cat("Wrote", length(feature_plots), "per-feature PDFs to plots/\n")
+print(paste0("71_te_vs_rna_", names(feature_plots), ".pdf"))
+```
+
+```{r show_per_feature, fig.width=12, fig.height=4, results='asis'}
+# Render each feature in turn, GC block first then Length (FEATURE_ORDER).
+ordered_feats <- names(all_feats)[order(match(unname(all_feats), FEATURE_ORDER))]
+for (f in ordered_feats) {
+  cat("\n\n## ", unname(all_feats[f]), "\n\n", sep = "")
+  print(feature_plots[[f]])
+}
+```
+
+```{r fit_slopes}
+# The slope behind each fitted line, so the visual comparison has a number.
+# Reported per 10 units of the feature for GC (percentage points) and per log2
+# unit for the length features.
+slope_tbl <- map_dfr(names(all_feats), function(f) {
+  map_dfr(names(READOUTS), function(rc) {
+    d <- paired_long %>% filter(feature == f, readout_col == rc)
+    fit <- lm(centered ~ value, data = d)
+    tibble(feature = unname(all_feats[f]),
+           readout = unname(READOUTS[rc]),
+           slope_per_unit = unname(coef(fit)[2]),
+           n = nrow(d))
+  })
+}) %>%
+  pivot_wider(names_from = readout, values_from = c(slope_per_unit, n)) %>%
+  dplyr::rename(slope_TE = `slope_per_unit_TE change`,
+                slope_RNA = `slope_per_unit_RNA change`) %>%
+  mutate(across(c(slope_TE, slope_RNA), ~ signif(.x, 3))) %>%
+  dplyr::select(feature, slope_TE, slope_RNA, `n_TE change`)
+print(as.data.frame(slope_tbl))
+write_csv(slope_tbl, here("output", "71_te_vs_rna_fit_slopes.csv"))
+```
+
+# Confounder Check: GC vs Length
+
+GC content and 5'UTR length are not independent, and 5'UTR length carries the real
+signal. If the small GC correlations are just length leaking through, they should
+vanish once length is partialled out.
+
+```{r partial_correlation}
+# Spearman partial correlation: rank-transform, regress out the length ranks, then
+# correlate the residuals. Done manually so this does not depend on ppcor.
+partial_spearman <- function(x, y, z) {
+  ok <- complete.cases(x, y, z)
+  rx <- rank(x[ok]); ry <- rank(y[ok]); rz <- rank(z[ok])
+  ex <- residuals(lm(rx ~ rz))
+  ey <- residuals(lm(ry ~ rz))
+  c(rho = unname(cor(ex, ey)), n = sum(ok))
+}
+
+# Each n is carried with the rho it belongs to. The partials drop rows on
+# complete.cases(x, y, z) while the raw correlation drops only on (x, y), so
+# reusing the raw n would overstate the partials' sample size the moment a
+# conditioning variable carries NAs (log2_utr3_length has 134).
+partial_tbl <- map_dfr(names(GC_FEATURES), function(f) {
+  raw <- cor_one(dat[[f]], dat$rna_lfc, f, unname(GC_FEATURES[f]), "RNA")
+  pu  <- partial_spearman(dat[[f]], dat$rna_lfc, dat$log2_utr5_length)
+  pc  <- partial_spearman(dat[[f]], dat$rna_lfc, dat$log2_cds_length)
+  tibble(label = unname(GC_FEATURES[f]),
+         rho_raw = raw$rho,                n_raw = raw$n,
+         rho_given_utr5_len = pu[["rho"]], n_given_utr5_len = pu[["n"]],
+         rho_given_cds_len  = pc[["rho"]], n_given_cds_len  = pc[["n"]])
+})
+print(partial_tbl)
+
+cat("\ncor(cds_gc, log2_utr5_length)  =",
+    round(cor(dat$cds_gc, dat$log2_utr5_length, use = "complete.obs"), 3), "\n")
+cat("cor(utr5_gc, log2_utr5_length) =",
+    round(cor(dat$utr5_gc, dat$log2_utr5_length, use = "complete.obs"), 3), "\n")
+```
+
+# Gene Sets vs Whole Transcriptome
+
+Violin comparison of GC content between the eIF3d-defined gene sets and the rest
+of the transcriptome, in the style of notebooks 48/62.
+
+A gene may belong to more than one set (the RNA- and TE-promoted sets overlap),
+so groups are built in **long format**: each set is drawn independently from the
+full table and a gene contributes a row to every set it belongs to. "All other
+genes" is the complement of the union of all four sets. This avoids an arbitrary
+priority rule silently reassigning the overlap.
+
+```{r load_genesets}
+read_set <- function(path, col) {
+  stopifnot("gene set file not found" = file.exists(path))
+  read_csv(path, show_col_types = FALSE) %>% pull({{ col }}) %>% unique()
+}
+
+set_rna_pos <- read_set(here("output", "genesets",
+                             "hypoxia_3d_promotes_RNA_1hr_lfc1.csv"), ensembl_gene)
+set_te_pos  <- read_set(here("output", "genesets",
+                             "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"), ensembl_gene)
+set_rna_neg <- read_set(here("output", "genesets",
+                             "si3d_rna_negative_controls_nor1and4_hyp1_hyp4.csv"), ensembl_gene)
+set_te_neg  <- read_csv(here("output", "predictive_modeling",
+                             "negative_control_genes.csv"), show_col_types = FALSE) %>%
+  mutate(g = sub("\\..*", "", gene_id)) %>% pull(g) %>% unique()
+
+set_list <- list(
+  "eIF3d RNA promoted"    = set_rna_pos,
+  "eIF3d TE promoted"     = set_te_pos,
+  "eIF3d-protected (RNA)" = set_rna_neg,
+  "Negative control (TE)" = set_te_neg
+)
+
+set_sizes <- imap_dfr(set_list, ~ tibble(
+  group = .y, n_total = length(.x),
+  n_in_data = sum(.x %in% dat$gene_id_clean)
+))
+print(set_sizes)
+stopifnot("a gene set has no overlap with the joined data" = all(set_sizes$n_in_data > 0))
+```
+
+## Cross-set overlap
+
+The four sets are **not** mutually exclusive, and the cross-readout overlap is
+large enough to change how the violins must be read. Report the full matrix
+rather than the positive-positive pair alone.
+
+```{r overlap_matrix}
+in_data <- map(set_list, ~ intersect(unique(.x), dat$gene_id_clean))
+
+ov <- outer(seq_along(in_data), seq_along(in_data),
+            Vectorize(function(i, j) length(intersect(in_data[[i]], in_data[[j]]))))
+dimnames(ov) <- list(names(in_data), names(in_data))
+print(ov)
+
+# Within a readout the positive and negative sets are disjoint by construction.
+# Assert that, since a violation would mean a gene set was rebuilt incorrectly.
+stopifnot("RNA positive and RNA-protected sets overlap" =
+  length(intersect(in_data[["eIF3d RNA promoted"]],
+                   in_data[["eIF3d-protected (RNA)"]])) == 0)
+stopifnot("TE positive and TE negative sets overlap" =
+  length(intersect(in_data[["eIF3d TE promoted"]],
+                   in_data[["Negative control (TE)"]])) == 0)
+
+cross <- length(intersect(in_data[["eIF3d RNA promoted"]],
+                          in_data[["Negative control (TE)"]]))
+cat("\nACROSS readouts the sets overlap substantially:\n")
+cat("  RNA-promoted genes that are also TE negative controls:", cross,
+    sprintf("(%.0f%% of the RNA-promoted set)\n",
+            100 * cross / length(in_data[["eIF3d RNA promoted"]])))
+cat("  These are genes whose mRNA drops sharply while TE holds constant -\n",
+    "  the 'forwarded' category, a real biological class rather than an artifact.\n")
+cat("  Consequence: 'Negative control (TE)' median rna_lfc is inflated by them.\n")
+
+te_neg_all <- dat %>% filter(gene_id_clean %in% in_data[["Negative control (TE)"]])
+te_neg_excl <- dat %>%
+  filter(gene_id_clean %in% setdiff(in_data[["Negative control (TE)"]],
+                                    in_data[["eIF3d RNA promoted"]]))
+cat("    as drawn                :", round(median(te_neg_all$rna_lfc), 3), "\n")
+cat("    minus RNA-promoted genes:", round(median(te_neg_excl$rna_lfc), 3), "\n")
+```
+
+```{r build_groups}
+in_any <- unique(unlist(set_list))
+
+grouped <- bind_rows(
+  imap_dfr(set_list, function(ids, nm) {
+    dat %>% filter(gene_id_clean %in% ids) %>% mutate(group = nm)
+  }),
+  dat %>% filter(!gene_id_clean %in% in_any) %>% mutate(group = "All other genes")
+) %>%
+  mutate(group = factor(group, levels = GROUP_LEVELS))
+
+group_n <- grouped %>% dplyr::count(group)
+print(group_n)
+
+# dplyr::count() defaults to .drop = TRUE, so an empty factor level is ABSENT
+# from group_n rather than present with n = 0 - which makes all(group_n$n > 0)
+# vacuously true and would let a whole group vanish from every plot silently
+# (e.g. if a geneset CSV were regenerated with versioned Ensembl IDs, or a
+# set_list name drifted out of sync with GROUP_LEVELS and coerced to NA).
+# Check the levels are present, not that the counts are positive.
+stopifnot("a group is missing entirely from the plotting data" =
+  all(GROUP_LEVELS %in% as.character(group_n$group)))
+stopifnot("a group name did not match GROUP_LEVELS and became NA" =
+  !anyNA(grouped$group))
+```
+
+```{r wilcox_vs_background}
+# Each set against "All other genes", which is the comparison the plot invites.
+bg <- grouped %>% filter(group == "All other genes")
+
+wilcox_tbl <- map_dfr(names(set_list), function(g) {
+  map_dfr(names(GC_FEATURES), function(f) {
+    a <- grouped %>% filter(group == g) %>% pull(all_of(f))
+    b <- bg %>% pull(all_of(f))
+    a <- a[!is.na(a)]; b <- b[!is.na(b)]
+    tibble(group = g, feature = unname(GC_FEATURES[f]),
+           median_set = median(a), median_bg = median(b),
+           delta = median(a) - median(b),
+           p_wilcox = suppressWarnings(wilcox.test(a, b)$p.value),
+           n_set = length(a), n_bg = length(b))
+  })
+})
+
+wilcox_tbl <- wilcox_tbl %>% mutate(p_adj = p.adjust(p_wilcox, method = "BH"))
+print(wilcox_tbl %>% arrange(desc(abs(delta))), n = 20)
+```
+
+`delta` is the quantity to read: it is in GC percentage points. With n in the
+thousands the p-values go significant on differences of well under one point.
+
+```{r group_sanity_check}
+# Grouping sanity check (kept after the violin was removed): the RNA-promoted set
+# is defined as rna_lfc > 1, so it must exceed every other group. If this fails,
+# the grouping or the join is wrong.
+med_by_group <- grouped %>% group_by(group) %>%
+  summarise(m = median(rna_lfc, na.rm = TRUE), .groups = "drop")
+print(med_by_group)
+stopifnot("RNA-promoted set does not have the highest median rna_lfc" =
+  med_by_group$m[med_by_group$group == "eIF3d RNA promoted"] == max(med_by_group$m))
+```
+
+# Summary
+
+```{r summary}
+summary_tbl <- cor_wide %>%
+  mutate(across(c(rho_RNA, rho_TE), ~ round(.x, 3))) %>%
+  dplyr::rename(feature = label)
+print(summary_tbl, n = 20)
+
+write_csv(cor_tbl,     here("output", "71_gc_vs_rna_correlations.csv"))
+write_csv(binned,      here("output", "71_gc_vs_rna_binned_medians.csv"))
+write_csv(wilcox_tbl,  here("output", "71_gc_geneset_vs_background.csv"))
+write_csv(partial_tbl, here("output", "71_gc_partial_correlations.csv"))
+
+cat("\nWrote 4 summary tables to output/ and 5 plots to plots/\n")
+```
+
+```{r headline}
+best_gc  <- cor_tbl %>% filter(readout == "RNA", feature %in% names(GC_FEATURES)) %>%
+  slice_max(abs(rho), n = 1)
+best_len <- cor_tbl %>% filter(readout == "RNA", feature %in% names(LEN_FEATURES)) %>%
+  slice_max(abs(rho), n = 1)
+gc_te    <- cor_tbl %>% filter(readout == "TE", feature == "cds_gc")
+
+cat("Strongest GC correlate of rna_lfc    :", best_gc$label,
+    sprintf("rho = %+.3f (n = %d)", best_gc$rho, best_gc$n), "\n")
+cat("Strongest length correlate of rna_lfc:", best_len$label,
+    sprintf("rho = %+.3f (n = %d)", best_len$rho, best_len$n), "\n")
+cat("cds_gc vs te_lfc, same genes         :",
+    sprintf("rho = %+.3f (n = %d)", gc_te$rho, gc_te$n), "\n")
+cat("\nGC decile span in rna_lfc units:",
+    round(bin_range$span[bin_range$label == unname(GC_FEATURES["cds_gc"])], 3), "\n")
+```
