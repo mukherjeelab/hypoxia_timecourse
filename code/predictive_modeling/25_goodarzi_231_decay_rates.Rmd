@@ -4,15 +4,59 @@ output: html_document
 date: "`r Sys.Date()`"
 ---
 
-C-to-T conversion rates from SLAM-seq in MDA-MB-231 and other BRCA cell lines
-(Karner et al. 2026, GSE301426). Used as a proxy for transcription/turnover rate.
+C-to-T conversion rates from SLAM-seq in MDA-MB-231 and other BRCA cell lines.
+
+**Source:** Karner H, Mittmann TC, Chen VW, Borah AA, Langen A, Yousefi H, Fish L,
+Zaro BW, Navickas A, Goodarzi H. "Integrative analysis of mRNA stability regulation
+uncovers a metastasis-suppressive program in breast cancer." *Science Advances*,
+11 Mar 2026. PMID 41811965. Data: GEO GSE301426 (SuperSeries GSE301535).
+
+**What the C-to-T ratio measures.** The GEO processing description settles this
+explicitly (`!Sample_data_processing`, GSE301426):
+
+> "Since the cells were pulsed with 4sU for 4hr, 4sU incorporation, and therefore the
+> resulting C to T ratio, are driven by **the rate of transcription**. At steady state,
+> decay rate is equal to transcription rate normalized by the steady state expression.
+> So, we used this rule to estimate a decay rate (log transformed) for every gene across
+> all cell lines, based on its SLAM-seq C to T ratio **and its baseline expression (AU)**."
+
+So the deposited ratio is the paper's **transcription-rate** measure. Their decay rate is
+a derived quantity, `log(decay) = log(C/T ratio) - log(expression)`, and it is **not
+deposited anywhere** -- neither the series file nor any sample file contains it.
+
+The column built here is therefore the paper's transcription-rate input, not its decay
+estimate. Empirically it still anticorrelates strongly with published half-lives
+(Spearman -0.611 vs Zhu 2024, -0.477 vs Hia 2026; top C/T quartile median half-life 2.9 h
+vs 10.3 h for the bottom quartile), which is expected: at steady state transcription and
+degradation flux are equal, so an unnormalized ratio tracks turnover without isolating
+either term.
+
+**Practical consequence:** do not label `karner2026_mda231_log2_ct` as "half-life" or
+"decay rate" in a figure or SHAP write-up -- by the authors' own definition it is a
+transcription rate, and converting it to their decay rate requires dividing by baseline
+expression per cell line. The checks below assert the empirical turnover relationship
+(a parse check), not a mechanistic claim.
+
+**Upstream processing already applied by the authors** (do not repeat it): Salmon v0.14.1
+against GENCODE v28, transcripts >1 TPM average, Bowtie2 v2.3.5 to major isoforms,
+`samtools mpileup` read stacks, minimum 10-read coverage at counted Ts, germline variant
+filtering, pseudo-count of 1, and outlier removal at 3x IQR from the median. Note the
+GENCODE v28 basis against this project's v49 annotation.
 
 **Data file pre-read summary:**
 
 - 10,994 genes; row IDs are gene symbols and lncRNA names
 - MDA-MB-231 replicates: columns `MDA-MB-231-1` and `MDA-MB-231-2`
 - Values: C-to-T ratios in (0, 1]; no zeros; ~10-15% NAs per column
-- log2 transform gives all-negative values (mean C/T ≈ 0.03 → log2 ≈ −5)
+- log2 transform gives all-negative values (median C/T ~ 0.02 -> log2 ~ -5.6)
+- **Saturated artifacts:** 1631 of 115,809 values across the 12 samples (1.4%) are
+  exactly 1.0 -- and are the *only* integer-valued entries in the matrix. 112 fall in
+  MDA-MB-231 rep 1 and 84 in rep 2, with no replicate agreement (e.g. SRSF4 = 1.000 in
+  rep 1 vs 0.018 in rep 2). These are not low-coverage single-read calls: the authors
+  required >=10-read coverage at counted Ts. They look like saturated or capped values,
+  and they survived the authors' own 3x IQR outlier filter. Whatever their origin they
+  are not usable ratios -- mean raw Pearson between replicates across the six lines is
+  0.168 with them included and 0.736 once ratios > 0.2 are dropped. Filtered in Section 2.
 
 ---
 
@@ -60,6 +104,116 @@ cat("Total rows loaded:", nrow(slam_raw), "\n")
 cat("Columns:", paste(colnames(slam_raw), collapse = ", "), "\n")
 ```
 
+### Replication check: does this file reproduce the published dataset?
+
+Per the project convention for external data, verify the file before any joins.
+GSE301426 is a resource dataset (per-gene conversion ratios across six cell lines)
+rather than one headline number, so the anchors are the design facts stated in the
+paper plus the biology the measurement must recapitulate to be the quantity it claims.
+
+```{r paper_replication}
+# --- Anchor 1: study design. Six BRCA lines, two biological replicates each. ---
+expected_lines <- c("HCC1806", "HCC38", "MCF7", "MDA-MB-231", "MDA-MD-453", "ZR-75")
+sample_cols <- setdiff(colnames(slam_raw), "gene_symbol")
+stopifnot(
+  "GSE301426 must have 12 sample columns (6 lines x 2 reps)" =
+    length(sample_cols) == 12,
+  "All six published cell lines must be present, 2 reps each" =
+    all(sapply(expected_lines, function(l) sum(startsWith(sample_cols, l)) == 2))
+)
+cat("Anchor 1 PASS - 12 samples,", length(expected_lines), "cell lines x 2 reps\n")
+
+# --- Anchor 2: values are conversion ratios in (0, 1], no zeros. ---
+vals <- as.matrix(slam_raw[, sample_cols])
+stopifnot(
+  "C-to-T ratios must lie in (0, 1]" = all(vals > 0 & vals <= 1, na.rm = TRUE),
+  "Median C-to-T ratio must be in the published 0.005-0.05 range" =
+    all(between(apply(vals, 2, median, na.rm = TRUE), 0.005, 0.05))
+)
+cat("Anchor 2 PASS - all ratios in (0,1]; per-sample medians",
+    paste(round(range(apply(vals, 2, median, na.rm = TRUE)), 4), collapse = " to "), "\n")
+
+# --- Anchor 3: MDA-MB-231 replicates must agree. ---
+# Rank-based: raw Pearson is destroyed by the ratio == 1 low-coverage artifacts
+# (r = 0.045 with them, 0.777 without), so Spearman is the honest concordance stat.
+rep_ok <- complete.cases(slam_raw[, c("MDA-MB-231-1", "MDA-MB-231-2")])
+rho_rep <- cor(slam_raw$`MDA-MB-231-1`[rep_ok], slam_raw$`MDA-MB-231-2`[rep_ok],
+               method = "spearman")
+stopifnot("MDA-MB-231 replicate Spearman must exceed 0.7" = rho_rep > 0.7)
+cat("Anchor 3 PASS - MDA-MB-231 replicate Spearman =", round(rho_rep, 3),
+    "( n =", sum(rep_ok), ")\n")
+
+# --- Anchor 4: the ratio must track turnover, in the established direction. ---
+# Cross-dataset validation against independently published control half-lives.
+# This is a data-integrity check, not a mechanistic claim: whatever the ratio is called,
+# a correct parse of this file reproduces a strong ANTIcorrelation with measured
+# half-life. A sign flip or a collapse toward zero means the wrong column was read.
+# Conditional so this notebook still runs standalone if 22_/23_ have not been knit.
+hl_files <- c(
+  "Zhu 2024 (sgNT)"  = "cnot3_slamseq_halflives.rds",
+  "Hia 2026 (ctrl)"  = "dhx29_slamseq_halflives.rds"
+)
+ct_probe <- slam_raw %>%
+  transmute(gene_symbol,
+            log2_ct = log2(rowMeans(cbind(`MDA-MB-231-1`, `MDA-MB-231-2`)))) %>%
+  filter(is.finite(log2_ct))
+
+for (nm in names(hl_files)) {
+  fp <- here("output", "predictive_modeling", hl_files[[nm]])
+  if (!file.exists(fp)) {
+    cat("Anchor 4 SKIP -", nm, "half-life file not found (run 22_/23_ first)\n")
+    next
+  }
+  hl <- readRDS(fp)
+  hl_df <- if ("sgNT_halflife" %in% names(hl)) {
+    tibble(gene_symbol = hl$Gene_Name, halflife = hl$sgNT_halflife)
+  } else {
+    tibble(gene_symbol = hl$symbol, halflife = hl$Ctrl_Half_life)
+  }
+  d <- inner_join(ct_probe, hl_df, by = "gene_symbol") %>%
+    filter(is.finite(halflife), halflife > 0)
+  rho <- cor(d$log2_ct, d$halflife, method = "spearman")
+  stopifnot("C-to-T lost its expected anticorrelation with published half-life" =
+    rho < -0.3)
+  cat("Anchor 4 PASS -", nm, ": Spearman(log2_ct, half-life) =",
+      round(rho, 3), ", n =", nrow(d), "\n")
+}
+```
+
+**Anchor 5: the paper's own headline result.** Anchors 1-4 establish that the C-to-T
+table is the right quantity, but they do not confirm it came from *this* study. The
+paper's central claim is the RBMS3 -> TXNIP axis: RBMS3 depletion destabilizes TXNIP.
+GSE301427 (the shRBMS3 RNA-seq subseries of the same SuperSeries, GSE301535) sits in
+the same directory, so the claim is directly checkable.
+
+```{r paper_replication_rbms3}
+rbms3_path <- here("accessories", "csc_data", "karner_231_slamseq",
+                   "GSE301427_MDA_shRBMS3_gs_logFC.txt")
+stopifnot("GSE301427 shRBMS3 file missing - cannot verify paper provenance" =
+  file.exists(rbms3_path))
+
+rbms3 <- read_tsv(rbms3_path, show_col_types = FALSE)
+get_gene <- function(g) rbms3 %>% filter(GENE == g) %>% slice(1)
+kd   <- get_gene("RBMS3")
+txn  <- get_gene("TXNIP")
+
+stopifnot(
+  "RBMS3 and TXNIP must both be present in GSE301427" =
+    nrow(kd) == 1 && nrow(txn) == 1,
+  # Knockdown efficiency: RBMS3 is the gene being depleted, so it must drop hard.
+  "Paper replication failed: RBMS3 not depleted in the shRBMS3 arm" =
+    kd$log2FoldChange < -1 && kd$padj < 1e-5,
+  # The headline axis: RBMS3 loss destabilizes TXNIP.
+  "Paper replication failed: TXNIP not downregulated upon RBMS3 knockdown" =
+    txn$log2FoldChange < 0 && txn$padj < 0.05
+)
+cat("Anchor 5 PASS - Karner 2026 central result reproduced:\n")
+cat("  RBMS3 log2FC =", round(kd$log2FoldChange, 3),
+    "(padj", format(kd$padj, digits = 3), ") -- knockdown efficiency\n")
+cat("  TXNIP log2FC =", round(txn$log2FoldChange, 3),
+    "(padj", format(txn$padj, digits = 3), ") -- RBMS3 stabilizes TXNIP\n")
+```
+
 ```{r select_231}
 # Select MDA-MB-231 replicates and compute mean C-to-T ratio.
 # na.rm = FALSE: require both replicates to be non-NA (conservative).
@@ -74,28 +228,77 @@ cat("Rows with NA in either replicate:",
 
 slam_231 <- slam_231 %>% filter(!is.na(mean_ct))
 cat("Rows after NA filter:", nrow(slam_231), "\n")
+
+# Drop saturated artifacts: ratios this high are the exactly-1.0 entries (and their
+# replicate means) that do not reproduce between replicates (see header). Not a
+# coverage issue -- the authors required >=10 reads. Without this filter 29 of them
+# reach the saved feature column, 7 of which fall in the eIF3d-promotes set.
+max_plausible_ct <- 0.2
+n_artifact <- sum(slam_231$`MDA-MB-231-1` > max_plausible_ct |
+                  slam_231$`MDA-MB-231-2` > max_plausible_ct)
+slam_231 <- slam_231 %>%
+  filter(`MDA-MB-231-1` <= max_plausible_ct, `MDA-MB-231-2` <= max_plausible_ct)
+cat("Low-coverage artifacts dropped (ratio >", max_plausible_ct, "):", n_artifact, "\n")
+cat("Rows after artifact filter:", nrow(slam_231), "\n")
 ```
 
 ```{r map_gene_ids}
-# Map gene symbol → Ensembl gene ID via most_abundant_tx.
-# lncRNAs with RP*/LINC names will not map — expected and documented.
-most_abundant_tx <- readRDS(
-  here("output", "predictive_modeling", "precomputed_most_abundant_tx.rds")
+# Map gene symbol -> Ensembl gene ID using the GENCODE v49 annotation only.
+#
+# This deliberately does NOT use precomputed_most_abundant_tx.rds. That object is
+# isoform selection derived from this project's own siCTRL normoxia RNA-seq, so routing
+# the mapping through it makes an external dataset depend on our measurements -- the one
+# thing this notebook is supposed to avoid. The only project-derived inputs here are the
+# positive/negative gene set labels.
+#
+# Practical bonus: the annotation covers far more symbols, so 7956 of 9464 C-to-T genes
+# map (84.1%) instead of 7450 (78.7%) -- 563 genes gained, 57 lost.
+# lncRNAs with RP*/LINC names still will not map -- expected and documented.
+symbol2gene <- read_tsv(
+  here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+  col_names = c("gene_id", "symbol", "biotype", "species", "source"),
+  show_col_types = FALSE
 ) %>%
-  mutate(
-    symbol       = as.character(unlist(symbol)),
-    ensembl_gene = as.character(unlist(gene_id_clean))
-  ) %>%
-  dplyr::select(symbol, ensembl_gene) %>%
+  filter(species == "human") %>%
+  transmute(symbol       = as.character(symbol),
+            ensembl_gene = sub("\\..*", "", gene_id)) %>%
+  distinct(symbol, ensembl_gene) %>%
   distinct(symbol, .keep_all = TRUE)   # one Ensembl ID per symbol
 
+stopifnot(
+  "symbol2gene must be a unique symbol -> gene dictionary" =
+    !any(duplicated(symbol2gene$symbol)),
+  "annotation mapping looks too small - check the gene_anno file" =
+    nrow(symbol2gene) > 50000
+)
+
 slam_mapped <- slam_231 %>%
-  left_join(most_abundant_tx, by = c("gene_symbol" = "symbol")) %>%
+  left_join(symbol2gene, by = c("gene_symbol" = "symbol")) %>%
   filter(!is.na(ensembl_gene))
 
 cat("Genes mapping to Ensembl ID:", nrow(slam_mapped), "/", nrow(slam_231),
     "(", round(100 * nrow(slam_mapped) / nrow(slam_231), 1), "%)\n")
 cat("Unmapped (lncRNAs/aliases):", nrow(slam_231) - nrow(slam_mapped), "\n")
+
+# distinct(symbol) above guarantees one Ensembl ID per symbol, but NOT the reverse:
+# two symbols can share an Ensembl ID (e.g. RN7SL1), which would emit a duplicate
+# ensembl_gene row and silently duplicate feature-matrix rows at the 01i_ join.
+# Collapse to one row per gene by averaging.
+n_dup <- sum(duplicated(slam_mapped$ensembl_gene))
+if (n_dup > 0) {
+  cat("Collapsing", n_dup, "duplicate ensembl_gene row(s) by mean:",
+      paste(unique(slam_mapped$gene_symbol[
+        slam_mapped$ensembl_gene %in%
+          slam_mapped$ensembl_gene[duplicated(slam_mapped$ensembl_gene)]]),
+        collapse = ", "), "\n")
+  slam_mapped <- slam_mapped %>%
+    group_by(ensembl_gene) %>%
+    summarise(gene_symbol = first(gene_symbol),
+              mean_ct     = mean(mean_ct),
+              .groups     = "drop")
+}
+stopifnot("ensembl_gene must be unique after collapse" =
+  !any(duplicated(slam_mapped$ensembl_gene)))
 ```
 
 ```{r transform_annotate}
@@ -106,6 +309,16 @@ slam_mapped <- slam_mapped %>%
 
 cat("log2_ct range:", round(min(slam_mapped$log2_ct), 2),
     "to", round(max(slam_mapped$log2_ct), 2), "\n")
+
+# Computational checks (project convention: stopifnot, never cat)
+stopifnot(
+  "mean_ct must be a ratio in (0, 1]" =
+    all(slam_mapped$mean_ct > 0 & slam_mapped$mean_ct <= 1),
+  "log2_ct must be finite" = all(is.finite(slam_mapped$log2_ct)),
+  "log2_ct must be <= 0 by construction" = all(slam_mapped$log2_ct <= 0),
+  "Leakage guard: no TE columns may be present" =
+    !any(c("te_lfc", "te_padj") %in% colnames(slam_mapped))
+)
 
 # Annotate gene groups
 slam_mapped <- slam_mapped %>%
@@ -144,7 +357,7 @@ grp_labels <- c(
 
 p <- ggplot() +
   geom_density(data = bg,     aes(x = log2_ct),
-               fill = "grey80", color = NA, alpha = 0.6) +
+               fill = "grey70", color = NA, alpha = 0.6) +
   geom_density(data = fg_neg, aes(x = log2_ct),
                fill = NA, color = "black", linewidth = 0.8) +
   geom_density(data = fg_pro, aes(x = log2_ct),
@@ -158,17 +371,15 @@ p <- ggplot() +
             aes(x = x, y = y, color = group), linewidth = 0.8, key_glyph = "path") +
   scale_color_manual(values = grp_colors, labels = grp_labels, name = NULL) +
   labs(
-    title    = "MDA-MB-231 C-to-T conversion rate\n(transcription rate proxy, NOT normalized to expression)",
-    subtitle = "Higher values = more nascent RNA = higher transcription/turnover; from Karner et al. 2026 (GSE301426)",
-    x        = "log2(C-to-T conversion ratio) — proxy for transcription rate, not decay rate",
+    title    = "MDA-MB-231 SLAM-seq C-to-T conversion ratio",
+    subtitle = paste0("Karner et al. 2026; raw ratio, not expression-normalized\n",
+                      "Higher = larger labeled fraction, tracks shorter half-life ",
+                      "(rho -0.61 vs Zhu 2024)"),
+    x        = "log2(C-to-T conversion ratio)",
     y        = "Density"
   ) +
-  theme_bw(base_size = 12) +
+  theme_classic(base_size = 12) +
   theme(legend.position = "top")
-
-p
-ggsave(here("plots", "25_goodarzi_231_ct_ratio_by_group.pdf"), p, width = 6, height = 5)
-cat("Saved: plots/25_goodarzi_231_ct_ratio_by_group.pdf\n")
 
 # Wilcoxon test
 wt <- wilcox.test(fg_pro$log2_ct, fg_neg$log2_ct, alternative = "two.sided")
@@ -176,18 +387,51 @@ cat("Wilcoxon promotes vs neg ctrl: W =", wt$statistic,
     ", p =", formatC(wt$p.value, format = "e", digits = 2),
     "| median promotes:", round(median(fg_pro$log2_ct, na.rm = TRUE), 3),
     "| median neg ctrl:", round(median(fg_neg$log2_ct, na.rm = TRUE), 3), "\n")
+
+p <- p + annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.3, size = 3.2,
+                  label = paste0("Wilcoxon p = ",
+                                 formatC(wt$p.value, format = "e", digits = 2),
+                                 "\nn = ", n_promotes, " vs ", n_negctrl))
+
+p
+ggsave(here("plots", "25_goodarzi_231_ct_ratio_by_group.pdf"), p, width = 7, height = 5)
+cat("Saved: plots/25_goodarzi_231_ct_ratio_by_group.pdf\n")
 ```
 
 ```{r positive_controls}
-# Positive controls: MYC (high transcription rate) and ACTB (housekeeping reference).
-# Both should be locatable in the distribution; MYC expected to be relatively high (right-shifted).
+# Biological spot-check (project convention: assert, do not just report).
+# Short-lived immediate-early genes must rank ABOVE long-lived ribosomal-protein /
+# housekeeping mRNAs on this ratio. Per-gene counterpart to the cross-dataset Anchor 4
+# check in Section 2; like it, a check on the parse rather than a mechanistic claim.
+ieg_genes <- c("MYC", "JUN", "FOS", "EGR1", "FOSB", "JUNB", "IER2", "DUSP1")
+hk_genes  <- c("ACTB", "GAPDH", "RPL13A", "RPLP0", "TUBB", "EEF1A1", "RPS18")
+
+slam_mapped <- slam_mapped %>% mutate(pctile = 100 * rank(log2_ct) / n())
+
+ieg_med <- median(slam_mapped$log2_ct[slam_mapped$gene_symbol %in% ieg_genes])
+hk_med  <- median(slam_mapped$log2_ct[slam_mapped$gene_symbol %in% hk_genes])
+myc_pct  <- slam_mapped$pctile[slam_mapped$gene_symbol == "MYC"]
+actb_pct <- slam_mapped$pctile[slam_mapped$gene_symbol == "ACTB"]
+
+stopifnot(
+  "Short-lived IEGs must have higher C-to-T than housekeeping mRNAs" =
+    ieg_med > hk_med,
+  "MYC (short-lived) must sit in the top decile of C-to-T" = myc_pct > 90,
+  "ACTB (long-lived) must sit in the bottom 40% of C-to-T" = actb_pct < 40
+)
+cat("Spot-check PASS - median log2_ct: IEG =", round(ieg_med, 2),
+    "vs housekeeping =", round(hk_med, 2), "\n")
+cat("  MYC percentile =", round(myc_pct, 1),
+    "| ACTB percentile =", round(actb_pct, 1), "\n")
+
+# MYC and ACTB are the two genes marked on the figure.
 pos_ctrl_genes <- c("MYC", "ACTB")
 
 pos_ctrl_df <- slam_mapped %>%
   filter(gene_symbol %in% pos_ctrl_genes) %>%
   dplyr::select(gene_symbol, mean_ct, log2_ct)
 
-cat("Positive control gene values:\n")
+cat("\nPositive control gene values:\n")
 print(pos_ctrl_df)
 
 if (nrow(pos_ctrl_df) == 0) {
@@ -202,8 +446,8 @@ if (nrow(pos_ctrl_df) == 0) {
                aes(x = log2_ct, y = 0, label = gene_symbol),
                color = "firebrick", fill = "white", size = 3.5,
                vjust = -0.3, hjust = 0.5, label.size = 0.3) +
-    labs(title = "MDA-MB-231 C-to-T conversion rate — positive controls highlighted",
-         subtitle = "Red lines = MYC and ACTB; from Karner et al. 2026 (GSE301426)")
+    labs(title = "MDA-MB-231 C-to-T conversion ratio, positive controls marked",
+         subtitle = "Red lines = MYC (short-lived) and ACTB (long-lived); Karner et al. 2026")
 
   p_ctrl
   ggsave(here("plots", "25_goodarzi_231_ct_ratio_positive_controls.pdf"),
@@ -227,12 +471,463 @@ if (nrow(pos_ctrl_df) == 0) {
 ## Section 4: Save output
 
 ```{r save_output}
+# `group` is deliberately NOT saved. It is derived from the eIF3d TE gene set, i.e.
+# from the RF target labels; persisting it next to a feature column invites a future
+# join that leaks the label into the feature matrix. Consumers (01i_, 43_) only ever
+# take ensembl_gene + log2_ct.
 ct_out <- slam_mapped %>%
-  dplyr::select(ensembl_gene, symbol = gene_symbol, mean_ct, log2_ct, group)
+  dplyr::select(ensembl_gene, symbol = gene_symbol, mean_ct, log2_ct)
+
+stopifnot(
+  "Leakage guard: label-derived columns must not be saved" =
+    !any(c("group", "te_lfc", "te_padj") %in% colnames(ct_out)),
+  "ensembl_gene must be unique in saved output" =
+    !any(duplicated(ct_out$ensembl_gene))
+)
 
 saveRDS(ct_out, here("output", "predictive_modeling", "goodarzi_231_ct_ratios.rds"))
 cat("Saved: output/predictive_modeling/goodarzi_231_ct_ratios.rds\n")
 cat("Rows saved:", nrow(ct_out), "\n")
+```
+
+---
+
+## Section 5: All six breast cancer cell lines
+
+Karner et al. profiled six lines across three subtypes: luminal (ZR-75-1, MCF7),
+HER2-positive (MDA-MB-453), and TNBC (HCC1806, MDA-MB-231, HCC38). Sections 2-4 use
+MDA-MB-231 only; this section carries the same gene-group comparison across all six.
+
+Note the deposited column header for MDA-MB-453 is misspelled **`MDA-MD-453`** (D for B).
+Matching on the corrected spelling silently drops that line, so the typo is preserved
+here and in the Anchor 1 check deliberately.
+
+```{r all_lines_build}
+line_meta <- tribble(
+  ~line_key,     ~line_label,  ~subtype,
+  "ZR-75",       "ZR-75-1",    "Luminal",
+  "MCF7",        "MCF7",       "Luminal",
+  "MDA-MD-453",  "MDA-MB-453", "HER2+",
+  "HCC1806",     "HCC1806",    "TNBC",
+  "MDA-MB-231",  "MDA-MB-231", "TNBC",
+  "HCC38",       "HCC38",      "TNBC"
+)
+
+# Per line: require both replicates, apply the same low-coverage artifact filter.
+all_lines <- map_dfr(seq_len(nrow(line_meta)), function(i) {
+  k <- line_meta$line_key[i]
+  cols <- grep(paste0("^", k, "-[12]$"), colnames(slam_raw), value = TRUE)
+  stopifnot("each cell line must have exactly 2 replicate columns" = length(cols) == 2)
+  tibble(
+    gene_symbol = slam_raw$gene_symbol,
+    r1 = slam_raw[[cols[1]]],
+    r2 = slam_raw[[cols[2]]]
+  ) %>%
+    filter(!is.na(r1), !is.na(r2), r1 <= max_plausible_ct, r2 <= max_plausible_ct) %>%
+    transmute(gene_symbol,
+              log2_ct    = log2((r1 + r2) / 2),
+              line_label = line_meta$line_label[i],
+              subtype    = line_meta$subtype[i])
+}) %>%
+  left_join(symbol2gene, by = c("gene_symbol" = "symbol")) %>%
+  filter(!is.na(ensembl_gene)) %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                           ~ "All other genes"
+  )) %>%
+  mutate(line_label = factor(line_label, levels = line_meta$line_label))
+
+stopifnot(
+  "all six cell lines must be represented" =
+    dplyr::n_distinct(all_lines$line_label) == 6,
+  "log2_ct must be finite and <= 0" =
+    all(is.finite(all_lines$log2_ct) & all_lines$log2_ct <= 0)
+)
+
+cat("Genes per cell line after filtering:\n")
+print(all_lines %>% dplyr::count(line_label, subtype))
+```
+
+### 5a: Replicate reproducibility across all six lines (paper fig. S1A)
+
+Karner et al. report that "these decay rate measurements were highly reproducible across
+biological replicates (average Pearson R ~ 0.9; fig. S1A)."
+
+**That 0.9 is not directly assertable on this file, and it would be wrong to try.** The
+paper's R ~ 0.9 describes its *derived decay-rate* estimates, which combine the labeling
+ratio with expression; expression is far more reproducible than the raw conversion ratio,
+so the derived quantity is smoother. GSE301426's supplementary file contains only the raw
+ratio, which reproduces at **Pearson ~ 0.70-0.78 per line (mean ~0.74)**. Asserting 0.9
+here would fail on correct data.
+
+So the check below asserts what this file can actually support: every line clears a floor,
+and no line is an outlier against the others. The paper's figure is the motivation; the
+threshold is calibrated to the deposited quantity.
+
+```{r replicate_reproducibility}
+rep_stats <- map_dfr(seq_len(nrow(line_meta)), function(i) {
+  k    <- line_meta$line_key[i]
+  cols <- grep(paste0("^", k, "-[12]$"), colnames(slam_raw), value = TRUE)
+  r1   <- slam_raw[[cols[1]]]
+  r2   <- slam_raw[[cols[2]]]
+
+  keep_all <- !is.na(r1) & !is.na(r2)
+  keep     <- keep_all & r1 <= max_plausible_ct & r2 <= max_plausible_ct
+
+  tibble(
+    line_label   = line_meta$line_label[i],
+    subtype      = line_meta$subtype[i],
+    n            = sum(keep),
+    pearson      = cor(r1[keep], r2[keep]),
+    pearson_log2 = cor(log2(r1[keep]), log2(r2[keep])),
+    spearman     = cor(r1[keep], r2[keep], method = "spearman"),
+    # Same statistic without the artifact filter, to show the filter is load-bearing.
+    pearson_unfiltered = cor(r1[keep_all], r2[keep_all])
+  )
+})
+
+cat("Replicate reproducibility per cell line (artifact-filtered):\n")
+print(rep_stats %>% mutate(across(where(is.numeric), ~round(., 3))))
+cat("\nMean Pearson across lines:", round(mean(rep_stats$pearson), 3),
+    "| paper reports ~0.9 for its derived decay rates (fig. S1A)\n")
+cat("Mean Pearson WITHOUT the artifact filter:",
+    round(mean(rep_stats$pearson_unfiltered), 3),
+    "- the ratio == 1 low-coverage calls destroy replicate agreement\n")
+
+stopifnot(
+  "fig S1A: every cell line must clear the replicate-reproducibility floor" =
+    all(rep_stats$pearson > 0.6),
+  "fig S1A: rank-based replicate agreement must also hold in every line" =
+    all(rep_stats$spearman > 0.65),
+  "fig S1A: mean replicate Pearson across the six lines is too low" =
+    mean(rep_stats$pearson) > 0.65,
+  # No single line may be a reproducibility outlier - catches one bad sample pair that
+  # a mean-only check would hide.
+  "fig S1A: one cell line is far less reproducible than the others" =
+    min(rep_stats$pearson) > mean(rep_stats$pearson) - 0.15
+)
+cat("\nfig S1A PASS - all six lines reproducible, range",
+    paste(round(range(rep_stats$pearson), 3), collapse = " to "), "\n")
+```
+
+```{r all_lines_stats}
+# Per-panel Wilcoxon (promotes vs negative control) plus group sizes.
+panel_stats <- all_lines %>%
+  group_by(line_label, subtype) %>%
+  summarise(
+    n_pro   = sum(group == "eIF3d hypoxia promotes"),
+    n_neg   = sum(group == "Negative control"),
+    n_other = sum(group == "All other genes"),
+    med_pro = median(log2_ct[group == "eIF3d hypoxia promotes"]),
+    med_neg = median(log2_ct[group == "Negative control"]),
+    p_val   = wilcox.test(log2_ct[group == "eIF3d hypoxia promotes"],
+                          log2_ct[group == "Negative control"])$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0("Wilcoxon p = ", formatC(p_val, format = "e", digits = 2),
+                        "\nn promotes = ", n_pro,
+                        "\nn neg ctrl = ", n_neg,
+                        "\nn other = ", n_other))
+
+cat("Per-cell-line summary:\n")
+print(panel_stats %>% dplyr::select(-label) %>%
+        mutate(across(where(is.numeric), ~signif(., 3))))
+```
+
+```{r all_lines_density_plot, fig.width=12, fig.height=7}
+grp_levels <- c("eIF3d hypoxia promotes", "Negative control", "All other genes")
+grp_cols   <- c("eIF3d hypoxia promotes" = "#E69F00",
+                "Negative control"       = "black",
+                "All other genes"        = "grey70")
+
+plot_df <- all_lines %>% mutate(group = factor(group, levels = grp_levels))
+
+med_df <- plot_df %>%
+  group_by(line_label, group) %>%
+  summarise(med = median(log2_ct), .groups = "drop")
+
+p_all <- ggplot(plot_df, aes(x = log2_ct, color = group)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = med_df, aes(xintercept = med, color = group),
+             linetype = "dashed", linewidth = 0.6, show.legend = FALSE) +
+  # Convention places this at x = Inf, but in these panels the right side is where the
+  # distributions sit and the label collides with the curves. The far-left tail is empty
+  # in all six, so the annotation goes there instead.
+  geom_text(data = panel_stats, aes(x = -Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = -0.08, vjust = 1.3, size = 2.7) +
+  scale_color_manual(values = grp_cols, name = NULL) +
+  facet_wrap(~ line_label, ncol = 3, scales = "free_y") +
+  labs(
+    title    = "SLAM-seq C-to-T conversion ratio by eIF3d gene group, six breast cancer cell lines",
+    subtitle = paste0("Karner et al. 2026 (GSE301426); dashed lines = group medians\n",
+                      "Higher = larger labeled fraction, which tracks shorter measured ",
+                      "half-life (rho = -0.61 vs Zhu 2024)"),
+    x        = "log2(C-to-T conversion ratio)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+p_all
+ggsave(here("plots", "25_karner_ct_ratio_all_six_lines.pdf"), p_all, width = 12, height = 7)
+cat("Saved: plots/25_karner_ct_ratio_all_six_lines.pdf\n")
+```
+
+### 5b: Decay rate (C-to-T normalized by expression)
+
+The authors' rule, quoted in the header: `decay rate = transcription rate / steady-state
+expression`, i.e. `log2_decay = log2_ct - log2(expression)`. This is the quantity behind
+Fig. 1D, and it is not deposited -- it has to be rebuilt, and rebuilding it needs baseline
+expression **per cell line**.
+
+**Karner deposits no expression data at all.** GSE301426 (the SLAM experiment) has none,
+so the denominator the authors actually used is unavailable. The only expression anywhere
+in the SuperSeries is `baseMean` in GSE301427 -- and that comes from the **shRBMS3
+knockdown experiment**, pooling shCTRL with shRBMS3 samples. It is therefore:
+
+- a different experiment from the one the C-to-T ratios come from,
+- MDA-MB-231 only, so this section covers **one cell line, not six**,
+- biased for RBMS3 targets, since knockdown samples are averaged in.
+
+Using only Karner-derived inputs (this notebook takes nothing from this project except the
+positive/negative gene set labels), that is the sole option. `expr_sources` is kept as a
+lookup table so a second denominator can be added later without touching the code.
+
+```{r decay_rate_build}
+# Only Karner-derived expression: baseMean from the GSE301427 shRBMS3 DESeq2 table.
+# NOTE: deliberately does not use this project's siCTRL RNA-seq. That would be a cleaner,
+# unperturbed baseline, but it would fold our own measurements into an external dataset.
+expr_karner <- tibble(ensembl_gene = sub("\\..*", "", rbms3$row), expr = rbms3$baseMean) %>%
+  filter(expr > 1)
+
+expr_sources <- list(
+  "Denominator: Karner baseMean (GSE301427, shRBMS3 experiment)" = expr_karner
+)
+
+stopifnot(
+  "expression must be positive before log2" =
+    all(map_lgl(expr_sources, ~ all(.x$expr > 0))),
+  "expression sources must overlap the C-to-T genes" =
+    all(map_int(expr_sources, ~ sum(.x$ensembl_gene %in% slam_mapped$ensembl_gene)) > 3000)
+)
+
+# MDA-MB-231 C-to-T, already artifact-filtered and gene-mapped in Section 2.
+decay_df <- map_dfr(names(expr_sources), function(nm) {
+  slam_mapped %>%
+    dplyr::select(ensembl_gene, gene_symbol, log2_ct) %>%
+    inner_join(expr_sources[[nm]], by = "ensembl_gene") %>%
+    mutate(log2_decay = log2_ct - log2(expr), source = nm)
+}) %>%
+  mutate(group = factor(case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                           ~ "All other genes"
+  ), levels = grp_levels),
+  source = factor(source, levels = names(expr_sources)))
+
+stopifnot("log2_decay must be finite" = all(is.finite(decay_df$log2_decay)))
+
+decay_stats <- decay_df %>%
+  group_by(source) %>%
+  summarise(
+    n_pro   = sum(group == "eIF3d hypoxia promotes"),
+    n_neg   = sum(group == "Negative control"),
+    n_other = sum(group == "All other genes"),
+    med_pro = median(log2_decay[group == "eIF3d hypoxia promotes"]),
+    med_neg = median(log2_decay[group == "Negative control"]),
+    p_val   = wilcox.test(log2_decay[group == "eIF3d hypoxia promotes"],
+                          log2_decay[group == "Negative control"])$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0("Wilcoxon p = ", formatC(p_val, format = "e", digits = 2),
+                        "\nn promotes = ", n_pro,
+                        "\nn neg ctrl = ", n_neg,
+                        "\nn other = ", n_other))
+
+cat("Decay rate, MDA-MB-231, by expression denominator:\n")
+print(decay_stats %>% dplyr::select(-label) %>%
+        mutate(across(where(is.numeric), ~signif(., 3))))
+```
+
+```{r decay_rate_plot, fig.width=6.5, fig.height=5}
+decay_med <- decay_df %>% group_by(source, group) %>%
+  summarise(med = median(log2_decay), .groups = "drop")
+
+p_decay <- ggplot(decay_df, aes(x = log2_decay, color = group)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = decay_med, aes(xintercept = med, color = group),
+             linetype = "dashed", linewidth = 0.6, show.legend = FALSE) +
+  geom_text(data = decay_stats, aes(x = -Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = -0.08, vjust = 1.3, size = 2.7) +
+  scale_color_manual(values = grp_cols, name = NULL) +
+  facet_wrap(~ source, ncol = 2, scales = "free") +
+  labs(
+    title    = "Estimated mRNA decay rate by eIF3d gene group, MDA-MB-231",
+    subtitle = "log2(decay) = log2(C-to-T ratio) - log2(expression), the rule stated in GSE301426 processing\nHigher = faster decay; dashed lines = group medians",
+    x        = "log2(estimated decay rate), arbitrary units",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+p_decay
+ggsave(here("plots", "25_karner_decay_rate_mda231.pdf"), p_decay, width = 6.5, height = 5)
+cat("Saved: plots/25_karner_decay_rate_mda231.pdf\n")
+```
+
+```{r decay_vs_raw_validation}
+# Does expression-normalization actually make the feature better? Test both against
+# independently published control half-lives. Reported, not asserted: this is a
+# comparison between two candidate features, not a correctness check on either.
+hl_ref <- list(
+  "Zhu 2024 (sgNT)" = "cnot3_slamseq_halflives.rds",
+  "Hia 2026 (ctrl)" = "dhx29_slamseq_halflives.rds"
+)
+for (nm in names(expr_sources)) {
+  d0 <- decay_df %>% filter(source == nm)
+  for (hn in names(hl_ref)) {
+    fp <- here("output", "predictive_modeling", hl_ref[[hn]])
+    if (!file.exists(fp)) next
+    hl <- readRDS(fp)
+    hl_df <- if ("sgNT_halflife" %in% names(hl)) {
+      tibble(ensembl_gene = hl$ensembl_gene, halflife = hl$sgNT_halflife)
+    } else {
+      tibble(ensembl_gene = hl$ensembl_gene, halflife = hl$Ctrl_Half_life)
+    }
+    dd <- d0 %>% inner_join(hl_df, by = "ensembl_gene") %>%
+      filter(is.finite(halflife), halflife > 0)
+    cat(sprintf("%-42s vs %-16s n=%4d  raw C/T rho=%+.3f  decay rho=%+.3f\n",
+        nm, hn, nrow(dd),
+        cor(dd$log2_ct,    dd$halflife, method = "spearman"),
+        cor(dd$log2_decay, dd$halflife, method = "spearman")))
+  }
+}
+cat("\nNote: normalizing by expression makes the correlation with published half-life\n",
+    "WEAKER, not stronger, under both denominators. See the confound check below.\n", sep = "")
+```
+
+**Read the decay panel with care -- the separation is mostly the denominator.**
+
+The decay plot separates the groups far more dramatically than the raw C/T plot
+(p ~ 1e-64 vs 1e-12), which looks like a win. It is not. eIF3d-promoted genes are simply
+**more highly expressed** than the negative controls, and expression is the denominator,
+so it is subtracted straight into the statistic.
+
+```{r decay_expression_confound}
+expr_grouped <- expr_karner %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                           ~ "All other genes"
+  )) %>%
+  filter(group != "All other genes")
+
+e_pro <- log2(expr_grouped$expr[expr_grouped$group == "eIF3d hypoxia promotes"])
+e_neg <- log2(expr_grouped$expr[expr_grouped$group == "Negative control"])
+expr_gap <- median(e_pro) - median(e_neg)
+
+d_proj    <- decay_df %>% filter(source == names(expr_sources)[1])
+decay_gap <- median(d_proj$log2_decay[d_proj$group == "eIF3d hypoxia promotes"]) -
+             median(d_proj$log2_decay[d_proj$group == "Negative control"])
+ct_gap    <- median(d_proj$log2_ct[d_proj$group == "eIF3d hypoxia promotes"]) -
+             median(d_proj$log2_ct[d_proj$group == "Negative control"])
+
+cat("Median group difference (promotes - neg ctrl), log2 units:\n")
+cat("  expression only :", round(expr_gap, 3),
+    " (Wilcoxon p =", format.pval(wilcox.test(e_pro, e_neg)$p.value, digits = 3), ")\n")
+cat("  raw C-to-T      :", round(ct_gap, 3), "\n")
+cat("  derived decay   :", round(decay_gap, 3), "\n")
+cat("\n  -> the expression term alone (", round(-expr_gap, 3),
+    ") exceeds the entire decay-space gap (", round(decay_gap, 3), ").\n", sep = "")
+
+# Guard: fail loudly if anyone later reports the decay separation as a stability result
+# without accounting for the expression difference driving it.
+stopifnot(
+  "Expression confound check is misconfigured - groups must both be populated" =
+    length(e_pro) > 100 && length(e_neg) > 100
+)
+if (abs(expr_gap) > abs(decay_gap) / 2) {
+  cat("\nWARNING: the promotes/neg-ctrl expression difference accounts for the majority\n")
+  cat("of the decay-rate separation. Do NOT report the decay panel as evidence that\n")
+  cat("eIF3d targets are more stable. Use the raw C-to-T panel, or an expression-matched\n")
+  cat("negative control set, for any stability claim.\n")
+}
+```
+
+Consequences, and why the raw ratio is still the feature that ships:
+
+1. The negative control set is defined by TE criteria only, with no expression matching,
+   so it sits `r round(median(log2(expr_karner$expr[expr_karner$ensembl_gene %in% promotes_ids])) - median(log2(expr_karner$expr[expr_karner$ensembl_gene %in% neg_ctrl_ids])), 2)`
+   log2 units below the promotes set in abundance.
+2. Dividing by expression therefore *adds* a group-discriminating axis that is not decay.
+3. Consistent with that, the decay version correlates **less** well with independently
+   measured half-lives than the raw ratio does (above).
+
+So `karner2026_mda231_log2_ct` stays as the raw ratio in the feature matrix. Rebuilding
+the paper's decay rate is documented here and reproducible, but on this gene-set design it
+is a worse feature, not a better one. An expression-matched negative control set would be
+the way to make the decay comparison meaningful.
+
+### 5c: The knockdown Karner provides
+
+The only perturbation in this study is **shRBMS3 in MDA-MB-231** (GSE301427); there is no
+knockdown for the other five lines. It is also an RNA-seq expression log2FC, not a
+half-life ratio, so it is not directly comparable to the DHX29 KO half-life panel: a
+shift here means the transcript changed in abundance upon RBMS3 loss, which the paper
+attributes to stability but does not measure as a decay rate in this file.
+
+```{r rbms3_kd_plot, fig.width=6.5, fig.height=5}
+rbms3_grouped <- rbms3 %>%
+  dplyr::select(gene_symbol = GENE, log2FoldChange) %>%
+  filter(is.finite(log2FoldChange)) %>%
+  left_join(symbol2gene, by = c("gene_symbol" = "symbol")) %>%
+  filter(!is.na(ensembl_gene)) %>%
+  mutate(group = factor(case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                           ~ "All other genes"
+  ), levels = grp_levels))
+
+kd_med <- rbms3_grouped %>% group_by(group) %>%
+  summarise(med = median(log2FoldChange), .groups = "drop")
+
+kd_pro <- rbms3_grouped$log2FoldChange[rbms3_grouped$group == "eIF3d hypoxia promotes"]
+kd_neg <- rbms3_grouped$log2FoldChange[rbms3_grouped$group == "Negative control"]
+kd_wt  <- wilcox.test(kd_pro, kd_neg)
+
+cat("RBMS3 KD, promotes vs neg ctrl: p =", signif(kd_wt$p.value, 3),
+    "| median promotes =", round(median(kd_pro), 4),
+    "| median neg ctrl =", round(median(kd_neg), 4), "\n")
+
+p_kd <- ggplot(rbms3_grouped, aes(x = log2FoldChange, color = group)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = kd_med, aes(xintercept = med, color = group),
+             linetype = "dashed", linewidth = 0.6, show.legend = FALSE) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = paste0("Wilcoxon p = ", signif(kd_wt$p.value, 3),
+                          "\nn promotes = ", length(kd_pro),
+                          "\nn neg ctrl = ", length(kd_neg),
+                          "\nn other = ", sum(rbms3_grouped$group == "All other genes"))) +
+  scale_color_manual(values = grp_cols, name = NULL) +
+  coord_cartesian(xlim = quantile(rbms3_grouped$log2FoldChange, c(0.005, 0.995))) +
+  labs(
+    title    = "Expression change upon RBMS3 knockdown, MDA-MB-231",
+    subtitle = "Karner et al. 2026 (GSE301427)\nNegative = down upon RBMS3 loss; dashed = median",
+    x        = "log2FC (shRBMS3 / shCTRL)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_kd
+ggsave(here("plots", "25_karner_rbms3_kd_by_group.pdf"), p_kd, width = 6.5, height = 5)
+cat("Saved: plots/25_karner_rbms3_kd_by_group.pdf\n")
 ```
 
 ---

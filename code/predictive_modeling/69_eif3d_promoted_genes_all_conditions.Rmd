@@ -1,0 +1,501 @@
+---
+title: "eIF3d-promoted genes across all conditions and timepoints"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  lfc_cutoff: 0.5
+  padj_cutoff: 0.05
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+
+# knitr builds `params` from the YAML header, but it does not exist when running
+# chunks interactively - and bare `params` then resolves to an unrelated function
+# from an attached package ("object of type 'closure' is not subsettable").
+# Test is.list() rather than exists(), since exists() finds that function.
+if (!exists("params") || !is.list(params)) {
+  params <- list(lfc_cutoff = 0.5, padj_cutoff = 0.05)
+}
+```
+
+## Purpose
+
+Build a single collaborator-facing table covering **every tested gene**, with a
+per-condition flag marking where its translation is **promoted by eIF3d**. Genes
+that are not up in any condition are retained rather than filtered out, so the
+file serves as its own background set and the collaborator can compare hits
+against non-hits without needing a second export.
+
+Conditions scanned (MDA-MB-231, si3d vs siCTRL, spike-in normalized):
+
+| Condition | Timepoints |
+|---|---|
+| normoxia | 1hr, 4hr, 24hr |
+| hypoxia  | 1hr, 4hr, 24hr |
+
+**Directionality (MDA-MB-231):** the DESeq2 coefficient in these files is
+log2(sictrl / si3d), so **positive `te_lfc` = knockdown reduces TE = eIF3d
+promotes translation**. This is the convention already used by
+`code/generate_signatures.Rmd`; no sign flip is applied here.
+
+**Call:** `te_padj < `r params$padj_cutoff`` AND `te_lfc > `r params$lfc_cutoff``
+(the project's standard 0.5 fold-change threshold).
+
+## Load per-condition TE results
+
+```{r load}
+conditions <- tribble(
+  ~condition,  ~timepoint, ~file,
+  "normoxia",  "1hr",      "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv",
+  "normoxia",  "4hr",      "translation_categories_si3d_vs_sictrl_normoxia_4hr.csv",
+  "normoxia",  "24hr",     "translation_categories_si3d_vs_sictrl_normoxia_24hr.csv",
+  "hypoxia",   "1hr",      "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "hypoxia",   "4hr",      "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv",
+  "hypoxia",   "24hr",     "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv"
+)
+
+# fail early rather than silently dropping a condition, and name what is missing
+missing_files <- conditions$file[!file.exists(here("output", conditions$file))]
+if (length(missing_files) > 0) {
+  stop("missing TE result file(s): ", paste(missing_files, collapse = ", "))
+}
+
+te_long <- conditions %>%
+  mutate(data = map(file, ~ read_csv(here("output", .x), show_col_types = FALSE))) %>%
+  dplyr::select(-file) %>%
+  unnest(data) %>%
+  mutate(
+    gene_id_clean = sub("\\..*", "", gene_id),
+    contrast      = paste0(condition, "_", timepoint),
+    contrast      = factor(contrast, levels = paste0(
+      rep(c("normoxia", "hypoxia"), each = 3), "_", c("1hr", "4hr", "24hr")))
+  )
+
+# computational checks
+stopifnot(all(c("gene_id", "symbol", "te_lfc", "te_padj") %in% colnames(te_long)))
+stopifnot("te_lfc must be finite where present" =
+  all(is.finite(te_long$te_lfc[!is.na(te_long$te_lfc)])))
+stopifnot("te_padj must lie in [0, 1]" =
+  all(te_long$te_padj >= 0 & te_long$te_padj <= 1, na.rm = TRUE))
+stopifnot("all six contrasts must be present" =
+  n_distinct(te_long$contrast) == 6)
+# one row per gene per contrast: duplicates would inflate n_conditions_promoted
+stopifnot("gene x contrast must be unique" =
+  nrow(te_long) == n_distinct(te_long$gene_id_clean, te_long$contrast))
+# version stripping must not collapse two distinct gene IDs into one
+stopifnot("version stripping collapsed distinct gene IDs" =
+  n_distinct(te_long$gene_id) == n_distinct(te_long$gene_id_clean))
+
+cat("Rows loaded:", nrow(te_long), "across", n_distinct(te_long$gene_id_clean), "genes\n")
+te_long %>% dplyr::count(condition, timepoint)
+```
+
+## Call promoted genes per contrast
+
+```{r call}
+promoted_long <- te_long %>%
+  filter(!is.na(te_padj), te_padj < params$padj_cutoff, te_lfc > params$lfc_cutoff)
+
+promoted_long %>%
+  dplyr::count(condition, timepoint, name = "n_promoted") %>%
+  arrange(condition, timepoint)
+
+# Anchor check: the si3d hypoxia 1hr promoted set is the project's primary
+# positive gene set and is known to contain 1604 genes at lfc > 0.5, padj < 0.05.
+# Hard-coded on purpose - if an upstream TE file is ever regenerated, this fires
+# rather than silently shipping a different list to a collaborator.
+n_hyp_1hr <- sum(promoted_long$contrast == "hypoxia_1hr")
+cat("hypoxia 1hr genes up with (promoted by) eIF3d:", n_hyp_1hr, "\n")
+if (params$lfc_cutoff == 0.5 && params$padj_cutoff == 0.05) {
+  stopifnot("hypoxia 1hr promoted set must contain 1604 genes" = n_hyp_1hr == 1604)
+}
+```
+
+### Validation: reproduce the existing per-contrast gene sets
+
+`output/genesets/{condition}_3d_promotes_TE_{timepoint}_lfc0.5.csv` were written
+by `code/generate_signatures.Rmd` with the same thresholds. At the default params
+the sets here must match those files **gene for gene**; this catches a wrong input
+file, a flipped sign, or a mis-set threshold.
+
+Caveat: `generate_signatures.Rmd` caps each reference set with `slice_head(n = 2500)`.
+All six sets are currently well under that cap (largest is 1604), so the comparison
+is exact. If a regenerated TE file ever pushed a contrast past 2500, the reference
+would be truncated and this check would fail for that reason rather than a real
+discrepancy - the cap-headroom check below makes that case self-explanatory.
+
+```{r validate_against_genesets}
+if (params$lfc_cutoff == 0.5 && params$padj_cutoff == 0.05) {
+  ref_sets <- conditions %>%
+    dplyr::select(condition, timepoint) %>%
+    mutate(
+      ref_genes = map2(condition, timepoint, ~ read_csv(
+        here("output", "genesets",
+             paste0(.x, "_3d_promotes_TE_", .y, "_lfc0.5.csv")),
+        show_col_types = FALSE)$ensembl_gene)
+    )
+
+  here_sets <- promoted_long %>%
+    group_by(condition, timepoint) %>%
+    summarise(here_genes = list(unique(gene_id_clean)), .groups = "drop")
+
+  comparison <- ref_sets %>%
+    full_join(here_sets, by = c("condition", "timepoint")) %>%
+    mutate(
+      n_ref      = map_int(ref_genes, length),
+      n_here     = map_int(here_genes, length),
+      identical_set = map2_lgl(ref_genes, here_genes, setequal)
+    ) %>%
+    dplyr::select(condition, timepoint, n_ref, n_here, identical_set)
+
+  print(comparison)
+  # the reference sets are slice_head(2500)-capped upstream; flag if any contrast
+  # approaches that cap, which would make the comparison below non-exact
+  stopifnot("a contrast now exceeds the reference set's 2500 cap" =
+    all(comparison$n_here <= 2500))
+  # gene-identity match, not just counts: a flipped sign would produce a
+  # same-size but disjoint set and still pass a count-only check
+  stopifnot("promoted gene sets disagree with existing geneset CSVs" =
+    all(comparison$identical_set))
+  cat("All six contrasts reproduce the published gene sets gene-for-gene.\n")
+} else {
+  cat("Non-default thresholds (lfc =", params$lfc_cutoff,
+      ", padj =", params$padj_cutoff, ") - skipping reference comparison.\n")
+}
+```
+
+### Biological spot-check: directionality
+
+The 1hr hypoxia si3d set is the project's primary positive gene set and by far the
+largest. In **every** contrast its median TE LFC must sit **above** the
+transcriptome-wide median for that contrast: eIF3d-promoted genes are shifted
+positive relative to background. This is a directionality assertion - if the sign
+convention were inverted anywhere, the promoted set would fall *below* background.
+
+Note the shift is tested relative to background, not against zero. The hypoxia
+effect decays with time (by 24hr the promoted set's median TE LFC is ~0), so an
+absolute `> 0` test would fail for a real biological reason rather than a coding
+error.
+
+```{r spot_check}
+hyp_1hr_genes <- promoted_long %>%
+  filter(contrast == "hypoxia_1hr") %>%
+  pull(gene_id_clean)
+
+bg_medians <- te_long %>%
+  group_by(contrast) %>%
+  summarise(background_median = median(te_lfc, na.rm = TRUE), .groups = "drop")
+
+shift_check <- te_long %>%
+  filter(gene_id_clean %in% hyp_1hr_genes) %>%
+  group_by(contrast) %>%
+  summarise(
+    set_median   = median(te_lfc, na.rm = TRUE),
+    frac_te_lfc_positive = mean(te_lfc > 0, na.rm = TRUE),
+    n = n(), .groups = "drop"
+  ) %>%
+  left_join(bg_medians, by = "contrast") %>%
+  mutate(shifted_positive = set_median > background_median)
+
+print(shift_check)
+stopifnot("hypoxia 1hr promoted set must sit above background in every contrast" =
+  all(shift_check$shifted_positive))
+
+# and in its own calling contrast the shift must be strongly significant
+own_contrast <- te_long %>%
+  filter(contrast == "hypoxia_1hr") %>%
+  mutate(in_set = gene_id_clean %in% hyp_1hr_genes)
+wt <- wilcox.test(te_lfc ~ in_set, data = own_contrast, alternative = "less")
+cat("hypoxia_1hr promoted vs rest, Wilcoxon p =", format.pval(wt$p.value),
+    ", n set =", sum(own_contrast$in_set),
+    ", n rest =", sum(!own_contrast$in_set), "\n")
+stopifnot("promoted set not significantly shifted positive in its own contrast" =
+  wt$p.value < 1e-10)
+```
+
+## Build the collaborator table
+
+**One row per tested gene - every gene, not just the promoted ones.** Each of the
+six contrasts contributes three columns: `promoted_*` (the up-in-this-condition
+flag), plus `te_lfc_*` and `te_padj_*` giving the underlying numbers. Genes never
+promoted in any condition are retained with `promoted_any = FALSE`, so the file is
+a complete background set as well as a hit list.
+
+```{r build_table}
+gene_symbols <- te_long %>%
+  filter(!is.na(symbol), symbol != "") %>%
+  distinct(gene_id_clean, symbol) %>%
+  group_by(gene_id_clean) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+# every gene in the tested universe, promoted or not
+all_genes <- te_long %>%
+  distinct(gene_id_clean) %>%
+  left_join(gene_symbols, by = "gene_id_clean")
+
+promoted_genes <- sort(unique(promoted_long$gene_id_clean))
+
+# per-contrast stats for ALL genes, significant or not
+stats_wide <- te_long %>%
+  dplyr::select(gene_id_clean, contrast, te_lfc, te_padj) %>%
+  pivot_wider(
+    names_from  = contrast,
+    values_from = c(te_lfc, te_padj),
+    names_glue  = "{.value}_{contrast}",
+    names_sort  = FALSE
+  )
+
+# the per-condition "is it up here" flags - recomputed from the same predicate
+# as promoted_long so the two can be cross-checked against each other below
+promoted_flags_wide <- te_long %>%
+  mutate(promoted = !is.na(te_padj) &
+           te_padj < params$padj_cutoff &
+           te_lfc  > params$lfc_cutoff) %>%
+  dplyr::select(gene_id_clean, contrast, promoted) %>%
+  pivot_wider(
+    names_from  = contrast,
+    values_from = promoted,
+    names_glue  = "promoted_{contrast}",
+    names_sort  = FALSE
+  )
+
+summary_tbl <- promoted_long %>%
+  group_by(gene_id_clean) %>%
+  summarise(
+    # n_distinct(), not n(): n() would silently inflate on duplicate gene x
+    # contrast rows (guarded upstream, but keep the summary self-correct)
+    n_conditions_promoted = n_distinct(contrast),
+    # sort the FACTOR then coerce, so timepoints come out chronologically.
+    # sort(as.character(contrast)) sorts alphabetically and puts 24hr before 4hr.
+    conditions_promoted   = paste(as.character(sort(contrast)), collapse = "; "),
+    promoted_normoxia     = any(condition == "normoxia"),
+    promoted_hypoxia      = any(condition == "hypoxia"),
+    # NB: max/min are over the contrasts where the gene was PROMOTED, not over
+    # all six - hence the explicit `_promoted` suffix. A gene can have a larger
+    # te_lfc in a contrast that missed the padj cutoff; that value still appears
+    # in its te_lfc_* column but is deliberately not summarised here.
+    max_te_lfc_promoted   = max(te_lfc),
+    max_te_lfc_condition  = as.character(contrast[which.max(te_lfc)]),
+    min_te_padj_promoted  = min(te_padj),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    shared_normoxia_hypoxia = promoted_normoxia & promoted_hypoxia,
+    condition_class = case_when(
+      shared_normoxia_hypoxia ~ "both",
+      promoted_hypoxia        ~ "hypoxia_only",
+      promoted_normoxia       ~ "normoxia_only"
+    )
+  )
+
+contrast_levels <- levels(te_long$contrast)
+
+eif3d_te_all <- all_genes %>%
+  left_join(summary_tbl,          by = "gene_id_clean") %>%
+  left_join(promoted_flags_wide,  by = "gene_id_clean") %>%
+  left_join(stats_wide,           by = "gene_id_clean") %>%
+  # genes never promoted get 0 / FALSE / "none" rather than NA, so the summary
+  # columns stay usable for filtering and never silently drop background genes
+  mutate(
+    n_conditions_promoted = coalesce(n_conditions_promoted, 0L),
+    conditions_promoted   = coalesce(conditions_promoted, "none"),
+    promoted_normoxia     = coalesce(promoted_normoxia, FALSE),
+    promoted_hypoxia      = coalesce(promoted_hypoxia, FALSE),
+    condition_class       = coalesce(condition_class, "not_promoted"),
+    promoted_any          = n_conditions_promoted > 0
+  ) %>%
+  dplyr::select(
+    symbol, gene_id_clean,
+    promoted_any, condition_class, conditions_promoted, n_conditions_promoted,
+    promoted_normoxia, promoted_hypoxia,
+    max_te_lfc_promoted, max_te_lfc_condition, min_te_padj_promoted,
+    all_of(paste0("promoted_", contrast_levels)),
+    all_of(paste0("te_lfc_",   contrast_levels)),
+    all_of(paste0("te_padj_",  contrast_levels))
+  ) %>%
+  arrange(desc(promoted_any), desc(n_conditions_promoted),
+          desc(max_te_lfc_promoted))
+
+# the promoted-only subset stays available as a convenience file
+eif3d_promoted <- eif3d_te_all %>% filter(promoted_any)
+
+# --- checks on the full table -------------------------------------------------
+stopifnot("one row per tested gene" =
+  nrow(eif3d_te_all) == n_distinct(te_long$gene_id_clean))
+stopifnot("gene_id_clean must be unique" =
+  !any(duplicated(eif3d_te_all$gene_id_clean)))
+stopifnot("n_conditions_promoted must be 0-6" =
+  all(eif3d_te_all$n_conditions_promoted >= 0 &
+      eif3d_te_all$n_conditions_promoted <= 6))
+stopifnot("missing condition_class" = all(!is.na(eif3d_te_all$condition_class)))
+
+# the per-contrast flags must reproduce n_conditions_promoted exactly. This is
+# the key cross-check: the flags come from pivoting the raw predicate, the count
+# comes from promoted_long, so agreement means the two paths concur.
+flag_mat <- as.matrix(eif3d_te_all[, paste0("promoted_", contrast_levels)])
+stopifnot("no NA in the promoted flags" = !any(is.na(flag_mat)))
+stopifnot("promoted flags disagree with n_conditions_promoted" =
+  all(rowSums(flag_mat) == eif3d_te_all$n_conditions_promoted))
+stopifnot("promoted_any disagrees with the flags" =
+  all(eif3d_te_all$promoted_any == (rowSums(flag_mat) > 0)))
+
+# per-contrast column totals must equal the per-contrast counts from promoted_long
+flag_totals <- colSums(flag_mat)
+long_totals <- table(factor(promoted_long$contrast, levels = contrast_levels))
+stopifnot("per-contrast flag totals disagree with promoted_long" =
+  all(flag_totals == as.integer(long_totals)))
+
+# summary stats present exactly for promoted genes, absent otherwise
+stopifnot("max_te_lfc_promoted must be NA iff the gene was never promoted" =
+  all(is.na(eif3d_te_all$max_te_lfc_promoted) == !eif3d_te_all$promoted_any))
+stopifnot("max_te_lfc_promoted must clear the cutoff where present" =
+  all(eif3d_te_all$max_te_lfc_promoted[eif3d_te_all$promoted_any] >
+        params$lfc_cutoff))
+stopifnot("min_te_padj_promoted must clear the cutoff where present" =
+  all(eif3d_te_all$min_te_padj_promoted[eif3d_te_all$promoted_any] <
+        params$padj_cutoff))
+stopifnot("not_promoted class must match promoted_any" =
+  all((eif3d_te_all$condition_class == "not_promoted") ==
+        !eif3d_te_all$promoted_any))
+
+# --- checks on the promoted subset (unchanged from the previous version) ------
+stopifnot("promoted subset must equal the union of per-contrast sets" =
+  setequal(eif3d_promoted$gene_id_clean, promoted_genes))
+stopifnot("conditions_promoted disagrees with n_conditions_promoted" =
+  all(lengths(strsplit(eif3d_promoted$conditions_promoted, "; ")) ==
+        eif3d_promoted$n_conditions_promoted))
+stopifnot("promoted_hypoxia flag disagrees with conditions_promoted" =
+  all(eif3d_promoted$promoted_hypoxia ==
+        grepl("hypoxia", eif3d_promoted$conditions_promoted)))
+stopifnot("promoted_normoxia flag disagrees with conditions_promoted" =
+  all(eif3d_promoted$promoted_normoxia ==
+        grepl("normoxia", eif3d_promoted$conditions_promoted)))
+
+cat("All tested genes:", nrow(eif3d_te_all), "\n")
+cat("  promoted in >= 1 condition:", sum(eif3d_te_all$promoted_any), "\n")
+cat("  never promoted (background):", sum(!eif3d_te_all$promoted_any), "\n")
+cat("  genes with no HGNC symbol:", sum(is.na(eif3d_te_all$symbol)), "\n")
+head(eif3d_te_all, 10)
+```
+
+## Summary breakdown
+
+```{r summary}
+# includes the not_promoted background class
+eif3d_te_all %>% dplyr::count(condition_class, name = "n_genes")
+
+eif3d_te_all %>%
+  dplyr::count(n_conditions_promoted, name = "n_genes") %>%
+  arrange(n_conditions_promoted)
+
+# per-condition tally straight off the exported flag columns
+tibble(
+  contrast   = contrast_levels,
+  n_promoted = as.integer(colSums(flag_mat)),
+  n_not      = nrow(eif3d_te_all) - as.integer(colSums(flag_mat))
+)
+
+# most frequently recurring genes
+eif3d_te_all %>%
+  filter(n_conditions_promoted >= 3) %>%
+  dplyr::select(symbol, conditions_promoted, n_conditions_promoted,
+                max_te_lfc_promoted) %>%
+  head(20)
+
+# gene symbols are not unique keys - warn the collaborator explicitly
+dup_symbols <- eif3d_te_all %>%
+  filter(!is.na(symbol)) %>%
+  dplyr::count(symbol, name = "n_gene_ids") %>%
+  filter(n_gene_ids > 1)
+cat("\nSymbols mapping to >1 gene_id (key on gene_id_clean, not symbol):",
+    nrow(dup_symbols), "\n")
+```
+
+## Export
+
+```{r export}
+# PRIMARY FILE: every tested gene, with an up-in-this-condition flag per contrast
+out_all <- here("output", "genesets", "eif3d_te_all_genes_all_conditions.csv")
+write_csv(eif3d_te_all, out_all)
+cat("Wrote", nrow(eif3d_te_all), "genes (",
+    sum(eif3d_te_all$promoted_any), "promoted,",
+    sum(!eif3d_te_all$promoted_any), "not ) to", out_all, "\n")
+
+# convenience subset: promoted genes only, same columns
+out_wide <- here("output", "genesets", "eif3d_promoted_genes_all_conditions.csv")
+write_csv(eif3d_promoted, out_wide)
+cat("Wrote", nrow(eif3d_promoted), "promoted genes to", out_wide, "\n")
+
+# long / tidy version of the FULL matrix: one row per gene x contrast, with the
+# promoted flag alongside the RNA and ribosome components of each TE call
+eif3d_te_long_export <- te_long %>%
+  mutate(promoted = !is.na(te_padj) &
+           te_padj < params$padj_cutoff &
+           te_lfc  > params$lfc_cutoff) %>%
+  dplyr::select(gene_id_clean, symbol, condition, timepoint, contrast,
+                promoted, te_lfc, te_padj, rna_lfc, ribo_lfc, category) %>%
+  arrange(gene_id_clean, contrast)
+
+out_long <- here("output", "genesets", "eif3d_te_all_genes_all_conditions_long.csv")
+write_csv(eif3d_te_long_export, out_long)
+cat("Wrote", nrow(eif3d_te_long_export), "gene x contrast rows to", out_long, "\n")
+
+# the long file must carry exactly the same promoted calls as the wide file
+stopifnot("long/wide promoted calls disagree" =
+  sum(eif3d_te_long_export$promoted) == sum(flag_mat))
+stopifnot("long file must be gene x contrast complete" =
+  nrow(eif3d_te_long_export) == nrow(eif3d_te_all) * length(contrast_levels))
+```
+
+## Files written
+
+| File | Contents |
+|---|---|
+| `eif3d_te_all_genes_all_conditions.csv` | **primary** - every tested gene, one row each, with a promoted flag + TE stats for all 6 contrasts |
+| `eif3d_promoted_genes_all_conditions.csv` | the `promoted_any == TRUE` subset, same columns |
+| `eif3d_te_all_genes_all_conditions_long.csv` | tidy gene x contrast form, adds `rna_lfc` / `ribo_lfc` / `category` |
+
+## Column dictionary (for the collaborator)
+
+| Column | Meaning |
+|---|---|
+| `symbol` | HGNC gene symbol (`NA` where GENCODE has none) |
+| `gene_id_clean` | ENSEMBL gene ID, version stripped |
+| `promoted_any` | TRUE if promoted by eIF3d in at least one of the 6 contrasts |
+| `condition_class` | `hypoxia_only` / `normoxia_only` / `both` / `not_promoted` |
+| `conditions_promoted` | semicolon-separated contrasts where the gene passed the threshold; `none` if never |
+| `n_conditions_promoted` | how many of the 6 contrasts the gene was promoted in (0-6) |
+| `promoted_normoxia` / `promoted_hypoxia` | TRUE if promoted in >= 1 timepoint of that condition |
+| `max_te_lfc_promoted` | largest TE log2FC **among the contrasts where the gene passed the threshold**; `NA` if never promoted |
+| `max_te_lfc_condition` | contrast achieving `max_te_lfc_promoted`; `NA` if never promoted |
+| `min_te_padj_promoted` | smallest TE adjusted p-value among those same contrasts; `NA` if never promoted |
+| `promoted_{condition}_{timepoint}` | **the per-condition up-flag**: TRUE if `te_padj < 0.05` and `te_lfc > 0.5` in that contrast |
+| `te_lfc_{condition}_{timepoint}` | TE log2FC in that contrast, reported whether or not significant |
+| `te_padj_{condition}_{timepoint}` | BH-adjusted p-value in that contrast |
+
+Positive `te_lfc` = eIF3d promotes translation of that gene.
+
+**Notes when reading the table:**
+
+1. The file is the **complete tested universe**, so it doubles as its own
+   background set. Filter on `promoted_any` for the hit list, or on an individual
+   `promoted_*` column for one condition. Genes that are *not* up simply have
+   `FALSE` in those columns - their `te_lfc_*` / `te_padj_*` values are still
+   reported, so genes going the other way (eIF3d-inhibited, negative `te_lfc`) are
+   recoverable from the same file.
+2. `max_te_lfc_promoted` summarises only the contrasts where the gene was called
+   promoted, so for 65 genes it is **smaller** than the largest value in that row's
+   `te_lfc_*` columns. That is not an inconsistency: the larger value sits in a
+   contrast that missed the `te_padj < 0.05` cutoff, so the gene was not called
+   promoted there. Use the `te_lfc_*` columns for the full picture.
+3. `symbol` is **not** a unique key - a handful of symbols map to two ENSEMBL IDs.
+   Join and deduplicate on `gene_id_clean`.
+
+`te_padj` is `NA` for a small number of gene x contrast pairs (DESeq2 independent
+filtering); those genes were not testable in that contrast and their `promoted_*`
+flag is `FALSE`.

@@ -76,6 +76,34 @@ cat("Fold_Change range:", round(min(s8$Fold_Change), 3), "-",
 cat("\nTop 10 codons by CES:\n")
 print(s8 %>% arrange(desc(Fold_Change)) %>% head(10) %>%
         dplyr::select(codon, Input_Avg, IP_Avg, Fold_Change))
+
+# ---- Table S8 replication, asserted at the point of load ----
+# Hia 2026: DHX29 occupancy is AU3-biased. This is the upstream tripwire for the
+# Fig 4D assertion further down -- if the CES table itself is wrong (wrong sheet,
+# wrong column, stale download), catch it here rather than 800 lines later.
+# Observed: 61 sense codons, CES 0.757-1.482, all 10 top codons AU3, 2/10 bottom
+# codons AU3, mean CES 1.045 (AU3) vs 0.903 (GC3), Wilcoxon p = 2.6e-4.
+s8_au3 <- substr(s8$codon, 3, 3) %in% c("A", "T")
+ces_top10_au3 <- mean(s8_au3[order(-s8$Fold_Change)][1:10])
+ces_bot10_au3 <- mean(s8_au3[order( s8$Fold_Change)][1:10])
+
+stopifnot(
+  "S8 must contain all 61 sense codons" = nrow(s8) == 61,
+  "CES is a fold change and must be positive" = all(s8$Fold_Change > 0),
+  "CES range implausible - check the S8 file/column" =
+    dplyr::between(max(s8$Fold_Change), 1.1, 3.0) &&
+    dplyr::between(min(s8$Fold_Change), 0.3, 0.95),
+  "Table S8 replication failed: top CES codons are not AU3-biased" =
+    ces_top10_au3 >= 0.8,
+  "Table S8 replication failed: bottom CES codons are not GC3-biased" =
+    ces_bot10_au3 <= 0.4,
+  "Table S8 replication failed: AU3 codons do not have higher mean CES than GC3" =
+    mean(s8$Fold_Change[s8_au3]) > mean(s8$Fold_Change[!s8_au3])
+)
+cat("\nTable S8 PASS - AU3 fraction: top-10 CES =", ces_top10_au3,
+    ", bottom-10 CES =", ces_bot10_au3, "\n")
+cat("  mean CES: AU3 =", round(mean(s8$Fold_Change[s8_au3]), 3),
+    "vs GC3 =", round(mean(s8$Fold_Change[!s8_au3]), 3), "\n")
 ```
 
 ### 2a-QC: CES values per codon
@@ -304,13 +332,23 @@ tasor_rank <- dhx29_occupancy %>%
   mutate(rank = row_number()) %>%
   filter(str_to_upper(symbol) == "TASOR")
 
-if (nrow(tasor_rank) > 0) {
-  cat("\nTASOR rank:", tasor_rank$rank, "of", nrow(dhx29_occupancy),
-      "(score:", round(tasor_rank$dhx29_occupancy_score, 4), ")\n")
-} else {
-  cat("\nTASOR not found in occupancy table",
-      "(may lack a matched most-abundant transcript).\n")
-}
+# ---- TASOR positive control, asserted ----
+# TASOR is the DHX29 target highlighted in Hia 2026. The previous if/else reported its
+# rank but passed silently when TASOR was missing entirely -- exactly the case that
+# should fail, since TASOR going absent means the transcript mapping broke.
+# Observed: rank 655 of 9740 = 93.3rd percentile.
+stopifnot(
+  "TASOR absent from occupancy table - transcript mapping likely broken" =
+    nrow(tasor_rank) == 1
+)
+tasor_pctile <- 100 * (1 - tasor_rank$rank / nrow(dhx29_occupancy))
+stopifnot(
+  "Hia2026 positive control failed: TASOR not in the top decile of DHX29 occupancy" =
+    tasor_pctile > 90
+)
+cat("\nTASOR rank:", tasor_rank$rank, "of", nrow(dhx29_occupancy),
+    "(percentile", round(tasor_pctile, 1),
+    ", score", round(tasor_rank$dhx29_occupancy_score, 4), ") - positive control PASS\n")
 ```
 
 ```{r verify_codon_extraction}
@@ -702,6 +740,25 @@ cat("  Median neg ctrl:", round(median(neg_hl, na.rm = TRUE), 2), "h\n")
 Per-gene GC3 content should negatively predict logFC: low GC3 (AU3-rich) genes should be
 most stabilized upon DHX29 KO. Using paper's exact bin boundaries for direct comparison.
 
+> **This does not reproduce, and the section is retained as a negative result.**
+> Re-derived here, GC3 does *not* predict logFC: Spearman rho = **-0.024, p = 0.118**
+> (n = 4234) -- indistinguishable from zero. Median logFC by GC3 decile is flat
+> (0.050 to 0.079, no monotone trend), and only the top decile dips. The apparent effect
+> in the binned table is confined to the smallest, most extreme bin (>80% GC3, n = 356).
+>
+> An earlier version of this section asserted only `median(<40%) > median(>80%)`, which
+> passed on a 0.024 difference between two hand-picked endpoints while the claimed
+> monotone relationship was absent. That is a check that cannot fail for the right
+> reason, so it has been replaced with the correlation test below plus an explicit
+> record of the non-replication.
+>
+> This is not evidence the paper is wrong. Likely sources of divergence: Hia et al.
+> compute Fig 1H against their own decay-rate estimates rather than the Table S6
+> `logFC` used here, and the gene universe differs (our most-abundant-transcript
+> selection and gene-level dedup). Treat the DHX29 half-life features as valid --
+> `logFC = log2(KO/Ctrl)` is asserted exactly at load -- but do not cite Fig 1H as
+> independently replicated in this pipeline.
+
 ```{r compute_gc3}
 compute_gc3 <- function(seq_char) {
   n_codons <- nchar(seq_char) / 3
@@ -754,18 +811,47 @@ gc3_medians <- gc3_binned %>%
   summarise(median_logFC = median(logFC, na.rm = TRUE),
             n = n(), .groups = "drop")
 
-# Figure 1H replication asserted, not just plotted: AU3-rich (low GC3) genes must be
-# more stabilized upon DHX29 KO than GC3-rich genes.
+# Figure 1H: tested as a monotone relationship, which is what the claim actually is.
+# A two-endpoint median comparison cannot distinguish a trend from noise in the tails.
 cat("\nMedian logFC per GC3 bin:\n")
 print(gc3_medians)
-gc3_lowest  <- gc3_medians$median_logFC[gc3_medians$gc3_bin == "<40%"]
-gc3_highest <- gc3_medians$median_logFC[gc3_medians$gc3_bin == ">80%"]
+
+cat("\nMedian logFC per GC3 decile (monotonicity check):\n")
+print(gc3_logfc %>% mutate(decile = ntile(gc3, 10)) %>%
+        group_by(decile) %>%
+        summarise(gc3 = round(median(gc3), 3),
+                  median_logFC = round(median(logFC), 4),
+                  n = n(), .groups = "drop"), n = 10)
+
+gc3_cor <- cor.test(gc3_logfc$gc3, gc3_logfc$logFC, method = "spearman")
+cat("\nSpearman(GC3, logFC) =", round(gc3_cor$estimate, 4),
+    " p =", format.pval(gc3_cor$p.value, digits = 3),
+    " n =", nrow(gc3_logfc), "\n")
+
+# Global offset, same issue as nb22: most genes score as stabilized upon KO, so the
+# sign of logFC alone is not informative.
+cat("Global offset: median logFC across all genes =", round(median(gc3_logfc$logFC), 4),
+    "| fraction > 0 =", round(mean(gc3_logfc$logFC > 0), 3), "\n")
+
+# Structural checks still assert. The Fig 1H trend itself is REPORTED, not asserted,
+# because it does not reproduce here (rho = -0.024, p = 0.118) -- see the note above.
+# Asserting it would either fail every knit or, if weakened to two endpoints, pass
+# without testing the claim.
 stopifnot(
   "GC3 bins must all be populated to validate Fig 1H" =
     all(!is.na(gc3_medians$median_logFC)),
-  "Fig 1H replication failed: low-GC3 genes not more stabilized than high-GC3 genes" =
-    gc3_lowest > gc3_highest
+  "GC3 must be a fraction in [0, 1]" =
+    all(gc3_logfc$gc3 >= 0 & gc3_logfc$gc3 <= 1),
+  "Too few genes to evaluate the GC3 relationship" = nrow(gc3_logfc) > 1000
 )
+
+if (gc3_cor$estimate < -0.1 && gc3_cor$p.value < 0.01) {
+  cat("Fig 1H: monotone negative GC3-logFC relationship REPRODUCED\n")
+} else {
+  cat("Fig 1H: NOT reproduced in this pipeline (rho =", round(gc3_cor$estimate, 4),
+      ", p =", format.pval(gc3_cor$p.value, digits = 3),
+      ") - recorded as a negative result, see section note\n")
+}
 
 p_gc3 <- ggplot(gc3_binned, aes(x = gc3_bin, y = logFC)) +
   geom_boxplot(fill = "grey80", outlier.size = 0.5, outlier.alpha = 0.3) +
