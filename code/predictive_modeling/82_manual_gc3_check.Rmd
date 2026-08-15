@@ -1,0 +1,492 @@
+---
+title: "GC3 calculated manually, and compared between 4E-resistant and 4E-sensitive"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Why this notebook exists
+
+The GC3 difference between 4E-resistant and 4E-sensitive mRNAs is large (roughly 73%
+vs 39%), and large enough to be worth recomputing from scratch rather than trusting the
+feature-extraction pipeline.
+
+So this notebook does it the slow, obvious way: read the CDS sequences, walk through
+every transcript one at a time, pull out the third base of every codon, and count how
+many of those are G or C. No helper functions, no `Biostrings` shortcuts for the counting
+itself, nothing clever. Then compare the answer to the pipeline value, and to the two
+gene sets.
+
+```{r libraries}
+library(tidyverse)
+library(Biostrings)
+library(here)   # so file paths work whether knitting or running chunks by hand
+```
+
+# Step 1: read in the CDS sequences
+
+These are the coding sequences of the dominant transcript of each gene, written by
+`cluster_scripts/viennarna/01c_generate_fasta_teleman.R`. The FASTA headers are the
+version-stripped transcript IDs.
+
+```{r read-fasta}
+cds <- readDNAStringSet(here("output", "viennarna", "teleman_cds_sequences.fa"))
+
+length(cds)
+head(names(cds))
+head(width(cds))
+```
+
+# Step 2: walk through every transcript and count GC at the third codon position
+
+The third position of codon 1 is base 3, of codon 2 is base 6, of codon 3 is base 9, and
+so on. So the positions we want are 3, 6, 9, ... up to the end of the sequence.
+
+```{r manual-gc3}
+# empty table to fill in as we go
+results <- data.frame(
+  transcript_id = names(cds),
+  n_bases = NA,
+  n_codons = NA,
+  n_gc_at_pos3 = NA,
+  gc3_manual = NA
+)
+
+for (i in 1:length(cds)) {
+
+  # the sequence of this one transcript, as plain text
+  one_sequence <- as.character(cds[[i]])
+
+  # split it into single letters
+  bases <- strsplit(one_sequence, "")[[1]]
+
+  # positions 3, 6, 9, ... are the third base of each codon
+  third_positions <- seq(from = 3, to = length(bases), by = 3)
+
+  # the bases sitting at those positions
+  third_bases <- bases[third_positions]
+
+  # how many of them are G or C
+  n_g <- sum(third_bases == "G")
+  n_c <- sum(third_bases == "C")
+
+  # fill in the table
+  results$n_bases[i] <- length(bases)
+  results$n_codons[i] <- length(third_bases)
+  results$n_gc_at_pos3[i] <- n_g + n_c
+  results$gc3_manual[i] <- (n_g + n_c) / length(third_bases) * 100
+}
+
+head(results)
+nrow(results)
+```
+
+## A couple of sanity checks on the loop itself
+
+```{r loop-checks}
+# every CDS length should divide by 3
+table(results$n_bases %% 3)
+
+# number of codons should be the length divided by 3
+head(results$n_bases / 3)
+head(results$n_codons)
+
+# GC3 has to sit between 0 and 100
+range(results$gc3_manual)
+
+# the count of G+C can never exceed the number of codons
+sum(results$n_gc_at_pos3 > results$n_codons)
+```
+
+## Work one transcript out by hand, completely
+
+Pick a short transcript and print every step, so the arithmetic can be checked with a
+calculator.
+
+```{r one-by-hand}
+# the shortest CDS in the set
+which_short <- which.min(results$n_codons)
+results[which_short, ]
+
+short_seq <- as.character(cds[[which_short]])
+short_seq
+
+short_bases <- strsplit(short_seq, "")[[1]]
+short_third <- short_bases[seq(3, length(short_bases), by = 3)]
+
+# the third base of every codon, in order
+short_third
+
+# how many are G or C
+sum(short_third == "G")
+sum(short_third == "C")
+
+# and the percentage
+(sum(short_third == "G") + sum(short_third == "C")) / length(short_third) * 100
+```
+
+# Step 3: does this agree with the pipeline?
+
+```{r compare-pipeline}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_teleman_4e.rds"))
+
+compare <- merge(results, fm[, c("transcript_id_clean", "gc3", "symbol")],
+                 by.x = "transcript_id", by.y = "transcript_id_clean")
+
+nrow(compare)
+
+# the pipeline leaves gc3 as NA for any CDS whose length is not a multiple of 3,
+# so those cannot be compared
+sum(is.na(compare$gc3))
+
+# difference between the two, on the transcripts where both exist
+compare$difference <- compare$gc3_manual - compare$gc3
+both <- compare[!is.na(compare$gc3), ]
+
+nrow(both)
+max(abs(both$difference))
+sum(abs(both$difference) > 1e-9)
+cor(both$gc3_manual, both$gc3)
+```
+
+```{r compare-plot, fig.width = 5, fig.height = 5}
+plot(both$gc3, both$gc3_manual,
+     pch = 16, cex = 0.3, col = rgb(0, 0, 0, 0.2),
+     xlab = "GC3 from the pipeline (%)",
+     ylab = "GC3 counted by hand (%)",
+     main = "Manual GC3 vs pipeline GC3")
+abline(0, 1, col = "red")
+```
+
+# Step 4: compare GC3 between 4E-resistant and 4E-sensitive
+
+```{r load-genesets}
+resistant <- read.csv(here("output", "genesets", "teleman_4e_resistant_TE_1hr_lfc0.5.csv"))
+sensitive <- read.csv(here("output", "genesets", "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"))
+
+nrow(resistant)
+nrow(sensitive)
+
+# label each transcript by which set its gene belongs to
+compare$gene_id <- fm$gene_id_clean[match(compare$transcript_id, fm$transcript_id_clean)]
+
+compare$class <- NA
+compare$class[compare$gene_id %in% resistant$ensembl_gene] <- "4E-resistant"
+compare$class[compare$gene_id %in% sensitive$ensembl_gene] <- "4E-sensitive"
+
+table(compare$class, useNA = "ifany")
+```
+
+```{r compare-classes}
+gc3_resistant <- compare$gc3_manual[compare$class == "4E-resistant" & !is.na(compare$class)]
+gc3_sensitive <- compare$gc3_manual[compare$class == "4E-sensitive" & !is.na(compare$class)]
+
+length(gc3_resistant)
+length(gc3_sensitive)
+
+median(gc3_resistant)
+median(gc3_sensitive)
+
+mean(gc3_resistant)
+mean(gc3_sensitive)
+
+# spread, not just the centre
+quantile(gc3_resistant, c(0.25, 0.75))
+quantile(gc3_sensitive, c(0.25, 0.75))
+
+wilcox.test(gc3_resistant, gc3_sensitive)
+```
+
+```{r density-plot, fig.width = 7, fig.height = 4.5}
+plot_data <- compare[!is.na(compare$class), ]
+
+ggplot(plot_data, aes(x = gc3_manual, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = median(gc3_resistant), color = "#D55E00",
+             linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = median(gc3_sensitive), color = "#0072B2",
+             linetype = "dashed", linewidth = 0.5) +
+  scale_fill_manual(values = c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2"),
+                    name = NULL) +
+  scale_color_manual(values = c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2"),
+                     name = NULL) +
+  labs(title = "GC3 counted by hand, 4E-resistant vs 4E-sensitive",
+       subtitle = paste0("median ", round(median(gc3_resistant), 1), "% vs ",
+                         round(median(gc3_sensitive), 1), "%   |   n = ",
+                         length(gc3_resistant), " vs ", length(gc3_sensitive)),
+       x = "GC3, third codon position (%)",
+       y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave(here("plots", "82_gc3_manual_resistant_vs_sensitive.pdf"), width = 7, height = 4.5)
+```
+
+# Step 5: the same thing for the first and second codon positions
+
+A sanity check on the loop itself. If the counting is right, doing it at positions 1 and 2
+should give sensible numbers too, and the three positions should average to the overall
+CDS GC content. That last check is the strong one: it uses nothing but arithmetic, and it
+would fail immediately if the positions were off by one.
+
+```{r manual-gc1-gc2}
+results$gc1_manual <- NA
+results$gc2_manual <- NA
+
+for (i in 1:length(cds)) {
+
+  bases <- strsplit(as.character(cds[[i]]), "")[[1]]
+
+  # positions 1, 4, 7, ... are the first base of each codon
+  first_bases <- bases[seq(from = 1, to = length(bases), by = 3)]
+
+  # positions 2, 5, 8, ... are the second base of each codon
+  second_bases <- bases[seq(from = 2, to = length(bases), by = 3)]
+
+  results$gc1_manual[i] <-
+    (sum(first_bases == "G") + sum(first_bases == "C")) / length(first_bases) * 100
+
+  results$gc2_manual[i] <-
+    (sum(second_bases == "G") + sum(second_bases == "C")) / length(second_bases) * 100
+}
+
+head(results[, c("transcript_id", "gc1_manual", "gc2_manual", "gc3_manual")])
+```
+
+## Check 1: every position should have the same number of bases
+
+```{r check-counts}
+# each codon contributes exactly one base to each position
+n_first  <- NA
+n_second <- NA
+n_third  <- NA
+
+for (i in 1:5) {
+  bases <- strsplit(as.character(cds[[i]]), "")[[1]]
+  n_first[i]  <- length(bases[seq(1, length(bases), by = 3)])
+  n_second[i] <- length(bases[seq(2, length(bases), by = 3)])
+  n_third[i]  <- length(bases[seq(3, length(bases), by = 3)])
+}
+
+n_first
+n_second
+n_third
+results$n_codons[1:5]
+```
+
+## Check 2: the three positions must average to the whole-CDS GC
+
+```{r check-average}
+results$gc_mean_of_three <- (results$gc1_manual + results$gc2_manual + results$gc3_manual) / 3
+
+# whole-CDS GC, counted the same plain way
+results$cds_gc_manual <- NA
+for (i in 1:length(cds)) {
+  bases <- strsplit(as.character(cds[[i]]), "")[[1]]
+  results$cds_gc_manual[i] <-
+    (sum(bases == "G") + sum(bases == "C")) / length(bases) * 100
+}
+
+max(abs(results$gc_mean_of_three - results$cds_gc_manual))
+
+# and against the pipeline's cds_gc
+check_cds <- merge(results, fm[, c("transcript_id_clean", "cds_gc")],
+                   by.x = "transcript_id", by.y = "transcript_id_clean")
+max(abs(check_cds$cds_gc_manual - check_cds$cds_gc))
+```
+
+## Check 3: the pipeline's gc1 and gc2 should match too
+
+```{r check-gc1-gc2-pipeline}
+check2 <- merge(results, fm[, c("transcript_id_clean", "gc1", "gc2")],
+                by.x = "transcript_id", by.y = "transcript_id_clean")
+check2 <- check2[!is.na(check2$gc1), ]
+
+nrow(check2)
+max(abs(check2$gc1_manual - check2$gc1))
+max(abs(check2$gc2_manual - check2$gc2))
+```
+
+# Step 6: compare all three positions between the two gene sets
+
+```{r compare-all-positions}
+compare$gc1_manual <- results$gc1_manual[match(compare$transcript_id, results$transcript_id)]
+compare$gc2_manual <- results$gc2_manual[match(compare$transcript_id, results$transcript_id)]
+
+in_sets <- compare[!is.na(compare$class), ]
+
+# medians per position
+tapply(in_sets$gc1_manual, in_sets$class, median)
+tapply(in_sets$gc2_manual, in_sets$class, median)
+tapply(in_sets$gc3_manual, in_sets$class, median)
+
+# and the tests
+wilcox.test(in_sets$gc1_manual ~ in_sets$class)
+wilcox.test(in_sets$gc2_manual ~ in_sets$class)
+wilcox.test(in_sets$gc3_manual ~ in_sets$class)
+```
+
+```{r plot-all-positions, fig.width = 9, fig.height = 4}
+long <- rbind(
+  data.frame(class = in_sets$class, position = "GC1", gc = in_sets$gc1_manual),
+  data.frame(class = in_sets$class, position = "GC2", gc = in_sets$gc2_manual),
+  data.frame(class = in_sets$class, position = "GC3", gc = in_sets$gc3_manual)
+)
+
+ggplot(long, aes(x = gc, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ position, nrow = 1) +
+  scale_fill_manual(values = c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2"),
+                    name = NULL) +
+  scale_color_manual(values = c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2"),
+                     name = NULL) +
+  labs(title = "GC counted by hand at each codon position",
+       subtitle = paste0("n = ", sum(in_sets$class == "4E-resistant"), " resistant, ",
+                         sum(in_sets$class == "4E-sensitive"), " sensitive"),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave(here("plots", "82_gc_by_codon_position_manual.pdf"), width = 9, height = 4)
+```
+
+```{r threshold-all-positions}
+# how well does each position alone sort the two sets, using one cutoff
+for (pos in c("gc1_manual", "gc2_manual", "gc3_manual")) {
+  r <- in_sets[[pos]][in_sets$class == "4E-resistant"]
+  s <- in_sets[[pos]][in_sets$class == "4E-sensitive"]
+  th <- (median(r) + median(s)) / 2
+  pct <- (sum(r > th) + sum(s < th)) / (length(r) + length(s)) * 100
+  cat(pos, ": median", round(median(r), 1), "vs", round(median(s), 1),
+      " threshold", round(th, 1), " correct", round(pct, 1), "%\n")
+}
+```
+
+# Step 7: which nucleotide is actually preferred at each position?
+
+GC3 lumps G and C together, and lumps A and T together as "not GC". That hides the
+question of *which* base is preferred. So count all four separately, at each of the three
+codon positions, still by hand.
+
+```{r manual-four-bases}
+# twelve new columns: each base at each position
+for (base in c("A", "C", "G", "T")) {
+  for (pos in 1:3) {
+    results[[paste0("pos", pos, "_", base)]] <- NA
+  }
+}
+
+for (i in 1:length(cds)) {
+
+  bases <- strsplit(as.character(cds[[i]]), "")[[1]]
+
+  first  <- bases[seq(from = 1, to = length(bases), by = 3)]
+  second <- bases[seq(from = 2, to = length(bases), by = 3)]
+  third  <- bases[seq(from = 3, to = length(bases), by = 3)]
+
+  results$pos1_A[i] <- sum(first == "A") / length(first) * 100
+  results$pos1_C[i] <- sum(first == "C") / length(first) * 100
+  results$pos1_G[i] <- sum(first == "G") / length(first) * 100
+  results$pos1_T[i] <- sum(first == "T") / length(first) * 100
+
+  results$pos2_A[i] <- sum(second == "A") / length(second) * 100
+  results$pos2_C[i] <- sum(second == "C") / length(second) * 100
+  results$pos2_G[i] <- sum(second == "G") / length(second) * 100
+  results$pos2_T[i] <- sum(second == "T") / length(second) * 100
+
+  results$pos3_A[i] <- sum(third == "A") / length(third) * 100
+  results$pos3_C[i] <- sum(third == "C") / length(third) * 100
+  results$pos3_G[i] <- sum(third == "G") / length(third) * 100
+  results$pos3_T[i] <- sum(third == "T") / length(third) * 100
+}
+
+head(results[, c("transcript_id", "pos3_A", "pos3_C", "pos3_G", "pos3_T")])
+```
+
+## Check: the four bases at a position must add up to 100%
+
+```{r check-sums}
+sum1 <- results$pos1_A + results$pos1_C + results$pos1_G + results$pos1_T
+sum2 <- results$pos2_A + results$pos2_C + results$pos2_G + results$pos2_T
+sum3 <- results$pos3_A + results$pos3_C + results$pos3_G + results$pos3_T
+
+max(abs(sum1 - 100))
+max(abs(sum2 - 100))
+max(abs(sum3 - 100))
+
+# and C + G at position 3 has to equal the GC3 we already counted
+max(abs((results$pos3_C + results$pos3_G) - results$gc3_manual))
+```
+
+## Density of each nucleotide at each codon position
+
+```{r plot-four-bases, fig.width = 11, fig.height = 7}
+# attach the class labels to the per-base table
+base_cols <- c("pos1_A","pos1_C","pos1_G","pos1_T",
+               "pos2_A","pos2_C","pos2_G","pos2_T",
+               "pos3_A","pos3_C","pos3_G","pos3_T")
+
+base_table <- results[, c("transcript_id", base_cols)]
+base_table$class <- compare$class[match(base_table$transcript_id, compare$transcript_id)]
+base_table <- base_table[!is.na(base_table$class), ]
+
+nrow(base_table)
+table(base_table$class)
+
+# long format, one row per transcript per position per base
+base_long <- base_table %>%
+  pivot_longer(cols = all_of(base_cols),
+               names_to = c("position", "nucleotide"),
+               names_sep = "_",
+               values_to = "percent")
+
+base_long$position <- factor(base_long$position,
+                             levels = c("pos1", "pos2", "pos3"),
+                             labels = c("codon position 1", "codon position 2",
+                                        "codon position 3"))
+
+ggplot(base_long, aes(x = percent, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.7) +
+  facet_grid(position ~ nucleotide, scales = "free_y") +
+  scale_fill_manual(values = c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2"),
+                    name = NULL) +
+  scale_color_manual(values = c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2"),
+                     name = NULL) +
+  labs(title = "Which base does each codon position prefer?",
+       subtitle = paste0("counted by hand   |   n = ",
+                         sum(base_table$class == "4E-resistant"), " resistant, ",
+                         sum(base_table$class == "4E-sensitive"), " sensitive"),
+       x = "percent of codons with this base at this position",
+       y = "Density") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+ggsave(here("plots", "82_nucleotide_preference_by_position.pdf"), width = 11, height = 7)
+```
+
+## The numbers behind those plots
+
+```{r base-medians}
+for (pos in c("pos1", "pos2", "pos3")) {
+  cat("\n", pos, "\n", sep = "")
+  for (base in c("A", "C", "G", "T")) {
+    col <- paste0(pos, "_", base)
+    r <- base_table[[col]][base_table$class == "4E-resistant"]
+    s <- base_table[[col]][base_table$class == "4E-sensitive"]
+    cat(sprintf("  %s : resistant %5.1f%%   sensitive %5.1f%%   difference %+5.1f\n",
+                base, median(r), median(s), median(r) - median(s)))
+  }
+}
+```
+
+# What this shows
+
+The GC3 values counted base by base match the pipeline exactly, so the difference between
+the two gene sets is not an artefact of the feature-extraction code. The size of the
+difference, and how little the two distributions overlap, are printed above.

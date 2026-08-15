@@ -1,0 +1,855 @@
+---
+title: "Teleman RNA and RIBO separately, and feature densities by 4E class"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  mpra_repo: "/Users/katematlin/github/mpra_preliminary"
+  feature_matrix: "feature_matrix_teleman_4e.rds"
+  pos_csv: "teleman_4e_resistant_TE_1hr_lfc0.5.csv"
+  neg_csv: "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"
+  refit: FALSE
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Two things.
+
+**1. Decompose the TE contrast.** Notebooks 76 and 78 use the interaction coefficient,
+`log2((ribo/rna in 4E-BP1-4A) / (ribo/rna in E.V.))`. That is a ratio of ratios, so a
+systematic effect in *either* library propagates into it. Here the two arms are fit
+separately as main effects:
+
+| contrast | libraries | meaning |
+|---|---|---|
+| RIBO | the four `Riboseq_*` | footprint change on 4E-BP1-4A |
+| RNA | the four `Total_RNA_Riboseq_*` | mRNA-level change on 4E-BP1-4A |
+
+This matters because notebook 79 found that 4E-resistant and 4E-sensitive mRNAs differ by
+~18 points of CDS GC and ~34 points of GC3, and a compositional split that large could
+come from real translational biology **or** from GC-dependent library behaviour. Splitting
+the arms says where the GC association actually lives.
+
+**2. Feature densities.** Resistant vs sensitive for every feature built in notebook 78,
+not just the GC ones.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(DESeq2)
+library(janitor)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    mpra_repo      = "/Users/katematlin/github/mpra_preliminary",
+    feature_matrix = "feature_matrix_teleman_4e.rds",
+    pos_csv        = "teleman_4e_resistant_TE_1hr_lfc0.5.csv",
+    neg_csv        = "teleman_4e_sensitive_TE_1hr_lfc0.5.csv",
+    refit          = FALSE,
+    save_plots     = TRUE
+  )
+}
+MPRA_REPO      <- params$mpra_repo
+FEATURE_MATRIX <- params$feature_matrix
+POS_CSV        <- params$pos_csv
+NEG_CSV        <- params$neg_csv
+REFIT          <- params$refit
+SAVE_PLOTS     <- params$save_plots
+
+ARMS_RDS <- here("output", "predictive_modeling", "teleman_rna_ribo_arms.rds")
+
+# eIF3d orange / eIF3e blue stay reserved (CLAUDE.md); reuse the nb76/nb79 pair.
+class_colors <- c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2")
+
+RIBO_COLS <- c("Riboseq_Empty_vector_1", "Riboseq_Empty_vector_2",
+               "Riboseq_4EBP1_4a_1", "Riboseq_4EBP1_4A_2")
+RNA_COLS  <- c("Total_RNA_Riboseq_Empty_vector_1", "Total_RNA_Riboseq_Empty_vector_2",
+               "Total_RNA_Riboseq_4EBP1_4A_1", "Total_RNA_Riboseq_4EBP1_4A_2")
+```
+
+# Part 1: RNA and RIBO fit separately
+
+Same inputs and filters as notebook 76 - PCR-artifact removal, transcript-to-gene
+summing, the `log2(rowSums) > 10` cut and the protein-coding filter - so the gene
+universe is comparable. Only the design changes: `~treatment` within one assay type,
+rather than the interaction across both.
+
+```{r fit-arms}
+fit_arms <- function() {
+  raw <- read_csv(file.path(MPRA_REPO, "data/GSE243708_raw_counts_matrix_Roiuk.csv"),
+                  show_col_types = FALSE)
+  pcr_art <- read_csv(file.path(MPRA_REPO, "data/pcr_artifacts_sup8.csv"),
+                      show_col_types = FALSE)
+
+  geneInfo <- read_csv(file.path(MPRA_REPO, "accessories/gencode.v26.primary.info.csv.gz"),
+                       col_names = FALSE, show_col_types = FALSE) %>%
+    dplyr::filter(!str_detect(X2, "pre_"))
+  colnames(geneInfo) <- c("gene_id", "transcript_id", "biotype", "symbol")
+  geneInfo <- geneInfo %>% dplyr::mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+  gene_symbol <- geneInfo %>%
+    dplyr::select(gene_id = gene_id_clean, symbol) %>%
+    dplyr::distinct(gene_id, .keep_all = TRUE)
+  pc <- geneInfo %>% dplyr::filter(biotype == "protein_coding") %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  nonpolyA <- readxl::read_xlsx(file.path(MPRA_REPO, "accessories/polyAminus.xlsx"),
+                                sheet = 1) %>% dplyr::pull(Gene)
+  nonpolyA_ID <- geneInfo %>% dplyr::filter(symbol %in% nonpolyA) %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  bl <- c("snoRNA", "miRNA", "snRNA", "rRNA", "Mt_tRNA", "scaRNA", "Mt_rRNA")
+  bl_ID <- geneInfo %>% dplyr::filter(biotype %in% bl) %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  genes_to_kill <- unique(c(bl_ID, nonpolyA_ID))
+
+  counts <- raw %>%
+    dplyr::filter(!`Transcript stable ID` %in% pcr_art$Transcript_id) %>%
+    dplyr::select(`Gene stable ID`, all_of(c(RIBO_COLS, RNA_COLS))) %>%
+    dplyr::group_by(`Gene stable ID`) %>%
+    dplyr::summarise(across(everything(), \(x) sum(x, na.rm = TRUE)), .groups = "drop") %>%
+    clean_names() %>%
+    column_to_rownames("gene_stable_id")
+
+  keep <- rownames(counts)[log2(rowSums(counts)) > 10]
+  universe <- intersect(setdiff(keep, genes_to_kill), pc)
+
+  run_arm <- function(cols, label) {
+    cn <- make_clean_names(cols)
+    m <- data.frame(sample_name = cn,
+                    treatment = factor(if_else(str_detect(cn, "4ebp"), "BP_inhib", "vehicle"),
+                                       levels = c("vehicle", "BP_inhib")))
+    rownames(m) <- cn
+    stopifnot("column mismatch" = all(cn %in% colnames(counts)))
+    dds <- DESeqDataSetFromMatrix(counts[universe, cn, drop = FALSE], m, ~treatment)
+    dds <- DESeq(dds, quiet = TRUE)
+    coef_name <- str_subset(resultsNames(dds), "^treatment_BP_inhib_vs_vehicle$")
+    stopifnot("coefficient not found" = length(coef_name) == 1)
+    res <- results(dds, name = coef_name, cooksCutoff = FALSE, independentFiltering = FALSE)
+    lfcShrink(dds, coef = coef_name, res = res, type = "apeglm", quiet = TRUE) %>%
+      as.data.frame() %>% rownames_to_column("gene_id") %>%
+      dplyr::left_join(gene_symbol, by = "gene_id") %>%
+      dplyr::rename_with(~ paste0(label, "_", .x), c("log2FoldChange", "padj", "baseMean"))
+  }
+
+  list(ribo = run_arm(RIBO_COLS, "ribo"),
+       rna  = run_arm(RNA_COLS,  "rna"),
+       n_universe = length(universe))
+}
+
+if (REFIT || !file.exists(ARMS_RDS)) {
+  arms <- fit_arms(); saveRDS(arms, ARMS_RDS)
+} else {
+  arms <- readRDS(ARMS_RDS); cat("loaded cached arms from", basename(ARMS_RDS), "\n")
+}
+cat("universe:", arms$n_universe, "genes\n")
+```
+
+## Sanity check: the arms must reconstruct the TE contrast
+
+`te_lfc` is the interaction, so it should be close to `ribo_lfc - rna_lfc`. They will not
+be identical - each fit shrinks separately and the interaction model shares dispersion
+across all eight libraries - but a weak correlation here would mean something is wrong.
+
+```{r reconstruct-te}
+te <- read_csv(here("output", "teleman_riboseq_te_all_genes.csv"), show_col_types = FALSE)
+
+arms_j <- arms$ribo %>%
+  dplyr::select(gene_id, ribo_log2FoldChange, ribo_padj, ribo_baseMean) %>%
+  dplyr::inner_join(arms$rna %>% dplyr::select(gene_id, rna_log2FoldChange, rna_padj),
+                    by = "gene_id") %>%
+  dplyr::inner_join(te %>% dplyr::select(gene_id, symbol, te_lfc = log2FoldChange,
+                                         te_padj = padj), by = "gene_id") %>%
+  dplyr::mutate(ribo_minus_rna = ribo_log2FoldChange - rna_log2FoldChange)
+
+cat("genes with all three:", nrow(arms_j), "\n")
+cat("cor(te_lfc, ribo - rna):",
+    round(cor(arms_j$te_lfc, arms_j$ribo_minus_rna, use = "complete.obs"), 4), "\n")
+stopifnot("te_lfc is not reconstructed by ribo - rna" =
+  cor(arms_j$te_lfc, arms_j$ribo_minus_rna, use = "complete.obs") > 0.7)
+
+cat("\nglobal medians (4E-BP1-4A vs E.V.):\n")
+cat("  ribo log2FC:", round(median(arms_j$ribo_log2FoldChange, na.rm = TRUE), 3), "\n")
+cat("  rna  log2FC:", round(median(arms_j$rna_log2FoldChange,  na.rm = TRUE), 3), "\n")
+cat("  te   log2FC:", round(median(arms_j$te_lfc, na.rm = TRUE), 3), "\n")
+```
+
+Ribosome profiling normalises away the global drop in translation, so the TE median sits
+near zero by construction; the RIBO arm carries whatever global shift survives
+size-factor normalisation.
+
+## Where does the GC association live?
+
+The decisive panel. If GC tracks the **RIBO** arm, the compositional split is a
+translation phenomenon. If it tracks the **RNA** arm, it is at least partly an
+mRNA-abundance or library-composition effect being carried into the ratio.
+
+```{r gc-by-arm}
+fm <- readRDS(here("output", "predictive_modeling", FEATURE_MATRIX))
+pos <- read_csv(here("output", "genesets", POS_CSV), show_col_types = FALSE)
+neg <- read_csv(here("output", "genesets", NEG_CSV), show_col_types = FALSE)
+
+gc_arms <- arms_j %>%
+  dplyr::inner_join(fm %>% dplyr::select(gene_id_clean, cds_gc, gc3),
+                    by = c("gene_id" = "gene_id_clean")) %>%
+  dplyr::filter(!is.na(cds_gc))
+
+cor_tbl <- tibble::tibble(
+  contrast = c("RIBO (footprints)", "RNA (mRNA level)", "TE (interaction)"),
+  cor_cds_gc = c(cor(gc_arms$ribo_log2FoldChange, gc_arms$cds_gc, method = "spearman"),
+                 cor(gc_arms$rna_log2FoldChange,  gc_arms$cds_gc, method = "spearman"),
+                 cor(gc_arms$te_lfc,              gc_arms$cds_gc, method = "spearman")),
+  cor_gc3    = c(cor(gc_arms$ribo_log2FoldChange, gc_arms$gc3, method = "spearman",
+                     use = "complete.obs"),
+                 cor(gc_arms$rna_log2FoldChange,  gc_arms$gc3, method = "spearman",
+                     use = "complete.obs"),
+                 cor(gc_arms$te_lfc,              gc_arms$gc3, method = "spearman",
+                     use = "complete.obs"))
+) %>% dplyr::mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+cat("Spearman correlation with GC, n =", nrow(gc_arms), "\n")
+print(as.data.frame(cor_tbl), row.names = FALSE)
+```
+
+```{r arm-medians-by-class}
+cls <- gc_arms %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE ~ NA_character_)) %>%
+  dplyr::filter(!is.na(class)) %>%
+  dplyr::mutate(class = factor(class, levels = names(class_colors)))
+
+cls %>%
+  dplyr::group_by(class) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   median_ribo = round(median(ribo_log2FoldChange, na.rm = TRUE), 3),
+                   median_rna  = round(median(rna_log2FoldChange,  na.rm = TRUE), 3),
+                   median_te   = round(median(te_lfc, na.rm = TRUE), 3),
+                   .groups = "drop") %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+```{r arm-density, fig.width = 9, fig.height = 4}
+arm_long <- cls %>%
+  dplyr::select(class, RIBO = ribo_log2FoldChange, RNA = rna_log2FoldChange, TE = te_lfc) %>%
+  tidyr::pivot_longer(-class, names_to = "contrast", values_to = "lfc") %>%
+  dplyr::filter(!is.na(lfc)) %>%
+  dplyr::mutate(contrast = factor(contrast, levels = c("RNA", "RIBO", "TE")))
+
+p_arm <- ggplot(arm_long, aes(x = lfc, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey40") +
+  facet_wrap(~ contrast, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = class_colors, name = NULL) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  labs(title = "4E-BP1-4A vs E.V., each arm fit separately",
+       subtitle = paste0("n = ", sum(cls$class == "4E-resistant"), " resistant, ",
+                         sum(cls$class == "4E-sensitive"), " sensitive"),
+       x = "log2 fold change", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_arm)
+if (SAVE_PLOTS) ggsave(here("plots", "80_rna_ribo_te_by_class.pdf"), p_arm,
+                       width = 9, height = 4)
+```
+
+```{r gc-scatter, fig.width = 9, fig.height = 4}
+sc <- gc_arms %>%
+  dplyr::select(cds_gc, RIBO = ribo_log2FoldChange, RNA = rna_log2FoldChange, TE = te_lfc) %>%
+  tidyr::pivot_longer(-cds_gc, names_to = "contrast", values_to = "lfc") %>%
+  dplyr::mutate(contrast = factor(contrast, levels = c("RNA", "RIBO", "TE")))
+
+lab <- sc %>% dplyr::group_by(contrast) %>%
+  dplyr::summarise(r = round(cor(cds_gc, lfc, method = "spearman", use = "complete.obs"), 3),
+                   .groups = "drop") %>%
+  dplyr::mutate(txt = paste0("rho = ", r, "\nn = ", nrow(gc_arms)))
+
+p_sc <- ggplot(sc, aes(x = cds_gc, y = lfc)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+  geom_point(size = 0.3, alpha = 0.15, color = "grey30") +
+  geom_smooth(method = "lm", se = FALSE, color = "#0072B2", linewidth = 0.8) +
+  facet_wrap(~ contrast, nrow = 1) +
+  geom_text(data = lab, aes(x = -Inf, y = Inf, label = txt),
+            hjust = -0.1, vjust = 1.3, size = 3.2, inherit.aes = FALSE) +
+  labs(title = "CDS GC vs each contrast",
+       x = "CDS GC content (%)", y = "log2 fold change") +
+  theme_classic(base_size = 12)
+
+print(p_sc)
+if (SAVE_PLOTS) ggsave(here("plots", "80_cds_gc_vs_each_arm.pdf"), p_sc,
+                       width = 9, height = 4)
+```
+
+## RIBO and RNA changes, for the TE-defined resistant and sensitive transcripts
+
+The classes here are **exactly** the ones from the TE analysis - the same 1,195 resistant
+and 1,195 sensitive transcripts used in notebook 79 - held fixed. What changes between the
+two figures is the contrast on the x axis.
+
+GC content is a property of the transcript, not of the assay, so a GC-by-region figure
+cannot differ between the arms. The quantity that does differ is the fold change, and
+that is what is plotted.
+
+```{r arm-lfc-fixed-classes, fig.width = 7, fig.height = 4.5}
+cls_fixed <- arms_j %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE ~ NA_character_)) %>%
+  dplyr::filter(!is.na(class)) %>%
+  dplyr::mutate(class = factor(class, levels = names(class_colors)))
+
+cat("n per class (TE-defined, as in nb79):\n")
+print(dplyr::count(cls_fixed, class) %>% as.data.frame(), row.names = FALSE)
+
+arm_lfc_plot <- function(col, arm_label, xlab) {
+  sub <- cls_fixed %>% dplyr::filter(!is.na(.data[[col]]))
+  wt  <- wilcox.test(sub[[col]] ~ sub$class)
+  med <- sub %>% dplyr::group_by(class) %>%
+    dplyr::summarise(m = median(.data[[col]]), .groups = "drop")
+
+  lab <- paste0(
+    "Wilcoxon p = ", format.pval(wt$p.value, digits = 3, eps = 2.2e-16),
+    "\nmedian ", med$class[1], " = ", round(med$m[1], 3),
+    "\nmedian ", med$class[2], " = ", round(med$m[2], 3),
+    "\nn = ", sum(sub$class == med$class[1]), " / ", sum(sub$class == med$class[2]))
+
+  ggplot(sub, aes(x = .data[[col]], fill = class, color = class)) +
+    geom_density(alpha = 0.15, linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dotted", color = "grey40") +
+    geom_vline(data = med, aes(xintercept = m, color = class),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    scale_fill_manual(values = class_colors, name = NULL) +
+    scale_color_manual(values = class_colors, name = NULL) +
+    labs(title = paste0(arm_label, " change on 4E-BP1-4A"),
+         subtitle = "classes fixed from the TE analysis (same transcripts as nb79)",
+         x = xlab, y = "Density") +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2, label = lab) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+}
+
+p_ribo <- arm_lfc_plot("ribo_log2FoldChange", "RIBO (ribosome footprints)",
+                       "log2 fold change, footprints (4E-BP1-4A vs E.V.)")
+print(p_ribo)
+if (SAVE_PLOTS) ggsave(here("plots", "80_ribo_lfc_by_te_class.pdf"), p_ribo,
+                       width = 7, height = 4.5)
+
+p_rna <- arm_lfc_plot("rna_log2FoldChange", "RNA (mRNA level)",
+                      "log2 fold change, mRNA (4E-BP1-4A vs E.V.)")
+print(p_rna)
+if (SAVE_PLOTS) ggsave(here("plots", "80_rna_lfc_by_te_class.pdf"), p_rna,
+                       width = 7, height = 4.5)
+```
+
+Both arms separate the TE-defined classes, in opposite directions: the transcripts called
+resistant gain footprints and lose mRNA, and the sensitive ones do the reverse. A story in
+which eIF4E sequestration acts on initiation predicts the footprint shift; it does not
+predict an mRNA shift of comparable size in the opposite direction.
+
+```{r arm-separation-of-te-classes}
+sep <- purrr::map_dfr(
+  c(RIBO = "ribo_log2FoldChange", RNA = "rna_log2FoldChange", TE = "te_lfc"),
+  function(col) {
+    x <- cls_fixed[[col]]; ok <- !is.na(x)
+    r <- rank(x[ok]); cl <- cls_fixed$class[ok]
+    n1 <- sum(cl == "4E-resistant"); n0 <- sum(cl == "4E-sensitive")
+    a  <- (sum(r[cl == "4E-resistant"]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+    tibble::tibble(auc = round(max(a, 1 - a), 3),
+                   median_resistant = round(median(x[cl == "4E-resistant"], na.rm = TRUE), 3),
+                   median_sensitive = round(median(x[cl == "4E-sensitive"], na.rm = TRUE), 3))
+  }, .id = "contrast")
+print(as.data.frame(sep), row.names = FALSE)
+```
+
+TE separates the classes perfectly by construction (they were defined from it), so only
+the RIBO and RNA rows carry information.
+
+## GC by region, classes taken from each arm at matched n
+
+The notebook 79 figure defines resistant/sensitive from **TE**. Here the same panel is
+drawn twice more, with the classes taken from the **RIBO** contrast alone and from the
+**RNA** contrast alone.
+
+Everything else is held constant so the three figures are directly comparable:
+
+- the **same transcript per gene** (nb78's dominant isoform, MANE fallback), so the GC
+  values are identical molecules in all three figures;
+- the **same class sizes**, 1,195 up and 1,195 down, matching the TE sets.
+
+To reach 1,195 per class the ranking is by effect size alone - the significance filter
+used for the TE sets would cap RIBO at 737 and RNA at 465 per class. The count passing
+`padj < 0.05` is reported alongside so the difference is visible.
+
+**Which direction is "resistant" in each arm.** `TE = ribo - rna`, so TE rises when
+footprints go **up** *or* mRNA goes **down**. The resistant class is therefore the top of
+the RIBO distribution but the *bottom* of the RNA distribution. Assigning mRNA-up as
+"resistant" would label genes whose median TE is -0.58, i.e. the sensitive ones. Each
+figure states its direction in the legend so this cannot be misread.
+
+```{r arm-gc-matched-n, fig.width = 11, fig.height = 7}
+gc_cols <- c("cds_gc", "gc1", "gc2", "gc3", "utr5_gc", "utr3_gc")
+N_PER_CLASS <- 1195   # matches the TE sets used in nb79
+
+# resistant_dir: which tail of this arm corresponds to HIGHER TE.
+#   RIBO -> "up"   (more footprints raises TE)
+#   RNA  -> "down" (less mRNA raises TE, since TE = ribo - rna)
+arm_gc_matched <- function(lfc_col, padj_col, arm_label, resistant_dir) {
+  stopifnot(resistant_dir %in% c("up", "down"))
+  d0 <- arms_j %>%
+    dplyr::select(gene_id, lfc = dplyr::all_of(lfc_col), padj = dplyr::all_of(padj_col)) %>%
+    dplyr::filter(!is.na(lfc))
+
+  hi <- d0 %>% dplyr::arrange(dplyr::desc(lfc)) %>% dplyr::slice_head(n = N_PER_CLASS)
+  lo <- d0 %>% dplyr::arrange(lfc) %>% dplyr::slice_head(n = N_PER_CLASS)
+
+  sets <- dplyr::bind_rows(
+    (if (resistant_dir == "up") hi else lo) %>% dplyr::mutate(class = "4E-resistant"),
+    (if (resistant_dir == "up") lo else hi) %>% dplyr::mutate(class = "4E-sensitive")
+  ) %>%
+    dplyr::inner_join(fm %>% dplyr::select(gene_id_clean, dplyr::all_of(gc_cols)),
+                      by = c("gene_id" = "gene_id_clean")) %>%
+    dplyr::mutate(class = factor(class, levels = names(class_colors)))
+
+  cat("\n===", arm_label, " (resistant = ", arm_label, " ",
+      if (resistant_dir == "up") "up" else "down", ") ===\n", sep = "")
+  print(sets %>% dplyr::group_by(class) %>%
+          dplyr::summarise(n = dplyr::n(),
+                           n_padj_lt_05 = sum(padj < 0.05, na.rm = TRUE),
+                           min_abs_lfc = round(min(abs(lfc)), 3),
+                           median_cds_gc = round(median(cds_gc, na.rm = TRUE), 2),
+                           median_gc3 = round(median(gc3, na.rm = TRUE), 2),
+                           .groups = "drop") %>% as.data.frame(), row.names = FALSE)
+
+  long <- sets %>%
+    tidyr::pivot_longer(dplyr::all_of(gc_cols), names_to = "feature", values_to = "gc") %>%
+    dplyr::filter(!is.na(gc)) %>%
+    dplyr::mutate(feature = factor(feature, levels = gc_cols))
+
+  ggplot(long, aes(x = gc, fill = class, color = class)) +
+    geom_density(alpha = 0.15, linewidth = 0.8) +
+    facet_wrap(~ feature, scales = "free_y", ncol = 3) +
+    scale_fill_manual(values = class_colors, name = NULL) +
+    scale_color_manual(values = class_colors, name = NULL) +
+    labs(title = paste0("GC content by region and codon position: ", arm_label),
+         subtitle = paste0("classes from the ", arm_label, " contrast; resistant = ",
+                           arm_label, " ", if (resistant_dir == "up") "up" else "down",
+                           " (the direction that raises TE)   |   n = ",
+                           N_PER_CLASS, " per class"),
+         x = "GC content (%)", y = "Density") +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+}
+
+p_gc_ribo <- arm_gc_matched("ribo_log2FoldChange", "ribo_padj", "RIBO", "up")
+print(p_gc_ribo)
+if (SAVE_PLOTS) ggsave(here("plots", "80_gc_by_region_RIBO.pdf"), p_gc_ribo,
+                       width = 11, height = 7)
+
+p_gc_rna <- arm_gc_matched("rna_log2FoldChange", "rna_padj", "RNA", "down")
+print(p_gc_rna)
+if (SAVE_PLOTS) ggsave(here("plots", "80_gc_by_region_RNA.pdf"), p_gc_rna,
+                       width = 11, height = 7)
+```
+
+```{r arm-gc-auc-matched}
+auc_matched <- function(lfc_col, label) {
+  d0 <- arms_j %>% dplyr::select(gene_id, lfc = dplyr::all_of(lfc_col)) %>%
+    dplyr::filter(!is.na(lfc))
+  sets <- dplyr::bind_rows(
+    d0 %>% dplyr::arrange(dplyr::desc(lfc)) %>% dplyr::slice_head(n = N_PER_CLASS) %>%
+      dplyr::mutate(cls = "up"),
+    d0 %>% dplyr::arrange(lfc) %>% dplyr::slice_head(n = N_PER_CLASS) %>%
+      dplyr::mutate(cls = "down")
+  ) %>% dplyr::inner_join(fm %>% dplyr::select(gene_id_clean, dplyr::all_of(gc_cols)),
+                          by = c("gene_id" = "gene_id_clean"))
+  purrr::map_dfr(gc_cols, function(f) {
+    x <- sets[[f]]; ok <- !is.na(x)
+    r <- rank(x[ok]); cl <- sets$cls[ok]
+    n1 <- sum(cl == "up"); n0 <- sum(cl == "down")
+    a <- (sum(r[cl == "up"]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+    tibble::tibble(definition = label, feature = f, auc = round(max(a, 1 - a), 3))
+  })
+}
+
+dplyr::bind_rows(
+  auc_matched("te_lfc", "TE"),
+  auc_matched("ribo_log2FoldChange", "RIBO"),
+  auc_matched("rna_log2FoldChange",  "RNA")
+) %>%
+  tidyr::pivot_wider(names_from = definition, values_from = auc) %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+All three use the same molecules and the same class sizes, so the AUCs are directly
+comparable: the only thing that changes is which contrast picked the genes.
+
+---
+
+## How confident is the resistant/sensitive call, independent of any model?
+
+The classes come from a single TE coefficient. Whether a given TE change reflects
+*translation* is a separate question, and it is answered by looking at the two arms
+together - which is what `categorize_translation_changes()` in `code/functions.R` already
+does for this project (deltaTE-style classes):
+
+| category | meaning | reading for a TE call |
+|---|---|---|
+| **Exclusive** | RIBO moves, RNA does not | translational - the confident case |
+| **Buffered** | RNA moves; RIBO opposes or does not follow | the TE change is driven by the RNA denominator |
+| **Forwarded** | RNA and RIBO move together, TE does not | not a TE change at all |
+| **TE_only** | only the TE coefficient is significant | too weak to attribute to either arm |
+
+`lfc_cutoff = 0.0` matches every existing call site in this project, so the categories
+reflect significance by `padj` alone.
+
+```{r deltate-categories}
+source(here("code", "functions.R"))
+
+cat_out <- categorize_translation_changes(
+  res_rna  = arms$rna  %>% dplyr::transmute(gene_id, log2FoldChange = rna_log2FoldChange,
+                                            padj = rna_padj),
+  res_ribo = arms$ribo %>% dplyr::transmute(gene_id, log2FoldChange = ribo_log2FoldChange,
+                                            padj = ribo_padj),
+  res_te   = te        %>% dplyr::transmute(gene_id, log2FoldChange, padj),
+  padj_cutoff = 0.05, lfc_cutoff = 0.0)
+
+deltate <- cat_out$categorized_table %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE ~ "other")) 
+
+cat("deltaTE categories, all genes:\n")
+print(cat_out$summary_table, row.names = FALSE)
+
+cat("\nWithin the 4E sets, % of each category:\n")
+in_sets <- deltate %>% dplyr::filter(class != "other")
+print(round(100 * prop.table(table(class = in_sets$class,
+                                   category = in_sets$category), 1), 1))
+
+cat("\nCounts:\n")
+print(table(class = in_sets$class, category = in_sets$category))
+```
+
+```{r deltate-scatter, fig.width = 11, fig.height = 5}
+# Project convention (code/functions.R): x = RNA log2FC, y = Ribo log2FC,
+# alpha 0.6, +/-5 limits, theme_minimal(13), no legend title.
+myCols <- c("Not_sig" = "grey80", "Forwarded" = "blue", "Exclusive" = "red",
+            "Buffered" = "green", "TE_only" = "purple")
+cls_cols <- c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2", "other" = "grey85")
+
+base_scatter <- function(df, colour_var, cols, title, subtitle) {
+  ggplot(df, aes(x = rna_lfc, y = ribo_lfc, color = .data[[colour_var]])) +
+    geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+    geom_vline(xintercept = 0, color = "grey70", linewidth = 0.3) +
+    geom_point(alpha = 0.6, size = 0.9) +
+    scale_color_manual(values = cols) +
+    xlim(-5, 5) + ylim(-5, 5) +
+    xlab("RNA-seq log2FC") + ylab("Ribo-seq log2FC") +
+    labs(title = title, subtitle = subtitle) +
+    theme_minimal(base_size = 13) +
+    theme(legend.title = element_blank())
+}
+
+p_cls <- base_scatter(
+  deltate %>% dplyr::arrange(class != "other"), "class", cls_cols,
+  "Ribo vs RNA change",
+  paste0("n = ", sum(deltate$class == "4E-resistant"), " resistant, ",
+         sum(deltate$class == "4E-sensitive"), " sensitive"))
+
+p_cat <- base_scatter(
+  deltate %>% dplyr::filter(category != "Not_sig"), "category", myCols,
+  "Ribo vs RNA change, coloured by deltaTE category",
+  "Not_sig omitted, as in code/functions.R")
+
+print(p_cls); print(p_cat)
+if (SAVE_PLOTS) {
+  ggsave(here("plots", "80_ribo_vs_rna_by_4e_class.pdf"), p_cls, width = 6.5, height = 5)
+  ggsave(here("plots", "80_ribo_vs_rna_by_deltate_category.pdf"), p_cat, width = 6.5, height = 5)
+}
+```
+
+```{r deltate-scatter-facet, fig.width = 10, fig.height = 5}
+p_facet <- base_scatter(
+  in_sets, "category", myCols,
+  "Where each 4E class sits in the ribo/RNA plane",
+  "faceted by 4E class; colour = deltaTE category") +
+  facet_wrap(~ class)
+
+print(p_facet)
+if (SAVE_PLOTS) ggsave(here("plots", "80_ribo_vs_rna_faceted_by_class.pdf"),
+                       p_facet, width = 10, height = 5)
+```
+
+**Reading the confidence.** Points high on the y axis with `rna_lfc` near zero are the
+clean translational calls. Points that reach a positive TE mainly by moving left along the
+x axis owe their TE change to the mRNA denominator. The category table quantifies exactly
+that split.
+
+---
+
+## GC by region, split by deltaTE category within the TE classes
+
+The deltaTE categories are defined from the three-way RNA/RIBO/TE comparison, so they
+only apply to the **TE-defined** resistant and sensitive sets - the same 1,195 / 1,195
+used in notebook 79. Colours are the project's deltaTE palette from `code/functions.R`.
+
+This asks the question the categories exist for: **does the GC separation survive inside
+the Exclusive genes**, whose TE change is confidently translational, or does it live in
+the Buffered genes, whose TE change is driven by the mRNA arm?
+
+```{r gc-by-te-category, fig.width = 13, fig.height = 6}
+cat_cols <- c("Exclusive" = "red", "Buffered" = "green", "TE_only" = "purple")
+
+te_cat_sets <- deltate %>%
+  dplyr::filter(class != "other", category %in% names(cat_cols)) %>%
+  dplyr::inner_join(fm %>% dplyr::select(gene_id_clean, dplyr::all_of(gc_cols)),
+                    by = c("gene_id" = "gene_id_clean")) %>%
+  dplyr::mutate(class = factor(class, levels = names(class_colors)),
+                category = factor(category, levels = names(cat_cols)))
+
+cat("n per class x deltaTE category (TE-defined sets):\n")
+print(table(class = te_cat_sets$class, category = te_cat_sets$category))
+
+# Forwarded and Not_sig cannot occur here, by construction: both require the gene to be
+# NON-significant for TE, while every gene in these sets was selected on te padj < 0.05.
+stopifnot("a Forwarded or Not_sig gene appeared in a TE-defined set" =
+  !any(deltate$category[deltate$class != "other"] %in% c("Forwarded", "Not_sig")))
+cat("\nForwarded / Not_sig are absent by construction: both require TE to be\n",
+    "non-significant, and every gene in these sets has te padj < 0.05.\n", sep = "")
+
+cat("\nmedian cds_gc / gc3 per group:\n")
+print(te_cat_sets %>% dplyr::group_by(class, category) %>%
+        dplyr::summarise(n = dplyr::n(),
+                         cds_gc = round(median(cds_gc, na.rm = TRUE), 1),
+                         gc3 = round(median(gc3, na.rm = TRUE), 1), .groups = "drop") %>%
+        as.data.frame(), row.names = FALSE)
+
+long_cat <- te_cat_sets %>%
+  tidyr::pivot_longer(dplyr::all_of(gc_cols), names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(feature, levels = gc_cols))
+
+# Unfilled lines: three overlapping categories make shaded densities unreadable.
+p_gc_cat <- ggplot(long_cat, aes(x = gc, color = category)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  facet_grid(class ~ feature, scales = "free_y") +
+  scale_color_manual(values = cat_cols, name = NULL) +
+  labs(title = "GC content by deltaTE category, within the TE-defined classes",
+       subtitle = paste0("colour = deltaTE category   |   n = ",
+                         sum(te_cat_sets$class == "4E-resistant"), " resistant, ",
+                         sum(te_cat_sets$class == "4E-sensitive"), " sensitive"),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top", strip.text = element_text(size = 9))
+
+print(p_gc_cat)
+if (SAVE_PLOTS) ggsave(here("plots", "80_gc_by_deltate_category.pdf"), p_gc_cat,
+                       width = 13, height = 6)
+```
+
+## Does the GC split survive inside the translational genes?
+
+Separability of resistant from sensitive on GC, computed **within each deltaTE category
+separately**. If the split is translational it should hold inside Exclusive; if it is an
+mRNA effect it should be strongest inside Buffered.
+
+```{r gc-auc-within-te-category}
+purrr::map_dfr(levels(te_cat_sets$category), function(cc) {
+  sub <- te_cat_sets %>% dplyr::filter(category == cc)
+  purrr::map_dfr(c("cds_gc", "gc3", "utr3_gc", "utr5_gc"), function(f) {
+    x <- sub[[f]]; ok <- !is.na(x)
+    r <- rank(x[ok]); cl <- sub$class[ok]
+    n1 <- sum(cl == "4E-resistant"); n0 <- sum(cl == "4E-sensitive")
+    if (n1 < 20 || n0 < 20) return(NULL)
+    a <- (sum(r[cl == "4E-resistant"]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+    tibble::tibble(category = cc, n_resistant = n1, n_sensitive = n0,
+                   feature = f, auc = round(max(a, 1 - a), 3))
+  })
+}) %>%
+  tidyr::pivot_wider(names_from = feature, values_from = auc) %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+---
+
+# Part 2: Feature densities, resistant vs sensitive
+
+Every feature from the notebook 78 matrix, split by class.
+
+```{r feature-densities, fig.width = 11, fig.height = 13}
+feat_cols <- setdiff(names(fm), c("transcript_id_clean", "gene_id_clean", "symbol"))
+
+d <- fm %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id_clean %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id_clean %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE ~ NA_character_)) %>%
+  dplyr::filter(!is.na(class)) %>%
+  dplyr::mutate(class = factor(class, levels = names(class_colors)))
+
+cat("features plotted:", length(feat_cols), "  genes:", nrow(d), "\n")
+
+long <- d %>%
+  dplyr::select(class, dplyr::all_of(feat_cols)) %>%
+  tidyr::pivot_longer(-class, names_to = "feature", values_to = "value") %>%
+  dplyr::filter(!is.na(value))
+
+p_feat <- ggplot(long, aes(x = value, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.6) +
+  facet_wrap(~ feature, scales = "free", ncol = 4) +
+  scale_fill_manual(values = class_colors, name = NULL) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  labs(title = "All notebook 78 features, 4E-resistant vs 4E-sensitive",
+       subtitle = paste0("n = ", sum(d$class == "4E-resistant"), " resistant, ",
+                         sum(d$class == "4E-sensitive"), " sensitive"),
+       x = NULL, y = "Density") +
+  theme_classic(base_size = 9) +
+  theme(legend.position = "top",
+        strip.text = element_text(size = 7),
+        axis.text = element_text(size = 6))
+
+print(p_feat)
+if (SAVE_PLOTS) ggsave(here("plots", "80_all_features_density_by_class.pdf"), p_feat,
+                       width = 11, height = 13)
+```
+
+## Codon optimality: CAI, tAI, FOP and CSC
+
+The four optimality measures, resistant vs sensitive. They do **not** agree, so the
+column that matters is the last one: how far each measure is just restating GC3.
+
+```{r optimality-densities, fig.width = 9, fig.height = 6}
+opt_cols <- c("cai", "tai", "fop", "csc")
+
+opt_long <- d %>%
+  dplyr::select(class, dplyr::all_of(opt_cols)) %>%
+  tidyr::pivot_longer(-class, names_to = "measure", values_to = "value") %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::mutate(measure = factor(measure, levels = opt_cols,
+                                 labels = c("CAI", "tAI", "FOP", "CSC")))
+
+p_opt <- ggplot(opt_long, aes(x = value, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ measure, scales = "free", nrow = 2) +
+  scale_fill_manual(values = class_colors, name = NULL) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  labs(title = "Codon optimality measures, 4E-resistant vs 4E-sensitive",
+       subtitle = paste0("n = ", sum(d$class == "4E-resistant"), " resistant, ",
+                         sum(d$class == "4E-sensitive"), " sensitive"),
+       x = NULL, y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_opt)
+if (SAVE_PLOTS) ggsave(here("plots", "80_codon_optimality_density_by_class.pdf"),
+                       p_opt, width = 9, height = 6)
+```
+
+```{r optimality-stats}
+opt_stats <- purrr::map_dfr(opt_cols, function(m) {
+  x <- d[[m]]; ok <- !is.na(x)
+  r <- rank(x[ok]); cl <- d$class[ok]
+  n1 <- sum(cl == "4E-resistant"); n0 <- sum(cl == "4E-sensitive")
+  a  <- (sum(r[cl == "4E-resistant"]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  tibble::tibble(
+    measure = m,
+    median_resistant = round(median(x[cl == "4E-resistant"], na.rm = TRUE), 4),
+    median_sensitive = round(median(x[cl == "4E-sensitive"], na.rm = TRUE), 4),
+    higher_in = ifelse(a > 0.5, "resistant", "sensitive"),
+    auc = round(max(a, 1 - a), 3),
+    wilcox_p = signif(wilcox.test(x[cl == "4E-resistant"],
+                                  x[cl == "4E-sensitive"])$p.value, 3),
+    rho_with_gc3 = round(cor(fm[[m]], fm$gc3, method = "spearman",
+                             use = "complete.obs"), 3)
+  )
+})
+print(as.data.frame(opt_stats), row.names = FALSE)
+```
+
+**Read the `rho_with_gc3` column before the rest.** CAI correlates 0.87 with GC3 in this
+dataset, so "resistant have higher CAI" is close to a restatement of "resistant are
+GC3-rich" rather than independent evidence. The reason is structural: of the 18
+multi-codon amino-acid families, 17 have a C- or G-ending codon as the top-ranked one in
+the ribosomal-protein reference, so a gene using the preferred codon everywhere is
+GC3-rich by construction.
+
+tAI is built from tRNA gene copy numbers and is independent of the transcripts
+(rho with GC3 = -0.15), and CSC comes from iCodon's empirical stability weights
+(rho = 0.24). Note that FOP as built in notebook 78 is the fraction of codons in the top
+tertile of *tAI* weights, so it is not independent confirmation of tAI.
+
+```{r optimality-agreement}
+cat("do the measures agree with each other?\n")
+cat("  rho(CAI, tAI) =", round(cor(fm$cai, fm$tai, method = "spearman",
+                                   use = "complete.obs"), 3), "\n")
+cat("  rho(tAI, FOP) =", round(cor(fm$tai, fm$fop, method = "spearman",
+                                   use = "complete.obs"), 3), " (FOP derives from tAI)\n")
+cat("  rho(CSC, tAI) =", round(cor(fm$csc, fm$tai, method = "spearman",
+                                   use = "complete.obs"), 3), "\n")
+```
+
+CAI and tAI are essentially uncorrelated, so they are not two versions of the same
+quantity. By the measures not confounded with GC3, the **sensitive** set is the more
+optimal one.
+
+## Ranked separation
+
+```{r feature-stats}
+auc_single <- function(x, cls, positive = "4E-resistant") {
+  ok <- !is.na(x); x <- x[ok]; cls <- cls[ok]
+  if (length(unique(cls)) < 2) return(NA_real_)
+  r <- rank(x); n1 <- sum(cls == positive); n0 <- sum(cls != positive)
+  a <- (sum(r[cls == positive]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  max(a, 1 - a)
+}
+
+feat_stats <- purrr::map_dfr(feat_cols, function(f) {
+  x <- d[[f]]; ok <- !is.na(x)
+  if (sum(ok) < 30 || dplyr::n_distinct(x[ok]) < 3) return(NULL)
+  wt <- suppressWarnings(wilcox.test(x[ok] ~ d$class[ok]))
+  tibble::tibble(
+    feature   = f,
+    auc_alone = round(auc_single(x, d$class), 3),
+    median_resistant = round(median(x[d$class == "4E-resistant"], na.rm = TRUE), 3),
+    median_sensitive = round(median(x[d$class == "4E-sensitive"], na.rm = TRUE), 3),
+    wilcox_p  = wt$p.value,
+    pct_na    = round(100 * mean(!ok), 1)
+  )
+}) %>%
+  dplyr::mutate(padj = p.adjust(wilcox_p, method = "BH")) %>%
+  dplyr::arrange(dplyr::desc(auc_alone))
+
+print(as.data.frame(feat_stats %>%
+  dplyr::mutate(wilcox_p = format.pval(wilcox_p, digits = 2, eps = 2.2e-16),
+                padj     = format.pval(padj,     digits = 2, eps = 2.2e-16))),
+  row.names = FALSE)
+
+if (SAVE_PLOTS) {
+  write_csv(feat_stats, here("output", "predictive_modeling",
+                             "teleman_4e_feature_separation_stats.csv"))
+}
+```
+
+# Summary
+
+Read the `cor_tbl` and `arm-density` panels together: they say whether the GC split that
+drives the notebook 07 classifier originates in the footprint arm, the mRNA arm, or only
+in their ratio. A GC association of similar magnitude in both arms with opposite sign, or
+one concentrated in the RNA arm, would argue that the compositional signal is not purely
+translational.

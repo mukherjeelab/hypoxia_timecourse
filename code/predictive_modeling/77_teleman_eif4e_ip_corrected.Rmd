@@ -1,0 +1,416 @@
+---
+title: "Teleman eIF4E-IP: corrected re-run and Fig 4E validation"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  mpra_repo: "/Users/katematlin/github/mpra_preliminary"
+  te_corrected_csv: "output/teleman_riboseq_te_all_genes.csv"
+  lfc_cut: 1
+  padj_cut: 0.05
+  refit: FALSE
+  write_outputs: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Purpose
+
+Companion to notebook 76. That notebook corrected the Teleman **ribosome profiling** TE
+analysis; this one applies the same three corrections to the **eIF4E-IP** arm of the same
+GEO submission (GSE243708), which was fit by the same upstream code and carries the same
+defects.
+
+The three corrections, identical to nb76:
+
+1. Strip the ENSEMBL version **before** de-duplicating the symbol lookup, so `_PAR_Y`
+   entries do not collapse onto their X-linked twin and duplicate the annotation join.
+2. Actually apply the protein-coding filter. Upstream it was computed into `pc_keep` and
+   never referenced, and it was built on versioned IDs while the count matrix rownames
+   were version-stripped, so it would have matched nothing had it been used.
+3. Select the DESeq2 coefficient by name rather than by positional index.
+
+**Three contrasts are refit**, matching the three the upstream code produced:
+
+| Contrast | Design | Meaning |
+|---|---|---|
+| Vehicle-only | `~type` on E.V. samples | baseline eIF4E binding (IP vs input) |
+| Inhibitor-only | `~type` on 4E-BP1-4A samples | eIF4E binding under inhibition |
+| Interaction | `~treatment + type + treatment:type` | **change** in eIF4E binding |
+
+**Validation anchor.** The paper reports (Fig 4E) a negative correlation between the
+change in translation efficiency on eIF4E inhibition and eIF4E binding, where the binding
+axis is `log2((4E-BP1-4A: IP/input) / (E.V.: IP/input))` — the interaction contrast. That
+correlation is asserted below against notebook 76's corrected TE values.
+
+**Note on which binding axis.** Baseline binding and the *change* in binding correlate
+with TE change in **opposite** directions (+0.24 and -0.25 respectively). Only the change
+in binding reproduces Fig 4E. Do not substitute one for the other.
+
+| Item | Location |
+|---|---|
+| Raw counts | `mpra_preliminary/data/GSE243708_raw_counts_matrix_Roiuk.csv` |
+| Original DESeq2 code | `mpra_preliminary/code/eif4e_ip_clip_analysis.Rmd` |
+| Original results | `mpra_preliminary/res_eif4e_ip_{vehicle,inhibitor_only,inhib_vs_vehicle}.csv` |
+| Corrected TE (nb76) | `output/teleman_riboseq_te_all_genes.csv` (all tested genes, unthresholded) |
+| Corrected IP (here) | `output/teleman_eif4e_ip_{vehicle,inhibitor,interaction}_corrected.csv` |
+
+## Load libraries
+
+```{r load-libraries}
+library(tidyverse)
+library(here)
+library(DESeq2)
+library(janitor)
+```
+
+## Parameters
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+# REFIT = TRUE forces the three DESeq2 models to refit; otherwise the cached RDS is
+# reloaded if present.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    mpra_repo        = "/Users/katematlin/github/mpra_preliminary",
+    te_corrected_csv = "output/teleman_riboseq_te_all_genes.csv",
+    lfc_cut          = 1,
+    padj_cut         = 0.05,
+    refit            = FALSE,
+    write_outputs    = TRUE
+  )
+}
+
+MPRA_REPO        <- params$mpra_repo
+TE_CORRECTED_CSV <- params$te_corrected_csv
+LFC_CUT          <- params$lfc_cut
+PADJ_CUT         <- params$padj_cut
+REFIT            <- params$refit
+WRITE_OUTPUTS    <- params$write_outputs
+
+IP_RDS <- here("output", "predictive_modeling", "teleman_eif4e_ip_fixed.rds")
+
+classify_ip <- function(lfc, padj, l = LFC_CUT, p = PADJ_CUT) {
+  dplyr::case_when(
+    lfc >  l & padj < p ~ "up",
+    lfc < -l & padj < p ~ "down",
+    TRUE                ~ "unchanged"
+  )
+}
+
+cat("thresholds: |log2FC| >", LFC_CUT, " padj <", PADJ_CUT, "\n")
+```
+
+## The eIF4E-IP design is unbalanced
+
+Worth knowing before reading any of the numbers: the IP arm has 11 libraries, not 12.
+There are three replicates everywhere except the 4E-BP1-4A input, which has two.
+
+```{r design-note}
+ip_cols <- c(
+  "eIF4E_IPed_RNA_4EBP1_4A_replica1", "eIF4E_IPed_RNA_4EBP1_4A_replica2",
+  "eIF4E_IPed_RNA_4EBP1_4A_replica3",
+  "eIF4E_IPed_RNA_Empty_vector_replica1", "eIF4E_IPed_RNA_Empty_vector_replica2",
+  "eIF4E_IPed_RNA_Empty_vector_replica3",
+  "Total_RNA_eIF4E_IP_4EBP1_4A_replica1", "Total_RNA_eIF4E_IP_4EBP1_4A_replica2",
+  "Total_RNA_eIF4E_IP_Empty_vector_replica1", "Total_RNA_eIF4E_IP_Empty_vector_replica2",
+  "Total_RNA_eIF4E_IP_Empty_vector_replica3"
+)
+cat("IP-arm libraries:", length(ip_cols), "\n")
+```
+
+---
+
+# Part 1: Corrected re-run
+
+```{r ip-refit}
+fit_teleman_ip <- function() {
+  raw <- read_csv(file.path(MPRA_REPO, "data/GSE243708_raw_counts_matrix_Roiuk.csv"),
+                  show_col_types = FALSE)
+  pcr_art <- read_csv(file.path(MPRA_REPO, "data/pcr_artifacts_sup8.csv"),
+                      show_col_types = FALSE)
+
+  geneInfo <- read_csv(file.path(MPRA_REPO, "accessories/gencode.v26.primary.info.csv.gz"),
+                       col_names = FALSE, show_col_types = FALSE) %>%
+    dplyr::filter(!str_detect(X2, "pre_"))
+  colnames(geneInfo) <- c("gene_id", "transcript_id", "biotype", "symbol")
+  geneInfo <- geneInfo %>% dplyr::mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+  # correction 1: strip version BEFORE de-duplicating
+  gene_symbol <- geneInfo %>%
+    dplyr::select(gene_id = gene_id_clean, symbol) %>%
+    dplyr::distinct(gene_id, .keep_all = TRUE)
+  stopifnot("symbol map has duplicate keys" = !any(duplicated(gene_symbol$gene_id)))
+
+  # correction 2: protein-coding set on version-stripped IDs, and actually applied
+  pc <- geneInfo %>% dplyr::filter(biotype == "protein_coding") %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+
+  nonpolyA <- readxl::read_xlsx(file.path(MPRA_REPO, "accessories/polyAminus.xlsx"),
+                                sheet = 1) %>% dplyr::pull(Gene)
+  nonpolyA_ID <- geneInfo %>% dplyr::filter(symbol %in% nonpolyA) %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  blacklist_smRNA <- c("snoRNA", "miRNA", "snRNA", "rRNA", "Mt_tRNA", "scaRNA", "Mt_rRNA")
+  blacklist_ID <- geneInfo %>% dplyr::filter(biotype %in% blacklist_smRNA) %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  genes_to_kill <- unique(c(blacklist_ID, nonpolyA_ID))
+
+  ip_data <- raw %>%
+    dplyr::filter(!`Transcript stable ID` %in% pcr_art$Transcript_id) %>%
+    dplyr::select(`Gene stable ID`, all_of(ip_cols))
+
+  ip_deseq <- ip_data %>%
+    dplyr::group_by(`Gene stable ID`) %>%
+    dplyr::summarise(across(where(is.numeric), \(x) sum(x, na.rm = TRUE)), .groups = "drop") %>%
+    clean_names() %>%
+    column_to_rownames("gene_stable_id")
+
+  keepGenes <- rownames(ip_deseq)[log2(rowSums(ip_deseq)) > 10]
+  universe_orig  <- setdiff(keepGenes, genes_to_kill)
+  universe_fixed <- intersect(universe_orig, pc)
+
+  meta <- tibble::tibble(sample_name = colnames(ip_deseq)) %>%
+    dplyr::mutate(
+      type      = factor(if_else(str_detect(sample_name, "^total_rna"), "input", "IP"),
+                         levels = c("input", "IP")),
+      treatment = factor(if_else(str_detect(sample_name, "4ebp1_4a"), "BP_inhib", "vehicle"),
+                         levels = c("vehicle", "BP_inhib")),
+      rep       = factor(str_remove(str_extract(sample_name, "replica[0-9]"), "replica"),
+                         levels = c("1", "2", "3"))
+    ) %>%
+    as.data.frame()
+  rownames(meta) <- meta$sample_name
+
+  stopifnot("metadata rows do not match count matrix columns" =
+              identical(rownames(meta), colnames(ip_deseq)))
+  stopifnot("expected 6 IP and 5 input libraries" =
+              all(table(meta$type)[c("input", "IP")] == c(5, 6)))
+
+  run_de <- function(samples, design_formula, coef_regex) {
+    m <- droplevels(meta[samples, , drop = FALSE])
+    dds <- DESeqDataSetFromMatrix(ip_deseq[universe_fixed, samples, drop = FALSE],
+                                  colData = m, design = design_formula)
+    dds <- DESeq(dds, quiet = TRUE)
+    # correction 3: coefficient by name, asserted unique
+    cn <- str_subset(resultsNames(dds), coef_regex)
+    stopifnot("coefficient not found or not unique" = length(cn) == 1)
+    res <- results(dds, name = cn, cooksCutoff = FALSE, independentFiltering = FALSE)
+    lfcShrink(dds, coef = cn, res = res, type = "apeglm", quiet = TRUE) %>%
+      as.data.frame() %>%
+      rownames_to_column("gene_id") %>%
+      dplyr::left_join(gene_symbol, by = "gene_id")
+  }
+
+  all_s <- rownames(meta)
+  veh_s <- rownames(meta)[meta$treatment == "vehicle"]
+  inh_s <- rownames(meta)[meta$treatment == "BP_inhib"]
+
+  list(
+    ip_vehicle = run_de(veh_s, ~type, "^type_IP_vs_input$"),
+    ip_inhib   = run_de(inh_s, ~type, "^type_IP_vs_input$"),
+    ip_inter   = run_de(all_s, ~treatment + type + treatment:type,
+                        "^treatmentBP_inhib\\.typeIP$"),
+    meta = meta,
+    n_universe_orig  = length(universe_orig),
+    n_universe_fixed = length(universe_fixed)
+  )
+}
+
+if (REFIT || !file.exists(IP_RDS)) {
+  ip_fit <- fit_teleman_ip()
+  saveRDS(ip_fit, IP_RDS)
+} else {
+  ip_fit <- readRDS(IP_RDS)
+  cat("loaded cached fit from", basename(IP_RDS), "\n")
+}
+
+print(ip_fit$meta, row.names = FALSE)
+print(table(treatment = ip_fit$meta$treatment, type = ip_fit$meta$type))
+
+cat("\nuniverse, original (no protein-coding filter):", ip_fit$n_universe_orig, "\n")
+cat("universe, corrected (protein-coding only):   ", ip_fit$n_universe_fixed, "\n")
+```
+
+## Integrity checks
+
+```{r ip-integrity}
+ip_fit[c("ip_vehicle", "ip_inhib", "ip_inter")] %>%
+  purrr::iwalk(function(d, nm) {
+    stopifnot("duplicate gene_id"  = !any(duplicated(d$gene_id)))
+    stopifnot("missing symbol"     = !any(is.na(d$symbol)))
+    stopifnot("non-finite log2FC"  = all(is.finite(d$log2FoldChange[!is.na(d$log2FoldChange)])))
+    stopifnot("padj outside [0,1]" = all(d$padj >= 0 & d$padj <= 1, na.rm = TRUE))
+    stopifnot("negative baseMean"  = all(d$baseMean >= 0, na.rm = TRUE))
+    cat(sprintf("%-11s n=%5d  dup=%d  NA symbol=%d\n", nm, nrow(d),
+                sum(duplicated(d$gene_id)), sum(is.na(d$symbol))))
+  })
+```
+
+---
+
+# Part 2: Fig 4E validation
+
+The published anchor: TE change on eIF4E inhibition should be **negatively** correlated
+with the change in eIF4E binding.
+
+```{r fig4e}
+te <- read_csv(here(TE_CORRECTED_CSV), show_col_types = FALSE)
+
+fig4e <- te %>%
+  dplyr::select(gene_id, symbol, te_lfc = log2FoldChange) %>%
+  dplyr::inner_join(ip_fit$ip_vehicle %>% dplyr::select(gene_id, bind_vehicle = log2FoldChange),
+                    by = "gene_id") %>%
+  dplyr::inner_join(ip_fit$ip_inhib %>% dplyr::select(gene_id, bind_inhib = log2FoldChange),
+                    by = "gene_id") %>%
+  dplyr::inner_join(ip_fit$ip_inter %>% dplyr::select(gene_id, delta_bind = log2FoldChange),
+                    by = "gene_id")
+
+cat("genes with both TE and IP measurements:", nrow(fig4e), "\n\n")
+
+purrr::map_dfr(c("delta_bind", "bind_vehicle", "bind_inhib"), \(v) tibble::tibble(
+  binding_axis = v,
+  pearson      = round(cor(fig4e$te_lfc, fig4e[[v]]), 3),
+  spearman     = round(cor(fig4e$te_lfc, fig4e[[v]], method = "spearman"), 3)
+)) %>% as.data.frame() %>% print(row.names = FALSE)
+
+# The published anchor.
+stopifnot("Fig 4E not reproduced: TE change vs change in eIF4E binding is not negative" =
+            cor(fig4e$te_lfc, fig4e$delta_bind, method = "spearman") < -0.15)
+
+# Categorical form of the same statement: TE-resistant mRNAs should lose eIF4E binding
+# relative to TE-sensitive ones.
+by_class <- fig4e %>%
+  dplyr::mutate(te_class = dplyr::case_when(
+    te_lfc >  LFC_CUT ~ "TE resistant",
+    te_lfc < -LFC_CUT ~ "TE sensitive",
+    TRUE              ~ "TE unchanged")) %>%
+  dplyr::group_by(te_class) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   mean_delta_bind  = mean(delta_bind),
+                   mean_bind_vehicle = mean(bind_vehicle), .groups = "drop")
+print(as.data.frame(by_class), digits = 3)
+
+stopifnot("TE-resistant mRNAs do not lose eIF4E binding relative to TE-sensitive ones" =
+            by_class$mean_delta_bind[by_class$te_class == "TE resistant"] <
+            by_class$mean_delta_bind[by_class$te_class == "TE sensitive"])
+
+cat("\nFig 4E anchor reproduced\n")
+```
+
+**Baseline binding runs the other way, and that is not an error.** TE-resistant mRNAs are
+*more* eIF4E-bound at baseline (mean +0.46) yet *lose* eIF4E occupancy under inhibition,
+while TE-sensitive mRNAs start less bound and gain occupancy. Only the change in binding
+reproduces Fig 4E; the baseline contrast is a different quantity and is confounded with
+transcript abundance.
+
+```{r fig4e-plot, fig.width = 5.5, fig.height = 5.5}
+p_fig4e <- ggplot(fig4e, aes(x = delta_bind, y = te_lfc)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey70", linewidth = 0.3) +
+  geom_point(size = 0.4, alpha = 0.25, color = "grey30") +
+  geom_smooth(method = "lm", se = FALSE, color = "#0072B2", linewidth = 0.8) +
+  labs(
+    title = "Fig 4E: TE change vs change in eIF4E binding",
+    x = "log2 change in eIF4E binding (IP/input, 4E-BP1-4A vs E.V.)",
+    y = "log2 TE change (4E-BP1-4A vs E.V.)"
+  ) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.4, size = 3.2,
+           label = paste0("Pearson R = ", round(cor(fig4e$te_lfc, fig4e$delta_bind), 3),
+                          ", n = ", nrow(fig4e))) +
+  theme_classic(base_size = 12)
+
+print(p_fig4e)
+ggsave(here("plots", "77_teleman_fig4e_te_vs_eif4e_binding.pdf"),
+       p_fig4e, width = 5.5, height = 5.5)
+```
+
+---
+
+# Part 3: Original vs corrected
+
+```{r ip-compare}
+orig_files <- c(vehicle     = "res_eif4e_ip_vehicle.csv",
+                inhibitor   = "res_eif4e_ip_inhibitor_only.csv",
+                interaction = "res_eif4e_ip_inhib_vs_vehicle.csv")
+fixed_names <- c(vehicle = "ip_vehicle", inhibitor = "ip_inhib", interaction = "ip_inter")
+
+compare_tbl <- purrr::map_dfr(names(orig_files), function(k) {
+  o <- read_csv(file.path(MPRA_REPO, orig_files[[k]]), show_col_types = FALSE)
+  f <- ip_fit[[fixed_names[[k]]]]
+  j <- dplyr::inner_join(
+    o %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+      dplyr::select(gene_id, lfc_o = log2FoldChange),
+    f %>% dplyr::select(gene_id, lfc_f = log2FoldChange), by = "gene_id")
+  tibble::tibble(
+    contrast       = k,
+    n_orig         = nrow(o),
+    n_fixed        = nrow(f),
+    dup_orig       = sum(duplicated(o$gene_id)),
+    na_symbol_orig = sum(is.na(o$symbol)),
+    up_orig        = sum(classify_ip(o$log2FoldChange, o$padj) == "up",   na.rm = TRUE),
+    up_fixed       = sum(classify_ip(f$log2FoldChange, f$padj) == "up",   na.rm = TRUE),
+    down_orig      = sum(classify_ip(o$log2FoldChange, o$padj) == "down", na.rm = TRUE),
+    down_fixed     = sum(classify_ip(f$log2FoldChange, f$padj) == "down", na.rm = TRUE),
+    lfc_r          = round(cor(j$lfc_o, j$lfc_f), 5)
+  )
+})
+print(as.data.frame(compare_tbl))
+```
+
+Same pattern as nb76: effect sizes essentially unmoved, set sizes down because the
+protein-coding filter collapses alternate-haplotype duplicate gene IDs (chiefly MHC
+region) that the original was testing and calling once per haplotype copy. GENCODE v26
+is a primary-assembly annotation and contains only the reference copy of each gene, so
+intersecting with it keeps exactly one ID per gene. See nb76 for the full accounting.
+
+---
+
+# Part 4: Export
+
+```{r ip-export}
+if (WRITE_OUTPUTS) {
+
+out_map <- c(ip_vehicle = "teleman_eif4e_ip_vehicle_corrected.csv",
+             ip_inhib   = "teleman_eif4e_ip_inhibitor_corrected.csv",
+             ip_inter   = "teleman_eif4e_ip_interaction_corrected.csv")
+
+purrr::iwalk(out_map, function(fname, nm) {
+  d <- ip_fit[[nm]] %>%
+    dplyr::mutate(class = classify_ip(log2FoldChange, padj)) %>%
+    dplyr::select(gene_id, symbol, baseMean, log2FoldChange, lfcSE, pvalue, padj, class)
+  write_csv(d, here("output", fname))
+  cat("wrote", fname, "-", nrow(d), "genes\n")
+})
+
+}
+```
+
+---
+
+# Summary
+
+The eIF4E-IP arm carried the same three defects as the riboseq arm and is now corrected
+the same way. Across all three contrasts: no duplicate gene IDs, no symbol-less genes,
+coefficients selected by name, sample alignment asserted.
+
+**Fig 4E reproduces**, and slightly more strongly after correction: Spearman -0.290
+between TE change and change in eIF4E binding, against -0.287 on the original files.
+
+**The two binding axes point opposite ways.** Change in binding correlates -0.25 with TE
+change (the published relationship); baseline binding correlates +0.24. Any downstream
+analysis using "eIF4E binding" must say which one it means. The interaction contrast is
+the one that matches the paper.
+
+**Still unchanged, as in nb76:** the design carries no `rep` term, the `log2(rowSums) > 10`
+expression cut is inherited as-is, and `cooksCutoff` / `independentFiltering` are left
+off. The IP arm is also unbalanced (5 input vs 6 IP libraries, because the 4E-BP1-4A input
+has only two replicates), which is handled correctly by DESeq2 but is worth knowing when
+reading the inhibitor-only contrast.

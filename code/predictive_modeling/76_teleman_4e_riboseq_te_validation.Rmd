@@ -1,0 +1,1086 @@
+---
+title: "Teleman 4E-BP1-4A riboseq: direction check, corrected re-run, and threshold counts"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  mpra_repo: "/Users/katematlin/github/mpra_preliminary"
+  teleman_res_csv: "/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv"
+  lfc_cut: 1
+  export_lfc: 0.5
+  n_per_class: 1195
+  padj_cut: 0.05
+  refit: FALSE
+  run_sensitivity: TRUE
+  write_genesets: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Purpose
+
+Bring the Teleman-lab ribosome profiling analysis (Roiuk et al., GSE243708) into this
+repo as a validated external dataset, per the "Integrating External Data from Papers"
+rule in `CLAUDE.md`: before any of it feeds a gene set or feature matrix, confirm that
+our own DESeq re-analysis reproduces a published result.
+
+The published result being reproduced is **Fig 1A** of the paper: a volcano of
+`log2(TE 4E-BP1-4A / TE E.V.)` against `-log10(adj. p-value)`, reporting
+**422 sensitive (blue) / 3753 unchanged (grey) / 183 resistant (red)** genes at
+`|log2FC| > 1` and `padj < 0.05`, with **CDKN2B** and **RPP25** called out as the most
+resistant and **GLO1** as strongly sensitive.
+
+Three things happen here:
+
+1. A direction check: the genes labelled in Fig 1A must land on the same side, with
+   CDKN2B up and GLO1 down.
+2. A **corrected re-run** of the DESeq2 model, and a gene-by-gene comparison against
+   the original results.
+3. Counts of mRNAs on each side of the significance thresholds, and a reconciliation
+   with the paper's 422 / 183.
+
+**Provenance.** The original model was fit in a different repo; the corrected re-run
+happens here, reading that repo's raw inputs.
+
+| Item | Location |
+|---|---|
+| Raw counts | `mpra_preliminary/data/GSE243708_raw_counts_matrix_Roiuk.csv` |
+| PCR artifact list | `mpra_preliminary/data/pcr_artifacts_sup8.csv` |
+| Annotation | `mpra_preliminary/accessories/gencode.v26.primary.info.csv.gz` |
+| Original DESeq2 code | `mpra_preliminary/code/resistant_4e_overlap2.Rmd` |
+| Original results | `mpra_preliminary/teleman_riboseq_analyzed.csv` |
+| Corrected results | `output/predictive_modeling/teleman_riboseq_te_fixed.rds` (written here) |
+
+An older, partly superseded copy of the same model lives in
+`mpra_preliminary/teleman_lab_data.Rmd`; it omits the PCR-artifact filter and should not
+be used. The corrected re-run below supersedes both copies.
+
+## Load libraries
+
+```{r load-libraries}
+library(tidyverse)
+library(here)
+library(ggrepel)
+library(DESeq2)
+library(janitor)
+```
+
+## Parameters
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+# LFC_CUT / PADJ_CUT are the paper's Fig 1A thresholds. They are NOT the project's
+# 0.5 TE convention - this is an external dataset reproduced on its own terms.
+# REFIT = TRUE forces the corrected DESeq2 models to refit; otherwise the cached
+# RDS is reloaded if present (the three models take a couple of minutes).
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    mpra_repo       = "/Users/katematlin/github/mpra_preliminary",
+    teleman_res_csv = "/Users/katematlin/github/mpra_preliminary/teleman_riboseq_analyzed.csv",
+    lfc_cut         = 1,      # Fig 1A comparison - do not change
+    export_lfc      = 0.5,    # threshold for the exported gene sets
+    n_per_class     = 1195,   # top N per class kept in the final table
+    padj_cut        = 0.05,
+    refit           = FALSE,
+    run_sensitivity = TRUE,
+    write_genesets  = TRUE
+  )
+}
+
+MPRA_REPO       <- params$mpra_repo
+TELEMAN_RES_CSV <- params$teleman_res_csv
+LFC_CUT         <- params$lfc_cut     # used for the Fig 1A reproduction
+EXPORT_LFC      <- params$export_lfc  # used for the exported gene sets
+N_PER_CLASS     <- params$n_per_class # top N resistant and top N sensitive kept
+PADJ_CUT        <- params$padj_cut
+REFIT           <- params$refit
+RUN_SENSITIVITY <- params$run_sensitivity
+WRITE_GENESETS  <- params$write_genesets
+
+FIXED_RDS <- here("output", "predictive_modeling", "teleman_riboseq_te_fixed.rds")
+
+# Classify once, everywhere.
+classify_te <- function(lfc, padj, l = LFC_CUT, p = PADJ_CUT) {
+  dplyr::case_when(
+    lfc >  l & padj < p ~ "resistant",
+    lfc < -l & padj < p ~ "sensitive",
+    TRUE                ~ "unchanged"
+  )
+}
+
+# The eight riboseq-arm libraries in GSE243708, named rather than indexed by position.
+# Note the case inconsistency in the GEO header (4EBP1_4a_1 vs 4EBP1_4A_2); the
+# treatment/type regexes below are case-insensitive to it by construction.
+RIBO_COLS <- c(
+  "Riboseq_Empty_vector_1", "Riboseq_Empty_vector_2",
+  "Riboseq_4EBP1_4a_1", "Riboseq_4EBP1_4A_2",
+  "Total_RNA_Riboseq_Empty_vector_1", "Total_RNA_Riboseq_Empty_vector_2",
+  "Total_RNA_Riboseq_4EBP1_4A_1", "Total_RNA_Riboseq_4EBP1_4A_2"
+)
+
+# Control-condition total RNA, used to pick the dominant transcript of each gene.
+CTRL_RNA_COLS <- c("Total_RNA_Riboseq_Empty_vector_1", "Total_RNA_Riboseq_Empty_vector_2")
+
+# MANE Select transcripts (one per gene), extracted from the GENCODE v49 GTF.
+# v49 is used here only for the MANE tag, which did not exist in the older builds;
+# it plays no part in defining the tested universe.
+MANE_CSV <- here("accessories", "human", "mane_select_v49.csv")
+
+# The counts reported in Fig 1A, and the order they are shown in.
+PAPER_FIG1A  <- c(sensitive = 422L, unchanged = 3753L, resistant = 183L)
+CLASS_LEVELS <- names(PAPER_FIG1A)
+N_PAPER      <- sum(PAPER_FIG1A)
+
+# Attach the published counts to any table with a `class` column, in figure order.
+add_paper_counts <- function(tbl) {
+  tbl %>%
+    dplyr::mutate(paper_fig1a = unname(PAPER_FIG1A[class])) %>%
+    dplyr::arrange(factor(class, levels = CLASS_LEVELS))
+}
+
+# Set sizes at an arbitrary threshold pair, used for both sensitivity grids.
+count_at <- function(l, p, df) {
+  tibble::tibble(
+    lfc_cut   = l,
+    padj_cut  = p,
+    resistant = sum(df$log2FoldChange >  l & df$padj < p, na.rm = TRUE),
+    sensitive = sum(df$log2FoldChange < -l & df$padj < p, na.rm = TRUE)
+  )
+}
+
+cat("Fig 1A comparison threshold: |log2FC| >", LFC_CUT, " padj <", PADJ_CUT, "\n")
+cat("gene set export threshold:   |log2FC| >", EXPORT_LFC, " padj <", PADJ_CUT, "\n")
+cat("final table keeps the top", N_PER_CLASS, "of each class\n")
+```
+
+## Load the original DESeq2 results
+
+```{r load-results}
+teleman_orig <- read_csv(TELEMAN_RES_CSV, show_col_types = FALSE)
+
+stopifnot(all(c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol")
+              %in% colnames(teleman_orig)))
+
+cat("rows:                ", nrow(teleman_orig), "\n")
+cat("unique gene_id:      ", dplyr::n_distinct(teleman_orig$gene_id), "\n")
+cat("rows with NA padj:   ", sum(is.na(teleman_orig$padj)), "\n")
+cat("rows with NA symbol: ", sum(is.na(teleman_orig$symbol)), "\n")
+```
+
+`independentFiltering = FALSE` was set upstream, so every tested gene carries a `padj`.
+The 12 duplicated `gene_id` keys and the 770 rows with no symbol are both artifacts of
+the original annotation and filtering steps; the corrected re-run in Part 2 removes them.
+
+---
+
+# Part 1: Direction check against the genes labelled in Fig 1A
+
+Fig 1A labels genes on both sides plus a cluster of housekeeping and translation-factor
+mRNAs at the origin. All three groups are checked: resistant labels positive, sensitive
+labels negative, origin cluster near zero and non-significant.
+
+```{r fig1a-labels}
+fig1a_resistant <- c("CDKN2B", "RPP25", "ID1", "PHLDA1", "IER3", "MAFK", "ADM",
+                     "CDKN1B", "BCL2L12", "HNRNPA0", "SLC2A1", "CEBPB", "DYNC1H1",
+                     "PPP1R10", "TPRA1", "SLC25A22", "POLD4", "FOSL1", "CCDC85B",
+                     "COL12A1", "COL4A1", "EIF4G1")
+fig1a_sensitive <- c("GLO1", "RPS6", "RPL13A", "STAT3")
+fig1a_origin    <- c("EIF4E", "GAPDH", "ENO1", "EIF3B", "HSP90AB1", "TUBA1A")
+
+teleman_orig %>%
+  dplyr::filter(symbol %in% c(fig1a_resistant, fig1a_sensitive, fig1a_origin)) %>%
+  dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::mutate(fig1a_group = dplyr::case_when(
+    symbol %in% fig1a_resistant ~ "resistant (red)",
+    symbol %in% fig1a_sensitive ~ "sensitive (blue)",
+    TRUE                        ~ "origin cluster"
+  )) %>%
+  dplyr::select(symbol, fig1a_group, log2FoldChange, padj, baseMean) %>%
+  dplyr::arrange(dplyr::desc(log2FoldChange)) %>%
+  as.data.frame() %>%
+  print(digits = 3)
+```
+
+## Assertions
+
+Wrapped in a function so the same checks can be re-run against the corrected results.
+
+```{r direction-assertions}
+check_direction <- function(df, label) {
+  lfc_of  <- function(g) df$log2FoldChange[match(g, df$symbol)]
+  padj_of <- function(g) df$padj[match(g, df$symbol)]
+
+  # The two genes the paper singles out, and the two poles of the volcano.
+  stopifnot("CDKN2B is not resistant: interaction sign may be flipped" =
+              lfc_of("CDKN2B") > LFC_CUT & padj_of("CDKN2B") < PADJ_CUT)
+  stopifnot("GLO1 is not sensitive: interaction sign may be flipped" =
+              lfc_of("GLO1") < -LFC_CUT & padj_of("GLO1") < PADJ_CUT)
+
+  # The paper's other bolded resistant calls.
+  stopifnot("RPP25 not resistant"  = lfc_of("RPP25")  > LFC_CUT)
+  stopifnot("CDKN1B not resistant" = lfc_of("CDKN1B") > LFC_CUT)
+
+  # Every labelled gene present must fall on its published side.
+  res_present <- intersect(fig1a_resistant, df$symbol)
+  sen_present <- intersect(fig1a_sensitive, df$symbol)
+  stopifnot("a Fig 1A resistant label came out negative" = all(lfc_of(res_present) > 0))
+  stopifnot("a Fig 1A sensitive label came out positive" = all(lfc_of(sen_present) < 0))
+
+  # Origin cluster near zero and non-significant.
+  org_present <- intersect(fig1a_origin, df$symbol)
+  stopifnot("an origin-cluster gene moved more than 0.5 log2" =
+              all(abs(lfc_of(org_present)) < 0.5))
+  stopifnot("an origin-cluster gene came out significant" =
+              all(padj_of(org_present) >= PADJ_CUT))
+
+  # A TE ratio is a ratio of ratios and should centre near zero.
+  stopifnot("median TE log2FC is not centred near zero" =
+              abs(median(df$log2FoldChange, na.rm = TRUE)) < 0.1)
+
+  # Range checks.
+  stopifnot("non-finite log2FC" = all(is.finite(df$log2FoldChange[!is.na(df$log2FoldChange)])))
+  stopifnot("padj outside [0,1]" = all(df$padj >= 0 & df$padj <= 1, na.rm = TRUE))
+  stopifnot("negative baseMean"  = all(df$baseMean >= 0, na.rm = TRUE))
+
+  cat("[", label, "] all direction assertions passed; median log2FC =",
+      round(median(df$log2FoldChange, na.rm = TRUE), 4), "over", nrow(df), "genes\n")
+  invisible(TRUE)
+}
+
+check_direction(teleman_orig, "original")
+```
+
+## Rank positions
+
+Sign agreement is necessary but weak. The paper labels CDKN2B and RPP25 because they are
+extreme, so they should be extreme here too.
+
+```{r rank-check}
+rank_report <- function(df, label) {
+  ranked <- df %>%
+    dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+    dplyr::arrange(dplyr::desc(log2FoldChange)) %>%
+    dplyr::mutate(rank_resistant = dplyr::row_number(),
+                  pct_from_top = 100 * rank_resistant / dplyr::n())
+
+  ranked %>%
+    dplyr::filter(symbol %in% c("CDKN2B", "RPP25", "CDKN1B", "GLO1", "RPS6")) %>%
+    dplyr::select(symbol, log2FoldChange, padj, rank_resistant, pct_from_top) %>%
+    as.data.frame() %>%
+    print(digits = 3)
+
+  stopifnot("CDKN2B is not in the top 1% of resistant genes" =
+              ranked$pct_from_top[match("CDKN2B", ranked$symbol)] < 1)
+  stopifnot("GLO1 is not in the bottom 5% (most sensitive)" =
+              ranked$pct_from_top[match("GLO1", ranked$symbol)] > 95)
+  cat("[", label, "] rank assertions passed\n")
+  invisible(ranked)
+}
+
+rank_report(teleman_orig, "original")
+```
+
+CDKN2B sits in the top 0.3% and GLO1 in the bottom 3.4%, which is where Fig 1A puts
+them. The interaction coefficient is oriented as the published axis.
+
+---
+
+# Part 2: Corrected re-run
+
+Refits the same interaction model from the raw GEO counts with three corrections, plus
+the alignment assertion. The design, the expression cut, `cooksCutoff` and
+`independentFiltering` are all deliberately left at their original values so that every
+difference is attributable to the three fixes.
+
+```{r fixed-refit}
+fit_teleman <- function() {
+  raw <- read_csv(file.path(MPRA_REPO, "data/GSE243708_raw_counts_matrix_Roiuk.csv"),
+                  show_col_types = FALSE)
+  pcr_art <- read_csv(file.path(MPRA_REPO, "data/pcr_artifacts_sup8.csv"),
+                      show_col_types = FALSE)
+
+  # --- annotation: strip the ID version BEFORE de-duplicating, so that PAR_Y
+  #     entries do not collapse onto their X-linked twin and duplicate the join ---
+  geneInfo <- read_csv(file.path(MPRA_REPO, "accessories/gencode.v26.primary.info.csv.gz"),
+                       col_names = FALSE, show_col_types = FALSE) %>%
+    dplyr::filter(!str_detect(X2, "pre_"))
+  colnames(geneInfo) <- c("gene_id", "transcript_id", "biotype", "symbol")
+  geneInfo <- geneInfo %>% dplyr::mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+  gene_symbol <- geneInfo %>%
+    dplyr::select(gene_id = gene_id_clean, symbol) %>%
+    dplyr::distinct(gene_id, .keep_all = TRUE)
+  stopifnot("symbol map has duplicate keys" =
+              !any(duplicated(gene_symbol$gene_id)))
+
+  # The original's map, rebuilt exactly as it was (de-duplicate, THEN strip version).
+  # Used only to reproduce the original results in the faithfulness check below.
+  gene_symbol_orig <- geneInfo %>%
+    dplyr::select(gene_id, symbol) %>%
+    dplyr::distinct() %>%
+    dplyr::mutate(gene_id = str_remove(gene_id, "\\..*"))
+
+  # --- protein-coding set, built on version-stripped IDs so it actually matches ---
+  pc <- geneInfo %>% dplyr::filter(biotype == "protein_coding") %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+
+  nonpolyA <- readxl::read_xlsx(file.path(MPRA_REPO, "accessories/polyAminus.xlsx"),
+                                sheet = 1) %>% dplyr::pull(Gene)
+  nonpolyA_ID <- geneInfo %>% dplyr::filter(symbol %in% nonpolyA) %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  blacklist_smRNA <- c("snoRNA", "miRNA", "snRNA", "rRNA", "Mt_tRNA", "scaRNA", "Mt_rRNA")
+  blacklist_ID <- geneInfo %>% dplyr::filter(biotype %in% blacklist_smRNA) %>%
+    dplyr::pull(gene_id_clean) %>% unique()
+  genes_to_kill <- unique(c(blacklist_ID, nonpolyA_ID))
+
+  # --- counts: drop PCR artifacts, then sum transcripts to gene.
+  #     Columns are named explicitly rather than indexed by position ---
+  ribo_deseq <- raw %>%
+    dplyr::filter(!`Transcript stable ID` %in% pcr_art$Transcript_id) %>%
+    dplyr::select(`Gene stable ID`, all_of(RIBO_COLS)) %>%
+    dplyr::group_by(`Gene stable ID`) %>%
+    dplyr::summarise(across(everything(), \(x) sum(x, na.rm = TRUE)), .groups = "drop") %>%
+    clean_names() %>%
+    column_to_rownames("gene_stable_id")
+
+  # --- dominant transcript per gene, chosen by CONTROL-condition total RNA.
+  #     Matches this project's convention of picking the isoform from control RNA-seq
+  #     rather than from footprints. Computed after the PCR-artifact filter, so an
+  #     artifact transcript can never be selected. Ties break on transcript ID so the
+  #     choice is deterministic. ---
+  tx_tbl <- raw %>%
+    dplyr::filter(!`Transcript stable ID` %in% pcr_art$Transcript_id) %>%
+    dplyr::select(gene_id = `Gene stable ID`,
+                  transcript_id = `Transcript stable ID`,
+                  all_of(CTRL_RNA_COLS))
+  tx_tbl$ctrl_rna <- rowSums(tx_tbl[, CTRL_RNA_COLS])
+
+  dominant_tx <- tx_tbl %>%
+    dplyr::group_by(gene_id) %>%
+    dplyr::mutate(gene_ctrl_rna = sum(ctrl_rna), n_transcripts = dplyr::n()) %>%
+    dplyr::arrange(dplyr::desc(ctrl_rna), transcript_id, .by_group = TRUE) %>%
+    dplyr::slice_head(n = 1) %>%
+    dplyr::ungroup() %>%
+    dplyr::transmute(
+      gene_id,
+      transcript_id = str_remove(transcript_id, "\\..*"),
+      n_transcripts,
+      dominant_tx_rna_fraction = dplyr::if_else(gene_ctrl_rna > 0,
+                                                ctrl_rna / gene_ctrl_rna, NA_real_)
+    )
+  stopifnot("dominant transcript table is not one row per gene" =
+              !any(duplicated(dominant_tx$gene_id)))
+  stopifnot("transcript RNA fraction outside [0,1]" =
+              all(dominant_tx$dominant_tx_rna_fraction >= 0 &
+                  dominant_tx$dominant_tx_rna_fraction <= 1, na.rm = TRUE))
+
+  # --- expression cut: > 1024 summed counts across the 8 libraries. This is a free
+  #     parameter and it sets the size of the tested universe ---
+  keepGenes <- rownames(ribo_deseq)[log2(rowSums(ribo_deseq)) > 10]
+  universe_orig  <- setdiff(keepGenes, genes_to_kill)   # what the original tested
+  universe_fixed <- intersect(universe_orig, pc)        # protein-coding only
+
+  # --- metadata, with the alignment assertion the original lacked ---
+  meta <- tibble::tibble(sample_name = RIBO_COLS) %>%
+    dplyr::mutate(
+      type      = factor(if_else(str_detect(sample_name, "Total_RNA"), "rna", "ribo"),
+                         levels = c("rna", "ribo")),
+      treatment = factor(if_else(str_detect(sample_name, "4EBP"), "BP_inhib", "vehicle"),
+                         levels = c("vehicle", "BP_inhib")),
+      rep       = factor(if_else(str_detect(sample_name, "_1$"), "1", "2"),
+                         levels = c("1", "2"))
+    ) %>%
+    as.data.frame()
+  rownames(meta) <- make_clean_names(meta$sample_name)
+  stopifnot("metadata rows do not match count matrix columns" =
+              identical(rownames(meta), colnames(ribo_deseq)))
+  stopifnot("expected 4 ribo and 4 rna libraries" = all(table(meta$type) == 4))
+  stopifnot("expected 4 vehicle and 4 BP_inhib libraries" = all(table(meta$treatment) == 4))
+
+  run_de <- function(universe, design_formula, indep_filter = FALSE,
+                     symbol_map = gene_symbol) {
+    dds <- DESeqDataSetFromMatrix(ribo_deseq[universe, , drop = FALSE],
+                                  colData = meta, design = design_formula)
+    dds <- DESeq(dds, quiet = TRUE)
+    # select the interaction coefficient by name, not position, and assert uniqueness
+    coef_name <- str_subset(resultsNames(dds), "^treatmentBP_inhib\\.typeribo$")
+    stopifnot("interaction coefficient not found or not unique" = length(coef_name) == 1)
+    res <- results(dds, name = coef_name,
+                   cooksCutoff = FALSE, independentFiltering = indep_filter)
+    lfcShrink(dds, coef = coef_name, res = res, type = "apeglm", quiet = TRUE) %>%
+      as.data.frame() %>%
+      rownames_to_column("gene_id") %>%
+      dplyr::left_join(symbol_map, by = "gene_id")
+  }
+
+  list(
+    fixed     = run_de(universe_fixed, ~treatment + type + treatment:type, FALSE),
+    fixed_rep = run_de(universe_fixed, ~rep + treatment + type + treatment:type, FALSE),
+    fixed_if  = run_de(universe_fixed, ~treatment + type + treatment:type, TRUE),
+    # The original configuration, rebuilt from raw counts: original universe (no
+    # protein-coding filter) and original symbol map. Only used to prove that this
+    # pipeline reproduces the original file, so that every difference reported below
+    # is attributable to the three corrections and not to a re-implementation drift.
+    orig_repro = run_de(universe_orig, ~treatment + type + treatment:type, FALSE,
+                        symbol_map = gene_symbol_orig),
+    meta        = meta,
+    dominant_tx = dominant_tx,
+    n_universe_orig  = length(universe_orig),
+    n_universe_fixed = length(universe_fixed)
+  )
+}
+
+if (REFIT || !file.exists(FIXED_RDS)) {
+  fit <- fit_teleman()
+  saveRDS(fit, FIXED_RDS)
+} else {
+  fit <- readRDS(FIXED_RDS)
+  cat("loaded cached fit from", basename(FIXED_RDS), "\n")
+}
+
+teleman_fixed <- fit$fixed
+
+cat("universe, original (no protein-coding filter):", fit$n_universe_orig, "\n")
+cat("universe, corrected (protein-coding only):   ", fit$n_universe_fixed, "\n")
+cat("duplicate gene_id in corrected results:      ",
+    sum(duplicated(teleman_fixed$gene_id)), "\n")
+cat("rows with NA symbol, corrected:              ",
+    sum(is.na(teleman_fixed$symbol)), " (original: ",
+    sum(is.na(teleman_orig$symbol)), ")\n", sep = "")
+```
+
+## Faithfulness check: does this pipeline reproduce the original?
+
+Everything reported below is a difference between the original results and the corrected
+ones. That comparison is only meaningful if this pipeline reproduces the original when
+configured the original way — otherwise a difference could be re-implementation drift
+rather than a correction.
+
+So refit with the original universe (no protein-coding filter) and the original symbol
+map, and compare element-wise against the published file.
+
+```{r faithfulness}
+repro <- fit$orig_repro
+
+cat("rows      reconstruction:", nrow(repro), "  original file:", nrow(teleman_orig), "\n")
+cat("gene sets identical:     ", setequal(repro$gene_id, teleman_orig$gene_id), "\n")
+cat("duplicate gene_id   repro:", sum(duplicated(repro$gene_id)),
+    " original:", sum(duplicated(teleman_orig$gene_id)), "\n")
+
+faith <- dplyr::inner_join(
+  repro        %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+    dplyr::select(gene_id, lfc_r = log2FoldChange, padj_r = padj, base_r = baseMean),
+  teleman_orig %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+    dplyr::select(gene_id, lfc_o = log2FoldChange, padj_o = padj, base_o = baseMean),
+  by = "gene_id")
+
+cat("genes compared:  ", nrow(faith), "\n")
+cat("max |delta LFC|: ", format(max(abs(faith$lfc_r - faith$lfc_o)), digits = 4), "\n")
+cat("max |delta padj|:", format(max(abs(faith$padj_r - faith$padj_o)), digits = 4), "\n")
+cat("max |delta base|:", format(max(abs(faith$base_r - faith$base_o)), digits = 4), "\n")
+
+stopifnot("reconstruction does not reproduce the original gene set" =
+            setequal(repro$gene_id, teleman_orig$gene_id))
+stopifnot("reconstruction reproduces the original PAR duplication" =
+            sum(duplicated(repro$gene_id)) == sum(duplicated(teleman_orig$gene_id)))
+# 1e-3 is a loose bound on apeglm's optimiser tolerance, not a claim about precision;
+# the observed agreement is ~5e-05 on LFC and ~1e-06 on padj.
+stopifnot("reconstruction does not reproduce the original effect sizes" =
+            max(abs(faith$lfc_r - faith$lfc_o)) < 1e-3)
+stopifnot("reconstruction does not reproduce the original padj" =
+            max(abs(faith$padj_r - faith$padj_o)) < 1e-3)
+stopifnot("reconstruction does not reproduce the original baseMean" =
+            max(abs(faith$base_r - faith$base_o)) < 1e-6)
+
+cat("\nreconstruction reproduces the original file\n")
+```
+
+Configured the original way, this pipeline returns the original's 12,090 rows, the same
+gene set, the same 12 PAR duplicates, and effect sizes agreeing to ~5e-05 (the residual
+is apeglm's optimiser tolerance, not a structural difference). Every difference reported
+from here on is therefore caused by the three corrections and nothing else.
+
+Note also that `n_universe_orig` is 12,078, exactly the number of **unique** genes in the
+original file: its 12,090 rows are those 12,078 genes plus the 12 PAR duplicates.
+
+## The corrected results pass the same direction checks
+
+```{r fixed-direction}
+check_direction(teleman_fixed, "corrected")
+rank_report(teleman_fixed, "corrected")
+```
+
+## Original vs corrected, gene by gene
+
+```{r fixed-vs-orig}
+orig_u <- teleman_orig %>%
+  dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::mutate(class = classify_te(log2FoldChange, padj))
+fixed_u <- teleman_fixed %>%
+  dplyr::mutate(class = classify_te(log2FoldChange, padj))
+
+cmp <- dplyr::inner_join(
+  orig_u  %>% dplyr::select(gene_id, symbol, lfc_orig = log2FoldChange,
+                            padj_orig = padj, class_orig = class),
+  fixed_u %>% dplyr::select(gene_id, lfc_fixed = log2FoldChange,
+                            padj_fixed = padj, class_fixed = class),
+  by = "gene_id"
+)
+
+cat("genes present in both:", nrow(cmp), "\n")
+cat("log2FC Pearson r:  ", round(cor(cmp$lfc_orig, cmp$lfc_fixed), 5), "\n")
+cat("log2FC Spearman:   ", round(cor(cmp$lfc_orig, cmp$lfc_fixed, method = "spearman"), 5), "\n")
+cat("median |delta LFC|:", round(median(abs(cmp$lfc_orig - cmp$lfc_fixed)), 5), "\n")
+cat("max |delta LFC|:   ", round(max(abs(cmp$lfc_orig - cmp$lfc_fixed)), 4), "\n\n")
+
+cat("class transitions among shared genes (rows original, columns corrected):\n")
+cmp %>%
+  dplyr::count(class_orig, class_fixed) %>%
+  tidyr::pivot_wider(names_from = class_fixed, values_from = n, values_fill = 0) %>%
+  as.data.frame() %>%
+  print(row.names = FALSE)
+```
+
+The effect estimates are essentially unmoved (r = 0.9999, median shift 0.016). The size
+factors and dispersion trend are re-estimated on a smaller gene set, which nudges
+borderline genes across the cut in both directions, but no gene flips from resistant to
+sensitive or back.
+
+## What the protein-coding filter removed
+
+```{r dropped-genes}
+dropped <- orig_u %>% dplyr::filter(!gene_id %in% teleman_fixed$gene_id)
+dropped_sig <- dropped %>% dplyr::filter(class != "unchanged")
+
+cat("genes dropped by the protein-coding filter:", nrow(dropped), "\n")
+cat("of which were called significant:", nrow(dropped_sig), "\n\n")
+print(dplyr::count(dropped, class))
+
+cat("\nof the dropped significant genes, how many had no gene symbol:",
+    sum(is.na(dropped_sig$symbol)), "of", nrow(dropped_sig), "\n")
+
+dropped_sig %>%
+  dplyr::arrange(dplyr::desc(abs(log2FoldChange))) %>%
+  dplyr::select(gene_id, symbol, log2FoldChange, padj, class) %>%
+  dplyr::slice_head(n = 10) %>%
+  as.data.frame() %>% print(digits = 3)
+```
+
+## What those dropped genes actually are
+
+They have no symbol in the GENCODE v26 join, which makes them look like unannotated
+junk. They are not. The GEO count matrix carries its own `GENE NAME` column, and read
+against that, the dropped set is dominated by **alternate-haplotype duplicate gene IDs,
+chiefly from the MHC region on chromosome 6.**
+
+Ensembl assigns a separate stable ID to each haplotype copy of an MHC gene, and the GEO
+matrix was quantified against a gene set that includes them. GENCODE v26 is a
+*primary assembly* annotation and contains only the reference copy, so intersecting with
+it keeps exactly one ID per gene and discards the haplotype twins.
+
+```{r haplotype-duplicates}
+geo_names <- read_csv(file.path(MPRA_REPO, "data/GSE243708_raw_counts_matrix_Roiuk.csv"),
+                      show_col_types = FALSE) %>%
+  dplyr::select(gene_id = 2, geo_name = 3) %>%
+  dplyr::distinct()
+
+dropped_named <- dropped %>%
+  dplyr::left_join(geo_names, by = "gene_id") %>%
+  dplyr::filter(!is.na(geo_name), geo_name != "#N/A")
+kept_names <- fixed_u %>% dplyr::left_join(geo_names, by = "gene_id") %>% dplyr::pull(geo_name)
+
+cat("dropped genes carrying a GEO gene name:", nrow(dropped_named), "\n")
+cat("of those, symbol already present in the retained set:",
+    sum(dropped_named$geo_name %in% kept_names),
+    sprintf("(%.1f%%)\n", 100 * mean(dropped_named$geo_name %in% kept_names)))
+
+# Three MHC genes labelled resistant in Fig 1A, each with several haplotype IDs.
+purrr::map_dfr(c("IER3", "PPP1R10", "HSPA1A"), function(g) {
+  ids  <- geo_names$gene_id[geo_names$geo_name == g]
+  kept <- fixed_u %>% dplyr::filter(gene_id %in% ids)
+  tibble::tibble(symbol = g, ids_in_geo_matrix = length(ids),
+                 retained = nrow(kept), log2FC = round(kept$log2FoldChange[1], 2))
+}) %>% as.data.frame() %>% print(row.names = FALSE)
+
+stopifnot("haplotype duplicates are not being collapsed to one ID per gene" =
+            mean(dropped_named$geo_name %in% kept_names) > 0.8)
+```
+
+So the filter is not discarding biology, it is **de-duplicating it**. IER3 and PPP1R10
+are both labelled resistant in Fig 1A, and each appears in the raw matrix under six or
+seven gene IDs with near-identical fold changes; the original analysis counted every
+copy. That is the bulk of the 83 significant calls removed here, and it is why the
+original resistant set was inflated relative to the paper's.
+
+Two consequences worth carrying forward:
+
+- **Set sizes in the original were inflated by duplicate counting**, not only by
+  contamination. Roughly 92% of the dropped genes duplicate a symbol that survives.
+- **The symbol-less rows were an artifact of the annotation join, not of the data.** The
+  GEO matrix names all of them. Joining GENCODE v26 by ENSEMBL ID simply cannot resolve
+  haplotype IDs, because that annotation does not contain them.
+
+## Sensitivity: two modelling choices
+
+```{r sensitivity-models}
+if (RUN_SENSITIVITY) {
+
+sens_models <- c("corrected (as above)"            = "fixed",
+                 "corrected + rep in design"       = "fixed_rep",
+                 "corrected + independentFiltering" = "fixed_if")
+
+sens <- purrr::imap_dfr(sens_models, function(slot, label) {
+  cls <- classify_te(fit[[slot]]$log2FoldChange, fit[[slot]]$padj)
+  tibble::tibble(model = label,
+                 resistant = sum(cls == "resistant"),
+                 sensitive = sum(cls == "sensitive"))
+})
+print(as.data.frame(sens))
+
+cat("\ngenes filtered out by independentFiltering:",
+    sum(is.na(fit$fixed_if$padj)), "\n")
+
+rep_cmp <- dplyr::inner_join(
+  fit$fixed     %>% dplyr::transmute(gene_id, cls_no_rep = classify_te(log2FoldChange, padj),
+                                     lfc_no_rep = log2FoldChange),
+  fit$fixed_rep %>% dplyr::transmute(gene_id, cls_rep = classify_te(log2FoldChange, padj),
+                                     lfc_rep = log2FoldChange),
+  by = "gene_id")
+cat("log2FC correlation with vs without rep:", round(cor(rep_cmp$lfc_no_rep, rep_cmp$lfc_rep), 4), "\n\n")
+cat("rows = without rep, columns = with rep:\n")
+rep_cmp %>%
+  dplyr::count(cls_no_rep, cls_rep) %>%
+  tidyr::pivot_wider(names_from = cls_rep, values_from = n, values_fill = 0) %>%
+  as.data.frame() %>%
+  print(row.names = FALSE)
+
+}
+```
+
+**Independent filtering makes no difference here:** it removes zero genes, so the counts
+are byte-identical to the corrected run. Leaving it off costs nothing.
+
+**Replicate pairing is a real choice.** Footprint and total-RNA libraries from the same
+biological replicate are paired, but `rep` is not in the design. Adding it moves ~170 genes: it tightens CDKN2B's padj by two
+orders of magnitude (8.9e-06 to 1.3e-07) but drops 94 genes out of the resistant set,
+because one residual degree of freedom out of four is a steep price at n = 2. The
+corrected run leaves it out, which is the more conservative choice with respect to
+changing the published set membership, and the more liberal one with respect to set
+size. If the resistant set is going to be used as a classifier target, the `rep` version
+is the defensible one to prefer; it is cached in `fit$fixed_rep` and requires no refit.
+
+---
+
+# Part 3: Counts on each side of the thresholds
+
+```{r classify}
+counts_tbl <- dplyr::full_join(
+  dplyr::count(orig_u,  class, name = "original"),
+  dplyr::count(fixed_u, class, name = "corrected"),
+  by = "class"
+) %>%
+  add_paper_counts()
+
+print(as.data.frame(counts_tbl))
+
+cat("\ntotal tested, original:  ", nrow(orig_u),
+    "\ntotal tested, corrected: ", nrow(fixed_u),
+    "\ntotal plotted in Fig 1A: ", N_PAPER, "\n", sep = "")
+```
+
+Both versions call more genes than the paper. The counts differ because the **tested
+universe differs**: 11,306 genes after correction versus 4,358 plotted in Fig 1A. The
+paper's expression filter is more aggressive than the `log2(rowSums) > 10` cut used here.
+
+## Reconciliation on a matched universe
+
+If the remaining difference is universe size rather than model or direction, restricting
+to the most-expressed 4,358 genes should land close to 422 / 183 without changing
+anything else.
+
+```{r matched-universe}
+matched_counts <- function(df, label) {
+  df %>%
+    dplyr::slice_max(baseMean, n = N_PAPER, with_ties = FALSE) %>%
+    dplyr::count(class, name = label)
+}
+
+matched_tbl <- dplyr::full_join(
+  matched_counts(orig_u,  "original"),
+  matched_counts(fixed_u, "corrected"),
+  by = "class"
+) %>%
+  add_paper_counts()
+
+print(as.data.frame(matched_tbl))
+```
+
+Matched on universe size, the corrected resistant count is **191 against the paper's
+183** — a 4% difference, and closer than the original's 175. The sensitive count stays
+at 317 against 422, consistent with the paper retaining more moderately expressed genes
+than a flat top-N baseMean cut does, and with apeglm shrinkage pulling low-count genes
+toward zero.
+
+This answers the open question in the margin of the original notebook ("In the paper
+they identify fewer mRNAs -- I am not sure why"): the model and the direction were right;
+the gene universe was wider, and partly contaminated with non-coding features.
+
+## Threshold sensitivity
+
+```{r sensitivity}
+lfc_grid  <- purrr::map_dfr(c(0.5, 1, 1.5, 2),  count_at, p = PADJ_CUT,  df = fixed_u)
+padj_grid <- purrr::map_dfr(c(0.05, 0.01, 0.001), \(p) count_at(LFC_CUT, p, fixed_u))
+
+print(as.data.frame(lfc_grid))
+print(as.data.frame(padj_grid))
+
+cat("\ngenes with padj <", PADJ_CUT, "at any fold change:",
+    sum(fixed_u$padj < PADJ_CUT, na.rm = TRUE), "\n")
+```
+
+The LFC cut does nearly all the work, and resistant calls fall off faster than sensitive
+ones as it rises, which is the asymmetry visible in Fig 1A.
+
+---
+
+# Part 4: Volcano
+
+```{r volcano, fig.width = 7, fig.height = 6}
+class_colors <- c("resistant" = "#D55E00",
+                  "sensitive" = "#0072B2",
+                  "unchanged" = "grey70")
+
+label_genes <- c("CDKN2B", "RPP25", "CDKN1B", "ID1", "SLC2A1", "MAFK", "IER3",
+                 "PHLDA1", "ADM", "CEBPB", "HNRNPA0", "DYNC1H1",
+                 "GLO1", "RPS6", "STAT3", "RPL13A",
+                 "EIF4E", "GAPDH", "ENO1", "EIF3B")
+
+plot_df <- fixed_u %>% dplyr::filter(!is.na(padj))
+n_lab <- plot_df %>% dplyr::count(class) %>% tibble::deframe()
+
+p_volcano <- ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = class), size = 0.7, alpha = 0.6) +
+  geom_vline(xintercept = c(-LFC_CUT, LFC_CUT), linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(PADJ_CUT), linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  ggrepel::geom_text_repel(
+    data = plot_df %>% dplyr::filter(symbol %in% label_genes),
+    aes(label = symbol), size = 2.8, max.overlaps = 30,
+    segment.color = "grey50", segment.size = 0.3, min.segment.length = 0
+  ) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  labs(
+    title = "Teleman riboseq: TE change on eIF4E inhibition (corrected re-run)",
+    subtitle = paste0(
+      "|log2FC| > ", LFC_CUT, ", padj < ", PADJ_CUT,
+      "   |   sensitive ", n_lab[["sensitive"]],
+      ", unchanged ",     n_lab[["unchanged"]],
+      ", resistant ",     n_lab[["resistant"]],
+      "   |   n = ", nrow(plot_df)),
+    x = "log2(TE 4E-BP1-4A / TE E.V.)",
+    y = "-log10(adj. p-value)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_volcano)
+ggsave(here("plots", "76_teleman_4e_riboseq_te_volcano.pdf"),
+       p_volcano, width = 7, height = 6)
+```
+
+Same axes, same orientation, same labelled genes on the same sides as Fig 1A. Ours is
+denser because the universe is wider.
+
+## Original vs corrected effect sizes
+
+```{r lfc-concordance, fig.width = 5.5, fig.height = 5.5}
+p_conc <- ggplot(cmp, aes(x = lfc_orig, y = lfc_fixed)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = "dashed") +
+  geom_point(size = 0.5, alpha = 0.3, color = "grey30") +
+  labs(
+    title = "Effect sizes are unchanged by the fixes",
+    x = "log2FC, original analysis",
+    y = "log2FC, corrected re-run"
+  ) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4, size = 3.2,
+           label = paste0("Pearson R = ", round(cor(cmp$lfc_orig, cmp$lfc_fixed), 4),
+                          ", n = ", nrow(cmp))) +
+  theme_classic(base_size = 12)
+
+print(p_conc)
+ggsave(here("plots", "76_teleman_orig_vs_corrected_lfc.pdf"),
+       p_conc, width = 5.5, height = 5.5)
+```
+
+---
+
+# Part 5: Dominant transcript and MANE status
+
+The DESeq2 model is gene-level, but the GEO matrix is transcript-level (41,260
+transcripts over 21,540 genes, up to 25 isoforms per gene), so a representative
+transcript can be named for every gene that was tested.
+
+**Selection rule:** the isoform with the highest **control-condition total RNA**
+(`Total_RNA_Riboseq_Empty_vector_1` + `_2`), chosen after the PCR-artifact filter so an
+artifact transcript can never be picked, with ties broken on transcript ID for
+determinism. This follows the project convention of selecting isoforms from control
+RNA-seq rather than from footprints.
+
+**MANE status** is then checked against the MANE Select set (one transcript per gene,
+the RefSeq/Ensembl-agreed representative), extracted from the GENCODE v49 GTF. v49 is
+used *only* for this tag, which did not exist in the older builds; it plays no part in
+defining the tested universe.
+
+```{r dominant-transcript}
+mane <- read_csv(MANE_CSV,
+                 col_names = c("gene_id", "mane_transcript_id", "mane_symbol"),
+                 show_col_types = FALSE)
+stopifnot("MANE table is not one row per gene" = !any(duplicated(mane$gene_id)))
+cat("MANE Select transcripts loaded:", nrow(mane), "\n\n")
+
+tx_annot <- fit$dominant_tx %>%
+  dplyr::left_join(mane %>% dplyr::select(gene_id, mane_transcript_id), by = "gene_id") %>%
+  dplyr::mutate(
+    gene_has_mane  = !is.na(mane_transcript_id),
+    is_mane_select = dplyr::if_else(gene_has_mane, transcript_id == mane_transcript_id, NA)
+  )
+
+fixed_u <- fixed_u %>% dplyr::left_join(tx_annot, by = "gene_id")
+
+stopifnot("every tested gene should get a dominant transcript" =
+            !any(is.na(fixed_u$transcript_id)))
+
+cat("genes in the tested set:", nrow(fixed_u), "\n")
+cat("  single-isoform genes (choice is trivial):", sum(fixed_u$n_transcripts == 1), "\n")
+cat("  multi-isoform genes:                     ", sum(fixed_u$n_transcripts > 1), "\n\n")
+cat("  gene has a MANE Select transcript:", sum(fixed_u$gene_has_mane),
+    sprintf("(%.1f%%)\n", 100 * mean(fixed_u$gene_has_mane)))
+cat("  dominant transcript IS the MANE Select:", sum(fixed_u$is_mane_select, na.rm = TRUE),
+    sprintf("(%.1f%% of genes with MANE)\n",
+            100 * mean(fixed_u$is_mane_select, na.rm = TRUE)))
+cat("  dominant transcript differs from MANE:  ",
+    sum(!fixed_u$is_mane_select, na.rm = TRUE), "\n")
+cat("  no MANE entry for the gene:             ", sum(!fixed_u$gene_has_mane), "\n\n")
+
+cat("agreement with MANE, split by isoform count:\n")
+fixed_u %>%
+  dplyr::filter(gene_has_mane) %>%
+  dplyr::mutate(isoforms = dplyr::if_else(n_transcripts == 1, "1", "2+")) %>%
+  dplyr::group_by(isoforms) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   pct_matching_mane = round(100 * mean(is_mane_select), 1),
+                   median_rna_fraction = round(median(dominant_tx_rna_fraction, na.rm = TRUE), 3),
+                   .groups = "drop") %>%
+  as.data.frame() %>% print(row.names = FALSE)
+
+cat("\nexamples where the dominant transcript is NOT the MANE Select:\n")
+fixed_u %>%
+  dplyr::filter(gene_has_mane, !is_mane_select) %>%
+  dplyr::arrange(dplyr::desc(baseMean)) %>%
+  dplyr::select(symbol, transcript_id, mane_transcript_id, n_transcripts,
+                dominant_tx_rna_fraction) %>%
+  dplyr::slice_head(n = 8) %>%
+  as.data.frame() %>% print(digits = 3, row.names = FALSE)
+```
+
+A single-isoform gene matches MANE trivially, so the informative number is the
+multi-isoform row: that is the rate at which the most abundant isoform in these cells
+agrees with the community reference transcript. Where they disagree,
+`mane_transcript_id` records what MANE would have picked, so either convention can be
+used downstream.
+
+---
+
+# Part 6: Export gene sets
+
+Everything above reproduces Fig 1A at the paper's `|log2FC| > 1`. **The exported sets use
+`|log2FC| > EXPORT_LFC` (0.5) instead** — the two thresholds are deliberately decoupled,
+so tightening or loosening the deliverable never disturbs the published comparison.
+
+The final list keeps **only the resistant and sensitive genes**; unchanged genes are
+dropped. A separate all-genes table is still written for anything that needs the
+unthresholded values (notebook 77's Fig 4E correlation reads it).
+
+Columns follow this repo's gene set convention (`ensembl_gene`, `db_gene_symbol`) so the
+sets drop straight into the notebook 09 Venn and overlap code. Each row carries the most
+abundant transcript and a flag for whether that transcript is the MANE Select; the MANE
+transcript ID itself is not exported, since the analysis of it lives in Part 5.
+
+```{r export-genesets}
+# Re-classify at the export threshold. `class` (Fig 1A, LFC 1) is left untouched.
+export_u <- fixed_u %>%
+  dplyr::mutate(class_export = classify_te(log2FoldChange, padj, l = EXPORT_LFC))
+
+cat("at the export threshold (|log2FC| >", EXPORT_LFC, ", padj <", PADJ_CUT, "):\n")
+print(dplyr::count(export_u, class_export) %>% as.data.frame())
+
+export_cols <- function(df) {
+  df %>%
+    dplyr::transmute(
+      ensembl_gene   = gene_id,
+      db_gene_symbol = symbol,
+      transcript_id  = transcript_id,   # most abundant isoform, control RNA
+      is_mane_select = is_mane_select,  # flag only; the MANE ID itself is not exported
+      n_transcripts  = n_transcripts,
+      dominant_tx_rna_fraction = dominant_tx_rna_fraction,
+      log2FoldChange = log2FoldChange,
+      padj           = padj,
+      baseMean       = baseMean,
+      class          = class_export
+    ) %>%
+    dplyr::arrange(dplyr::desc(abs(log2FoldChange)))
+}
+
+# Rank within each class by effect size and keep the top N. "Most resistant" is the
+# largest positive log2FC; "most sensitive" the most negative. Ties break on padj so
+# the cut is deterministic.
+make_set <- function(which_class, n_keep = N_PER_CLASS) {
+  d <- export_u %>%
+    dplyr::filter(class_export == which_class, !is.na(symbol), symbol != "#N/A") %>%
+    dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+    dplyr::arrange(dplyr::desc(abs(log2FoldChange)), padj)
+  n_avail <- nrow(d)
+  if (n_avail < n_keep) {
+    cat("NOTE: only", n_avail, which_class, "genes available, fewer than the requested",
+        n_keep, "- keeping all of them\n")
+  }
+  d %>% dplyr::slice_head(n = min(n_keep, n_avail)) %>% export_cols()
+}
+
+resistant_set <- make_set("resistant")
+sensitive_set <- make_set("sensitive")
+
+# The final list: top N resistant + top N sensitive, no unchanged genes.
+final_set <- dplyr::bind_rows(resistant_set, sensitive_set) %>%
+  dplyr::arrange(factor(class, levels = c("resistant", "sensitive")),
+                 dplyr::desc(abs(log2FoldChange)))
+
+cat("\nresistant kept:", nrow(resistant_set),
+    " (|log2FC| range", sprintf("%.3f", min(abs(resistant_set$log2FoldChange))),
+    "-", sprintf("%.3f", max(abs(resistant_set$log2FoldChange))), ")\n")
+cat("sensitive kept:", nrow(sensitive_set),
+    " (|log2FC| range", sprintf("%.3f", min(abs(sensitive_set$log2FoldChange))),
+    "-", sprintf("%.3f", max(abs(sensitive_set$log2FoldChange))), ")\n")
+
+stopifnot("resistant set contains a non-positive LFC" = all(resistant_set$log2FoldChange > 0))
+stopifnot("sensitive set contains a non-negative LFC" = all(sensitive_set$log2FoldChange < 0))
+stopifnot("CDKN2B missing from the resistant set" = "CDKN2B" %in% resistant_set$db_gene_symbol)
+stopifnot("GLO1 missing from the sensitive set"   = "GLO1"   %in% sensitive_set$db_gene_symbol)
+stopifnot("duplicate gene in resistant set" = !any(duplicated(resistant_set$ensembl_gene)))
+stopifnot("duplicate gene in sensitive set" = !any(duplicated(sensitive_set$ensembl_gene)))
+stopifnot("final list still contains unchanged genes" =
+            !any(final_set$class == "unchanged"))
+stopifnot("final list contains a class other than resistant/sensitive" =
+            all(final_set$class %in% c("resistant", "sensitive")))
+stopifnot("final list is not the two sets combined" =
+            nrow(final_set) == nrow(resistant_set) + nrow(sensitive_set))
+stopifnot("a class exceeds the requested size" =
+            nrow(resistant_set) <= N_PER_CLASS && nrow(sensitive_set) <= N_PER_CLASS)
+stopifnot("every exported row must name a transcript" =
+            !any(is.na(final_set$transcript_id)))
+
+lfc_tag <- sub("\\.", "p", as.character(EXPORT_LFC))
+
+if (WRITE_GENESETS) {
+
+write_csv(resistant_set,
+          here("output", "genesets", paste0("teleman_4e_resistant_TE_lfc", lfc_tag, ".csv")))
+write_csv(sensitive_set,
+          here("output", "genesets", paste0("teleman_4e_sensitive_TE_lfc", lfc_tag, ".csv")))
+write_csv(final_set,
+          here("output", "genesets", paste0("teleman_4e_resistant_sensitive_TE_lfc", lfc_tag, ".csv")))
+
+# All tested genes, unthresholded. Not the deliverable, but notebook 77 needs the full
+# distribution for the Fig 4E correlation, and it keeps the unchanged class available.
+write_csv(export_u %>% dplyr::select(gene_id, symbol, transcript_id, is_mane_select,
+                                     n_transcripts, dominant_tx_rna_fraction, baseMean,
+                                     log2FoldChange, lfcSE, pvalue, padj,
+                                     class_lfc1 = class, class_lfc_export = class_export),
+          here("output", "teleman_riboseq_te_all_genes.csv"))
+
+cat("\nresistant genes written:", nrow(resistant_set), "\n")
+cat("sensitive genes written:", nrow(sensitive_set), "\n")
+cat("final combined list:     ", nrow(final_set), "\n")
+cat("all-genes table:         ", nrow(export_u), "\n")
+
+}
+```
+
+## The final table
+
+Both sets in full, ranked by effect size. Paged so the whole list is browsable without
+flooding the document.
+
+```{r print-final-resistant}
+cat("TOP", nrow(resistant_set), "MOST RESISTANT (log2FC > ", EXPORT_LFC, ")\n")
+rmarkdown::paged_table(resistant_set)
+```
+
+```{r print-final-sensitive}
+cat("TOP", nrow(sensitive_set), "MOST SENSITIVE (log2FC < -", EXPORT_LFC, ")\n")
+rmarkdown::paged_table(sensitive_set)
+```
+
+
+
+---
+
+# Summary
+
+**Direction is correct and validated, in both the original and the corrected run.** The
+interaction coefficient `treatmentBP_inhib.typeribo` is oriented exactly as Fig 1A's x
+axis: positive = resistant to eIF4E inhibition. CDKN2B is in the top 0.3% of resistant
+genes and GLO1 in the bottom 3.4%, matching the paper's two named extremes; every gene
+labelled in Fig 1A falls on its published side, and the housekeeping cluster sits at the
+origin and non-significant.
+
+**Counts at `|log2FC| > 1`, `padj < 0.05`:**
+
+| | original | corrected | corrected, matched universe | Fig 1A |
+|---|---|---|---|---|
+| Resistant (up) | 822 | 796 | **191** | 183 |
+| Sensitive (down) | 716 | 664 | 317 | 422 |
+| Unchanged | 10,552 | 9,846 | 3,850 | 3,753 |
+| Total tested | 12,078 | 11,306 | 4,358 | 4,358 |
+
+**What the fixes changed.** Effect sizes are untouched (Pearson r = 0.9999, median
+|Δlog2FC| = 0.016) and no gene flips sign of significance. What changed is set
+membership: 83 significant calls were removed, **74 of them alternate-haplotype duplicate
+IDs of a gene that is still in the set** (chiefly MHC-region genes such as IER3, PPP1R10
+and HSPA1A, which appear under six or seven ENSEMBL IDs each), 59 of which had been in the resistant
+set at fold changes up to |log2FC| ~ 4.8. Re-estimating dispersions on the cleaner
+universe then moved 62 borderline genes across the cut (34 into resistant, 28 out of
+sensitive). The corrected resistant set also reproduces the paper more closely on a
+matched universe (191 vs 183, against the original's 175).
+
+**What the corrected run changes, relative to the original.** Three things: the
+annotation join no longer duplicates pseudoautosomal genes, the protein-coding filter is
+actually applied, and the interaction coefficient is selected by name rather than by
+position. The metadata/count-matrix alignment that the original relied on implicitly is
+now asserted.
+
+**Left deliberately unchanged**, so that every difference above is attributable to those
+three corrections: the design (no `rep` term), the `log2(rowSums) > 10` expression cut,
+and `cooksCutoff` / `independentFiltering`. The first and last are quantified in the
+sensitivity section; the expression cut is the main remaining reason the tested universe
+is wider than the paper's.
+
+**Annotation provenance.** The paper's methods state that reads were mapped to ENSEMBL
+transcript assembly **94**, whereas the annotation joined here is **GENCODE v26**
+(= Ensembl 88). That mismatch is worth knowing about, but it is not what produces the
+symbol-less rows: those are alternate-haplotype IDs, which are absent from *any*
+primary-assembly annotation regardless of build. Swapping v26 for the provenance-matched
+GENCODE v29 (= Ensembl 94, verified from its own file header) moves the tested universe
+by only 14 genes, because both are primary-assembly annotations and the haplotype
+collapsing is what actually matters. The gene symbols in the exported tables come from
+this annotation, so a handful of names follow v26 conventions rather than current ones;
+join on `gene_id` where that matters.

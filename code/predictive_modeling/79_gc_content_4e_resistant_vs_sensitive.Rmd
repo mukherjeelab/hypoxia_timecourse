@@ -1,0 +1,273 @@
+---
+title: "GC content of 4E-resistant vs 4E-sensitive mRNAs"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_matrix: "feature_matrix_teleman_4e.rds"
+  pos_csv: "teleman_4e_resistant_TE_1hr_lfc0.5.csv"
+  neg_csv: "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Two things:
+
+1. Density of **CDS GC%** and **GC3** for the 4E-resistant vs 4E-sensitive sets from
+   notebook 76.
+2. An explanation for why the notebook 07 classifier reaches AUC 0.99 on these classes.
+   The short version is in the plots: these two sets are almost non-overlapping on GC.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    feature_matrix = "feature_matrix_teleman_4e.rds",
+    pos_csv        = "teleman_4e_resistant_TE_1hr_lfc0.5.csv",
+    neg_csv        = "teleman_4e_sensitive_TE_1hr_lfc0.5.csv",
+    save_plots     = TRUE
+  )
+}
+FEATURE_MATRIX <- params$feature_matrix
+POS_CSV        <- params$pos_csv
+NEG_CSV        <- params$neg_csv
+SAVE_PLOTS     <- params$save_plots
+
+# eIF3d orange and eIF3e blue are reserved for those two factors (CLAUDE.md), so this
+# figure uses two of the remaining Okabe-Ito hues, matching the nb76 volcano.
+class_colors <- c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2")
+```
+
+# Data
+
+```{r load}
+fm  <- readRDS(here("output", "predictive_modeling", FEATURE_MATRIX))
+pos <- read_csv(here("output", "genesets", POS_CSV), show_col_types = FALSE)
+neg <- read_csv(here("output", "genesets", NEG_CSV), show_col_types = FALSE)
+
+d <- fm %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id_clean %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id_clean %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE                                ~ NA_character_)) %>%
+  dplyr::filter(!is.na(class)) %>%
+  dplyr::mutate(class = factor(class, levels = names(class_colors)))
+
+print(dplyr::count(d, class) %>% as.data.frame(), row.names = FALSE)
+stopifnot("classes overlap" =
+  length(intersect(pos$ensembl_gene, neg$ensembl_gene)) == 0)
+```
+
+# Density plots
+
+```{r density-fn}
+gc_density <- function(df, col, xlab, title) {
+  sub <- df %>% dplyr::filter(!is.na(.data[[col]]))
+  wt  <- wilcox.test(sub[[col]] ~ sub$class)
+  med <- sub %>% dplyr::group_by(class) %>%
+    dplyr::summarise(m = median(.data[[col]]), .groups = "drop")
+
+  lab <- paste0(
+    "Wilcoxon p = ", format.pval(wt$p.value, digits = 3, eps = 2.2e-16),
+    "\nmedian ", med$class[1], " = ", round(med$m[1], 1),
+    "\nmedian ", med$class[2], " = ", round(med$m[2], 1),
+    "\nn = ", sum(sub$class == med$class[1]), " / ", sum(sub$class == med$class[2]))
+
+  ggplot(sub, aes(x = .data[[col]], fill = class, color = class)) +
+    geom_density(alpha = 0.15, linewidth = 0.8) +
+    geom_vline(data = med, aes(xintercept = m, color = class),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    scale_fill_manual(values = class_colors, name = NULL) +
+    scale_color_manual(values = class_colors, name = NULL) +
+    labs(title = title, x = xlab, y = "Density") +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+             size = 3.2, label = lab) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+}
+```
+
+## CDS GC content
+
+```{r cds-gc, fig.width = 7, fig.height = 4.5}
+p_cds <- gc_density(d, "cds_gc", "CDS GC content (%)",
+                    "CDS GC content, 4E-resistant vs 4E-sensitive")
+print(p_cds)
+if (SAVE_PLOTS) ggsave(here("plots", "79_cds_gc_density_4e.pdf"), p_cds,
+                       width = 7, height = 4.5)
+```
+
+## GC3 (third codon position)
+
+```{r gc3, fig.width = 7, fig.height = 4.5}
+p_gc3 <- gc_density(d, "gc3", "GC3, third codon position (%)",
+                    "GC3, 4E-resistant vs 4E-sensitive")
+print(p_gc3)
+if (SAVE_PLOTS) ggsave(here("plots", "79_gc3_density_4e.pdf"), p_gc3,
+                       width = 7, height = 4.5)
+```
+
+## The other GC flavours, for context
+
+```{r other-gc, fig.width = 9, fig.height = 6}
+gc_long <- d %>%
+  dplyr::select(class, cds_gc, gc1, gc2, gc3, utr5_gc, utr3_gc) %>%
+  tidyr::pivot_longer(-class, names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(feature,
+    levels = c("cds_gc", "gc1", "gc2", "gc3", "utr5_gc", "utr3_gc")))
+
+p_all <- ggplot(gc_long, aes(x = gc, fill = class, color = class)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = class_colors, name = NULL) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  labs(title = "GC content by region and codon position",
+       subtitle = paste0("n = ", sum(d$class == "4E-resistant"), " resistant, ",
+                         sum(d$class == "4E-sensitive"), " sensitive"),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_all)
+if (SAVE_PLOTS) ggsave(here("plots", "79_gc_all_regions_density_4e.pdf"), p_all,
+                       width = 9, height = 6)
+```
+
+Note the contrast between `gc3` and `utr5_gc`: the separation is a **coding-sequence**
+property, concentrated at the wobble position. The 5'UTRs of the two sets are nearly
+superimposable.
+
+---
+
+# Why the notebook 07 classifier reaches AUC 0.99
+
+The classifier is not finding something subtle. Each feature is scored here on its own,
+as a single-variable classifier, by the rank-based AUC.
+
+```{r single-feature-auc}
+auc_single <- function(x, cls, positive = "4E-resistant") {
+  ok <- !is.na(x); x <- x[ok]; cls <- cls[ok]
+  r  <- rank(x)
+  n1 <- sum(cls == positive); n0 <- sum(cls != positive)
+  a  <- (sum(r[cls == positive]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  max(a, 1 - a)   # direction-agnostic separability
+}
+
+feats <- c("cds_gc", "gc3", "gc1", "gc2", "utr3_gc", "utr5_gc", "cai", "tai", "fop",
+           "csc", "hia2026_dhx29_occupancy", "log2_cds_length", "log2_utr5_length",
+           "log2_utr3_length", "kozak_pwm_score")
+feats <- intersect(feats, names(d))
+
+auc_tbl <- purrr::map_dfr(feats, function(f) {
+  tibble::tibble(
+    feature = f,
+    auc_alone = round(auc_single(d[[f]], d$class), 3),
+    median_resistant = round(median(d[[f]][d$class == "4E-resistant"], na.rm = TRUE), 2),
+    median_sensitive = round(median(d[[f]][d$class == "4E-sensitive"], na.rm = TRUE), 2),
+    pct_na = round(100 * mean(is.na(d[[f]])), 1)
+  )
+}) %>% dplyr::arrange(dplyr::desc(auc_alone))
+
+print(as.data.frame(auc_tbl), row.names = FALSE)
+```
+
+**`cds_gc` on its own reaches AUC `r round(auc_tbl$auc_alone[auc_tbl$feature == "cds_gc"], 3)`.**
+The full random forest, with all `r length(setdiff(names(fm), c("transcript_id_clean","gene_id_clean","symbol")))`
+features, reaches ~0.99. The model is essentially reading GC content and adding very
+little on top.
+
+## The top features are not independent
+
+```{r feature-correlation}
+top <- auc_tbl$feature[auc_tbl$auc_alone > 0.85]
+cm  <- d %>% dplyr::select(dplyr::all_of(top)) %>%
+  cor(use = "pairwise.complete.obs", method = "spearman")
+print(round(cm, 2))
+
+cat("\nSpearman correlation with cds_gc:\n")
+cor_with_gc <- sort(abs(cm["cds_gc", setdiff(top, "cds_gc")]), decreasing = TRUE)
+print(round(cor_with_gc, 3))
+```
+
+Everything that separates the classes well is strongly correlated with CDS GC. Even
+`hia2026_dhx29_occupancy`, which comes from an entirely different experiment and cell
+line, tracks it. There is effectively **one axis** doing the work, not fifteen features.
+
+## What this does and does not mean
+
+**It is not leakage.** The target columns were removed from the feature matrix (notebook
+78 asserts it), and no eIF4E-derived feature was ever built.
+
+**The classes make the problem easy by construction.** They are the 1,195 most resistant
+and 1,195 most sensitive genes: opposite tails of one continuous variable, with a gap in
+between (resistant have log2FC >= 0.65, sensitive <= -0.50, nothing in the middle).
+Separating two extremes is a much easier task than separating resistant mRNAs from
+typical ones, and the AUC should not be read as "we can predict 4E resistance".
+
+**The GC difference is large enough to deserve its own scrutiny.** A median CDS GC of
+`r round(auc_tbl$median_resistant[auc_tbl$feature == "cds_gc"], 1)`% versus
+`r round(auc_tbl$median_sensitive[auc_tbl$feature == "cds_gc"], 1)`%, and GC3 of
+`r round(auc_tbl$median_resistant[auc_tbl$feature == "gc3"], 1)`% versus
+`r round(auc_tbl$median_sensitive[auc_tbl$feature == "gc3"], 1)`%, is a very big
+compositional split. Two readings, not distinguishable from this data alone:
+
+- *Biological*: GC-rich, structured coding sequences are translated by a route less
+  dependent on eIF4E, so they hold their TE when eIF4E is sequestered.
+- *Technical*: GC affects library preparation efficiency, and a TE ratio is a ratio of
+  two libraries. If footprint and total-RNA libraries have different GC-amplification
+  characteristics, a GC-dependent artefact appears in `log2FC` directly. This dataset is
+  known to carry PCR artefacts, which is why the authors ship a blocklist
+  (Suppl. Data 8) rather than a UMI-deduplicated pipeline.
+
+A useful discriminator would be whether the same GC split shows up in an eIF4E-inhibition
+dataset generated with a different library protocol.
+
+## Where the classifier sits relative to GC alone
+
+```{r auc-comparison, fig.width = 6, fig.height = 4}
+rf_auc <- 0.992   # test-set AUC from the notebook 07 run on these sets
+
+comp <- auc_tbl %>%
+  dplyr::slice_head(n = 8) %>%
+  dplyr::mutate(feature = forcats::fct_reorder(feature, auc_alone))
+
+p_auc <- ggplot(comp, aes(x = auc_alone, y = feature)) +
+  geom_col(fill = "grey70", width = 0.7) +
+  geom_vline(xintercept = rf_auc, linetype = "dashed", color = "#D55E00", linewidth = 0.8) +
+  annotate("text", x = rf_auc, y = 1, label = paste0(" full RF = ", rf_auc),
+           hjust = 0, vjust = -0.5, size = 3.2, color = "#D55E00") +
+  coord_cartesian(xlim = c(0.5, 1)) +
+  labs(title = "Single features vs the full random forest",
+       subtitle = paste0("n = ", nrow(d), " genes"),
+       x = "AUC on its own", y = NULL) +
+  theme_classic(base_size = 12)
+
+print(p_auc)
+if (SAVE_PLOTS) ggsave(here("plots", "79_single_feature_auc_vs_rf.pdf"), p_auc,
+                       width = 6, height = 4)
+```
+
+# Summary
+
+- CDS GC and GC3 separate the two classes almost completely; 5'UTR GC does not.
+- `cds_gc` alone gives AUC ~0.98 against the full model's ~0.99, so the classifier is
+  reading one compositional axis.
+- This is a property of the gene sets, not a defect in the model. A resistant-vs-unchanged
+  comparison would be the more informative test of predictive power.

@@ -1,0 +1,439 @@
+---
+title: "Are 4E-resistant mRNAs more or less enriched in the eIF4E IP?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Question
+
+Do the mRNAs that hold their translation when eIF4E is inhibited bind **more** or **less**
+eIF4E to begin with?
+
+Three-group CDFs in the style of `ripseq/code/20_eif4e_teleman_validation.Rmd`:
+4E-resistant, 4E-sensitive, and all other tested genes.
+
+# Which contrast answers which question
+
+The eIF4E-IP arm gives three different quantities, and they do not mean the same thing.
+Getting these straight is the whole analysis:
+
+| contrast | what it is | positive value means |
+|---|---|---|
+| **vehicle** | IP / input in E.V. cells | binds **more** eIF4E at baseline |
+| **inhibitor** | IP / input in 4E-BP1-4A cells | binds more eIF4E under inhibition |
+| **interaction** | (IP/input in 4E-BP1-4A) / (IP/input in E.V.) | **gains** eIF4E binding when eIF4E is inhibited |
+
+"Enriched in the IP" in the plain sense is the **vehicle** contrast. The interaction is a
+change, not a level, and it answers a different question.
+
+All three come from notebook 77, which corrected the annotation and filtering defects in
+the original IP fits.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r settings}
+# eIF3d orange and eIF3e blue stay reserved for those factors (CLAUDE.md).
+group_colors <- c(
+  "4E-resistant"    = "#CC79A7",  # Okabe-Ito reddish purple, as in ripseq nb20
+  "4E-sensitive"    = "black",
+  "All other genes" = "grey70"
+)
+```
+
+# Section 1: Load the corrected IP results and the gene sets
+
+```{r load}
+ip_vehicle     <- read_csv(here("output", "teleman_eif4e_ip_vehicle_corrected.csv"),
+                           show_col_types = FALSE)
+ip_inhibitor   <- read_csv(here("output", "teleman_eif4e_ip_inhibitor_corrected.csv"),
+                           show_col_types = FALSE)
+ip_interaction <- read_csv(here("output", "teleman_eif4e_ip_interaction_corrected.csv"),
+                           show_col_types = FALSE)
+
+resistant <- read_csv(here("output", "genesets", "teleman_4e_resistant_TE_1hr_lfc0.5.csv"),
+                      show_col_types = FALSE)
+sensitive <- read_csv(here("output", "genesets", "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"),
+                      show_col_types = FALSE)
+
+te <- read_csv(here("output", "teleman_riboseq_te_all_genes.csv"), show_col_types = FALSE)
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_teleman_4e.rds"))
+
+cat("IP contrasts:", nrow(ip_vehicle), "/", nrow(ip_inhibitor), "/",
+    nrow(ip_interaction), "genes\n")
+cat("gene sets:", nrow(resistant), "resistant,", nrow(sensitive), "sensitive\n")
+
+stopifnot("IP contrasts must cover the same genes" =
+            setequal(ip_vehicle$gene_id, ip_interaction$gene_id))
+stopifnot("gene sets must be disjoint" =
+            length(intersect(resistant$ensembl_gene, sensitive$ensembl_gene)) == 0)
+```
+
+# Section 2: Direction anchor
+
+Before comparing groups, confirm the IP data points the way the paper says it does.
+Roiuk et al. Fig 4E reports a **negative** correlation between the change in TE on eIF4E
+inhibition and the change in eIF4E binding. If that reproduces, the sign convention on
+the interaction contrast is right.
+
+```{r direction-anchor}
+anchor <- te %>%
+  dplyr::select(gene_id, te_lfc = log2FoldChange) %>%
+  dplyr::inner_join(ip_interaction %>% dplyr::select(gene_id, delta_bind = log2FoldChange),
+                    by = "gene_id")
+
+rho_fig4e <- cor(anchor$te_lfc, anchor$delta_bind, method = "spearman")
+cat("Fig 4E anchor: rho(TE change, change in eIF4E binding) =", round(rho_fig4e, 3),
+    " n =", nrow(anchor), "\n")
+
+stopifnot("Fig 4E not reproduced - check the interaction sign" = rho_fig4e < -0.15)
+cat("Direction anchor passed\n")
+```
+
+# Section 3: Build the three groups
+
+```{r build-groups}
+# one row per gene, all three IP contrasts side by side
+ip_all <- ip_vehicle %>%
+  dplyr::select(gene_id, symbol, vehicle = log2FoldChange) %>%
+  dplyr::inner_join(ip_inhibitor %>% dplyr::select(gene_id, inhibitor = log2FoldChange),
+                    by = "gene_id") %>%
+  dplyr::inner_join(ip_interaction %>% dplyr::select(gene_id, interaction = log2FoldChange),
+                    by = "gene_id") %>%
+  dplyr::mutate(group = dplyr::case_when(
+    gene_id %in% resistant$ensembl_gene ~ "4E-resistant",
+    gene_id %in% sensitive$ensembl_gene ~ "4E-sensitive",
+    TRUE                                ~ "All other genes")) %>%
+  dplyr::mutate(group = factor(group, levels = names(group_colors)))
+
+print(dplyr::count(ip_all, group) %>% as.data.frame(), row.names = FALSE)
+
+stopifnot("group column must have no NA" = !any(is.na(ip_all$group)))
+stopifnot("resistant group must be non-empty" = sum(ip_all$group == "4E-resistant") > 0)
+stopifnot("sensitive group must be non-empty" = sum(ip_all$group == "4E-sensitive") > 0)
+stopifnot("gene_id must be unique" = !any(duplicated(ip_all$gene_id)))
+
+# Not every set gene has IP data: the IP arm has its own expression filter.
+cat("\nresistant genes with IP data:", sum(ip_all$group == "4E-resistant"),
+    "of", nrow(resistant), "\n")
+cat("sensitive genes with IP data:", sum(ip_all$group == "4E-sensitive"),
+    "of", nrow(sensitive), "\n")
+```
+
+# Section 4: CDF plots
+
+```{r make-cdf}
+make_cdf_plot <- function(value_col, x_label, plot_title, out_name) {
+
+  d <- ip_all %>% dplyr::filter(!is.na(.data[[value_col]]))
+
+  x_res   <- d[[value_col]][d$group == "4E-resistant"]
+  x_sen   <- d[[value_col]][d$group == "4E-sensitive"]
+  x_other <- d[[value_col]][d$group == "All other genes"]
+
+  p_res_sen   <- wilcox.test(x_res, x_sen)$p.value
+  p_res_other <- wilcox.test(x_res, x_other)$p.value
+
+  cat("\n", plot_title, "\n", sep = "")
+  cat("  median resistant =", round(median(x_res), 3),
+      "  sensitive =", round(median(x_sen), 3),
+      "  other =", round(median(x_other), 3), "\n")
+  cat("  resistant vs sensitive p =", signif(p_res_sen, 3), "\n")
+  cat("  resistant vs other     p =", signif(p_res_other, 3), "\n")
+
+  n_labels <- c(
+    "4E-resistant"    = paste0("4E-resistant (n=", length(x_res), ")"),
+    "4E-sensitive"    = paste0("4E-sensitive (n=", length(x_sen), ")"),
+    "All other genes" = paste0("All other genes (n=", length(x_other), ")")
+  )
+
+  n_label <- paste0("resistant n=", length(x_res), "\n",
+                    "sensitive n=", length(x_sen), "\n",
+                    "other n=", length(x_other))
+
+  p <- ggplot(d, aes(x = .data[[value_col]], color = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    annotate("text", x = Inf, y = 0, hjust = 1.1, vjust = -0.4,
+             label = n_label, size = 3.5) +
+    scale_color_manual(values = group_colors, breaks = names(group_colors),
+                       labels = n_labels) +
+    coord_cartesian(xlim = c(-2, 2)) +
+    labs(x = x_label, y = "Cumulative fraction", color = NULL, title = plot_title) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(here("plots", out_name), p, width = 7, height = 5.5)
+  p
+}
+```
+
+## Baseline eIF4E binding - the direct answer to the question
+
+```{r cdf-vehicle, fig.width = 7, fig.height = 5.5}
+make_cdf_plot("vehicle",
+              "log2 eIF4E IP / input, E.V. cells",
+              "Baseline eIF4E binding",
+              "81_cdf_eif4e_ip_vehicle.pdf")
+```
+
+## eIF4E binding under 4E-BP1-4A
+
+```{r cdf-inhibitor, fig.width = 7, fig.height = 5.5}
+make_cdf_plot("inhibitor",
+              "log2 eIF4E IP / input, 4E-BP1-4A cells",
+              "eIF4E binding under inhibition",
+              "81_cdf_eif4e_ip_inhibitor.pdf")
+```
+
+## Change in eIF4E binding
+
+```{r cdf-interaction, fig.width = 7, fig.height = 5.5}
+make_cdf_plot("interaction",
+              "log2 change in eIF4E binding (4E-BP1-4A vs E.V.)",
+              "Change in eIF4E binding",
+              "81_cdf_eif4e_ip_interaction.pdf")
+```
+
+# Section 5: Effect sizes
+
+The rank-based AUC says how completely the two sets separate on each contrast. 0.5 is no
+separation; values are reported as "resistant above sensitive", so below 0.5 means the
+resistant set sits *lower*.
+
+```{r effect-sizes}
+auc_resistant_over_sensitive <- function(value_col) {
+  d <- ip_all %>% dplyr::filter(group != "All other genes", !is.na(.data[[value_col]]))
+  x <- d[[value_col]]
+  r <- rank(x)
+  n_res <- sum(d$group == "4E-resistant")
+  n_sen <- sum(d$group == "4E-sensitive")
+  (sum(r[d$group == "4E-resistant"]) - n_res * (n_res + 1) / 2) / (n_res * n_sen)
+}
+
+effect_table <- purrr::map_dfr(c("vehicle", "inhibitor", "interaction"), function(v) {
+  d <- ip_all %>% dplyr::filter(!is.na(.data[[v]]))
+  tibble::tibble(
+    contrast = v,
+    median_resistant = round(median(d[[v]][d$group == "4E-resistant"]), 3),
+    median_sensitive = round(median(d[[v]][d$group == "4E-sensitive"]), 3),
+    median_other     = round(median(d[[v]][d$group == "All other genes"]), 3),
+    auc_res_over_sen = round(auc_resistant_over_sensitive(v), 3),
+    wilcox_p = signif(wilcox.test(d[[v]][d$group == "4E-resistant"],
+                                  d[[v]][d$group == "4E-sensitive"])$p.value, 3)
+  )
+})
+
+print(as.data.frame(effect_table), row.names = FALSE)
+```
+
+# Section 6: Does this agree with the paper?
+
+Roiuk et al. Fig 4C/D plot exactly our **interaction** contrast:
+`log2( (4E-BP1-4A cells: eIF4E-IP/Total) / (control cells: eIF4E-IP/Total) )`.
+
+Their Fig 4C compares **Resistant against All** (not against sensitive) and shows the
+resistant density shifted **left** - resistant mRNAs lose eIF4E binding when eIF4E is
+inhibited. Their Fig 4D labels individual mRNAs along the same axis.
+
+Both are recreated below and checked.
+
+## Fig 4C: resistant vs all
+
+```{r fig4c, fig.width = 6, fig.height = 5.5}
+library(cowplot)
+
+fig4c <- dplyr::bind_rows(
+  ip_all %>% dplyr::filter(group == "4E-resistant") %>%
+    dplyr::transmute(value = interaction, paper_group = "Resistant"),
+  ip_all %>% dplyr::transmute(value = interaction, paper_group = "All")
+) %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::mutate(paper_group = factor(paper_group, levels = c("Resistant", "All")))
+
+paper_cols <- c("Resistant" = "#F0E442", "All" = "grey45")   # yellow / grey, as published
+
+x_res <- fig4c$value[fig4c$paper_group == "Resistant"]
+x_all <- fig4c$value[fig4c$paper_group == "All"]
+p_4c  <- wilcox.test(x_res, x_all)$p.value
+
+cat("Resistant n =", length(x_res), " median", round(median(x_res), 3), "\n")
+cat("All       n =", length(x_all), " median", round(median(x_all), 3), "\n")
+cat("shift     =", round(median(x_res) - median(x_all), 3),
+    " (paper: resistant shifted LEFT)\n")
+cat("Wilcoxon p =", format.pval(p_4c, digits = 3, eps = 2.2e-16), "\n")
+
+stopifnot("Fig 4C not reproduced: resistant is not shifted left of all" =
+            median(x_res) < median(x_all))
+
+dens <- ggplot(fig4c, aes(x = value, fill = paper_group)) +
+  geom_density(alpha = 0.65, color = NA) +
+  scale_fill_manual(values = paper_cols, name = NULL) +
+  coord_cartesian(xlim = c(-2, 2)) +
+  annotate("text", x = 0, y = Inf, vjust = 1.5, size = 3.5,
+           label = paste0("p ", format.pval(p_4c, digits = 2, eps = 2.2e-16))) +
+  labs(y = "density", x = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.85, 0.75),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+box <- ggplot(fig4c, aes(x = value, y = paper_group, fill = paper_group)) +
+  geom_boxplot(outlier.size = 0.4, linewidth = 0.4) +
+  scale_fill_manual(values = paper_cols, guide = "none") +
+  coord_cartesian(xlim = c(-2, 2)) +
+  labs(y = NULL,
+       x = "log2( 4E-BP1-4A: eIF4E-IP/Total  /  control: eIF4E-IP/Total )") +
+  theme_classic(base_size = 12)
+
+p_fig4c <- cowplot::plot_grid(dens, box, ncol = 1, align = "v",
+                              rel_heights = c(2.2, 1))
+print(p_fig4c)
+ggsave(here("plots", "81_fig4c_recreation_resistant_vs_all.pdf"),
+       p_fig4c, width = 6, height = 5.5)
+```
+
+## Fig 4D: spot-check the labelled mRNAs
+
+The paper labels these along the same axis. Reading left to right in their panel:
+CDKN2B and RPP25 far left, RPL13A left of zero, WARS / TIA1 / GAPDH / ACTB at zero,
+GLO1 right of zero.
+
+```{r fig4d-spotcheck}
+labelled <- c("CDKN2B", "RPP25", "RPL13A", "WARS", "TIA1", "GAPDH", "ACTB", "GLO1")
+
+spot <- ip_interaction %>%
+  dplyr::filter(symbol %in% labelled) %>%
+  dplyr::mutate(in_resistant_set = gene_id %in% resistant$ensembl_gene) %>%
+  dplyr::select(symbol, log2FoldChange, padj, in_resistant_set) %>%
+  dplyr::arrange(log2FoldChange)
+
+print(as.data.frame(spot), digits = 3, row.names = FALSE)
+
+stopifnot("every labelled gene should be present" =
+            all(labelled %in% ip_interaction$symbol))
+
+# The two the paper puts furthest left must lose binding.
+lfc_of <- function(g) spot$log2FoldChange[spot$symbol == g]
+stopifnot("CDKN2B should lose eIF4E binding" = lfc_of("CDKN2B") < -0.5)
+stopifnot("RPP25 should lose eIF4E binding"  = lfc_of("RPP25")  < -0.5)
+stopifnot("RPL13A should sit left of zero"   = lfc_of("RPL13A") < 0)
+stopifnot("GLO1 should sit right of zero"    = lfc_of("GLO1")   > 0)
+# The housekeeping cluster the paper puts at the origin.
+stopifnot("a housekeeping gene moved too far" =
+            all(abs(sapply(c("GAPDH", "ACTB", "TIA1", "WARS"), lfc_of)) < 0.3))
+cat("\nAll Fig 4D spot-checks passed\n")
+```
+
+```{r fig4d-volcano, fig.width = 7, fig.height = 6}
+volc <- ip_interaction %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::mutate(
+    call = dplyr::case_when(
+      log2FoldChange >  1 & padj < 0.05 ~ "gains binding",
+      log2FoldChange < -1 & padj < 0.05 ~ "loses binding",
+      TRUE                              ~ "ns"),
+    is_resistant = gene_id %in% resistant$ensembl_gene)
+
+p_volc <- ggplot(volc, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = call), size = 0.5, alpha = 0.5) +
+  # resistant mRNAs overlaid, as the yellow dots in the published panel
+  geom_point(data = dplyr::filter(volc, is_resistant),
+             color = "#F0E442", size = 0.7, alpha = 0.8) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(volc, symbol %in% labelled),
+    aes(label = symbol), size = 3, min.segment.length = 0,
+    segment.color = "grey50", segment.size = 0.3) +
+  scale_color_manual(values = c("loses binding" = "#0072B2", "gains binding" = "#D55E00",
+                                "ns" = "grey80"), name = NULL) +
+  labs(title = "Change in eIF4E binding (Fig 4D recreation)",
+       subtitle = paste0("yellow = 4E-resistant mRNAs (n = ", sum(volc$is_resistant),
+                         ")   |   n = ", nrow(volc)),
+       x = "log2( 4E-BP1-4A: eIF4E-IP/Total  /  control: eIF4E-IP/Total )",
+       y = "-log10(adj. p-value)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_volc)
+ggsave(here("plots", "81_fig4d_recreation_volcano.pdf"), p_volc, width = 7, height = 6)
+```
+
+---
+
+# Section 6: Is this just GC again?
+
+Everything about these gene sets is confounded with GC content (notebooks 79 and 82:
+median GC3 73% vs 39%). So before concluding anything about eIF4E binding, check whether
+the IP signal is separable from GC.
+
+```{r gc-confound}
+ip_gc <- ip_all %>%
+  dplyr::inner_join(fm %>% dplyr::select(gene_id_clean, cds_gc),
+                    by = c("gene_id" = "gene_id_clean")) %>%
+  dplyr::filter(!is.na(cds_gc))
+
+cat("Spearman correlation of each IP contrast with CDS GC, n =", nrow(ip_gc), "\n")
+for (v in c("vehicle", "inhibitor", "interaction")) {
+  cat(sprintf("  %-12s rho = %+.3f\n", v,
+              cor(ip_gc[[v]], ip_gc$cds_gc, method = "spearman")))
+}
+```
+
+If baseline binding tracks GC, then the group difference could be GC rather than binding.
+The test: split into CDS GC deciles and recompute the resistant-vs-sensitive AUC *within*
+each decile, where the two groups are matched on GC by construction.
+
+```{r gc-stratified}
+strat <- ip_gc %>%
+  dplyr::filter(group != "All other genes") %>%
+  dplyr::mutate(gc_decile = dplyr::ntile(cds_gc, 10)) %>%
+  dplyr::group_by(gc_decile) %>%
+  dplyr::filter(sum(group == "4E-resistant") >= 15,
+                sum(group == "4E-sensitive") >= 15) %>%
+  dplyr::summarise(
+    n_resistant = sum(group == "4E-resistant"),
+    n_sensitive = sum(group == "4E-sensitive"),
+    gc_range = paste0(round(min(cds_gc), 1), " - ", round(max(cds_gc), 1)),
+    auc_vehicle = {
+      r <- rank(vehicle); n1 <- sum(group == "4E-resistant"); n0 <- sum(group == "4E-sensitive")
+      round((sum(r[group == "4E-resistant"]) - n1 * (n1 + 1) / 2) / (n1 * n0), 3)
+    },
+    .groups = "drop")
+
+print(as.data.frame(strat), row.names = FALSE)
+
+cat("\nunstratified AUC (baseline binding):",
+    round(auc_resistant_over_sensitive("vehicle"), 3), "\n")
+cat("weighted mean AUC across GC-matched deciles:",
+    round(weighted.mean(strat$auc_vehicle, strat$n_resistant + strat$n_sensitive), 3), "\n")
+cat("deciles usable:", nrow(strat), "of 10\n")
+```
+
+**How to read this.** Only the middle deciles contain enough of both groups to compare -
+the sets barely overlap in GC, which is the point of notebook 79. So the stratified
+estimate rests on a minority of genes and is noisy. It is a check on whether the IP
+signal vanishes once GC is held fixed, not a precise effect size.
+
+# Summary
+
+```{r summary}
+print(as.data.frame(effect_table), row.names = FALSE)
+```
+
+- **Baseline (vehicle):** the direct answer to the question asked.
+- **Under inhibition:** whether any baseline difference persists once eIF4E is sequestered.
+- **Interaction:** a change in binding, not a level. Note it runs opposite in sign to
+  baseline, so quoting "resistant mRNAs bind eIF4E more/less" without naming the contrast
+  will give the wrong answer half the time.
+- The GC-stratified table says how much of the baseline difference survives when the two
+  groups are matched on CDS GC.
