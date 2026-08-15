@@ -1,0 +1,650 @@
+---
+title: "Subunit-seq: eIF3d cap-bound mRNAs vs the rest of the transcriptome (MANE transcripts)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  lamper_lfc: 2
+  lamper_padj: 0.005
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+The composition analysis of notebook 83, run on the mRNAs that eIF3d binds **at their 5'
+cap**, rather than on the mRNAs whose TE eIF3d controls.
+
+The binding data is **subunit-seq**: the Lee lab eIF3d-TEV assay, which uses a TEV
+protease domain to release and sequence only the transcripts held at the cap by eIF3d.
+Three conditions across two publications:
+
+| group | source | condition |
+|---|---|---|
+| **complete media (CM)** | Lamper et al. 2020 (Table S3) | unstressed baseline |
+| **glucose deprivation (GLU)** | Lamper et al. 2020 (Table S3) | metabolic stress |
+| **integrated stress response (ISR)** | Lee lab 2023 (Table S2) | chronic stress |
+
+Features compared: GC content by region (5'UTR, CDS, 3'UTR, whole transcript), GC by
+codon position (GC1/GC2/GC3), region lengths, and CSC. Density curves are drawn
+**unshaded** (outline only), unlike notebook 83.
+
+## Two things this notebook cannot do, stated up front
+
+**1. Subunit-seq is gene-level.** Both source tables carry `ensembl_gene_id` and
+`hgnc_symbol` and nothing else. There are no transcript identifiers, and (unlike the Lee
+2015 PAR-CLIP) no cluster coordinates either, so there is no route to transcript
+resolution from the data itself. Every binding call below is therefore a **gene** call.
+The MANE Select transcript is used as the sequence representative for that gene, which is
+a modelling choice made here, not something the assay measured.
+
+**2. "All other genes" conflates untested with unbound.** Lamper Table S3 reports 1,141
+genes and the ISR table 563 - these are the published hit tables, not whole-transcriptome
+results. A gene absent from them may have been unbound, or may simply not be reported.
+The background group is therefore "not called bound in any subunit-seq condition", and
+comparisons against it are conservative in an unquantifiable direction.
+
+## Why MANE rather than the pipeline's usual transcript
+
+The `01_` series keys feature matrices on the **most abundant** transcript in siCTRL
+normoxia. Only 61.4% of those are the MANE Select for their gene, so
+`feature_matrix_external_stability.rds` cannot be reused here - 39% of its rows would be
+the wrong transcript for a MANE-keyed analysis. All features below are recomputed from
+the GENCODE v49 TxDb on MANE transcripts, using the same helper definitions as `01_`,
+`01g_` and `01v_` so the numbers stay comparable to notebook 83.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(janitor)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(iCodon)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    lamper_lfc  = 2,
+    lamper_padj = 0.005,
+    save_plots  = TRUE
+  )
+}
+LAMPER_LFC  <- params$lamper_lfc
+LAMPER_PADJ <- params$lamper_padj
+SAVE_PLOTS  <- params$save_plots
+
+SUBUNIT_SEQ_DIR <- "/Users/katematlin/github/mpra_preliminary/data"
+LAMPER_XLSX <- file.path(SUBUNIT_SEQ_DIR, "lamper-s3.xlsx")
+ISR_XLSX    <- file.path(SUBUNIT_SEQ_DIR, "integrated_stress_response.xlsx")
+
+stopifnot("Lamper Table S3 not found" = file.exists(LAMPER_XLSX),
+          "ISR Table S2 not found"    = file.exists(ISR_XLSX))
+
+# All three sets are eIF3d, so orange alone cannot separate them. GLU keeps eIF3d's
+# reserved orange as the headline stress condition; CM and ISR take remaining Okabe-Ito
+# hues, avoiding #56B4E9 which is reserved for eIF3e. Background is grey70 per CLAUDE.md.
+group_colors <- c(
+  "eIF3d cap-bound (glucose deprivation)" = "#E69F00",
+  "eIF3d cap-bound (complete media)"      = "#CC79A7",
+  "eIF3d cap-bound (ISR)"                 = "#009E73",
+  "All other genes"                       = "grey70"
+)
+GROUP_LEVELS <- names(group_colors)
+```
+
+# Section 1: Load subunit-seq data
+
+Thresholds for the Lamper table follow the ones already used in
+`code/clip_binding_sites.Rmd:107` and `code/ecdf_plots_3e_and_3d.Rmd:869`
+(`log2FoldChange > 2 & padj < 0.005`), so the sets here agree with those notebooks. The
+ISR table is already a filtered hit list and takes no further cut.
+
+```{r load_lamper}
+lamper <- read_excel(LAMPER_XLSX) %>%
+  clean_names() %>%
+  dplyr::mutate(dplyr::across(
+    c(log2fold_change_cm, padj_cm, log2fold_change_glu, padj_glu,
+      ip_in_cm_avg, ip_in_glu_avg, fold_enrichment_glu_cm),
+    ~ suppressWarnings(as.numeric(.))
+  )) %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", ensembl_gene_id))
+
+cat("Lamper Table S3 rows:", nrow(lamper), "\n")
+cat("  rows with a testable GLU log2FC:", sum(!is.na(lamper$log2fold_change_glu)), "\n")
+cat("  rows with a testable CM  log2FC:", sum(!is.na(lamper$log2fold_change_cm)), "\n")
+```
+
+## Replication check: Lamper et al. 2020
+
+The paper's central claim is that eIF3d cap binding is **induced by glucose deprivation**,
+not constitutive. The table must reproduce that: median IP/input enrichment under GLU has
+to exceed the CM baseline, and the reported per-gene GLU/CM fold enrichment has to sit
+above 1. This is checked before any threshold is applied, so a wrong file or a swapped
+column pair fails here rather than silently reversing the biology downstream.
+
+```{r replication_check_lamper}
+med_ip_cm  <- median(lamper$ip_in_cm_avg,  na.rm = TRUE)
+med_ip_glu <- median(lamper$ip_in_glu_avg, na.rm = TRUE)
+med_fold   <- median(lamper$fold_enrichment_glu_cm, na.rm = TRUE)
+
+cat("median IP/IN, complete media:      ", round(med_ip_cm, 2), "\n")
+cat("median IP/IN, glucose deprivation: ", round(med_ip_glu, 2), "\n")
+cat("median fold enrichment (GLU / CM): ", round(med_fold, 2),
+    " (expected > 1: cap binding is stress-induced)\n")
+
+stopifnot(
+  "Lamper2020: GLU IP/IN does not exceed CM - columns may be swapped" =
+    med_ip_glu > med_ip_cm,
+  "Lamper2020: median GLU/CM fold enrichment is not above 1" =
+    med_fold > 1
+)
+cat("Lamper 2020 replication check passed\n")
+```
+
+```{r load_isr}
+isr <- read_excel(ISR_XLSX) %>%
+  clean_names() %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", ensembl_gene_id))
+
+cat("ISR Table S2 rows:", nrow(isr), "\n")
+cat("  log2FoldChange range:", round(range(isr$log2fold_change, na.rm = TRUE), 2), "\n")
+cat("  max padj:", signif(max(isr$padj, na.rm = TRUE), 3), "\n")
+```
+
+## Replication check: Lee lab 2023 ISR table
+
+This table is published as the set of transcripts **enriched** in the eIF3d-TEV IP, so
+every entry must have a positive log2FoldChange. A negative value would mean the file is
+a full DESeq2 output rather than the hit table, and the "bound" set would then be
+contaminated with depleted transcripts.
+
+```{r replication_check_isr}
+cat("ISR entries with log2FoldChange > 0:", sum(isr$log2fold_change > 0, na.rm = TRUE),
+    "of", nrow(isr), "\n")
+
+stopifnot(
+  "ISR table contains non-enriched entries - this is not the filtered hit table" =
+    all(isr$log2fold_change > 0, na.rm = TRUE),
+  "ISR log2FoldChange must be finite" =
+    all(is.finite(isr$log2fold_change[!is.na(isr$log2fold_change)]))
+)
+cat("ISR 2023 replication check passed\n")
+```
+
+## Define the three bound gene sets
+
+```{r define_bound_sets}
+bound_glu <- lamper %>%
+  dplyr::filter(log2fold_change_glu > LAMPER_LFC, padj_glu < LAMPER_PADJ) %>%
+  dplyr::pull(gene_id_clean) %>% unique()
+
+bound_cm <- lamper %>%
+  dplyr::filter(log2fold_change_cm > LAMPER_LFC, padj_cm < LAMPER_PADJ) %>%
+  dplyr::pull(gene_id_clean) %>% unique()
+
+bound_isr <- isr %>%
+  dplyr::pull(gene_id_clean) %>% unique()
+
+bound_sets <- list(
+  "eIF3d cap-bound (glucose deprivation)" = bound_glu,
+  "eIF3d cap-bound (complete media)"      = bound_cm,
+  "eIF3d cap-bound (ISR)"                 = bound_isr
+)
+
+cat("bound gene sets (unique ENSG):\n")
+for (nm in names(bound_sets)) cat("  ", nm, ":", length(bound_sets[[nm]]), "\n")
+
+cat("\npairwise overlaps:\n")
+cat("  GLU & CM :", length(intersect(bound_glu, bound_cm)), "\n")
+cat("  GLU & ISR:", length(intersect(bound_glu, bound_isr)), "\n")
+cat("  CM  & ISR:", length(intersect(bound_cm,  bound_isr)), "\n")
+cat("  any of the three:", length(Reduce(union, bound_sets)), "\n")
+
+stopifnot("every bound set must be non-empty" =
+            all(lengths(bound_sets) > 0))
+```
+
+The three sets overlap heavily, so they are **not** mutually exclusive groups. Each is
+plotted as its own curve against the same shared background below; a gene bound in both
+CM and GLU legitimately contributes to both curves.
+
+# Section 2: MANE Select transcript per gene
+
+```{r load_mane}
+MANE_CSV <- here("accessories", "human", "mane_select_v49.csv")
+stopifnot("MANE Select table not found" = file.exists(MANE_CSV))
+
+mane <- read_csv(MANE_CSV,
+                 col_names = c("gene_id_clean", "transcript_id_clean", "symbol"),
+                 show_col_types = FALSE)
+
+cat("MANE Select transcripts:", nrow(mane), "\n")
+stopifnot(
+  "MANE table is not one row per gene" = !any(duplicated(mane$gene_id_clean)),
+  "MANE transcript IDs are not unique" = !any(duplicated(mane$transcript_id_clean)),
+  "MANE gene IDs must be unversioned"  = !any(grepl("\\.", mane$gene_id_clean))
+)
+
+for (nm in names(bound_sets)) {
+  n_mapped <- sum(bound_sets[[nm]] %in% mane$gene_id_clean)
+  cat(sprintf("  %-38s %4d of %4d genes have a MANE transcript (%.1f%%)\n",
+              nm, n_mapped, length(bound_sets[[nm]]),
+              100 * n_mapped / length(bound_sets[[nm]])))
+}
+```
+
+# Section 3: Compute features on MANE transcripts
+
+Region sequences come from the GENCODE v49 TxDb; `gc_content()` and
+`calculate_gc_at_position()` are the definitions from `01_feature_extraction.Rmd` and
+`01v_feature_extraction_positional_gc.Rmd`, and `transcript_gc` is the same
+length-weighted composite of the three regions used at `01_feature_extraction.Rmd:749`.
+
+```{r load_txdb}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+utr5 <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+utr3 <- threeUTRsByTranscript(txdb, use.names = TRUE)
+cds  <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+cat("TxDb regions loaded: 5'UTR", length(utr5),
+    "| CDS", length(cds), "| 3'UTR", length(utr3), "\n")
+```
+
+```{r extract_sequences}
+# Extract sequences for one region set, restricted to MANE transcripts, returning a
+# tibble keyed by transcript_id_clean.
+extract_region <- function(gr_list, seq_col) {
+  keep <- sub("\\..*", "", names(gr_list)) %in% mane$transcript_id_clean
+  gr_list <- gr_list[keep]
+  seqs <- extractTranscriptSeqs(genome, gr_list)
+  tibble::tibble(
+    transcript_id_clean = sub("\\..*", "", names(gr_list)),
+    !!seq_col := as.character(seqs)
+  )
+}
+
+utr5_seq <- extract_region(utr5, "utr5_sequence")
+utr3_seq <- extract_region(utr3, "utr3_sequence")
+cds_seq  <- extract_region(cds,  "cds_sequence")
+
+cat("MANE transcripts with a 5'UTR:", nrow(utr5_seq), "\n")
+cat("MANE transcripts with a CDS:  ", nrow(cds_seq), "\n")
+cat("MANE transcripts with a 3'UTR:", nrow(utr3_seq), "\n")
+
+stopifnot(
+  "duplicate transcript in 5'UTR sequences" = !any(duplicated(utr5_seq$transcript_id_clean)),
+  "duplicate transcript in CDS sequences"   = !any(duplicated(cds_seq$transcript_id_clean)),
+  "duplicate transcript in 3'UTR sequences" = !any(duplicated(utr3_seq$transcript_id_clean))
+)
+```
+
+```{r gc_helpers}
+# From 01_feature_extraction.Rmd
+gc_content <- function(seq) {
+  seq <- str_to_upper(seq)
+  gc_count     <- str_count(seq, "[GC]")
+  total_length <- str_length(seq)
+  result <- (gc_count / total_length) * 100
+  result[total_length == 0] <- NA
+  result
+}
+
+# From 01v_feature_extraction_positional_gc.Rmd
+calculate_gc_at_position <- function(seqs, position) {
+  stopifnot("position must be 1, 2 or 3" = position %in% 1:3)
+  seqs <- str_to_upper(seqs)
+  vapply(seqs, function(seq) {
+    if (is.na(seq) || nchar(seq) < 3L) return(NA_real_)
+    n_codons <- nchar(seq) %/% 3L
+    starts   <- seq.int(position, n_codons * 3L, 3L)
+    bases    <- substr(rep.int(seq, n_codons), starts, starts)
+    sum(bases %in% c("G", "C")) * 100 / n_codons
+  }, numeric(1L), USE.NAMES = FALSE)
+}
+```
+
+```{r compute_gc}
+features <- mane %>%
+  dplyr::left_join(utr5_seq, by = "transcript_id_clean") %>%
+  dplyr::left_join(cds_seq,  by = "transcript_id_clean") %>%
+  dplyr::left_join(utr3_seq, by = "transcript_id_clean") %>%
+  dplyr::mutate(
+    utr5_length = str_length(utr5_sequence),
+    cds_length  = str_length(cds_sequence),
+    utr3_length = str_length(utr3_sequence),
+    utr5_gc     = gc_content(utr5_sequence),
+    cds_gc      = gc_content(cds_sequence),
+    utr3_gc     = gc_content(utr3_sequence),
+    gc1         = calculate_gc_at_position(cds_sequence, 1),
+    gc2         = calculate_gc_at_position(cds_sequence, 2),
+    gc3         = calculate_gc_at_position(cds_sequence, 3),
+    # Length-weighted composite, matching 01_feature_extraction.Rmd:749
+    transcript_gc = (utr5_gc * utr5_length + cds_gc * cds_length + utr3_gc * utr3_length) /
+                    (utr5_length + cds_length + utr3_length)
+  )
+
+cat("MANE feature table:", nrow(features), "transcripts\n")
+cat("non-NA per feature:\n")
+for (f in c("utr5_gc", "cds_gc", "utr3_gc", "transcript_gc", "gc1", "gc2", "gc3")) {
+  cat(sprintf("  %-14s %5d\n", f, sum(!is.na(features[[f]]))))
+}
+```
+
+```{r compute_csc}
+# iCodon CSC, following the deduplicate-score-restore pattern from 01g_ / 01j_.
+predict_human <- iCodon::predict_stability("human")
+
+cds_ok <- features %>%
+  dplyr::filter(!is.na(cds_sequence), str_length(cds_sequence) %% 3 == 0,
+                str_length(cds_sequence) >= 3)
+
+cat("CDS scorable for CSC (length divisible by 3):", nrow(cds_ok),
+    "of", sum(!is.na(features$cds_sequence)), "\n")
+
+unique_seqs   <- unique(cds_ok$cds_sequence)
+unique_scores <- predict_human(unique_seqs)
+names(unique_scores) <- unique_seqs
+
+features <- features %>%
+  dplyr::mutate(csc = dplyr::if_else(
+    !is.na(cds_sequence) & str_length(cds_sequence) %% 3 == 0 &
+      str_length(cds_sequence) >= 3,
+    unname(unique_scores[cds_sequence]),
+    NA_real_
+  ))
+
+cat("csc non-NA:", sum(!is.na(features$csc)), "\n")
+print(summary(features$csc))
+```
+
+# Section 4: Validation
+
+## Computational checks
+
+```{r checks_computational}
+gc_cols  <- c("utr5_gc", "cds_gc", "utr3_gc", "transcript_gc", "gc1", "gc2", "gc3")
+len_cols <- c("utr5_length", "cds_length", "utr3_length")
+
+for (f in gc_cols) {
+  stopifnot(setNames(
+    list(all(features[[f]] >= 0 & features[[f]] <= 100, na.rm = TRUE)),
+    paste(f, "out of [0, 100]")
+  )[[1]])
+}
+
+stopifnot(
+  "region lengths must be positive"  =
+    all(unlist(features[len_cols]) > 0, na.rm = TRUE),
+  "csc must be finite where present" =
+    all(is.finite(features$csc[!is.na(features$csc)])),
+  "expected feature columns missing" =
+    all(c(gc_cols, len_cols, "csc") %in% colnames(features)),
+  "transcript key must be unique"    =
+    !any(duplicated(features$transcript_id_clean))
+)
+
+# Leakage guard: nothing about eIF3d binding may live in the feature table itself
+stopifnot("binding label must not be a feature" =
+            !any(c("bound", "group", "log2fold_change_glu") %in% colnames(features)))
+
+cat("Computational checks passed\n")
+```
+
+## Biological spot-checks
+
+The established invariants from `01_`, `01g_` and `01v_`, re-run because these features
+are computed on a different transcript set (MANE) than those notebooks used.
+
+```{r checks_biological}
+actb <- features %>% dplyr::filter(symbol == "ACTB")
+cat("ACTB CDS GC:", round(actb$cds_gc, 2), "% (expected 50-70)\n")
+stopifnot("ACTB CDS GC outside 50-70%" = between(actb$cds_gc, 50, 70))
+
+med_gc3 <- median(features$gc3, na.rm = TRUE)
+cat("median GC3:", round(med_gc3, 2), "% (expected 40-65)\n")
+stopifnot("GC3 median outside [40, 65]" = between(med_gc3, 40, 65))
+
+med_gc1 <- median(features$gc1, na.rm = TRUE)
+med_gc2 <- median(features$gc2, na.rm = TRUE)
+cat("median GC1:", round(med_gc1, 2), "% | median GC2:", round(med_gc2, 2), "%\n")
+stopifnot("GC1 should exceed GC2 in human coding sequence" = med_gc1 > med_gc2)
+stopifnot("GC3 should be the most variable codon position" =
+            sd(features$gc3, na.rm = TRUE) > sd(features$gc1, na.rm = TRUE) &&
+            sd(features$gc3, na.rm = TRUE) > sd(features$gc2, na.rm = TRUE))
+
+# Ribosomal proteins are the canonical optimal-codon set, so their CSC must beat the
+# transcriptome median (the CAI analogue of the 01g_ check).
+rp_csc  <- features$csc[str_detect(features$symbol, "^RP[LS]\\d")]
+all_csc <- features$csc
+cat("median CSC, ribosomal proteins:", round(median(rp_csc, na.rm = TRUE), 4),
+    "| all genes:", round(median(all_csc, na.rm = TRUE), 4),
+    "| n RP =", sum(!is.na(rp_csc)), "\n")
+stopifnot("ribosomal proteins do not have above-median CSC" =
+            median(rp_csc, na.rm = TRUE) > median(all_csc, na.rm = TRUE))
+
+cat("Biological spot-checks passed\n")
+```
+
+# Section 5: Assign groups
+
+Each bound set becomes its own curve; the background is every MANE gene called bound in
+none of the three conditions. Because the sets overlap, this is built long, one row per
+(transcript, group) pair, rather than as a single exclusive factor.
+
+```{r assign_groups}
+bound_any <- Reduce(union, bound_sets)
+
+feature_cols <- c(gc_cols, len_cols, "csc")
+
+d_long <- purrr::imap_dfr(bound_sets, function(genes, nm) {
+  features %>%
+    dplyr::filter(gene_id_clean %in% genes) %>%
+    dplyr::mutate(group = nm)
+}) %>%
+  dplyr::bind_rows(
+    features %>%
+      dplyr::filter(!gene_id_clean %in% bound_any) %>%
+      dplyr::mutate(group = "All other genes")
+  ) %>%
+  dplyr::mutate(group = factor(group, levels = GROUP_LEVELS))
+
+group_n <- dplyr::count(d_long, group, name = "n")
+print(as.data.frame(group_n), row.names = FALSE)
+
+stopifnot(
+  "group must have no NA"       = !any(is.na(d_long$group)),
+  "every group must be present" = nrow(group_n) == length(GROUP_LEVELS),
+  "every group must be non-empty" = all(group_n$n > 0)
+)
+
+n_label <- paste0("n = ", paste(sprintf("%s %s", group_n$n,
+                                        c("GLU", "CM", "ISR", "other")),
+                                collapse = ", "))
+cat("\n", n_label, "\n")
+```
+
+# Section 6: Density plots (unshaded)
+
+```{r density_gc, fig.width = 11, fig.height = 6}
+gc_long <- d_long %>%
+  dplyr::select(group, dplyr::all_of(gc_cols)) %>%
+  tidyr::pivot_longer(-group, names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(feature, levels = gc_cols))
+
+p_gc <- ggplot(gc_long, aes(x = gc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "GC content by region and codon position, eIF3d cap-bound (subunit-seq)",
+       subtitle = n_label,
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  guides(color = guide_legend(nrow = 2))
+
+print(p_gc)
+if (SAVE_PLOTS) ggsave(here("plots", "85_gc_by_region_subunit_seq_bound.pdf"),
+                       p_gc, width = 11, height = 6)
+```
+
+```{r density_length, fig.width = 11, fig.height = 3.5}
+len_long <- d_long %>%
+  dplyr::select(group, dplyr::all_of(len_cols)) %>%
+  tidyr::pivot_longer(-group, names_to = "feature", values_to = "len") %>%
+  dplyr::filter(!is.na(len), len > 0) %>%
+  dplyr::mutate(feature = factor(feature, levels = len_cols))
+
+p_len <- ggplot(len_long, aes(x = len, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free", ncol = 3) +
+  scale_x_log10() +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "Region length, eIF3d cap-bound (subunit-seq)",
+       subtitle = n_label,
+       x = "Length (nt, log10 scale)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  guides(color = guide_legend(nrow = 2))
+
+print(p_len)
+if (SAVE_PLOTS) ggsave(here("plots", "85_length_subunit_seq_bound.pdf"),
+                       p_len, width = 11, height = 3.5)
+```
+
+```{r density_csc, fig.width = 7, fig.height = 4.5}
+csc_d <- d_long %>% dplyr::filter(!is.na(csc))
+
+wt_csc <- wilcox.test(
+  csc_d$csc[csc_d$group == "eIF3d cap-bound (glucose deprivation)"],
+  csc_d$csc[csc_d$group == "All other genes"]
+)
+
+p_csc <- ggplot(csc_d, aes(x = csc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "CSC, eIF3d cap-bound (subunit-seq) vs all other genes",
+       x = "CSC (codon stabilisation coefficient)", y = "Density") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+           label = paste0("GLU-bound vs all other\np = ",
+                          format.pval(wt_csc$p.value, digits = 3, eps = 2.2e-16),
+                          "\nn = ",
+                          sum(csc_d$group == "eIF3d cap-bound (glucose deprivation)"),
+                          " / ", sum(csc_d$group == "All other genes"))) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  guides(color = guide_legend(nrow = 2))
+
+print(p_csc)
+if (SAVE_PLOTS) ggsave(here("plots", "85_csc_subunit_seq_bound.pdf"),
+                       p_csc, width = 7, height = 4.5)
+```
+
+# Section 7: Cumulative distributions
+
+The bound sets are roughly 20-fold smaller than the background, and CDFs read shifts more
+reliably than densities at that size ratio (the same reasoning as notebook 83, Section 5).
+
+```{r cdf_gc, fig.width = 11, fig.height = 6}
+p_cdf <- ggplot(gc_long, aes(x = gc, color = group)) +
+  stat_ecdf(linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_x", ncol = 4) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "GC content, cumulative distributions",
+       subtitle = n_label,
+       x = "GC content (%)", y = "Cumulative fraction") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  guides(color = guide_legend(nrow = 2))
+
+print(p_cdf)
+if (SAVE_PLOTS) ggsave(here("plots", "85_gc_cdf_subunit_seq_bound.pdf"),
+                       p_cdf, width = 11, height = 6)
+```
+
+# Section 8: Statistics
+
+For every feature and every bound set: medians, Wilcoxon against the background, and the
+rank-based AUC of bound vs background.
+
+```{r stats}
+bg <- d_long %>% dplyr::filter(group == "All other genes")
+
+stats <- purrr::map_dfr(setdiff(GROUP_LEVELS, "All other genes"), function(grp) {
+  sub <- d_long %>% dplyr::filter(group == grp)
+  purrr::map_dfr(feature_cols, function(f) {
+    x_pos <- sub[[f]][!is.na(sub[[f]])]
+    x_bg  <- bg[[f]][!is.na(bg[[f]])]
+    if (length(x_pos) < 3 || length(x_bg) < 3) return(NULL)
+
+    r  <- rank(c(x_pos, x_bg))
+    n1 <- length(x_pos); n0 <- length(x_bg)
+    a  <- (sum(r[seq_len(n1)]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+
+    tibble::tibble(
+      group          = grp,
+      feature        = f,
+      n_bound        = n1,
+      n_background   = n0,
+      median_bound   = round(median(x_pos), 3),
+      median_bg      = round(median(x_bg), 3),
+      higher_in      = ifelse(a > 0.5, "bound", "background"),
+      auc            = round(max(a, 1 - a), 3),
+      p_vs_bg        = signif(wilcox.test(x_pos, x_bg)$p.value, 3)
+    )
+  })
+}) %>%
+  dplyr::arrange(group, dplyr::desc(auc))
+
+print(as.data.frame(stats), row.names = FALSE)
+```
+
+# Section 9: Write outputs
+
+The three bound sets are written MANE-keyed, carrying both the gene and its MANE
+transcript so downstream notebooks can join on either. Genes without a MANE Select
+transcript are retained with `transcript_id_clean = NA` rather than dropped, so the files
+stay a faithful record of the published sets.
+
+```{r write_outputs}
+if (SAVE_PLOTS) {
+  set_files <- c(
+    "eIF3d cap-bound (glucose deprivation)" = "subunit_seq_3d_bound_glucose_deprivation_mane.csv",
+    "eIF3d cap-bound (complete media)"      = "subunit_seq_3d_bound_complete_media_mane.csv",
+    "eIF3d cap-bound (ISR)"                 = "subunit_seq_3d_bound_isr_mane.csv"
+  )
+
+  for (nm in names(bound_sets)) {
+    out <- tibble::tibble(gene_id_clean = bound_sets[[nm]]) %>%
+      dplyr::left_join(mane, by = "gene_id_clean") %>%
+      dplyr::mutate(condition = nm)
+    write_csv(out, here("output", "genesets", set_files[[nm]]))
+    cat("wrote", set_files[[nm]], "-", nrow(out), "genes,",
+        sum(!is.na(out$transcript_id_clean)), "with a MANE transcript\n")
+  }
+
+  write_csv(stats, here("output", "predictive_modeling",
+                        "85_subunit_seq_bound_feature_stats.csv"))
+  saveRDS(features, here("output", "predictive_modeling",
+                         "feature_matrix_mane_gc_csc.rds"))
+  cat("wrote 85_subunit_seq_bound_feature_stats.csv and feature_matrix_mane_gc_csc.rds\n")
+}
+```
+
+```{r session_info}
+sessionInfo()
+```
