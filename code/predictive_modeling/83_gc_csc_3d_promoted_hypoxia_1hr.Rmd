@@ -1,0 +1,426 @@
+---
+title: "GC content and CSC: eIF3d-promoted vs negative control vs all transcripts (hypoxia 1hr)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  pos_geneset: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"
+  neg_geneset: "negative_control_genes.csv"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+The same composition analysis run on the Teleman 4E sets (notebooks 79 and 82), but on
+**our own MDA-MB-231 data**: mRNAs whose translation eIF3d promotes at hypoxia 1hr,
+against the negative control set and against every other transcript.
+
+Features compared: GC content in each region (5'UTR, CDS, 3'UTR, whole transcript),
+GC by codon position (GC1/GC2/GC3), and CSC.
+
+Three groups throughout, following the project convention in `CLAUDE.md`:
+
+| group | definition |
+|---|---|
+| **eIF3d hypoxia promotes** | `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` - te_lfc > 0.5, padj < 0.05 |
+| **Negative control** | `negative_control_genes.csv` - \|TE_LFC\| < 0.5 and padj > 0.3 in every si3d condition |
+| **All other genes** | everything else in the feature matrix |
+
+**Direction reminder.** The si3d DESeq2 coefficient is log2(sictrl / si3d) despite the
+filename, so positive `te_lfc` means the knockdown *reduces* TE, i.e. eIF3d **promotes**
+that mRNA. This is checked below rather than assumed.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    pos_geneset = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
+    neg_geneset = "negative_control_genes.csv",
+    save_plots  = TRUE
+  )
+}
+POS_GENESET <- params$pos_geneset
+NEG_GENESET <- params$neg_geneset
+SAVE_PLOTS  <- params$save_plots
+
+# eIF3d keeps its reserved orange; negative control black and background grey70 are the
+# newer CLAUDE.md convention for new plots.
+group_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",
+  "Negative control"       = "black",
+  "All other genes"        = "grey70"
+)
+```
+
+# Section 1: Load the feature matrix and the gene sets
+
+`feature_matrix_external_stability.rds` carries the regional GC, GC3 and CSC columns;
+GC1 and GC2 come from `feature_matrix_positional_gc.rds`, which is keyed identically.
+
+```{r load}
+fm <- readRDS(here("output", "predictive_modeling", "feature_matrix_external_stability.rds"))
+fp <- readRDS(here("output", "predictive_modeling", "feature_matrix_positional_gc.rds"))
+
+features <- fm %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol,
+                utr5_gc, cds_gc, utr3_gc, transcript_gc, gc3, csc) %>%
+  dplyr::left_join(fp %>% dplyr::select(transcript_id_clean, gc1, gc2),
+                   by = "transcript_id_clean")
+
+cat("feature matrix:", nrow(features), "transcripts\n")
+stopifnot("matrix key must be unique" = !any(duplicated(features$transcript_id_clean)))
+
+positives <- read_csv(here("output", "genesets", POS_GENESET), show_col_types = FALSE) %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", ensembl_gene))
+
+negatives <- read_csv(here("output", "predictive_modeling", NEG_GENESET),
+                      show_col_types = FALSE) %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+cat("positive set:", nrow(positives), "genes\n")
+cat("negative set:", nrow(negatives), "genes\n")
+
+overlap <- intersect(positives$gene_id_clean, negatives$gene_id_clean)
+cat("overlap between the two sets:", length(overlap), "\n")
+stopifnot("positive and negative sets must be disjoint" = length(overlap) == 0)
+```
+
+# Section 2: Direction check
+
+The gene set is only meaningful if positive `te_lfc` really means eIF3d-promoted. Two
+checks against the source DESeq2 table: EIF3D's own `rna_lfc` must be strongly positive
+(the siRNA depletes its target), and the positive set must have positive `te_lfc`.
+
+```{r direction-check}
+de <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+               show_col_types = FALSE) %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+eif3d_rna <- de$rna_lfc[de$symbol == "EIF3D"]
+cat("EIF3D rna_lfc =", round(eif3d_rna, 3), " (expected strongly positive, ~+2.9)\n")
+stopifnot("EIF3D rna_lfc is not positive - the contrast direction has flipped" =
+            eif3d_rna > 1)
+
+pos_te <- de$te_lfc[de$gene_id_clean %in% positives$gene_id_clean]
+cat("positive-set te_lfc: median", round(median(pos_te, na.rm = TRUE), 3),
+    " min", round(min(pos_te, na.rm = TRUE), 3), "\n")
+stopifnot("positive set does not have positive te_lfc" =
+            median(pos_te, na.rm = TRUE) > 0.5)
+
+neg_te <- de$te_lfc[de$gene_id_clean %in% negatives$gene_id_clean]
+cat("negative-set te_lfc: median", round(median(neg_te, na.rm = TRUE), 3),
+    " (expected near 0)\n")
+stopifnot("negative set is not centred near zero" =
+            abs(median(neg_te, na.rm = TRUE)) < 0.3)
+
+cat("Direction checks passed\n")
+```
+
+# Section 3: Assign the three groups
+
+```{r assign-groups}
+d <- features %>%
+  dplyr::mutate(group = dplyr::case_when(
+    gene_id_clean %in% positives$gene_id_clean ~ "eIF3d hypoxia promotes",
+    gene_id_clean %in% negatives$gene_id_clean ~ "Negative control",
+    TRUE                                       ~ "All other genes")) %>%
+  dplyr::mutate(group = factor(group, levels = names(group_colors)))
+
+print(dplyr::count(d, group) %>% as.data.frame(), row.names = FALSE)
+
+stopifnot("group must have no NA" = !any(is.na(d$group)))
+stopifnot("positive group must be non-empty" = sum(d$group == "eIF3d hypoxia promotes") > 0)
+stopifnot("negative group must be non-empty" = sum(d$group == "Negative control") > 0)
+
+cat("\npositive genes with features:", sum(d$group == "eIF3d hypoxia promotes"),
+    "of", nrow(positives), "\n")
+cat("negative genes with features:", sum(d$group == "Negative control"),
+    "of", nrow(negatives), "\n")
+```
+
+# Section 4: Density plots
+
+```{r density-grid, fig.width = 11, fig.height = 6}
+gc_cols <- c("utr5_gc", "cds_gc", "utr3_gc", "transcript_gc", "gc1", "gc2", "gc3")
+
+gc_long <- d %>%
+  dplyr::select(group, dplyr::all_of(gc_cols)) %>%
+  tidyr::pivot_longer(-group, names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(feature, levels = gc_cols))
+
+p_gc <- ggplot(gc_long, aes(x = gc, fill = group, color = group)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = group_colors, name = NULL) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "GC content by region and codon position, hypoxia 1hr",
+       subtitle = paste0("n = ", sum(d$group == "eIF3d hypoxia promotes"),
+                         " eIF3d-promoted, ", sum(d$group == "Negative control"),
+                         " negative control, ", sum(d$group == "All other genes"), " other"),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_gc)
+if (SAVE_PLOTS) ggsave(here("plots", "83_gc_by_region_3d_promoted_hypoxia_1hr.pdf"),
+                       p_gc, width = 11, height = 6)
+```
+
+```{r density-csc, fig.width = 7, fig.height = 4.5}
+csc_d <- d %>% dplyr::filter(!is.na(csc))
+
+wt_csc <- wilcox.test(csc_d$csc[csc_d$group == "eIF3d hypoxia promotes"],
+                      csc_d$csc[csc_d$group == "Negative control"])
+
+p_csc <- ggplot(csc_d, aes(x = csc, fill = group, color = group)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  scale_fill_manual(values = group_colors, name = NULL) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "CSC, eIF3d-promoted vs negative control vs all other genes",
+       x = "CSC (codon stabilisation coefficient)", y = "Density") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+           label = paste0("promoted vs negative control\np = ",
+                          format.pval(wt_csc$p.value, digits = 3, eps = 2.2e-16),
+                          "\nn = ", sum(csc_d$group == "eIF3d hypoxia promotes"), " / ",
+                          sum(csc_d$group == "Negative control"))) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_csc)
+if (SAVE_PLOTS) ggsave(here("plots", "83_csc_3d_promoted_hypoxia_1hr.pdf"),
+                       p_csc, width = 7, height = 4.5)
+```
+
+# Section 5: CDF plots
+
+The project's other three-group comparisons (`ripseq/code/20_*`) use CDFs, which show
+distribution shifts more clearly than densities when the groups differ in size.
+
+```{r cdf-grid, fig.width = 11, fig.height = 6}
+p_cdf <- ggplot(gc_long, aes(x = gc, color = group)) +
+  stat_ecdf(linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_x", ncol = 4) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "GC content, cumulative distributions",
+       subtitle = paste0("n = ", sum(d$group == "eIF3d hypoxia promotes"),
+                         " eIF3d-promoted, ", sum(d$group == "Negative control"),
+                         " negative control, ", sum(d$group == "All other genes"), " other"),
+       x = "GC content (%)", y = "Cumulative fraction") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_cdf)
+if (SAVE_PLOTS) ggsave(here("plots", "83_gc_cdf_3d_promoted_hypoxia_1hr.pdf"),
+                       p_cdf, width = 11, height = 6)
+```
+
+# Section 6: Statistics
+
+For each feature: medians per group, Wilcoxon of the promoted set against each
+comparator, and the rank-based AUC of promoted vs negative control.
+
+```{r stats}
+all_features <- c(gc_cols, "csc")
+
+stats <- purrr::map_dfr(all_features, function(f) {
+  x <- d[[f]]
+  ok <- !is.na(x)
+  g  <- d$group[ok]; x <- x[ok]
+
+  x_pos <- x[g == "eIF3d hypoxia promotes"]
+  x_neg <- x[g == "Negative control"]
+  x_oth <- x[g == "All other genes"]
+
+  r  <- rank(c(x_pos, x_neg))
+  n1 <- length(x_pos); n0 <- length(x_neg)
+  a  <- (sum(r[seq_len(n1)]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+
+  tibble::tibble(
+    feature          = f,
+    median_promoted  = round(median(x_pos), 3),
+    median_negctrl   = round(median(x_neg), 3),
+    median_other     = round(median(x_oth), 3),
+    higher_in        = ifelse(a > 0.5, "promoted", "negative control"),
+    auc_vs_negctrl   = round(max(a, 1 - a), 3),
+    p_vs_negctrl     = signif(wilcox.test(x_pos, x_neg)$p.value, 3),
+    p_vs_other       = signif(wilcox.test(x_pos, x_oth)$p.value, 3)
+  )
+}) %>%
+  dplyr::arrange(dplyr::desc(auc_vs_negctrl))
+
+print(as.data.frame(stats), row.names = FALSE)
+
+if (SAVE_PLOTS) {
+  write_csv(stats, here("output", "predictive_modeling",
+                        "83_gc_csc_stats_3d_promoted_hypoxia_1hr.csv"))
+}
+```
+
+# Section 7: Promoted genes split by deltaTE category, against the two backgrounds
+
+Only the **promoted** set is split by deltaTE category. The negative control and the rest
+of the transcriptome are each shown as a single reference curve.
+
+That asymmetry is deliberate, and it is forced by the data: promoted genes were selected
+on `te_padj < 0.05`, so they can only be Exclusive, Buffered or TE_only. Genes that are
+not promoted have no significant TE change, so they can only be Forwarded or Not_sig -
+splitting them by category would compare categories that cannot co-occur.
+
+The question the split answers is whether the promoted set's composition depends on
+**which arm drove its TE change**: Exclusive (RIBO moves, RNA does not) against Buffered
+(the RNA arm is driving it).
+
+```{r deltate-category-gc, fig.width = 13, fig.height = 5}
+de_cat <- de %>% dplyr::select(gene_id_clean, category)
+
+d_cat <- d %>%
+  dplyr::left_join(de_cat, by = "gene_id_clean") %>%
+  dplyr::mutate(plot_group = dplyr::case_when(
+    group == "eIF3d hypoxia promotes" & category == "Exclusive" ~ "Promoted: Exclusive",
+    group == "eIF3d hypoxia promotes" & category == "Buffered"  ~ "Promoted: Buffered",
+    group == "eIF3d hypoxia promotes" & category == "TE_only"   ~ "Promoted: TE_only",
+    group == "Negative control"                                 ~ "Negative control",
+    group == "All other genes"                                  ~ "All other genes",
+    TRUE                                                        ~ NA_character_)) %>%
+  dplyr::filter(!is.na(plot_group))
+
+plot_cols <- c("Promoted: Exclusive" = "red",
+               "Promoted: Buffered"  = "green3",
+               "Promoted: TE_only"   = "purple",
+               "Negative control"    = "black",
+               "All other genes"     = "grey70")
+
+d_cat <- d_cat %>% dplyr::mutate(plot_group = factor(plot_group, levels = names(plot_cols)))
+
+cat("n per group:\n")
+print(dplyr::count(d_cat, plot_group) %>% as.data.frame(), row.names = FALSE)
+
+long_cat <- d_cat %>%
+  tidyr::pivot_longer(dplyr::all_of(gc_cols), names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(feature, levels = gc_cols))
+
+# unfilled lines: five overlapping groups make shaded densities unreadable
+p_cat <- ggplot(long_cat, aes(x = gc, color = plot_group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = plot_cols, name = NULL) +
+  labs(title = "GC content: eIF3d-promoted genes by deltaTE category, vs both backgrounds",
+       subtitle = paste0("hypoxia 1hr   |   promoted n = ",
+                         sum(grepl("^Promoted", d_cat$plot_group)),
+                         ", negative control n = ", sum(d_cat$plot_group == "Negative control"),
+                         ", other n = ", sum(d_cat$plot_group == "All other genes")),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top", strip.text = element_text(size = 9))
+
+print(p_cat)
+if (SAVE_PLOTS) ggsave(here("plots", "83_gc_by_deltate_category_3d_promoted.pdf"),
+                       p_cat, width = 13, height = 5)
+```
+
+```{r deltate-category-csc, fig.width = 7, fig.height = 4.5}
+p_cat_csc <- d_cat %>%
+  dplyr::filter(!is.na(csc)) %>%
+  ggplot(aes(x = csc, color = plot_group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  scale_color_manual(values = plot_cols, name = NULL) +
+  labs(title = "CSC by deltaTE category, vs both backgrounds",
+       x = "CSC (codon stabilisation coefficient)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_cat_csc)
+if (SAVE_PLOTS) ggsave(here("plots", "83_csc_by_deltate_category_3d_promoted.pdf"),
+                       p_cat_csc, width = 7, height = 4.5)
+```
+
+## Medians per group
+
+```{r category-medians}
+d_cat %>%
+  dplyr::group_by(plot_group) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   across(dplyr::all_of(c(gc_cols, "csc")),
+                          ~ round(median(.x, na.rm = TRUE), 2)),
+                   .groups = "drop") %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+## Within the promoted set: Exclusive vs Buffered
+
+```{r exclusive-vs-buffered}
+prom <- d_cat %>%
+  dplyr::filter(plot_group %in% c("Promoted: Exclusive", "Promoted: Buffered")) %>%
+  dplyr::mutate(cat2 = droplevels(plot_group))
+
+cat("n Exclusive =", sum(prom$cat2 == "Promoted: Exclusive"),
+    "  n Buffered =", sum(prom$cat2 == "Promoted: Buffered"), "\n\n")
+
+purrr::map_dfr(c(gc_cols, "csc"), function(f) {
+  x <- prom[[f]]; ok <- !is.na(x)
+  x <- x[ok]; cl <- prom$cat2[ok]
+  n1 <- sum(cl == "Promoted: Exclusive"); n0 <- sum(cl == "Promoted: Buffered")
+  if (n1 < 20 || n0 < 20) return(NULL)
+  r <- rank(x)
+  a <- (sum(r[cl == "Promoted: Exclusive"]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  tibble::tibble(
+    feature = f,
+    median_exclusive = round(median(x[cl == "Promoted: Exclusive"]), 3),
+    median_buffered  = round(median(x[cl == "Promoted: Buffered"]), 3),
+    higher_in = ifelse(a > 0.5, "Exclusive", "Buffered"),
+    auc = round(max(a, 1 - a), 3),
+    wilcox_p = signif(wilcox.test(x[cl == "Promoted: Exclusive"],
+                                  x[cl == "Promoted: Buffered"])$p.value, 3))
+}) %>% dplyr::arrange(dplyr::desc(auc)) %>% as.data.frame() %>% print(row.names = FALSE)
+```
+
+A high AUC would mean the promoted set's composition depends on which arm drove the TE
+change - the same diagnostic applied to the Teleman sets in notebook 80.
+
+---
+
+# Section 7: Comparison to the Teleman 4E sets
+
+For context: in the Teleman eIF4E data the resistant and sensitive sets differ by roughly
+19 points of CDS GC and 34 points of GC3, and a single GC3 threshold classifies 90% of
+transcripts correctly. The table above shows whether the eIF3d comparison is anywhere
+near that scale.
+
+```{r scale-comparison}
+gap <- stats %>%
+  dplyr::filter(feature %in% c("cds_gc", "gc3")) %>%
+  dplyr::mutate(gap_promoted_minus_negctrl = round(median_promoted - median_negctrl, 2)) %>%
+  dplyr::select(feature, median_promoted, median_negctrl,
+                gap_promoted_minus_negctrl, auc_vs_negctrl)
+
+print(as.data.frame(gap), row.names = FALSE)
+
+cat("\nFor reference, the Teleman 4E-resistant vs 4E-sensitive gaps were:\n")
+cat("  cds_gc  +18.4 points, AUC 0.978\n")
+cat("  gc3     +33.9 points, AUC 0.962\n")
+```
+
+# Summary
+
+The statistics table is the deliverable. Note that the negative control set is
+**eIF3d-unaffected**, not a random background, so the promoted-vs-negative comparison
+asks whether eIF3d targets differ compositionally from transcripts eIF3d demonstrably
+does not regulate. The promoted-vs-other comparison is the looser test against the rest
+of the transcriptome.
