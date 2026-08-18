@@ -167,6 +167,7 @@ library(pROC)
 library(cowplot)
 library(treeshap)
 library(ggbeeswarm)
+library(pheatmap)
 ```
 
 ```{r table_helper}
@@ -562,7 +563,9 @@ categorize_feature <- function(f) {
     str_detect(f, "^gc[12]$|^gc3_residual$")               ~ "Positional GC",
     str_detect(f, "^bg_rscu_")                             ~ "Codon usage (RSCU)",
     str_detect(f, "^codon_freq_")                          ~ "Codon frequency",
-    str_detect(f, "^log2_.*_length$")                      ~ "Region lengths",
+    # transcript_length (utr5+cds+utr3) is the one length feature that is not log2'd;
+    # it appears in feature_matrix_teleman_4e.rds but not in external_stability.
+    str_detect(f, "^log2_.*_length$|^transcript_length$")   ~ "Region lengths",
     str_detect(f, "_gc$|^gc3$")                            ~ "GC content",
     str_detect(f, "^struct_") & str_detect(f, "cds")       ~ "RNA structure (CDS)",
     str_detect(f, "^struct_") & str_detect(f, "utr3")      ~ "RNA structure (3'UTR)",
@@ -572,7 +575,9 @@ categorize_feature <- function(f) {
     str_detect(f, "^is_dap5_|^dap5_")                      ~ "DAP5 dependence",
     str_detect(f, "^kozak_")                               ~ "Kozak context",
     str_detect(f, "^cai$|^tai$|^csc|^fop$|weighted_codon") ~ "Codon optimality",
-    str_detect(f, "^zhu2024_|^karner2026_")                ~ "mRNA stability",
+    # ^karner rather than ^karner2026_: nb78 names the same Karner SLAM-seq column
+    # karner_ct_ratio, while 01i_ names it karner2026_mda231_log2_ct.
+    str_detect(f, "^zhu2024_|^karner")                     ~ "mRNA stability",
     str_detect(f, "ribo_enrichment|_occupancy$")           ~ "Ribosome occupancy (external)",
     TRUE                                                   ~ "Other"
   )
@@ -660,6 +665,7 @@ clean_feature_name <- function(f) {
     str_replace("^kozak_", "Kozak: ") %>%
     str_replace("^zhu2024_", "Zhu 2024: ") %>%
     str_replace("^karner2026_", "Karner 2026: ") %>%
+    str_replace("^karner_ct_ratio$", "Karner 2026: C/T ratio") %>%
     str_replace("^hia2026_", "Hia 2026: ") %>%
     str_replace("^cnot3_", "CNOT3: ") %>%
     str_replace("^is_4e_", "4E-") %>%
@@ -671,6 +677,143 @@ clean_feature_name <- function(f) {
 }
 
 feature_meta <- feature_meta %>% mutate(feature_clean = clean_feature_name(feature))
+```
+
+# Are the Hand-Drawn Categories Supported by the Data?
+
+`categorize_feature()` above is a **hand-written map from feature names to categories**. It is
+not derived from the data: no correlation, clustering or importance information enters it. That
+is a deliberate choice (biological families are the unit a reader cares about, and SHAP is
+additive so summing within any partition is exact), but it means the grouped-SHAP panel can
+present two blocks as distinct when the underlying features are collinear, or split one real
+signal across two named categories.
+
+This section is the audit. It asks whether the correlation structure of the features agrees
+with the hand-drawn partition, and reports it as a number as well as a picture so the answer
+does not depend on eyeballing the heatmap.
+
+```{r category_correlation_heatmap, fig.width=11, fig.height=9.5}
+# Spearman throughout: several features (CLIP counts, kozak_optimal, imputed columns) are
+# discrete or heavily tied, so Pearson would misstate the association.
+cor_mat <- cor(train_data[, feature_cols], method = "spearman", use = "pairwise.complete.obs")
+
+# Order features by assigned category so hand-drawn blocks sit on the diagonal. Categories are
+# ordered by size, then features alphabetically within a category -- deterministic, and it does
+# not depend on the SHAP results, so this panel is a statement about the FEATURES alone.
+cat_order <- feature_meta %>%
+  dplyr::count(category, name = "n_cat") %>%
+  arrange(desc(n_cat), category) %>%
+  pull(category)
+
+ordered_feats <- feature_meta %>%
+  mutate(category = factor(category, levels = cat_order)) %>%
+  arrange(category, feature) %>%
+  pull(feature)
+
+cor_ord <- cor_mat[ordered_feats, ordered_feats]
+# Label with display names, which are what every other figure in this notebook uses.
+# make.unique guards the pheatmap rownames: clean_feature_name() is not injective in
+# principle, and a collision would be a hard error rather than a cosmetic one.
+lab <- make.unique(feature_meta$feature_clean[match(ordered_feats, feature_meta$feature)])
+dimnames(cor_ord) <- list(lab, lab)
+
+annot <- data.frame(Category = feature_meta$category[match(ordered_feats, feature_meta$feature)],
+                    row.names = lab)
+annot_colors <- list(Category = category_colors[unique(annot$Category)])
+
+# Diverging blue-white-red per the project convention; correlation has a meaningful midpoint
+# at 0, so the scale is symmetric about it (unlike the sequential beeswarm colour scale).
+cor_breaks <- seq(-1, 1, length.out = 101)
+cor_palette <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(100)
+
+ph_args <- list(
+  mat = cor_ord, cluster_rows = FALSE, cluster_cols = FALSE,
+  annotation_row = annot, annotation_colors = annot_colors,
+  color = cor_palette, breaks = cor_breaks,
+  fontsize = 8, border_color = NA,
+  main = paste0("Spearman correlation, features ordered by assigned category (train, n = ",
+                nrow(train_data), ")")
+)
+do.call(pheatmap, ph_args)
+do.call(pheatmap, c(ph_args, list(
+  filename = here("plots", paste0("shap_feature_correlation_by_category_", suffix_shap, ".pdf")),
+  width = 11, height = 9.5)))
+```
+
+The same matrix with the ordering taken *from the data* instead. If the hand-drawn map matched
+the correlation structure, the annotation bar would come out in contiguous blocks; wherever a
+colour is interleaved, features the map separates are behaving alike.
+
+```{r category_correlation_clustered, fig.width=11, fig.height=9.5}
+# Cluster on correlation DISTANCE (1 - |rho|): features that move together belong together
+# regardless of the sign of the association.
+clust_dist <- as.dist(1 - abs(cor_mat))
+hc <- hclust(clust_dist, method = "average")
+
+cor_cl <- cor_mat[hc$order, hc$order]
+lab_cl <- make.unique(feature_meta$feature_clean[match(rownames(cor_cl), feature_meta$feature)])
+annot_cl <- data.frame(Category = feature_meta$category[match(rownames(cor_cl), feature_meta$feature)],
+                       row.names = lab_cl)
+dimnames(cor_cl) <- list(lab_cl, lab_cl)
+
+ph_args_cl <- list(
+  mat = cor_cl, cluster_rows = FALSE, cluster_cols = FALSE,
+  annotation_row = annot_cl, annotation_colors = annot_colors,
+  color = cor_palette, breaks = cor_breaks,
+  fontsize = 8, border_color = NA,
+  main = "Same matrix, ordered by hierarchical clustering on 1 - |rho|"
+)
+do.call(pheatmap, ph_args_cl)
+do.call(pheatmap, c(ph_args_cl, list(
+  filename = here("plots", paste0("shap_feature_correlation_clustered_", suffix_shap, ".pdf")),
+  width = 11, height = 9.5)))
+```
+
+```{r category_coherence}
+# Quantitative version of the same question, so the verdict is not an eyeball call.
+# For each category with >= 2 features: mean |rho| among its own members (cohesion) vs mean
+# |rho| from its members to every feature outside it (bleed). A category that carves out a
+# real block has cohesion well above bleed; cohesion ~ bleed means the name is doing the work.
+diag(cor_mat) <- NA
+
+coherence <- map_dfr(unique(feature_meta$category), function(ct) {
+  members <- feature_meta$feature[feature_meta$category == ct]
+  others  <- setdiff(feature_cols, members)
+  if (length(members) < 2 || length(others) == 0) return(NULL)
+  tibble(
+    category = ct,
+    n        = length(members),
+    cohesion = mean(abs(cor_mat[members, members]), na.rm = TRUE),
+    bleed    = mean(abs(cor_mat[members, others]),  na.rm = TRUE)
+  )
+}) %>%
+  mutate(ratio = cohesion / bleed) %>%
+  arrange(desc(ratio))
+
+cat("Category coherence (Spearman |rho|, training set):\n")
+cat("  cohesion = mean |rho| within the category\n")
+cat("  bleed    = mean |rho| from its members to all features outside it\n")
+cat("  ratio    > ~1.5 = the category is a real block; ~1 = the grouping is nominal\n\n")
+coherence %>% mutate(across(c(cohesion, bleed, ratio), ~round(.x, 3))) %>%
+  as.data.frame() %>% print(right = FALSE)
+
+# Cross-category entanglement: which PAIRS of categories are most correlated with each other.
+# This is what identifies categories that should arguably be merged before the grouped-SHAP
+# panel is read as showing independent contributions.
+cat_pairs <- combn(unique(feature_meta$category), 2, simplify = FALSE)
+pair_tbl <- map_dfr(cat_pairs, function(p) {
+  a <- feature_meta$feature[feature_meta$category == p[1]]
+  b <- feature_meta$feature[feature_meta$category == p[2]]
+  tibble(category_a = p[1], category_b = p[2],
+         mean_abs_rho = mean(abs(cor_mat[a, b]), na.rm = TRUE))
+}) %>% arrange(desc(mean_abs_rho))
+
+cat("\nMost entangled category pairs (mean |rho| across the two blocks):\n")
+pair_tbl %>% head(8) %>% mutate(mean_abs_rho = round(mean_abs_rho, 3)) %>%
+  as.data.frame() %>% print(right = FALSE)
+cat("\nA pair above ~0.7 is one signal split across two names: sum those categories before\n",
+    "reading the grouped-SHAP panel as independent contributions.\n")
+diag(cor_mat) <- 1
 ```
 
 # SHAP Importance

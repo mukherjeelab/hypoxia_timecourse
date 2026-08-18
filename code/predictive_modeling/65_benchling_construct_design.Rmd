@@ -50,12 +50,38 @@ neg_ctrl <- read_csv(
 neg_symbols <- neg_ctrl$symbol
 cat("Loaded", length(neg_symbols), "negative control candidates from negative_control_genes_strict.csv\n")
 
-all_symbols <- c(target_symbols, neg_symbols)
+# nb24 Plot 2c condition-specific candidates (see notebook 24, chunk
+# plot-named-specific-genes). Gene IDs are pinned explicitly here rather than
+# resolved by expression: three of these five symbols map to two ENSG IDs each,
+# and for SMIM10L1 the expression rule used below picks the WRONG copy — the
+# lncRNA locus ENSG00000281930 (higher total RNA) rather than the protein-coding
+# locus ENSG00000256537 that actually carries the eIF3d TE effect. DDR1 and TNKS
+# likewise carry their signal on the non-canonical copy.
+nb24_candidates <- tribble(
+  ~symbol,    ~gene_id_forced,   ~nb24_group,
+  "DDR1",     "ENSG00000230456", "Hypoxia-specific",
+  "FAM72D",   "ENSG00000215784", "Hypoxia-specific",
+  "SMIM10L1", "ENSG00000256537", "Hypoxia-specific",
+  "PDIA3P1",  "ENSG00000180867", "Normoxia-specific",
+  "TNKS",     "ENSG00000285372", "Normoxia-specific"
+)
+nb24_symbols <- nb24_candidates$symbol
+
+# These must not collide with the existing lists, or the forced-ID join below
+# would rewrite the gene ID of an unrelated target/negative-control row.
+stopifnot(
+  "nb24 candidate symbols must not overlap the target or neg-control lists" =
+    length(intersect(nb24_symbols, c(target_symbols, neg_symbols))) == 0
+)
+cat("Loaded", length(nb24_symbols), "nb24 condition-specific candidates\n")
+
+all_symbols <- c(target_symbols, neg_symbols, nb24_symbols)
 
 gene_groups <- tibble(
   symbol     = all_symbols,
   gene_group = c(rep("target", length(target_symbols)),
-                 rep("negative_control", length(neg_symbols)))
+                 rep("negative_control", length(neg_symbols)),
+                 rep("nb24_candidate", length(nb24_symbols)))
 )
 ```
 
@@ -89,7 +115,26 @@ gene_id_map <- te_full |>
   ungroup()
 
 gene_df <- gene_groups |>
-  left_join(gene_id_map |> dplyr::select(symbol, gene_id_clean), by = "symbol")
+  left_join(gene_id_map |> dplyr::select(symbol, gene_id_clean), by = "symbol") |>
+  left_join(nb24_candidates |> dplyr::select(symbol, gene_id_forced), by = "symbol") |>
+  mutate(gene_id_clean = coalesce(gene_id_forced, gene_id_clean))
+
+# Report where the pinned ID disagrees with the expression rule, so the override is
+# visible in the knit rather than silent. SMIM10L1 is the known case.
+nb24_override_check <- gene_df |>
+  filter(!is.na(gene_id_forced)) |>
+  left_join(gene_id_map |> dplyr::select(symbol, gene_id_by_expression = gene_id_clean),
+            by = "symbol") |>
+  mutate(overridden = gene_id_forced != gene_id_by_expression)
+cat("\nnb24 candidates — pinned gene ID vs expression-selected gene ID:\n")
+print(nb24_override_check |>
+        dplyr::select(symbol, gene_id_forced, gene_id_by_expression, overridden))
+stopifnot(
+  "pinned nb24 gene IDs must all be present in the TE dataset" =
+    all(nb24_candidates$gene_id_forced %in% te_full$gene_id_clean)
+)
+
+gene_df <- gene_df |> dplyr::select(-gene_id_forced)
 
 stopifnot(
   "All symbols must be found in TE data" =
@@ -208,8 +253,29 @@ neg_missing <- tx_selected |>
 if (length(neg_missing) > 0) {
   cat("Negative controls without a 5'UTR-annotated transcript (excluded from pipeline):\n")
   cat(paste(neg_missing, collapse = ", "), "\n")
-  tx_selected <- tx_selected |> filter(!is.na(transcript_id_final))
 }
+
+# nb24 candidates are reported-and-excluded rather than hard-failed: three of the
+# five pinned loci have NO transcript with an annotated 5'UTR in GENCODE v49,
+# because the copy carrying the eIF3d effect is not a normal coding transcript —
+# DDR1 ENSG00000230456 is protein_coding_CDS_not_defined, TNKS ENSG00000285372 is
+# nonsense_mediated_decay, and PDIA3P1 is a transcribed_processed_pseudogene. With
+# no CDS there is no annotated 5'UTR boundary, so no 5'UTR construct can be built
+# from these loci. Their other ENSG copy does have UTRs but shows no TE effect
+# (DDR1 ENSG00000204580 te_lfc -0.01, TNKS ENSG00000173273 -0.06), so silently
+# substituting it would build a reporter for the wrong transcript.
+nb24_missing <- tx_selected |>
+  filter(gene_group == "nb24_candidate", is.na(transcript_id_final)) |>
+  pull(symbol)
+nb24_ok <- tx_selected |>
+  filter(gene_group == "nb24_candidate", !is.na(transcript_id_final)) |>
+  pull(symbol)
+cat("\nnb24 candidates WITH a 5'UTR-annotated transcript:",
+    if (length(nb24_ok) > 0) paste(nb24_ok, collapse = ", ") else "(none)", "\n")
+cat("nb24 candidates WITHOUT one (cannot build a 5'UTR construct):",
+    if (length(nb24_missing) > 0) paste(nb24_missing, collapse = ", ") else "(none)", "\n")
+
+tx_selected <- tx_selected |> filter(!is.na(transcript_id_final))
 ```
 
 # Extract 5' UTR sequences
@@ -300,10 +366,42 @@ stopifnot(
 cat("Construct lengths (bp):\n")
 print(constructs_df |> dplyr::select(Name, gene_group, utr5_length, construct_length))
 
+# The bidirectional vector is linearised with Eco31I (BsaI, GGTCTC) and BsmBI-v2
+# (Esp3I, CGTCTC), so an internal site in an inserted 5'UTR would be re-cut. The
+# fixed prefix / reporter_start / suffix are site-free by design; only the variable
+# 5'UTR can introduce one. Reported, not filtered — a Gibson-style assembly onto the
+# 20 bp homology arms tolerates internal sites, a Golden Gate one does not.
+count_sites <- function(x) {
+  x <- toupper(x)
+  str_count(x, "GGTCTC") + str_count(x, "GAGACC") +   # Eco31I / BsaI, both strands
+  str_count(x, "CGTCTC") + str_count(x, "GAGACG")     # Esp3I / BsmBI-v2, both strands
+}
+stopifnot(
+  "fixed construct parts must be free of Eco31I / BsmBI sites" =
+    count_sites(paste0(prefix, reporter_start, suffix)) == 0
+)
+constructs_df <- constructs_df |> mutate(n_typeIIs_sites = count_sites(utr5_sequence))
+flagged <- constructs_df |> filter(n_typeIIs_sites > 0)
+if (nrow(flagged) > 0) {
+  cat("\nWARNING — 5'UTRs containing an internal Eco31I/BsmBI site:\n")
+  print(flagged |> dplyr::select(Name, gene_group, utr5_length, n_typeIIs_sites))
+} else {
+  cat("\nNo internal Eco31I/BsmBI sites in any 5'UTR.\n")
+}
+
+# Report what the length filter removes rather than dropping it silently — the
+# fixed parts total 113 bp, so this cut requires a 5'UTR of >= 187 bp.
+dropped_short <- constructs_df |> filter(construct_length < 300)
+if (nrow(dropped_short) > 0) {
+  cat("\nDropped by the >= 300 bp construct filter:\n")
+  print(dropped_short |> dplyr::select(Name, gene_group, utr5_length, construct_length))
+}
+
 constructs_df <- constructs_df |> filter(construct_length >= 300)
 cat("\nAfter filtering to >= 300 bp constructs:", nrow(constructs_df), "remain",
     "(", sum(constructs_df$gene_group == "target"), "targets,",
-    sum(constructs_df$gene_group == "negative_control"), "neg controls )\n")
+    sum(constructs_df$gene_group == "negative_control"), "neg controls,",
+    sum(constructs_df$gene_group == "nb24_candidate"), "nb24 candidates )\n")
 ```
 
 # Negative control candidate review
@@ -348,16 +446,40 @@ stopifnot(
     all(target_symbols_keep %in% constructs_df$symbol[constructs_df$gene_group == "target"])
 )
 
+# All nb24 candidates that survived 5'UTR extraction and the length filter are kept.
+nb24_symbols_keep <- constructs_df |>
+  filter(gene_group == "nb24_candidate") |>
+  pull(symbol)
+
 constructs_final <- constructs_df |>
   filter(
     (gene_group == "target" & symbol %in% target_symbols_keep) |
-    (gene_group == "negative_control" & symbol %in% neg_symbols_keep)
+    (gene_group == "negative_control" & symbol %in% neg_symbols_keep) |
+    (gene_group == "nb24_candidate" & symbol %in% nb24_symbols_keep)
   )
 
 cat("Final selection:", nrow(constructs_final), "constructs\n")
 cat(" ", sum(constructs_final$gene_group == "target"), "targets\n")
 cat(" ", sum(constructs_final$gene_group == "negative_control"), "negative controls\n")
+cat(" ", sum(constructs_final$gene_group == "nb24_candidate"), "nb24 candidates\n")
 print(constructs_final |> dplyr::select(symbol, gene_group, utr5_length, construct_length))
+
+# Account for every one of the five nb24 candidates: built, or dropped with a reason.
+nb24_outcome <- nb24_candidates |>
+  mutate(
+    outcome = case_when(
+      symbol %in% constructs_final$symbol                       ~ "construct built",
+      symbol %in% nb24_missing                                  ~ "no annotated 5'UTR at pinned locus",
+      symbol %in% dropped_short$symbol                          ~ "5'UTR too short (< 187 bp)",
+      TRUE                                                      ~ "excluded (see log above)"
+    )
+  )
+cat("\nnb24 candidate outcomes:\n")
+print(nb24_outcome)
+stopifnot(
+  "every nb24 candidate must be accounted for" =
+    nrow(nb24_outcome) == length(nb24_symbols)
+)
 ```
 
 # CLIC1 and ADAT3 5' UTR sequences

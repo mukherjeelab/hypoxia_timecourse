@@ -113,16 +113,31 @@ tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
 ---
 
 ```{r params}
-lfc_cutoff  <- 0.5
-padj_cutoff <- 0.05
-n_boot      <- 1000
-seed        <- 9
-# if (exists("params") && !is.null(params) && length(params) > 0) {
-#   lfc_cutoff  <- params$lfc_cutoff
-#   padj_cutoff <- params$padj_cutoff
-#   n_boot      <- params$n_boot
-#   seed        <- params$seed
-# }
+# `params` only exists during knit; running chunks by hand in RStudio would
+# otherwise resolve bare `params` to an unrelated attached-package function
+# ("object of type 'closure' is not subsettable"). These fallbacks match the YAML
+# defaults exactly, so a knit and an interactive run give identical results.
+if (!exists("params") || !is.list(params)) {
+  params <- list(lfc_cutoff = 0.5, padj_cutoff = 0.05, n_boot = 1000, seed = 9)
+}
+lfc_cutoff  <- params$lfc_cutoff
+padj_cutoff <- params$padj_cutoff
+n_boot      <- params$n_boot
+seed        <- params$seed
+
+stopifnot(
+  "lfc_cutoff must be a single non-negative number" =
+    is.numeric(lfc_cutoff)  && length(lfc_cutoff)  == 1 && lfc_cutoff >= 0,
+  "padj_cutoff must be a single number in (0, 1]"   =
+    is.numeric(padj_cutoff) && length(padj_cutoff) == 1 &&
+    padj_cutoff > 0 && padj_cutoff <= 1,
+  "n_boot must be a single positive number"         =
+    is.numeric(n_boot)      && length(n_boot)      == 1 && n_boot >= 1,
+  "seed must be a single number"                    =
+    is.numeric(seed)        && length(seed)        == 1
+)
+cat("Params — lfc_cutoff:", lfc_cutoff, "| padj_cutoff:", padj_cutoff,
+    "| n_boot:", n_boot, "| seed:", seed, "\n")
 ```
 
 # Section 2: Gene Set Loading
@@ -136,10 +151,27 @@ hyp_gene_ids <- hyp_raw$ensembl_gene
 cat("Hypoxia 1hr promoted genes:", length(hyp_gene_ids), "\n")
 
 tc <- read_csv(
-  here("output", "genesets",
-       "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+  here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
   show_col_types = FALSE
 )
+
+# Direction guard. The filenames say si3d_vs_sictrl but the DESeq2 coefficient is
+# sictrl_vs_si3d, so every LFC column here is log2(sictrl / si3d) and positive =
+# eIF3d promotes. EIF3D's own rna_lfc must be strongly positive (~+3, the siRNA
+# depletes its target); if it is negative the contrast direction has flipped and
+# every "promoted" set below would be inverted.
+assert_eif3d_direction <- function(tbl, label) {
+  stopifnot("EIF3D row missing — cannot verify contrast direction" =
+              sum(tbl$symbol == "EIF3D", na.rm = TRUE) == 1)
+  eif3d_rna <- tbl$rna_lfc[which(tbl$symbol == "EIF3D")]
+  cat("EIF3D rna_lfc (", label, "):", round(eif3d_rna, 2),
+      "— expect strongly positive\n")
+  stopifnot("EIF3D rna_lfc not positive — contrast direction is flipped" =
+              is.finite(eif3d_rna) && eif3d_rna > 2)
+  invisible(eif3d_rna)
+}
+assert_eif3d_direction(tc, "normoxia 1+4hr")
+
 nor_gene_ids <- tc %>%
   filter(te_lfc > lfc_cutoff, !is.na(te_padj), te_padj < padj_cutoff) %>%
   mutate(ensembl_gene = sub("\\..*", "", gene_id)) %>%
@@ -310,13 +342,19 @@ cat("CTG pooled RSCU — hypoxia:", round(rscu_hyp["CTG"], 3),
 # set) to force a recompute -- the stored key below detects those changes for you.
 boot_cache_path <- here("output", "predictive_modeling", "54_bootstrap_pooled_rscu.rds")
 # as.integer throughout: identical() is type-strict, so a key field arriving as
-# double in one run and integer in another (e.g. if the YAML params block above is
-# re-enabled) would spuriously invalidate an otherwise-valid cache.
-boot_key <- list(n_boot   = as.integer(n_boot),
-                 seed     = as.integer(seed),
-                 n_hyp_tx = as.integer(length(hyp_tx)),
-                 n_nor_tx = as.integer(length(nor_tx)),
-                 n_codons = as.integer(ncol(counts_mat0)))
+# double in one run and integer in another (e.g. via the YAML params block above)
+# would spuriously invalidate an otherwise-valid cache.
+#
+# The gene sets are keyed by a content hash of their sorted transcript IDs, not by
+# length: set sizes can stay identical while membership changes (a different lfc /
+# padj cutoff, a regenerated geneset CSV), and a length-only key would silently
+# serve bootstrap CIs computed for the wrong genes.
+boot_key <- list(n_boot    = as.integer(n_boot),
+                 seed      = as.integer(seed),
+                 hyp_hash  = rlang::hash(sort(hyp_tx)),
+                 nor_hash  = rlang::hash(sort(nor_tx)),
+                 codon_hash = rlang::hash(colnames(counts_mat0)),
+                 n_codons  = as.integer(ncol(counts_mat0)))
 
 boot_cache <- NULL
 if (file.exists(boot_cache_path)) {
@@ -751,15 +789,24 @@ rscu_hyp_f2 <- compute_pooled_rscu(hyp_tx, counts_mat2, bg_props_pooled)
 rscu_nor_f2 <- compute_pooled_rscu(nor_tx, counts_mat2, bg_props_pooled)
 delta_f2    <- rscu_hyp_f2 - rscu_nor_f2
 
-cat("Frame 0 mean |delta| (multi-synonymous codons):",
-    round(mean(abs(delta_rscu[sense_codons[sense_codons %in% names(delta_rscu)]]),
-               na.rm = TRUE), 4), "\n")
-cat("Frame 1 mean |delta|:",
-    round(mean(abs(delta_f1[sense_codons[sense_codons %in% names(delta_f1)]]),
-               na.rm = TRUE), 4), "\n")
-cat("Frame 2 mean |delta|:",
-    round(mean(abs(delta_f2[sense_codons[sense_codons %in% names(delta_f2)]]),
-               na.rm = TRUE), 4), "\n")
+# Restrict to multi-synonymous codons. ATG (Met) and TGG (Trp) are the sole codons
+# for their amino acid, so their RSCU is 1 in every pool and their delta is 0 by
+# construction — averaging over all 61 sense codons dilutes each frame's mean by
+# 2/61 (~3%) and understates the frame-0 signal this control is quantifying.
+multi_syn_codons <- sense_codons[gen_code[sense_codons] %in% multi_aa]
+stopifnot(
+  "single-codon amino acids leaked into multi_syn_codons" =
+    !any(c("ATG", "TGG") %in% multi_syn_codons),
+  "unexpected number of multi-synonymous sense codons" =
+    length(multi_syn_codons) == length(sense_codons) - 2
+)
+
+mean_abs_delta <- function(d) {
+  round(mean(abs(d[intersect(multi_syn_codons, names(d))]), na.rm = TRUE), 4)
+}
+cat("Frame 0 mean |delta| (multi-synonymous codons):", mean_abs_delta(delta_rscu), "\n")
+cat("Frame 1 mean |delta| (multi-synonymous codons):", mean_abs_delta(delta_f1),   "\n")
+cat("Frame 2 mean |delta| (multi-synonymous codons):", mean_abs_delta(delta_f2),   "\n")
 ```
 
 ```{r plot_frame_ctrl_scatter, fig.width=6, fig.height=5.5}
@@ -841,34 +888,46 @@ p_frame_lollipop <- ggplot(frame_long, aes(x = delta, y = codon, colour = gc3_cl
     x = "delta pooled RSCU (hypoxia minus normoxia)",
     y = NULL
   ) +
-  theme_classic(base_size = 10) +
+  theme_classic(base_size = 14) +
   theme(
-    axis.text.y     = element_text(size = 6, family = "mono"),
+    axis.text.y     = element_text(size = 8, family = "mono"),
     legend.position = "top",
     strip.text      = element_text(face = "bold")
   )
 p_frame_lollipop
 ggsave(here("plots", "54_rscu_pooled_frame_ctrl_lollipop.pdf"),
-       p_frame_lollipop, width = 7, height = 9)
+       p_frame_lollipop, width = 7, height = 10)
 ```
 
 ```{r plot_frame_ctrl_lollipop_star, fig.width=7, fig.height=9}
-# Classify codons as "codon-specific" if frame-0 chi-sq significant AND
-# |frame-0 delta| exceeds the shifted-frame baseline (mean of frames +1 and +2).
+# Classify codons as "codon-specific" if frame-0 chi-sq significant AND |frame-0
+# delta| exceeds 1.5x the larger of the two shifted-frame deltas (pmax, matching
+# the plot subtitle below — not their mean).
+#
+# Restricted to multi-synonymous codons for the same reason as the frame means
+# above: ATG/TGG have no synonym to prefer, get no chi-squared test, and would
+# otherwise pad the denominator of the count reported here to 61.
 frame_specificity <- tibble(
-  codon    = names(delta_rscu),
-  f0_delta = as.numeric(delta_rscu),
-  f1_delta = as.numeric(delta_f1[names(delta_rscu)]),
-  f2_delta = as.numeric(delta_f2[names(delta_rscu)])
+  codon    = multi_syn_codons,
+  f0_delta = as.numeric(delta_rscu[multi_syn_codons]),
+  f1_delta = as.numeric(delta_f1[multi_syn_codons]),
+  f2_delta = as.numeric(delta_f2[multi_syn_codons])
 ) %>%
   mutate(max_shift = pmax(abs(f1_delta), abs(f2_delta))) %>%
   left_join(chi_df %>% dplyr::select(codon, p_adj_chi), by = "codon") %>%
   mutate(codon_specific = !is.na(p_adj_chi) & p_adj_chi < 0.05 &
            abs(f0_delta) > max_shift * 1.5)
 
+stopifnot(
+  "frame_specificity should cover every multi-synonymous codon exactly once" =
+    nrow(frame_specificity) == length(multi_syn_codons),
+  "codon_specific must be TRUE/FALSE, never NA" =
+    !any(is.na(frame_specificity$codon_specific))
+)
+
 cat("Codons with codon-specific preference:",
-    sum(frame_specificity$codon_specific, na.rm = TRUE), "of",
-    sum(!is.na(frame_specificity$codon_specific)), "multi-synonymous codons\n")
+    sum(frame_specificity$codon_specific), "of",
+    nrow(frame_specificity), "multi-synonymous codons\n")
 
 frame_long_star <- frame_long %>%
   left_join(frame_specificity %>% dplyr::select(codon, codon_specific),
@@ -1057,10 +1116,10 @@ p_gc3_group <- ggplot(gc3_gene, aes(x = group, y = gc3_frac * 100, fill = group)
   geom_boxplot(width = 0.14, outlier.shape = NA, linewidth = 0.6, fill = "white") +
   geom_text(data = group_medians,
             aes(x = group, y = med, label = round(med, 1)),
-            nudge_x = 0.18, size = 3, fontface = "bold", inherit.aes = FALSE) +
+            nudge_x = 0.18, size = 4, fontface = "bold", inherit.aes = FALSE) +
   scale_fill_manual(values = group_colors, guide = "none") +
   scale_x_discrete(labels = setNames(n_labels$label, n_labels$group)) +
-  annotate("text", x = Inf, y = Inf, hjust = 1.05, vjust = 1.4, size = 3,
+  annotate("text", x = Inf, y = Inf, hjust = 1.05, vjust = 1.4, size = 4,
            label = paste0("Hyp vs Nor: p=", formatC(w_hyp_nor, format = "e", digits = 1),
                           "\nHyp vs Bg: p=",  formatC(w_hyp_bg,  format = "e", digits = 1),
                           "\nNor vs Bg: p=",  formatC(w_nor_bg,  format = "e", digits = 1))) +
@@ -1069,7 +1128,7 @@ p_gc3_group <- ggplot(gc3_gene, aes(x = group, y = gc3_frac * 100, fill = group)
     subtitle = "GC% at 3rd codon position; one value per gene (highest-count transcript)",
     x = NULL, y = "GC3 content (%)"
   ) +
-  theme_classic(base_size = 12)
+  theme_classic(base_size = 16)
 p_gc3_group
 ggsave(here("plots", "54_gc3_by_group.pdf"), p_gc3_group, width = 6, height = 5)
 
@@ -1162,8 +1221,10 @@ ggsave(here("plots", "54_gc_all_by_group_density.pdf"), p_gc_all_density, width 
 tc_hyp <- read_csv(
   here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
   show_col_types = FALSE
-) %>%
-  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+)
+assert_eif3d_direction(tc_hyp, "hypoxia 1hr")
+
+tc_hyp <- tc_hyp %>% mutate(gene_id_clean = sub("\\..*", "", gene_id))
 
 # Normoxia tc also needs gene_id_clean
 tc_nor_clean <- tc %>%
@@ -1182,6 +1243,7 @@ cor_df <- lfc_df %>%
   group_by(condition) %>%
   summarise(
     rho = round(cor(te_lfc, gc3_frac, method = "spearman", use = "complete.obs"), 3),
+    n   = sum(!is.na(te_lfc) & !is.na(gc3_frac)),
     .groups = "drop"
   )
 cat("Spearman correlation (te_lfc vs GC3%):\n"); print(cor_df)
@@ -1190,8 +1252,8 @@ p_gc3_lfc <- ggplot(lfc_df, aes(x = te_lfc, y = gc3_frac * 100, colour = group))
   geom_point(size = 1.2, alpha = 0.5) +
   geom_smooth(method = "lm", se = FALSE, colour = "grey30", linewidth = 0.7) +
   geom_text(data = cor_df,
-            aes(x = Inf, y = Inf, label = paste0("rho=", rho)),
-            colour = "black", hjust = 1.1, vjust = 1.4, size = 3.5,
+            aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
+            colour = "black", hjust = 1.1, vjust = 1.3, size = 3.5,
             inherit.aes = FALSE) +
   facet_wrap(~ condition, scales = "free_x") +
   scale_colour_manual(values = group_colors, name = NULL) +
@@ -1436,6 +1498,7 @@ cor_df_all <- lfc_df_all %>%
   group_by(condition) %>%
   summarise(
     rho = round(cor(gc3_frac, te_lfc, method = "spearman", use = "complete.obs"), 3),
+    n   = sum(!is.na(gc3_frac) & !is.na(te_lfc)),
     .groups = "drop"
   )
 cat("Spearman rho (GC3 vs TE LFC, all genes):\n"); print(cor_df_all)
@@ -1446,8 +1509,8 @@ p_te_gc3_scatter <- ggplot(lfc_df_all,
   geom_point(size = 0.5, alpha = 0.2, colour = "grey40") +
   geom_smooth(method = "lm", se = FALSE, colour = "#E69F00", linewidth = 0.9) +
   geom_text(data = cor_df_all,
-            aes(x = Inf, y = Inf, label = paste0("rho=", rho)),
-            colour = "black", hjust = 1.1, vjust = 1.4, size = 3.5,
+            aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
+            colour = "black", hjust = 1.1, vjust = 1.3, size = 4.5,
             inherit.aes = FALSE) +
   facet_wrap(~ condition, nrow = 1) +
   labs(
@@ -1456,7 +1519,7 @@ p_te_gc3_scatter <- ggplot(lfc_df_all,
     x        = "GC3 content (%)",
     y        = "TE LFC (positive = eIF3d promotes)"
   ) +
-  theme_classic(base_size = 12) +
+  theme_classic(base_size = 16) +
   # coord_cartesian, not ylim: ylim() would drop out-of-range rows before
   # stat_smooth runs, fitting the line to a truncated sample while rho uses all genes.
   coord_cartesian(ylim = c(-1, 2))
@@ -1519,14 +1582,16 @@ stopifnot(
     med_by[["Whole mRNA"]] > med_by[["3' UTR"]] & med_by[["Whole mRNA"]] < med_by[["5' UTR"]]
 )
 
+# Facet labels spell out the timepoint so each panel is readable without the
+# subtitle, and match the condition labels used by the GC3 scatter above.
 lfc_gc_region <- bind_rows(
-  tc_nor_clean %>% dplyr::select(gene_id_clean, te_lfc, symbol) %>% mutate(condition = "Normoxia"),
+  tc_nor_clean %>% dplyr::select(gene_id_clean, te_lfc, symbol) %>% mutate(condition = "Normoxia 1+4hr"),
   tc_hyp       %>% dplyr::select(gene_id_clean, te_lfc, symbol) %>% mutate(condition = "Hypoxia 1hr")
 ) %>%
   # one row per gene per condition joined to 4 GC-region rows per gene
   inner_join(gc_region_gene, by = "gene_id_clean", relationship = "many-to-many") %>%
   filter(!is.na(te_lfc)) %>%
-  mutate(condition = factor(condition, levels = c("Normoxia", "Hypoxia 1hr")))
+  mutate(condition = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr")))
 
 stopifnot(
   "lfc_gc_region has no rows"          = nrow(lfc_gc_region) > 100,
@@ -1552,7 +1617,7 @@ gc_scatter_layers <- list(
   geom_hline(yintercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.5),
   geom_point(size = 0.5, alpha = 0.2, colour = "grey40"),
   geom_smooth(method = "lm", se = FALSE, colour = "#E69F00", linewidth = 0.9),
-  theme_classic(base_size = 12),
+  theme_classic(base_size = 16),
   theme(strip.text = element_text(face = "bold")),
   coord_cartesian(ylim = c(-1, 2))
 )
@@ -1566,7 +1631,7 @@ p_te_gc_whole <- ggplot(lfc_gc_region %>% filter(gc_region == "Whole mRNA"),
   gc_scatter_layers +
   geom_text(data = cor_gc_region %>% filter(gc_region == "Whole mRNA"),
             aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
-            colour = "black", hjust = 1.1, vjust = 1.3, size = 3.5,
+            colour = "black", hjust = 1.1, vjust = 1.3, size = 4.5,
             inherit.aes = FALSE) +
   facet_wrap(~ condition, nrow = 1) +
   labs(
@@ -1591,7 +1656,7 @@ p_te_gc_region <- ggplot(lfc_gc_region %>%
               filter(gc_region %in% sub_regions) %>%
               mutate(gc_region = droplevels(gc_region)),
             aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
-            colour = "black", hjust = 1.1, vjust = 1.3, size = 3,
+            colour = "black", hjust = 1.1, vjust = 1.3, size = 4,
             inherit.aes = FALSE) +
   facet_grid(condition ~ gc_region) +
   labs(

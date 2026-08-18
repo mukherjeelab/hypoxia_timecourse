@@ -6,6 +6,7 @@ output: html_document
 params:
   pos_geneset: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"
   neg_geneset: "negative_control_genes.csv"
+  match_negatives: TRUE
   save_plots: TRUE
 editor_options:
   chunk_output_type: console
@@ -49,14 +50,16 @@ library(here)
 # Defaults for interactive use; the YAML params win when knitting.
 if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
-    pos_geneset = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
-    neg_geneset = "negative_control_genes.csv",
-    save_plots  = TRUE
+    pos_geneset     = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
+    neg_geneset     = "negative_control_genes.csv",
+    match_negatives = TRUE,
+    save_plots      = TRUE
   )
 }
-POS_GENESET <- params$pos_geneset
-NEG_GENESET <- params$neg_geneset
-SAVE_PLOTS  <- params$save_plots
+POS_GENESET     <- params$pos_geneset
+NEG_GENESET     <- params$neg_geneset
+MATCH_NEGATIVES <- params$match_negatives
+SAVE_PLOTS      <- params$save_plots
 
 # eIF3d keeps its reserved orange; negative control black and background grey70 are the
 # newer CLAUDE.md convention for new plots.
@@ -133,24 +136,97 @@ cat("Direction checks passed\n")
 
 # Section 3: Assign the three groups
 
+The negative control pool is larger than the promoted set, so with `match_negatives`
+(default TRUE) it is **downsampled to the promoted count under `set.seed(9)`**, the way
+notebook 07 balances the classifier's input.
+
+This reproduces 07's draw rather than merely its size: the same two gene sets are
+restricted to genes present in the feature matrix, in the order they appear in the CSVs,
+and `sample()` is called on that vector immediately after `set.seed(9)` with
+`min(n_pos, n_neg)` - identical inputs to 07's `create_target` chunk, so the same genes
+come out. Unmatched negatives are dropped rather than folded into "All other genes", so
+that group keeps its definition (every transcript in neither gene set), which is also
+what 07 does with them.
+
 ```{r assign-groups}
+# Mirrors notebook 07's create_target chunk exactly, including the vector being sampled.
+pos_in_features <- positives$gene_id_clean[positives$gene_id_clean %in% features$gene_id_clean]
+neg_in_features <- negatives$gene_id_clean[negatives$gene_id_clean %in% features$gene_id_clean]
+number_to_match <- min(length(pos_in_features), length(neg_in_features))
+
+cat("positive genes with features:", length(pos_in_features), "of", nrow(positives), "\n")
+cat("negative genes with features:", length(neg_in_features), "of", nrow(negatives), "\n")
+
+if (MATCH_NEGATIVES) {
+  set.seed(9)  # project-wide seed; same draw as the model input in notebook 07
+  neg_keep <- sample(neg_in_features, number_to_match)
+  cat("size-matched negative control:", length(neg_in_features), "->",
+      length(neg_keep), "(set.seed(9))\n")
+} else {
+  neg_keep <- neg_in_features
+}
+
 d <- features %>%
   dplyr::mutate(group = dplyr::case_when(
     gene_id_clean %in% positives$gene_id_clean ~ "eIF3d hypoxia promotes",
-    gene_id_clean %in% negatives$gene_id_clean ~ "Negative control",
+    gene_id_clean %in% neg_keep                ~ "Negative control",
+    # unsampled negatives are neither group: drop them, do not call them "other"
+    gene_id_clean %in% negatives$gene_id_clean ~ NA_character_,
     TRUE                                       ~ "All other genes")) %>%
+  dplyr::filter(!is.na(group)) %>%
   dplyr::mutate(group = factor(group, levels = names(group_colors)))
 
 print(dplyr::count(d, group) %>% as.data.frame(), row.names = FALSE)
 
-stopifnot("group must have no NA" = !any(is.na(d$group)))
-stopifnot("positive group must be non-empty" = sum(d$group == "eIF3d hypoxia promotes") > 0)
-stopifnot("negative group must be non-empty" = sum(d$group == "Negative control") > 0)
+n_pos <- sum(d$group == "eIF3d hypoxia promotes")
+n_neg <- sum(d$group == "Negative control")
 
-cat("\npositive genes with features:", sum(d$group == "eIF3d hypoxia promotes"),
-    "of", nrow(positives), "\n")
-cat("negative genes with features:", sum(d$group == "Negative control"),
-    "of", nrow(negatives), "\n")
+stopifnot("group must have no NA" = !any(is.na(d$group)))
+stopifnot("positive group must be non-empty" = n_pos > 0)
+stopifnot("negative group must be non-empty" = n_neg > 0)
+stopifnot("every positive-set gene in the matrix must be labelled positive" =
+            n_pos == length(pos_in_features))
+stopifnot("negative control must be size-matched to the positive set" =
+            !MATCH_NEGATIVES || n_neg == number_to_match)
+stopifnot("no unsampled negative may leak into the background" =
+            sum(d$group == "All other genes" & d$gene_id_clean %in% negatives$gene_id_clean) == 0)
+
+# Section 2 checked the full negative pool; re-check the drawn subset, so a pathological
+# sample cannot pass unnoticed. Direction is unchanged: te_lfc is log2(sictrl / si3d).
+te_by_group <- tibble::tibble(
+  group  = c("promoted", "negative control"),
+  n      = c(n_pos, n_neg),
+  median_te_lfc = c(
+    median(de$te_lfc[de$gene_id_clean %in%
+                       d$gene_id_clean[d$group == "eIF3d hypoxia promotes"]], na.rm = TRUE),
+    median(de$te_lfc[de$gene_id_clean %in%
+                       d$gene_id_clean[d$group == "Negative control"]], na.rm = TRUE)))
+print(as.data.frame(te_by_group %>% dplyr::mutate(median_te_lfc = round(median_te_lfc, 3))),
+      row.names = FALSE)
+
+stopifnot("drawn negative control is not centred near zero" =
+            abs(te_by_group$median_te_lfc[2]) < 0.3)
+stopifnot("promoted set must sit above the negative control in te_lfc" =
+            te_by_group$median_te_lfc[1] > te_by_group$median_te_lfc[2] + 0.5)
+```
+
+A single helper builds the legend labels so every plot below carries its own n's.
+
+```{r legend-helper}
+# labels of the form "Negative control (n = 1436)", computed on the rows actually plotted
+label_with_n <- function(g) {
+  tab <- table(droplevels(as.factor(g)))
+  stats::setNames(paste0(names(tab), " (n = ", as.integer(tab), ")"), names(tab))
+}
+
+# n's make the labels long; wrapping keeps the legend inside the plotting frame
+legend_rows <- function(n) guides(color = guide_legend(nrow = n, byrow = TRUE),
+                                  fill  = guide_legend(nrow = n, byrow = TRUE))
+
+# Every plot carries the sampling caveat, since the n's alone do not say the set was drawn
+match_note <- if (MATCH_NEGATIVES)
+  "negative control size-matched to the promoted set, set.seed(9)" else
+  "full negative control pool (not size-matched)"
 ```
 
 # Section 4: Density plots
@@ -158,24 +234,32 @@ cat("negative genes with features:", sum(d$group == "Negative control"),
 ```{r density-grid, fig.width = 11, fig.height = 6}
 gc_cols <- c("utr5_gc", "cds_gc", "utr3_gc", "transcript_gc", "gc1", "gc2", "gc3")
 
-gc_long <- d %>%
+# Complete cases across all GC columns, so the legend's n is exact in every facet rather
+# than an upper bound. The missingness is in utr3_gc / transcript_gc (transcripts with no
+# annotated 3'UTR); utr5_gc, cds_gc and gc1/gc2/gc3 are complete.
+d_gc <- d %>% tidyr::drop_na(dplyr::all_of(gc_cols))
+cat("dropped for incomplete GC features:", nrow(d) - nrow(d_gc), "transcripts\n")
+print(colSums(is.na(d[, gc_cols])))
+print(dplyr::count(d_gc, group) %>% as.data.frame(), row.names = FALSE)
+
+gc_long <- d_gc %>%
   dplyr::select(group, dplyr::all_of(gc_cols)) %>%
   tidyr::pivot_longer(-group, names_to = "feature", values_to = "gc") %>%
-  dplyr::filter(!is.na(gc)) %>%
   dplyr::mutate(feature = factor(feature, levels = gc_cols))
+
+gc_labels <- label_with_n(d_gc$group)
 
 p_gc <- ggplot(gc_long, aes(x = gc, fill = group, color = group)) +
   geom_density(alpha = 0.15, linewidth = 0.8) +
   facet_wrap(~ feature, scales = "free_y", ncol = 4) +
-  scale_fill_manual(values = group_colors, name = NULL) +
-  scale_color_manual(values = group_colors, name = NULL) +
+  scale_fill_manual(values = group_colors, labels = gc_labels, name = NULL) +
+  scale_color_manual(values = group_colors, labels = gc_labels, name = NULL) +
   labs(title = "GC content by region and codon position, hypoxia 1hr",
-       subtitle = paste0("n = ", sum(d$group == "eIF3d hypoxia promotes"),
-                         " eIF3d-promoted, ", sum(d$group == "Negative control"),
-                         " negative control, ", sum(d$group == "All other genes"), " other"),
+       subtitle = match_note,
        x = "GC content (%)", y = "Density") +
   theme_classic(base_size = 12) +
-  theme(legend.position = "top")
+  theme(legend.position = "top") +
+  legend_rows(1)
 
 print(p_gc)
 if (SAVE_PLOTS) ggsave(here("plots", "83_gc_by_region_3d_promoted_hypoxia_1hr.pdf"),
@@ -188,11 +272,14 @@ csc_d <- d %>% dplyr::filter(!is.na(csc))
 wt_csc <- wilcox.test(csc_d$csc[csc_d$group == "eIF3d hypoxia promotes"],
                       csc_d$csc[csc_d$group == "Negative control"])
 
+csc_labels <- label_with_n(csc_d$group)
+
 p_csc <- ggplot(csc_d, aes(x = csc, fill = group, color = group)) +
   geom_density(alpha = 0.15, linewidth = 0.8) +
-  scale_fill_manual(values = group_colors, name = NULL) +
-  scale_color_manual(values = group_colors, name = NULL) +
+  scale_fill_manual(values = group_colors, labels = csc_labels, name = NULL) +
+  scale_color_manual(values = group_colors, labels = csc_labels, name = NULL) +
   labs(title = "CSC, eIF3d-promoted vs negative control vs all other genes",
+       subtitle = match_note,
        x = "CSC (codon stabilisation coefficient)", y = "Density") +
   annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
            label = paste0("promoted vs negative control\np = ",
@@ -200,7 +287,8 @@ p_csc <- ggplot(csc_d, aes(x = csc, fill = group, color = group)) +
                           "\nn = ", sum(csc_d$group == "eIF3d hypoxia promotes"), " / ",
                           sum(csc_d$group == "Negative control"))) +
   theme_classic(base_size = 12) +
-  theme(legend.position = "top")
+  theme(legend.position = "top") +
+  legend_rows(2)
 
 print(p_csc)
 if (SAVE_PLOTS) ggsave(here("plots", "83_csc_3d_promoted_hypoxia_1hr.pdf"),
@@ -216,14 +304,13 @@ distribution shifts more clearly than densities when the groups differ in size.
 p_cdf <- ggplot(gc_long, aes(x = gc, color = group)) +
   stat_ecdf(linewidth = 0.8) +
   facet_wrap(~ feature, scales = "free_x", ncol = 4) +
-  scale_color_manual(values = group_colors, name = NULL) +
+  scale_color_manual(values = group_colors, labels = gc_labels, name = NULL) +
   labs(title = "GC content, cumulative distributions",
-       subtitle = paste0("n = ", sum(d$group == "eIF3d hypoxia promotes"),
-                         " eIF3d-promoted, ", sum(d$group == "Negative control"),
-                         " negative control, ", sum(d$group == "All other genes"), " other"),
+       subtitle = match_note,
        x = "GC content (%)", y = "Cumulative fraction") +
   theme_classic(base_size = 12) +
-  theme(legend.position = "top")
+  theme(legend.position = "top") +
+  legend_rows(1)
 
 print(p_cdf)
 if (SAVE_PLOTS) ggsave(here("plots", "83_gc_cdf_3d_promoted_hypoxia_1hr.pdf"),
@@ -253,6 +340,9 @@ stats <- purrr::map_dfr(all_features, function(f) {
 
   tibble::tibble(
     feature          = f,
+    n_promoted       = length(x_pos),
+    n_negctrl        = length(x_neg),
+    n_other          = length(x_oth),
     median_promoted  = round(median(x_pos), 3),
     median_negctrl   = round(median(x_neg), 3),
     median_other     = round(median(x_oth), 3),
@@ -274,8 +364,21 @@ if (SAVE_PLOTS) {
 
 # Section 7: Promoted genes split by deltaTE category, against the two backgrounds
 
-Only the **promoted** set is split by deltaTE category. The negative control and the rest
-of the transcriptome are each shown as a single reference curve.
+The categories come from `categorize_translation_changes()` in `code/functions.R`, which
+labels each gene by **which of the three contrasts is significant** - RNA, RIBO and TE.
+Every call site in this project passes `lfc_cutoff = 0`, so "significant" here means
+`padj < 0.05` alone, with no magnitude filter:
+
+| category | RNA | RIBO | TE | reading |
+|---|---|---|---|---|
+| **Exclusive** | ns | sig | sig | footprints move, mRNA does not - a pure translational change |
+| **Buffered** | sig | sig or ns | sig | mRNA moves and the ribosome does not follow it 1:1, so TE shifts |
+| **TE_only** | ns | ns | sig | neither arm clears significance on its own; only the ratio does |
+| **Forwarded** | sig | sig | ns | mRNA moves and footprints track it exactly - no TE change |
+| **Not_sig** | ns | ns | ns | nothing moves |
+
+Only the **promoted** set is split by category. The negative control and the rest of the
+transcriptome are each shown as a single reference curve.
 
 That asymmetry is deliberate, and it is forced by the data: promoted genes were selected
 on `te_padj < 0.05`, so they can only be Exclusive, Buffered or TE_only. Genes that are
@@ -284,10 +387,13 @@ splitting them by category would compare categories that cannot co-occur.
 
 The question the split answers is whether the promoted set's composition depends on
 **which arm drove its TE change**: Exclusive (RIBO moves, RNA does not) against Buffered
-(the RNA arm is driving it).
+(the RNA arm is driving it). TE_only is a residual bucket of ~12 genes here - its curve is
+plotted for completeness but is not interpretable, which is exactly what the legend n
+makes visible.
 
 ```{r deltate-category-gc, fig.width = 13, fig.height = 5}
 de_cat <- de %>% dplyr::select(gene_id_clean, category)
+stopifnot("category table must be one row per gene" = !any(duplicated(de_cat$gene_id_clean)))
 
 d_cat <- d %>%
   dplyr::left_join(de_cat, by = "gene_id_clean") %>%
@@ -306,29 +412,44 @@ plot_cols <- c("Promoted: Exclusive" = "red",
                "Negative control"    = "black",
                "All other genes"     = "grey70")
 
-d_cat <- d_cat %>% dplyr::mutate(plot_group = factor(plot_group, levels = names(plot_cols)))
+d_cat <- d_cat %>%
+  dplyr::mutate(plot_group = factor(plot_group, levels = names(plot_cols)))
 
 cat("n per group:\n")
 print(dplyr::count(d_cat, plot_group) %>% as.data.frame(), row.names = FALSE)
 
-long_cat <- d_cat %>%
+# The three promoted categories must account for the whole promoted set: a promoted gene
+# with a missing or Forwarded/Not_sig category would be dropped silently by the filter above.
+stopifnot("promoted genes lost when splitting by category" =
+            sum(grepl("^Promoted", d_cat$plot_group)) == n_pos)
+
+# Complete cases, so the legend n holds in every facet
+d_cat_gc <- d_cat %>% tidyr::drop_na(dplyr::all_of(gc_cols))
+cat("\nn per group with complete GC features:\n")
+print(dplyr::count(d_cat_gc, plot_group) %>% as.data.frame(), row.names = FALSE)
+
+# Densities normalise to unit area, so a curve's shape does not reveal how few genes are
+# behind it - the per-group n belongs in the legend, next to each colour.
+cat_labels <- label_with_n(d_cat_gc$plot_group)
+
+long_cat <- d_cat_gc %>%
   tidyr::pivot_longer(dplyr::all_of(gc_cols), names_to = "feature", values_to = "gc") %>%
-  dplyr::filter(!is.na(gc)) %>%
   dplyr::mutate(feature = factor(feature, levels = gc_cols))
 
 # unfilled lines: five overlapping groups make shaded densities unreadable
 p_cat <- ggplot(long_cat, aes(x = gc, color = plot_group)) +
   geom_density(fill = NA, linewidth = 0.8) +
   facet_wrap(~ feature, scales = "free_y", ncol = 4) +
-  scale_color_manual(values = plot_cols, name = NULL) +
+  scale_color_manual(values = plot_cols, labels = cat_labels, name = NULL) +
   labs(title = "GC content: eIF3d-promoted genes by deltaTE category, vs both backgrounds",
        subtitle = paste0("hypoxia 1hr   |   promoted n = ",
-                         sum(grepl("^Promoted", d_cat$plot_group)),
-                         ", negative control n = ", sum(d_cat$plot_group == "Negative control"),
-                         ", other n = ", sum(d_cat$plot_group == "All other genes")),
+                         sum(grepl("^Promoted", d_cat_gc$plot_group)),
+                         " total   |   ", match_note),
        x = "GC content (%)", y = "Density") +
   theme_classic(base_size = 11) +
-  theme(legend.position = "top", strip.text = element_text(size = 9))
+  theme(legend.position = "top", strip.text = element_text(size = 9),
+        legend.text = element_text(size = 9)) +
+  legend_rows(2)
 
 print(p_cat)
 if (SAVE_PLOTS) ggsave(here("plots", "83_gc_by_deltate_category_3d_promoted.pdf"),
@@ -336,15 +457,18 @@ if (SAVE_PLOTS) ggsave(here("plots", "83_gc_by_deltate_category_3d_promoted.pdf"
 ```
 
 ```{r deltate-category-csc, fig.width = 7, fig.height = 4.5}
-p_cat_csc <- d_cat %>%
-  dplyr::filter(!is.na(csc)) %>%
-  ggplot(aes(x = csc, color = plot_group)) +
+csc_cat <- d_cat %>% dplyr::filter(!is.na(csc))
+cat_csc_labels <- label_with_n(csc_cat$plot_group)
+
+p_cat_csc <- ggplot(csc_cat, aes(x = csc, color = plot_group)) +
   geom_density(fill = NA, linewidth = 0.8) +
-  scale_color_manual(values = plot_cols, name = NULL) +
+  scale_color_manual(values = plot_cols, labels = cat_csc_labels, name = NULL) +
   labs(title = "CSC by deltaTE category, vs both backgrounds",
+       subtitle = match_note,
        x = "CSC (codon stabilisation coefficient)", y = "Density") +
   theme_classic(base_size = 12) +
-  theme(legend.position = "top")
+  theme(legend.position = "top", legend.text = element_text(size = 9)) +
+  legend_rows(3)
 
 print(p_cat_csc)
 if (SAVE_PLOTS) ggsave(here("plots", "83_csc_by_deltate_category_3d_promoted.pdf"),
@@ -353,12 +477,23 @@ if (SAVE_PLOTS) ggsave(here("plots", "83_csc_by_deltate_category_3d_promoted.pdf
 
 ## Medians per group
 
+Medians drop NAs per feature, so the group size is an upper bound on what any one column
+is computed from. The n's actually behind each median are printed underneath.
+
 ```{r category-medians}
+cat("medians:\n")
 d_cat %>%
   dplyr::group_by(plot_group) %>%
-  dplyr::summarise(n = dplyr::n(),
-                   across(dplyr::all_of(c(gc_cols, "csc")),
+  dplyr::summarise(across(dplyr::all_of(c(gc_cols, "csc")),
                           ~ round(median(.x, na.rm = TRUE), 2)),
+                   .groups = "drop") %>%
+  as.data.frame() %>% print(row.names = FALSE)
+
+cat("\nn behind each median (non-missing values per feature):\n")
+d_cat %>%
+  dplyr::group_by(plot_group) %>%
+  dplyr::summarise(n_group = dplyr::n(),
+                   across(dplyr::all_of(c(gc_cols, "csc")), ~ sum(!is.na(.x))),
                    .groups = "drop") %>%
   as.data.frame() %>% print(row.names = FALSE)
 ```
@@ -396,12 +531,20 @@ change - the same diagnostic applied to the Teleman sets in notebook 80.
 
 ---
 
-# Section 7: Comparison to the Teleman 4E sets
+# Section 8: Comparison to the Teleman 4E sets
 
-For context: in the Teleman eIF4E data the resistant and sensitive sets differ by roughly
-19 points of CDS GC and 34 points of GC3, and a single GC3 threshold classifies 90% of
-transcripts correctly. The table above shows whether the eIF3d comparison is anywhere
-near that scale.
+For scale: in the Teleman eIF4E data the 4E-**resistant** set is GC-**rich** relative to
+the 4E-sensitive set - about 19 points of CDS GC and 34 points of GC3 higher (GC3 roughly
+73% vs 39%, notebooks 79 and 82) - and a single GC3 threshold classifies 90% of
+transcripts correctly.
+
+Both the magnitude and the **sign** are worth reading off the table below. The gap here is
+printed as promoted minus negative control, so a negative number means the eIF3d-promoted
+set is GC-*poor* relative to transcripts eIF3d does not regulate - the opposite direction
+from the 4E-resistant set, at roughly a third of the magnitude. The two comparisons are
+not strictly parallel (resistant vs sensitive is extreme-vs-extreme; promoted vs negative
+control is regulated-vs-unregulated), so this is a scale check, not a like-for-like
+contrast.
 
 ```{r scale-comparison}
 gap <- stats %>%
@@ -412,15 +555,29 @@ gap <- stats %>%
 
 print(as.data.frame(gap), row.names = FALSE)
 
-cat("\nFor reference, the Teleman 4E-resistant vs 4E-sensitive gaps were:\n")
+# Sanity check on the direction claimed in the prose above: eIF3d-promoted mRNAs are the
+# GC-poor side of this comparison, unlike the 4E-resistant set.
+stopifnot("eIF3d-promoted set is not GC-poor relative to the negative control" =
+            all(gap$gap_promoted_minus_negctrl < 0))
+
+cat("\nFor reference, the Teleman gaps (4E-resistant minus 4E-sensitive) were:\n")
 cat("  cds_gc  +18.4 points, AUC 0.978\n")
 cat("  gc3     +33.9 points, AUC 0.962\n")
+cat("i.e. resistant mRNAs are GC-rich; here the promoted mRNAs are GC-poor.\n")
 ```
+
+Note that `auc_vs_negctrl` is folded to the 0.5-1 range, so it carries magnitude only -
+the `higher_in` column in Section 6 carries the direction.
 
 # Summary
 
-The statistics table is the deliverable. Note that the negative control set is
-**eIF3d-unaffected**, not a random background, so the promoted-vs-negative comparison
-asks whether eIF3d targets differ compositionally from transcripts eIF3d demonstrably
-does not regulate. The promoted-vs-other comparison is the looser test against the rest
-of the transcriptome.
+The statistics table is the deliverable. Two things about the comparison itself:
+
+- The negative control set is **eIF3d-unaffected**, not a random background, so
+  promoted-vs-negative asks whether eIF3d targets differ compositionally from transcripts
+  eIF3d demonstrably does not regulate. Promoted-vs-other is the looser test against the
+  rest of the transcriptome.
+- With `match_negatives = TRUE` that negative set is the **same 1,436 genes the classifier
+  in notebook 07 trains on** - same CSVs, same restriction to the feature matrix, same
+  `set.seed(9)` draw - so these distributions describe the model's actual input rather
+  than a differently sized pool.
