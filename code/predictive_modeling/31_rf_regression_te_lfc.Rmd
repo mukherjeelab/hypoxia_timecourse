@@ -1,5 +1,5 @@
 ---
-title: "`r paste0('Random Forest Regression: TE LFC Prediction (eIF3', params$gene, ', ', tools::toTitleCase(params$condition), ', ', params$timepoint, ', ', params$feature_set, ')')`"
+title: "`r if (isTRUE(nzchar(params$dataset_label))) paste0('Random Forest Regression: continuous outcome (', params$dataset_label, ', ', params$feature_set, ')') else paste0('Random Forest Regression: TE LFC Prediction (eIF3', params$gene, ', ', tools::toTitleCase(params$condition), ', ', params$timepoint, ', ', params$feature_set, ')')`"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
@@ -11,12 +11,23 @@ params:
   clip_mode: "aggregate"
   exclude_4e_features: false
   exclude_own_te_features: true
+  # --- overrides for datasets outside the MDA-MB-231 si3d/si3e pipeline ---
+  # All default to "" / the existing column names, so leaving them alone reproduces
+  # every previous run of this notebook byte-identically.
+  feature_matrix_path: ""      # "" = pick the matrix from feature_set (below)
+  outcome_csv: ""              # "" = build translation_categories_... from gene/condition/timepoint
+  outcome_col: "te_lfc"        # name of the continuous outcome column in outcome_csv
+  outcome_padj_col: "te_padj"  # name of its adjusted p-value column
+  dataset_label: ""            # "" = label plots/outputs as eIF3d/eIF3e; else used verbatim
 editor_options:
   chunk_output_type: console
 ---
 
 ```{r}
-rm(params)
+# Interactive use only: `params` is a function outside knitr, so it must be cleared before
+# the derived_values chunk can define it as a list. During a knit the YAML params object
+# must survive, hence the guard.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
 ```
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
@@ -36,6 +47,23 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 # eIF3d normoxia with clip_split features:
 #   condition="normoxia", timepoint="normoxia", feature_set="clip_split"
 #
+# Teleman 4E inhibition (HeLa), continuous TE log2FC over the FULL distribution:
+#   the regression counterpart to the notebook 07 tails classifier. The matrix already
+#   holds all 11,286 genes, so nothing new needs building. Set:
+#     feature_matrix_path = "feature_matrix_teleman_4e.rds",
+#     outcome_csv         = "teleman_riboseq_te_all_genes.csv",
+#     outcome_col         = "log2FoldChange",   # positive = TE held up = 4E-resistant
+#     outcome_padj_col    = "padj",
+#     dataset_label       = "teleman_4e",
+#     feature_set         = "full", exclude_own_te_features = FALSE
+#   (feature_set only picks a matrix and gates the k-mer drop; with feature_matrix_path
+#    set, any label not in the k-mer list works. "full" keeps the suffix readable:
+#    teleman_4e_full_clipaggregate_regression)
+#   The two exclude_* flags are no-ops here: notebook 78 never built a 4E-derived or
+#   own-TE column. Baseline to beat is nb88's lm(lfc ~ gc3 + log2_cds_length), test
+#   R2 = 0.348. Note the <50% coverage filter drops hia2026_ctrl_halflife and
+#   hia2026_dhx29_halflife_logfc (both 42% complete), leaving ~30 features.
+#
 if (!isTRUE(getOption("knitr.in.progress"))) {
   params <- list(
     gene        = "3d",                  # "3d" | "3e"
@@ -53,14 +81,32 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
                                          # "kozak"             — Kozak-focused features
                                          # "cnot3"             — CNOT3-focused features
     clip_mode   = "aggregate",           # "aggregate" | "individual" | "both"
-    exclude_4e_features     = FALSE,     # TRUE = remove eIF4E circular features
-    exclude_own_te_features = TRUE       # TRUE = remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
+    exclude_4e_features     = TRUE,     # TRUE = remove eIF4E circular features
+    exclude_own_te_features = TRUE,      # TRUE = remove own-data TE features (indiv_te_*, delta_te_*, sig_*)
                                          # recommended: these are correlated with the outcome
+    # Overrides for datasets outside the MDA-MB-231 pipeline; "" = existing behaviour.
+    feature_matrix_path = "feature_matrix_teleman_4e.rds",            # e.g. "feature_matrix_teleman_4e.rds"
+    outcome_csv         = "teleman_riboseq_te_all_genes.csv",            # e.g. "teleman_riboseq_te_all_genes.csv"
+    outcome_col         = "log2FoldChange",      # e.g. "log2FoldChange"
+    outcome_padj_col    = "padj",     # e.g. "padj"
+    dataset_label       = "teleman_4e"             # e.g. "teleman_4e"
   )
 }
 
-# Feature matrix selection (same logic as nb07)
-feature_matrix_rds <- if (params$feature_set == "te_lfc") {
+# Resolve the overrides into local constants. `params` itself is never modified, since it
+# is supplied read-only by knitr; an older param list simply falls back to the defaults.
+`%||%`             <- function(a, b) if (is.null(a)) b else a
+FEATURE_MATRIX_PATH <- params$feature_matrix_path %||% ""
+OUTCOME_CSV         <- params$outcome_csv         %||% ""
+OUTCOME_COL         <- params$outcome_col         %||% "te_lfc"
+OUTCOME_PADJ_COL    <- params$outcome_padj_col    %||% "te_padj"
+DATASET_LABEL       <- params$dataset_label       %||% ""
+
+# Feature matrix selection (same logic as nb07). An explicit feature_matrix_path wins,
+# which is how non-231 matrices (e.g. the Teleman HeLa build from nb78) are loaded.
+feature_matrix_rds <- if (nzchar(FEATURE_MATRIX_PATH)) {
+  FEATURE_MATRIX_PATH
+} else if (params$feature_set == "te_lfc") {
   "feature_matrix_te_lfc.rds"
 } else if (params$feature_set == "codon_optimality") {
   "feature_matrix_codon_optimality.rds"
@@ -81,22 +127,57 @@ feature_matrix_rds <- if (params$feature_set == "te_lfc") {
 # Outcome CSV: siGENE vs sictrl TE LFC for all genes (positive = promoted by eIF3d/e)
 # Special case: si3e normoxia 1and4hr only has TE results (no RNA/ribo/categories),
 # so load the TE-only file (same te_lfc / te_padj columns, just a different prefix)
-te_lfc_csv <- if (params$gene == "3e" && params$timepoint == "1and4hr") {
+te_lfc_csv <- if (nzchar(OUTCOME_CSV)) {
+  OUTCOME_CSV
+} else if (params$gene == "3e" && params$timepoint == "1and4hr") {
   paste0("te_si3e_vs_sictrl_", params$condition, "_", params$timepoint, ".csv")
 } else {
   paste0("translation_categories_si", params$gene, "_vs_sictrl_",
          params$condition, "_", params$timepoint, ".csv")
 }
 
-gene_label <- paste0("eIF", params$gene)  # "eIF3d" or "eIF3e"
+# Label used in plot axes and legends. dataset_label replaces the eIF3d/eIF3e wording
+# entirely, since "promoted by eIF3d" is wrong for any other contrast.
+gene_label <- if (nzchar(DATASET_LABEL)) DATASET_LABEL else paste0("eIF", params$gene)
 
-suffix <- paste0("eif", params$gene, "_", params$condition, "_", params$timepoint,
-                 "_", params$feature_set, "_clip", params$clip_mode, "_regression",
-                 if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
-                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
+# Axis/subtitle wording. For an eIF3d/eIF3e run the outcome really is "TE LFC, positive =
+# promoted by eIF3x"; for any other dataset that sentence would be false, so the wording
+# falls back to the neutral form and the run identifies itself by dataset_label alone.
+outcome_axis_label <- function(prefix) {
+  if (nzchar(DATASET_LABEL)) {
+    paste0(prefix, " outcome")
+  } else {
+    paste0(prefix, " TE LFC (positive = promoted by ", gene_label, ")")
+  }
+}
+promoted_label <- if (nzchar(DATASET_LABEL)) {
+  "Precision (fraction in the positive tail)"
+} else {
+  paste0("Precision (fraction promoted by ", gene_label, ")")
+}
+run_subtitle <- if (nzchar(DATASET_LABEL)) {
+  paste0(DATASET_LABEL, " | ", params$feature_set)
+} else {
+  paste0(gene_label, " | ", tools::toTitleCase(params$condition), " | ", params$timepoint)
+}
+
+# Output suffix. A dataset_label run gets its own namespace so it can never overwrite the
+# saved models, importance tables or plots of an existing eIF3d/eIF3e run.
+suffix <- paste0(
+  if (nzchar(DATASET_LABEL)) DATASET_LABEL
+  else paste0("eif", params$gene, "_", params$condition, "_", params$timepoint),
+  "_", params$feature_set, "_clip", params$clip_mode, "_regression",
+  if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
+  if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
+
+# This chunk runs before the library block, so `here` is namespace-qualified.
+stopifnot("feature matrix not found" =
+  file.exists(here::here("output", "predictive_modeling", feature_matrix_rds)))
+stopifnot("outcome CSV not found" = file.exists(here::here("output", te_lfc_csv)))
 
 cat("Feature matrix:", feature_matrix_rds, "\n")
 cat("Outcome CSV:", te_lfc_csv, "\n")
+cat("Outcome column:", OUTCOME_COL, "/", OUTCOME_PADJ_COL, "\n")
 cat("Output suffix:", suffix, "\n")
 ```
 
@@ -136,9 +217,20 @@ features <- readRDS(here("output", "predictive_modeling", feature_matrix_rds)) %
 cat("Feature matrix:", nrow(features), "genes x", ncol(features), "columns\n")
 
 # Outcome: siGENE vs sictrl TE LFC for all genes (positive = promoted by eIF3d/e)
-te_lfc_data <- read_csv(here("output", te_lfc_csv), show_col_types = FALSE) %>%
+outcome_raw <- read_csv(here("output", te_lfc_csv), show_col_types = FALSE)
+stopifnot("outcome column not in outcome CSV" = OUTCOME_COL %in% names(outcome_raw))
+stopifnot("outcome padj column not in outcome CSV" = OUTCOME_PADJ_COL %in% names(outcome_raw))
+stopifnot("outcome CSV has no gene_id column" = "gene_id" %in% names(outcome_raw))
+
+# sub() on an already-unversioned gene_id is a no-op, so this handles both conventions.
+te_lfc_data <- outcome_raw %>%
   mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
-  dplyr::select(gene_id_clean, outcome = te_lfc, outcome_padj = te_padj)
+  dplyr::select(gene_id_clean,
+                outcome      = dplyr::all_of(OUTCOME_COL),
+                outcome_padj = dplyr::all_of(OUTCOME_PADJ_COL))
+stopifnot("outcome is not numeric" = is.numeric(te_lfc_data$outcome))
+stopifnot("non-finite outcome values" =
+  all(is.finite(te_lfc_data$outcome[!is.na(te_lfc_data$outcome)])))
 
 cat("Outcome file:", nrow(te_lfc_data), "genes\n")
 cat("Genes with non-NA outcome:", sum(!is.na(te_lfc_data$outcome)), "\n")
@@ -333,13 +425,25 @@ pred_test <- predict(rf_model, test_data[, feature_cols])$predictions
 actual    <- test_data$outcome
 
 # Regression metrics
+# Two different quantities, both called R2 in the literature:
+#   r2_test          = squared Pearson correlation. Free of scale and bias, so a
+#                      perfectly rank-ordered but compressed prediction still scores high.
+#   r2_var_explained = 1 - SS_res/SS_tot, the standard regression R2. Penalises the scale
+#                      compression random forests always show, since predictions are
+#                      averages over leaves and so span a narrower range than the data.
+# The fitted line sitting shallower than y = x on the scatter below IS that compression;
+# only the second number reflects it. Notebook 88's lm baseline uses variance-explained,
+# so compare against that one.
 r2_test   <- cor(pred_test, actual)^2
+r2_var_explained <- 1 - sum((actual - pred_test)^2) /
+                        sum((actual - mean(train_data$outcome))^2)
 rmse_test <- sqrt(mean((pred_test - actual)^2))
 pearson_r <- cor(pred_test, actual, method = "pearson")
 spearman_r <- cor(pred_test, actual, method = "spearman")
 
 cat("Test Set Metrics:\n")
-cat("  R²:       ", round(r2_test,    4), "\n")
+cat("  R² (squared correlation):", round(r2_test, 4), "\n")
+cat("  R² (variance explained):", round(r2_var_explained, 4), "\n")
 cat("  RMSE:     ", round(rmse_test,  4), "\n")
 cat("  Pearson r:", round(pearson_r,  4), "\n")
 cat("  Spearman ρ:", round(spearman_r, 4), "\n")
@@ -356,15 +460,17 @@ p_scatter <- ggplot(scatter_df, aes(x = actual, y = predicted)) +
   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
   geom_smooth(method = "lm", se = TRUE, color = "#E69F00", linewidth = 0.8) +
   annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5, size = 3.5,
-           label = paste0(tools::toTitleCase(params$condition), " | ", params$timepoint,
-                          "\nR\u00b2 = ", round(r2_test, 3),
+           label = paste0(run_subtitle,
+                          "\nn = ", nrow(scatter_df), " held-out genes",
+                          "\nR\u00b2 (squared correlation) = ", round(r2_test, 3),
+                          "\nR\u00b2 (variance explained) = ", round(r2_var_explained, 3),
                           "  |  Pearson r = ", round(pearson_r, 3),
                           "  |  Spearman rho = ", round(spearman_r, 3))) +
   theme_cowplot() +
   labs(
     title = "RF Regression: Predicted vs Observed TE LFC",
-    x = paste0("Observed TE LFC (positive = promoted by ", gene_label, ")"),
-    y = paste0("Predicted TE LFC (positive = promoted by ", gene_label, ")")
+    x = outcome_axis_label("Observed"),
+    y = outcome_axis_label("Predicted")
   )
 
 print(p_scatter)
@@ -438,9 +544,9 @@ p_preck <- ggplot(prec_df, aes(x = k, y = precision)) +
   theme_cowplot() +
   labs(
     title    = "Precision @ K: Ranking Model Recovery of Promoted Genes",
-    subtitle = paste0(gene_label, " | ", tools::toTitleCase(params$condition), " | ", params$timepoint),
+    subtitle = run_subtitle,
     x        = "Top K genes (ranked by predicted TE LFC)",
-    y        = paste0("Precision (fraction promoted by ", gene_label, ")")
+    y        = promoted_label
   )
 
 print(p_preck)

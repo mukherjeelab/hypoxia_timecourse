@@ -1139,6 +1139,25 @@ cat("Codons changed     | 0         |", n_adapted_changed,
 ```
 
 ```{r plot_design_summary, fig.width=5, fig.height=4.5}
+# One palette for the four NanoLuc constructs, used by every construct figure in
+# this notebook (64f bars, 64h-j density vlines, 64k hlines) so a variant reads
+# as the same colour throughout.
+#
+# No construct colour may reuse a gene-group colour (#E69F00 / grey40 / grey80),
+# or a construct line reads as a gene group. 3d-Adapted is a true red (#CC0000)
+# rather than Okabe-Ito vermillion (#D55E00) for the reason notebook 68
+# documents: vermillion sits close enough to #E69F00 that it still reads as the
+# eIF3d-promotes group.
+construct_variants <- c("Original NanoLuc", "3d-Adapted", "3d-Anti-adapted", "3d-Neg-ctrl")
+construct_palette  <- c(
+  "Original NanoLuc" = "#CC79A7",  # reddish purple
+  "3d-Adapted"       = "#CC0000",  # true red
+  "3d-Anti-adapted"  = "#0072B2",  # dark blue
+  "3d-Neg-ctrl"      = "#009E73"   # bluish green
+)
+stopifnot("construct palette must cover every variant" =
+  setequal(names(construct_palette), construct_variants))
+
 design_summary <- tibble(
   variant    = factor(
     c("Original\nNanoLuc", "3d-Adapted", "3d-Anti-adapted", "3d-Neg-ctrl"),
@@ -1146,7 +1165,8 @@ design_summary <- tibble(
   ),
   gc3_pct    = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted, gc3_negctrl),
   mean_rscu  = c(mean_rscu_orig, mean_rscu_adapted, mean_rscu_anti, mean_rscu_negctrl),
-  colour     = c("#56B4E9", "#E69F00", "#009E73", "#CC79A7")
+  # Bar order matches construct_variants; the labels only differ by a line break.
+  colour     = unname(construct_palette[construct_variants])
 )
 
 p_design_gc3 <- ggplot(design_summary, aes(x = variant, y = gc3_pct, fill = variant)) +
@@ -1206,21 +1226,16 @@ gc_pct_adapted <- as.numeric(letterFrequency(DNAString(adapted_cds),     "GC", a
 gc_pct_anti    <- as.numeric(letterFrequency(DNAString(antiadapted_cds), "GC", as.prob = TRUE)) * 100
 gc_pct_negctrl <- as.numeric(letterFrequency(DNAString(negctrl_cds),     "GC", as.prob = TRUE)) * 100
 
-# Construct vline colours must NOT reuse any density-curve colour
-# (#E69F00 / grey40 / grey80), or a vertical line reads as a gene group.
-# 3d-Adapted was previously #E69F00 -- same orange as the promoted-gene density.
-# It is now a true red (#CC0000) rather than Okabe-Ito vermillion (#D55E00),
-# for the reason notebook 68 documents: vermillion sits close enough to #E69F00
-# that the line still reads as the eIF3d-promotes group.
+# Colours come from construct_palette (defined with the 64f design summary), so
+# a variant is the same colour in every figure here.
 construct_lines <- tibble(
-  variant    = factor(c("Original NanoLuc", "3d-Adapted", "3d-Anti-adapted", "3d-Neg-ctrl"),
-                      levels = c("Original NanoLuc", "3d-Adapted", "3d-Anti-adapted", "3d-Neg-ctrl")),
+  variant    = factor(construct_variants, levels = construct_variants),
   cds_length = nchar(nanoluc_cds_orf) / 1000,
   gc_pct     = c(gc_pct_orig, gc_pct_adapted, gc_pct_anti, gc_pct_negctrl),
   gc3_pct    = c(nanoluc_gc3, gc3_adapted, gc3_antiadapted, gc3_negctrl),
-  color      = c("#0072B2", "#CC0000", "#CC79A7", "#009E73")
+  color      = unname(construct_palette[construct_variants])
 )
-construct_colors <- setNames(construct_lines$color, as.character(construct_lines$variant))
+construct_colors <- construct_palette[construct_variants]
 
 cat("Construct GC% :", round(construct_lines$gc_pct, 1), "\n")
 cat("Construct GC3%:", round(construct_lines$gc3_pct, 1), "\n")
@@ -1228,36 +1243,57 @@ cat("Construct CDS length:", construct_lines$cds_length[1], "kb (all equal)\n")
 
 # The neg-ctrl is a within-AA synonymous shuffle of the original, so its codon
 # multiset -- and therefore its GC%, GC3% and length -- is identical to Original
-# NanoLuc. Their vlines coincide exactly; drawing Original last and dashed is the
-# only way both stay visible.
+# NanoLuc, and all four constructs share one length. Coincident vlines are drawn
+# side by side rather than stacked (see make_density below).
 stopifnot("neg-ctrl GC/GC3 should equal original by construction" =
   all(abs(c(gc_pct_negctrl - gc_pct_orig, gc3_negctrl - nanoluc_gc3)) < 1e-9))
 cat("Note: 3d-Neg-ctrl GC%/GC3% are identical to Original NanoLuc (synonymous",
-    "shuffle preserves codon counts); Original is drawn dashed on top.\n")
+    "shuffle preserves codon counts); the two lines are drawn adjacent.\n")
 
-vline_under <- construct_lines %>% dplyr::filter(variant != "Original NanoLuc")
-vline_over  <- construct_lines %>% dplyr::filter(variant == "Original NanoLuc")
+# Spread any set of constructs sharing an identical value symmetrically about
+# that value, so each stays visible as its own solid line. The shift is ~one
+# line width and is stated in the plot caption -- it is a drawing offset, never
+# a real difference. Ties are exact here (same codon multiset), so rounding to
+# 6 dp is only a float-safety net.
+offset_ties <- function(df, value_col, nudge, group_cols = character(0)) {
+  df %>%
+    group_by(across(all_of(group_cols)), .tie = round(.data[[value_col]], 6)) %>%
+    mutate(.x    = .data[[value_col]] + nudge * (dplyr::row_number() - (dplyr::n() + 1) / 2),
+           .tied = dplyr::n() > 1) %>%
+    ungroup() %>%
+    dplyr::select(-.tie)
+}
 
 make_density <- function(data, x_col, vline_col, x_label, filename, xlim_range = NULL) {
+  # Nudge is a fraction of the *visible* x range, so it renders the same width
+  # on every panel regardless of the metric's units.
+  x_span   <- if (!is.null(xlim_range)) diff(xlim_range) else
+    diff(range(c(data[[x_col]], construct_lines[[vline_col]]), na.rm = TRUE))
+  nudge    <- 0.006 * x_span
+  lines_df <- offset_ties(construct_lines, vline_col, nudge)
+
+  n_tied <- sum(lines_df$.tied)
+  cap    <- if (n_tied > 0) {
+    sprintf(paste("%d constructs have identical %s and are drawn side by side",
+                  "(offset %.3g, not a real difference)"),
+            n_tied, x_label, nudge)
+  } else NULL
+
   p <- ggplot(data, aes(x = .data[[x_col]], colour = group)) +
     geom_density(linewidth = 1) +
-    geom_vline(data = vline_under,
-               aes(xintercept = .data[[vline_col]], colour = variant),
+    geom_vline(data = lines_df, aes(xintercept = .x, colour = variant),
                linewidth = 0.9) +
-    geom_vline(data = vline_over,
-               aes(xintercept = .data[[vline_col]], colour = variant),
-               linewidth = 0.9, linetype = "22") +
-    # Explicit breaks: splitting Original NanoLuc into its own layer otherwise
-    # pushes it to the end of the legend, after the constructs drawn before it.
+    # Explicit breaks so the legend keeps the groups-then-constructs order.
     scale_colour_manual(values = c(group_colors3, construct_colors),
                         breaks = c(names(group_colors3), names(construct_colors)),
                         name = NULL) +
-    labs(x = x_label, y = "Density") +
+    labs(x = x_label, y = "Density", caption = cap) +
     theme_classic(base_size = 16) +
     theme(legend.position = "right",
           axis.title   = element_text(size = 17),
           axis.text    = element_text(size = 15, colour = "black"),
           legend.text  = element_text(size = 14),
+          plot.caption = element_text(size = 11, colour = "grey30", hjust = 0),
           legend.key.height = unit(1.1, "lines"))
   if (!is.null(xlim_range)) p <- p + scale_x_continuous(limits = xlim_range, expand = expansion(mult = c(0, 0.05)))
   print(p)
@@ -1330,12 +1366,20 @@ construct_nuc3 <- imap_dfr(codon_vecs, function(cv, nm) {
     nucleotide = factor(nucleotide, levels = c("A", "U", "G", "C"))
   )
 
-construct_nuc3_colors <- c(
-  "Original NanoLuc" = "#0072B2",
-  "3d-Adapted"       = "#E69F00",
-  "3d-Anti-adapted"  = "#CC79A7",
-  "3d-Neg-ctrl"      = "#009E73"
-)
+construct_nuc3_colors <- construct_palette
+
+# The neg-ctrl is a synonymous shuffle of the original, so its 3rd-position
+# nucleotide composition is identical and the two hlines coincide exactly in
+# every facet. Offset ties within each facet so both stay visible (drawing
+# offset only, stated in the caption).
+nuc3_nudge  <- 0.01 * diff(range(nuc3_gene_df$pct, na.rm = TRUE))
+nuc3_lines  <- offset_ties(construct_nuc3, "pct", nuc3_nudge, group_cols = "nucleotide")
+nuc3_cap    <- if (any(nuc3_lines$.tied)) {
+  sprintf(paste("Constructs with identical composition are drawn side by side",
+                "(offset %.3g%%, not a real difference)"), nuc3_nudge)
+} else NULL
+stopifnot("neg-ctrl 3rd-position composition should equal original" =
+  any(nuc3_lines$.tied))
 
 cat("Construct 3rd-position nucleotide %:\n")
 print(construct_nuc3 %>% pivot_wider(names_from = nucleotide, values_from = pct))
@@ -1343,15 +1387,16 @@ print(construct_nuc3 %>% pivot_wider(names_from = nucleotide, values_from = pct)
 p_nuc3 <- ggplot(nuc3_gene_df, aes(x = group, y = pct)) +
   geom_boxplot(outlier.shape = NA, width = 0.5, fill = "white") +
   geom_jitter(width = 0.15, size = 0.8, alpha = 0.4, colour = "grey40") +
-  geom_hline(data = construct_nuc3,
-             aes(yintercept = pct, colour = variant),
+  geom_hline(data = nuc3_lines,
+             aes(yintercept = .x, colour = variant),
              linewidth = 0.8) +
   facet_wrap(~ nucleotide, nrow = 1) +
   scale_colour_manual(values = construct_nuc3_colors, name = "NanoLuc variant") +
-  labs(x = NULL, y = "% of all codons") +
+  labs(x = NULL, y = "% of all codons", caption = nuc3_cap) +
   theme_classic(base_size = 12) +
   theme(legend.position = "right",
         strip.text      = element_text(face = "bold"),
+        plot.caption    = element_text(size = 9, colour = "grey30", hjust = 0),
         axis.text.x     = element_text(angle = 20, hjust = 1))
 
 print(p_nuc3)

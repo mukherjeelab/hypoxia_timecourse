@@ -1,0 +1,899 @@
+---
+title: "Linear models of 4E resistance from GC3"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  teleman_all_csv: "output/teleman_riboseq_te_all_genes.csv"
+  feature_matrix: "feature_matrix_teleman_4e.rds"
+  pos_csv: "teleman_4e_resistant_TE_1hr_lfc0.5.csv"
+  neg_csv: "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"
+  rf_test_auc: 0.992
+  train_frac: 0.7
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Notebook 07 reaches a test-set AUC of ~0.99 separating the 4E-resistant from the
+4E-sensitive gene sets, and notebook 79 showed that `cds_gc` alone reaches ~0.978 on the
+same task. That raises a question the random forest cannot answer: **how much of 4E
+resistance does GC3 actually explain, and does it explain anything away from the
+extremes?**
+
+This notebook fits explicit linear models, in order of how much they can be trusted:
+
+1. `lm` on the **continuous** TE log2FC across all genes. This is the headline: it is not
+   conditioned on a gene being extreme.
+2. A held-out split of the same model.
+3. **Transfer**: fit on the two tails only, predict the middle. This is the test no
+   earlier notebook has run.
+4. `glm` (logistic) on the tails, for a like-for-like comparison against the notebook 07
+   AUC, plus the calibration curve the forest never reports.
+5. A `baseMean` control for the GC library-preparation artefact notebook 79 flagged.
+
+## Direction convention
+
+This is the Teleman/Roiuk HeLa 4E-BP-inhibition dataset (notebook 76), **not** an
+MDA-MB-231 si3d contrast. The MDA-MB-231 filename wart described in CLAUDE.md does not
+apply here. In `teleman_riboseq_te_all_genes.csv`:
+
+- **positive `log2FoldChange` = TE held up under 4E inhibition = resistant**
+- negative = TE dropped = sensitive
+
+Asserted below on the two genes the paper bolds in Fig 1A (CDKN2B resistant, GLO1
+sensitive).
+
+## Feature choice
+
+`gc3` plus one more term. The second term was chosen by testing every available feature
+as `lfc ~ gc3 + X` over all genes:
+
+| candidate | R2 gain over gc3 alone | Spearman with gc3 |
+|---|---|---|
+| `log2_cds_length` | **+0.067** | -0.11 |
+| `cds_gc` | +0.051 | 0.94 |
+| `gc3_residual` | +0.051 | 0.37 |
+| `hia2026_dhx29_occupancy` | +0.040 | -0.91 |
+| `csc` | +0.031 | 0.24 |
+| `cai`, `tai`, `fop`, kozak, UTR GC | <= +0.02 | - |
+
+`log2_cds_length` wins on both counts: the largest gain, and near-orthogonality to GC3, so
+the two coefficients stay separately interpretable. `cds_gc`, `gc3_residual` and `gc2`
+give a similar gain but are the same compositional axis re-split, and
+`hia2026_dhx29_occupancy` is 0.91-correlated with GC3 and missing for ~22% of genes.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(pROC)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    teleman_all_csv = "output/teleman_riboseq_te_all_genes.csv",
+    feature_matrix  = "feature_matrix_teleman_4e.rds",
+    pos_csv         = "teleman_4e_resistant_TE_1hr_lfc0.5.csv",
+    neg_csv         = "teleman_4e_sensitive_TE_1hr_lfc0.5.csv",
+    rf_test_auc     = 0.992,
+    train_frac      = 0.7,
+    save_plots      = TRUE
+  )
+}
+TELEMAN_ALL <- params$teleman_all_csv
+FEATURE_MATRIX <- params$feature_matrix
+POS_CSV <- params$pos_csv
+NEG_CSV <- params$neg_csv
+RF_TEST_AUC <- params$rf_test_auc
+TRAIN_FRAC <- params$train_frac
+SAVE_PLOTS <- params$save_plots
+
+# eIF3d orange (#E69F00) and eIF3e blue (#56B4E9) are reserved for those two factors
+# (CLAUDE.md), so this notebook uses the same two Okabe-Ito hues as notebooks 76 and 79.
+class_colors <- c("4E-resistant" = "#D55E00",
+                  "middle"       = "grey70",
+                  "4E-sensitive" = "#0072B2")
+
+set.seed(9)
+```
+
+# 1. Data
+
+```{r load}
+te <- read_csv(here(TELEMAN_ALL), show_col_types = FALSE)
+fm <- readRDS(here("output", "predictive_modeling", FEATURE_MATRIX))
+pos <- read_csv(here("output", "genesets", POS_CSV), show_col_types = FALSE)
+neg <- read_csv(here("output", "genesets", NEG_CSV), show_col_types = FALSE)
+
+stopifnot("expected columns missing from the Teleman table" =
+  all(c("gene_id", "symbol", "log2FoldChange", "padj", "baseMean") %in% names(te)))
+stopifnot("expected features missing from the feature matrix" =
+  all(c("gene_id_clean", "gc3", "log2_cds_length") %in% names(fm)))
+```
+
+## Leakage guard
+
+The feature matrix is built by notebook 78, which excludes every eIF4E-derived column by
+construction. Re-assert it here rather than assume it, since the target is 4E resistance.
+
+```{r leakage-guard}
+leaky <- grep("4e_resistance|is_4e|eif4e|^te_|^sig_|^delta_te|^indiv_te",
+              names(fm), ignore.case = TRUE, value = TRUE)
+stopifnot("a 4E-derived or TE column is present in the feature matrix" =
+  length(leaky) == 0)
+cat("no 4E-derived or TE columns in the feature matrix\n")
+```
+
+## Direction check
+
+```{r direction-check}
+lfc_of <- function(g) te$log2FoldChange[match(g, te$symbol)]
+
+stopifnot("CDKN2B is not positive: the resistance sign has flipped" = lfc_of("CDKN2B") > 0)
+stopifnot("GLO1 is not negative: the resistance sign has flipped"   = lfc_of("GLO1")   < 0)
+cat("CDKN2B (paper: resistant) log2FC =", round(lfc_of("CDKN2B"), 3), "\n")
+cat("GLO1   (paper: sensitive) log2FC =", round(lfc_of("GLO1"),   3), "\n")
+```
+
+## Join and classes
+
+```{r join}
+d <- te %>%
+  dplyr::select(gene_id, symbol, log2FoldChange, padj, baseMean) %>%
+  dplyr::inner_join(fm, by = c("gene_id" = "gene_id_clean"),
+                    suffix = c("", "_fm")) %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE                          ~ "middle"),
+    class = factor(class, levels = names(class_colors)))
+
+stopifnot("gene_id is not unique after the join" = !any(duplicated(d$gene_id)))
+stopifnot("resistant and sensitive sets overlap" =
+  length(intersect(pos$ensembl_gene, neg$ensembl_gene)) == 0)
+stopifnot("some positive-set genes were lost in the join" =
+  all(pos$ensembl_gene %in% d$gene_id))
+stopifnot("some negative-set genes were lost in the join" =
+  all(neg$ensembl_gene %in% d$gene_id))
+
+print(dplyr::count(d, class) %>% as.data.frame(), row.names = FALSE)
+```
+
+## Value checks
+
+```{r value-checks}
+stopifnot("gc3 outside [0, 100]"  = all(d$gc3 >= 0 & d$gc3 <= 100, na.rm = TRUE))
+stopifnot("non-finite log2FC"     = all(is.finite(d$log2FoldChange[!is.na(d$log2FoldChange)])))
+stopifnot("non-finite cds length" = all(is.finite(d$log2_cds_length[!is.na(d$log2_cds_length)])))
+stopifnot("baseMean must be positive to log" = all(d$baseMean > 0, na.rm = TRUE))
+
+# GC3 median in [40, 65]% is the project-wide spot-check (CLAUDE.md); this transcript set
+# is HeLa-dominant rather than MDA-MB-231, but the transcriptome-wide value should still
+# land in range.
+cat("GC3 median over all genes:", round(median(d$gc3, na.rm = TRUE), 1), "%\n")
+stopifnot("transcriptome GC3 median out of range" =
+  between(median(d$gc3, na.rm = TRUE), 40, 65))
+```
+
+## The model frame
+
+```{r model-frame}
+md <- d %>%
+  dplyr::filter(!is.na(log2FoldChange), !is.na(gc3), !is.na(log2_cds_length))
+
+cat("genes dropped for missing gc3 or CDS length:", nrow(d) - nrow(md), "\n")
+cat("genes modelled:", nrow(md), "\n")
+print(dplyr::count(md, class) %>% as.data.frame(), row.names = FALSE)
+```
+
+## What "middle" actually is
+
+The tails are the top and bottom 1,195 genes **among those passing `padj < 0.05`**, not a
+plain magnitude cut. So the middle set is not a clean band around zero: it contains genes
+whose log2FC exceeds the tail thresholds but which were not significant. Quantified here,
+because it matters for the transfer test in section 4.
+
+```{r middle-composition}
+mid <- md %>% dplyr::filter(class == "middle")
+res_min <- min(md$log2FoldChange[md$class == "4E-resistant"])
+sen_max <- max(md$log2FoldChange[md$class == "4E-sensitive"])
+
+cat("resistant tail starts at log2FC =", round(res_min, 3), "\n")
+cat("sensitive tail ends at   log2FC =", round(sen_max, 3), "\n")
+cat("middle genes above the resistant threshold:", sum(mid$log2FoldChange > res_min), "\n")
+cat("middle genes below the sensitive threshold:", sum(mid$log2FoldChange < sen_max), "\n")
+cat("...all of them non-significant:",
+    all(mid$padj[abs(mid$log2FoldChange) > 0.5] >= 0.05 |
+        is.na(mid$padj[abs(mid$log2FoldChange) > 0.5])), "\n\n")
+print(round(quantile(mid$log2FoldChange, c(0, .05, .25, .5, .75, .95, 1)), 3))
+```
+
+Section 4 therefore reports the transfer test twice: once on the whole middle set, and
+once on a strict band (`|log2FC| < 0.5`) that removes the underpowered large-effect genes.
+
+# 2. Continuous models over all genes
+
+The headline models. No gene is excluded for being unremarkable, so nothing here is
+conditioned on the outcome.
+
+```{r fit-continuous}
+m_gc3  <- lm(log2FoldChange ~ gc3, data = md)
+m_both <- lm(log2FoldChange ~ gc3 + log2_cds_length, data = md)
+
+summary(m_gc3)
+summary(m_both)
+```
+
+```{r continuous-table}
+model_row <- function(m, label) {
+  s <- summary(m)
+  tibble::tibble(
+    model     = label,
+    n         = length(m$fitted.values),
+    r_squared = round(s$r.squared, 3),
+    adj_r2    = round(s$adj.r.squared, 3),
+    rmse      = round(sqrt(mean(residuals(m)^2)), 3))
+}
+
+fit_tbl <- dplyr::bind_rows(
+  model_row(m_gc3,  "lfc ~ gc3"),
+  model_row(m_both, "lfc ~ gc3 + log2_cds_length"))
+print(as.data.frame(fit_tbl), row.names = FALSE)
+
+cat("\nSpearman gc3 vs log2FC:",
+    round(cor(md$gc3, md$log2FoldChange, method = "spearman"), 3),
+    "  (n =", nrow(md), ")\n")
+
+cat("\nNested model comparison:\n")
+print(anova(m_gc3, m_both))
+```
+
+```{r coef-table}
+coef_tbl <- function(m, label) {
+  broom::tidy(m) %>%
+    dplyr::mutate(model = label,
+                  across(c(estimate, std.error, statistic), ~ signif(.x, 3)),
+                  p.value = format.pval(p.value, digits = 3, eps = 2.2e-16)) %>%
+    dplyr::select(model, term, estimate, std.error, statistic, p.value)
+}
+print(as.data.frame(dplyr::bind_rows(coef_tbl(m_gc3,  "gc3 only"),
+                                     coef_tbl(m_both, "gc3 + length"))),
+      row.names = FALSE)
+```
+
+The `gc3` slope is per **percentage point**, so multiply by 10 to read it as "per 10% GC3".
+
+```{r slope-interpretation}
+b <- coef(m_both)
+cat("per +10% GC3:        ", round(10 * b[["gc3"]], 3), "log2FC\n")
+cat("per doubling of CDS: ", round(b[["log2_cds_length"]], 3), "log2FC\n")
+cat("predicted log2FC at GC3 = 40% vs 75%, CDS length held at the median:\n")
+med_len <- median(md$log2_cds_length)
+print(round(predict(m_both, tibble::tibble(gc3 = c(40, 75), log2_cds_length = med_len)), 3))
+```
+
+## Scatter with the fitted relationship
+
+```{r scatter-gc3, fig.width = 7, fig.height = 5}
+r2_lab <- paste0("lfc ~ gc3\nR2 = ", round(summary(m_gc3)$r.squared, 3),
+                 "\nSpearman = ", round(cor(md$gc3, md$log2FoldChange,
+                                            method = "spearman"), 3),
+                 "\nn = ", nrow(md))
+
+p_scatter <- ggplot(md, aes(x = gc3, y = log2FoldChange)) +
+  geom_point(aes(color = class), size = 0.5, alpha = 0.35) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "black", linewidth = 0.8,
+              se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(title = "GC3 vs TE change under 4E inhibition",
+       subtitle = "Positive log2FC = TE held up = 4E-resistant",
+       x = "GC3, third codon position (%)",
+       y = "TE log2FC (4E inhibition vs vehicle)") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4, size = 3.2,
+           label = r2_lab) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_scatter)
+if (SAVE_PLOTS) ggsave(here("plots", "88_gc3_vs_te_lfc_scatter.pdf"), p_scatter,
+                       width = 7, height = 5)
+```
+
+## The same plot for every GC flavour
+
+`cds_gc` is exactly the mean of `gc1`, `gc2` and `gc3` (verified to 2e-14), so these four
+panels are one quantity and its three-way decomposition, not four independent features.
+All panels use the same genes so the fits are directly comparable.
+
+```{r scatter-gc-facets, fig.width = 9.5, fig.height = 7.5}
+gc_panel_feats <- c(cds_gc = "CDS GC, all positions (%)",
+                    gc1    = "GC1, first codon position (%)",
+                    gc2    = "GC2, second codon position (%)",
+                    gc3    = "GC3, third codon position (%)")
+stopifnot("a GC panel feature is missing" = all(names(gc_panel_feats) %in% names(md)))
+
+gc_long <- md %>%
+  dplyr::select(class, log2FoldChange, dplyr::all_of(names(gc_panel_feats))) %>%
+  tidyr::pivot_longer(dplyr::all_of(names(gc_panel_feats)),
+                      names_to = "feature", values_to = "gc") %>%
+  dplyr::mutate(feature = factor(feature, levels = names(gc_panel_feats)))
+
+# One label per panel: R2 and Spearman from that feature's own simple regression.
+gc_stats <- gc_long %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(
+    r2       = summary(lm(log2FoldChange ~ gc))$r.squared,
+    spearman = cor(gc, log2FoldChange, method = "spearman"),
+    n        = dplyr::n(), .groups = "drop") %>%
+  dplyr::mutate(label = paste0("R2 = ", sprintf("%.3f", r2),
+                               "\nSpearman = ", sprintf("%.3f", spearman),
+                               "\nn = ", n))
+print(as.data.frame(gc_stats %>% dplyr::select(feature, r2, spearman, n) %>%
+                      dplyr::mutate(across(where(is.numeric), ~ round(.x, 3)))),
+      row.names = FALSE)
+
+panel_labeller <- as_labeller(c(cds_gc = "CDS GC (all positions)",
+                                gc1 = "GC1 (first codon position)",
+                                gc2 = "GC2 (second codon position)",
+                                gc3 = "GC3 (third codon position)"))
+
+p_facet <- ggplot(gc_long, aes(x = gc, y = log2FoldChange)) +
+  geom_point(aes(color = class), size = 0.4, alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "black", linewidth = 0.8, se = TRUE) +
+  geom_text(data = gc_stats, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.1, vjust = 1.3, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ feature, scales = "free_x", ncol = 2, labeller = panel_labeller) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(title = "GC content vs TE change under 4E inhibition, by codon position",
+       subtitle = "Positive log2FC = TE held up = 4E-resistant",
+       x = "GC content (%)", y = "TE log2FC (4E inhibition vs vehicle)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", strip.background = element_blank())
+
+print(p_facet)
+if (SAVE_PLOTS) ggsave(here("plots", "88_gc_by_position_vs_te_lfc_facets.pdf"), p_facet,
+                       width = 9.5, height = 7.5)
+```
+
+## Binned means
+
+The scatter is dense enough to hide the shape. Binning by GC3 decile shows whether the
+relationship is linear across the range or driven by one end.
+
+```{r binned-means, fig.width = 7, fig.height = 4.5}
+binned <- md %>%
+  dplyr::mutate(gc3_bin = ntile(gc3, 10)) %>%
+  dplyr::group_by(gc3_bin) %>%
+  dplyr::summarise(gc3_mid = median(gc3),
+                   mean_lfc = mean(log2FoldChange),
+                   se = sd(log2FoldChange) / sqrt(dplyr::n()),
+                   n = dplyr::n(), .groups = "drop")
+print(as.data.frame(binned %>% dplyr::mutate(across(where(is.numeric), ~ round(.x, 3)))),
+      row.names = FALSE)
+
+p_bin <- ggplot(binned, aes(x = gc3_mid, y = mean_lfc)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_errorbar(aes(ymin = mean_lfc - 1.96 * se, ymax = mean_lfc + 1.96 * se),
+                width = 0.6, color = "grey40") +
+  geom_point(size = 2.5, color = "#D55E00") +
+  geom_line(color = "#D55E00", linewidth = 0.8) +
+  labs(title = "Mean TE change by GC3 decile",
+       subtitle = paste0("error bars = 95% CI on the mean, n = ", nrow(md),
+                         " genes in 10 bins"),
+       x = "GC3, decile median (%)", y = "Mean TE log2FC") +
+  theme_classic(base_size = 12)
+
+print(p_bin)
+if (SAVE_PLOTS) ggsave(here("plots", "88_gc3_decile_mean_lfc.pdf"), p_bin,
+                       width = 7, height = 4.5)
+```
+
+# 3. Held-out evaluation
+
+Routine, and included for completeness. Notebook 07 already evaluates on a held-out 20%
+with a bootstrap CI and 5-fold CV, so this is not a correction to that; it just confirms a
+two-parameter model is nowhere near capacity-limited.
+
+```{r holdout}
+set.seed(9)
+train_idx <- sample.int(nrow(md), size = floor(TRAIN_FRAC * nrow(md)))
+train <- md[train_idx, ]
+test  <- md[-train_idx, ]
+cat("train:", nrow(train), " test:", nrow(test), "\n")
+
+eval_holdout <- function(form, label) {
+  fit  <- lm(form, data = train)
+  pred <- predict(fit, newdata = test)
+  ss_res <- sum((test$log2FoldChange - pred)^2)
+  ss_tot <- sum((test$log2FoldChange - mean(train$log2FoldChange))^2)
+  tibble::tibble(
+    model        = label,
+    n_train      = nrow(train),
+    n_test       = nrow(test),
+    train_r2     = round(summary(fit)$r.squared, 3),
+    test_r2      = round(1 - ss_res / ss_tot, 3),
+    test_spearman = round(cor(pred, test$log2FoldChange, method = "spearman"), 3),
+    test_rmse    = round(sqrt(mean((test$log2FoldChange - pred)^2)), 3))
+}
+
+ho <- dplyr::bind_rows(
+  eval_holdout(log2FoldChange ~ gc3, "lfc ~ gc3"),
+  eval_holdout(log2FoldChange ~ gc3 + log2_cds_length, "lfc ~ gc3 + log2_cds_length"))
+print(as.data.frame(ho), row.names = FALSE)
+```
+
+```{r pred-vs-obs, fig.width = 6, fig.height = 5.5}
+fit_ho <- lm(log2FoldChange ~ gc3 + log2_cds_length, data = train)
+test_pred <- test %>% dplyr::mutate(pred = predict(fit_ho, newdata = test))
+
+lab <- paste0("test R2 = ", ho$test_r2[ho$model == "lfc ~ gc3 + log2_cds_length"],
+              "\nSpearman = ", ho$test_spearman[ho$model == "lfc ~ gc3 + log2_cds_length"],
+              "\nn = ", nrow(test))
+
+p_po <- ggplot(test_pred, aes(x = pred, y = log2FoldChange)) +
+  geom_point(aes(color = class), size = 0.6, alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey40", linewidth = 0.5) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  coord_equal(xlim = range(test_pred$log2FoldChange),
+              ylim = range(test_pred$log2FoldChange)) +
+  labs(title = "Held-out prediction, gc3 + CDS length",
+       subtitle = "dashed line = perfect prediction",
+       x = "Predicted TE log2FC", y = "Observed TE log2FC") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4, size = 3.2, label = lab) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_po)
+if (SAVE_PLOTS) ggsave(here("plots", "88_holdout_pred_vs_obs.pdf"), p_po,
+                       width = 6, height = 5.5)
+```
+
+# 4. Transfer: fit on the tails, predict the middle
+
+This is the test the classifier framing cannot run. Notebook 07 trains and tests entirely
+within the two tails, so every gene it has ever scored is an extreme gene. Here the model
+is fit **only** on the 1,195 + 1,195 tail genes and then asked to order the middle genes it
+has never seen, which is where nearly every real mRNA lives.
+
+```{r transfer}
+tails  <- md %>% dplyr::filter(class != "middle")
+middle <- md %>% dplyr::filter(class == "middle")
+strict <- middle %>% dplyr::filter(abs(log2FoldChange) < 0.5)
+
+cat("tails:", nrow(tails), " middle:", nrow(middle),
+    " strict middle (|lfc| < 0.5):", nrow(strict), "\n\n")
+
+m_tail <- lm(log2FoldChange ~ gc3 + log2_cds_length, data = tails)
+m_full <- m_both
+
+transfer_row <- function(fit, newdata, fit_label, set_label) {
+  pred <- predict(fit, newdata = newdata)
+  ss_res <- sum((newdata$log2FoldChange - pred)^2)
+  ss_tot <- sum((newdata$log2FoldChange - mean(newdata$log2FoldChange))^2)
+  tibble::tibble(
+    fit_on   = fit_label,
+    evaluated_on = set_label,
+    n        = nrow(newdata),
+    r2       = round(1 - ss_res / ss_tot, 3),
+    spearman = round(cor(pred, newdata$log2FoldChange, method = "spearman"), 3),
+    rmse     = round(sqrt(mean((newdata$log2FoldChange - pred)^2)), 3))
+}
+
+tr <- dplyr::bind_rows(
+  transfer_row(m_tail, middle, "tails only", "middle"),
+  transfer_row(m_full, middle, "all genes",  "middle"),
+  transfer_row(m_tail, strict, "tails only", "strict middle |lfc| < 0.5"),
+  transfer_row(m_full, strict, "all genes",  "strict middle |lfc| < 0.5"))
+print(as.data.frame(tr), row.names = FALSE)
+```
+
+`r2` here is computed against the middle set's own mean, so a **negative** value means the
+model predicts the middle worse than its own average does. Spearman is the more forgiving
+read: it asks only whether the ordering carries over.
+
+## How far apart are the two fits?
+
+```{r transfer-coefs}
+cmp <- dplyr::bind_rows(
+  broom::tidy(m_tail) %>% dplyr::mutate(fit_on = "tails only"),
+  broom::tidy(m_full) %>% dplyr::mutate(fit_on = "all genes")) %>%
+  dplyr::select(fit_on, term, estimate, std.error) %>%
+  dplyr::mutate(across(c(estimate, std.error), ~ signif(.x, 3))) %>%
+  tidyr::pivot_wider(names_from = fit_on, values_from = c(estimate, std.error))
+print(as.data.frame(cmp), row.names = FALSE)
+```
+
+A tail-fitted slope steeper than the full-data slope is the expected signature of fitting
+on extremes: the tails exaggerate the effect per unit GC3.
+
+```{r transfer-plot, fig.width = 7, fig.height = 5}
+middle_pred <- middle %>% dplyr::mutate(pred_tail = predict(m_tail, newdata = middle))
+
+lab_t <- paste0("fit on tails, evaluated on middle\nSpearman = ",
+                tr$spearman[tr$fit_on == "tails only" & tr$evaluated_on == "middle"],
+                "\nR2 = ", tr$r2[tr$fit_on == "tails only" & tr$evaluated_on == "middle"],
+                "\nn = ", nrow(middle))
+
+p_tr <- ggplot(middle_pred, aes(x = pred_tail, y = log2FoldChange)) +
+  geom_point(size = 0.5, alpha = 0.3, color = "grey40") +
+  geom_smooth(method = "lm", formula = y ~ x, color = "black", linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "#D55E00", linewidth = 0.6) +
+  labs(title = "Tail-trained model applied to the middle genes",
+       subtitle = "dashed orange = perfect prediction, black = actual relationship",
+       x = "Predicted TE log2FC (model fit on tails only)",
+       y = "Observed TE log2FC") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4, size = 3.2, label = lab_t) +
+  theme_classic(base_size = 12)
+
+print(p_tr)
+if (SAVE_PLOTS) ggsave(here("plots", "88_tail_fit_predicts_middle.pdf"), p_tr,
+                       width = 7, height = 5)
+```
+
+# 5. Logistic model on the tails, against the notebook 07 AUC
+
+Like-for-like with the random forest: same two gene sets, same held-out design, two
+features instead of ~30.
+
+```{r logistic}
+tails_bin <- tails %>%
+  dplyr::mutate(resistant = as.integer(class == "4E-resistant"))
+stopifnot("class encoding is not 0/1" = all(tails_bin$resistant %in% c(0L, 1L)))
+
+set.seed(9)
+tr_idx <- sample.int(nrow(tails_bin), size = floor(TRAIN_FRAC * nrow(tails_bin)))
+b_train <- tails_bin[tr_idx, ]
+b_test  <- tails_bin[-tr_idx, ]
+cat("train:", nrow(b_train), " test:", nrow(b_test), "\n")
+print(dplyr::count(b_test, class) %>% as.data.frame(), row.names = FALSE)
+
+g_gc3  <- glm(resistant ~ gc3, data = b_train, family = binomial())
+g_both <- glm(resistant ~ gc3 + log2_cds_length, data = b_train, family = binomial())
+summary(g_both)
+
+auc_of <- function(fit) {
+  p <- predict(fit, newdata = b_test, type = "response")
+  as.numeric(pROC::auc(pROC::roc(b_test$resistant, p, quiet = TRUE)))
+}
+auc_tbl <- tibble::tibble(
+  model = c("glm ~ gc3", "glm ~ gc3 + log2_cds_length", "notebook 07 random forest"),
+  test_auc = c(round(auc_of(g_gc3), 4), round(auc_of(g_both), 4), RF_TEST_AUC),
+  n_features = c(1L, 2L, NA_integer_))
+print(as.data.frame(auc_tbl), row.names = FALSE)
+```
+
+```{r roc-plot, fig.width = 6, fig.height = 5.5}
+p_test_gc3 <- predict(g_gc3,  newdata = b_test, type = "response")
+p_test     <- predict(g_both, newdata = b_test, type = "response")
+
+roc_gc3 <- pROC::roc(b_test$resistant, p_test_gc3, quiet = TRUE)
+roc_obj <- pROC::roc(b_test$resistant, p_test,     quiet = TRUE)
+
+set.seed(9)
+ci_gc3 <- pROC::ci.auc(roc_gc3, method = "bootstrap", boot.n = 1000)
+set.seed(9)
+ci_auc <- pROC::ci.auc(roc_obj, method = "bootstrap", boot.n = 1000)
+
+roc_points <- function(r) tibble::tibble(fpr = 1 - r$specificities,
+                                         tpr = r$sensitivities)
+roc_df     <- roc_points(roc_obj)
+roc_df_gc3 <- roc_points(roc_gc3)
+
+p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey60", linewidth = 0.5) +
+  geom_line(color = "#D55E00", linewidth = 0.8) +
+  coord_equal() +
+  labs(title = "Logistic model on GC3 + log2 CDS length, resistant vs sensitive",
+       subtitle = paste0("features: gc3, log2_cds_length   AUC = ",
+                         round(as.numeric(roc_obj$auc), 3),
+                         " [", round(ci_auc[1], 3), "-", round(ci_auc[3], 3),
+                         "]   vs random forest ", RF_TEST_AUC,
+                         "\nn = ", nrow(b_test), " held-out genes"),
+       x = "False positive rate", y = "True positive rate") +
+  theme_classic(base_size = 12)
+
+print(p_roc)
+if (SAVE_PLOTS) ggsave(here("plots", "88_logistic_roc_vs_rf.pdf"), p_roc,
+                       width = 6, height = 5.5)
+```
+
+## GC3 on its own
+
+The same held-out genes and the same split, with `log2_cds_length` dropped. This is the
+single-feature version of the plot above.
+
+```{r roc-plot-gc3, fig.width = 6, fig.height = 5.5}
+p_roc_gc3 <- ggplot(roc_df_gc3, aes(x = fpr, y = tpr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey60", linewidth = 0.5) +
+  geom_line(color = "#D55E00", linewidth = 0.8) +
+  coord_equal() +
+  labs(title = "Logistic model on GC3 alone, resistant vs sensitive",
+       subtitle = paste0("feature: gc3   AUC = ", round(as.numeric(roc_gc3$auc), 3),
+                         " [", round(ci_gc3[1], 3), "-", round(ci_gc3[3], 3),
+                         "]   vs random forest ", RF_TEST_AUC,
+                         "\nn = ", nrow(b_test), " held-out genes"),
+       x = "False positive rate", y = "True positive rate") +
+  theme_classic(base_size = 12)
+
+print(p_roc_gc3)
+if (SAVE_PLOTS) ggsave(here("plots", "88_logistic_roc_gc3_only.pdf"), p_roc_gc3,
+                       width = 6, height = 5.5)
+```
+
+## Both curves together
+
+What the second feature actually buys, on one panel.
+
+```{r roc-plot-overlay, fig.width = 6.5, fig.height = 5.5}
+roc_both <- dplyr::bind_rows(
+  roc_df_gc3 %>% dplyr::mutate(model = paste0("gc3 alone (AUC ",
+                                              round(as.numeric(roc_gc3$auc), 3), ")")),
+  roc_df     %>% dplyr::mutate(model = paste0("gc3 + log2 CDS length (AUC ",
+                                              round(as.numeric(roc_obj$auc), 3), ")")))
+
+# #D55E00 and #0072B2 already denote the two classes in this notebook, so the second
+# curve uses reddish purple from the remaining Okabe-Ito hues.
+roc_colors <- setNames(c("#D55E00", "#CC79A7"), unique(roc_both$model))
+
+p_roc_both <- ggplot(roc_both, aes(x = fpr, y = tpr, color = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey60", linewidth = 0.5) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = roc_colors, name = NULL) +
+  coord_equal() +
+  labs(title = "One feature vs two, resistant vs sensitive",
+       subtitle = paste0("random forest on ~30 features = ", RF_TEST_AUC,
+                         "   n = ", nrow(b_test), " held-out genes"),
+       x = "False positive rate", y = "True positive rate") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", legend.direction = "vertical")
+
+print(p_roc_both)
+if (SAVE_PLOTS) ggsave(here("plots", "88_logistic_roc_gc3_vs_both.pdf"), p_roc_both,
+                       width = 6.5, height = 5.5)
+```
+
+## Is codon position 3 special? One curve per GC flavour
+
+Single-feature logistic models, one per codon position, no CDS length term. If 4E
+resistance were driven by *wobble* choice, `gc3` should beat `gc1` and `gc2` by a clear
+margin and should not be matched by aggregate `cds_gc`. Same split, same held-out genes as
+above.
+
+```{r roc-gc-positions, fig.width = 6.5, fig.height = 5.5}
+gc_feats <- c("gc1", "gc2", "gc3", "cds_gc")
+stopifnot("a GC feature is missing" = all(gc_feats %in% names(b_train)))
+
+fit_one_gc <- function(f) {
+  tr <- b_train[!is.na(b_train[[f]]), ]
+  te_ <- b_test[!is.na(b_test[[f]]), ]
+  fit <- glm(reformulate(f, response = "resistant"), data = tr, family = binomial())
+  pr  <- predict(fit, newdata = te_, type = "response")
+  r   <- pROC::roc(te_$resistant, pr, quiet = TRUE)
+  set.seed(9)
+  ci  <- pROC::ci.auc(r, method = "bootstrap", boot.n = 1000)
+  list(roc = r,
+       row = tibble::tibble(feature = f,
+                            n_test = nrow(te_),
+                            auc = round(as.numeric(r$auc), 4),
+                            ci_low = round(ci[1], 4),
+                            ci_high = round(ci[3], 4),
+                            slope = signif(coef(fit)[[f]], 3)))
+}
+
+gc_fits <- purrr::map(gc_feats, fit_one_gc) %>% setNames(gc_feats)
+gc_auc  <- purrr::map_dfr(gc_fits, "row") %>% dplyr::arrange(dplyr::desc(auc))
+print(as.data.frame(gc_auc), row.names = FALSE)
+
+gc_roc_df <- purrr::imap_dfr(gc_fits, function(x, f) {
+  tibble::tibble(fpr = 1 - x$roc$specificities,
+                 tpr = x$roc$sensitivities,
+                 feature = f)
+}) %>%
+  dplyr::left_join(gc_auc %>% dplyr::select(feature, auc), by = "feature") %>%
+  dplyr::mutate(label = paste0(feature, " (AUC ", sprintf("%.3f", auc), ")"),
+                label = forcats::fct_reorder(label, -auc))
+
+# #E69F00 and #56B4E9 are reserved for eIF3d and eIF3e (CLAUDE.md); these are four of the
+# remaining Okabe-Ito hues, with gc3 kept vermillion to match the earlier ROC panels.
+gc_colors <- setNames(
+  c("#D55E00", "#0072B2", "#009E73", "#CC79A7"),
+  levels(gc_roc_df$label)[match(c("gc3", "gc1", "gc2", "cds_gc"),
+                                sub(" .*", "", levels(gc_roc_df$label)))])
+
+p_roc_gc <- ggplot(gc_roc_df, aes(x = fpr, y = tpr, color = label)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey60", linewidth = 0.5) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = gc_colors, name = NULL) +
+  coord_equal() +
+  labs(title = "GC by codon position, resistant vs sensitive",
+       subtitle = paste0("one logistic model per feature, no CDS length term",
+                         "\nrandom forest on ~30 features = ", RF_TEST_AUC,
+                         "   n = ", nrow(b_test), " held-out genes"),
+       x = "False positive rate", y = "True positive rate") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", legend.direction = "vertical",
+        legend.key.height = unit(0.8, "lines"))
+
+print(p_roc_gc)
+if (SAVE_PLOTS) ggsave(here("plots", "88_logistic_roc_gc_positions.pdf"), p_roc_gc,
+                       width = 6.5, height = 5.5)
+```
+
+Read this against the correlations between the features themselves, since `gc1`, `gc2` and
+`gc3` are not independent measurements.
+
+```{r gc-position-correlations}
+gc_cor <- b_train %>% dplyr::select(dplyr::all_of(gc_feats)) %>%
+  cor(use = "pairwise.complete.obs", method = "spearman")
+print(round(gc_cor, 3))
+```
+
+## Calibration
+
+AUC only measures ordering. Calibration asks whether a predicted probability of 0.8 means
+8 in 10 of those genes really are resistant. Notebook 07 reports discrimination but never
+this.
+
+```{r calibration, fig.width = 6, fig.height = 5.5}
+calib <- tibble::tibble(p = p_test, y = b_test$resistant) %>%
+  dplyr::mutate(bin = ntile(p, 10)) %>%
+  dplyr::group_by(bin) %>%
+  dplyr::summarise(mean_pred = mean(p),
+                   obs_frac  = mean(y),
+                   n = dplyr::n(), .groups = "drop") %>%
+  dplyr::mutate(se = sqrt(obs_frac * (1 - obs_frac) / n))
+print(as.data.frame(calib %>% dplyr::mutate(across(where(is.numeric), ~ round(.x, 3)))),
+      row.names = FALSE)
+
+# Brier score: mean squared error of the predicted probabilities. 0 is perfect,
+# 0.25 is what always predicting 0.5 would give on a balanced set.
+brier <- mean((p_test - b_test$resistant)^2)
+cat("\nBrier score:", round(brier, 4), " (0.25 = uninformative on a balanced set)\n")
+
+p_cal <- ggplot(calib, aes(x = mean_pred, y = obs_frac)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey60", linewidth = 0.5) +
+  geom_errorbar(aes(ymin = pmax(0, obs_frac - 1.96 * se),
+                    ymax = pmin(1, obs_frac + 1.96 * se)),
+                width = 0.02, color = "grey40") +
+  geom_point(size = 2.5, color = "#D55E00") +
+  geom_line(color = "#D55E00", linewidth = 0.8) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(title = "Calibration, logistic model on GC3 + log2 CDS length",
+       subtitle = paste0("decile bins, dashed = perfect calibration, Brier = ",
+                         round(brier, 3), ", n = ", nrow(b_test)),
+       x = "Mean predicted probability of resistance",
+       y = "Observed fraction resistant") +
+  theme_classic(base_size = 12)
+
+print(p_cal)
+if (SAVE_PLOTS) ggsave(here("plots", "88_logistic_calibration.pdf"), p_cal,
+                       width = 6, height = 5.5)
+```
+
+# 6. Is it a GC library-preparation artefact?
+
+Notebook 79 raised the alternative reading: TE is a ratio of two libraries, and if
+footprint and total-RNA libraries amplify GC-rich templates differently, a GC-dependent
+term appears in `log2FoldChange` with no biology behind it. This cannot be settled from
+one dataset, but expression level is the handle available here, since amplification bias
+acts through it.
+
+```{r basemean-control}
+md <- md %>% dplyr::mutate(log2_basemean = log2(baseMean))
+
+cat("Spearman gc3 vs log2(baseMean):",
+    round(cor(md$gc3, md$log2_basemean, method = "spearman"), 3), "\n")
+cat("Spearman log2FC vs log2(baseMean):",
+    round(cor(md$log2FoldChange, md$log2_basemean, method = "spearman"), 3), "\n\n")
+
+m_adj <- lm(log2FoldChange ~ gc3 + log2_cds_length + log2_basemean, data = md)
+
+adj_cmp <- dplyr::bind_rows(
+  broom::tidy(m_both) %>% dplyr::mutate(model = "gc3 + length"),
+  broom::tidy(m_adj)  %>% dplyr::mutate(model = "gc3 + length + log2(baseMean)")) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  dplyr::mutate(estimate = signif(estimate, 3), std.error = signif(std.error, 3)) %>%
+  dplyr::select(model, term, estimate, std.error)
+print(as.data.frame(adj_cmp), row.names = FALSE)
+
+cat("\nR2:", round(summary(m_both)$r.squared, 3), "->",
+    round(summary(m_adj)$r.squared, 3), "\n")
+cat("gc3 coefficient retained:",
+    round(100 * coef(m_adj)[["gc3"]] / coef(m_both)[["gc3"]], 1), "% of its unadjusted value\n")
+```
+
+A stronger version of the same question: does the GC3 slope hold *within* narrow
+expression strata? If the effect were an amplification artefact tied to abundance, it
+should weaken in the strata where abundance barely varies.
+
+```{r basemean-strata}
+strata <- md %>%
+  dplyr::mutate(bm_q = ntile(log2_basemean, 4)) %>%
+  dplyr::group_by(bm_q) %>%
+  dplyr::group_modify(~ {
+    f <- lm(log2FoldChange ~ gc3 + log2_cds_length, data = .x)
+    tibble::tibble(n = nrow(.x),
+                   median_basemean = round(median(.x$baseMean), 1),
+                   gc3_slope = signif(coef(f)[["gc3"]], 3),
+                   gc3_se    = signif(summary(f)$coefficients["gc3", "Std. Error"], 3),
+                   r2        = round(summary(f)$r.squared, 3))
+  }) %>%
+  dplyr::ungroup()
+print(as.data.frame(strata), row.names = FALSE)
+```
+
+```{r strata-plot, fig.width = 6.5, fig.height = 4.5}
+p_str <- ggplot(strata, aes(x = factor(bm_q), y = gc3_slope)) +
+  geom_hline(yintercept = coef(m_both)[["gc3"]], linetype = "dashed",
+             color = "#D55E00", linewidth = 0.6) +
+  geom_errorbar(aes(ymin = gc3_slope - 1.96 * gc3_se,
+                    ymax = gc3_slope + 1.96 * gc3_se),
+                width = 0.15, color = "grey40") +
+  geom_point(size = 2.5) +
+  labs(title = "GC3 slope within expression quartiles",
+       subtitle = paste0("dashed orange = slope over all genes, n = ",
+                         paste(strata$n, collapse = " / "), " per quartile"),
+       x = "baseMean quartile (1 = lowest)", y = "GC3 coefficient (log2FC per % GC3)") +
+  theme_classic(base_size = 12)
+
+print(p_str)
+if (SAVE_PLOTS) ggsave(here("plots", "88_gc3_slope_by_basemean_quartile.pdf"), p_str,
+                       width = 6.5, height = 4.5)
+```
+
+Neither check can rule out a GC bias acting equally at all expression levels. The
+discriminating experiment is the one notebook 79 named: the same comparison in a 4E
+inhibition dataset built with a different library protocol, ideally UMI-deduplicated.
+
+# 7. Summary
+
+```{r summary-table}
+summary_tbl <- tibble::tibble(
+  question = c(
+    "Variance in TE log2FC explained by GC3, all genes",
+    "...adding log2 CDS length",
+    "Held-out test R2 (two features)",
+    "Spearman on middle genes, model fit on tails only",
+    "Held-out AUC, resistant vs sensitive, gc3 alone",
+    "Held-out AUC, resistant vs sensitive, two features",
+    "Notebook 07 random forest AUC, same sets",
+    "GC3 coefficient retained after baseMean adjustment (%)"),
+  value = c(
+    round(summary(m_gc3)$r.squared, 3),
+    round(summary(m_both)$r.squared, 3),
+    ho$test_r2[ho$model == "lfc ~ gc3 + log2_cds_length"],
+    tr$spearman[tr$fit_on == "tails only" & tr$evaluated_on == "middle"],
+    auc_tbl$test_auc[auc_tbl$model == "glm ~ gc3"],
+    auc_tbl$test_auc[auc_tbl$model == "glm ~ gc3 + log2_cds_length"],
+    RF_TEST_AUC,
+    round(100 * coef(m_adj)[["gc3"]] / coef(m_both)[["gc3"]], 1)))
+print(as.data.frame(summary_tbl), row.names = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```

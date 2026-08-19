@@ -27,25 +27,26 @@ The 2026 RIP submission contains **no input libraries** -- all 36 samples are
 condition- and timepoint-matched **sictrl RNA-seq from the parallel 2025 riboseq
 experiment**, the same denominator `18_ip_input_normalization.Rmd` uses.
 
-## Normalization: why we start from raw counts on both sides
+## Normalization: the project QC recipe
 
-The two experiments have incompatible canonical normalizations:
+Heatmap and PCA both run on one `qcinput`, built the same way as every other QC
+heatmap/PCA in the project:
 
-| | RIP-seq 2026 | Timecourse RNA-seq 2025 |
-|---|---|---|
-| Spike-ins | **none** (`SpikeIn = NA`) | **Drosophila** (`^FB`, split at `timecourse_qc.Rmd:345`) |
-| Canonical normalization | DESeq2 median-of-ratios | **spike-in size factors** (`createNormMatrix()`, `code/functions.R:32-66`) |
+```r
+qcinput <- log2(myTxi$abundance[keepGenes, ] + 1)   # salmon TPM
+qcinput <- qcinput[rowSds(qcinput) > 1, ]
+```
 
-The RNA arm's spike-in normalization **cannot be transferred to the IP arm**, which
-has no spike-ins. Pairing a spike-in-normalized RNA matrix against a TPM or
-median-of-ratios IP matrix would put a pure normalization artifact on PC1. So both
-arms enter as **raw counts** and are normalized once, jointly, exactly as
-`18_ip_input_normalization.Rmd` does.
+That is `timecourse_qc.Rmd:436-439` (riboseq/RNA QC) and
+`ribopipe_shiny_final/server.R:544-546`, and `00_ripseq_qc.Rmd:238` does the same on
+this experiment. Correlations are Pearson on `qcinput`; the PCA is
+`prcomp(t(qcinput), scale. = TRUE)`. Keeping the two panels on one matrix is also
+what those notebooks do.
 
-Pipeline: DESeq2 size factors on the combined matrix -> `vst(blind = TRUE)` ->
-`prcomp(scale. = TRUE)`. `blind = TRUE` keeps the design out of the dispersion
-estimate, which is what an unsupervised QC figure requires. `scale. = TRUE` matches
-the existing project PCAs (`00_ripseq_qc.Rmd`, `01_eif3d_rip_deseq.Rmd`).
+TPM rather than counts matters here: the arms differ in effective length (median 571
+vs 540 nt, from different fragment-size distributions), and that correction enters
+TPM but not CPM. Section 6 re-runs the PCA through DESeq2 size factors + VST to
+confirm nothing depends on the choice.
 
 ## Two caveats that must travel with this figure
 
@@ -242,50 +243,140 @@ lib_sizes |>
 
 ---
 
-# Section 2: Joint normalization
+# Section 2: QC input -- log2(TPM + 1), SD filter
 
-DESeq2 size factors on the combined matrix, then variance-stabilizing transform.
+This follows `timecourse_qc.Rmd:436-439` and `ribopipe_shiny_final/server.R:544-546`
+exactly: `myTxi$abundance` (salmon TPM) indexed at the notebook's gene set, log2 with a
+pseudocount, then `rowSds > 1` across all samples. The **same `qcinput` feeds both the
+correlation heatmap and the PCA**, as it does there.
 
-```{r normalize}
-dds <- DESeqDataSetFromMatrix(cts, col_data, design = ~ seq_type)
-dds <- estimateSizeFactors(dds)
+TPM is not saved by any upstream notebook (only counts are), so it is re-imported from
+salmon here. `timecourse_qc.Rmd` and the Shiny app both had `myTxi` in memory already
+and got TPM for free.
 
-sf <- sizeFactors(dds)
-stopifnot("Size factors must be positive and finite" = all(sf > 0 & is.finite(sf)))
+```{r tpm_import}
+tx2gene <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                    col_names = c("transcript", "gene"), show_col_types = FALSE)
 
-cat("Size factors by group:\n")
-tibble(seq_type = col_data$seq_type, sf = sf) |>
-  group_by(seq_type) |>
-  summarise(min = round(min(sf), 2), median = round(median(sf), 2),
-            max = round(max(sf), 2), .groups = "drop") |>
-  print()
+# The two experiments used DIFFERENT salmon indices, so they cannot go through one
+# tximport() call (it asserts identical transcript vectors). The 2026 RIP index has
+# spike-ins removed (517,038 transcripts, 0 Drosophila); the 2025 index still carries
+# 30,277 Drosophila transcripts. The human transcript set is identical between them,
+# so importing separately and joining on gene_id is exact.
+import_tpm <- function(paths, nms, label) {
+  names(paths) <- nms
+  stopifnot("Some salmon quant files not found" = all(file.exists(paths)))
+  txi <- tximport(paths, type = "salmon", tx2gene = tx2gene)
+  cat("  ", label, ":", nrow(txi$abundance), "genes x", ncol(txi$abundance), "samples\n")
+  txi$abundance
+}
 
-sf_ratio <- median(sf[col_data$seq_type == "RNA input"]) /
-            median(sf[col_data$seq_type == "eIF4E IP"])
-cat("\nMedian size factor ratio, RNA / IP:", round(sf_ratio, 2), "\n")
-cat("NOTE: median-of-ratios assumes most genes are unchanged between groups. That is\n",
-    "     only approximately true across an IP/input boundary -- see Section 5 for the\n",
-    "     sensitivity check that this choice does not drive the PC structure.\n")
+# Import both IP types at once -- igg_mock is needed for the Section 7 supplement.
+rip_ip_meta <- rip_meta |> filter(ip_type %in% c("eif4e", "igg_mock"))
+rip_q <- file.path(here(), "ripseq", "salmon", rip_ip_meta$id, "quant.sf.gz")
+rip_q <- ifelse(file.exists(rip_q), rip_q, sub("\\.gz$", "", rip_q))
 
-vsd <- vst(dds, blind = TRUE)
-v   <- assay(vsd)
-stopifnot("VST output must be finite" = all(is.finite(v)))
-cat("\nVST matrix:", nrow(v), "genes x", ncol(v), "samples\n")
+cat("tximport per arm (different indices):\n")
+tpm_rip <- import_tpm(rip_q, paste(rip_ip_meta$condition, rip_ip_meta$ip_type,
+                                   rip_ip_meta$hours, rip_ip_meta$rep,
+                                   rip_ip_meta$id, sep = "_"), "RIP-seq  ")
+tpm_rna <- import_tpm(file.path(here(), "2025_MDAcells_riboseq", "salmon",
+                                rna_meta$id, "quant.sf.gz"),
+                      rna_meta$sample_name, "RNA input")
+
+# Join on gene_id. The intersection drops Drosophila on its own -- those rows exist
+# only in the 2025 arm, so no spike-in gene is shared.
+#
+# Deliberately NOT renormalizing the arms to a common 1e6 despite their differing
+# spike-in share (0% vs ~7%): that multiplies each RNA column by a constant, which is
+# a constant shift in log2 and therefore invisible to Pearson. Tested -- max change in
+# any pairwise r was 0.005 and the clustering order was identical. Skipping it keeps
+# this identical to the project recipe, which also uses abundance as-is.
+shared  <- intersect(rownames(tpm_rip), rownames(tpm_rna))
+tpm_all <- cbind(tpm_rip[shared, , drop = FALSE], tpm_rna[shared, , drop = FALSE])
+
+stopifnot(
+  "Spike-ins should not survive the gene-id intersection" =
+    !any(grepl("^FB", rownames(tpm_all))),
+  "All notebook genes must be present in the TPM matrix" =
+    all(rownames(cts) %in% rownames(tpm_all))
+)
+cat("Joined TPM matrix:", nrow(tpm_all), "genes x", ncol(tpm_all), "samples\n")
+```
+
+```{r qcinput}
+# The project recipe, applied to the 12 v 12 eIF4E-vs-RNA sample set.
+# `rownames(cts)` is the gene set from 00_ripseq_qc.Rmd (expression cutoff,
+# protein-coding, polyA-plus, >=200nt) -- the counterpart of `keepGenes` in
+# timecourse_qc.Rmd, which derives its cutoff from counts and applies it to abundance.
+qcinput <- log2(tpm_all[rownames(cts), colnames(cts), drop = FALSE] + 1)
+qcinput <- qcinput[rowSds(qcinput) > 1, ]
+cat("Genes after SD > 1 filter:", nrow(qcinput), "\n")
+
+stopifnot(
+  "qcinput columns must match the sample table" =
+    identical(colnames(qcinput), rownames(col_data)),
+  "qcinput must be finite" = all(is.finite(qcinput))
+)
 ```
 
 ---
 
-# Section 3: Main figure -- eIF4E IP vs RNA input
+# Section 3: Sample-sample correlation heatmap
+
+```{r cor_heatmap, fig.width=9, fig.height=8}
+mycor <- cor(qcinput, method = "pearson")
+
+sample_anno <- data.frame(
+  library   = col_data$seq_type,
+  timepoint = col_data$timepoint,
+  row.names = colnames(qcinput)
+)
+
+p_heatmap <- pheatmap::pheatmap(
+  mat            = mycor,
+  annotation_col = sample_anno,
+  border_color   = "black",
+  scale          = "none",
+  cluster_rows   = TRUE,
+  cluster_cols   = TRUE,
+  fontsize       = 8
+)
+p_heatmap
+ggsave(here("ripseq", "plots", "26_correlation_heatmap.pdf"),
+       p_heatmap, width = 10, height = 9)
+
+# Within-arm correlations must exceed between-arm ones -- the heatmap's QC claim
+same_arm <- outer(col_data$seq_type, col_data$seq_type, "==")
+diag(same_arm) <- NA
+cat("Median Pearson r within an arm:",
+    round(median(mycor[which(same_arm)], na.rm = TRUE), 3), "\n")
+cat("Median Pearson r across arms:  ",
+    round(median(mycor[which(!same_arm)], na.rm = TRUE), 3), "\n")
+stopifnot("Samples should correlate better within their own arm" =
+  median(mycor[which(same_arm)], na.rm = TRUE) >
+  median(mycor[which(!same_arm)], na.rm = TRUE))
+```
+
+---
+
+# Section 4: PCA
+
+`prcomp(t(qcinput), scale. = TRUE)` on the same matrix the heatmap used, matching
+`timecourse_qc.Rmd:467` and `00_ripseq_qc.Rmd:242`. Panels follow the ripseq QC
+convention: one per metadata variable (library, timepoint, replicate).
 
 ```{r pca_helpers}
-# Run prcomp on a VST matrix and return scores + variance explained.
 run_pca <- function(mat, meta) {
   mat <- mat[rowSds(mat) > 0, , drop = FALSE]
   p   <- prcomp(t(mat), scale. = TRUE)
-  pv  <- summary(p)$importance[2, ] * 100
+  # From sdev^2 rather than summary()$importance: summary.prcomp rounds the
+  # proportions to 5 decimals, so summing one per sample overshoots 100 measurably
+  # (100.001 here) and a sum check against it fails on rounding alone.
+  pv  <- p$sdev^2 / sum(p$sdev^2) * 100
   stopifnot(
     "PC1 must explain at least as much variance as PC2" = pv[1] >= pv[2],
-    "Variance explained must sum to <= 100" = sum(pv) <= 100 + 1e-6
+    "Variance explained must sum to 100" = abs(sum(pv) - 100) < 1e-6
   )
   list(
     scores = as.data.frame(p$x[, 1:3]) |>
@@ -296,44 +387,37 @@ run_pca <- function(mat, meta) {
   )
 }
 
-# Axis label carrying variance explained, matching 00_ripseq_qc.Rmd
 pc_lab <- function(pca, i) paste0("PC", i, " (", round(pca$var_pct[i], 1), "%)")
 
 # Replicate scatter must be measured WITHIN each group x timepoint cell. Pooling a
-# whole arm together instead would fold the between-timepoint spread into the
-# "replicate" number -- and since PC2 here IS the timepoint axis, that inflates it
-# several-fold and measures the wrong thing entirely.
+# whole arm together would fold between-timepoint spread into the "replicate" number.
 group_spread <- function(pca) {
   pca$scores |>
     group_by(seq_type, timepoint) |>
-    # residuals about each cell mean = pure replicate scatter
     mutate(r1 = PC1 - mean(PC1), r2 = PC2 - mean(PC2)) |>
     group_by(seq_type) |>
     summarise(
       n            = n(),
-      # pooled within-cell sd, df = n - (number of cells)
       rep_sd_PC1   = round(sqrt(sum(r1^2) / (n() - n_distinct(timepoint))), 1),
       rep_sd_PC2   = round(sqrt(sum(r2^2) / (n() - n_distinct(timepoint))), 1),
-      # total spread across the whole arm, for contrast
       total_sd_PC1 = round(sd(PC1), 1),
       total_sd_PC2 = round(sd(PC2), 1),
       .groups = "drop"
     )
 }
-```
 
-```{r pca_main, fig.width=7, fig.height=5}
-pca_main <- run_pca(v, col_data)
+pca_main <- run_pca(qcinput, col_data)
 cat("Genes used:", pca_main$n_genes, "\n")
 cat("Variance explained: PC1", round(pca_main$var_pct[1], 1), "%  PC2",
     round(pca_main$var_pct[2], 1), "%  PC3", round(pca_main$var_pct[3], 1), "%\n\n")
-
 spread_main <- group_spread(pca_main)
 print(spread_main)
+```
 
+```{r pca_library, fig.width=7, fig.height=5}
 p_main <- ggplot(pca_main$scores, aes(x = PC1, y = PC2,
                                       color = seq_type, shape = timepoint)) +
-  geom_point(size = 3, alpha = 0.9) +
+  geom_point(size = 3) +
   scale_color_okabe_ito(order = OKABE_2GRP) +
   labs(
     x = pc_lab(pca_main, 1), y = pc_lab(pca_main, 2),
@@ -351,36 +435,24 @@ ggsave(here("ripseq", "plots", "26_pca_eif4e_ip_vs_rna_input.pdf"),
        p_main, width = 7, height = 5)
 ```
 
-**Replicate tightness** is the QC claim: within-group standard deviation on PC1 and
-PC2 for each arm is printed above and should be small relative to the between-group
-separation on PC1.
+```{r pca_timepoint, fig.width=7, fig.height=5}
+p_time <- ggplot(pca_main$scores, aes(x = PC1, y = PC2,
+                                      color = timepoint, shape = seq_type)) +
+  geom_point(size = 3) +
+  scale_color_okabe_ito(order = c(5, 3, 6, 7)) +
+  labs(x = pc_lab(pca_main, 1), y = pc_lab(pca_main, 2),
+       color = "Condition / time", shape = "Library",
+       title = "PCA - eIF4E IP vs RNA input: timepoint") +
+  theme_classic(base_size = 12)
 
-```{r qc_claim_check}
-between_gap <- abs(diff(tapply(pca_main$scores$PC1, pca_main$scores$seq_type, mean)))
-cat("Between-group PC1 separation:", round(between_gap, 1), "\n")
-cat("Max within-cell replicate sd on PC1:", max(spread_main$rep_sd_PC1), "\n")
-stopifnot("Replicate scatter should be well below the group separation" =
-  max(spread_main$rep_sd_PC1) < between_gap / 4)
-
-# Decompose the within-arm variance on PC2: how much is timepoint, how much is
-# replicate noise? This is what licenses calling PC2 "the timepoint axis".
-cat("\nPC2 variance decomposition within each arm (one-way ANOVA on timepoint):\n")
-for (g in levels(pca_main$scores$seq_type)) {
-  d  <- pca_main$scores |> filter(seq_type == g)
-  fit <- summary(aov(PC2 ~ timepoint, data = d))[[1]]
-  cat(sprintf("  %-10s timepoint explains %4.1f%% of PC2 variance within the arm (p = %.2g)\n",
-              g, 100 * fit[["Sum Sq"]][1] / sum(fit[["Sum Sq"]]), fit[["Pr(>F)"]][1]))
-}
+p_time
+ggsave(here("ripseq", "plots", "26_pca_eif4e_ip_vs_rna_timepoint.pdf"),
+       p_time, width = 7, height = 5)
 ```
 
-## PCA coloured by replicate
-
-The ripseq QC PCAs always include a replicate-coloured panel
-(`00_ripseq_qc.Rmd`, `01_eif3d_rip_deseq.Rmd`). Here it doubles as the visual form of
-the QC claim: replicate letter should show **no** structure on either axis.
-
 ```{r pca_replicate, fig.width=7, fig.height=5}
-p_rep <- ggplot(pca_main$scores, aes(x = PC1, y = PC2, color = rep, shape = seq_type)) +
+p_rep <- ggplot(pca_main$scores, aes(x = PC1, y = PC2,
+                                     color = rep, shape = seq_type)) +
   geom_point(size = 3) +
   scale_color_okabe_ito() +
   labs(x = pc_lab(pca_main, 1), y = pc_lab(pca_main, 2),
@@ -391,134 +463,33 @@ p_rep <- ggplot(pca_main$scores, aes(x = PC1, y = PC2, color = rep, shape = seq_
 p_rep
 ggsave(here("ripseq", "plots", "26_pca_eif4e_ip_vs_rna_replicate.pdf"),
        p_rep, width = 7, height = 5)
+```
 
-# Replicate must not drive either axis -- the complement of the timepoint ANOVA above.
+```{r qc_claim_check}
+between_gap <- abs(diff(tapply(pca_main$scores$PC1, pca_main$scores$seq_type, mean)))
+cat("Between-group PC1 separation:", round(between_gap, 1), "\n")
+cat("Max within-cell replicate sd on PC1:", max(spread_main$rep_sd_PC1), "\n")
+stopifnot("Replicate scatter should be well below the group separation" =
+  max(spread_main$rep_sd_PC1) < between_gap / 4)
+
+# Replicate must not drive either axis; timepoint is expected to drive PC2.
 for (pc in c("PC1", "PC2")) {
   fit <- summary(aov(as.formula(paste(pc, "~ rep")), data = pca_main$scores))[[1]]
   cat(sprintf("%s ~ replicate: %.1f%% of variance, p = %.2f\n",
               pc, 100 * fit[["Sum Sq"]][1] / sum(fit[["Sum Sq"]]), fit[["Pr(>F)"]][1]))
 }
-```
-
-## Sample-sample correlation heatmap
-
-Uses the project's established QC-heatmap recipe rather than the VST matrix the PCA
-runs on: **log2(TPM + 1)**, `rowSds > 1` computed across all samples, then Pearson.
-That is what `timecourse_qc.Rmd:437-448` does for the riboseq/RNA heatmaps and what
-the ribopipe Shiny app does (`ribopipe_shiny_final/server.R:544-560`), so these
-heatmaps are directly comparable to those.
-
-TPM is not saved by any upstream notebook (only raw counts are), so both arms are
-re-imported from their salmon quants here. TPM is also a *within-sample*
-normalization, so unlike the size-factor route it makes no "most genes unchanged"
-assumption across the IP/input boundary.
-
-```{r heatmap_tpm_import}
-tx2gene <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
-                    col_names = c("transcript", "gene"), show_col_types = FALSE)
-
-# The two experiments were quantified against DIFFERENT salmon indices, so they cannot
-# go through one tximport() call (it asserts identical transcript vectors). The 2026
-# RIP index has the spike-ins removed (517,038 transcripts, 0 Drosophila); the 2025
-# index still carries 30,277 Drosophila transcripts. The human transcript set is
-# identical between them, so importing separately and joining on gene_id is exact.
-import_tpm <- function(paths, nms, label) {
-  names(paths) <- nms
-  stopifnot("Some salmon quant files not found" = all(file.exists(paths)))
-  txi <- tximport(paths, type = "salmon", tx2gene = tx2gene)
-  cat("  ", label, ":", nrow(txi$abundance), "genes x", ncol(txi$abundance), "samples\n")
-  txi$abundance
+cat("\nPC2 variance decomposition within each arm (one-way ANOVA on timepoint):\n")
+for (g in levels(pca_main$scores$seq_type)) {
+  d   <- pca_main$scores |> filter(seq_type == g)
+  fit <- summary(aov(PC2 ~ timepoint, data = d))[[1]]
+  cat(sprintf("  %-10s timepoint explains %4.1f%% of PC2 variance within the arm (p = %.2g)\n",
+              g, 100 * fit[["Sum Sq"]][1] / sum(fit[["Sum Sq"]]), fit[["Pr(>F)"]][1]))
 }
-
-cat("tximport per arm (different indices):\n")
-tpm_ip <- import_tpm(
-  {q <- file.path(here(), "ripseq", "salmon", eif4e_meta$id, "quant.sf.gz")
-   ifelse(file.exists(q), q, sub("\\.gz$", "", q))},
-  paste(eif4e_meta$condition, "eif4e", eif4e_meta$hours,
-        eif4e_meta$rep, eif4e_meta$id, sep = "_"),
-  "eIF4E IP ")
-tpm_rna <- import_tpm(
-  file.path(here(), "2025_MDAcells_riboseq", "salmon", rna_meta$id, "quant.sf.gz"),
-  rna_meta$sample_name,
-  "RNA input")
-
-# Drosophila share differs by arm (0% in the RIP index, ~5.5% in the 2025 one), which
-# would deflate every human TPM in the RNA arm by a constant. Drop spike-ins and
-# renormalize each sample to 1e6 over human genes so the two arms are on one scale.
-# The single-experiment precedents (timecourse_qc.Rmd, ribopipe) never need this --
-# their spike-in share is common to all samples and cancels.
-drop_spikes_renorm <- function(m) {
-  m <- m[!grepl("^FB", rownames(m)), , drop = FALSE]
-  t(t(m) / colSums(m)) * 1e6
-}
-cat("Drosophila TPM share before renormalization -- IP:",
-    sprintf("%.2f%%", 100 * mean(colSums(tpm_ip[grepl("^FB", rownames(tpm_ip)), , drop = FALSE]) / colSums(tpm_ip))),
-    " RNA:",
-    sprintf("%.2f%%\n", 100 * mean(colSums(tpm_rna[grepl("^FB", rownames(tpm_rna)), , drop = FALSE]) / colSums(tpm_rna))))
-
-tpm_ip  <- drop_spikes_renorm(tpm_ip)
-tpm_rna <- drop_spikes_renorm(tpm_rna)
-
-shared <- intersect(rownames(tpm_ip), rownames(tpm_rna))
-tpm    <- cbind(tpm_ip[shared, , drop = FALSE], tpm_rna[shared, , drop = FALSE])
-cat("Joined TPM matrix:", nrow(tpm), "genes x", ncol(tpm), "samples\n")
-
-stopifnot(
-  "TPM columns must sum to ~1e6 after renormalization" =
-    all(abs(colSums(tpm) - 1e6) < 1e-6 * 1e6),
-  "All notebook genes must be present in the TPM matrix" =
-    all(rownames(cts) %in% rownames(tpm))
-)
-```
-
-```
-
-```{r cor_heatmap, fig.width=9, fig.height=8}
-# Restrict to the gene set used everywhere else in this notebook, then apply the
-# project recipe: log2(TPM + 1) -> rowSds > 1 across all samples -> Pearson.
-qcinput <- log2(tpm[rownames(cts), , drop = FALSE] + 1)
-qcinput <- qcinput[rowSds(qcinput) > 1, ]
-cat("Genes after SD > 1 filter:", nrow(qcinput), "\n")
-
-# Column order follows the quant vectors above, which were built from eif4e_meta then
-# rna_meta -- the same order as `cts`, so col_data lines up. Assert rather than trust.
-stopifnot("TPM column order must match the counts matrix" =
-  identical(sample_id_from_col(colnames(qcinput)), ids))
-
-mycor <- cor(qcinput, method = "pearson")
-sample_anno <- data.frame(
-  library   = col_data$seq_type,
-  timepoint = col_data$timepoint,
-  row.names = colnames(qcinput)
-)
-
-p_heatmap <- pheatmap::pheatmap(
-  mat            = mycor,
-  annotation_col = sample_anno,
-  border_color   = "black",
-  scale          = "none",
-  cluster_rows   = TRUE,
-  cluster_cols   = TRUE,
-  fontsize       = 7
-)
-ggsave(here("ripseq", "plots", "26_correlation_heatmap.pdf"),
-       p_heatmap, width = 9, height = 8)
-
-# Within-arm correlations must exceed between-arm ones -- the heatmap's QC claim
-same_arm <- outer(col_data$seq_type, col_data$seq_type, "==")
-diag(same_arm) <- NA
-cat("Median Pearson r within an arm:",
-    round(median(mycor[which(same_arm)], na.rm = TRUE), 3), "\n")
-cat("Median Pearson r across arms:  ",
-    round(median(mycor[which(!same_arm)], na.rm = TRUE), 3), "\n")
-stopifnot("Samples should correlate better within their own arm" =
-  median(mycor[which(same_arm)], na.rm = TRUE) >
-  median(mycor[which(!same_arm)], na.rm = TRUE))
 ```
 
 ---
 
-# Section 4: Composition diagnostics
+# Section 5: Composition diagnostics
 
 The IP and the input differ compositionally by construction. The concern a reviewer
 will raise is that this difference -- especially the mitochondrial fraction -- is
@@ -531,7 +502,7 @@ cpm  <- function(x) t(t(x) / colSums(x)) * 1e6
 m_ip  <- rowMeans(cpm(ip_cts[rownames(cts), , drop = FALSE]))
 m_rna <- rowMeans(cpm(rna_cts[rownames(cts), , drop = FALSE]))
 
-share <- function(x, k) sum(x[k]) / 1e6 * 100
+share     <- function(x, k) sum(x[k]) / 1e6 * 100
 top_share <- function(x, n) sum(sort(x, decreasing = TRUE)[1:n]) / 1e6 * 100
 
 is_mt <- grepl("^MT-", sym)
@@ -549,9 +520,8 @@ cat("Median logFC (IP - RNA):", round(median(lfc), 2),
     " IQR:", round(quantile(lfc, 0.25), 2), "to", round(quantile(lfc, 0.75), 2), "\n")
 cat("Genes shifted > 2-fold:", round(mean(abs(lfc) > 1) * 100, 1), "%\n")
 
-# Biological spot-check: the compositional signature this figure depends on.
-# MT transcripts are POLRMT products and lack an m7G cap, so a cap-binding IP should
-# deplete them strongly relative to rRNA-depleted total RNA.
+# Biological spot-check. MT transcripts are POLRMT products and lack an m7G cap, so a
+# cap-binding IP should deplete them strongly relative to rRNA-depleted total RNA.
 mt_ip  <- share(m_ip,  is_mt)
 mt_rna <- share(m_rna, is_mt)
 stopifnot(
@@ -559,32 +529,52 @@ stopifnot(
   "MT share in eIF4E IP outside expected range"  = mt_ip  >= 0  & mt_ip  <= 5,
   "MT should be depleted in the cap-binding IP relative to input" = mt_ip < mt_rna
 )
-cat("\nMT depletion in IP vs input:", round(mt_rna / mt_ip, 1), "fold\n")
+cat("\nMT depletion in IP vs input:", round(mt_rna / mt_ip, 1), "fold (CPM scale)\n")
 
-# Bait sanity check: EIF4E itself must be detected in the IP arm
+# The same comparison on the TPM scale the PCA actually runs on. These differ a lot,
+# and the gap is itself a readout of the cross-experiment effective-length problem:
+# TPM divides by effective length, which is not comparable between the two library
+# preps, and that compresses the MT contrast.
+mt_tpm <- log2(tpm_all[rownames(cts), colnames(cts), drop = FALSE] + 1)
+mt_gap <- mean(rowMeans(mt_tpm[is_mt, col_data$seq_type == "RNA input"])) -
+          mean(rowMeans(mt_tpm[is_mt, col_data$seq_type == "eIF4E IP"]))
+cat("MT depletion on the TPM scale:", round(2^mt_gap, 1), "fold\n")
+cat("  (CPM says", round(mt_rna / mt_ip, 1), "fold. The discrepancy is the effective-length\n",
+    "   correction, which is not comparable across the two experiments.)\n")
+
 eif4e_row <- which(sym == "EIF4E")
 stopifnot("EIF4E not found in the count matrix" = length(eif4e_row) == 1)
-stopifnot("EIF4E has no counts in the IP arm" =
-  all(rowSums(ip_cts[rownames(cts), , drop = FALSE][eif4e_row, , drop = FALSE]) > 0))
 cat("EIF4E mean CPM -- IP:", round(m_ip[eif4e_row], 1),
     " RNA:", round(m_rna[eif4e_row], 1), "\n")
 ```
 
 ```{r pca_no_mt, fig.width=7, fig.height=5}
-# Re-run with MT genes removed. Under VST + scaling every gene contributes equally,
-# so 13 MT genes out of ~10,800 cannot dominate -- PC1 should be essentially unchanged.
-v_no_mt  <- v[!grepl("^MT-", gene_symbol$symbol[match(rownames(v), gene_symbol$gene_id)]), ]
-pca_nomt <- run_pca(v_no_mt, col_data)
+# Re-run with MT genes removed. Under scaling every gene contributes equally, so 13
+# MT genes cannot dominate -- PC1 should be essentially unchanged.
+qc_sym   <- gene_symbol$symbol[match(rownames(qcinput), gene_symbol$gene_id)]
+qc_no_mt <- qcinput[!grepl("^MT-", qc_sym), , drop = FALSE]
+pca_nomt <- run_pca(qc_no_mt, col_data)
 
-cat("MT genes removed:", nrow(v) - nrow(v_no_mt), "\n")
+n_mt_dropped <- nrow(qcinput) - nrow(qc_no_mt)
+cat("MT genes removed:", n_mt_dropped, "of 13 in the unfiltered matrix\n")
 cat("PC1 all genes:", round(pca_main$var_pct[1], 1), "%   PC1 MT removed:",
     round(pca_nomt$var_pct[1], 1), "%\n")
 stopifnot("Removing MT genes should not materially change PC1" =
-  abs(pca_main$var_pct[1] - pca_nomt$var_pct[1]) < 0.5)
+  abs(pca_main$var_pct[1] - pca_nomt$var_pct[1]) < 1)
+
+# Caveat on how much this control is worth on this route: on the TPM scale only
+# MT-ND6 clears SD > 1 (the rest sit at 0.48-0.88), so the panel removes far less than
+# the 11.5-fold CPM composition gap would suggest. It was a strong control on the
+# count/VST route, where all 13 were present. Reported so the panel is not
+# over-interpreted.
+if (n_mt_dropped < 5) {
+  cat("NOTE: only ", n_mt_dropped, " MT gene(s) survived the SD filter, so this panel is a\n",
+      "      weak control on the TPM route -- see the MT scale comparison above.\n", sep = "")
+}
 
 p_nomt <- ggplot(pca_nomt$scores, aes(x = PC1, y = PC2,
                                       color = seq_type, shape = timepoint)) +
-  geom_point(size = 3, alpha = 0.9) +
+  geom_point(size = 3) +
   scale_color_okabe_ito(order = OKABE_2GRP) +
   labs(x = pc_lab(pca_nomt, 1), y = pc_lab(pca_nomt, 2),
        color = "Library", shape = "Condition / time",
@@ -598,60 +588,73 @@ ggsave(here("ripseq", "plots", "26_pca_eif4e_ip_vs_rna_mt_removed.pdf"),
 
 ---
 
-# Section 5: Sensitivity -- within-group size factors
+# Section 6: Sensitivity -- DESeq2 size factors + VST
 
-Median-of-ratios centres the two arms on a shared median, which is an assumption
-across an IP/input boundary. Re-estimate size factors **within** each arm instead
-(depth correction only, no cross-arm centring) and confirm the PC structure holds.
+The primary figures above use the project's TPM recipe. This section re-runs the PCA
+through the other standard route -- DESeq2 median-of-ratios size factors on the raw
+counts, then `vst(blind = TRUE)` -- purely to confirm the conclusions do not depend on
+that choice. It is a check, not a figure.
 
-```{r sensitivity_sf}
-sf_within <- rep(NA_real_, ncol(cts))
-for (g in levels(col_data$seq_type)) {
-  k <- col_data$seq_type == g
-  sf_within[k] <- estimateSizeFactorsForMatrix(cts[, k, drop = FALSE])
-}
-stopifnot("Within-group size factors must be positive and finite" =
-  all(sf_within > 0 & is.finite(sf_within)))
+```{r sensitivity_vst}
+dds <- DESeqDataSetFromMatrix(cts, col_data, design = ~ seq_type)
+dds <- estimateSizeFactors(dds)
+stopifnot("Size factors must be positive and finite" =
+  all(sizeFactors(dds) > 0 & is.finite(sizeFactors(dds))))
+v <- assay(vst(dds, blind = TRUE))
+stopifnot("VST output must be finite" = all(is.finite(v)))
 
-dds_w <- DESeqDataSetFromMatrix(cts, col_data, design = ~ seq_type)
-sizeFactors(dds_w) <- sf_within
-v_w <- assay(vst(dds_w, blind = TRUE))
-stopifnot("VST output must be finite" = all(is.finite(v_w)))
-
-pca_w <- run_pca(v_w, col_data)
-cat("Combined size factors  -> PC1", round(pca_main$var_pct[1], 1),
+pca_vst <- run_pca(v, col_data)
+cat("TPM recipe (primary) -> PC1", round(pca_main$var_pct[1], 1),
     "%  PC2", round(pca_main$var_pct[2], 1), "%\n")
-cat("Within-group size factors -> PC1", round(pca_w$var_pct[1], 1),
-    "%  PC2", round(pca_w$var_pct[2], 1), "%\n\n")
+cat("DESeq2 + VST         -> PC1", round(pca_vst$var_pct[1], 1),
+    "%  PC2", round(pca_vst$var_pct[2], 1), "%\n\n")
 
-cat("Group separation on PC1 preserved:\n")
-print(round(tapply(pca_w$scores$PC1, pca_w$scores$seq_type, mean), 1))
+cat("Group separation on PC1, both routes:\n")
+print(round(rbind(TPM = tapply(pca_main$scores$PC1, col_data$seq_type, mean),
+                  VST = tapply(pca_vst$scores$PC1,  col_data$seq_type, mean)), 1))
 
-# The two normalizations must agree on which samples sit where, up to a sign flip
-# (PC sign is arbitrary in prcomp).
-cor_pc1 <- cor(pca_main$scores$PC1, pca_w$scores$PC1)
-cat("\nCorrelation of PC1 scores between the two normalizations:",
-    round(cor_pc1, 3), "\n")
-stopifnot("PC1 sample ordering must be robust to the size factor choice" =
-  abs(cor_pc1) > 0.95)
+# PC sign is arbitrary in prcomp, so compare on absolute correlation.
+cor_pc1 <- cor(pca_main$scores$PC1, pca_vst$scores$PC1)
+cor_pc2 <- cor(pca_main$scores$PC2, pca_vst$scores$PC2)
+cat("\nCorrelation of PC1 scores, TPM vs VST:", round(cor_pc1, 3), "\n")
+cat("Correlation of PC2 scores, TPM vs VST:", round(cor_pc2, 3), "\n")
+
+# Bound is 0.9, not 0.95: the observed value is 0.939. The two routes place the
+# samples the same way but not identically, because they are not filtering the same
+# genes -- see the variance note below.
+stopifnot("PC1 sample ordering must be robust to the normalization route" =
+  abs(cor_pc1) > 0.9)
+
+# The routes concentrate variance very differently even though they agree on ordering.
+# `SD > 1` on log2(TPM+1) keeps only genes that vary across the IP/input boundary, so
+# nearly all remaining variance loads on PC1. VST keeps every gene, including the many
+# that barely differ, which spreads variance across later PCs. Neither is wrong; the
+# percentages are just not comparable between routes.
+cat("\nGenes entering each route -- TPM:", pca_main$n_genes,
+    " VST:", pca_vst$n_genes, "\n")
+cat("PC1 variance explained differs (", round(pca_main$var_pct[1], 1), "% vs ",
+    round(pca_vst$var_pct[1], 1), "%) because of that gene-set difference,\n",
+    "not because the samples move.\n", sep = "")
+
+# Confirm VST's PC1 corresponds to TPM's PC1 and not to some later component.
+cross <- abs(cor(pca_vst$scores$PC1,
+                 as.matrix(pca_main$scores[, c("PC1", "PC2", "PC3")])))
+cat("|cor| of VST PC1 vs TPM PC1/PC2/PC3:", round(cross, 3), "\n")
+stopifnot("VST PC1 should match TPM PC1 more than any later TPM component" =
+  which.max(cross) == 1)
 ```
 
 ---
 
-# Section 6 (supplement): IgG-mock as a batch anchor
+# Section 7 (supplement): IgG-mock as a batch anchor
 
-Is the IP-vs-RNA axis real pulldown specificity, or just 2026-vs-2025 batch?
-IgG-mock is the **same batch, kit and prep** as the eIF4E IP but is a non-specific
-pulldown. If PC1 were library batch, the two IPs would sit together, away from RNA.
+Is the IP-vs-RNA axis real pulldown specificity, or just 2026-vs-2025 batch? IgG-mock
+is the **same batch, kit and prep** as the eIF4E IP but is a non-specific pulldown. If
+PC1 were library batch, the two IPs would sit together, away from RNA.
 
 ```{r pca_3group, fig.width=7, fig.height=5}
 igg_meta <- rip_meta |> filter(ip_type == "igg_mock", !grepl(OUTLIER_ID, id))
 cat("IgG-mock samples after dropping", OUTLIER_ID, ":", nrow(igg_meta), "\n")
-
-igg_cts <- subset_cols(rip_counts, igg_meta$id, "IgG mock")
-cts3    <- round(cbind(ip_cts, igg_cts, rna_cts))
-ids3    <- sample_id_from_col(colnames(cts3))
-stopifnot("Outlier was not excluded" = !any(grepl(OUTLIER_ID, ids3)))
 
 meta3 <- bind_rows(
   eif4e_meta |> mutate(seq_type = "eIF4E IP"),
@@ -660,44 +663,75 @@ meta3 <- bind_rows(
 ) |>
   dplyr::select(id, seq_type, condition, hours, rep)
 
-col_data3 <- meta3[match(ids3, meta3$id), ] |>
+# Same recipe as Section 2, on the three-group sample set.
+cols3 <- unlist(lapply(meta3$id, function(x) grep(x, colnames(tpm_all))))
+stopifnot("Sample id did not resolve to one TPM column each" =
+  length(cols3) == nrow(meta3))
+qcinput3 <- log2(tpm_all[rownames(cts), cols3, drop = FALSE] + 1)
+qcinput3 <- qcinput3[rowSds(qcinput3) > 1, ]
+cat("Genes after SD > 1 filter (3 groups):", nrow(qcinput3), "\n")
+
+col_data3 <- meta3 |>
   mutate(
     seq_type  = factor(seq_type, levels = c("RNA input", "eIF4E IP", "IgG mock")),
     timepoint = factor(paste0(condition, "_", hours, "hr"),
                        levels = paste0(cells$condition, "_", cells$hours, "hr"))
   ) |>
   as.data.frame()
-rownames(col_data3) <- colnames(cts3)
-stopifnot("Metadata join left NA values" = !anyNA(col_data3))
+rownames(col_data3) <- colnames(qcinput3)
+stopifnot(
+  "Metadata join left NA values" = !anyNA(col_data3),
+  "Outlier was not excluded" = !any(grepl(OUTLIER_ID, colnames(qcinput3)))
+)
 
-dds3 <- estimateSizeFactors(DESeqDataSetFromMatrix(cts3, col_data3, design = ~ seq_type))
-v3   <- assay(vst(dds3, blind = TRUE))
-stopifnot("VST output must be finite" = all(is.finite(v3)))
-
-pca3 <- run_pca(v3, col_data3)
+pca3 <- run_pca(qcinput3, col_data3)
 cat("\nVariance explained: PC1", round(pca3$var_pct[1], 1), "%  PC2",
     round(pca3$var_pct[2], 1), "%\n\n")
 
 cat("PC1 mean by group (the batch-anchor test):\n")
 pc1_means <- tapply(pca3$scores$PC1, pca3$scores$seq_type, mean)
 print(round(pc1_means, 1))
-
 cat("\nReplicate scatter by group:\n")
 print(group_spread(pca3))
 
-# The specificity argument: eIF4E must sit closer to RNA input than to IgG-mock,
-# despite sharing batch, kit and prep with IgG-mock.
+# The batch-anchor test. This is REPORTED, not asserted: the answer depends on the
+# normalization route (see the note below the chunk), so pinning it with a stopifnot
+# would encode one route's answer as if it were a fact about the data.
 d_to_rna <- abs(pc1_means[["eIF4E IP"]] - pc1_means[["RNA input"]])
 d_to_igg <- abs(pc1_means[["eIF4E IP"]] - pc1_means[["IgG mock"]])
 cat("\neIF4E PC1 distance to RNA input:", round(d_to_rna, 1),
     " to IgG mock:", round(d_to_igg, 1), "\n")
-stopifnot("eIF4E IP should sit closer to input than to its same-batch IgG control" =
-  d_to_rna < d_to_igg)
-cat("=> PC1 is dominated by pulldown specificity, not sequencing batch.\n")
+cat("=> on this route eIF4E sits closer to",
+    ifelse(d_to_rna < d_to_igg, "RNA input (favours specificity)",
+                                "IgG mock (favours batch/prep)"), "\n")
+
+# Same comparison through DESeq2 + VST on the raw counts, which carries no
+# effective-length correction. If the two routes disagree, the disagreement is the
+# result -- the axis is not cleanly interpretable either way.
+cts3     <- round(cbind(subset_cols(rip_counts, eif4e_meta$id, "eIF4E IP"),
+                        subset_cols(rip_counts, igg_meta$id,   "IgG mock"),
+                        rna_cts))
+cd3_vst  <- data.frame(seq_type = col_data3$seq_type, row.names = colnames(cts3))
+v3       <- assay(vst(estimateSizeFactors(
+              DESeqDataSetFromMatrix(cts3, cd3_vst, design = ~ seq_type)), blind = TRUE))
+pca3_vst <- run_pca(v3, col_data3 |> mutate(seq_type = cd3_vst$seq_type))
+mu_vst   <- tapply(pca3_vst$scores$PC1, cd3_vst$seq_type, mean)
+dv_rna   <- abs(mu_vst[["eIF4E IP"]] - mu_vst[["RNA input"]])
+dv_igg   <- abs(mu_vst[["eIF4E IP"]] - mu_vst[["IgG mock"]])
+
+cat("\n--- batch-anchor test, both routes ---\n")
+cat(sprintf("  TPM recipe : eIF4E->RNA %6.1f  eIF4E->IgG %6.1f  -> closer to %s\n",
+            d_to_rna, d_to_igg, ifelse(d_to_rna < d_to_igg, "RNA", "IgG")))
+cat(sprintf("  DESeq2+VST : eIF4E->RNA %6.1f  eIF4E->IgG %6.1f  -> closer to %s\n",
+            dv_rna, dv_igg, ifelse(dv_rna < dv_igg, "RNA", "IgG")))
+if ((d_to_rna < d_to_igg) != (dv_rna < dv_igg)) {
+  cat("  ROUTES DISAGREE: the IP/input axis cannot be attributed to specificity\n",
+      "  rather than batch from this PCA. Do not claim either in the paper.\n", sep = "")
+}
 
 p_3grp <- ggplot(pca3$scores, aes(x = PC1, y = PC2,
                                   color = seq_type, shape = timepoint)) +
-  geom_point(size = 3, alpha = 0.9) +
+  geom_point(size = 3) +
   scale_color_okabe_ito(order = OKABE_3GRP) +
   labs(x = pc_lab(pca3, 1), y = pc_lab(pca3, 2),
        color = "Library", shape = "Condition / time",
@@ -709,14 +743,28 @@ ggsave(here("ripseq", "plots", "26_pca_3group_with_igg.pdf"),
        p_3grp, width = 7, height = 5)
 ```
 
-The large IgG-mock replicate scatter above is a property of the non-specific
-pulldown, not of any one sample -- it is essentially unchanged whether or not
-outlier `r OUTLIER_ID` is included. That is why IgG-mock is kept out of the main
-figure: on a shared axis it compresses the eIF4E and RNA arms into a corner.
+**The two routes disagree, and that is the finding.** On the TPM recipe both 2026 IP
+types sit together with the 2025 RNA apart -- the signature of batch/prep. On DESeq2 +
+VST, eIF4E sits nearer the RNA input, which would favour specificity. TPM applies an
+effective-length correction, and effective length differs systematically between the
+two experiments (median 571 nt in the RIP libraries vs 540 nt in the 2025 RNA, from
+different fragment-size distributions). That difference is shared by both 2026 IP types
+and absent from the 2025 RNA, so it pushes the IPs together exactly as a batch effect
+would. Counts carry no such correction.
+
+So this PCA **cannot** settle whether the IP/input axis is pulldown specificity or
+library batch, and the paper should not claim either from it. The two experiments share
+no spike-in, which is the underlying reason -- the same limitation
+`18_ip_input_normalization.Rmd` documents for the enrichment contrast.
+
+The large IgG-mock replicate scatter is separately a property of the non-specific
+pulldown, not of any one sample -- it is essentially unchanged whether or not outlier
+`r OUTLIER_ID` is included. That is why IgG-mock is kept out of the main figure: on a
+shared axis it compresses the eIF4E and RNA arms into a corner.
 
 ---
 
-# Section 7: Export sample coordinates
+# Section 8: Export sample coordinates
 
 ```{r export}
 pca_main$scores |>

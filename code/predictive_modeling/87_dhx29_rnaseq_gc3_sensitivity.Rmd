@@ -1,0 +1,1674 @@
+---
+title: "Notebook 87: DHX29 KO/KD RNA-seq, GC3 dependence and eIF3d-promoted mRNAs"
+output: html_document
+date: "`r Sys.Date()`"
+params:
+  n_up: 500
+  n_down: 500
+  dhx29_contrast: "kd"
+  down_mode: "extreme"
+  padj_cut: 0.05
+  unchanged_padj: 0.30
+  unchanged_max_abs_lfc: 0.10
+  n_slam_up: 500
+  n_slam_down: 500
+  write_genesets: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# `params` only exists during knit; supply the same defaults so chunks can be run
+# interactively in RStudio.
+#
+# Interactively we REBUILD params rather than only filling it in when absent. A stale
+# `params` left in the global environment by another notebook, or by an earlier version
+# of this one, is a list and so passed an `exists()`-only guard - then a renamed field
+# reads back NULL, `as.integer(NULL)` is integer(0), `&&` on that yields NA, and the
+# failure surfaces as a misleading "must be a positive integer" much further down.
+default_params <- list(
+  n_up                  = 500,
+  n_down                = 500,
+  dhx29_contrast        = "kd",
+  down_mode             = "extreme",
+  padj_cut              = 0.05,
+  unchanged_padj        = 0.30,
+  unchanged_max_abs_lfc = 0.10,
+  n_slam_up             = 500,
+  n_slam_down           = 500,
+  write_genesets        = TRUE
+)
+
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- default_params
+}
+
+# During knit params comes from the YAML above. Assert it is complete rather than
+# letting a missing field become a length-zero read later.
+missing_params <- setdiff(names(default_params), names(params))
+stopifnot(
+  "params is not a list - a stale object is masking it, run rm(params)" = is.list(params),
+  "params is missing fields; if running interactively, run rm(params) and re-run setup" =
+    length(missing_params) == 0
+)
+stopifnot(
+  "every param must be a single non-NA value" =
+    all(vapply(params[names(default_params)],
+               function(x) length(x) == 1 && !is.na(x), logical(1)))
+)
+```
+
+## Overview
+
+Hia et al. 2026 (Science, adw0288) depleted DHX29 in K562 cells two ways and profiled
+steady-state mRNA by RNA-seq:
+
+- **Table S2** — `DHX29KDvsCtrl`: CRISPRi knockdown, assayed shortly after gRNA transduction
+  (acute depletion). Keyed by versioned ENSEMBL gene ID.
+- **Table S3** — `DHX29KOvsCtrl`: CRISPR knockout, maintained long-term as single-cell clones.
+  Keyed by ENTREZ + unversioned ENSEMBL + SYMBOL.
+
+Both are limma `logFC` for **depleted vs control**, so **positive logFC = the mRNA accumulates
+when DHX29 is lost**. The paper's interpretation is that those transcripts are normally
+subject to DHX29-dependent, codon-driven decay: DHX29 resolves stalls on AU3-rich (GC3-poor)
+codons, and losing it stabilises exactly those mRNAs (Fig 1F, fig. S2E).
+
+> **Caveat on the premise, and it does not survive checking.** Positive logFC here is a
+> *steady-state RNA* change, so it is consistent with reduced decay but does not by itself
+> exclude a transcriptional contribution. The paper's only direct stability measurement is
+> the SLAM-seq half-life time course (Table S6, KO only). Section 7a tests whether the two
+> agree per gene and finds they do not: Spearman = 0.030. **These RNA-seq tables therefore
+> measure abundance, not decay**, and nothing derived from them is named or described as a
+> stability readout anywhere in this notebook.
+
+This notebook does four things:
+
+1. **Recreate Fig 1F** — GC3-poor mRNAs are up in both contrasts, more strongly in the KD.
+2. **Ask whether eIF3d-promoted mRNAs respond to DHX29 loss** — density plots of KO and KD
+   logFC for eIF3d hypoxia-promoted genes (1hr, |LFC| > 0.5) vs the size-matched negative
+   control vs the rest of the transcriptome, followed by a GC3-stratified decomposition.
+3. **Export abundance-defined gene sets** for notebook 07 (Section 6).
+4. **Repeat both on the KO SLAM-seq half-life data** — the paper's actual stability readout —
+   and export stability-defined gene sets (Section 7).
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(ggplot2)
+
+# Wilcoxon p-values in these comparisons underflow to exactly 0 in double precision
+# (n ~ 4500 per group). signif(0, 3) prints "0", which claims a p-value no test can
+# return. Floor the display at R's own printing threshold instead.
+fmt_p <- function(p) {
+  ifelse(p < 2.2e-16, "< 2.2e-16", paste("=", signif(p, 3)))
+}
+```
+
+---
+
+## Section 1: Load the RNA-seq tables
+
+```{r load_tables}
+s_dir <- here("accessories", "csc_data", "hia_dhx29",
+              "science.adw0288_tables_s1_to_s11")
+
+s3_path <- file.path(s_dir, "science.adw0288_table_s3.xlsx")
+s2_path <- file.path(s_dir, "science.adw0288_table_s2.xlsx")
+
+stopifnot(
+  "Table S3 (DHX29 KO RNA-seq) not found" = file.exists(s3_path),
+  "Table S2 (DHX29 KD RNA-seq) not found" = file.exists(s2_path)
+)
+
+cat("S3 sheets:", paste(excel_sheets(s3_path), collapse = ", "), "\n")
+cat("S2 sheets:", paste(excel_sheets(s2_path), collapse = ", "), "\n")
+
+s3_raw <- read_excel(s3_path)
+s2_raw <- read_excel(s2_path)
+
+cat("\nS3 (KO) dim:", dim(s3_raw), "| cols:", paste(colnames(s3_raw), collapse = ", "), "\n")
+cat("S2 (KD) dim:", dim(s2_raw), "| cols:", paste(colnames(s2_raw), collapse = ", "), "\n")
+```
+
+### 1a: Replication check at the point of load
+
+The single cheapest quantitative check on these files is **DHX29's own logFC**: the
+perturbation depletes DHX29, so DHX29 must be significantly *down* in both contrasts. If the
+sign is flipped, the contrast direction is reversed and every conclusion below inverts.
+
+Observed: KO logFC = **-0.958** (adj.P = 6.9e-101), KD logFC = **-2.645** (adj.P = 1.3e-13).
+The KD is the deeper depletion, matching the paper's statement that the KD reflects the acute
+consequence while KO clones may have adapted.
+
+```{r direction_check}
+dhx29_ens <- "ENSG00000067248"
+
+dhx29_ko <- s3_raw %>% dplyr::filter(SYMBOL == "DHX29")
+dhx29_kd <- s2_raw %>% dplyr::filter(str_detect(Gene, dhx29_ens))
+
+cat("DHX29 in KO table: logFC =", round(dhx29_ko$logFC, 3),
+    " adj.P =", format.pval(dhx29_ko$adj.P.Val, digits = 3), "\n")
+cat("DHX29 in KD table: logFC =", round(dhx29_kd$logFC, 3),
+    " adj.P =", format.pval(dhx29_kd$adj.P.Val, digits = 3), "\n")
+
+stopifnot(
+  "DHX29 must appear exactly once in the KO table" = nrow(dhx29_ko) == 1,
+  "DHX29 must appear exactly once in the KD table" = nrow(dhx29_kd) == 1,
+  "Direction check failed: DHX29 is not down in the KO contrast" =
+    dhx29_ko$logFC < -0.5 && dhx29_ko$adj.P.Val < 0.01,
+  "Direction check failed: DHX29 is not down in the KD contrast" =
+    dhx29_kd$logFC < -1.0 && dhx29_kd$adj.P.Val < 0.01,
+  "KD is expected to be the deeper depletion of the two" =
+    dhx29_kd$logFC < dhx29_ko$logFC
+)
+cat("\nDirection check PASS - both contrasts are depleted-vs-control ",
+    "(positive logFC = up on DHX29 loss)\n", sep = "")
+```
+
+### 1b: Tidy to one row per gene
+
+The KO table is Entrez-keyed, so `ENSEMBL` carries the literal string `"NA"` for 118 rows
+with no ENSEMBL mapping, plus one gene (`ENSG00000230124`) that two Entrez IDs map onto.
+Drop the unmapped rows and keep the more significant row for the genuine duplicate.
+
+```{r tidy_tables}
+ko <- s3_raw %>%
+  dplyr::filter(!is.na(ENSEMBL), ENSEMBL != "NA") %>%
+  transmute(
+    ensembl_gene = ENSEMBL,
+    symbol_ko    = SYMBOL,
+    logFC_ko     = logFC,
+    padj_ko      = adj.P.Val
+  ) %>%
+  group_by(ensembl_gene) %>%
+  slice_min(padj_ko, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+kd <- s2_raw %>%
+  transmute(
+    ensembl_gene = str_remove(Gene, "\\..*"),
+    logFC_kd     = logFC,
+    padj_kd      = adj.P.Val
+  )
+
+cat("KO genes (unique ENSEMBL):", nrow(ko), "\n")
+cat("KD genes (unique ENSEMBL):", nrow(kd), "\n")
+cat("KO median logFC:", round(median(ko$logFC_ko), 4),
+    "| KD median logFC:", round(median(kd$logFC_kd), 4), "\n")
+cat("KO n adj.P < 0.05:", sum(ko$padj_ko < 0.05),
+    "| KD n adj.P < 0.05:", sum(kd$padj_kd < 0.05), "\n")
+
+stopifnot(
+  "KO gene IDs must be unique after dedup" = !any(duplicated(ko$ensembl_gene)),
+  "KD gene IDs must be unique"             = !any(duplicated(kd$ensembl_gene)),
+  "KO logFC must be finite"  = all(is.finite(ko$logFC_ko)),
+  "KD logFC must be finite"  = all(is.finite(kd$logFC_kd)),
+  "adj.P values must lie in [0, 1]" =
+    all(ko$padj_ko >= 0 & ko$padj_ko <= 1) && all(kd$padj_kd >= 0 & kd$padj_kd <= 1),
+  "logFC magnitudes are implausible - wrong column or wrong sheet" =
+    max(abs(ko$logFC_ko)) < 10 && max(abs(kd$logFC_kd)) < 10,
+  "Both tables should be near-centred on zero" =
+    abs(median(ko$logFC_ko)) < 0.2 && abs(median(kd$logFC_kd)) < 0.2
+)
+```
+
+---
+
+## Section 2: Join per-gene GC3
+
+GC3 comes from the existing positional-GC feature matrix (notebook `01v_`), which stores
+`gc1`/`gc2`/`gc3` as **percentages** and `gc3_residual` as GC3 orthogonalised against
+`cds_gc`. `cds_gc` itself is dropped from that matrix by design, so pull it from
+`feature_matrix_external_stability.rds` for the aggregate-GC control.
+
+Feature matrices are transcript-keyed, so deduplicate to one row per gene first.
+
+```{r load_gc}
+gc_path <- here("output", "predictive_modeling", "feature_matrix_positional_gc.rds")
+es_path <- here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+stopifnot(
+  "feature_matrix_positional_gc.rds not found - run 01v_ first"      = file.exists(gc_path),
+  "feature_matrix_external_stability.rds not found - run 01i_-01k_"  = file.exists(es_path)
+)
+
+gc_fm <- readRDS(gc_path) %>%
+  distinct(gene_id_clean, .keep_all = TRUE) %>%
+  transmute(
+    ensembl_gene = gene_id_clean,
+    symbol,
+    gc1, gc2, gc3, gc3_residual,
+    cds_length
+  )
+
+cds_gc_fm <- readRDS(es_path) %>%
+  distinct(gene_id_clean, .keep_all = TRUE) %>%
+  transmute(ensembl_gene = gene_id_clean, cds_gc)
+
+gc_fm <- left_join(gc_fm, cds_gc_fm, by = "ensembl_gene")
+
+cat("Genes with positional GC:", nrow(gc_fm), "\n")
+print(summary(gc_fm %>% dplyr::select(gc1, gc2, gc3, cds_gc)))
+
+stopifnot(
+  "GC percentages must lie in [0, 100]" =
+    all(c(gc_fm$gc1, gc_fm$gc2, gc_fm$gc3) >= 0 &
+        c(gc_fm$gc1, gc_fm$gc2, gc_fm$gc3) <= 100, na.rm = TRUE),
+  "cds_gc must lie in [0, 100]" =
+    all(gc_fm$cds_gc >= 0 & gc_fm$cds_gc <= 100, na.rm = TRUE),
+  # Project convention: GC3 median in [40, 65]% (01_, 43_)
+  "GC3 median outside the expected 40-65% window" =
+    dplyr::between(median(gc_fm$gc3, na.rm = TRUE), 40, 65),
+  "gc3_residual must be mean-zero by construction" =
+    abs(mean(gc_fm$gc3_residual, na.rm = TRUE)) < 1e-6,
+  "cds_gc failed to join from the external-stability matrix" =
+    mean(!is.na(gc_fm$cds_gc)) > 0.9
+)
+```
+
+```{r join_gc_dhx29}
+dhx <- gc_fm %>%
+  inner_join(ko, by = "ensembl_gene") %>%
+  inner_join(kd, by = "ensembl_gene") %>%
+  dplyr::filter(!is.na(gc3), !is.na(logFC_ko), !is.na(logFC_kd))
+
+cat("Genes with GC3 + KO + KD logFC:", nrow(dhx), "\n")
+stopifnot("Too few genes joined - check ID versioning" = nrow(dhx) > 5000)
+```
+
+---
+
+## Section 3: Recreate Fig 1F - GC3-poor mRNAs accumulate on DHX29 loss
+
+### 3a: Rank correlations
+
+```{r gc3_correlations}
+cor_row <- function(x, y, xlab, ylab) {
+  ct <- suppressWarnings(cor.test(x, y, method = "spearman"))
+  tibble(
+    feature  = xlab,
+    contrast = ylab,
+    rho      = unname(ct$estimate),
+    p        = ct$p.value,
+    n        = sum(complete.cases(x, y))
+  )
+}
+
+cor_tbl <- bind_rows(
+  cor_row(dhx$gc3,          dhx$logFC_ko, "GC3",          "DHX29 KO"),
+  cor_row(dhx$gc3,          dhx$logFC_kd, "GC3",          "DHX29 KD"),
+  cor_row(dhx$cds_gc,       dhx$logFC_ko, "CDS GC",       "DHX29 KO"),
+  cor_row(dhx$cds_gc,       dhx$logFC_kd, "CDS GC",       "DHX29 KD"),
+  cor_row(dhx$gc3_residual, dhx$logFC_ko, "GC3 residual", "DHX29 KO"),
+  cor_row(dhx$gc3_residual, dhx$logFC_kd, "GC3 residual", "DHX29 KD")
+) %>%
+  mutate(rho = round(rho, 3), p = format.pval(p, digits = 3))
+
+print(as.data.frame(cor_tbl))
+
+rho_gc3_ko <- cor_tbl$rho[cor_tbl$feature == "GC3" & cor_tbl$contrast == "DHX29 KO"]
+rho_gc3_kd <- cor_tbl$rho[cor_tbl$feature == "GC3" & cor_tbl$contrast == "DHX29 KD"]
+
+stopifnot(
+  "Fig 1F replication failed: GC3 does not negatively track KO logFC" = rho_gc3_ko < -0.05,
+  "Fig 1F replication failed: GC3 does not negatively track KD logFC" = rho_gc3_kd < -0.30,
+  "Paper's claim failed: the KD effect should exceed the KO effect" =
+    rho_gc3_kd < rho_gc3_ko
+)
+cat("\nFig 1F PASS - Spearman(GC3, logFC): KO =", rho_gc3_ko,
+    ", KD =", rho_gc3_kd, " (n =", nrow(dhx), ")\n")
+```
+
+`GC3 residual` (GC3 with `cds_gc` regressed out) keeps the same sign but is much weaker than
+raw GC3, and raw `cds_gc` tracks logFC nearly as well as GC3 does. As documented in CLAUDE.md,
+aggregate GC3 is ~0.93-correlated with `cds_gc` via isochore structure, so **these RNA-seq
+tables cannot separate a third-position (wobble) effect from bulk CDS GC.** The AU3-specific
+claim rests on the codon-level Thor-Ribo-seq (Table S8, notebook 23), not on this figure.
+
+### 3b: logFC by GC3 bin, KO vs KD
+
+```{r gc3_bins}
+gc3_breaks <- c(0, 40, 50, 60, 70, 80, 100)
+gc3_labels <- c("<40", "40-50", "50-60", "60-70", "70-80", ">80")
+
+dhx_long <- dhx %>%
+  dplyr::select(ensembl_gene, symbol, gc3, logFC_ko, logFC_kd) %>%
+  pivot_longer(c(logFC_ko, logFC_kd), names_to = "contrast", values_to = "logFC") %>%
+  mutate(
+    contrast = recode(contrast,
+                      logFC_ko = "DHX29 KO (clonal)",
+                      logFC_kd = "DHX29 KD (CRISPRi, acute)"),
+    contrast = factor(contrast, levels = c("DHX29 KO (clonal)",
+                                           "DHX29 KD (CRISPRi, acute)")),
+    gc3_bin  = cut(gc3, breaks = gc3_breaks, labels = gc3_labels, include.lowest = TRUE)
+  )
+
+bin_summary <- dhx_long %>%
+  group_by(contrast, gc3_bin) %>%
+  summarise(n = n(), median_logFC = median(logFC), .groups = "drop")
+
+cat("Median logFC per GC3 bin:\n")
+print(as.data.frame(bin_summary))
+
+stopifnot(
+  "All GC3 bins must be populated" = all(!is.na(bin_summary$gc3_bin)),
+  "Every GC3 bin needs enough genes to read a median" = all(bin_summary$n >= 100)
+)
+
+# Monotonicity of the paper's claim, tested at the extremes of each contrast.
+extremes <- bin_summary %>%
+  dplyr::filter(gc3_bin %in% c("<40", ">80")) %>%
+  dplyr::select(contrast, gc3_bin, median_logFC) %>%
+  pivot_wider(names_from = gc3_bin, values_from = median_logFC)
+print(as.data.frame(extremes))
+
+stopifnot(
+  "Fig 1F replication failed: lowest-GC3 bin is not above the highest-GC3 bin" =
+    all(extremes$`<40` > extremes$`>80`)
+)
+```
+
+```{r gc3_bin_plot, fig.width=9, fig.height=4.5}
+contrast_colors <- c("DHX29 KO (clonal)"         = "#0072B2",
+                     "DHX29 KD (CRISPRi, acute)" = "#CC79A7")
+
+p_bins <- ggplot(dhx_long, aes(x = gc3_bin, y = logFC, fill = contrast)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.2, linewidth = 0.4) +
+  geom_text(data = bin_summary, aes(x = gc3_bin, y = -Inf, label = paste0("n=", n)),
+            inherit.aes = FALSE, vjust = -0.6, size = 2.6, color = "grey40") +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_fill_manual(values = contrast_colors, guide = "none") +
+  coord_cartesian(ylim = quantile(dhx_long$logFC, c(0.002, 0.998))) +
+  labs(
+    title    = "GC3-poor mRNAs accumulate when DHX29 is depleted (recreates Fig 1F)",
+    subtitle = paste0("Positive logFC = up on DHX29 loss. Spearman(GC3, logFC): KO = ",
+                      rho_gc3_ko, ", KD = ", rho_gc3_kd, "; n = ", nrow(dhx), " genes"),
+    x = "GC3 content bin (%)",
+    y = "logFC (DHX29-depleted vs control)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_bins
+ggsave(here("plots", "87_dhx29_rnaseq_logfc_by_gc3_bin.pdf"), p_bins,
+       width = 9, height = 4.5)
+cat("Saved: plots/87_dhx29_rnaseq_logfc_by_gc3_bin.pdf\n")
+```
+
+### 3c: GC3-quartile CDFs
+
+```{r gc3_quartile_cdf, fig.width=9, fig.height=4.5}
+dhx_q <- dhx_long %>%
+  group_by(contrast) %>%
+  mutate(gc3_q = ntile(gc3, 4)) %>%
+  ungroup() %>%
+  mutate(gc3_q = factor(gc3_q, levels = 1:4,
+                        labels = c("Q1 (most AU3-rich)", "Q2", "Q3",
+                                   "Q4 (most GC3-rich)")))
+
+q_stats <- dhx_q %>%
+  group_by(contrast, gc3_q) %>%
+  summarise(n = n(), median_gc3 = round(median(gc3), 1),
+            median_logFC = round(median(logFC), 3), .groups = "drop")
+cat("GC3 quartiles:\n")
+print(as.data.frame(q_stats))
+
+q_test <- dhx_q %>%
+  dplyr::filter(gc3_q %in% c("Q1 (most AU3-rich)", "Q4 (most GC3-rich)")) %>%
+  group_by(contrast) %>%
+  summarise(
+    p = wilcox.test(logFC ~ droplevels(gc3_q))$p.value,
+    delta_median = median(logFC[gc3_q == "Q1 (most AU3-rich)"]) -
+                   median(logFC[gc3_q == "Q4 (most GC3-rich)"]),
+    .groups = "drop"
+  )
+cat("\nQ1 vs Q4 Wilcoxon:\n")
+print(as.data.frame(q_test %>% mutate(p = format.pval(p, digits = 3),
+                                      delta_median = round(delta_median, 3))))
+
+stopifnot(
+  "Q1 (AU3-rich) must exceed Q4 (GC3-rich) in both contrasts" = all(q_test$delta_median > 0),
+  "Q1 vs Q4 separation must be significant in both contrasts" = all(q_test$p < 1e-5),
+  "KD must show the larger Q1-Q4 shift than KO" =
+    q_test$delta_median[q_test$contrast == "DHX29 KD (CRISPRi, acute)"] >
+    q_test$delta_median[q_test$contrast == "DHX29 KO (clonal)"]
+)
+
+quartile_colors <- c("Q1 (most AU3-rich)" = "#D55E00", "Q2" = "grey60",
+                     "Q3" = "grey40", "Q4 (most GC3-rich)" = "#0072B2")
+
+q_label <- q_test %>%
+  mutate(label = paste0("Q1 vs Q4 Wilcoxon p ", fmt_p(p),
+                        "\ndelta median = ", round(delta_median, 3),
+                        "\nn per quartile = ", round(nrow(dhx) / 4)))
+
+p_cdf <- ggplot(dhx_q, aes(x = logFC, color = gc3_q)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", linewidth = 0.5) +
+  geom_text(data = q_label, aes(x = Inf, y = -Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.05, vjust = -0.3, size = 3) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_color_manual(values = quartile_colors) +
+  coord_cartesian(xlim = quantile(dhx_long$logFC, c(0.005, 0.995))) +
+  labs(
+    title    = "Cumulative distribution of DHX29-depletion logFC by GC3 quartile",
+    subtitle = "Leftward shift with rising GC3 = GC3-rich mRNAs are not stabilised on DHX29 loss",
+    x = "logFC (DHX29-depleted vs control)", y = "Cumulative fraction", color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_cdf
+ggsave(here("plots", "87_dhx29_rnaseq_logfc_cdf_by_gc3_quartile.pdf"), p_cdf,
+       width = 9, height = 4.5)
+cat("Saved: plots/87_dhx29_rnaseq_logfc_cdf_by_gc3_quartile.pdf\n")
+```
+
+---
+
+## Section 4: Do eIF3d-promoted mRNAs respond to DHX29 loss?
+
+### 4a: Gene groups
+
+Same construction as notebook 23: eIF3d hypoxia-promoted (1hr, |TE LFC| > 0.5), a
+size-matched negative control drawn under `set.seed(9)` from the negative pool with any
+overlap removed, and everything else as background.
+
+```{r gene_groups}
+promotes <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+promotes_ids <- promotes$ensembl_gene
+
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  dplyr::filter(!ensembl_gene %in% promotes_ids)
+
+set.seed(9)
+neg_ctrl_ids <- sample(neg_pool$ensembl_gene, size = length(promotes_ids), replace = FALSE)
+
+cat("Promotes genes:", length(promotes_ids), "\n")
+cat("Neg ctrl genes (size-matched):", length(neg_ctrl_ids), "\n")
+
+stopifnot(
+  "Gene sets must not overlap" = length(intersect(promotes_ids, neg_ctrl_ids)) == 0,
+  "Negative control must be size-matched" =
+    length(neg_ctrl_ids) == length(promotes_ids)
+)
+
+set_colors <- c(
+  "eIF3d hypoxia promotes" = "#E69F00",   # Okabe-Ito orange, reserved for eIF3d
+  "Negative control"       = "black",
+  "All other genes"        = "grey70"
+)
+
+dhx <- dhx %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                           ~ "All other genes"
+  ))
+
+group_summary <- dhx %>%
+  group_by(group) %>%
+  summarise(n = n(),
+            median_gc3   = round(median(gc3), 1),
+            median_ko    = round(median(logFC_ko), 3),
+            median_kd    = round(median(logFC_kd), 3),
+            .groups = "drop")
+cat("\nGroup summary:\n")
+print(as.data.frame(group_summary))
+
+stopifnot(
+  "All three groups must be represented in the DHX29 universe" =
+    setequal(unique(dhx$group), names(set_colors)),
+  "Each group needs enough genes for a density estimate" = all(group_summary$n >= 50)
+)
+```
+
+### 4b: Density plots
+
+```{r density_helper}
+# Corner annotation carrying the test result and all three group sizes, so each
+# figure is self-contained.
+stat_label <- function(p_value, x_promotes, x_neg, x_other) {
+  paste0(
+    "Wilcoxon p ", fmt_p(p_value),
+    "\nn promotes = ", sum(!is.na(x_promotes)),
+    "\nn neg ctrl = ", sum(!is.na(x_neg)),
+    "\nn other = ",    sum(!is.na(x_other))
+  )
+}
+
+density_by_group <- function(df, value_col, title, subtitle, xlab, outfile) {
+  v  <- rlang::sym(value_col)
+  bg <- df %>% dplyr::filter(group == "All other genes")
+  fg <- df %>% dplyr::filter(group != "All other genes")
+
+  med <- fg %>% group_by(group) %>%
+    summarise(med = median(!!v, na.rm = TRUE), .groups = "drop")
+
+  x_prom <- df %>% dplyr::filter(group == "eIF3d hypoxia promotes") %>% pull(!!v)
+  x_neg  <- df %>% dplyr::filter(group == "Negative control")       %>% pull(!!v)
+  wt     <- wilcox.test(x_prom, x_neg, alternative = "two.sided")
+
+  # Outline only - no fills. The background group is drawn as a line as well, so all
+  # three curves are read the same way.
+  p <- ggplot() +
+    geom_density(data = bg, aes(x = !!v, color = group),
+                 fill = NA, linewidth = 0.8, key_glyph = "path") +
+    geom_density(data = fg %>% dplyr::filter(group == "Negative control"),
+                 aes(x = !!v, color = group),
+                 fill = NA, linewidth = 0.8, key_glyph = "path") +
+    geom_density(data = fg %>% dplyr::filter(group == "eIF3d hypoxia promotes"),
+                 aes(x = !!v, color = group),
+                 fill = NA, linewidth = 0.8, key_glyph = "path") +
+    geom_vline(xintercept = 0, linetype = "dotted", color = "black", linewidth = 0.5) +
+    geom_vline(data = med, aes(xintercept = med, color = group),
+               linetype = "dashed", linewidth = 0.6, show.legend = FALSE) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+             label = stat_label(wt$p.value, x_prom, x_neg, bg %>% pull(!!v))) +
+    scale_color_manual(values = set_colors) +
+    coord_cartesian(xlim = quantile(df %>% pull(!!v), c(0.002, 0.998), na.rm = TRUE)) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = "Density", color = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+
+  ggsave(here("plots", outfile), p, width = 6.5, height = 5)
+  cat("Saved: plots/", outfile, "\n", sep = "")
+
+  list(plot = p, wilcox = wt, medians = med)
+}
+```
+
+```{r density_kd, fig.width=6.5, fig.height=5}
+res_kd <- density_by_group(
+  dhx, "logFC_kd",
+  title    = "DHX29 knockdown (CRISPRi): eIF3d-promoted genes (hypoxia 1hr)",
+  subtitle = paste0("Positive logFC = mRNA accumulates on DHX29 loss\n",
+                    "Dashed vertical lines = group medians"),
+  xlab     = "logFC (DHX29 KD vs control)",
+  outfile  = "87_dhx29_kd_logfc_by_gene_group.pdf"
+)
+res_kd$plot
+```
+
+```{r density_ko, fig.width=6.5, fig.height=5}
+res_ko <- density_by_group(
+  dhx, "logFC_ko",
+  title    = "DHX29 knockout (clonal): eIF3d-promoted genes (hypoxia 1hr)",
+  subtitle = paste0("Positive logFC = mRNA accumulates on DHX29 loss\n",
+                    "Dashed vertical lines = group medians"),
+  xlab     = "logFC (DHX29 KO vs control)",
+  outfile  = "87_dhx29_ko_logfc_by_gene_group.pdf"
+)
+res_ko$plot
+```
+
+### 4c: Full test panel
+
+```{r group_tests}
+group_tests <- map_dfr(c(logFC_kd = "DHX29 KD", logFC_ko = "DHX29 KO") %>%
+                         imap(~ list(col = .y, lab = .x)), function(z) {
+  x_prom  <- dhx[[z$col]][dhx$group == "eIF3d hypoxia promotes"]
+  x_neg   <- dhx[[z$col]][dhx$group == "Negative control"]
+  x_other <- dhx[[z$col]][dhx$group == "All other genes"]
+  tibble(
+    contrast          = z$lab,
+    median_promotes   = median(x_prom),
+    median_neg_ctrl   = median(x_neg),
+    median_other      = median(x_other),
+    p_prom_vs_neg     = wilcox.test(x_prom, x_neg)$p.value,
+    p_prom_vs_other   = wilcox.test(x_prom, x_other)$p.value,
+    n_prom = length(x_prom), n_neg = length(x_neg), n_other = length(x_other)
+  )
+})
+
+print(as.data.frame(group_tests %>%
+  mutate(across(starts_with("median"), ~ round(.x, 4)),
+         across(starts_with("p_"), ~ format.pval(.x, digits = 3)))))
+```
+
+> **Result.** eIF3d-promoted mRNAs are **not** preferentially stabilised on DHX29 loss.
+> In the KD their median logFC is indistinguishable from the negative control
+> (medians -0.068 vs -0.071, p = 0.39), and in the KO they sit **below** both the negative
+> control and the background (-0.058 vs +0.014 and -0.011, p = 2e-15 and 8e-13) - the
+> opposite of the DHX29-substrate direction.
+>
+> This is striking because eIF3d-promoted genes are markedly **AU3-rich** (median GC3 48.6%
+> vs 60.3% for the negative control and 57.3% for background). On GC3 alone they should be
+> the *most* DHX29-responsive set in the transcriptome. Section 5 decomposes this.
+
+---
+
+## Section 5: Why the GC3 signal does not carry over - stratified decomposition
+
+If eIF3d-promoted genes were ordinary AU3-rich DHX29 substrates, they should track the
+background *within* each GC3 stratum. Splitting the transcriptome into GC3 quintiles and
+comparing groups inside each one separates composition (they are AU3-rich) from behaviour
+(how they respond at matched GC3).
+
+```{r gc3_stratified}
+dhx_strat <- dhx %>%
+  mutate(gc3_quintile = cut(gc3, breaks = quantile(gc3, 0:5 / 5),
+                            include.lowest = TRUE,
+                            labels = paste0("GC3 Q", 1:5)))
+
+strat_summary <- dhx_strat %>%
+  group_by(gc3_quintile, group) %>%
+  summarise(n = n(),
+            median_kd = round(median(logFC_kd), 3),
+            median_ko = round(median(logFC_ko), 3),
+            .groups = "drop")
+
+cat("Median logFC by GC3 quintile and gene group:\n")
+print(as.data.frame(
+  strat_summary %>%
+    pivot_wider(names_from = group, values_from = c(n, median_kd, median_ko))
+))
+
+# Within-stratum sign test: is the promoted set at or below background in every quintile?
+strat_wide <- strat_summary %>%
+  dplyr::select(gc3_quintile, group, median_kd, median_ko) %>%
+  pivot_longer(c(median_kd, median_ko), names_to = "contrast", values_to = "median") %>%
+  pivot_wider(names_from = group, values_from = median)
+
+strat_wide <- strat_wide %>%
+  mutate(prom_minus_other = `eIF3d hypoxia promotes` - `All other genes`,
+         prom_minus_neg   = `eIF3d hypoxia promotes` - `Negative control`)
+cat("\nPromoted minus reference, per stratum:\n")
+print(as.data.frame(strat_wide %>% mutate(across(where(is.numeric), ~ round(.x, 3)))))
+
+stopifnot(
+  "Every GC3 quintile must contain all three groups" =
+    all(!is.na(strat_wide$`eIF3d hypoxia promotes`)) &&
+    all(!is.na(strat_wide$`Negative control`)),
+  "Promoted set must be AU3-richer than the negative control (composition claim)" =
+    median(dhx$gc3[dhx$group == "eIF3d hypoxia promotes"]) <
+    median(dhx$gc3[dhx$group == "Negative control"])
+)
+
+cat("\nStrata where the promoted set sits at or below background:",
+    sum(strat_wide$prom_minus_other <= 0), "of", nrow(strat_wide), "\n")
+```
+
+```{r stratified_plot, fig.width=9, fig.height=4.5}
+strat_plot_df <- strat_summary %>%
+  pivot_longer(c(median_kd, median_ko), names_to = "contrast", values_to = "median_logFC") %>%
+  mutate(contrast = recode(contrast,
+                           median_ko = "DHX29 KO (clonal)",
+                           median_kd = "DHX29 KD (CRISPRi, acute)"),
+         contrast = factor(contrast, levels = c("DHX29 KO (clonal)",
+                                                "DHX29 KD (CRISPRi, acute)")))
+
+p_strat <- ggplot(strat_plot_df,
+                  aes(x = gc3_quintile, y = median_logFC, color = group, group = group)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.5) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_color_manual(values = set_colors) +
+  labs(
+    title    = "eIF3d-promoted mRNAs are AU3-rich but do not respond to DHX29 loss at matched GC3",
+    subtitle = paste0("Median logFC within GC3 quintiles; n = ", nrow(dhx), " genes total\n",
+                      "GC3 median: promoted ",
+                      round(median(dhx$gc3[dhx$group == "eIF3d hypoxia promotes"]), 1),
+                      "%, neg ctrl ",
+                      round(median(dhx$gc3[dhx$group == "Negative control"]), 1),
+                      "%, other ",
+                      round(median(dhx$gc3[dhx$group == "All other genes"]), 1), "%"),
+    x = "GC3 quintile (low to high)", y = "Median logFC on DHX29 depletion", color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_strat
+ggsave(here("plots", "87_dhx29_logfc_by_gc3_quintile_and_group.pdf"), p_strat,
+       width = 9, height = 4.5)
+cat("Saved: plots/87_dhx29_logfc_by_gc3_quintile_and_group.pdf\n")
+```
+
+---
+---
+
+## Section 6: Abundance-defined gene sets (DHX29 KD RNA-seq) for notebook 07
+
+Two gene sets are exported to `output/genesets/` in the standard schema
+(`db_gene_symbol`, `ensembl_gene`, `gs_name`, `gs_description`, `gs_source_species`), so
+notebook 07 can take one as the positive class and the other as the negative class.
+
+**These sets are defined on steady-state abundance, not stability.** They are named
+`dhx29_{contrast}_up` / `dhx29_{contrast}_down` for exactly that reason. An earlier draft
+called them "sensitive" / "resistant to DHX29-mediated degradation"; Section 7a shows that
+claim is not supported by the paper's own half-life data, so the naming was corrected.
+Stability-defined sets are built separately in Section 7d.
+
+**Parameters** (all YAML, edit at the top of this notebook):
+
+| Param | Meaning |
+|---|---|
+| `n_up` / `n_down` | Target set sizes. 07 keeps all positives and downsamples the negative pool to `min(n_pos, n_neg)`, so make `n_down >= n_up` or 07 will silently shrink the positive class. |
+| `dhx29_contrast` | `"kd"` (CRISPRi, the stronger and more acute effect - default), `"ko"` (clonal), or `"both"` (require the same sign in both contrasts, rank by KD). |
+| `down_mode` | `"extreme"` (default: bottom-N by logFC, `padj < padj_cut` - a symmetric top-vs-bottom contrast) or `"unchanged"` (project negative-control convention: `\|logFC\| < unchanged_max_abs_lfc` and `padj > unchanged_padj`). |
+| `padj_cut` | Significance cut applied to both tails in `"extreme"` mode. |
+
+**Definitions.** Positive logFC = the mRNA accumulates when DHX29 is depleted, so:
+
+- **`up`** = top `n_up` genes by logFC, `padj < padj_cut`. More mRNA present without DHX29.
+- **`down`** = the most negative-logFC genes (`"extreme"`, default), or genes whose level
+  does not depend on DHX29 (`"unchanged"`).
+
+**Why `"extreme"` is the default.** A classifier learns from the contrast it is given, and
+extreme-vs-extreme is the sharper, symmetric one: both classes are drawn under the same
+significance filter, and the label is monotone in the quantity of interest. Extreme-vs-middle
+mixes two different things into the negative class - genes DHX29 does not act on and genes
+with too little power to tell - so the model partly learns "was this gene measurable" rather
+than "did it respond". The same top-vs-bottom design is what the eIF4E resistant/sensitive
+sets in this project use.
+
+```{r geneset_params}
+n_up           <- as.integer(params$n_up)
+n_down         <- as.integer(params$n_down)
+dhx29_contrast <- tolower(params$dhx29_contrast)
+down_mode      <- tolower(params$down_mode)
+
+stopifnot(
+  "n_up must be a positive integer"   = !is.na(n_up)   && n_up   > 0,
+  "n_down must be a positive integer" = !is.na(n_down) && n_down > 0,
+  "dhx29_contrast must be one of kd / ko / both" =
+    dhx29_contrast %in% c("kd", "ko", "both"),
+  "down_mode must be one of unchanged / extreme" =
+    down_mode %in% c("unchanged", "extreme")
+)
+
+rank_lfc  <- if (dhx29_contrast == "ko") "logFC_ko" else "logFC_kd"
+rank_padj <- if (dhx29_contrast == "ko") "padj_ko"  else "padj_kd"
+
+cat("Ranking contrast:", dhx29_contrast, "->", rank_lfc, "\n")
+cat("Target sizes: up =", n_up, ", down =", n_down, "\n")
+cat("Down mode:", down_mode, "\n")
+
+if (n_down < n_up) {
+  warning("n_down < n_up: notebook 07 downsamples the negative pool to min(n_pos, n_neg), ",
+          "so the positive class will be silently truncated to ", n_down, ".")
+}
+```
+
+```{r build_genesets}
+pool <- dhx %>%
+  dplyr::filter(!is.na(symbol), symbol != "") %>%
+  mutate(rank_lfc_val = .data[[rank_lfc]], rank_padj_val = .data[[rank_padj]])
+
+cat("Selection pool:", nrow(pool), "genes\n")
+
+up_pool <- pool %>% dplyr::filter(rank_padj_val < params$padj_cut, rank_lfc_val > 0)
+if (dhx29_contrast == "both") {
+  up_pool <- up_pool %>% dplyr::filter(logFC_ko > 0, logFC_kd > 0)
+}
+cat("Up pool (padj <", params$padj_cut,
+    if (dhx29_contrast == "both") ", up in both contrasts" else "", "):", nrow(up_pool), "\n")
+
+up_set <- up_pool %>% slice_max(rank_lfc_val, n = n_up, with_ties = FALSE)
+
+if (down_mode == "unchanged") {
+  down_pool <- pool %>%
+    dplyr::filter(abs(rank_lfc_val) < params$unchanged_max_abs_lfc,
+                  rank_padj_val > params$unchanged_padj)
+  if (dhx29_contrast == "both") {
+    down_pool <- down_pool %>%
+      dplyr::filter(abs(logFC_ko) < params$unchanged_max_abs_lfc,
+                    abs(logFC_kd) < params$unchanged_max_abs_lfc)
+  }
+  cat("Down pool (|logFC| <", params$unchanged_max_abs_lfc,
+      ", padj >", params$unchanged_padj, "):", nrow(down_pool), "\n")
+  down_set <- down_pool %>% slice_min(abs(rank_lfc_val), n = n_down, with_ties = FALSE)
+} else {
+  down_pool <- pool %>% dplyr::filter(rank_padj_val < params$padj_cut, rank_lfc_val < 0)
+  if (dhx29_contrast == "both") {
+    down_pool <- down_pool %>% dplyr::filter(logFC_ko < 0, logFC_kd < 0)
+  }
+  cat("Down pool (down, padj <", params$padj_cut, "):", nrow(down_pool), "\n")
+  down_set <- down_pool %>% slice_min(rank_lfc_val, n = n_down, with_ties = FALSE)
+}
+
+cat("\nRealised sizes: up =", nrow(up_set), ", down =", nrow(down_set), "\n")
+cat("Ceiling under the current criteria: n_up <=", nrow(up_pool),
+    ", n_down <=", nrow(down_pool), "\n")
+
+stopifnot(
+  "Up pool is smaller than n_up - loosen padj_cut or lower n_up" =
+    nrow(up_set) == n_up,
+  "Down pool is smaller than n_down - loosen the criteria or lower n_down" =
+    nrow(down_set) == n_down,
+  "The two sets must be disjoint (notebook 07 requires this)" =
+    length(intersect(up_set$ensembl_gene, down_set$ensembl_gene)) == 0,
+  "Up genes must all be up on DHX29 depletion" = all(up_set$rank_lfc_val > 0),
+  "Gene IDs must be unique within each set" =
+    !any(duplicated(up_set$ensembl_gene)) && !any(duplicated(down_set$ensembl_gene))
+)
+```
+
+### 6a: Set characteristics
+
+```{r geneset_characteristics}
+set_profile <- bind_rows(
+  up_set   %>% mutate(set = "Up on DHX29 KD"),
+  down_set %>% mutate(set = "Down on DHX29 KD")
+) %>%
+  group_by(set) %>%
+  summarise(
+    n              = n(),
+    median_lfc_kd  = round(median(logFC_kd), 3),
+    median_lfc_ko  = round(median(logFC_ko), 3),
+    median_gc3     = round(median(gc3), 1),
+    median_cds_gc  = round(median(cds_gc, na.rm = TRUE), 1),
+    median_cds_len = round(median(cds_length, na.rm = TRUE)),
+    .groups = "drop"
+  )
+print(as.data.frame(set_profile))
+
+sep_test <- wilcox.test(up_set$rank_lfc_val, down_set$rank_lfc_val)
+cat("\nUp vs down on the ranking contrast: Wilcoxon p",
+    fmt_p(sep_test$p.value), "| n =", nrow(up_set), "vs", nrow(down_set), "\n")
+
+gc3_test <- wilcox.test(up_set$gc3, down_set$gc3)
+cat("GC3 difference between the sets: Wilcoxon p", fmt_p(gc3_test$p.value),
+    "| medians", round(median(up_set$gc3), 1), "vs", round(median(down_set$gc3), 1), "\n")
+
+cat("\nOverlap with eIF3d-promoted (hypoxia 1hr):",
+    length(intersect(up_set$ensembl_gene, promotes_ids)), "of", nrow(up_set), "up |",
+    length(intersect(down_set$ensembl_gene, promotes_ids)), "of", nrow(down_set), "down\n")
+
+stopifnot(
+  "The two sets must separate on the ranking contrast" = sep_test$p.value < 1e-10,
+  "The up set must be more AU3-rich than the down set" =
+    median(up_set$gc3) < median(down_set$gc3)
+)
+```
+
+```{r confound_report}
+confound <- set_profile %>% dplyr::select(set, median_gc3, median_cds_gc, median_cds_len)
+gc3_up    <- confound$median_gc3[confound$set == "Up on DHX29 KD"]
+gc3_down  <- confound$median_gc3[confound$set == "Down on DHX29 KD"]
+len_up    <- confound$median_cds_len[confound$set == "Up on DHX29 KD"]
+len_down  <- confound$median_cds_len[confound$set == "Down on DHX29 KD"]
+len_ratio <- round(max(len_up, len_down) / min(len_up, len_down), 2)
+
+cat("Confound check on the exported sets\n")
+cat("  GC3 median:        up", gc3_up, "% vs down", gc3_down, "%\n")
+cat("  CDS length median: up", len_up, "nt vs down", len_down, "nt  (", len_ratio, "x )\n")
+```
+
+> **Read this before modelling.** The two sets differ sharply on two confounded axes by
+> construction:
+>
+> - **GC.** GC3 median `r gc3_up`% (up) vs `r gc3_down`% (down), and Section 3 shows GC
+>   explains most of the DHX29-depletion logFC in these tables.
+> - **CDS length.** Median CDS `r len_up` nt (up) vs `r len_down` nt (down), a
+>   `r len_ratio`-fold gap that arrives free with the selection, since long CDSs are both
+>   AU3-richer and offer more stall sites.
+>
+> A notebook 07 classifier on these sets will therefore be substantially a GC/length
+> classifier, and the top importances will be the GC, codon and length families. That is a
+> valid answer to "what distinguishes mRNAs that accumulate on DHX29 knockdown", but it is
+> **not** independent evidence for a sequence-specific mechanism beyond base composition and
+> size. To ask what predicts the response *beyond* those, run 07c and read the SHAP
+> decomposition with the GC and length families summed, or rebuild the down set matched on
+> GC3 and `log2_cds_length`.
+
+```{r geneset_gc3_plot, fig.width=6, fig.height=4.5}
+geneset_colors <- c("Up on DHX29 KD" = "#D55E00", "Down on DHX29 KD" = "#0072B2")
+
+set_long <- bind_rows(
+  up_set   %>% mutate(set = "Up on DHX29 KD"),
+  down_set %>% mutate(set = "Down on DHX29 KD")
+) %>%
+  mutate(set = factor(set, levels = c("Up on DHX29 KD", "Down on DHX29 KD")))
+
+p_set_gc3 <- ggplot(set_long, aes(x = gc3, color = set)) +
+  geom_density(fill = NA, linewidth = 0.8, key_glyph = "path") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3,
+           label = paste0("Wilcoxon p ", fmt_p(gc3_test$p.value),
+                          "\nn up = ", nrow(up_set),
+                          "\nn down = ", nrow(down_set))) +
+  scale_color_manual(values = geneset_colors) +
+  labs(
+    title    = "GC3 composition of the exported abundance gene sets",
+    subtitle = paste0("Ranked on the ", toupper(dhx29_contrast),
+                      " RNA-seq contrast; down mode = ", down_mode),
+    x = "GC3 content (%)", y = "Density", color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_set_gc3
+ggsave(here("plots", "87_dhx29_kd_geneset_gc3_composition.pdf"), p_set_gc3,
+       width = 6, height = 4.5)
+cat("Saved: plots/87_dhx29_kd_geneset_gc3_composition.pdf\n")
+```
+
+### 6b: Write the gene set CSVs
+
+Filenames follow the pattern notebook 07 builds from its params
+(`{condition}_{gene}_{direction}_{readout}_{timepoint}_lfc{lfc}.csv`). No `readout` column is
+stamped, so 07 treats both files as `readout = "TE"` and its pairing guard passes.
+
+```{r write_genesets}
+geneset_timepoint <- paste0("k562", down_mode)
+
+geneset_stub <- function(direction) {
+  paste0("dhx29", dhx29_contrast, "_29_", direction, "_TE_", geneset_timepoint, "_lfc0.csv")
+}
+
+as_geneset <- function(df, direction, description) {
+  df %>%
+    transmute(
+      db_gene_symbol    = symbol,
+      ensembl_gene      = ensembl_gene,
+      gs_name           = paste0("dhx29_", dhx29_contrast, "_", direction),
+      gs_description    = description,
+      gs_source_species = "homo sapiens",
+      logFC_kd, padj_kd, logFC_ko, padj_ko, gc3
+    ) %>%
+    arrange(desc(abs(logFC_kd)))
+}
+
+src_table <- if (dhx29_contrast == "ko") "S3" else "S2"
+assay_txt <- paste0("steady-state abundance on DHX29 ", toupper(dhx29_contrast),
+                    if (dhx29_contrast == "kd") " CRISPRi knockdown" else " knockout",
+                    " in K562 (RNA-seq, not a stability assay)")
+
+up_out <- as_geneset(
+  up_set, "up",
+  paste0("top ", n_up, " mRNAs with increased ", assay_txt,
+         "; padj < ", params$padj_cut,
+         ". Hia et al. 2026 Science adw0288 table ", src_table)
+)
+
+down_out <- as_geneset(
+  down_set, "down",
+  paste0(n_down, " mRNAs with ",
+         if (down_mode == "unchanged")
+           paste0("unchanged ", assay_txt, " (|logFC| < ", params$unchanged_max_abs_lfc,
+                  ", padj > ", params$unchanged_padj, ")")
+         else
+           paste0("decreased ", assay_txt, "; padj < ", params$padj_cut),
+         ". Hia et al. 2026 Science adw0288 table ", src_table)
+)
+
+up_file   <- geneset_stub("up")
+down_file <- geneset_stub("down")
+
+stopifnot(
+  "Gene set schema is missing required columns" =
+    all(c("db_gene_symbol", "ensembl_gene", "gs_name", "gs_description",
+          "gs_source_species") %in% colnames(up_out)),
+  "No gene symbol may be blank" =
+    all(nzchar(up_out$db_gene_symbol)) && all(nzchar(down_out$db_gene_symbol)),
+  "readout column must be absent so 07 treats these as TE-compatible" =
+    !"readout" %in% colnames(up_out),
+  # Guard against the naming regression this section exists to fix. Matches affirmative
+  # decay claims only - the descriptions legitimately contain "not a stability assay".
+  "gene set descriptions must not claim a degradation/decay readout" =
+    !any(grepl("degrad|decay|clearance|half-life", c(up_out$gs_description,
+                                                     down_out$gs_description),
+               ignore.case = TRUE)),
+  "gene set descriptions must state the abundance readout explicitly" =
+    all(grepl("steady-state abundance", c(up_out$gs_description,
+                                          down_out$gs_description)))
+)
+
+if (isTRUE(params$write_genesets)) {
+  write_csv(up_out,   here("output", "genesets", up_file))
+  write_csv(down_out, here("output", "genesets", down_file))
+  cat("Wrote output/genesets/", up_file,   " (", nrow(up_out),   " genes)\n", sep = "")
+  cat("Wrote output/genesets/", down_file, " (", nrow(down_out), " genes)\n", sep = "")
+} else {
+  cat("write_genesets = FALSE - nothing written\n")
+}
+
+cat("\nHead of the up set:\n")
+print(as.data.frame(head(up_out %>%
+  dplyr::select(db_gene_symbol, ensembl_gene, logFC_kd, padj_kd, gc3), 10)))
+```
+
+---
+
+## Section 7: The KO SLAM-seq half-life data - the paper's actual stability readout
+
+Table S6 is a SLAM-seq metabolic-labelling time course (`Ctrl` and `KO` at 0/3/6 h, three
+replicates each) with fitted `Ctrl_Half_life` and `KO_Half_life`. It is the only direct decay
+measurement in the paper, and it exists **only for the KO** - there are no KD columns in S6.
+Notebook 23 already parsed and gene-mapped it; this section reads that saved object rather
+than re-deriving the transcript mapping.
+
+`logFC = log2(KO / Ctrl)` half-life, so **positive = stabilised when DHX29 is knocked out**,
+i.e. DHX29 normally promotes that mRNA's decay.
+
+```{r load_slamseq}
+slam_path <- here("output", "predictive_modeling", "dhx29_slamseq_halflives.rds")
+stopifnot(
+  "dhx29_slamseq_halflives.rds not found - knit notebook 23 first" = file.exists(slam_path)
+)
+
+slam <- readRDS(slam_path) %>%
+  dplyr::select(ensembl_gene, symbol, Ctrl_Half_life, KO_Half_life, logFC, n_transcripts) %>%
+  dplyr::filter(!is.na(logFC)) %>%
+  distinct(ensembl_gene, .keep_all = TRUE)
+
+cat("SLAM-seq genes:", nrow(slam), "\n")
+cat("Median Ctrl half-life:", round(median(slam$Ctrl_Half_life), 2),
+    "h | median KO half-life:", round(median(slam$KO_Half_life), 2), "h\n")
+
+# Identity check on the logFC column. nb23 aggregates genes with several mapped
+# transcripts by averaging half-lives and logFC separately, and the mean of ratios is
+# not the ratio of means - so the identity is exact only for single-transcript genes.
+# Asserting it separately on the two strata validates the column without failing on
+# legitimate aggregation.
+dev <- abs(slam$logFC - log2(slam$KO_Half_life / slam$Ctrl_Half_life))
+single <- slam$n_transcripts == 1
+
+cat("Single-transcript genes:", sum(single), "| aggregated:", sum(!single), "\n")
+cat("Max |logFC - log2(KO/Ctrl)|: single =", format(max(dev[single]), digits = 3),
+    "| aggregated =", round(max(dev[!single]), 4), "\n")
+
+stopifnot(
+  # Zhu-style replication check: Hia report a median half-life of a few hours.
+  "Median control half-life outside the expected range" =
+    dplyr::between(median(slam$Ctrl_Half_life), 2.0, 6.0),
+  "Half-lives must be positive"  = all(slam$Ctrl_Half_life > 0 & slam$KO_Half_life > 0),
+  "logFC must be finite"         = all(is.finite(slam$logFC)),
+  "logFC must equal log2(KO/Ctrl) exactly for single-transcript genes" =
+    max(dev[single]) < 1e-6,
+  "Aggregated genes must still be close to log2(KO/Ctrl)" =
+    max(dev[!single]) < 0.1,
+  "Aggregation must affect only a small minority of genes" =
+    mean(single) > 0.99
+)
+cat("logFC = log2(KO / Ctrl) half-life: verified\n")
+```
+
+### 7a: Abundance and stability do not agree
+
+The check that renamed Section 6's gene sets. If "up on DHX29 depletion" meant "stabilised",
+the RNA-seq logFC and the SLAM-seq half-life logFC would track each other.
+
+```{r abundance_vs_stability}
+av <- slam %>%
+  dplyr::select(ensembl_gene, slam_logfc = logFC) %>%
+  inner_join(dhx %>% dplyr::select(ensembl_gene, logFC_kd, logFC_ko, gc3),
+             by = "ensembl_gene")
+
+cat("Genes with both readouts:", nrow(av), "\n\n")
+
+agree <- bind_rows(
+  cor_row(av$logFC_kd, av$slam_logfc, "KD RNA-seq logFC", "SLAM-seq half-life logFC"),
+  cor_row(av$logFC_ko, av$slam_logfc, "KO RNA-seq logFC", "SLAM-seq half-life logFC"),
+  cor_row(av$gc3,      av$slam_logfc, "GC3",              "SLAM-seq half-life logFC"),
+  cor_row(av$gc3,      av$logFC_kd,   "GC3",              "KD RNA-seq logFC")
+) %>%
+  mutate(rho = round(rho, 3), p = format.pval(p, digits = 3))
+print(as.data.frame(agree))
+
+rho_abund_stab <- as.numeric(agree$rho[agree$feature == "KD RNA-seq logFC"])
+rho_gc3_slam   <- as.numeric(agree$rho[agree$feature == "GC3" &
+                                       agree$contrast == "SLAM-seq half-life logFC"])
+
+stopifnot(
+  "Abundance and stability are expected to be near-orthogonal here" =
+    abs(rho_abund_stab) < 0.15,
+  "GC3 is expected NOT to predict the SLAM-seq half-life change" =
+    abs(rho_gc3_slam) < 0.15
+)
+```
+
+> **Documented negative result.** The KD abundance change and the KO half-life change
+> correlate at rho = `r rho_abund_stab` across `r nrow(av)` genes. GC3 predicts the abundance
+> change strongly (rho ~ -0.63) but the half-life change not at all
+> (rho = `r rho_gc3_slam`). So the striking GC3 relationship in Section 3 lives entirely in
+> the abundance readout and does not appear in the paper's own decay measurement.
+>
+> Consequences, both applied above: Section 6's sets are named for abundance, and any claim
+> that they mark "DHX29-mediated degradation" is unsupported by this data. Notebook 23
+> reached the same conclusion from the GC3 side (rho = -0.024, p = 0.118).
+>
+> This is not a claim the paper is wrong. The KO is the weaker perturbation in the abundance
+> data too (rho -0.117 vs -0.633), the SLAM-seq universe is smaller and noisier, and our
+> transcript selection and gene-level dedup differ from theirs. It does mean this pipeline
+> cannot treat the two readouts as interchangeable.
+
+### 7b: Gene-group density on the SLAM-seq half-life change
+
+Same three groups as Section 4, now on the stability readout.
+
+```{r slam_groups}
+slam_gc <- slam %>%
+  inner_join(gc_fm %>% dplyr::select(ensembl_gene, gc3, cds_gc, cds_length),
+             by = "ensembl_gene") %>%
+  mutate(group = case_when(
+    ensembl_gene %in% promotes_ids ~ "eIF3d hypoxia promotes",
+    ensembl_gene %in% neg_ctrl_ids ~ "Negative control",
+    TRUE                           ~ "All other genes"
+  ))
+
+cat("SLAM-seq genes with GC3:", nrow(slam_gc), "\n")
+print(as.data.frame(
+  slam_gc %>% group_by(group) %>%
+    summarise(n = n(),
+              median_logfc = round(median(logFC), 4),
+              median_gc3   = round(median(gc3), 1), .groups = "drop")
+))
+
+stopifnot(
+  "All three groups must be represented" =
+    setequal(unique(slam_gc$group), names(set_colors)),
+  "Each group needs enough genes for a density estimate" =
+    all(table(slam_gc$group) >= 50)
+)
+```
+
+```{r density_slam, fig.width=6.5, fig.height=5}
+res_slam <- density_by_group(
+  slam_gc, "logFC",
+  title    = "DHX29 KO mRNA stability: eIF3d-promoted genes (hypoxia 1hr)",
+  subtitle = paste0("SLAM-seq log2(KO / Ctrl) half-life; positive = stabilised on KO\n",
+                    "Dashed vertical lines = group medians"),
+  xlab     = "log2(KO / Ctrl) half-life",
+  outfile  = "87_dhx29_slamseq_halflife_by_gene_group.pdf"
+)
+res_slam$plot
+```
+
+```{r slam_group_tests}
+x_prom  <- slam_gc$logFC[slam_gc$group == "eIF3d hypoxia promotes"]
+x_neg   <- slam_gc$logFC[slam_gc$group == "Negative control"]
+x_other <- slam_gc$logFC[slam_gc$group == "All other genes"]
+
+slam_tests <- tibble(
+  readout         = "SLAM-seq log2(KO/Ctrl) half-life",
+  median_promotes = median(x_prom),
+  median_neg_ctrl = median(x_neg),
+  median_other    = median(x_other),
+  p_prom_vs_neg   = wilcox.test(x_prom, x_neg)$p.value,
+  p_prom_vs_other = wilcox.test(x_prom, x_other)$p.value,
+  n_prom = length(x_prom), n_neg = length(x_neg), n_other = length(x_other)
+)
+print(as.data.frame(slam_tests %>%
+  mutate(across(starts_with("median"), ~ round(.x, 4)),
+         across(starts_with("p_"), ~ format.pval(.x, digits = 3)))))
+```
+
+> **Null result, and a cleaner one than Section 4's.** On the stability readout the three
+> groups are indistinguishable (both p > 0.6). eIF3d-promoted mRNAs are neither preferentially
+> stabilised nor destabilised when DHX29 is knocked out, despite being markedly AU3-rich.
+> Section 4 found the same thing on the abundance readout; here there is not even a
+> composition effect to decompose, because GC3 does not move this readout at all (7a).
+
+### 7c: SLAM-seq half-life change vs GC3
+
+```{r slam_gc3_plot, fig.width=6, fig.height=4.5}
+slam_q <- slam_gc %>%
+  mutate(gc3_q = ntile(gc3, 4),
+         gc3_q = factor(gc3_q, levels = 1:4,
+                        labels = c("Q1 (most AU3-rich)", "Q2", "Q3", "Q4 (most GC3-rich)")))
+
+slam_q_stats <- slam_q %>%
+  group_by(gc3_q) %>%
+  summarise(n = n(), median_gc3 = round(median(gc3), 1),
+            median_logfc = round(median(logFC), 4), .groups = "drop")
+print(as.data.frame(slam_q_stats))
+
+slam_q_test <- wilcox.test(
+  slam_q$logFC[slam_q$gc3_q == "Q1 (most AU3-rich)"],
+  slam_q$logFC[slam_q$gc3_q == "Q4 (most GC3-rich)"]
+)
+
+p_slam_gc3 <- ggplot(slam_q, aes(x = logFC, color = gc3_q)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", linewidth = 0.5) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.3, size = 3,
+           label = paste0("Q1 vs Q4 Wilcoxon p ", fmt_p(slam_q_test$p.value),
+                          "\nSpearman(GC3, logFC) = ", rho_gc3_slam,
+                          "\nn per quartile = ", round(nrow(slam_q) / 4))) +
+  scale_color_manual(values = quartile_colors) +
+  coord_cartesian(xlim = quantile(slam_q$logFC, c(0.005, 0.995))) +
+  labs(
+    title    = "DHX29 KO half-life change by GC3 quartile",
+    subtitle = "Contrast with Section 3: the GC3 effect present in RNA-seq is absent here",
+    x = "log2(KO / Ctrl) half-life", y = "Cumulative fraction", color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+p_slam_gc3
+ggsave(here("plots", "87_dhx29_slamseq_halflife_cdf_by_gc3_quartile.pdf"), p_slam_gc3,
+       width = 6, height = 4.5)
+cat("Saved: plots/87_dhx29_slamseq_halflife_cdf_by_gc3_quartile.pdf\n")
+```
+
+### 7d: Stability-defined gene sets
+
+Top/bottom N by SLAM-seq half-life logFC. Table S6 carries no per-gene p-value, so these are
+ranked on effect size alone - stated explicitly in the descriptions.
+
+```{r build_slam_genesets}
+n_slam_up   <- as.integer(params$n_slam_up)
+n_slam_down <- as.integer(params$n_slam_down)
+
+stopifnot(
+  "n_slam_up must be a positive integer"   = !is.na(n_slam_up)   && n_slam_up   > 0,
+  "n_slam_down must be a positive integer" = !is.na(n_slam_down) && n_slam_down > 0,
+  "Not enough SLAM-seq genes for the requested set sizes" =
+    nrow(slam_gc) >= n_slam_up + n_slam_down
+)
+
+slam_pool <- slam_gc %>% dplyr::filter(!is.na(symbol), symbol != "")
+
+slam_stab   <- slam_pool %>% slice_max(logFC, n = n_slam_up,   with_ties = FALSE)
+slam_destab <- slam_pool %>% slice_min(logFC, n = n_slam_down, with_ties = FALSE)
+
+slam_profile <- bind_rows(
+  slam_stab   %>% mutate(set = "Stabilised on KO"),
+  slam_destab %>% mutate(set = "Destabilised on KO")
+) %>%
+  group_by(set) %>%
+  summarise(n = n(),
+            median_logfc   = round(median(logFC), 3),
+            median_gc3     = round(median(gc3), 1),
+            median_cds_len = round(median(cds_length, na.rm = TRUE)),
+            .groups = "drop")
+print(as.data.frame(slam_profile))
+
+slam_gc3_test <- wilcox.test(slam_stab$gc3, slam_destab$gc3)
+cat("\nGC3 difference between the stability sets: Wilcoxon p",
+    fmt_p(slam_gc3_test$p.value), "| medians", round(median(slam_stab$gc3), 1),
+    "vs", round(median(slam_destab$gc3), 1), "\n")
+cat("Compare the abundance sets, which differ by",
+    round(abs(gc3_up - gc3_down), 1), "GC3 points.\n")
+
+stopifnot(
+  "Stability sets must be disjoint" =
+    length(intersect(slam_stab$ensembl_gene, slam_destab$ensembl_gene)) == 0,
+  "Stabilised set must have higher logFC than destabilised" =
+    median(slam_stab$logFC) > median(slam_destab$logFC),
+  "Gene IDs must be unique within each stability set" =
+    !any(duplicated(slam_stab$ensembl_gene)) && !any(duplicated(slam_destab$ensembl_gene))
+)
+```
+
+```{r write_slam_genesets}
+as_slam_geneset <- function(df, direction, description) {
+  df %>%
+    transmute(
+      db_gene_symbol    = symbol,
+      ensembl_gene      = ensembl_gene,
+      gs_name           = paste0("dhx29_slamseq_", direction),
+      gs_description    = description,
+      gs_source_species = "homo sapiens",
+      Ctrl_Half_life, KO_Half_life, slamseq_logfc = logFC, gc3
+    ) %>%
+    arrange(desc(abs(slamseq_logfc)))
+}
+
+slam_stub <- function(direction) {
+  paste0("dhx29slam_29_", direction, "_TE_k562slam_lfc0.csv")
+}
+
+stab_out <- as_slam_geneset(
+  slam_stab, "stabilized",
+  paste0("top ", n_slam_up, " mRNAs by log2(KO / Ctrl) half-life on DHX29 knockout in K562 ",
+         "(SLAM-seq); stabilised when DHX29 is lost. Ranked on effect size - table S6 ",
+         "reports no per-gene p-value. Hia et al. 2026 Science adw0288 table S6")
+)
+
+destab_out <- as_slam_geneset(
+  slam_destab, "destabilized",
+  paste0("bottom ", n_slam_down, " mRNAs by log2(KO / Ctrl) half-life on DHX29 knockout in ",
+         "K562 (SLAM-seq); destabilised when DHX29 is lost. Ranked on effect size - table S6 ",
+         "reports no per-gene p-value. Hia et al. 2026 Science adw0288 table S6")
+)
+
+stab_file   <- slam_stub("stabilized")
+destab_file <- slam_stub("destabilized")
+
+stopifnot(
+  "Gene set schema is missing required columns" =
+    all(c("db_gene_symbol", "ensembl_gene", "gs_name", "gs_description",
+          "gs_source_species") %in% colnames(stab_out)),
+  "No gene symbol may be blank" =
+    all(nzchar(stab_out$db_gene_symbol)) && all(nzchar(destab_out$db_gene_symbol)),
+  "readout column must be absent so 07 treats these as TE-compatible" =
+    !"readout" %in% colnames(stab_out)
+)
+
+if (isTRUE(params$write_genesets)) {
+  write_csv(stab_out,   here("output", "genesets", stab_file))
+  write_csv(destab_out, here("output", "genesets", destab_file))
+  cat("Wrote output/genesets/", stab_file,   " (", nrow(stab_out),   " genes)\n", sep = "")
+  cat("Wrote output/genesets/", destab_file, " (", nrow(destab_out), " genes)\n", sep = "")
+} else {
+  cat("write_genesets = FALSE - nothing written\n")
+}
+```
+
+### 7e: Coverage against the feature matrices
+
+```{r geneset_coverage}
+check_coverage <- function(matrix_file, sets) {
+  path <- here("output", "predictive_modeling", matrix_file)
+  if (!file.exists(path)) {
+    return(tibble(feature_matrix = matrix_file, set = names(sets), n = NA_integer_))
+  }
+  ids <- readRDS(path)$gene_id_clean
+  tibble(feature_matrix = matrix_file,
+         set = names(sets),
+         n   = vapply(sets, function(s) sum(s %in% ids), integer(1)))
+}
+
+all_sets <- list(
+  kd_up            = up_out$ensembl_gene,
+  kd_down          = down_out$ensembl_gene,
+  slam_stabilized  = stab_out$ensembl_gene,
+  slam_destabilized = destab_out$ensembl_gene
+)
+
+coverage <- map_dfr(c("feature_matrix_external_stability.rds",
+                      "feature_matrix_dhx29_no_hia_perturbation.rds"),
+                    check_coverage, sets = all_sets) %>%
+  pivot_wider(names_from = set, values_from = n)
+print(as.data.frame(coverage))
+
+stopifnot(
+  "Too few genes survive the feature-matrix join to train a classifier" =
+    min(coverage$slam_stabilized, coverage$slam_destabilized, na.rm = TRUE) >= 100
+)
+```
+
+---
+
+## Section 8: Feature matrices with the DHX29-derived features removed
+
+`feature_matrix_external_stability.rds` carries three columns derived from the same Hia 2026
+study these gene sets come from:
+
+| Column | Source | DHX29 perturbation readout? |
+|---|---|---|
+| `hia2026_dhx29_occupancy` | Thor-Ribo-seq DHX29-IP vs input (Table S8) | Yes - where DHX29 sits |
+| `hia2026_dhx29_halflife_logfc` | SLAM-seq log2(KO / Ctrl) half-life (Table S6) | Yes - response to DHX29 loss |
+| `hia2026_ctrl_halflife` | SLAM-seq control half-life (Table S6) | No - unperturbed baseline |
+
+**`hia2026_dhx29_halflife_logfc` IS the label for Section 7d's sets** - it is Table S6's
+`logFC`, the exact quantity those sets are ranked on. Using it there would be pure leakage,
+not a judgement call. For Section 6's abundance sets it is not circular (it correlates with
+the KD logFC at only r = 0.016), but it is dropped in the same variant for consistency.
+
+Two files are written. The occupancy-only file is kept because an earlier 07 run used it;
+overwriting it would silently invalidate that run's provenance.
+
+```{r write_reduced_matrices}
+fm_full <- readRDS(here("output", "predictive_modeling",
+                        "feature_matrix_external_stability.rds"))
+
+drop_sets <- list(
+  "feature_matrix_dhx29_no_occupancy.rds"        = "hia2026_dhx29_occupancy",
+  "feature_matrix_dhx29_no_hia_perturbation.rds" = c("hia2026_dhx29_occupancy",
+                                                     "hia2026_dhx29_halflife_logfc"),
+  # Additionally drops the baseline half-life features. hia2026_ctrl_halflife is
+  # Table S6's Ctrl_Half_life (rho = 1.000 with it), i.e. the DENOMINATOR of the
+  # Section 7d label log2(KO / Ctrl) - it correlates with that label at rho = -0.217
+  # purely by construction. zhu2024_ctrl_halflife is an independent measurement of
+  # baseline stability (rho = 0.604 with Ctrl_Half_life but only 0.018 with the label,
+  # so not itself a leak); it is dropped alongside to test the stability sets without
+  # any baseline-decay information at all.
+  "feature_matrix_dhx29_no_hia_no_ctrl_halflife.rds" = c("hia2026_dhx29_occupancy",
+                                                         "hia2026_dhx29_halflife_logfc",
+                                                         "hia2026_ctrl_halflife",
+                                                         "zhu2024_ctrl_halflife")
+)
+
+for (out_name in names(drop_sets)) {
+  drop_cols  <- drop_sets[[out_name]]
+  stopifnot("Columns to drop are not all in the matrix" =
+              all(drop_cols %in% colnames(fm_full)))
+
+  fm_reduced <- fm_full %>% dplyr::select(-all_of(drop_cols))
+
+  stopifnot(
+    "Exactly the named columns must be dropped" =
+      ncol(fm_reduced) == ncol(fm_full) - length(drop_cols),
+    "Dropped columns must be gone" = !any(drop_cols %in% colnames(fm_reduced)),
+    "No rows may be lost"          = nrow(fm_reduced) == nrow(fm_full),
+    "The join key must survive"    = "gene_id_clean" %in% colnames(fm_reduced),
+    "Only the named columns may be removed" =
+      setequal(setdiff(colnames(fm_full), colnames(fm_reduced)), drop_cols)
+  )
+
+  saveRDS(fm_reduced, here("output", "predictive_modeling", out_name))
+  cat(out_name, ": ", nrow(fm_reduced), " x ", ncol(fm_reduced),
+      "  (dropped ", paste(drop_cols, collapse = ", "), ")\n", sep = "")
+}
+
+cat("\nBaseline feature_matrix_external_stability.rds is unmodified: ",
+    nrow(fm_full), " x ", ncol(fm_full), "\n", sep = "")
+```
+
+Each variant needs its **own `feature_set` label**, since 07's output suffix is built from
+params and a reused label silently overwrites the previous run's saved model.
+
+| Matrix | Drops | `feature_set` label |
+|---|---|---|
+| `feature_matrix_external_stability.rds` | nothing | `dhx29_kd_extreme` |
+| `feature_matrix_dhx29_no_occupancy.rds` | occupancy | `dhx29_kd_extreme_noocc` |
+| `feature_matrix_dhx29_no_hia_perturbation.rds` | both DHX29 features | `*_nohia` |
+| `feature_matrix_dhx29_no_hia_no_ctrl_halflife.rds` | + both baseline half-lives | `*_nohia_nohl` |
+
+### 8a: Notebook 07 invocations
+
+```{r print_07_params, echo=FALSE, results='asis'}
+emit_call <- function(condition, direction, timepoint, feature_set,
+                      matrix_path, neg_csv, out_html) {
+  cat("```r\n")
+  cat("rmarkdown::render(\n")
+  cat("  \"code/predictive_modeling/07_rf_classification_eif3d_targets_no_boruta.Rmd\",\n")
+  cat("  params = list(\n")
+  cat("    condition               = \"", condition,   "\",\n", sep = "")
+  cat("    gene                    = \"29\",\n")
+  cat("    direction               = \"", direction,   "\",\n", sep = "")
+  cat("    timepoint               = \"", timepoint,   "\",\n", sep = "")
+  cat("    lfc                     = \"0\",\n")
+  cat("    feature_set             = \"", feature_set, "\",\n", sep = "")
+  cat("    feature_matrix_path     = \"", matrix_path, "\",\n", sep = "")
+  cat("    neg_geneset_csv         = \"", neg_csv,     "\",\n", sep = "")
+  cat("    exclude_4e_features     = TRUE,\n")
+  cat("    exclude_own_te_features = TRUE\n")
+  cat("  ),\n")
+  cat("  output_file = \"", out_html, "\"\n", sep = "")
+  cat(")\n")
+  cat("```\n\n")
+}
+
+cat("**Abundance sets (Section 6), no DHX29-derived features:**\n\n")
+emit_call(paste0("dhx29", dhx29_contrast), "up", geneset_timepoint,
+          paste0("dhx29_", dhx29_contrast, "_", down_mode, "_nohia"),
+          "feature_matrix_dhx29_no_hia_perturbation.rds", down_file,
+          paste0("07_rf_dhx29_", dhx29_contrast, "_", down_mode, "_nohia.html"))
+
+cat("**Stability sets (Section 7d), no DHX29-derived features:**\n\n")
+emit_call("dhx29slam", "stabilized", "k562slam", "dhx29_slam_nohia",
+          "feature_matrix_dhx29_no_hia_perturbation.rds", destab_file,
+          "07_rf_dhx29_slam_nohia.html")
+
+cat("**Stability sets, also dropping the baseline half-life features",
+    "(removes the label's own denominator):**\n\n")
+emit_call("dhx29slam", "stabilized", "k562slam", "dhx29_slam_nohia_nohl",
+          "feature_matrix_dhx29_no_hia_no_ctrl_halflife.rds", destab_file,
+          "07_rf_dhx29_slam_nohia_nohl.html")
+```
+
+Notes:
+
+- `condition` / `gene` / `direction` / `timepoint` / `lfc` exist only to reconstruct the
+  positive-set filename; they carry no other meaning for these runs.
+- `exclude_own_te_features = TRUE` drops the `indiv_te_*` / `delta_te_*` / `sig_*` columns.
+  These are eIF3d TE features and the target here is DHX29, so they are not leakage in the
+  usual sense - but leaving them in turns the model into a joint eIF3d/DHX29 question.
+- Run `07c_` afterwards with the same params for the SHAP decomposition, which is the only
+  way to sum the GC and length families and see how much of each classifier is composition.
+
+---
+
+## Summary
+
+1. **Fig 1F reproduces on the RNA-seq.** GC3 negatively tracks logFC in both contrasts, and
+   the acute CRISPRi knockdown is far stronger than the clonal knockout
+   (Spearman rho = `r rho_gc3_kd` vs `r rho_gc3_ko`, n = `r nrow(dhx)`), exactly as the paper
+   attributes to compensatory adaptation in the KO clones. The Q1-vs-Q4 median shift is
+   ~0.46 logFC in the KD vs ~0.06 in the KO.
+
+2. **The GC3 effect is not resolvably third-position.** Raw `cds_gc` predicts logFC almost as
+   well as GC3, and GC3 orthogonalised against `cds_gc` retains only a fraction of the
+   signal. Steady-state RNA-seq cannot separate wobble choice from bulk CDS GC; the
+   codon-resolved evidence for AU3 specificity is Table S8 (notebook 23).
+
+3. **Abundance is not stability in this dataset.** The KD RNA-seq logFC and the KO SLAM-seq
+   half-life logFC correlate at rho = `r rho_abund_stab` (n = `r nrow(av)`), and GC3 predicts
+   the former strongly but the latter not at all (rho = `r rho_gc3_slam`). Section 6's gene
+   sets are therefore named and described for abundance, never for degradation.
+
+4. **eIF3d-promoted mRNAs do not respond to DHX29 loss on either readout.** On abundance
+   their KD logFC matches the negative control (p = 0.39) and their KO logFC is significantly
+   *lower* than both references; stratifying by GC3 puts them at or below background in 10 of
+   10 strata. On stability all three groups are indistinguishable (p > 0.6). They are
+   markedly AU3-rich, and it buys them nothing here. Whatever eIF3d does for these transcripts
+   in hypoxia is not shared with DHX29-dependent codon-driven decay - consistent with
+   notebook 23.
+
+5. **Four gene sets exported**, two per readout, plus two reduced feature matrices with the
+   DHX29-derived columns removed. The abundance sets are heavily GC- and length-confounded
+   by construction and a classifier on them will largely recover composition; the stability
+   sets are not, which makes the pair a useful comparison rather than a redundant one.
+
+---
+
+## Section 9: Add the DHX29 KD RNA-seq logFC as a feature
+
+To ask whether DHX29 responsiveness helps predict **eIF3d promotion** (the standard
+`hypoxia / 3d / promotes / 1hr / lfc0.5` contrast), the KD logFC has to be a column in the
+feature matrix rather than a label.
+
+This is not circular: the label is an eIF3d TE change in MDA-MB-231, the feature is a DHX29
+knockdown RNA abundance change in K562 - different perturbation, cell line and readout.
+
+**A new file is written; `feature_matrix_external_stability.rds` is NOT modified.** Adding a
+column to the shared base matrix would change the feature set of every existing
+`external_stability` run, so those runs would no longer reproduce on a re-knit, and 07c
+asserts a saved model against a rebuilt feature set. Point `feature_matrix_path` at this file
+instead. If you do want it in the base matrix, change `out_file` below to
+`feature_matrix_external_stability.rds` and re-run every dependent notebook.
+
+```{r build_kd_feature_matrix}
+out_file <- "feature_matrix_dhx29_kd_feature.rds"
+
+fm_base <- readRDS(here("output", "predictive_modeling",
+                        "feature_matrix_external_stability.rds"))
+
+kd_feature <- kd %>%                       # tidied Table S2 from Section 1b
+  transmute(gene_id_clean = ensembl_gene,
+            hia2026_dhx29_kd_rna_lfc = logFC_kd)
+
+stopifnot(
+  "KD feature key must be unique" = !any(duplicated(kd_feature$gene_id_clean)),
+  "Feature name must not already exist in the base matrix" =
+    !"hia2026_dhx29_kd_rna_lfc" %in% colnames(fm_base)
+)
+
+fm_kd <- fm_base %>% left_join(kd_feature, by = "gene_id_clean")
+
+coverage_pct <- 100 * mean(!is.na(fm_kd$hia2026_dhx29_kd_rna_lfc))
+cat("Rows:", nrow(fm_kd), "| columns:", ncol(fm_base), "->", ncol(fm_kd), "\n")
+cat(sprintf("DHX29 KD logFC coverage: %.1f%% of genes\n", coverage_pct))
+
+stopifnot(
+  "Join must not duplicate or drop rows" = nrow(fm_kd) == nrow(fm_base),
+  "Exactly one column may be added" = ncol(fm_kd) == ncol(fm_base) + 1,
+  "logFC must be finite where present" =
+    all(is.finite(fm_kd$hia2026_dhx29_kd_rna_lfc[!is.na(fm_kd$hia2026_dhx29_kd_rna_lfc)])),
+  # 07 drops any feature below 50% non-NA; fail here rather than have it silently vanish.
+  "Coverage is below 07's 50% sparsity threshold - the feature would be dropped" =
+    coverage_pct > 55,
+  "Leakage guard: the eIF3d TE label must not be a feature" =
+    !"eif3d_target" %in% colnames(fm_kd)
+)
+
+saveRDS(fm_kd, here("output", "predictive_modeling", out_file))
+cat("Wrote output/predictive_modeling/", out_file, "\n", sep = "")
+cat("Base matrix unmodified:", ncol(fm_base), "columns\n")
+```
+
+### 9a: What to expect before running it
+
+Two diagnostics that make the 07 result interpretable rather than surprising.
+
+```{r kd_feature_diagnostics}
+diag_df <- fm_kd %>%
+  distinct(gene_id_clean, .keep_all = TRUE) %>%
+  dplyr::select(gene_id_clean, hia2026_dhx29_kd_rna_lfc, cds_gc) %>%
+  left_join(gc_fm %>% dplyr::select(ensembl_gene, gc3),
+            by = c("gene_id_clean" = "ensembl_gene")) %>%
+  dplyr::filter(!is.na(hia2026_dhx29_kd_rna_lfc))
+
+cat("1. The feature is largely a GC proxy:\n")
+print(as.data.frame(bind_rows(
+  cor_row(diag_df$cds_gc, diag_df$hia2026_dhx29_kd_rna_lfc, "cds_gc", "DHX29 KD logFC"),
+  cor_row(diag_df$gc3,    diag_df$hia2026_dhx29_kd_rna_lfc, "gc3",    "DHX29 KD logFC")
+) %>% mutate(rho = round(rho, 3), p = format.pval(p, digits = 3))))
+
+# 2. Marginal separation on the exact contrast 07 will train on.
+eif3d_pos <- promotes_ids
+eif3d_neg <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                      show_col_types = FALSE) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*")) %>%
+  dplyr::filter(!ensembl_gene %in% eif3d_pos) %>%
+  pull(ensembl_gene)
+
+x_pos <- diag_df$hia2026_dhx29_kd_rna_lfc[diag_df$gene_id_clean %in% eif3d_pos]
+x_neg <- diag_df$hia2026_dhx29_kd_rna_lfc[diag_df$gene_id_clean %in% eif3d_neg]
+mw <- wilcox.test(x_pos, x_neg)
+
+cat("\n2. Marginal separation for the eIF3d contrast 07 will train on:\n")
+cat("   median (3d promotes) =", round(median(x_pos), 4), ", n =", length(x_pos), "\n")
+cat("   median (neg control) =", round(median(x_neg), 4), ", n =", length(x_neg), "\n")
+cat("   Wilcoxon p", fmt_p(mw$p.value), "\n")
+
+stopifnot(
+  "Both eIF3d classes need enough genes carrying the feature" =
+    length(x_pos) >= 100 && length(x_neg) >= 100
+)
+```
+
+> **Prediction, stated before running.** The feature should rank **low**. It carries almost no
+> marginal information about this contrast (the two eIF3d classes have near-identical DHX29 KD
+> logFC, Section 4 found the same at p = 0.39), and what signal it does carry is GC, which the
+> matrix already represents directly via `cds_gc` / `gc3` / `transcript_gc`. If it ranks
+> *high*, the first thing to check is whether it is displacing the GC features rather than
+> adding anything - compare its rank against the `external_stability` run without it, and use
+> 07c to sum the GC family.
+
+```{r print_07_params_kdfeature, echo=FALSE, results='asis'}
+cat("```r\n")
+cat("rmarkdown::render(\n")
+cat("  \"code/predictive_modeling/07_rf_classification_eif3d_targets_no_boruta.Rmd\",\n")
+cat("  params = list(\n")
+cat("    condition               = \"hypoxia\",\n")
+cat("    gene                    = \"3d\",\n")
+cat("    direction               = \"promotes\",\n")
+cat("    timepoint               = \"1hr\",\n")
+cat("    lfc                     = \"0.5\",\n")
+cat("    feature_set             = \"dhx29_kd_feature\",\n")
+cat("    feature_matrix_path     = \"", out_file, "\",\n", sep = "")
+cat("    exclude_own_te_features = TRUE\n")
+cat("  ),\n")
+cat("  output_file = \"07_rf_3d_promotes_with_dhx29_kd.html\"\n")
+cat(")\n")
+cat("```\n")
+```
