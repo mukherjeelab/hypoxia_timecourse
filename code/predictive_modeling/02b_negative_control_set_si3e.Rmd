@@ -3,9 +3,17 @@ title: "Negative Control Gene Set for Random Forest — eIF3e"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
+params:
+  neg_lfc: 0.5
+  neg_padj: 0.3
+  out_genesets_csv: ""
 editor_options:
   chunk_output_type: console
 ---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
@@ -22,14 +30,70 @@ Normoxia is represented by the single time-regressed alltimepoints analysis; hyp
 
 A gene must satisfy **all** of the following across all 4 eIF3e comparisons (1 normoxia alltimepoints + 3 hypoxia timepoints):
 
-- `|te_lfc| < 0.5` (small effect size)
-- `te_padj > 0.3` (clearly non-significant)
+- `|te_lfc| < neg_lfc` (small effect size), default 0.5
+- `te_padj > neg_padj` (non-significant), default 0.3
+
+Both are parameters. Defaults reproduce the criteria this notebook has always used.
+
+**Why you would relax `neg_padj`.** Notebook 07 keeps every positive gene and downsamples
+only the negative pool, to `min(n_pos, n_neg)`. For eIF3d the negative pool has always been
+the larger of the two, so that balanced silently. The eIF3e pool is much smaller and can
+invert it: against `hypoxia_3e_promotes_TE_1hr_lfc0.5.csv` (986 positives present in the
+feature matrix) the pool sizes that survive into the matrix are
+
+| `neg_padj` | pool | in feature matrix | ratio to 986 positives |
+|---|---|---|---|
+| > 0.3  | 403  | 260 | 0.26 : 1 |
+| > 0.2  | 719  | 502 | 0.51 : 1 |
+| > 0.1  | 1111 | 814 | 0.83 : 1 |
+| > 0.05 | 1281 | 963 | 0.98 : 1 |
+
+Relax `neg_padj`, never `neg_lfc`. `neg_padj` is the binding constraint at the default
+setting (raising `neg_lfc` from 0.5 to 1.0 adds nothing at `neg_padj > 0.3`), and the
+`|te_lfc| < 0.5` bound is what makes these genes *unaffected* rather than merely
+*underpowered*. Loosening it to 1.0 would admit genes with real two-fold TE changes into a
+set whose whole purpose is to contain none.
+
+**Note on the shipped file.** `output/predictive_modeling/negative_control_genes_si3e.csv`
+holds 719 genes, which is the `neg_padj > 0.2` result, not the `> 0.3` these defaults
+produce (403). The artifact predates a change to the threshold in this notebook. Re-knitting
+with defaults will therefore shrink that file to 403 genes and change every existing eIF3e
+run that relies on it, so the write is now guarded: the legacy path is only overwritten when
+the parameters match the values it was built with.
 
 # Load Libraries
 
 ```{r load_libraries}
 library(tidyverse)
 library(here)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    neg_lfc          = 0.5,   # |te_lfc| must be below this in all 4 comparisons
+    neg_padj         = 0.3,   # te_padj must be above this in all 4 comparisons
+    out_genesets_csv = ""     # "" = write only the legacy predictive_modeling/ files.
+                              # A filename additionally writes an nb07-ready set to
+                              # output/genesets/, e.g.
+                              # "si3e_negative_controls_padj0.05.csv"
+  )
+}
+NEG_LFC  <- params$neg_lfc
+NEG_PADJ <- params$neg_padj
+OUT_GENESETS_CSV <- if (is.null(params$out_genesets_csv)) "" else params$out_genesets_csv
+
+# The shipped negative_control_genes_si3e.csv was built at these values; anything else
+# must not overwrite it, or every existing eIF3e run silently changes its negative class.
+LEGACY_LFC <- 0.5; LEGACY_PADJ <- 0.2
+write_legacy <- isTRUE(all.equal(NEG_LFC, LEGACY_LFC)) &&
+                isTRUE(all.equal(NEG_PADJ, LEGACY_PADJ))
+
+stopifnot("neg_lfc must be positive" = NEG_LFC > 0,
+          "neg_padj must be in (0, 1)" = NEG_PADJ > 0 && NEG_PADJ < 1)
+cat("Criteria: |te_lfc| <", NEG_LFC, "and te_padj >", NEG_PADJ, "in all 4 comparisons\n")
+cat("Overwrite legacy predictive_modeling/ files:", write_legacy, "\n")
 ```
 
 # Define File List
@@ -89,7 +153,7 @@ passing_genes <- all_data %>%
   mutate(
     passing = map(data, function(df) {
       df %>%
-        filter(abs(te_lfc) < 0.5, te_padj > 0.3) %>%
+        filter(abs(te_lfc) < NEG_LFC, te_padj > NEG_PADJ) %>%
         pull(gene_id)
     })
   )
@@ -140,7 +204,7 @@ head(negative_control_genes, 20)
 # QC & Summary
 
 ```{r qc_summary}
-# Verify: no gene in the negative set has |te_lfc| >= 0.5 or te_padj <= 0.3 in any condition
+# Verify: no gene in the negative set violates |te_lfc| < NEG_LFC or te_padj > NEG_PADJ
 cat("=== Verification ===\n\n")
 
 verification <- all_data %>%
@@ -148,7 +212,7 @@ verification <- all_data %>%
     violations = map(data, function(df) {
       df %>%
         filter(gene_id %in% negative_control_ids) %>%
-        filter(abs(te_lfc) >= 0.5 | te_padj <= 0.3)
+        filter(abs(te_lfc) >= NEG_LFC | te_padj <= NEG_PADJ)
     })
   )
 
@@ -263,13 +327,42 @@ ggplot(all_genes_te, aes(x = te_lfc, color = is_neg_ctrl, fill = is_neg_ctrl)) +
 ```{r export}
 dir.create(here("output", "predictive_modeling"), showWarnings = FALSE, recursive = TRUE)
 
-write_csv(negative_control_genes,
-          here("output", "predictive_modeling", "negative_control_genes_si3e.csv"))
-cat("Exported: output/predictive_modeling/negative_control_genes_si3e.csv\n")
+# Legacy path, consumed by notebook 07 whenever gene = "3e" and neg_geneset_csv is empty.
+# Only rewritten when the parameters match the values this file was built with, so a
+# threshold sweep cannot silently change the negative class of every existing eIF3e run.
+if (write_legacy) {
+  write_csv(negative_control_genes,
+            here("output", "predictive_modeling", "negative_control_genes_si3e.csv"))
+  cat("Exported: output/predictive_modeling/negative_control_genes_si3e.csv\n")
 
-saveRDS(negative_control_genes,
-        here("output", "predictive_modeling", "negative_control_genes_si3e.rds"))
-cat("Exported: output/predictive_modeling/negative_control_genes_si3e.rds\n")
+  saveRDS(negative_control_genes,
+          here("output", "predictive_modeling", "negative_control_genes_si3e.rds"))
+  cat("Exported: output/predictive_modeling/negative_control_genes_si3e.rds\n")
+} else {
+  cat("Skipped the legacy predictive_modeling/ files: parameters differ from the\n",
+      "  values they were built with (|te_lfc| <", LEGACY_LFC, ", te_padj >", LEGACY_PADJ,
+      ").\n  Pass out_genesets_csv to write this set somewhere notebook 07 can read it.\n")
+}
+
+# nb07-ready export. Its neg_geneset_csv param reads from output/genesets/ and keys on an
+# `ensembl_gene` column; readout / neg_* columns are the provenance fields nb07 prints in
+# its classification summary and checks for a TE-vs-RNA mismatch.
+if (nzchar(OUT_GENESETS_CSV)) {
+  dir.create(here("output", "genesets"), showWarnings = FALSE, recursive = TRUE)
+  geneset_out <- negative_control_genes %>%
+    transmute(
+      ensembl_gene   = sub("\\..*", "", gene_id),
+      db_gene_symbol = symbol,
+      gs_name        = tools::file_path_sans_ext(OUT_GENESETS_CSV),
+      readout        = "TE",
+      neg_contrasts  = paste(comparisons$label, collapse = "; "),
+      neg_lfc        = NEG_LFC,
+      neg_padj       = NEG_PADJ)
+  stopifnot("ensembl_gene must be unique" = !any(duplicated(geneset_out$ensembl_gene)),
+            "ensembl_gene still versioned" = !any(grepl("\\.", geneset_out$ensembl_gene)))
+  write_csv(geneset_out, here("output", "genesets", OUT_GENESETS_CSV))
+  cat("Exported: output/genesets/", OUT_GENESETS_CSV, " (", nrow(geneset_out), " genes)\n", sep = "")
+}
 
 cat("\nFinal negative control set:", nrow(negative_control_genes), "genes\n")
 ```
