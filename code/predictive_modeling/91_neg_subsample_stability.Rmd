@@ -1,0 +1,406 @@
+---
+title: "Negative-subsample stability of the eIF3e target model"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  neg_tag: "exprbg"
+  n_seeds: 20
+  top_n: 25
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Purpose
+
+Notebook 07 keeps every positive gene and draws a size-matched negative class from a much
+larger pool: 399 of 9,183 for the eIF3e-specific model. One run therefore reports the
+performance and the feature ranking of **one arbitrary draw**. This notebook reads the 20
+replicate runs produced by `90_replicate_neg_subsample_driver.R` and asks how much of
+either is a property of the model rather than of the draw.
+
+Only `neg_seed` varies across the replicates. The split, the forest and the CV are pinned
+at seed 9 inside notebook 07, so the spread reported here is attributable to negative-class
+composition alone.
+
+**Pool:** `si3e_expressed_background_pool.csv` (notebook 02c) - expressed genes minus all
+3e-promoted genes, not screened on effect size. Runs built on the older *screened*
+`si3e_negative_controls_padj0.05.csv` pool answer a different question and are not
+comparable; they are excluded here by the `neg_tag` filter.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r params_default}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(neg_tag = "exprbg", n_seeds = 20, top_n = 25, save_plots = TRUE)
+}
+SAVE_PLOTS <- params$save_plots
+SI3E_COLOR <- "#56B4E9"   # CLAUDE.md: si3e / eIF3e is always Okabe-Ito light blue
+```
+
+# 1. Locate the replicate runs
+
+```{r locate}
+base_suffix <- paste0("eif33e_promotes_hypoxia_1hr_not3d_lfc0.5_dhx29_kd_feature",
+                      "_clipaggregate_no_boruta_no4e_noOwnTE_", params$neg_tag)
+
+# Seed 9 is the un-suffixed run (notebook 07 appends _negseedN only when != 9), so the
+# file list has to cover both forms.
+suffix_for <- function(seed) {
+  paste0(base_suffix, if (seed != 9L) paste0("_negseed", seed) else "")
+}
+seeds <- seq_len(params$n_seeds)
+
+read_run <- function(prefix, seed) {
+  p <- here("output", "predictive_modeling",
+            paste0(prefix, "_", suffix_for(seed), ".csv"))
+  if (!file.exists(p)) return(NULL)
+  read_csv(p, show_col_types = FALSE) %>% mutate(seed = seed)
+}
+
+perf <- map_dfr(seeds, ~ read_run("rf_classification_performance", .x))
+imp  <- map_dfr(seeds, ~ read_run("rf_classification_importance", .x))
+sets <- map_dfr(seeds, ~ read_run("rf_model_gene_sets", .x))
+
+found <- sort(unique(perf$seed))
+cat("Replicates found:", length(found), "of", params$n_seeds, "\n")
+stopifnot("no replicate runs found - run notebook 90 first" = length(found) > 0)
+if (length(found) < params$n_seeds) {
+  warning("missing seeds: ", paste(setdiff(seeds, found), collapse = ", "))
+}
+```
+
+# 2. The replicates must differ in the right way
+
+A sweep that varied nothing would produce a reassuringly tight spread for the wrong
+reason. These two checks establish that the positive class is constant and the negative
+class genuinely moved before any spread is interpreted.
+
+```{r validate}
+stopifnot("model gene sets are missing the columns this check needs" =
+  all(c("gene_id_clean", "eif3d_target") %in% names(sets)))
+
+pos_by_seed <- sets %>% filter(eif3d_target == "promotes") %>%
+  group_by(seed) %>% summarise(genes = list(sort(gene_id_clean)), .groups = "drop")
+neg_by_seed <- sets %>% filter(eif3d_target != "promotes") %>%
+  group_by(seed) %>% summarise(genes = list(sort(gene_id_clean)), .groups = "drop")
+
+stopifnot("the positive set is not identical across replicates" =
+  length(unique(map_chr(pos_by_seed$genes, ~ paste(.x, collapse = ",")))) == 1)
+cat("Positive set identical across all", nrow(pos_by_seed), "replicates:",
+    length(pos_by_seed$genes[[1]]), "genes\n")
+
+neg_keys <- map_chr(neg_by_seed$genes, ~ paste(.x, collapse = ","))
+stopifnot("two replicates drew the identical negative set - the draw is degenerate" =
+  !any(duplicated(neg_keys)))
+
+# How much do the draws actually overlap? Independent 399-of-9,183 draws should share
+# about 399 * 399 / 9183 ~ 17 genes, i.e. a Jaccard near 0.02. Much higher would mean the
+# pool is far smaller than intended.
+jac <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+pairs <- combn(seq_len(nrow(neg_by_seed)), 2)
+neg_jac <- map_dbl(seq_len(ncol(pairs)),
+                   ~ jac(neg_by_seed$genes[[pairs[1, .x]]], neg_by_seed$genes[[pairs[2, .x]]]))
+n_neg <- length(neg_by_seed$genes[[1]])
+pool_n <- 9183
+cat(sprintf("Negative-draw overlap: median Jaccard %.3f (expected ~%.3f for %d of %d)\n",
+            median(neg_jac), n_neg / (2 * pool_n - n_neg), n_neg, pool_n))
+cat("Distinct genes used as negatives across all replicates:",
+    n_distinct(unlist(neg_by_seed$genes)), "\n")
+```
+
+# 3. Performance across replicates
+
+```{r performance}
+auc <- perf %>% filter(Metric == "AUC") %>%
+  transmute(seed, test_auc = Test_Set, cv_mean = CV_Mean, cv_sd = CV_SD)
+
+acc <- perf %>% filter(Metric == "Balanced_Accuracy") %>%
+  transmute(seed, bal_acc = Test_Set)
+
+summ <- auc %>% left_join(acc, by = "seed")
+
+cat(sprintf("Test AUC across %d replicates: median %.3f, mean %.3f, sd %.3f, range %.3f-%.3f\n",
+            nrow(summ), median(summ$test_auc), mean(summ$test_auc), sd(summ$test_auc),
+            min(summ$test_auc), max(summ$test_auc)))
+cat(sprintf("Seed 9 (the single run you would otherwise report): %.3f  [percentile %.0f%%]\n",
+            summ$test_auc[summ$seed == 9],
+            100 * mean(summ$test_auc <= summ$test_auc[summ$seed == 9])))
+cat(sprintf("Balanced accuracy: median %.3f, range %.3f-%.3f\n",
+            median(summ$bal_acc), min(summ$bal_acc), max(summ$bal_acc)))
+
+print(as.data.frame(summ %>% arrange(seed) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))), row.names = FALSE)
+```
+
+```{r plot-auc, fig.width = 5, fig.height = 4.5}
+p_auc <- summ %>%
+  dplyr::select(seed, `Test AUC` = test_auc, `CV mean AUC` = cv_mean) %>%
+  pivot_longer(-seed, names_to = "metric", values_to = "auc") %>%
+  ggplot(aes(x = metric, y = auc)) +
+  geom_boxplot(width = 0.45, outlier.shape = NA, fill = NA, color = "grey40") +
+  geom_jitter(width = 0.12, height = 0, size = 2, alpha = 0.6, color = SI3E_COLOR) +
+  geom_point(data = ~ dplyr::filter(.x, seed == 9), size = 3, shape = 21,
+             fill = SI3E_COLOR, color = "black", stroke = 0.9) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+  labs(title = "eIF3e-specific model: AUC across negative subsamples",
+       subtitle = paste0("399 positives held fixed; 399 negatives redrawn from a ",
+                         format(pool_n, big.mark = ","), "-gene expressed background\n",
+                         "Only neg_seed varies (split/forest/CV pinned at 9). ",
+                         "Outlined point = seed 9. n = ", nrow(summ), " replicates"),
+       x = NULL, y = "AUC") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 8.5, lineheight = 1.15))
+print(p_auc)
+if (SAVE_PLOTS) ggsave(here("plots", paste0("91_auc_across_neg_subsamples_", params$neg_tag, ".pdf")),
+                       p_auc, width = 5, height = 4.5)
+```
+
+# 4. Feature importance stability
+
+Impurity importance is reported per replicate, so a feature's rank can be summarised the
+same way as the AUC. A feature that matters to the *model* holds its rank across draws; a
+feature that matters to one *draw* does not.
+
+```{r importance-stability}
+stopifnot("importance table is missing expected columns" =
+  all(c("feature", "importance") %in% names(imp)))
+
+imp_ranked <- imp %>%
+  group_by(seed) %>%
+  mutate(rank = rank(-importance, ties.method = "min")) %>%
+  ungroup()
+
+feat_summary <- imp_ranked %>%
+  group_by(feature) %>%
+  summarise(mean_rank = mean(rank), sd_rank = sd(rank),
+            best = min(rank), worst = max(rank),
+            mean_imp = mean(importance), sd_imp = sd(importance),
+            n_top10 = sum(rank <= 10), .groups = "drop") %>%
+  arrange(mean_rank)
+
+# ALL features, not just the top of the list: a feature that ranks mid-table on every
+# replicate is a different (and more interpretable) situation than one that swings from
+# 5th to 40th, and neither is visible from a truncated table.
+feat_table <- feat_summary %>%
+  transmute(feature,
+            mean_rank = round(mean_rank, 1), sd_rank = round(sd_rank, 1),
+            best, worst, span = worst - best,
+            mean_imp = signif(mean_imp, 3), cv_imp = round(sd_imp / mean_imp, 2),
+            times_in_top10 = n_top10,
+            always_top20 = worst <= 20)
+
+cat("All", nrow(feat_table), "features by mean rank across", length(found), "replicates:\n")
+print(as.data.frame(feat_table), row.names = FALSE)
+
+# `span` is the honest summary: it is the full range a feature's rank covered, so a large
+# span means the feature's standing is a property of the draw and not of the model.
+out_csv <- here("output", "predictive_modeling",
+                paste0("91_feature_rank_stability_", params$neg_tag, ".csv"))
+write_csv(feat_table, out_csv)
+cat("\nWrote full table to", out_csv, "\n")
+
+cat("\nTop", params$top_n, "shown in the figure below.\n")
+```
+
+```{r plot-importance, fig.width = 7.5, fig.height = 7}
+top_feats <- feat_summary %>% head(params$top_n) %>% pull(feature)
+
+p_imp <- imp_ranked %>%
+  filter(feature %in% top_feats) %>%
+  mutate(feature = factor(feature, levels = rev(top_feats))) %>%
+  ggplot(aes(x = rank, y = feature)) +
+  geom_point(alpha = 0.45, size = 1.8, color = SI3E_COLOR) +
+  stat_summary(fun = median, geom = "point", shape = 124, size = 5, color = "black") +
+  labs(title = "Feature rank across negative subsamples",
+       subtitle = paste0("Each point is one replicate; black bar is the median rank. ",
+                         "n = ", length(found), " replicates\n",
+                         "Ordered by mean rank; a wide spread means the feature's ",
+                         "standing depends on which negatives were drawn"),
+       x = "Importance rank (1 = most important)", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 8.5, lineheight = 1.15))
+print(p_imp)
+if (SAVE_PLOTS) ggsave(here("plots", paste0("91_importance_rank_stability_", params$neg_tag, ".pdf")),
+                       p_imp, width = 7.5, height = 7)
+```
+
+```{r topn-jaccard}
+# How reproducible is "the top 20 features" itself? Jaccard between every pair of
+# replicates' top-20 lists.
+top20 <- imp_ranked %>% filter(rank <= 20) %>%
+  group_by(seed) %>% summarise(f = list(feature), .groups = "drop")
+tp <- combn(seq_len(nrow(top20)), 2)
+top_jac <- map_dbl(seq_len(ncol(tp)), ~ jac(top20$f[[tp[1, .x]]], top20$f[[tp[2, .x]]]))
+
+cat(sprintf("Top-20 agreement between replicate pairs: median Jaccard %.2f (range %.2f-%.2f, %d pairs)\n",
+            median(top_jac), min(top_jac), max(top_jac), length(top_jac)))
+cat("Features in the top 20 of EVERY replicate:",
+    sum(feat_summary$worst <= 20), "\n")
+cat("Features in the top 20 of at least one but not all:",
+    sum(feat_summary$best <= 20 & feat_summary$worst > 20), "\n")
+```
+
+# 5. Top features per replicate, with direction
+
+Notebook 07 writes a `rf_classification_directionality_*.csv` per run, so direction is
+already available for every replicate and does not need recomputing. `direction` is the
+sign of the feature's correlation with the target: **"Higher in promotes"** means eIF3e
+targets carry more of it than the background draw.
+
+Two separate questions, answered below in order:
+
+1. **How often** does a feature reach the top of a run? (`n_top`, out of the replicates)
+2. **Does it point the same way** when it gets there? A feature whose direction flips
+   between draws is not describing the biology, however often it ranks highly.
+
+```{r load-directionality}
+dirs <- map_dfr(seeds, ~ read_run("rf_classification_directionality", .x))
+stopifnot("directionality files not found - re-run notebook 90" = nrow(dirs) > 0)
+stopifnot("directionality table is missing expected columns" =
+  all(c("feature", "importance", "direction", "correlation", "wilcox_p_adj") %in% names(dirs)))
+
+TOP_K <- 10   # "top of a run" = top TOP_K features by impurity importance in that run
+
+dirs <- dirs %>%
+  group_by(seed) %>%
+  mutate(rank = rank(-importance, ties.method = "min")) %>%
+  ungroup() %>%
+  mutate(dir_sign = case_when(direction == "Higher in promotes" ~ "+",
+                              direction == "Lower in promotes"  ~ "-",
+                              TRUE ~ "?"))
+cat("Directionality loaded for", n_distinct(dirs$seed), "replicates x",
+    n_distinct(dirs$feature), "features\n")
+```
+
+## 5.1 Per-replicate top `r TOP_K`, side by side
+
+Rows are every feature that reached the top `r TOP_K` of at least one replicate; columns
+are the replicates. A cell shows that run's rank and direction (`3+` = ranked 3rd, higher
+in targets); `.` means the feature missed the top `r TOP_K` in that run.
+
+```{r per-run-table}
+in_top <- dirs %>% filter(rank <= TOP_K)
+feat_order <- in_top %>% dplyr::count(feature, name = "n_top") %>% arrange(desc(n_top))
+
+wide <- dirs %>%
+  filter(feature %in% feat_order$feature) %>%
+  mutate(cell = ifelse(rank <= TOP_K, paste0(rank, dir_sign), ".")) %>%
+  dplyr::select(feature, seed, cell) %>%
+  pivot_wider(names_from = seed, values_from = cell, names_prefix = "s") %>%
+  left_join(feat_order, by = "feature") %>%
+  arrange(desc(n_top)) %>%
+  relocate(feature, n_top)
+
+print(as.data.frame(wide), row.names = FALSE)
+```
+
+## 5.2 How common, and how consistent
+
+```{r direction-consistency}
+dir_summary <- dirs %>%
+  group_by(feature) %>%
+  summarise(
+    n_top          = sum(rank <= TOP_K),
+    mean_rank      = round(mean(rank), 1),
+    # Consensus direction and how strongly the replicates agree on it. Computed over ALL
+    # replicates, not just the ones where the feature ranked highly: a feature can be
+    # consistently directional while only occasionally being important.
+    n_higher       = sum(dir_sign == "+"),
+    n_lower        = sum(dir_sign == "-"),
+    consensus      = ifelse(n_higher >= n_lower, "Higher in promotes", "Lower in promotes"),
+    pct_agree      = round(100 * max(n_higher, n_lower) / (n_higher + n_lower)),
+    median_cor     = round(median(correlation, na.rm = TRUE), 3),
+    n_sig          = sum(wilcox_p_adj < 0.05, na.rm = TRUE),
+    .groups = "drop") %>%
+  arrange(desc(n_top), mean_rank)
+
+cat("All", nrow(dir_summary), "features: how often each reaches the top", TOP_K,
+    "and whether its direction holds\n")
+cat("(pct_agree = % of the", length(found),
+    "replicates agreeing on the consensus direction; n_sig = replicates with BH-adj Wilcoxon p < 0.05)\n\n")
+print(as.data.frame(dir_summary), row.names = FALSE)
+
+out_dir_csv <- here("output", "predictive_modeling",
+                    paste0("91_feature_direction_consistency_", params$neg_tag, ".csv"))
+write_csv(dir_summary, out_dir_csv)
+cat("\nWrote", out_dir_csv, "\n")
+```
+
+```{r direction-flips}
+# A feature that reaches the top of some runs but points in opposite directions between
+# them is reporting the draw, not the biology. Reported rather than asserted: with a
+# correlation near zero a sign flip is expected and harmless, which is why the magnitude
+# of median_cor is printed alongside.
+flips <- dir_summary %>% filter(pct_agree < 100)
+if (nrow(flips) == 0) {
+  cat("No feature changes direction across replicates.\n")
+} else {
+  cat(nrow(flips), "features change direction between replicates:\n")
+  print(as.data.frame(flips %>%
+    dplyr::select(feature, n_top, consensus, pct_agree, median_cor, n_sig)), row.names = FALSE)
+  cat("\nA flip matters only where |median_cor| is meaningfully above 0;",
+      "near zero the sign is noise.\n")
+}
+```
+
+```{r plot-direction, fig.width = 9, fig.height = 7}
+# Direction colours: Okabe-Ito dark blue / reddish purple. Orange and sky blue are reserved
+# for eIF3d and eIF3e (CLAUDE.md) and must not be reused for up/down here.
+dir_colors <- c("Higher in promotes" = "#0072B2", "Lower in promotes" = "#CC79A7")
+
+tile_feats <- feat_order$feature
+p_dir <- dirs %>%
+  filter(feature %in% tile_feats) %>%
+  mutate(feature = factor(feature, levels = rev(tile_feats)),
+         shown = ifelse(rank <= TOP_K, as.character(rank), "")) %>%
+  ggplot(aes(x = factor(seed), y = feature)) +
+  geom_tile(aes(fill = direction, alpha = rank <= TOP_K), color = "white", linewidth = 0.4) +
+  geom_text(aes(label = shown), size = 2.7, color = "white") +
+  scale_fill_manual(values = dir_colors, name = NULL, na.value = "grey85") +
+  scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.18), guide = "none") +
+  labs(title = paste0("Top-", TOP_K, " features per replicate, with direction"),
+       subtitle = paste0("One column per negative subsample; number = that run's importance rank. ",
+                         "Faded = outside the top ", TOP_K, ".\n",
+                         "Colour is the sign of the feature's correlation with the target. ",
+                         "n = ", length(found), " replicates, ", length(tile_feats),
+                         " features reaching the top ", TOP_K, " at least once"),
+       x = "neg_seed", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(size = 8.5, lineheight = 1.15),
+        axis.text.x = element_text(size = 7))
+print(p_dir)
+if (SAVE_PLOTS) ggsave(here("plots", paste0("91_top_features_direction_", params$neg_tag, ".pdf")),
+                       p_dir, width = 9, height = 7)
+```
+
+# 6. Summary
+
+```{r summary}
+cat("Replicates:                ", length(found), "\n")
+cat("Positive class:            ", length(pos_by_seed$genes[[1]]), "genes, identical throughout\n")
+cat("Negative class:            ", n_neg, "genes redrawn each replicate from", pool_n, "\n")
+cat(sprintf("Test AUC:                   %.3f  (median, sd %.3f, range %.3f-%.3f)\n",
+            median(summ$test_auc), sd(summ$test_auc),
+            min(summ$test_auc), max(summ$test_auc)))
+cat(sprintf("Top-20 feature agreement:   %.2f  (median pairwise Jaccard)\n", median(top_jac)))
+cat("Features top-20 in every replicate:", sum(feat_summary$worst <= 20), "\n")
+cat("Full per-feature table:      ", basename(out_csv), "\n")
+cat("Direction consistency table: ", basename(out_dir_csv), "\n")
+cat("Features reaching the top", TOP_K, "in every replicate:",
+    sum(dir_summary$n_top == length(found)), "\n")
+cat("Features changing direction between replicates:", sum(dir_summary$pct_agree < 100), "\n")
+```

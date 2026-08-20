@@ -61,6 +61,49 @@ The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvi
 **Negative control definition:**
 - `02_negative_control_set.Rmd` → `output/predictive_modeling/negative_control_genes.csv`
 - Negative controls = genes with |TE_LFC| < 0.5 AND padj > 0.3 across ALL si3d conditions
+- `02b_negative_control_set_si3e.Rmd` → the si3e equivalent (parameterized `neg_lfc` / `neg_padj`)
+
+**Screened control vs expressed background — two different comparators, two different claims.**
+The `02`/`02b` sets are screened: genes selected for having *no* effect. They are not a
+neutral background — the si3e screened pool is markedly GC-rich, so part of any GC
+separation against it is a property of the screen. `02c_expressed_background_pool_si3e.Rmd`
+builds the alternative: every gene DESeq2 could **test** in the contrast (non-NA `te_padj`)
+minus every gene in the positive set's parent list, with **no screening on effect size**
+(10,778 genes; 9,183 in `feature_matrix_dhx29_kd_feature.rds`). eIF3e-inhibited genes are
+deliberately retained — excluding them would rebuild the screened set.
+
+| Comparator | eIF3e-specific model, hypoxia 1hr | Claim |
+|---|---|---|
+| screened `si3e_negative_controls_padj0.05.csv` | test AUC 0.907 | targets vs eIF3e-**protected** mRNAs |
+| expressed background (`02c`) | test AUC 0.769 (seed 9); 0.740 median over 20 draws | targets vs a **typical expressed** mRNA |
+
+The two are not comparable and must not be plotted on the same axis. The pool CSV is a
+**definition**, not pre-intersected with any matrix — the models use
+`feature_matrix_dhx29_kd_feature.rds` (10,172 genes) and the nb89 GC figure uses
+`external_stability` joined to `positional_gc`, so each consumer intersects and reports its
+own n.
+
+**Negative-subsample replication (notebooks 90/91).** Notebook 07 keeps every positive and
+draws a size-matched negative class from the pool — 399 of 9,183 for the eIF3e-specific
+model — so a single run reports the AUC and feature ranking of *one arbitrary draw*.
+`90_replicate_neg_subsample_driver.R` renders 07 once per `neg_seed` (20 seeds, ~4 s each);
+`91_neg_subsample_stability.Rmd` reports the spread. On the eIF3e-specific model: test AUC
+median 0.740, sd 0.029, range 0.683–0.803, with **seed 9 sitting at the 90th percentile** —
+the default draw is on the lucky side. Top-20 feature agreement between replicate pairs is
+median Jaccard 0.67, and only **7 features are top-20 in every replicate**: `csc_q4`, `csc`,
+`log2_cds_length`, `csc_q3`, `log2_utr5_length`, `csc_q2`, `karner2026_mda231_log2_ct`.
+Rank a feature off a single 07 run only if it clears that bar.
+
+**Null-band GC figures (`89_gc_position_density_by_geneset.Rmd`, section 4b).** Against the
+02c background the comparator is drawn from the same population as the grey curve, so the
+black curves become a **null band** — what N random expressed mRNAs look like — rather than
+a contrast. `gc_null_band_figure()` plots 50 draws and computes an empirical p on 1,000
+(`(k+1)/(n+1)`, so the floor is 1/1001, not 0). Draws are cheap here and are deliberately
+**decoupled from the 20 model replicates**, which are limited by forest-fitting cost. On the
+eIF3e-specific set only GC3 clears the band decisively (median 62.8% vs null 57.4%, z = 3.6,
+p < 0.001); CDS GC is marginal (53.1 vs 51.5, p = 0.019) and GC1/GC2 are inside it
+(p = 0.069 / 0.159). Against the *screened* pool all four looked separated — that difference
+is the screen, not the biology.
 
 **RF classification models (03–10):**
 - `07_rf_classification_eif3d_targets_no_boruta.Rmd` — primary model, fully parameterized via YAML; key params:
@@ -68,6 +111,21 @@ The chain `22_cnot3` → `23_dhx29` → `01i_` → `01j_` → `01k_` is non-obvi
   - `neg_geneset_csv` — custom negative control CSV from `output/genesets/` (default uses `negative_control_genes.csv`)
   - `feature_matrix_path` — override to load a named RDS from `output/predictive_modeling/` (e.g. for MCF7-SIX1)
   - `exclude_own_te_features` — removes `indiv_te_*`, `delta_te_*`, `sig_*` columns; set TRUE when pos/neg sets are defined by TE
+  - `neg_seed` — seeds **only** the negative draw in `create_target`. The train/test split,
+    the forest and the CV stay pinned at 9, so across a seed sweep every difference is
+    attributable to negative-class composition. Default 9 = the historical draw.
+  - `neg_tag` — appended to the output suffix. **Required whenever you change the negative
+    POOL** (not just the draw): `neg_geneset_csv` is *not* part of the suffix, so a new pool
+    at `neg_seed = 9` silently overwrites the model, importance and predictions of the run
+    that used the old pool. `"exprbg"` is the tag for the 02c background pool. Both
+    `neg_seed` and `neg_tag` are mirrored in 07b/07c, which rebuild the draw themselves and
+    would otherwise explain a model trained on different genes.
+  - `save_plots` — FALSE suppresses the 8 `ggsave` calls; use for seed sweeps.
+  - Notebook 07 now **removes positives from the negative pool before sampling**. Previously
+    an overlapping gene was sampled, then relabelled positive by the `case_when`, silently
+    shrinking the negative class below `number_to_match`. It also reports when the pool is
+    no larger than the positive set, where every seed draws the same genes and a sweep
+    produces N copies of one model.
   - `readout` — `"TE"` (default) or `"RNA"`. Selects the gene set filename (`..._TE_...` vs `..._RNA_...`) and is appended to the output suffix **only when not "TE"**, so every pre-existing TE run keeps its filenames and 07c still resolves its saved models. Mirrored in 07b/07c/08/09. `"RNA"` requires an explicit `neg_geneset_csv` (the default `negative_control_genes.csv` is TE-defined and 307 of its genes satisfy the RNA positive definition) and is rejected with `timepoint="alltimepoints"/"1and4hr"` only for TE, since that shortcut filters `te_lfc` inline.
 - `09_cross_condition_importance_comparison.Rmd` — compare feature importance across two 07 runs; key params:
   - `condition_hyp`, `condition_nor` — condition strings used to construct the 07 output file suffixes (default `"hypoxia"` / `"normoxia"`; set to e.g. `"mcf7six1_hypoxia"` for MCF7-SIX1)

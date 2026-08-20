@@ -1,0 +1,214 @@
+---
+title: "Expressed background pool for eIF3e target models"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  pos_geneset_csv: "hypoxia_3e_promotes_TE_1hr_lfc0.5.csv"
+  de_csv: "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv"
+  out_csv: "si3e_expressed_background_pool.csv"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Purpose
+
+Builds the **expressed background pool** used as the negative-class pool for the eIF3e
+target models, replacing the screened `si3e_negative_controls_padj0.05.csv` set.
+
+- **Old pool:** genes screened as eIF3e-*protected* (`|te_lfc| < 0.5` & `padj > 0.05` in all
+  four si3e contrasts). 1,281 genes, markedly GC-rich relative to the transcriptome.
+- **New pool:** every gene DESeq2 could **test** in the si3e hypoxia 1hr contrast, minus
+  every gene in the positive set's parent list. No screening on effect size at all.
+
+The claim the model makes changes accordingly: from "eIF3e targets vs eIF3e-protected
+mRNAs" to **"eIF3e targets vs a typical expressed mRNA"**. Expect a lower AUC than the
+screened-pool runs; those runs are not comparable to these and should not be plotted on
+the same axis.
+
+## What "expressed" means here
+
+Two candidate definitions were checked and they agree to within 3 genes:
+
+| Definition | n |
+|---|---|
+| Present in `feature_matrix_dhx29_kd_feature.rds` (nb01 selects the most abundant isoform from siCTRL normoxia RNA-seq, so matrix membership is already an expression filter) | 10,172 |
+| Non-NA `te_padj` in the si3e hypoxia 1hr contrast (DESeq2 independent filtering drops low-count genes) | 11,861 |
+| Both | 10,169 |
+
+This notebook writes the **definition** - DESeq2-tested minus 3e-promoted - and leaves the
+matrix intersection to each consumer, which reports its own n. Writing a pre-intersected
+file would silently bind the pool to one feature matrix, and the model (`dhx29_kd_feature`,
+10,172 genes) and the GC figure (`external_stability` joined to `positional_gc`, 9,608)
+do not use the same one.
+
+## Which genes are excluded
+
+Excluded: every gene in `hypoxia_3e_promotes_TE_1hr_lfc0.5.csv` (1,083), not merely the
+399 eIF3e-*specific* ones. Genes promoted by both eIF3d and eIF3e are known targets and
+would be mislabelled as background.
+
+**Not excluded: eIF3e-inhibited genes.** They move in the opposite direction, but removing
+them would make the pool "everything eIF3e does not touch", which is the screened set this
+pool exists to replace. A background that excludes real biology is not a background.
+
+# Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r params_default}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    pos_geneset_csv = "hypoxia_3e_promotes_TE_1hr_lfc0.5.csv",
+    de_csv          = "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv",
+    out_csv         = "si3e_expressed_background_pool.csv"
+  )
+}
+```
+
+# Load the DESeq2 contrast
+
+```{r load_de}
+de_path <- here("output", params$de_csv)
+stopifnot("DESeq2 results file not found" = file.exists(de_path))
+
+de <- read_csv(de_path, show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+cat("Rows in", params$de_csv, ":", nrow(de), "\n")
+stopifnot("te_lfc has non-finite values" = all(is.finite(de$te_lfc[!is.na(de$te_lfc)])))
+
+# Directionality guard (CLAUDE.md): these files are log2(sictrl / si3e) despite the
+# filename saying si3e_vs_sictrl, so the knockdown's own target must come out strongly
+# POSITIVE. If it is negative the contrast has flipped and the positive set - hence the
+# pool's exclusion list - means the opposite of what it says.
+eif3e_rna <- de$rna_lfc[de$symbol == "EIF3E"]
+cat("EIF3E rna_lfc:", round(eif3e_rna, 2), "(expected ~ +4.9, must be positive)\n")
+stopifnot("EIF3E rna_lfc is not strongly positive - contrast direction has flipped" =
+  length(eif3e_rna) == 1 && eif3e_rna > 2)
+```
+
+# Define the pool
+
+```{r build_pool}
+# "Expressed" = DESeq2 could test the gene in this contrast. Independent filtering sets
+# padj to NA for genes with too little count support, which is exactly the set we do not
+# want drawing negatives from.
+expressed <- de %>% filter(!is.na(te_padj))
+cat("Expressed (non-NA te_padj):", nrow(expressed), "of", nrow(de), "\n")
+
+pos_path <- here("output", "genesets", params$pos_geneset_csv)
+stopifnot("positive gene set not found" = file.exists(pos_path))
+pos_genes <- unique(read_csv(pos_path, show_col_types = FALSE)$ensembl_gene)
+cat("Positive set (excluded from the pool):", length(pos_genes), "genes\n")
+
+pool <- expressed %>%
+  filter(!gene_id_clean %in% pos_genes) %>%
+  distinct(gene_id_clean, .keep_all = TRUE)
+
+cat("Background pool:", nrow(pool), "genes\n")
+
+stopifnot("pool overlaps the positive set" =
+  length(intersect(pool$gene_id_clean, pos_genes)) == 0)
+stopifnot("pool lost more genes than the positive set contains" =
+  nrow(expressed) - nrow(pool) <= length(pos_genes))
+stopifnot("pool is implausibly small" = nrow(pool) > 5000)
+```
+
+The pool is a background, so it must look like the transcriptome rather than like a
+screened set. The old screened pool sat well above the transcriptome median on GC3; this
+one should not.
+
+```{r pool_distribution}
+# Biological spot-check: an unscreened background must be centred on the transcriptome,
+# not displaced from it. A drifted median here means the filter is selecting on something.
+cat("median te_lfc  - pool:", round(median(pool$te_lfc, na.rm = TRUE), 3),
+    " all tested:", round(median(expressed$te_lfc, na.rm = TRUE), 3), "\n")
+stopifnot("pool median te_lfc is displaced from the transcriptome median" =
+  abs(median(pool$te_lfc, na.rm = TRUE) - median(expressed$te_lfc, na.rm = TRUE)) < 0.1)
+
+# The pool deliberately RETAINS eIF3e-inhibited genes; report how many so the composition
+# is on the record rather than assumed.
+n_inhibited <- sum(pool$te_lfc < -0.5 & pool$te_padj < 0.05, na.rm = TRUE)
+cat("Genes in the pool that eIF3e inhibits (te_lfc < -0.5 & padj < 0.05):",
+    n_inhibited, sprintf("(%.1f%%)", 100 * n_inhibited / nrow(pool)), "\n")
+```
+
+# Report the intersection with each consumer matrix
+
+```{r matrix_intersections}
+# Each consumer intersects the pool with its own matrix. Report both here so a shortfall
+# is visible at build time rather than inside a model run.
+report_matrix <- function(rds, label) {
+  path <- here("output", "predictive_modeling", rds)
+  if (!file.exists(path)) {
+    cat(label, ": matrix not found, skipped\n"); return(invisible(NULL))
+  }
+  g <- unique(readRDS(path)$gene_id_clean)
+  n <- length(intersect(pool$gene_id_clean, g))
+  cat(sprintf("%-28s matrix genes: %6d   pool genes present: %6d\n", label, length(g), n))
+  invisible(n)
+}
+n_model <- report_matrix("feature_matrix_dhx29_kd_feature.rds", "dhx29_kd_feature (models)")
+report_matrix("feature_matrix_external_stability.rds", "external_stability")
+report_matrix("feature_matrix_positional_gc.rds", "positional_gc (GC figure)")
+
+# The draw is only non-degenerate if the pool exceeds the positive set. The eIF3e-specific
+# set is 399 genes in the model matrix.
+stopifnot("pool does not exceed the positive set in the model matrix" =
+  is.null(n_model) || n_model > 1000)
+```
+
+# Write
+
+```{r write}
+out <- pool %>%
+  transmute(
+    ensembl_gene   = gene_id_clean,
+    db_gene_symbol = symbol,
+    gs_name        = sub("\\.csv$", "", params$out_csv),
+    # nb07 stops unless the negative set's readout matches the run's. The pool is drawn
+    # from the TE-tested universe, so "TE" is true rather than merely permissive - a file
+    # with no readout column would default to "TE" and pass the guard on a missing value.
+    readout        = "TE",
+    # nb07 prints neg_contrasts/neg_lfc/neg_padj when present. This pool has no per-contrast
+    # thresholds - it is defined on expression - so it stamps neg_criteria instead, and nb07
+    # reports that rather than claiming the file predates provenance stamping.
+    neg_criteria   = paste0("expressed background: non-NA te_padj in ", params$de_csv,
+                            ", excluding all ", length(pos_genes), " genes in ",
+                            params$pos_geneset_csv, "; NOT screened on effect size"),
+    built_by       = "notebook 02c"
+  )
+
+stopifnot("output has duplicate genes" = !any(duplicated(out$ensembl_gene)))
+stopifnot("output is missing required columns" =
+  all(c("ensembl_gene", "db_gene_symbol", "readout") %in% names(out)))
+
+out_path <- here("output", "genesets", params$out_csv)
+write_csv(out, out_path)
+cat("Wrote", nrow(out), "genes to", out_path, "\n")
+```
+
+# Summary
+
+```{r summary}
+cat("Pool:              ", nrow(out), "genes\n")
+cat("Definition:        expressed (DESeq2-tested) minus all 3e-promoted\n")
+cat("Screened on effect size: NO - this is a background, not a control set\n")
+cat("Use with notebook 07 as:\n")
+cat('  neg_geneset_csv = "', params$out_csv, '"\n', sep = "")
+cat('  neg_tag = "exprbg"   # REQUIRED: neg_geneset_csv is not part of the output\n')
+cat('                       # suffix, so without a tag this overwrites the runs that\n')
+cat('                       # used the screened pool.\n')
+```

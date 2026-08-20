@@ -16,6 +16,9 @@ params:
   exclude_own_te_features: true
   neg_geneset_csv: ""
   feature_matrix_path: ""
+  neg_seed: 9
+  neg_tag: ""
+  save_plots: TRUE
 editor_options:
   chunk_output_type: console
 ---
@@ -114,8 +117,31 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
                                      # "filename.rds" = override: load this RDS from output/predictive_modeling/
                                      #      use for cell-line-specific matrices, e.g.:
                                      #     feature_matrix_mcf7six1_external_stability.rds  "feature_matrix_mcf7six1_codon_features.rds"
+  ,
+  neg_seed  = 9,    # Seeds ONLY the negative-control draw in `create_target`. The
+                    # train/test split, the forest and the CV all stay pinned at 9, so
+                    # across a seed sweep every difference is attributable to which
+                    # negatives were drawn and to nothing else. 9 = the historical draw.
+  neg_tag   = "",   # Appended to the output suffix. REQUIRED when changing the negative
+                    # POOL (not just the draw): neg_geneset_csv is not part of the suffix,
+                    # so a new pool at neg_seed = 9 would otherwise overwrite the outputs
+                    # of the run that used the old pool. "" = legacy filenames, untouched.
+  save_plots = TRUE # FALSE suppresses the 8 ggsave calls. Set FALSE for seed sweeps,
+                    # which would otherwise write 8 near-identical PDFs per replicate.
   )
 }
+
+# neg_seed / neg_tag / save_plots default in for params lists written before they existed.
+NEG_SEED   <- if (is.null(params$neg_seed)) 9L else as.integer(params$neg_seed)
+NEG_TAG    <- if (is.null(params$neg_tag)) "" else params$neg_tag
+SAVE_PLOTS <- if (is.null(params$save_plots)) TRUE else isTRUE(params$save_plots)
+stopifnot("neg_seed must be a single finite integer" =
+  length(NEG_SEED) == 1 && is.finite(NEG_SEED))
+# neg_tag goes into filenames, so keep it to characters that are safe there.
+stopifnot("neg_tag must be alphanumeric/underscore" =
+  !nzchar(NEG_TAG) || grepl("^[A-Za-z0-9_]+$", NEG_TAG))
+
+ggsave_if <- function(...) if (SAVE_PLOTS) ggsave(...) else invisible(NULL)
 
 # Derived file paths and labels from params
 # readout defaults to "TE" so params lists written before this param existed still work
@@ -183,7 +209,11 @@ suffix <- paste0("eif3", params$gene, "_", params$direction, "_",
                  params$condition, "_", params$timepoint, "_lfc", params$lfc,
                  "_", params$feature_set, "_clip", params$clip_mode, "_no_boruta",
                  if (isTRUE(params$exclude_4e_features)) "_no4e" else "",
-                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "")
+                 if (isTRUE(params$exclude_own_te_features)) "_noOwnTE" else "",
+                 # Both default to "", so every pre-existing run keeps its filenames and
+                 # 07b/07c keep resolving rf_classifier_{suffix}.rds.
+                 if (nzchar(NEG_TAG)) paste0("_", NEG_TAG) else "",
+                 if (NEG_SEED != 9L) paste0("_negseed", NEG_SEED) else "")
 pos_label <- params$direction
 neg_label <- paste0("does_not_", sub("s$", "", params$direction))
 gene_label <- paste0("eIF", params$gene)
@@ -329,7 +359,12 @@ neg_provenance <- list(
   contrasts = stamped("neg_contrasts"),
   lfc       = stamped("neg_lfc"),
   padj      = stamped("neg_padj"),
-  built_by  = if (nzchar(params$neg_geneset_csv)) "notebook 70" else
+  criteria  = stamped("neg_criteria"),
+  # Prefer the file's own stamp. The fallback assumed every custom neg_geneset_csv came
+  # from notebook 70, which is wrong for any other builder and was being written into
+  # the classification summary as fact.
+  built_by  = if (!is.na(stamped("built_by"))) stamped("built_by") else
+              if (nzchar(params$neg_geneset_csv)) "notebook 70 (assumed)" else
               if (params$gene == "3e") "notebook 02b" else "notebook 02"
 )
 
@@ -360,18 +395,49 @@ if (n_overlap > 0) {
 # Create Binary Target
 
 ```{r create_target}
-set.seed(9)
+# NEG_SEED seeds this draw and nothing else - the split, the forest and the CV below
+# stay pinned at 9. Under the default NEG_SEED = 9 this reproduces the historical draw
+# exactly, so pre-existing runs are unchanged.
+set.seed(NEG_SEED)
 
 # Only consider genes present in the feature matrix
 pos_in_features <- positive_genes %>%
   filter(ensembl_gene %in% features$gene_id_clean)
 cat("Positive genes in feature matrix:", nrow(pos_in_features), "\n")
 
+# Drop positives from the negative pool BEFORE sampling. The case_when below evaluates
+# the positive branch first, so a sampled gene that is also positive is relabelled
+# positive and the negative class silently ends up SMALLER than number_to_match - the
+# classes stop being balanced without anything being reported. Screened negative sets
+# are usually disjoint already (this is a no-op for them); a background pool defined on
+# expression rather than on effect size is not guaranteed to be.
 neg_in_features <- negative_control_genes %>%
   filter(gene_id_clean %in% features$gene_id_clean)
+n_neg_before_excl <- nrow(neg_in_features)
+neg_in_features <- neg_in_features %>%
+  filter(!gene_id_clean %in% pos_in_features$ensembl_gene)
+if (n_neg_before_excl > nrow(neg_in_features)) {
+  cat("Removed", n_neg_before_excl - nrow(neg_in_features),
+      "positive-set genes from the negative pool before sampling\n")
+}
 cat("Negative control genes in feature matrix:", nrow(neg_in_features), "\n")
+stopifnot("negative pool overlaps the positive set after exclusion" =
+  length(intersect(neg_in_features$gene_id_clean, pos_in_features$ensembl_gene)) == 0)
 
 number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+
+# A pool no larger than the positive set means every "replicate" draws the same genes:
+# sample(n, n) is a permutation, and membership - which is all the model sees - is
+# identical across seeds. Report it rather than letting a seed sweep quietly produce
+# 20 copies of one model.
+if (nrow(neg_in_features) <= nrow(pos_in_features)) {
+  cat("NOTE: the negative pool (", nrow(neg_in_features), ") is not larger than the",
+      "positive set (", nrow(pos_in_features), "), so the draw is degenerate -",
+      "every neg_seed selects the same genes.\n")
+} else {
+  cat("Drawing", number_to_match, "of", nrow(neg_in_features),
+      "pool genes with neg_seed =", NEG_SEED, "\n")
+}
 
 # Label genes
 features <- features %>%
@@ -649,7 +715,7 @@ p_roc <- ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
 
 print(p_roc)
 
-ggsave(here("plots", paste0("rf_classification_roc_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_classification_roc_", suffix, ".pdf")),
        plot = p_roc, width = 8, height = 6)
 ```
 
@@ -701,7 +767,7 @@ p_cm <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
 
 print(p_cm)
 
-ggsave(here("plots", paste0("rf_classification_confusion_matrix_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_classification_confusion_matrix_", suffix, ".pdf")),
        plot = p_cm, width = 6, height = 5)
 ```
 
@@ -949,7 +1015,7 @@ p_importance <- importance_df %>%
 
 print(p_importance)
 
-ggsave(here("plots", paste0("rf_classification_feature_importance_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_classification_feature_importance_", suffix, ".pdf")),
        plot = p_importance, width = 10, height = 10)
 
 # All-features bar plot (cap at top 60 to avoid oversized PDFs)
@@ -970,7 +1036,7 @@ p_importance_all <- importance_all_plot %>%
 
 print(p_importance_all)
 
-ggsave(here("plots", paste0("rf_classification_feature_importance_all_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_classification_feature_importance_all_", suffix, ".pdf")),
        plot = p_importance_all, width = 10, height = all_height)
 
 # Custom-features-only bar plot (exclude k-mer and RBP motif features, cap at top 60)
@@ -994,7 +1060,7 @@ p_importance_custom <- importance_custom %>%
 
 print(p_importance_custom)
 
-ggsave(here("plots", paste0("rf_classification_feature_importance_custom_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_classification_feature_importance_custom_", suffix, ".pdf")),
        plot = p_importance_custom, width = 10, height = custom_height)
 ```
 
@@ -1050,7 +1116,7 @@ p_category <- ggplot(category_summary,
 
 print(p_category)
 
-ggsave(here("plots", paste0("rf_classification_importance_by_category_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_classification_importance_by_category_", suffix, ".pdf")),
        plot = p_category, width = 10, height = 6)
 ```
 
@@ -1140,7 +1206,7 @@ p_lollipop <- ggdotchart(
   theme(legend.title = element_blank())
 
 print(p_lollipop)
-ggsave(here("plots", paste0("rf_directionality_lollipop_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_directionality_lollipop_", suffix, ".pdf")),
        plot = p_lollipop, width = 10, height = 10)
 ```
 
@@ -1251,9 +1317,17 @@ if (!is.na(neg_provenance$contrasts)) {
   this_contrast <- paste0(params$condition, "_", params$timepoint)
   cat("  Includes this run's contrast (", this_contrast, "):",
       grepl(this_contrast, neg_provenance$contrasts, fixed = TRUE), "\n")
+} else if (!is.na(neg_provenance$criteria)) {
+  # A pool defined on expression rather than on effect size has no per-contrast
+  # thresholds to report, so it stamps neg_criteria instead of neg_contrasts. Without
+  # this branch it would be described as "predates provenance stamping", which is the
+  # opposite of true.
+  cat("  Criteria:", neg_provenance$criteria, "\n")
 } else {
   cat("  Criteria: not recorded in the file (predates provenance stamping)\n")
 }
+cat("  Draw: neg_seed =", NEG_SEED,
+    if (nzchar(NEG_TAG)) paste0(", neg_tag = ", NEG_TAG) else "", "\n")
 cat("\n")
 
 cat("  Overlap with positive set:", n_overlap, "genes",
@@ -1311,7 +1385,7 @@ p_final_importance <- importance_final_plot %>%
 
 print(p_final_importance)
 
-ggsave(here("plots", paste0("rf_final_importance_", suffix, ".pdf")),
+ggsave_if(here("plots", paste0("rf_final_importance_", suffix, ".pdf")),
        plot = p_final_importance, width = 8,
        height = final_height)
 ```
