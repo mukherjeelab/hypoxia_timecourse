@@ -75,13 +75,58 @@ stopifnot(
 )
 cat("Loaded", length(nb24_symbols), "nb24 condition-specific candidates\n")
 
-all_symbols <- c(target_symbols, neg_symbols, nb24_symbols)
+# nb24 Plot 2d replacement set (chunk `plot-clonable-specific-genes`). Three of the
+# five Plot 2c genes above carry their eIF3d effect on a locus with no annotated
+# 5'UTR, so no construct can be built from them; these five were re-screened under
+# the same condition-specific definitions with the added requirement that the MANE
+# Select transcript is the most-abundant 5'UTR-annotated isoform in BOTH siCTRL
+# normoxia 1hr and siCTRL hypoxia 1hr.
+#
+# `tx_expected` / `utr5_expected` are the values that screen produced. They are
+# pinned here so the isoform-selection and sequence-extraction steps below are
+# checked against an independent prior rather than merely re-run: if a GENCODE
+# update, a salmon re-quant, or an edit to the selection rule moves any of these,
+# the notebook fails instead of silently exporting a different 5'UTR.
+nb24_clonable <- tribble(
+  ~symbol,     ~gene_id_forced,   ~nb24_group,         ~tx_expected,      ~utr5_expected,
+  "MEMO1",     "ENSG00000162959", "Hypoxia-specific",  "ENST00000404530",  84L,
+  "DNAJC3",    "ENSG00000102580", "Hypoxia-specific",  "ENST00000602402", 117L,
+  "CCN1",      "ENSG00000142871", "Hypoxia-specific",  "ENST00000451137", 224L,
+  "GADD45B",   "ENSG00000099860", "Normoxia-specific", "ENST00000215631", 232L,
+  "MAP1LC3B",  "ENSG00000140941", "Normoxia-specific", "ENST00000268607",  92L
+)
+# TMSB15B (ENSG00000158427) was the first normoxia-specific pick on TE grounds
+# (nor 1.93 / hyp 0.10, the cleanest separation in the pool) and was dropped here:
+# its 114 bp 5'UTR carries an Eco31I site (GGTCTC), which the bidirectional vector
+# re-cuts during Golden Gate assembly. GADD45B is the next candidate that is
+# site-free, and it has the next-cleanest hypoxia null in the pool (hyp 0.07).
+clonable_symbols <- nb24_clonable$symbol
+
+stopifnot(
+  "clonable candidate symbols must not overlap any other list" =
+    length(intersect(clonable_symbols,
+                     c(target_symbols, neg_symbols, nb24_symbols))) == 0,
+  "clonable candidate symbols must be unique" =
+    !anyDuplicated(clonable_symbols),
+  "clonable candidate gene IDs must be unique" =
+    !anyDuplicated(nb24_clonable$gene_id_forced),
+  "clonable expected transcript IDs must be unique" =
+    !anyDuplicated(nb24_clonable$tx_expected)
+)
+cat("Loaded", length(clonable_symbols), "nb24 Plot 2d clonable candidates\n")
+
+all_symbols <- c(target_symbols, neg_symbols, nb24_symbols, clonable_symbols)
 
 gene_groups <- tibble(
   symbol     = all_symbols,
   gene_group = c(rep("target", length(target_symbols)),
                  rep("negative_control", length(neg_symbols)),
-                 rep("nb24_candidate", length(nb24_symbols)))
+                 rep("nb24_candidate", length(nb24_symbols)),
+                 rep("nb24_clonable", length(clonable_symbols)))
+)
+stopifnot(
+  "gene_groups must have one row per symbol with no duplicates" =
+    nrow(gene_groups) == length(all_symbols) && !anyDuplicated(gene_groups$symbol)
 )
 ```
 
@@ -114,9 +159,21 @@ gene_id_map <- te_full |>
   dplyr::slice_max(total_rna, n = 1, with_ties = FALSE) |>
   ungroup()
 
+# Both pinned tables feed one forced-ID column. Kept as a single bind_rows so a
+# symbol can never be pinned to two different gene IDs without the uniqueness check
+# below firing — a silent duplicate here would make the left_join fan out and
+# duplicate that gene's construct row.
+forced_ids <- bind_rows(
+  nb24_candidates |> dplyr::select(symbol, gene_id_forced),
+  nb24_clonable   |> dplyr::select(symbol, gene_id_forced)
+)
+stopifnot(
+  "a symbol is pinned to more than one gene ID" = !anyDuplicated(forced_ids$symbol)
+)
+
 gene_df <- gene_groups |>
   left_join(gene_id_map |> dplyr::select(symbol, gene_id_clean), by = "symbol") |>
-  left_join(nb24_candidates |> dplyr::select(symbol, gene_id_forced), by = "symbol") |>
+  left_join(forced_ids, by = "symbol") |>
   mutate(gene_id_clean = coalesce(gene_id_forced, gene_id_clean))
 
 # Report where the pinned ID disagrees with the expression rule, so the override is
@@ -126,13 +183,26 @@ nb24_override_check <- gene_df |>
   left_join(gene_id_map |> dplyr::select(symbol, gene_id_by_expression = gene_id_clean),
             by = "symbol") |>
   mutate(overridden = gene_id_forced != gene_id_by_expression)
-cat("\nnb24 candidates — pinned gene ID vs expression-selected gene ID:\n")
+cat("\nPinned candidates — pinned gene ID vs expression-selected gene ID:\n")
 print(nb24_override_check |>
-        dplyr::select(symbol, gene_id_forced, gene_id_by_expression, overridden))
+        dplyr::select(symbol, gene_group, gene_id_forced, gene_id_by_expression, overridden))
 stopifnot(
-  "pinned nb24 gene IDs must all be present in the TE dataset" =
-    all(nb24_candidates$gene_id_forced %in% te_full$gene_id_clean)
+  "pinned gene IDs must all be present in the TE dataset" =
+    all(forced_ids$gene_id_forced %in% te_full$gene_id_clean)
 )
+
+# The Plot 2d set was screened on a single ENSG per symbol, so unlike the Plot 2c
+# set the pin must AGREE with the expression rule. A disagreement means the symbol
+# has picked up a second expressed locus since the screen and the pick needs redoing.
+clonable_override <- nb24_override_check |> filter(gene_group == "nb24_clonable")
+stopifnot(
+  "every clonable candidate must appear in the override check" =
+    nrow(clonable_override) == length(clonable_symbols),
+  "a clonable candidate's pinned gene ID disagrees with the expression rule" =
+    !any(clonable_override$overridden)
+)
+cat("All", length(clonable_symbols),
+    "clonable candidates: pinned gene ID == expression-selected gene ID.\n")
 
 gene_df <- gene_df |> dplyr::select(-gene_id_forced)
 
@@ -275,6 +345,47 @@ cat("\nnb24 candidates WITH a 5'UTR-annotated transcript:",
 cat("nb24 candidates WITHOUT one (cannot build a 5'UTR construct):",
     if (length(nb24_missing) > 0) paste(nb24_missing, collapse = ", ") else "(none)", "\n")
 
+# --- Plot 2d clonable set: isoform selection must be exactly reproducible --------
+# These five were screened on the rule "MANE Select transcript is the most-abundant
+# 5'UTR-annotated isoform in BOTH siCTRL conditions". All three halves of that are
+# re-asserted here against independent sources: the salmon-derived dominance above,
+# the transcript IDs pinned in `define_genes`, and MANE Select read off the GENCODE
+# v49 companion file. Any one of them drifting is a hard failure, not a warning —
+# a construct built on a different isoform is a different experiment.
+mane_select <- read_csv(
+  here("accessories", "human", "mane_select_v49.csv"),
+  col_names = c("gene_id_clean", "mane_tx", "mane_symbol"), show_col_types = FALSE
+)
+stopifnot(
+  "MANE file must be one row per gene" = !anyDuplicated(mane_select$gene_id_clean)
+)
+
+clonable_iso <- isoform_check |>
+  filter(gene_group == "nb24_clonable") |>
+  left_join(nb24_clonable |> dplyr::select(symbol, tx_expected), by = "symbol") |>
+  left_join(mane_select |> dplyr::select(gene_id_clean, mane_tx), by = "gene_id_clean")
+
+cat("\nClonable set — isoform selection vs pinned expectation and MANE Select:\n")
+print(clonable_iso |>
+        dplyr::select(symbol, top_tx_nor, tpm_nor, top_tx_hyp, tpm_hyp,
+                      consistent, tx_expected, mane_tx))
+
+stopifnot(
+  "every clonable candidate must resolve to a 5'UTR-annotated transcript" =
+    nrow(clonable_iso) == length(clonable_symbols) &&
+    !any(is.na(clonable_iso$top_tx_nor)) && !any(is.na(clonable_iso$top_tx_hyp)),
+  "a clonable candidate's dominant isoform differs between normoxia and hypoxia" =
+    all(clonable_iso$consistent),
+  "a clonable candidate's selected transcript differs from the screened one" =
+    all(clonable_iso$top_tx_nor == clonable_iso$tx_expected),
+  "a clonable candidate has no MANE Select transcript" =
+    !any(is.na(clonable_iso$mane_tx)),
+  "a clonable candidate's most-expressed transcript is not the MANE Select one" =
+    all(clonable_iso$top_tx_nor == clonable_iso$mane_tx)
+)
+cat("Clonable set: dominant isoform == pinned transcript == MANE Select, in both",
+    "conditions, for all", nrow(clonable_iso), "genes.\n")
+
 tx_selected <- tx_selected |> filter(!is.na(transcript_id_final))
 ```
 
@@ -333,7 +444,42 @@ stopifnot(
     !anyDuplicated(seq_df$symbol)
 )
 
-cat("All validation checks passed.\n")
+# --- Plot 2d clonable set: sequence-level validation -----------------------------
+clonable_seq <- seq_df |>
+  filter(gene_group == "nb24_clonable") |>
+  left_join(nb24_clonable |> dplyr::select(symbol, tx_expected, utr5_expected),
+            by = "symbol")
+
+cat("\nClonable set — extracted 5'UTR vs pinned expectation:\n")
+print(clonable_seq |>
+        dplyr::select(symbol, transcript_id_final, tx_expected,
+                      utr5_length, utr5_expected))
+
+stopifnot(
+  "every clonable candidate must survive to sequence extraction" =
+    nrow(clonable_seq) == length(clonable_symbols),
+  "a clonable 5'UTR sequence is missing" =
+    !any(is.na(clonable_seq$utr5_sequence)),
+  "a clonable transcript ID changed between selection and extraction" =
+    all(clonable_seq$transcript_id_final == clonable_seq$tx_expected),
+  "a clonable 5'UTR length differs from the screened length" =
+    all(clonable_seq$utr5_length == clonable_seq$utr5_expected),
+  # extractTranscriptSeqs returns unambiguous DNA; an N would mean an assembly gap
+  # inside the UTR, which cannot be ordered as a synthesised fragment.
+  "a clonable 5'UTR contains a non-ACGT base" =
+    all(str_detect(toupper(clonable_seq$utr5_sequence), "^[ACGT]+$")),
+  "a clonable 5'UTR is shorter than 40 bp" =
+    all(clonable_seq$utr5_length >= 40)
+)
+
+# uAUGs are biology, not an error — but they change how a 5'UTR reporter reads, so
+# report the count rather than discovering it after cloning.
+clonable_seq <- clonable_seq |>
+  mutate(n_uAUG = str_count(toupper(utr5_sequence), "ATG"))
+cat("\nUpstream AUGs per clonable 5'UTR (reported, not filtered):\n")
+print(clonable_seq |> dplyr::select(symbol, utr5_length, n_uAUG))
+
+cat("\nAll validation checks passed.\n")
 ```
 
 # Assemble constructs
@@ -389,6 +535,20 @@ if (nrow(flagged) > 0) {
   cat("\nNo internal Eco31I/BsmBI sites in any 5'UTR.\n")
 }
 
+# For the hand-picked Plot 2d set an internal site is a hard failure rather than a
+# warning: these five are going into the bidirectional vector, which is linearised
+# with Eco31I and BsmBI-v2, so a site inside the insert would be re-cut during
+# assembly. The five larger groups above are pools that get filtered downstream.
+clonable_sites <- constructs_df |> filter(gene_group == "nb24_clonable")
+stopifnot(
+  "every clonable candidate must reach construct assembly" =
+    nrow(clonable_sites) == length(clonable_symbols),
+  "a clonable 5'UTR contains an internal Eco31I / BsmBI-v2 site" =
+    all(clonable_sites$n_typeIIs_sites == 0)
+)
+cat("Clonable set: all", nrow(clonable_sites),
+    "5'UTRs free of Eco31I (GGTCTC/GAGACC) and BsmBI-v2 (CGTCTC/GAGACG) sites.\n")
+
 # Report what the length filter removes rather than dropping it silently — the
 # fixed parts total 113 bp, so this cut requires a 5'UTR of >= 187 bp.
 dropped_short <- constructs_df |> filter(construct_length < 300)
@@ -397,11 +557,30 @@ if (nrow(dropped_short) > 0) {
   print(dropped_short |> dplyr::select(Name, gene_group, utr5_length, construct_length))
 }
 
-constructs_df <- constructs_df |> filter(construct_length >= 300)
+# The >= 300 bp cut is applied to the POOLS only. The Plot 2d set is five genes
+# chosen by name on their TE behaviour, and the fixed parts total 113 bp, so the cut
+# would require a 5'UTR of >= 187 bp and would silently drop MEMO1 (84), MAP1LC3B
+# (92) and DNAJC3 (117) — three of the five. Dropping a named pick on a length rule
+# it was never screened against is a change to the experiment, so the group is
+# exempted and the shortfall is reported.
+clonable_short <- constructs_df |>
+  filter(gene_group == "nb24_clonable", construct_length < 300)
+if (nrow(clonable_short) > 0) {
+  cat("\nNOTE — clonable picks below the 300 bp pool cut (exempt, still exported):\n")
+  print(clonable_short |> dplyr::select(Name, utr5_length, construct_length))
+}
+
+constructs_df <- constructs_df |>
+  filter(construct_length >= 300 | gene_group == "nb24_clonable")
+stopifnot(
+  "the length filter dropped a clonable candidate" =
+    sum(constructs_df$gene_group == "nb24_clonable") == length(clonable_symbols)
+)
 cat("\nAfter filtering to >= 300 bp constructs:", nrow(constructs_df), "remain",
     "(", sum(constructs_df$gene_group == "target"), "targets,",
     sum(constructs_df$gene_group == "negative_control"), "neg controls,",
-    sum(constructs_df$gene_group == "nb24_candidate"), "nb24 candidates )\n")
+    sum(constructs_df$gene_group == "nb24_candidate"), "nb24 candidates,",
+    sum(constructs_df$gene_group == "nb24_clonable"), "clonable picks (exempt) )\n")
 ```
 
 # Negative control candidate review
@@ -451,17 +630,29 @@ nb24_symbols_keep <- constructs_df |>
   filter(gene_group == "nb24_candidate") |>
   pull(symbol)
 
+# All five Plot 2d picks are kept — the set was chosen by name, so there is no
+# further selection step for it.
+clonable_symbols_keep <- constructs_df |>
+  filter(gene_group == "nb24_clonable") |>
+  pull(symbol)
+stopifnot(
+  "all five clonable picks must survive to final selection" =
+    setequal(clonable_symbols_keep, clonable_symbols)
+)
+
 constructs_final <- constructs_df |>
   filter(
     (gene_group == "target" & symbol %in% target_symbols_keep) |
     (gene_group == "negative_control" & symbol %in% neg_symbols_keep) |
-    (gene_group == "nb24_candidate" & symbol %in% nb24_symbols_keep)
+    (gene_group == "nb24_candidate" & symbol %in% nb24_symbols_keep) |
+    (gene_group == "nb24_clonable" & symbol %in% clonable_symbols_keep)
   )
 
 cat("Final selection:", nrow(constructs_final), "constructs\n")
 cat(" ", sum(constructs_final$gene_group == "target"), "targets\n")
 cat(" ", sum(constructs_final$gene_group == "negative_control"), "negative controls\n")
 cat(" ", sum(constructs_final$gene_group == "nb24_candidate"), "nb24 candidates\n")
+cat(" ", sum(constructs_final$gene_group == "nb24_clonable"), "clonable picks\n")
 print(constructs_final |> dplyr::select(symbol, gene_group, utr5_length, construct_length))
 
 # Account for every one of the five nb24 candidates: built, or dropped with a reason.
@@ -480,6 +671,245 @@ stopifnot(
   "every nb24 candidate must be accounted for" =
     nrow(nb24_outcome) == length(nb24_symbols)
 )
+```
+
+
+# Plot 2d clonable picks — construct integrity and export
+
+Every check here is a `stopifnot`. The point is that the exported `Bases` string can
+be pasted into Benchling and cloned without re-deriving anything by hand, so each
+step from gene symbol to final sequence is re-asserted against an independent source
+rather than trusted from the step before it.
+
+```{r clonable_integrity}
+clonable_final <- constructs_final |>
+  filter(gene_group == "nb24_clonable") |>
+  left_join(nb24_clonable |> dplyr::select(symbol, gene_id_forced, nb24_group,
+                                           tx_expected, utr5_expected),
+            by = "symbol") |>
+  arrange(match(symbol, clonable_symbols))
+
+stopifnot(
+  "clonable export must contain exactly the five picked genes" =
+    nrow(clonable_final) == length(clonable_symbols) &&
+    setequal(clonable_final$symbol, clonable_symbols),
+  "clonable construct names must be unique" =
+    !anyDuplicated(clonable_final$Name)
+)
+
+# 1. Provenance: transcript and 5'UTR length still equal the screened values.
+stopifnot(
+  "transcript ID drifted from the screened one" =
+    all(clonable_final$transcript_id_final == clonable_final$tx_expected),
+  "5'UTR length drifted from the screened one" =
+    all(clonable_final$utr5_length == clonable_final$utr5_expected)
+)
+
+# 2. Composition: the construct is exactly prefix + 5'UTR + reporter + suffix.
+#    Rebuilt independently here rather than reusing `full_construct`, so an edit to
+#    the assembly expression cannot pass this check by construction.
+rebuilt <- paste0(prefix, clonable_final$utr5_sequence, reporter_start, suffix)
+stopifnot(
+  "construct does not equal prefix + 5'UTR + reporter_start + suffix" =
+    all(clonable_final$full_construct == rebuilt),
+  "construct length does not equal 113 + 5'UTR length" =
+    all(clonable_final$construct_length ==
+        nchar(prefix) + clonable_final$utr5_length +
+        nchar(reporter_start) + nchar(suffix)),
+  "construct length disagrees with nchar of the sequence" =
+    all(clonable_final$construct_length == nchar(clonable_final$full_construct))
+)
+
+# 3. Boundaries: the fixed parts sit where they are supposed to, and the 5'UTR
+#    appears exactly once — a UTR that happens to repeat the prefix or the reporter
+#    start would make the junction ambiguous for Gibson assembly.
+stopifnot(
+  "construct does not start with the vector prefix" =
+    all(str_starts(clonable_final$full_construct, fixed(prefix))),
+  "construct does not end with the vector suffix" =
+    all(str_ends(clonable_final$full_construct, fixed(suffix))),
+  "reporter start does not appear exactly once" =
+    all(str_count(clonable_final$full_construct, fixed(reporter_start)) == 1),
+  "5'UTR does not appear exactly once in its own construct" =
+    all(mapply(function(cst, u) str_count(cst, fixed(u)) == 1,
+               clonable_final$full_construct, clonable_final$utr5_sequence)),
+  "5'UTR is not immediately followed by the reporter start" =
+    all(mapply(function(cst, u) str_detect(cst, fixed(paste0(u, reporter_start))),
+               clonable_final$full_construct, clonable_final$utr5_sequence)),
+  "5'UTR is not immediately preceded by the prefix" =
+    all(mapply(function(cst, u) str_detect(cst, fixed(paste0(prefix, u))),
+               clonable_final$full_construct, clonable_final$utr5_sequence))
+)
+
+# 4. Synthesisability: unambiguous bases only, and no internal Eco31I / BsmBI-v2
+#    site anywhere in the ordered fragment (not just in the variable 5'UTR — a site
+#    could also be created across a junction by the last bases of the UTR).
+stopifnot(
+  "construct contains a non-ACGT base" =
+    all(str_detect(toupper(clonable_final$full_construct), "^[ACGT]+$")),
+  "construct contains an internal Eco31I / BsmBI-v2 site" =
+    all(count_sites(clonable_final$full_construct) == 0)
+)
+
+# 5. Start codon placement. `reporter_start` is a 73 bp overlap into the vector's
+#    reporter ORF, which the vector continues, so it is deliberately NOT a whole
+#    number of codons and no frame assertion is made on it. What must hold is that
+#    its ATG is the first ATG downstream of the inserted 5'UTR and sits at exactly
+#    prefix + utr5_length + 1 — that offset is what makes the 5'UTR the 5'UTR.
+atg_pos <- str_locate(clonable_final$full_construct,
+                      fixed(reporter_start))[, "start"]
+stopifnot(
+  "reporter start not located in construct" = !any(is.na(atg_pos)),
+  "reporter ATG is not immediately after the 5'UTR" =
+    all(atg_pos == nchar(prefix) + clonable_final$utr5_length + 1),
+  "reporter_start does not begin with ATG" =
+    str_starts(toupper(reporter_start), "ATG")
+)
+
+# 5b. The vector arms themselves are pinned. An accidental edit to any of the three
+#     fixed parts would silently change every construct in this notebook, including
+#     the ones already ordered off the earlier export.
+stopifnot(
+  "vector prefix has changed" =
+    prefix == "GTGAACCGTCAGATCAGATC",
+  "reporter_start has changed" =
+    reporter_start == paste0("atgGTCTTCACACTCGAAGATTTCGTTGGGGACTGGCGACAGACAGCC",
+                             "GGCTACAACCTGGACCAAGTCCTTG"),
+  "vector suffix has changed" =
+    suffix == "AACAGGGAGGTGTGTCCAGT",
+  "fixed part lengths have changed" =
+    nchar(prefix) == 20 && nchar(reporter_start) == 73 && nchar(suffix) == 20
+)
+
+# 6. Cross-check against the biology the picks were made on. Re-read the two
+#    contrasts and re-assert the condition-specific definitions from notebook 24,
+#    so a construct can never be exported for a gene that no longer qualifies.
+#    Direction check first (CLAUDE.md): te_lfc is log2(sictrl / si3d), verified by
+#    EIF3D's own rna_lfc being strongly positive.
+nor24 <- read_csv(here("output/translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+                  show_col_types = FALSE)
+hyp24 <- read_csv(here("output/translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+                  show_col_types = FALSE)
+stopifnot(
+  "EIF3D rna_lfc not strongly positive — si3d contrast direction may have flipped" =
+    hyp24$rna_lfc[hyp24$symbol == "EIF3D"] > 2
+)
+
+te_chk <- clonable_final |>
+  dplyr::select(symbol, gene_id_clean = gene_id_forced, nb24_group) |>
+  left_join(nor24 |> mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+              dplyr::select(gene_id_clean, nor_lfc = te_lfc, nor_padj = te_padj),
+            by = "gene_id_clean") |>
+  left_join(hyp24 |> mutate(gene_id_clean = sub("\\..*", "", gene_id)) |>
+              dplyr::select(gene_id_clean, hyp_lfc = te_lfc, hyp_padj = te_padj),
+            by = "gene_id_clean") |>
+  mutate(
+    qualifies = case_when(
+      nb24_group == "Hypoxia-specific" ~
+        !is.na(hyp_padj) & hyp_padj < 0.05 & hyp_lfc > 0.5 &
+        (is.na(nor_padj) | nor_padj >= 0.05) & !is.na(nor_lfc) & nor_lfc < 0.5,
+      nb24_group == "Normoxia-specific" ~
+        !is.na(nor_padj) & nor_padj < 0.05 & nor_lfc > 0.5 &
+        (is.na(hyp_padj) | hyp_padj >= 0.05) & !is.na(hyp_lfc) & hyp_lfc < 0.5
+    )
+  )
+cat("Condition-specific definition re-checked against the source contrasts:\n")
+print(as.data.frame(te_chk |> mutate(across(where(is.numeric), ~round(.x, 4)))))
+stopifnot(
+  "a clonable pick no longer meets its condition-specific definition" =
+    all(te_chk$qualifies)
+)
+
+cat("\nAll clonable construct integrity checks passed.\n")
+
+clonable_report <- clonable_final |>
+  dplyr::select(Name, nb24_group, gene_id_forced, transcript_id_final,
+                utr5_length, construct_length, n_typeIIs_sites)
+print(as.data.frame(clonable_report))
+```
+
+## Sequences
+
+```{r clonable_sequences}
+for (i in seq_len(nrow(clonable_final))) {
+  cat(">", clonable_final$Name[i], " | ", clonable_final$nb24_group[i],
+      " | ", clonable_final$transcript_id_final[i],
+      " | 5'UTR ", clonable_final$utr5_length[i], " bp",
+      " | construct ", clonable_final$construct_length[i], " bp\n", sep = "")
+  cat(clonable_final$full_construct[i], "\n\n")
+}
+```
+
+## Export
+
+Written as its own pair of files rather than appended to `65_benchling_import.csv`,
+so the constructs already ordered off that file are not disturbed. The same rows are
+also present in `65_constructs_all.csv` under `gene_group == "nb24_clonable"`.
+
+```{r clonable_export}
+clonable_out <- clonable_final |>
+  dplyr::select(Name, nb24_group, gene_id = gene_id_forced,
+                transcript_id = transcript_id_final,
+                utr5_length, utr5_sequence,
+                prefix, reporter_start, suffix,
+                full_construct, construct_length, n_typeIIs_sites)
+
+write_csv(clonable_out,
+          here("output", "predictive_modeling", "65_constructs_nb24_clonable.csv"))
+cat("Saved:", nrow(clonable_out),
+    "rows to output/predictive_modeling/65_constructs_nb24_clonable.csv\n")
+
+clonable_benchling <- clonable_final |>
+  dplyr::select(Name, Bases = full_construct, construct_length)
+
+# A clonable Name must not equal any other construct's Name, or the two would
+# collide as Benchling sequence entries. Checked in memory against the other groups
+# in constructs_final rather than against the file on disk: the file is rewritten
+# further down and an earlier run of this notebook can have left the clonable rows
+# in it, which is not a collision but would look like one.
+other_names <- constructs_final |>
+  filter(gene_group != "nb24_clonable") |>
+  pull(Name)
+stopifnot(
+  "clonable construct name collides with another construct in this notebook" =
+    length(intersect(clonable_benchling$Name, other_names)) == 0
+)
+cat("No name collisions with", length(other_names), "other constructs.\n")
+
+# Separately: report clonable rows left in the main import file by an earlier run.
+# The main export below excludes this group, so they will be cleared on write.
+prior_import_path <- here("output", "predictive_modeling", "65_benchling_import.csv")
+if (file.exists(prior_import_path)) {
+  stale <- intersect(read_csv(prior_import_path, show_col_types = FALSE)$Name,
+                     clonable_symbols)
+  if (length(stale) > 0) {
+    cat("NOTE — clearing stale clonable rows from the main import file:",
+        paste(stale, collapse = ", "), "\n")
+  }
+}
+
+write_csv(clonable_benchling,
+          here("output", "predictive_modeling", "65_benchling_import_nb24_clonable.csv"))
+cat("Saved Benchling import:", nrow(clonable_benchling),
+    "constructs to output/predictive_modeling/65_benchling_import_nb24_clonable.csv\n")
+
+# Round-trip: re-read what was written and confirm it matches what is in memory.
+roundtrip <- read_csv(
+  here("output", "predictive_modeling", "65_benchling_import_nb24_clonable.csv"),
+  show_col_types = FALSE)
+stopifnot(
+  "written Benchling file does not round-trip" =
+    nrow(roundtrip) == nrow(clonable_benchling) &&
+    all(roundtrip$Name  == clonable_benchling$Name) &&
+    all(roundtrip$Bases == clonable_benchling$Bases) &&
+    all(nchar(roundtrip$Bases) == roundtrip$construct_length)
+)
+cat("Round-trip check passed.\n")
+
+print(clonable_benchling |>
+        mutate(Bases_preview = paste0(str_sub(Bases, 1, 40), "...")) |>
+        dplyr::select(Name, construct_length, Bases_preview) |>
+        as.data.frame())
 ```
 
 # CLIC1 and ADAT3 5' UTR sequences
@@ -512,8 +942,18 @@ write_csv(
 cat("Saved construct table:",
     nrow(constructs_final), "rows to output/predictive_modeling/65_constructs_all.csv\n")
 
+# The Plot 2d picks are excluded from THIS import file and get their own
+# (`65_benchling_import_nb24_clonable.csv`, written above). Re-uploading this file
+# should not re-import the constructs already in Benchling from the earlier run, so
+# it is kept to exactly the rows it had before that group existed. They are still in
+# 65_constructs_all.csv, which is the full record rather than an upload manifest.
 benchling_df <- constructs_final |>
+  filter(gene_group != "nb24_clonable") |>
   dplyr::select(Name, Bases = full_construct, construct_length)
+stopifnot(
+  "main Benchling import must not contain the clonable picks" =
+    !any(benchling_df$Name %in% clonable_symbols)
+)
 
 write_csv(
   benchling_df,
