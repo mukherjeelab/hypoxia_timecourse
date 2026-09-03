@@ -1,0 +1,397 @@
+---
+title: "5'UTR / CDS / 3'UTR length distributions, 4E-resistant vs 4E-sensitive"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_matrix: "feature_matrix_teleman_4e.rds"
+  pos_csv: "teleman_4e_resistant_TE_1hr_lfc0.5.csv"
+  neg_csv: "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"
+  pos_fasta: "teleman_4e_resistant_transcripts.fa"
+  neg_fasta: "teleman_4e_sensitive_transcripts.fa"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Length distributions of the three transcript regions (5'UTR, CDS, 3'UTR) for the
+4E-resistant and 4E-sensitive sets defined in notebook 76 -- the same two groups whose
+sequences were exported to `output/fasta/`. Companion to notebook 79, which does the
+same for GC content.
+
+Lengths come from the feature matrix (`utr5_length` / `cds_length` / `utr3_length`,
+one row per selected transcript) rather than from the FASTA files, which hold whole
+transcripts and so cannot be split by region. The chunk below asserts that the
+transcripts being plotted are exactly the ones in those FASTA files.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    feature_matrix = "feature_matrix_teleman_4e.rds",
+    pos_csv        = "teleman_4e_resistant_TE_1hr_lfc0.5.csv",
+    neg_csv        = "teleman_4e_sensitive_TE_1hr_lfc0.5.csv",
+    pos_fasta      = "teleman_4e_resistant_transcripts.fa",
+    neg_fasta      = "teleman_4e_sensitive_transcripts.fa",
+    save_plots     = TRUE
+  )
+}
+FEATURE_MATRIX <- params$feature_matrix
+POS_CSV        <- params$pos_csv
+NEG_CSV        <- params$neg_csv
+POS_FASTA      <- params$pos_fasta
+NEG_FASTA      <- params$neg_fasta
+SAVE_PLOTS     <- params$save_plots
+
+# eIF3d orange and eIF3e blue are reserved for those two factors (CLAUDE.md), so this
+# figure uses the same two Okabe-Ito hues as notebooks 76 and 79.
+class_colors <- c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2")
+
+region_labels <- c(
+  utr5_length = "5'UTR",
+  cds_length  = "CDS",
+  utr3_length = "3'UTR"
+)
+```
+
+# Data
+
+```{r load}
+fm  <- readRDS(here("output", "predictive_modeling", FEATURE_MATRIX))
+pos <- read_csv(here("output", "genesets", POS_CSV), show_col_types = FALSE)
+neg <- read_csv(here("output", "genesets", NEG_CSV), show_col_types = FALSE)
+
+stopifnot(all(names(region_labels) %in% colnames(fm)))
+
+d <- fm %>%
+  dplyr::mutate(class = dplyr::case_when(
+    gene_id_clean %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id_clean %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE                                ~ NA_character_)) %>%
+  dplyr::filter(!is.na(class)) %>%
+  dplyr::mutate(class = factor(class, levels = names(class_colors)))
+
+print(dplyr::count(d, class) %>% as.data.frame(), row.names = FALSE)
+stopifnot("classes overlap" =
+  length(intersect(pos$ensembl_gene, neg$ensembl_gene)) == 0)
+```
+
+The transcripts plotted here are the ones whose sequences were exported to FASTA.
+
+```{r fasta-check}
+fasta_ids <- function(path) {
+  sub("^>", "", grep("^>", readLines(path), value = TRUE))
+}
+fa_pos <- fasta_ids(here("output", "fasta", POS_FASTA))
+fa_neg <- fasta_ids(here("output", "fasta", NEG_FASTA))
+
+stopifnot(
+  "resistant transcripts differ from exported FASTA" =
+    setequal(fa_pos, d$transcript_id_clean[d$class == "4E-resistant"]),
+  "sensitive transcripts differ from exported FASTA" =
+    setequal(fa_neg, d$transcript_id_clean[d$class == "4E-sensitive"]))
+cat("FASTA transcript IDs match the plotted sets:",
+    length(fa_pos), "resistant /", length(fa_neg), "sensitive\n")
+```
+
+```{r range-checks}
+# Lengths are nucleotide counts: non-negative, and the three regions must fit inside
+# the transcript.
+lens <- d %>% dplyr::select(dplyr::all_of(names(region_labels)))
+stopifnot(
+  "negative region length" = all(lens >= 0, na.rm = TRUE),
+  "region lengths exceed transcript length" =
+    all(rowSums(lens) <= d$transcript_length, na.rm = TRUE))
+
+# A complete CDS is a whole number of codons. A handful of GENCODE entries are tagged
+# cds_start_NF / cds_end_NF and are not, so this is a tolerance rather than a hard
+# assert -- but a large count would mean the CDS ranges are being read wrong.
+n_partial <- sum(d$cds_length %% 3 != 0, na.rm = TRUE)
+cat("CDS length not a multiple of 3 (incomplete GENCODE CDS):", n_partial,
+    "of", sum(!is.na(d$cds_length)), "\n")
+stopifnot("too many CDS lengths are not a multiple of 3" =
+  n_partial / sum(!is.na(d$cds_length)) < 0.01)
+
+# Biological spot-check: median human 5'UTR is short (~100-300 nt) and the 3'UTR is
+# the longest of the three regions on a typical mRNA.
+med_all <- vapply(lens, median, numeric(1), na.rm = TRUE)
+print(med_all)
+stopifnot(
+  "median 5'UTR outside 50-400 nt" = dplyr::between(med_all[["utr5_length"]], 50, 400),
+  "median 3'UTR not longest region" =
+    med_all[["utr3_length"]] > med_all[["utr5_length"]])
+
+# Zero-length regions cannot be shown on a log axis; report how many are dropped.
+zero_counts <- lens %>%
+  tidyr::pivot_longer(dplyr::everything(),
+                      names_to = "region", values_to = "length") %>%
+  dplyr::filter(length == 0 | is.na(length)) %>%
+  dplyr::count(region, name = "n_zero_or_na")
+print(as.data.frame(zero_counts), row.names = FALSE)
+```
+
+```{r long}
+d_long <- d %>%
+  dplyr::select(transcript_id_clean, symbol, class,
+                dplyr::all_of(names(region_labels))) %>%
+  tidyr::pivot_longer(dplyr::all_of(names(region_labels)),
+                      names_to = "region", values_to = "length") %>%
+  dplyr::filter(!is.na(length), length > 0) %>%
+  dplyr::mutate(region = factor(region_labels[region],
+                                levels = unname(region_labels)))
+```
+
+# Reference: all expressed mRNAs in the Teleman data
+
+The 4E-resistant and 4E-sensitive sets are both tails of the same contrast, so a shift
+in one of them is only interpretable against the bulk. "Expressed" here is every gene
+DESeq2 could **test** in the Teleman TE contrast: `independentFiltering = FALSE` was set
+upstream, so all 11,306 tested genes carry a `padj`, and 11,286 of them have region
+annotations in the feature matrix. That whole matrix is the reference -- no filtering on
+effect size, so it is a background rather than a third selected group.
+
+Note the two classes are themselves part of this background (2,390 of 11,286, ~21%), so
+the reference line is pulled slightly toward them; it is not an independent set.
+
+```{r expressed-background}
+expressed_long <- fm %>%
+  dplyr::select(transcript_id_clean, dplyr::all_of(names(region_labels))) %>%
+  tidyr::pivot_longer(dplyr::all_of(names(region_labels)),
+                      names_to = "region", values_to = "length") %>%
+  dplyr::filter(!is.na(length), length > 0) %>%
+  dplyr::mutate(region = factor(region_labels[region],
+                                levels = unname(region_labels)))
+
+med_expressed <- expressed_long %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarise(n_expressed = dplyr::n(),
+                   m_all = median(length), .groups = "drop") %>%
+  dplyr::mutate(
+    label = paste0("grey dashed = all expressed mRNAs\n(median = ",
+                   round(m_all), " nt, n = ", n_expressed, ")"),
+    label_short = paste0(scales::comma(round(m_all)), " nt\n(n = ",
+                         scales::comma(n_expressed), ")"))
+print(as.data.frame(med_expressed), row.names = FALSE)
+
+stopifnot("expressed background is smaller than the two classes combined" =
+  all(med_expressed$n_expressed > nrow(d)))
+```
+
+# Summary statistics
+
+```{r summary}
+len_summary <- d_long %>%
+  dplyr::group_by(region, class) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   median = median(length),
+                   mean   = mean(length),
+                   q25    = quantile(length, 0.25),
+                   q75    = quantile(length, 0.75),
+                   .groups = "drop")
+print(as.data.frame(len_summary), row.names = FALSE)
+
+len_tests <- d_long %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarise(
+    n_resistant = sum(class == "4E-resistant"),
+    n_sensitive = sum(class == "4E-sensitive"),
+    median_resistant = median(length[class == "4E-resistant"]),
+    median_sensitive = median(length[class == "4E-sensitive"]),
+    wilcox_p = wilcox.test(length[class == "4E-resistant"],
+                           length[class == "4E-sensitive"])$p.value,
+    .groups = "drop")
+print(as.data.frame(len_tests), row.names = FALSE)
+
+if (SAVE_PLOTS) {
+  write_csv(len_tests, here("output", "92_region_length_stats_4e.csv"))
+}
+```
+
+Every density panel carries the same three medians: the expressed background and the two
+classes. Building them once here keeps the single-region and faceted figures consistent.
+
+```{r panel-medians}
+REF_GROUP    <- "all expressed"
+median_colors <- c(setNames("grey50", REF_GROUP), class_colors)
+
+panel_medians <- dplyr::bind_rows(
+  med_expressed %>%
+    dplyr::transmute(region, group = REF_GROUP, m = m_all, n = n_expressed),
+  d_long %>%
+    dplyr::group_by(region, class) %>%
+    dplyr::summarise(m = median(length), n = dplyr::n(), .groups = "drop") %>%
+    dplyr::transmute(region, group = as.character(class), m, n)) %>%
+  dplyr::mutate(group = factor(group, levels = names(median_colors)),
+                label = paste0(group, " median = ",
+                               scales::comma(round(m)), " nt")) %>%
+  dplyr::arrange(region, group) %>%
+  # one text line per group, stacked down from the top of the panel
+  dplyr::group_by(region) %>%
+  dplyr::mutate(vj = 1.4 + 1.35 * (dplyr::row_number() - 1)) %>%
+  dplyr::ungroup()
+
+stopifnot("expected 3 medians per region" =
+  all(dplyr::count(panel_medians, region)$n == 3))
+print(as.data.frame(panel_medians %>%
+                      dplyr::select(region, group, n, m)), row.names = FALSE)
+```
+
+# Density plots
+
+Lengths span orders of magnitude, so the x axis is log10 with nucleotide breaks.
+
+```{r density-fn}
+len_breaks <- c(10, 30, 100, 300, 1000, 3000, 10000, 30000)
+
+length_density <- function(df, region_name) {
+  sub <- df %>% dplyr::filter(region == region_name)
+  wt  <- wilcox.test(sub$length[sub$class == "4E-resistant"],
+                     sub$length[sub$class == "4E-sensitive"])
+  med <- sub %>% dplyr::group_by(class) %>%
+    dplyr::summarise(m = median(length), .groups = "drop")
+
+  lab <- paste0(
+    "Wilcoxon p = ", format.pval(wt$p.value, digits = 3, eps = 2.2e-16),
+    "\nn = ", sum(sub$class == med$class[1]), " / ", sum(sub$class == med$class[2]))
+
+  pm  <- panel_medians %>% dplyr::filter(region == region_name)
+  ref <- med_expressed %>% dplyr::filter(region == region_name)
+
+  ggplot(sub, aes(x = length, color = class)) +
+    geom_density(fill = NA, linewidth = 0.8) +
+    geom_vline(xintercept = ref$m_all, colour = "grey50",
+               linetype = "dashed", linewidth = 0.5) +
+    geom_vline(data = med, aes(xintercept = m, color = class),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    # all three medians, colour-matched to their dashed lines
+    geom_text(data = pm,
+              aes(x = min(sub$length), y = Inf, label = label,
+                  colour = group, vjust = vj),
+              hjust = 0, size = 3, show.legend = FALSE, inherit.aes = FALSE) +
+    scale_x_log10(breaks = len_breaks, labels = scales::comma) +
+    # the reference grey is in the scale so geom_text can map to it, but is kept out
+    # of `breaks` so the legend still shows only the two classes
+    scale_color_manual(values = median_colors, breaks = names(class_colors),
+                       name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+    labs(title = paste0(region_name, " length, 4E-resistant vs 4E-sensitive"),
+         x = paste0(region_name, " length (nt, log10 scale)"), y = "Density") +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+             size = 3.2, label = lab) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+}
+```
+
+## 5'UTR
+
+```{r utr5, fig.width = 7, fig.height = 4.5}
+p_utr5 <- length_density(d_long, "5'UTR")
+print(p_utr5)
+if (SAVE_PLOTS) ggsave(here("plots", "92_utr5_length_density_4e.pdf"), p_utr5,
+                       width = 7, height = 4.5)
+```
+
+## CDS
+
+```{r cds, fig.width = 7, fig.height = 4.5}
+p_cds <- length_density(d_long, "CDS")
+print(p_cds)
+if (SAVE_PLOTS) ggsave(here("plots", "92_cds_length_density_4e.pdf"), p_cds,
+                       width = 7, height = 4.5)
+```
+
+## 3'UTR
+
+```{r utr3, fig.width = 7, fig.height = 4.5}
+p_utr3 <- length_density(d_long, "3'UTR")
+print(p_utr3)
+if (SAVE_PLOTS) ggsave(here("plots", "92_utr3_length_density_4e.pdf"), p_utr3,
+                       width = 7, height = 4.5)
+```
+
+## All three regions together
+
+```{r facet, fig.width = 11, fig.height = 4}
+p_facet <- ggplot(d_long, aes(x = length, color = class)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  geom_vline(data = med_expressed, aes(xintercept = m_all),
+             colour = "grey50", linetype = "dashed", linewidth = 0.5,
+             inherit.aes = FALSE) +
+  geom_vline(data = panel_medians %>% dplyr::filter(group != REF_GROUP),
+             aes(xintercept = m, colour = group),
+             linetype = "dashed", linewidth = 0.5, inherit.aes = FALSE,
+             show.legend = FALSE) +
+  geom_text(data = panel_medians,
+            aes(x = min(d_long$length), y = Inf, label = label,
+                colour = group, vjust = vj),
+            hjust = 0, size = 2.3, show.legend = FALSE, inherit.aes = FALSE) +
+  facet_wrap(~ region, scales = "free_y", nrow = 1) +
+  scale_x_log10(breaks = len_breaks, labels = scales::comma) +
+  # headroom so the three median lines clear the density peak
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.32))) +
+  scale_color_manual(values = median_colors, breaks = names(class_colors),
+                     name = NULL) +
+  labs(title = paste0("Transcript region lengths, 4E-resistant vs 4E-sensitive (n = ",
+                      sum(d$class == "4E-resistant"), " / ",
+                      sum(d$class == "4E-sensitive"), " transcripts)"),
+       subtitle = "dashed lines = medians; grey = all expressed mRNAs in the Teleman data",
+       x = "Length (nt, log10 scale)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(size = 9, colour = "grey40"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_facet)
+if (SAVE_PLOTS) ggsave(here("plots", "92_region_length_density_4e_facet.pdf"), p_facet,
+                       width = 11, height = 4)
+```
+
+# Boxplots
+
+The densities show shape; the boxplots show the medians and spread side by side.
+
+```{r box, fig.width = 8, fig.height = 4.5}
+n_lab <- d_long %>%
+  dplyr::count(region, class) %>%
+  dplyr::mutate(label = paste0("n = ", n))
+
+p_box <- ggplot(d_long, aes(x = class, y = length, fill = class, color = class)) +
+  geom_boxplot(alpha = 0.15, linewidth = 0.6, outlier.size = 0.4,
+               outlier.alpha = 0.3) +
+  geom_text(data = n_lab, aes(x = class, y = Inf, label = label),
+            vjust = 1.4, size = 3, show.legend = FALSE, inherit.aes = FALSE,
+            colour = "grey30") +
+  facet_wrap(~ region, nrow = 1) +
+  scale_y_log10(breaks = len_breaks, labels = scales::comma) +
+  scale_fill_manual(values = class_colors, name = NULL) +
+  scale_color_manual(values = class_colors, name = NULL) +
+  labs(title = "Transcript region lengths, 4E-resistant vs 4E-sensitive",
+       x = NULL, y = "Length (nt, log10 scale)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+print(p_box)
+if (SAVE_PLOTS) ggsave(here("plots", "92_region_length_boxplot_4e.pdf"), p_box,
+                       width = 8, height = 4.5)
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

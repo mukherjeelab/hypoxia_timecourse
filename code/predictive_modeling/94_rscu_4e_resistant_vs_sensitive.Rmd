@@ -1,0 +1,727 @@
+---
+title: "94 — Frame-Control Pooled RSCU of 4E-Resistant vs 4E-Sensitive mRNAs (Teleman/Roiuk HeLa)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+Codon usage of the **4E-resistant** and **4E-sensitive** sets from notebook 76, drawn in
+the frame-control lollipop form of notebooks 54 and 93.
+
+| Figure | x-axis statistic | Reference pool |
+|---|---|---|
+| `94a_rscu_frame_ctrl_4e_resistant` | pooled bg-RSCU minus 1, **resistant** set | expressed Teleman transcriptome |
+| `94b_rscu_frame_ctrl_4e_sensitive` | pooled bg-RSCU minus 1, **sensitive** set | expressed Teleman transcriptome |
+| `94c_rscu_frame_ctrl_4e_res_minus_sens` | delta pooled RSCU, **resistant minus sensitive** | the two sets against each other |
+| `94d_rscu_resistant_vs_sensitive_scatter` | resistant vs sensitive bg-RSCU minus 1 | continuous, one point per codon |
+
+**Background = every gene the Teleman/Roiuk contrast could test**
+(`output/teleman_riboseq_te_all_genes.csv`, 11,306 genes; the ones with a usable v49
+transcript are in `feature_matrix_teleman_4e.rds`), with **no screening on effect size**.
+The resistant and sensitive genes are themselves part of that background, exactly as in
+nb93 — so a single-set bg-RSCU of 1 means "this set uses that codon at the rate of a
+typical expressed mRNA". The chi-squared tests use the **complement** of each set rather
+than the full background, because a set is not independent of a pool that contains it.
+
+**Each frame gets its own frame-matched background** (nb93 convention, not nb54's): in
+frame +1 the pseudo-codon composition of the background differs from frame 0, and
+dividing by the frame-0 background would report that difference rather than anything
+about the gene set.
+
+**Why this notebook exists.** Notebook 79 showed these two sets are almost separable on
+CDS GC and especially GC3, and notebook 88 modelled that. Aggregate GC3 nets out
+opposing preferences within synonymous families, so it cannot say whether the split is a
+*synonymous-choice* effect. Pooled bg-RSCU is normalized within each amino-acid family
+and the frame +1/+2 panels control for raw nucleotide composition: a codon that only
+moves in frame 0 is a codon-level signal, one that moves in all three frames is
+composition.
+
+**These classes are opposite tails of one variable.** Every statement below is
+resistant-relative-to-sensitive or tail-relative-to-background, never
+"4E-resistant mRNAs versus a typical mRNA of the same expression".
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+```
+
+```{r config}
+# Plain constants, no knit `params`: every chunk in this notebook runs as-is in Positron
+# (or any interactive R session) as well as under rmarkdown::render(). Edit here to point
+# the notebook at a different set of inputs.
+FEATURE_MATRIX <- "feature_matrix_teleman_4e.rds"          # output/predictive_modeling/
+POS_CSV        <- "teleman_4e_resistant_TE_1hr_lfc0.5.csv" # output/genesets/
+NEG_CSV        <- "teleman_4e_sensitive_TE_1hr_lfc0.5.csv" # output/genesets/
+TELEMAN_ALL    <- "teleman_riboseq_te_all_genes.csv"       # output/
+STAR_RATIO     <- 1.5    # frame-specificity multiple for the star rule
+SEED           <- 9      # project-wide standard seed
+SAVE_PLOTS     <- TRUE   # FALSE to draw without writing PDFs/CSVs
+
+stopifnot(
+  "STAR_RATIO must be a single number >= 1" =
+    is.numeric(STAR_RATIO) && length(STAR_RATIO) == 1 && STAR_RATIO >= 1,
+  "SEED must be a single number" = is.numeric(SEED) && length(SEED) == 1
+)
+set.seed(SEED)
+
+# Class colors match nb79 (Okabe-Ito vermillion / dark blue). #E69F00 and #56B4E9 are
+# reserved project-wide for eIF3d and eIF3e and must not be reused here.
+class_colors <- c("4E-resistant" = "#D55E00", "4E-sensitive" = "#0072B2")
+
+# Third-position coloring, same pair as nb93's scatter panels.
+gc3_colors <- c("AT-ending" = "#009E73", "GC-ending" = "#CC79A7")
+
+cat("Config — star ratio:", STAR_RATIO, "| seed:", SEED,
+    "| save_plots:", SAVE_PLOTS, "\n")
+```
+
+---
+
+# Section 1: Genetic Code Scaffold
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+# ATG (Met) and TGG (Trp) are the only codon for their amino acid: RSCU is 1 in every
+# pool by construction and no chi-squared test is defined. Excluded everywhere below,
+# matching nb54/nb93.
+multi_syn_codons <- sense_codons[gen_code[sense_codons] %in% multi_aa]
+stopifnot(
+  "single-codon amino acids leaked into multi_syn_codons" =
+    !any(c("ATG", "TGG") %in% multi_syn_codons),
+  "unexpected number of multi-synonymous sense codons" =
+    length(multi_syn_codons) == length(sense_codons) - 2
+)
+
+codon_meta <- tibble(
+  codon      = sense_codons,
+  amino_acid = as.character(gen_code[sense_codons]),
+  third_base = substr(sense_codons, 3, 3)
+) %>%
+  mutate(gc3_class = factor(if_else(third_base %in% c("G", "C"),
+                                    "GC-ending", "AT-ending"),
+                            levels = names(gc3_colors)))
+
+cat("Sense codons:", length(sense_codons),
+    "| multi-synonymous:", length(multi_syn_codons), "\n")
+```
+
+---
+
+# Section 2: Gene Sets and the Expressed Background
+
+```{r gene_sets}
+fm <- readRDS(here("output", "predictive_modeling", FEATURE_MATRIX))
+pos <- read_csv(here("output", "genesets", POS_CSV), show_col_types = FALSE)
+neg <- read_csv(here("output", "genesets", NEG_CSV), show_col_types = FALSE)
+teleman_all <- read_csv(here("output", TELEMAN_ALL), show_col_types = FALSE)
+
+cat("Feature matrix (HeLa dominant transcripts):", nrow(fm), "genes\n")
+cat("Teleman tested universe:", nrow(teleman_all), "genes\n")
+cat("Resistant:", nrow(pos), "| sensitive:", nrow(neg), "\n")
+
+# ---- Direction and identity guards ----
+# nb76 defines resistant as the positive-LFC tail of log2FC(TE) under eIF4E inhibition
+# and asserts CDKN2B / GLO1 as named members of the two classes (its Fig 1A check).
+# If either flips, every "resistant prefers X" statement below inverts.
+stopifnot(
+  "resistant set contains a non-positive LFC" = all(pos$log2FoldChange > 0),
+  "sensitive set contains a non-negative LFC" = all(neg$log2FoldChange < 0),
+  "classes overlap"        = length(intersect(pos$ensembl_gene, neg$ensembl_gene)) == 0,
+  "CDKN2B missing from the resistant set" = "CDKN2B" %in% pos$db_gene_symbol,
+  "GLO1 missing from the sensitive set"   = "GLO1"   %in% neg$db_gene_symbol,
+  "gene sets are not inside the tested universe" =
+    all(c(pos$ensembl_gene, neg$ensembl_gene) %in% teleman_all$gene_id),
+  "feature matrix is not gene-unique" = !any(duplicated(fm$gene_id_clean))
+)
+cat("Resistant log2FC range:", round(range(pos$log2FoldChange), 2),
+    "| sensitive:", round(range(neg$log2FoldChange), 2), "\n")
+
+# The background is the whole tested universe, unscreened. The feature matrix is that
+# universe minus the genes with no usable v49 transcript, so it IS the background here.
+stopifnot("feature matrix contains genes outside the tested universe" =
+            all(fm$gene_id_clean %in% teleman_all$gene_id))
+cat("Tested genes dropped for lack of a v49 transcript:",
+    nrow(teleman_all) - nrow(fm), "\n")
+
+tx_of <- function(gene_ids) {
+  fm$transcript_id_clean[fm$gene_id_clean %in% gene_ids]
+}
+res_tx_req <- tx_of(pos$ensembl_gene)
+sen_tx_req <- tx_of(neg$ensembl_gene)
+cat("Transcripts available — resistant:", length(res_tx_req),
+    "| sensitive:", length(sen_tx_req), "\n")
+```
+
+---
+
+# Section 3: CDS Sequences and Per-Frame Codon Counts
+
+```{r load_cds}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% fm$transcript_id_clean
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0 & width(cds_frame0) > 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0),
+    "of", nrow(fm), "feature-matrix transcripts\n")
+stopifnot("too few CDS sequences recovered from the v49 TxDb" =
+            length(cds_frame0) > 0.9 * nrow(fm))
+```
+
+```{r frame_counts}
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)
+  new_len <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+make_counts <- function(seqs) {
+  seqs <- seqs[width(seqs) > 0]
+  mat  <- codonCounts(codonTable(seqs))
+  rownames(mat) <- names(seqs)
+  mat
+}
+
+counts_by_frame <- list(
+  f0 = make_counts(cds_frame0),
+  f1 = make_counts(shift_frame(cds_frame0, 1)),
+  f2 = make_counts(shift_frame(cds_frame0, 2))
+)
+counts_mat0 <- counts_by_frame$f0
+
+for (fr in names(counts_by_frame)) {
+  cat(fr, ": ", nrow(counts_by_frame[[fr]]), " transcripts, ",
+      ncol(counts_by_frame[[fr]]), " codon columns\n", sep = "")
+}
+stopifnot(
+  "codon count matrices must be non-negative" =
+    all(sapply(counts_by_frame, function(m) all(m >= 0))),
+  "frame-shifted matrices lost transcripts unexpectedly" =
+    all(sapply(counts_by_frame, nrow) > 0.99 * nrow(counts_mat0))
+)
+
+res_tx <- intersect(res_tx_req, rownames(counts_mat0))
+sen_tx <- intersect(sen_tx_req, rownames(counts_mat0))
+all_tx <- rownames(counts_mat0)
+n_res  <- length(res_tx); n_sen <- length(sen_tx); n_all <- length(all_tx)
+
+cat("Transcripts scored — resistant:", n_res, "| sensitive:", n_sen,
+    "| expressed background:", n_all, "\n")
+stopifnot(
+  "too few resistant transcripts" = n_res > 100,
+  "too few sensitive transcripts" = n_sen > 100,
+  "the two sets must not share a transcript" =
+    length(intersect(res_tx, sen_tx)) == 0
+)
+```
+
+---
+
+# Section 4: Per-Frame Pooled bg-RSCU
+
+For codon *j* of amino acid *aa*:
+
+```
+pooled_RSCU_j = (set_count_j / set_aa_total) / (bg_count_j / bg_aa_total)
+```
+
+with numerator and denominator taken **in the same frame**. A value of 1 means the set
+uses codon *j* at exactly the background rate for that amino acid family.
+
+```{r rscu_helpers}
+# Pooled background proportions per amino acid family, for one frame.
+make_bg_props <- function(counts_mat) {
+  bg_counts <- colSums(counts_mat)
+  props <- lapply(aa_to_codons[multi_aa], function(codons) {
+    codons   <- intersect(codons, names(bg_counts))
+    aa_total <- sum(bg_counts[codons])
+    if (length(codons) == 0 || aa_total == 0) return(NULL)
+    bg_counts[codons] / aa_total
+  })
+  Filter(Negate(is.null), props)
+}
+
+pooled_counts <- function(tx_ids, counts_mat) {
+  colSums(counts_mat[intersect(tx_ids, rownames(counts_mat)), , drop = FALSE])
+}
+
+compute_pooled_rscu <- function(tx_ids, counts_mat, bg_props) {
+  pooled   <- pooled_counts(tx_ids, counts_mat)
+  rscu_vec <- set_names(rep(NA_real_, length(sense_codons)), sense_codons)
+  for (aa in names(bg_props)) {
+    props    <- bg_props[[aa]]
+    codons   <- intersect(names(props), names(pooled))
+    if (length(codons) == 0) next
+    aa_total <- sum(pooled[codons])
+    if (aa_total == 0) next
+    bp    <- props[codons]
+    valid <- bp > 0
+    if (any(valid)) {
+      rscu_vec[codons[valid]] <- (pooled[codons[valid]] / aa_total) / bp[valid]
+    }
+  }
+  rscu_vec
+}
+```
+
+```{r compute_rscu_all_frames}
+bg_props_by_frame <- lapply(counts_by_frame, make_bg_props)
+
+rscu_of <- function(tx_ids) {
+  set_names(
+    lapply(names(counts_by_frame), function(fr)
+      compute_pooled_rscu(tx_ids, counts_by_frame[[fr]], bg_props_by_frame[[fr]])),
+    names(counts_by_frame)
+  )
+}
+
+rscu_res <- rscu_of(res_tx)
+rscu_sen <- rscu_of(sen_tx)
+delta_rscu <- set_names(
+  lapply(names(counts_by_frame), function(fr) rscu_res[[fr]] - rscu_sen[[fr]]),
+  names(counts_by_frame)
+)
+
+for (fr in names(counts_by_frame)) {
+  cat(fr, " — resistant RSCU range: ",
+      paste(round(range(rscu_res[[fr]], na.rm = TRUE), 3), collapse = " to "),
+      " | sensitive: ",
+      paste(round(range(rscu_sen[[fr]], na.rm = TRUE), 3), collapse = " to "),
+      "\n", sep = "")
+}
+stopifnot("Pooled RSCU contains negative values" =
+            all(sapply(c(rscu_res, rscu_sen), function(v) all(v >= 0, na.rm = TRUE))))
+```
+
+```{r bg_validation}
+# The background scored against itself must give RSCU = 1 for every codon, in every
+# frame. This is the check that catches a numerator/denominator frame mismatch.
+for (fr in names(counts_by_frame)) {
+  chk <- compute_pooled_rscu(all_tx, counts_by_frame[[fr]], bg_props_by_frame[[fr]])
+  chk <- chk[!is.na(chk)]
+  cat(fr, " bg-RSCU self-check: min = ", round(min(chk), 8),
+      " max = ", round(max(chk), 8), " (n = ", length(chk), ")\n", sep = "")
+  stopifnot("Pooled bg-RSCU deviates from 1 — frame-matched background is wrong" =
+              all(abs(chk - 1) < 1e-10))
+}
+```
+
+```{r spot_check}
+# Cross-notebook consistency with nb79. That notebook reports median GC3 ~63% in the
+# resistant set against ~50% in the sensitive set, one of the largest compositional
+# splits in the project. If the sets or the frames were mixed up here, the frame-0
+# delta would not favour GC-ending codons.
+delta_f0 <- tibble(codon = multi_syn_codons,
+                   delta = as.numeric(delta_rscu$f0[multi_syn_codons])) %>%
+  left_join(codon_meta, by = "codon")
+
+gc3_means <- delta_f0 %>%
+  group_by(gc3_class) %>%
+  summarise(mean_delta = mean(delta), n = dplyr::n(), .groups = "drop")
+print(as.data.frame(gc3_means), row.names = FALSE)
+
+stopifnot(
+  "resistant-minus-sensitive delta does not favour GC-ending codons — contradicts nb79" =
+    gc3_means$mean_delta[gc3_means$gc3_class == "GC-ending"] >
+    gc3_means$mean_delta[gc3_means$gc3_class == "AT-ending"]
+)
+
+# Frame-0 deltas must be much larger than the out-of-frame controls if any of this is
+# codon-level rather than composition; reported, not asserted.
+mean_abs <- function(v) round(mean(abs(v[multi_syn_codons]), na.rm = TRUE), 4)
+cat("\nMean |delta| by frame (multi-synonymous codons):\n")
+for (fr in names(delta_rscu)) cat("  ", fr, ": ", mean_abs(delta_rscu[[fr]]), "\n", sep = "")
+```
+
+---
+
+# Section 5: Significance Tests
+
+Frame-0 only. Per codon, a 2x2 test on raw pooled counts: rows = the two pools, columns
+= (this codon, all other synonyms of its amino acid). BH-adjusted. For the single-set
+figures the comparator is the **complement** of that set within the expressed
+transcriptome, not the full background.
+
+```{r chisq}
+chisq_pools <- function(counts_a, counts_b) {
+  imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+    codons <- intersect(codons, names(counts_a))
+    if (length(codons) < 2) return(NULL)
+    n_aa_a <- sum(counts_a[codons]); n_aa_b <- sum(counts_b[codons])
+    if (n_aa_a == 0 || n_aa_b == 0) return(NULL)
+    map_dfr(codons, function(cd) {
+      mat <- round(matrix(
+        c(counts_a[cd], n_aa_a - counts_a[cd],
+          counts_b[cd], n_aa_b - counts_b[cd]),
+        nrow = 2, byrow = TRUE
+      ))
+      test <- if (any(mat < 5)) fisher.test(mat) else chisq.test(mat, correct = FALSE)
+      tibble(amino_acid = aa, codon = cd, p_val_chi = test$p.value)
+    })
+  }) %>%
+    mutate(p_adj_chi = p.adjust(p_val_chi, method = "BH"))
+}
+
+cnt_res <- pooled_counts(res_tx, counts_mat0)
+cnt_sen <- pooled_counts(sen_tx, counts_mat0)
+cnt_all <- pooled_counts(all_tx, counts_mat0)
+
+cnt_res_comp <- pooled_counts(setdiff(all_tx, res_tx), counts_mat0)
+cnt_sen_comp <- pooled_counts(setdiff(all_tx, sen_tx), counts_mat0)
+
+stopifnot(
+  "complement counts must reconstruct the background" =
+    all(abs((cnt_res + cnt_res_comp) - cnt_all) < 1e-6) &&
+    all(abs((cnt_sen + cnt_sen_comp) - cnt_all) < 1e-6)
+)
+
+chi_res   <- chisq_pools(cnt_res, cnt_res_comp)
+chi_sen   <- chisq_pools(cnt_sen, cnt_sen_comp)
+chi_delta <- chisq_pools(cnt_res, cnt_sen)
+
+chi_tables <- list("resistant vs complement" = chi_res,
+                   "sensitive vs complement" = chi_sen,
+                   "resistant vs sensitive"  = chi_delta)
+iwalk(chi_tables, function(tb, nm)
+  cat(nm, "— significant codons (BH q < 0.05):",
+      sum(tb$p_adj_chi < 0.05, na.rm = TRUE), "of", nrow(tb), "\n"))
+stopifnot(
+  "chi-squared tables must cover every multi-synonymous codon exactly once" =
+    all(sapply(chi_tables, nrow) == length(multi_syn_codons))
+)
+```
+
+---
+
+# Section 6: Figure Builder
+
+```{r figure_helpers}
+frame_levels <- c("Frame 0\n(real codons)",
+                  "Frame +1\n(non-coding ctrl)",
+                  "Frame +2\n(non-coding ctrl)")
+
+# Star rule (nb54/nb93): frame-0 BH q < 0.05 AND |frame-0 stat| > STAR_RATIO x the larger
+# of the two shifted-frame stats. A codon whose out-of-frame pseudo-codon shows the same
+# shift is reporting nucleotide composition, not codon choice.
+frame_specificity <- function(v0, v1, v2, chi_tbl) {
+  padj <- set_names(chi_tbl$p_adj_chi, chi_tbl$codon)
+  tibble(
+    codon     = multi_syn_codons,
+    f0_delta  = as.numeric(v0[multi_syn_codons]),
+    f1_delta  = as.numeric(v1[multi_syn_codons]),
+    f2_delta  = as.numeric(v2[multi_syn_codons]),
+    p_adj_chi = as.numeric(padj[multi_syn_codons])
+  ) %>%
+    mutate(
+      max_shift      = pmax(abs(f1_delta), abs(f2_delta)),
+      codon_specific = !is.na(p_adj_chi) & !is.na(f0_delta) & !is.na(max_shift) &
+        p_adj_chi < 0.05 & abs(f0_delta) > max_shift * STAR_RATIO
+    )
+}
+
+make_frame_figure <- function(v0, v1, v2, chi_tbl, title, subtitle, xlab, outfile) {
+  spec <- frame_specificity(v0, v1, v2, chi_tbl)
+  stopifnot(
+    "frame_specificity must cover every multi-synonymous codon exactly once" =
+      nrow(spec) == length(multi_syn_codons),
+    "codon_specific must be TRUE/FALSE, never NA" = !any(is.na(spec$codon_specific))
+  )
+  codon_order <- spec %>% arrange(f0_delta) %>% pull(codon)
+
+  plot_df <- spec %>%
+    dplyr::select(codon, codon_specific,
+                  `Frame 0\n(real codons)`      = f0_delta,
+                  `Frame +1\n(non-coding ctrl)` = f1_delta,
+                  `Frame +2\n(non-coding ctrl)` = f2_delta) %>%
+    pivot_longer(starts_with("Frame"), names_to = "frame", values_to = "delta") %>%
+    mutate(frame = factor(frame, levels = frame_levels)) %>%
+    left_join(codon_meta, by = "codon") %>%
+    mutate(codon = factor(codon, levels = codon_order))
+
+  # Stars pinned to the left edge of the Frame 0 panel as a row indicator.
+  star_df <- plot_df %>%
+    filter(codon_specific, frame == frame_levels[1]) %>%
+    mutate(delta = min(plot_df$delta, na.rm = TRUE))
+
+  # Do GC-ending codons sit on a different side than AT-ending ones?
+  f0 <- spec %>% left_join(codon_meta, by = "codon") %>% filter(!is.na(f0_delta))
+  wt <- wilcox.test(f0_delta ~ gc3_class, data = f0)
+  med_of <- function(cls) median(f0$f0_delta[f0$gc3_class == cls])
+  n_of   <- function(cls) sum(f0$gc3_class == cls)
+  ann <- sprintf(
+    "Frame 0 median: GC-ending = %.3f (n = %d) vs AT-ending = %.3f (n = %d); Wilcoxon p = %.2g",
+    med_of("GC-ending"), n_of("GC-ending"),
+    med_of("AT-ending"), n_of("AT-ending"), wt$p.value
+  )
+
+  p <- ggplot(plot_df, aes(x = delta, y = codon, colour = gc3_class)) +
+    geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey60") +
+    geom_point(size = 1.5, alpha = 0.85) +
+    geom_point(data = star_df, shape = 8, size = 2.5,
+               colour = "black", stroke = 0.6, show.legend = FALSE) +
+    facet_wrap(~ frame, nrow = 1) +
+    scale_colour_manual(values = gc3_colors, name = "Third position") +
+    labs(title = title, subtitle = subtitle, x = xlab, y = NULL, caption = ann) +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.text.y     = element_text(size = 9, family = "mono"),
+      legend.position = "top",
+      strip.text      = element_text(face = "bold"),
+      plot.caption    = element_text(hjust = 0, size = 9, colour = "grey30")
+    )
+  print(p)
+  if (SAVE_PLOTS) {
+    ggsave(here("plots", outfile), p, width = 9.5, height = 11)
+    cat("Saved: plots/", outfile, "\n", sep = "")
+  }
+
+  cat("Codon-specific (starred):", sum(spec$codon_specific), "of", nrow(spec),
+      "multi-synonymous codons\n")
+  cat(ann, "\n")
+  invisible(list(plot = p, spec = spec, wilcox = wt,
+                 n_gc = n_of("GC-ending"), n_at = n_of("AT-ending")))
+}
+
+star_subtitle <- paste0(
+  "star (Frame 0 only): BH-adj chi-sq p<0.05 AND abs(frame-0 value) > ",
+  STAR_RATIO, "x max(abs(frame+1), abs(frame+2))"
+)
+```
+
+---
+
+# Section 7: Frame-Control Lollipops
+
+```{r define_conditions}
+conditions <- list(
+  list(key = "resistant",
+       v   = list(rscu_res$f0 - 1, rscu_res$f1 - 1, rscu_res$f2 - 1),
+       chi = chi_res,
+       title_stem = "4E-resistant codon preference",
+       n_note = paste0("n = ", n_res, " transcripts vs ", n_all - n_res,
+                       " background transcripts (frame-matched background)"),
+       xlab = "pooled bg-RSCU minus 1 (4E-resistant vs expressed background)",
+       file_stem = "94a_rscu_frame_ctrl_4e_resistant"),
+  list(key = "sensitive",
+       v   = list(rscu_sen$f0 - 1, rscu_sen$f1 - 1, rscu_sen$f2 - 1),
+       chi = chi_sen,
+       title_stem = "4E-sensitive codon preference",
+       n_note = paste0("n = ", n_sen, " transcripts vs ", n_all - n_sen,
+                       " background transcripts (frame-matched background)"),
+       xlab = "pooled bg-RSCU minus 1 (4E-sensitive vs expressed background)",
+       file_stem = "94b_rscu_frame_ctrl_4e_sensitive"),
+  list(key = "res_minus_sens",
+       v   = list(delta_rscu$f0, delta_rscu$f1, delta_rscu$f2),
+       chi = chi_delta,
+       title_stem = "4E-resistant minus 4E-sensitive codon preference",
+       n_note = paste0("n = ", n_res, " resistant vs ", n_sen, " sensitive transcripts"),
+       xlab = "delta pooled RSCU (resistant minus sensitive)",
+       file_stem = "94c_rscu_frame_ctrl_4e_res_minus_sens")
+)
+```
+
+```{r fig_lollipops, fig.width=9.5, fig.height=11, results="asis"}
+fig_results <- list()
+for (cond in conditions) {
+  cat("\n\n### ", cond$title_stem, "\n\n", sep = "")
+  fig_results[[cond$key]] <- make_frame_figure(
+    v0 = cond$v[[1]], v1 = cond$v[[2]], v2 = cond$v[[3]],
+    chi_tbl  = cond$chi,
+    title    = paste0(cond$title_stem, ", colored by third position"),
+    subtitle = paste0(star_subtitle, "\n", cond$n_note),
+    xlab     = cond$xlab,
+    outfile  = paste0(cond$file_stem, ".pdf")
+  )
+}
+```
+
+---
+
+# Section 8: Resistant vs Sensitive, Codon by Codon
+
+The two single-set statistics against each other. Both are measured against the same
+background, so a codon on the diagonal is used identically by the two classes and one
+off the diagonal is a genuine class difference. Opposite tails of one variable should
+give a **negative** correlation.
+
+```{r scatter, fig.width=7.5, fig.height=6.5}
+scatter_df <- tibble(codon = multi_syn_codons) %>%
+  mutate(
+    resistant = as.numeric((rscu_res$f0 - 1)[codon]),
+    sensitive = as.numeric((rscu_sen$f0 - 1)[codon])
+  ) %>%
+  left_join(codon_meta, by = "codon") %>%
+  left_join(fig_results$res_minus_sens$spec %>%
+              dplyr::select(codon, codon_specific), by = "codon")
+
+stopifnot(
+  "scatter data must have one row per multi-synonymous codon" =
+    nrow(scatter_df) == length(multi_syn_codons),
+  "RSCU statistics must be finite" =
+    all(is.finite(scatter_df$resistant)) && all(is.finite(scatter_df$sensitive))
+)
+
+rho <- cor(scatter_df$resistant, scatter_df$sensitive, method = "spearman")
+r   <- cor(scatter_df$resistant, scatter_df$sensitive, method = "pearson")
+lab <- sprintf("Spearman rho = %.2f (p = %.2g)\nPearson R = %.2f (p = %.2g)\nn = %d codons",
+               rho,
+               cor.test(scatter_df$resistant, scatter_df$sensitive,
+                        method = "spearman", exact = FALSE)$p.value,
+               r,
+               cor.test(scatter_df$resistant, scatter_df$sensitive)$p.value,
+               nrow(scatter_df))
+
+p_scatter <- ggplot(scatter_df, aes(x = sensitive, y = resistant)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey70") +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted",
+              linewidth = 0.4, colour = "grey60") +
+  geom_smooth(method = "lm", se = TRUE, colour = "grey30",
+              linewidth = 0.6, alpha = 0.15) +
+  geom_point(aes(colour = gc3_class, shape = codon_specific), size = 2.2, alpha = 0.9) +
+  ggrepel::geom_text_repel(aes(label = codon, colour = gc3_class), size = 2.4,
+                           max.overlaps = Inf, min.segment.length = 0.2,
+                           segment.size = 0.2, show.legend = FALSE) +
+  annotate("text", x = -Inf, y = Inf, label = lab,
+           hjust = -0.05, vjust = 1.2, size = 3, colour = "grey30") +
+  scale_colour_manual(values = gc3_colors, name = "Third position") +
+  scale_shape_manual(values = c(`TRUE` = 8, `FALSE` = 16),
+                     name = "Codon-specific (starred)") +
+  labs(
+    title = "Codon usage of 4E-resistant vs 4E-sensitive mRNAs",
+    subtitle = paste0("Frame 0, pooled bg-RSCU minus 1 against the same expressed ",
+                      "background (n = ", n_all, " transcripts).",
+                      "\nDotted line = identical usage; grey band = linear fit with 95% CI."),
+    x = "4E-sensitive (bg-RSCU - 1)",
+    y = "4E-resistant (bg-RSCU - 1)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_scatter)
+if (SAVE_PLOTS) {
+  ggsave(here("plots", "94d_rscu_resistant_vs_sensitive_scatter.pdf"),
+         p_scatter, width = 7.5, height = 6.5)
+  cat("Saved: plots/94d_rscu_resistant_vs_sensitive_scatter.pdf\n")
+}
+cat(lab, "\n")
+```
+
+---
+
+# Section 9: Summary Tables
+
+```{r summary_table}
+spec_of <- function(key) fig_results[[key]]$spec
+
+summary_tbl <- codon_meta %>%
+  filter(codon %in% multi_syn_codons) %>%
+  left_join(spec_of("resistant") %>%
+              dplyr::select(codon, res_f0 = f0_delta, res_q = p_adj_chi,
+                            res_star = codon_specific), by = "codon") %>%
+  left_join(spec_of("sensitive") %>%
+              dplyr::select(codon, sen_f0 = f0_delta, sen_q = p_adj_chi,
+                            sen_star = codon_specific), by = "codon") %>%
+  left_join(spec_of("res_minus_sens") %>%
+              dplyr::select(codon, delta_f0 = f0_delta, delta_q = p_adj_chi,
+                            delta_star = codon_specific), by = "codon") %>%
+  arrange(desc(delta_f0))
+
+if (SAVE_PLOTS) {
+  out_csv <- here("output", "predictive_modeling", "94_rscu_4e_resistant_vs_sensitive.csv")
+  write_csv(summary_tbl, out_csv)
+  cat("Saved:", out_csv, "\n")
+}
+
+stopifnot(
+  "summary table must have one row per multi-synonymous codon" =
+    nrow(summary_tbl) == length(multi_syn_codons),
+  "frame-0 statistics must be finite" =
+    all(is.finite(c(summary_tbl$res_f0, summary_tbl$sen_f0, summary_tbl$delta_f0)))
+)
+
+cat("\nTop 10 codons by resistant-minus-sensitive delta:\n")
+print(summary_tbl %>%
+        dplyr::select(codon, amino_acid, gc3_class, res_f0, sen_f0, delta_f0,
+                      delta_star) %>% head(10))
+cat("\nBottom 10:\n")
+print(summary_tbl %>%
+        dplyr::select(codon, amino_acid, gc3_class, res_f0, sen_f0, delta_f0,
+                      delta_star) %>% tail(10))
+
+cat("\nStarred (codon-specific) counts, of", length(multi_syn_codons), "codons:\n")
+cat("  resistant:", sum(summary_tbl$res_star),
+    "| sensitive:", sum(summary_tbl$sen_star),
+    "| resistant-minus-sensitive:", sum(summary_tbl$delta_star), "\n")
+```
+
+```{r wilcoxon_summary}
+wilcox_tbl <- imap_dfr(fig_results, function(res, nm) {
+  tibble(
+    comparison  = nm,
+    n_gc_ending = res$n_gc,
+    n_at_ending = res$n_at,
+    wilcox_p    = res$wilcox$p.value
+  )
+})
+
+# Same test, restricted to the codons that survive the frame control: the composition
+# explanation is already excluded for these, so this is the codon-level version.
+wilcox_starred <- imap_dfr(fig_results, function(res, nm) {
+  d <- res$spec %>% left_join(codon_meta, by = "codon") %>% filter(codon_specific)
+  if (n_distinct(d$gc3_class) < 2) {
+    return(tibble(comparison = nm, n_starred = nrow(d),
+                  n_gc_ending = sum(d$gc3_class == "GC-ending"),
+                  n_at_ending = sum(d$gc3_class == "AT-ending"),
+                  wilcox_p = NA_real_))
+  }
+  tibble(comparison  = nm,
+         n_starred   = nrow(d),
+         n_gc_ending = sum(d$gc3_class == "GC-ending"),
+         n_at_ending = sum(d$gc3_class == "AT-ending"),
+         wilcox_p    = wilcox.test(f0_delta ~ gc3_class, data = d)$p.value)
+})
+
+cat("Wilcoxon of the frame-0 statistic, GC-ending vs AT-ending codons (all codons):\n")
+print(as.data.frame(wilcox_tbl), row.names = FALSE)
+cat("\nSame, restricted to frame-control-surviving (starred) codons:\n")
+print(as.data.frame(wilcox_starred), row.names = FALSE)
+
+if (SAVE_PLOTS) {
+  write_csv(wilcox_tbl,
+            here("output", "predictive_modeling", "94_rscu_4e_gc3_wilcoxon.csv"))
+}
+```
+
+```{r session_info}
+sessionInfo()
+```
