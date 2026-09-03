@@ -1,0 +1,914 @@
+---
+title: "93 — Frame-Control Pooled RSCU Colored by DHX29 Codon Preference (MDA-MB-231)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  lfc_cutoff:  0.5
+  padj_cutoff: 0.05
+  star_ratio:  1.5
+  seed:        9
+editor_options:
+  chunk_output_type: console
+---
+
+Re-draws the frame-shift-control lollipop of notebook 54, but colors each codon by
+whether **DHX29-engaged ribosomes are enriched or depleted on it** (Hia et al. 2026
+Thor-Ribo-seq codon enrichment score, CES = DHX29-IP / Input at the A site) instead
+of by third-position nucleotide.
+
+Three RSCU statistics, each drawn under two CES classification schemes (6 lollipops),
+plus two continuous scatter figures:
+
+| Figure | x-axis statistic | Reference |
+|---|---|---|
+| `93a_*_cesmedian` / `_cesnorm` | pooled bg-RSCU minus 1, **normoxia**-promoted set | expressed transcriptome |
+| `93b_*_cesmedian` / `_cesnorm` | pooled bg-RSCU minus 1, **hypoxia**-promoted set | expressed transcriptome |
+| `93c_*_cesmedian` / `_cesnorm` | delta pooled bg-RSCU, **hypoxia minus normoxia** | the two sets against each other |
+| `93d_ces_vs_rscu_scatter` | CES vs all three RSCU statistics | continuous, faceted |
+| `93e_ces_norm_vs_rscu_scatter` | abundance-normalized CES vs the same | continuous, faceted |
+
+The lollipops keep the three-panel frame-shift control (frame 0 = real codons, frames
++1/+2 = out-of-frame pseudo-codons) and the star rule from nb54.
+
+**CES = 1 is not a neutral threshold.** It sits at the ~74th percentile of the CES
+distribution, because CES is a proportion ratio whose *abundance-weighted* mean is 1
+by construction while its unweighted median is 0.939. Splitting there yields 16
+"favored" codons that are almost all AU3, making the coloring close to a relabeled
+AT/GC split. Section 2 documents this and defines the two schemes actually plotted:
+a median split of raw CES, and a median split of an abundance-normalized CES.
+
+**Background convention differs from nb54 for the shifted frames.** nb54 divided
+every frame by the *frame-0* background, which is fine for a hyp-minus-nor delta
+(the reference scales both terms) but makes a single-set bg-RSCU in frame +1
+uninterpretable — the deviation would be dominated by how out-of-frame pseudo-codon
+composition differs from real codon composition, which has nothing to do with the
+gene set. Here each frame gets its **own frame-matched background**, so a value of 1
+always means "this set looks like the expressed transcriptome *in that frame*".
+Frame 0 is identical to nb54 by construction and is asserted against it.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+```
+
+```{r params}
+# `params` only exists during knit; running chunks by hand in RStudio would
+# otherwise resolve bare `params` to an unrelated attached-package function.
+# These fallbacks match the YAML defaults exactly.
+if (!exists("params") || !is.list(params)) {
+  params <- list(lfc_cutoff = 0.5, padj_cutoff = 0.05, star_ratio = 1.5, seed = 9)
+}
+lfc_cutoff  <- params$lfc_cutoff
+padj_cutoff <- params$padj_cutoff
+star_ratio  <- params$star_ratio
+seed        <- params$seed
+
+stopifnot(
+  "lfc_cutoff must be a single non-negative number" =
+    is.numeric(lfc_cutoff)  && length(lfc_cutoff)  == 1 && lfc_cutoff >= 0,
+  "padj_cutoff must be a single number in (0, 1]" =
+    is.numeric(padj_cutoff) && length(padj_cutoff) == 1 &&
+    padj_cutoff > 0 && padj_cutoff <= 1,
+  "star_ratio must be a single number >= 1" =
+    is.numeric(star_ratio)  && length(star_ratio)  == 1 && star_ratio >= 1,
+  "seed must be a single number" =
+    is.numeric(seed)        && length(seed)        == 1
+)
+set.seed(seed)
+cat("Params — lfc_cutoff:", lfc_cutoff, "| padj_cutoff:", padj_cutoff,
+    "| star_ratio:", star_ratio, "| seed:", seed, "\n")
+```
+
+---
+
+# Section 1: Genetic Code Scaffold
+
+```{r genetic_code}
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[sapply(aa_to_codons, length) > 1]
+
+# ATG (Met) and TGG (Trp) are the only codon for their amino acid: RSCU is 1 in
+# every pool by construction, there is no synonym to prefer, and no chi-squared
+# test is defined. Excluded everywhere below, matching nb54.
+multi_syn_codons <- sense_codons[gen_code[sense_codons] %in% multi_aa]
+stopifnot(
+  "single-codon amino acids leaked into multi_syn_codons" =
+    !any(c("ATG", "TGG") %in% multi_syn_codons),
+  "unexpected number of multi-synonymous sense codons" =
+    length(multi_syn_codons) == length(sense_codons) - 2
+)
+cat("Sense codons:", length(sense_codons),
+    "| multi-synonymous:", length(multi_syn_codons), "\n")
+```
+
+---
+
+# Section 2: DHX29 Codon Enrichment Scores (Hia et al., Table S8)
+
+`Fold_Change` = IP_Avg / Input_Avg for the A-site codon in DHX29 Thor-Ribo-seq.
+CES > 1 = DHX29-engaged ribosomes are enriched on that codon (**DHX29-favored**);
+CES < 1 = depleted (**DHX29-disfavored**).
+
+```{r load_ces}
+s8_path <- here("accessories", "csc_data", "hia_dhx29",
+                "science.adw0288_tables_s1_to_s11",
+                "science.adw0288_table_s8.csv")
+stopifnot("Hia Table S8 not found" = file.exists(s8_path))
+
+s8 <- read_csv(s8_path, show_col_types = FALSE) %>%
+  mutate(codon = as.character(codon)) %>%
+  filter(!codon %in% c("TAA", "TAG", "TGA"))
+
+# ---- Replication of Hia et al. Fig 4D, asserted at the point of load ----
+# Same checks as nb23: if the wrong sheet/column were read, the AU3/GC3 split
+# would not reproduce and every color in this notebook would be meaningless.
+s8_au3 <- str_sub(s8$codon, 3, 3) %in% c("A", "T")
+ces_top10_au3 <- mean(s8_au3[order(-s8$Fold_Change)][1:10])
+ces_bot10_au3 <- mean(s8_au3[order( s8$Fold_Change)][1:10])
+
+cat("Sense codons in S8:", nrow(s8), "\n")
+cat("CES range:", round(range(s8$Fold_Change), 3), "\n")
+cat("Mean CES — AU3:", round(mean(s8$Fold_Change[s8_au3]), 3),
+    "| GC3:", round(mean(s8$Fold_Change[!s8_au3]), 3), "\n")
+cat("AU3 fraction — top-10 CES:", ces_top10_au3,
+    "| bottom-10 CES:", ces_bot10_au3, "\n")
+
+stopifnot(
+  "All 61 sense codons must be present in S8" = nrow(s8) == 61,
+  "CES is a fold change and must be positive" = all(s8$Fold_Change > 0),
+  "CES range implausible - check the S8 file/column" =
+    dplyr::between(max(s8$Fold_Change), 1.1, 3.0) &&
+    dplyr::between(min(s8$Fold_Change), 0.3, 0.95),
+  "Fig 4D replication failed: top CES codons are not AU3-biased" =
+    ces_top10_au3 >= 0.8,
+  "Fig 4D replication failed: bottom CES codons are not GC3-biased" =
+    ces_bot10_au3 <= 0.4,
+  "Fig 4D replication failed: AU3 mean CES not above GC3" =
+    mean(s8$Fold_Change[s8_au3]) > mean(s8$Fold_Change[!s8_au3])
+)
+cat("Table S8 replication PASS\n")
+```
+
+```{r ces_classes}
+ces_vec <- setNames(s8$Fold_Change, s8$codon)
+
+# ---- Why CES > 1 is not the midpoint ----
+# CES is a ratio of proportions, so it is the ABUNDANCE-WEIGHTED mean that equals 1
+# by construction (the IP and Input proportion vectors both sum to ~0.948). The
+# unweighted median is 0.939 and CES = 1 sits at the ~74th percentile, because CES
+# rises with codon abundance (Spearman 0.36, R^2 = 0.26 on log-log) and the common
+# codons carry the above-1 values. Counting codons above 1 therefore lands near a
+# top-quartile cut, and that cut is badly confounded with third position (AU3 12/30
+# vs GC3 4/31 favored) -- i.e. it is close to a relabeled AT/GC split.
+#
+# Two schemes are used instead, and every figure is produced under both:
+#   ces_class_median : median split of raw CES. Balanced, and less collinear with
+#                      third position (AU3 20/30 vs GC3 10/31).
+#   ces_class_norm   : median split of an abundance-normalized CES.
+#
+# Abundance normalization is done on RANKS -- the residual of rank(log2 CES) on
+# rank(log10 Input_Avg). A linear log-log fit leaves a residual rank correlation
+# with abundance of -0.23 (the relationship is not log-linear) and loess span 0.75
+# leaves -0.10; the rank residual leaves 0.03. All downstream statistics here are
+# Spearman, so removing the RANK dependence is the relevant guarantee.
+dhx29_df <- tibble(
+  codon     = sense_codons,
+  ces       = as.numeric(ces_vec[sense_codons]),
+  input_avg = as.numeric(setNames(s8$Input_Avg, s8$codon)[sense_codons])
+) %>%
+  mutate(
+    log2_ces    = log2(ces),
+    log10_abund = log10(input_avg)
+  )
+
+stopifnot(
+  "Every sense codon must have a CES value"       = !any(is.na(dhx29_df$ces)),
+  "Input_Avg must be a positive proportion"       = all(dhx29_df$input_avg > 0),
+  "No codon should sit exactly at CES = 1"        = !any(dhx29_df$ces == 1)
+)
+
+dhx29_df$ces_abund_norm <- resid(
+  lm(rank(log2_ces) ~ rank(log10_abund), data = dhx29_df)
+)
+
+rho_raw  <- cor(dhx29_df$input_avg, dhx29_df$ces,            method = "spearman")
+rho_norm <- cor(dhx29_df$input_avg, dhx29_df$ces_abund_norm, method = "spearman")
+cat("CES vs codon abundance — Spearman before normalization:", round(rho_raw, 3),
+    "| after:", round(rho_norm, 3), "\n")
+cat("Spearman(raw CES, abundance-normalized CES):",
+    round(cor(dhx29_df$ces, dhx29_df$ces_abund_norm, method = "spearman"), 3), "\n")
+cat("CES percentile of the value 1.0:",
+    round(100 * mean(dhx29_df$ces < 1), 1), "\n")
+cat("Abundance-weighted mean CES (must be ~1 by construction):",
+    round(sum(dhx29_df$input_avg * dhx29_df$ces) / sum(dhx29_df$input_avg), 4), "\n")
+
+stopifnot(
+  "CES must rise with abundance before normalization — check the S8 columns" =
+    rho_raw > 0.2,
+  "Rank normalization failed to remove the abundance dependence" =
+    abs(rho_norm) < 0.10,
+  "Abundance-weighted mean CES must be ~1" =
+    abs(sum(dhx29_df$input_avg * dhx29_df$ces) / sum(dhx29_df$input_avg) - 1) < 0.02
+)
+
+# Class labels are scheme-independent so one color map serves every figure; the
+# scheme is named in the legend title instead.
+cls_levels <- c("DHX29-favored", "DHX29-disfavored")
+split_at_median <- function(x) factor(if_else(x > median(x), cls_levels[1], cls_levels[2]),
+                                      levels = cls_levels)
+
+dhx29_df <- dhx29_df %>%
+  mutate(
+    ces_class_ces1   = factor(if_else(ces > 1, cls_levels[1], cls_levels[2]),
+                              levels = cls_levels),
+    ces_class_median = split_at_median(ces),
+    ces_class_norm   = split_at_median(ces_abund_norm),
+    third_base       = substr(codon, 3, 3),
+    gc3_class        = factor(if_else(third_base %in% c("G", "C"),
+                                      "GC-ending", "AT-ending"),
+                              levels = c("AT-ending", "GC-ending"))
+  )
+
+stopifnot(
+  "class columns must never be NA" =
+    !any(is.na(dhx29_df$ces_class_median)) && !any(is.na(dhx29_df$ces_class_norm))
+)
+
+cat("\nThird-position composition of each scheme (all 61 sense codons):\n")
+for (cc in c("ces_class_ces1", "ces_class_median", "ces_class_norm")) {
+  cat("\n", cc, ":\n", sep = "")
+  print(table(dhx29_df$gc3_class, dhx29_df[[cc]]))
+}
+cat("\nCodons reclassified by abundance normalization (vs raw median split):",
+    sum(dhx29_df$ces_class_median != dhx29_df$ces_class_norm), "of 61\n")
+
+# Okabe-Ito vermillion / dark blue. #E69F00 and #56B4E9 are reserved project-wide
+# for eIF3d and eIF3e and must not be reused for a third factor.
+dhx29_colors <- c("DHX29-favored" = "#D55E00", "DHX29-disfavored" = "#0072B2")
+
+# The scatter figures put CES on the x-axis, so coloring points by DHX29 class
+# there would just re-encode x. They are colored by third position instead, using
+# a pair that collides with neither the eIF3d/eIF3e hues nor dhx29_colors.
+gc3_colors <- c("AT-ending" = "#009E73", "GC-ending" = "#CC79A7")
+
+ces_schemes <- tibble::tribble(
+  ~key,       ~class_col,         ~legend,                                     ~tag,
+  "median",   "ces_class_median", "DHX29 A-site CES (median split)",           "cesmedian",
+  "norm",     "ces_class_norm",   "DHX29 A-site CES (abundance-normalized)",   "cesnorm"
+)
+```
+
+---
+
+# Section 3: CDS Sequences and Per-Frame Codon Counts
+
+```{r load_cds}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Feature matrix:", nrow(feature_matrix), "genes\n")
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx   <- cds_names_clean %in% keep_tx
+cds_frame0 <- cds_seqs_all[keep_idx]
+names(cds_frame0) <- cds_names_clean[keep_idx]
+
+valid      <- width(cds_frame0) %% 3 == 0 & width(cds_frame0) > 0
+cds_frame0 <- cds_frame0[valid]
+cat("CDS sequences (frame 0, divisible by 3):", length(cds_frame0), "\n")
+```
+
+```{r frame_counts}
+shift_frame <- function(seqs, shift) {
+  shifted <- subseq(seqs, start = shift + 1)
+  new_len <- floor(width(shifted) / 3) * 3
+  subseq(shifted, start = 1, end = new_len)
+}
+make_counts <- function(seqs) {
+  seqs <- seqs[width(seqs) > 0]
+  ct   <- codonTable(seqs)
+  mat  <- codonCounts(ct)
+  rownames(mat) <- names(seqs)
+  mat
+}
+
+counts_mat0 <- make_counts(cds_frame0)
+counts_mat1 <- make_counts(shift_frame(cds_frame0, 1))
+counts_mat2 <- make_counts(shift_frame(cds_frame0, 2))
+
+counts_by_frame <- list(f0 = counts_mat0, f1 = counts_mat1, f2 = counts_mat2)
+
+for (fr in names(counts_by_frame)) {
+  cat(fr, ": ", nrow(counts_by_frame[[fr]]), " transcripts, ",
+      ncol(counts_by_frame[[fr]]), " codon columns\n", sep = "")
+}
+stopifnot(
+  "codon count matrices must be non-negative" =
+    all(sapply(counts_by_frame, function(m) all(m >= 0))),
+  "frame-shifted matrices lost transcripts unexpectedly" =
+    all(sapply(counts_by_frame, nrow) > 0.99 * nrow(counts_mat0))
+)
+
+tx_to_gene <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id) %>%
+  mutate(ensembl_gene = str_remove(gene_id, "\\..*"))
+tx_gene_df <- tibble(transcript_id_clean = rownames(counts_mat0)) %>%
+  left_join(tx_to_gene, by = "transcript_id_clean")
+```
+
+---
+
+# Section 4: Gene Sets
+
+Identical definition to nb54: hypoxia = the saved 1hr eIF3d-promoted set; normoxia =
+recomputed from the 1+4hr TE table at the same thresholds.
+
+```{r gene_sets}
+hyp_gene_ids <- read_csv(
+  here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+  show_col_types = FALSE
+)$ensembl_gene
+cat("Hypoxia 1hr promoted genes:", length(hyp_gene_ids), "\n")
+
+tc <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+  show_col_types = FALSE
+)
+
+# Direction guard. The filenames say si3d_vs_sictrl but the DESeq2 coefficient is
+# sictrl_vs_si3d, so every LFC column is log2(sictrl / si3d) and positive means
+# eIF3d promotes. EIF3D's own rna_lfc must be strongly positive (the siRNA depletes
+# its target); if it is negative the contrast has flipped and "promoted" inverts.
+stopifnot("EIF3D row missing — cannot verify contrast direction" =
+            sum(tc$symbol == "EIF3D", na.rm = TRUE) == 1)
+eif3d_rna <- tc$rna_lfc[which(tc$symbol == "EIF3D")]
+cat("EIF3D rna_lfc (normoxia 1+4hr):", round(eif3d_rna, 2), "— expect strongly positive\n")
+stopifnot("EIF3D rna_lfc not positive — contrast direction is flipped" =
+            is.finite(eif3d_rna) && eif3d_rna > 2)
+
+nor_gene_ids <- tc %>%
+  filter(te_lfc > lfc_cutoff, !is.na(te_padj), te_padj < padj_cutoff) %>%
+  mutate(ensembl_gene = sub("\\..*", "", gene_id)) %>%
+  pull(ensembl_gene) %>%
+  unique()
+cat("Normoxia 1+4hr promoted genes:", length(nor_gene_ids), "\n")
+
+hyp_tx <- tx_gene_df %>% filter(ensembl_gene %in% hyp_gene_ids) %>% pull(transcript_id_clean)
+nor_tx <- tx_gene_df %>% filter(ensembl_gene %in% nor_gene_ids) %>% pull(transcript_id_clean)
+hyp_tx <- intersect(hyp_tx, rownames(counts_mat0))
+nor_tx <- intersect(nor_tx, rownames(counts_mat0))
+all_tx <- rownames(counts_mat0)
+
+n_hyp <- length(hyp_tx); n_nor <- length(nor_tx); n_all <- length(all_tx)
+cat("Transcripts — hypoxia:", n_hyp, "| normoxia:", n_nor,
+    "| expressed background:", n_all, "\n")
+cat("Overlap (transcripts in both sets):", length(intersect(hyp_tx, nor_tx)), "\n")
+
+stopifnot(
+  "No hypoxia transcripts in matrix"  = n_hyp > 100,
+  "No normoxia transcripts in matrix" = n_nor > 100
+)
+```
+
+---
+
+# Section 5: Per-Frame Pooled bg-RSCU
+
+For codon *j* of amino acid *aa*:
+
+```
+pooled_RSCU_j = (set_count_j / set_aa_total) / (bg_count_j / bg_aa_total)
+```
+
+with **numerator and denominator taken in the same frame**. A value of 1 means the
+set uses codon *j* at exactly the background rate for that amino acid family.
+
+```{r rscu_helpers}
+# Pooled background proportions per amino acid family, for one frame.
+make_bg_props <- function(counts_mat) {
+  bg_counts <- colSums(counts_mat)
+  props <- lapply(aa_to_codons[multi_aa], function(codons) {
+    codons   <- intersect(codons, names(bg_counts))
+    aa_total <- sum(bg_counts[codons])
+    if (length(codons) == 0 || aa_total == 0) return(NULL)
+    bg_counts[codons] / aa_total
+  })
+  Filter(Negate(is.null), props)
+}
+
+compute_pooled_rscu <- function(tx_ids, counts_mat, bg_props) {
+  tx_ids   <- intersect(tx_ids, rownames(counts_mat))
+  pooled   <- colSums(counts_mat[tx_ids, , drop = FALSE])
+  rscu_vec <- set_names(rep(NA_real_, length(sense_codons)), sense_codons)
+  for (aa in names(bg_props)) {
+    props    <- bg_props[[aa]]
+    codons   <- intersect(names(props), names(pooled))
+    if (length(codons) == 0) next
+    aa_total <- sum(pooled[codons])
+    if (aa_total == 0) next
+    bp    <- props[codons]
+    valid <- bp > 0
+    if (any(valid)) {
+      rscu_vec[codons[valid]] <- (pooled[codons[valid]] / aa_total) / bp[valid]
+    }
+  }
+  rscu_vec
+}
+
+pooled_counts <- function(tx_ids, counts_mat) {
+  colSums(counts_mat[intersect(tx_ids, rownames(counts_mat)), , drop = FALSE])
+}
+```
+
+```{r compute_rscu_all_frames}
+bg_props_by_frame <- lapply(counts_by_frame, make_bg_props)
+
+rscu_hyp <- lapply(names(counts_by_frame), function(fr)
+  compute_pooled_rscu(hyp_tx, counts_by_frame[[fr]], bg_props_by_frame[[fr]]))
+rscu_nor <- lapply(names(counts_by_frame), function(fr)
+  compute_pooled_rscu(nor_tx, counts_by_frame[[fr]], bg_props_by_frame[[fr]]))
+names(rscu_hyp) <- names(rscu_nor) <- names(counts_by_frame)
+
+delta_rscu <- lapply(names(counts_by_frame), function(fr) rscu_hyp[[fr]] - rscu_nor[[fr]])
+names(delta_rscu) <- names(counts_by_frame)
+
+for (fr in names(counts_by_frame)) {
+  cat(fr, " — hypoxia RSCU range: ", paste(round(range(rscu_hyp[[fr]], na.rm = TRUE), 3), collapse = " to "),
+      " | normoxia: ", paste(round(range(rscu_nor[[fr]], na.rm = TRUE), 3), collapse = " to "), "\n", sep = "")
+}
+stopifnot(
+  "Pooled RSCU contains negative values" =
+    all(sapply(c(rscu_hyp, rscu_nor), function(v) all(v >= 0, na.rm = TRUE)))
+)
+```
+
+```{r bg_validation}
+# The background scored against itself must give RSCU = 1 for every codon, in
+# every frame. This is the single check that catches a numerator/denominator
+# frame mismatch, which is exactly the failure mode this notebook introduces.
+for (fr in names(counts_by_frame)) {
+  chk <- compute_pooled_rscu(all_tx, counts_by_frame[[fr]], bg_props_by_frame[[fr]])
+  chk <- chk[!is.na(chk)]
+  cat(fr, " bg-RSCU self-check: min = ", round(min(chk), 8),
+      " max = ", round(max(chk), 8), " (n = ", length(chk), ")\n", sep = "")
+  stopifnot("Pooled bg-RSCU deviates from 1 — frame-matched background is wrong" =
+              all(abs(chk - 1) < 1e-10))
+}
+```
+
+```{r spot_check}
+# Biological spot-checks carried over from nb51/nb54.
+cat("TTA delta pooled RSCU, frame 0 (expect positive, AT-ending):",
+    round(delta_rscu$f0["TTA"], 4), "\n")
+cat("CTG pooled RSCU frame 0 — hypoxia:", round(rscu_hyp$f0["CTG"], 3),
+    "| normoxia:", round(rscu_nor$f0["CTG"], 3), "\n")
+stopifnot("TTA frame-0 delta not positive — contradicts nb51/nb54" =
+            delta_rscu$f0["TTA"] > 0)
+
+# Frame 0 must reproduce nb54 exactly: same counts, same background, so the
+# frame-matched background IS the frame-0 background there.
+mean_abs <- function(v) round(mean(abs(v[multi_syn_codons]), na.rm = TRUE), 4)
+cat("\nMean |delta| by frame (multi-synonymous codons):\n")
+for (fr in names(delta_rscu)) cat("  ", fr, ": ", mean_abs(delta_rscu[[fr]]), "\n", sep = "")
+```
+
+---
+
+# Section 6: Significance Tests
+
+Frame-0 only. Per codon, a 2x2 test on raw pooled counts: rows = the two pools,
+columns = (this codon, all other synonyms of its amino acid). BH-adjusted.
+
+For the single-set figures the comparator is the **complement** of that set within
+the expressed transcriptome, not the full background — the set is a subset of the
+background, so testing it against a pool that contains it is not a two-sample test.
+
+```{r chisq}
+chisq_pools <- function(counts_a, counts_b) {
+  imap_dfr(aa_to_codons[multi_aa], function(codons, aa) {
+    codons <- intersect(codons, names(counts_a))
+    if (length(codons) < 2) return(NULL)
+    n_aa_a <- sum(counts_a[codons]); n_aa_b <- sum(counts_b[codons])
+    if (n_aa_a == 0 || n_aa_b == 0) return(NULL)
+    map_dfr(codons, function(cd) {
+      mat <- round(matrix(
+        c(counts_a[cd], n_aa_a - counts_a[cd],
+          counts_b[cd], n_aa_b - counts_b[cd]),
+        nrow = 2, byrow = TRUE
+      ))
+      test <- if (any(mat < 5)) fisher.test(mat) else chisq.test(mat, correct = FALSE)
+      tibble(amino_acid = aa, codon = cd, p_val_chi = test$p.value)
+    })
+  }) %>%
+    mutate(p_adj_chi = p.adjust(p_val_chi, method = "BH"))
+}
+
+cnt_hyp <- pooled_counts(hyp_tx, counts_mat0)
+cnt_nor <- pooled_counts(nor_tx, counts_mat0)
+cnt_all <- pooled_counts(all_tx, counts_mat0)
+
+cnt_hyp_comp <- pooled_counts(setdiff(all_tx, hyp_tx), counts_mat0)
+cnt_nor_comp <- pooled_counts(setdiff(all_tx, nor_tx), counts_mat0)
+
+stopifnot(
+  "complement counts must reconstruct the background" =
+    all(abs((cnt_hyp + cnt_hyp_comp) - cnt_all) < 1e-6) &&
+    all(abs((cnt_nor + cnt_nor_comp) - cnt_all) < 1e-6)
+)
+
+chi_nor   <- chisq_pools(cnt_nor, cnt_nor_comp)
+chi_hyp   <- chisq_pools(cnt_hyp, cnt_hyp_comp)
+chi_delta <- chisq_pools(cnt_hyp, cnt_nor)
+
+for (nm in c("normoxia vs complement", "hypoxia vs complement", "hypoxia vs normoxia")) {
+  d <- switch(nm,
+              "normoxia vs complement" = chi_nor,
+              "hypoxia vs complement"  = chi_hyp,
+              "hypoxia vs normoxia"    = chi_delta)
+  cat(nm, "— significant codons (BH q < 0.05):",
+      sum(d$p_adj_chi < 0.05, na.rm = TRUE), "of", nrow(d), "\n")
+}
+stopifnot(
+  "chi-squared tables must cover every multi-synonymous codon exactly once" =
+    all(sapply(list(chi_nor, chi_hyp, chi_delta), nrow) == length(multi_syn_codons))
+)
+```
+
+---
+
+# Section 7: Figure Builders
+
+```{r figure_helpers}
+frame_levels <- c("Frame 0\n(real codons)",
+                  "Frame +1\n(non-coding ctrl)",
+                  "Frame +2\n(non-coding ctrl)")
+
+# Star rule (nb54): frame-0 BH q < 0.05 AND |frame-0 stat| > star_ratio x the
+# larger of the two shifted-frame stats. A codon whose out-of-frame pseudo-codon
+# shows the same shift is reporting nucleotide composition, not codon choice.
+frame_specificity <- function(v0, v1, v2, chi_tbl) {
+  padj <- setNames(chi_tbl$p_adj_chi, chi_tbl$codon)
+  tibble(
+    codon    = multi_syn_codons,
+    f0_delta = as.numeric(v0[multi_syn_codons]),
+    f1_delta = as.numeric(v1[multi_syn_codons]),
+    f2_delta = as.numeric(v2[multi_syn_codons]),
+    p_adj_chi = as.numeric(padj[multi_syn_codons])
+  ) %>%
+    mutate(
+      max_shift      = pmax(abs(f1_delta), abs(f2_delta)),
+      codon_specific = !is.na(p_adj_chi) & !is.na(f0_delta) & !is.na(max_shift) &
+        p_adj_chi < 0.05 & abs(f0_delta) > max_shift * star_ratio
+    )
+}
+
+make_frame_figure <- function(v0, v1, v2, chi_tbl, title, subtitle, xlab, outfile,
+                              class_col, legend_title) {
+  spec <- frame_specificity(v0, v1, v2, chi_tbl)
+  stopifnot(
+    "frame_specificity must cover every multi-synonymous codon exactly once" =
+      nrow(spec) == length(multi_syn_codons),
+    "codon_specific must be TRUE/FALSE, never NA" = !any(is.na(spec$codon_specific))
+  )
+  codon_order <- spec %>% arrange(f0_delta) %>% pull(codon)
+
+  plot_df <- spec %>%
+    dplyr::select(codon, codon_specific,
+                  `Frame 0\n(real codons)`      = f0_delta,
+                  `Frame +1\n(non-coding ctrl)` = f1_delta,
+                  `Frame +2\n(non-coding ctrl)` = f2_delta) %>%
+    pivot_longer(starts_with("Frame"), names_to = "frame", values_to = "delta") %>%
+    mutate(frame = factor(frame, levels = frame_levels)) %>%
+    left_join(
+      dhx29_df %>% dplyr::select(codon, ces, dhx29_class = all_of(class_col)),
+      by = "codon"
+    ) %>%
+    mutate(codon = factor(codon, levels = codon_order))
+
+  # Stars pinned to the left edge of the Frame 0 panel as a row indicator.
+  star_df <- plot_df %>%
+    filter(codon_specific, frame == frame_levels[1]) %>%
+    mutate(delta = min(plot_df$delta, na.rm = TRUE))
+
+  # Do DHX29-favored codons sit on a different side than disfavored ones?
+  f0 <- spec %>%
+    left_join(dhx29_df %>% dplyr::select(codon, dhx29_class = all_of(class_col)),
+              by = "codon") %>%
+    filter(!is.na(f0_delta))
+  wt    <- wilcox.test(f0_delta ~ dhx29_class, data = f0)
+  n_fav <- sum(f0$dhx29_class == "DHX29-favored")
+  n_dis <- sum(f0$dhx29_class == "DHX29-disfavored")
+  ann <- sprintf(
+    "Frame 0 median: DHX29-favored = %.3f (n = %d) vs disfavored = %.3f (n = %d); Wilcoxon p = %.2g",
+    median(f0$f0_delta[f0$dhx29_class == "DHX29-favored"]),    n_fav,
+    median(f0$f0_delta[f0$dhx29_class == "DHX29-disfavored"]), n_dis,
+    wt$p.value
+  )
+
+  p <- ggplot(plot_df, aes(x = delta, y = codon, colour = dhx29_class)) +
+    geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey60") +
+    geom_point(size = 1.5, alpha = 0.85) +
+    geom_point(data = star_df, shape = 8, size = 2.5,
+               colour = "black", stroke = 0.6, show.legend = FALSE) +
+    facet_wrap(~ frame, nrow = 1) +
+    scale_colour_manual(values = dhx29_colors, name = legend_title) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = NULL, caption = ann) +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.text.y     = element_text(size = 9, family = "mono"),
+      legend.position = "top",
+      strip.text      = element_text(face = "bold"),
+      plot.caption    = element_text(hjust = 0, size = 9, colour = "grey30")
+    )
+  print(p)
+  ggsave(here("plots", outfile), p, width = 9.5, height = 11)
+  cat("Saved: plots/", outfile, "\n", sep = "")
+
+  cat("Codon-specific (starred):", sum(spec$codon_specific), "of",
+      nrow(spec), "multi-synonymous codons\n")
+  cat(ann, "\n")
+
+  invisible(list(plot = p, spec = spec, wilcox = wt,
+                 n_fav = n_fav, n_dis = n_dis))
+}
+
+star_subtitle <- paste0(
+  "star (Frame 0 only): BH-adj chi-sq p<0.05 AND abs(frame-0 value) > ",
+  star_ratio, "x max(abs(frame+1), abs(frame+2))"
+)
+```
+
+---
+
+# Section 8: Frame-Control Lollipops
+
+Each of the three statistics is drawn under **both** classification schemes, so any
+conclusion that depends on where the CES cut is placed is visible as a difference
+between the two figures.
+
+```{r define_conditions}
+conditions <- list(
+  list(key = "normoxia",
+       v   = list(rscu_nor$f0 - 1, rscu_nor$f1 - 1, rscu_nor$f2 - 1),
+       chi = chi_nor,
+       title_stem = "Normoxia eIF3d-promoted codon preference",
+       n_note = paste0("n = ", n_nor, " transcripts vs ", n_all - n_nor,
+                       " background transcripts (frame-matched background)"),
+       xlab = "pooled bg-RSCU minus 1 (normoxia-promoted vs expressed background)",
+       file_stem = "93a_rscu_frame_ctrl_normoxia"),
+  list(key = "hypoxia",
+       v   = list(rscu_hyp$f0 - 1, rscu_hyp$f1 - 1, rscu_hyp$f2 - 1),
+       chi = chi_hyp,
+       title_stem = "Hypoxia eIF3d-promoted codon preference",
+       n_note = paste0("n = ", n_hyp, " transcripts vs ", n_all - n_hyp,
+                       " background transcripts (frame-matched background)"),
+       xlab = "pooled bg-RSCU minus 1 (hypoxia-promoted vs expressed background)",
+       file_stem = "93b_rscu_frame_ctrl_hypoxia"),
+  list(key = "hyp_minus_nor",
+       v   = list(delta_rscu$f0, delta_rscu$f1, delta_rscu$f2),
+       chi = chi_delta,
+       title_stem = "Hypoxia minus normoxia codon preference",
+       n_note = paste0("n = ", n_hyp, " hypoxia vs ", n_nor, " normoxia transcripts"),
+       xlab = "delta pooled RSCU (hypoxia minus normoxia)",
+       file_stem = "93c_rscu_frame_ctrl_hyp_minus_nor")
+)
+```
+
+```{r fig_lollipops, fig.width=9.5, fig.height=11, results="asis"}
+fig_results <- list()
+for (cond in conditions) {
+  for (i in seq_len(nrow(ces_schemes))) {
+    sch <- ces_schemes[i, ]
+    cat("\n\n### ", cond$title_stem, " — ", sch$legend, "\n\n", sep = "")
+    res <- make_frame_figure(
+      v0 = cond$v[[1]], v1 = cond$v[[2]], v2 = cond$v[[3]],
+      chi_tbl      = cond$chi,
+      title        = paste0(cond$title_stem, ", colored by DHX29 CES"),
+      subtitle     = paste0(star_subtitle, "\n", cond$n_note,
+                            "\ncolor: ", sch$legend),
+      xlab         = cond$xlab,
+      outfile      = paste0(cond$file_stem, "_", sch$tag, ".pdf"),
+      class_col    = sch$class_col,
+      legend_title = sch$legend
+    )
+    fig_results[[paste(cond$key, sch$key, sep = "__")]] <- res
+  }
+}
+```
+
+---
+
+# Section 9: DHX29 Preference vs RSCU, All Three Conditions
+
+Continuous view of the same relationship: one point per multi-synonymous codon,
+x = DHX29 CES, y = the frame-0 RSCU statistic for that condition. Overall Spearman
+and Pearson with n are annotated per panel.
+
+**y scales are free.** The three statistics have genuinely different spreads
+(normoxia is the narrowest, hypoxia the widest), and a shared axis would flatten the
+normoxia panel to the point of being unreadable. Compare the *shape* across panels,
+not the point positions.
+
+```{r scatter_data}
+scatter_df <- tibble(codon = multi_syn_codons) %>%
+  mutate(
+    `Normoxia\n(bg-RSCU - 1)`          = as.numeric((rscu_nor$f0 - 1)[codon]),
+    `Hypoxia\n(bg-RSCU - 1)`           = as.numeric((rscu_hyp$f0 - 1)[codon]),
+    `Hypoxia minus normoxia\n(delta)`  = as.numeric(delta_rscu$f0[codon])
+  ) %>%
+  pivot_longer(-codon, names_to = "condition", values_to = "rscu_stat") %>%
+  mutate(condition = factor(condition, levels = c(
+    "Normoxia\n(bg-RSCU - 1)",
+    "Hypoxia\n(bg-RSCU - 1)",
+    "Hypoxia minus normoxia\n(delta)"
+  ))) %>%
+  left_join(dhx29_df %>% dplyr::select(codon, ces, ces_abund_norm, gc3_class),
+            by = "codon") %>%
+  filter(!is.na(rscu_stat))
+
+stopifnot(
+  "scatter data must have 3 rows per multi-synonymous codon" =
+    nrow(scatter_df) == 3 * length(multi_syn_codons),
+  "RSCU statistics must be finite" = all(is.finite(scatter_df$rscu_stat))
+)
+```
+
+```{r scatter_builder}
+make_ces_scatter <- function(xcol, xlab, cut_line, title, outfile) {
+  stats_df <- scatter_df %>%
+    group_by(condition) %>%
+    summarise(
+      rho = cor(.data[[xcol]], rscu_stat, method = "spearman"),
+      p_s = cor.test(.data[[xcol]], rscu_stat, method = "spearman",
+                     exact = FALSE)$p.value,
+      r   = cor(.data[[xcol]], rscu_stat, method = "pearson"),
+      p_p = cor.test(.data[[xcol]], rscu_stat, method = "pearson")$p.value,
+      n   = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    mutate(label = sprintf("Spearman rho = %.2f (p = %.2g)\nPearson R = %.2f (p = %.2g)\nn = %d codons",
+                           rho, p_s, r, p_p, n))
+
+  p <- ggplot(scatter_df, aes(x = .data[[xcol]], y = rscu_stat)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey70") +
+    geom_vline(xintercept = cut_line, linetype = "dashed",
+               linewidth = 0.4, colour = "grey60") +
+    geom_smooth(method = "lm", se = TRUE, colour = "grey30",
+                linewidth = 0.6, alpha = 0.15) +
+    geom_point(aes(colour = gc3_class), size = 2, alpha = 0.9) +
+    ggrepel::geom_text_repel(aes(label = codon, colour = gc3_class),
+                             size = 2.3, max.overlaps = Inf,
+                             min.segment.length = 0.2, segment.size = 0.2,
+                             show.legend = FALSE) +
+    geom_text(data = stats_df, aes(x = -Inf, y = Inf, label = label),
+              inherit.aes = FALSE, hjust = -0.05, vjust = 1.2,
+              size = 2.7, colour = "grey30") +
+    facet_wrap(~ condition, nrow = 1, scales = "free_y") +
+    scale_colour_manual(values = gc3_colors, name = "Third position") +
+    labs(
+      title    = title,
+      subtitle = paste0(
+        "One point per multi-synonymous codon (n = ", length(multi_syn_codons),
+        "). Frame 0 only. Dashed line = the median split used in Section 8.",
+        "\ny scales are free across panels; grey band = linear fit with 95% CI."),
+      x = xlab,
+      y = "pooled RSCU statistic"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top", strip.text = element_text(face = "bold"))
+
+  print(p)
+  ggsave(here("plots", outfile), p, width = 13, height = 5.5)
+  cat("Saved: plots/", outfile, "\n", sep = "")
+  print(stats_df %>% dplyr::select(condition, rho, p_s, r, p_p, n))
+  invisible(stats_df)
+}
+```
+
+```{r scatter_raw_ces, fig.width=13, fig.height=5.5}
+stats_raw <- make_ces_scatter(
+  xcol     = "ces",
+  xlab     = "DHX29 CES (IP / Input, A-site)",
+  cut_line = median(dhx29_df$ces),
+  title    = "DHX29 codon preference vs codon usage, all three conditions",
+  outfile  = "93d_ces_vs_rscu_scatter.pdf"
+)
+```
+
+```{r scatter_norm_ces, fig.width=13, fig.height=5.5}
+stats_norm <- make_ces_scatter(
+  xcol     = "ces_abund_norm",
+  xlab     = "abundance-normalized DHX29 CES (rank residual)",
+  cut_line = median(dhx29_df$ces_abund_norm),
+  title    = "Abundance-normalized DHX29 codon preference vs codon usage",
+  outfile  = "93e_ces_norm_vs_rscu_scatter.pdf"
+)
+```
+
+---
+
+# Section 10: Summary Table
+
+```{r summary_table}
+# The spec (frame-0 values + star flags) is identical across schemes for a given
+# condition -- schemes only change the coloring -- so take it from the median run.
+spec_of <- function(cond_key) fig_results[[paste0(cond_key, "__median")]]$spec
+
+summary_tbl <- dhx29_df %>%
+  filter(codon %in% multi_syn_codons) %>%
+  dplyr::select(codon, ces, input_avg, ces_abund_norm, gc3_class,
+                ces_class_ces1, ces_class_median, ces_class_norm) %>%
+  left_join(spec_of("normoxia") %>%
+              dplyr::select(codon, nor_f0 = f0_delta, nor_star = codon_specific),
+            by = "codon") %>%
+  left_join(spec_of("hypoxia") %>%
+              dplyr::select(codon, hyp_f0 = f0_delta, hyp_star = codon_specific),
+            by = "codon") %>%
+  left_join(spec_of("hyp_minus_nor") %>%
+              dplyr::select(codon, delta_f0 = f0_delta, delta_star = codon_specific),
+            by = "codon") %>%
+  mutate(amino_acid = as.character(gen_code[codon])) %>%
+  dplyr::relocate(amino_acid, .after = codon) %>%
+  arrange(desc(delta_f0))
+
+out_csv <- here("output", "predictive_modeling", "93_rscu_frame_ctrl_dhx29_codons.csv")
+write_csv(summary_tbl, out_csv)
+cat("Saved:", out_csv, "\n")
+
+stopifnot(
+  "summary table must have one row per multi-synonymous codon" =
+    nrow(summary_tbl) == length(multi_syn_codons),
+  "frame-0 statistics must be finite" =
+    all(is.finite(summary_tbl$delta_f0)) &&
+    all(is.finite(summary_tbl$nor_f0))  &&
+    all(is.finite(summary_tbl$hyp_f0))
+)
+
+cat("\nTop 10 codons by hypoxia-minus-normoxia delta:\n")
+print(summary_tbl %>%
+        dplyr::select(codon, amino_acid, ces, ces_class_median, ces_class_norm,
+                      nor_f0, hyp_f0, delta_f0) %>% head(10))
+cat("\nBottom 10:\n")
+print(summary_tbl %>%
+        dplyr::select(codon, amino_acid, ces, ces_class_median, ces_class_norm,
+                      nor_f0, hyp_f0, delta_f0) %>% tail(10))
+
+cat("\nStarred (codon-specific) counts, of", length(multi_syn_codons), "codons:\n")
+cat("  normoxia:", sum(summary_tbl$nor_star),
+    "| hypoxia:", sum(summary_tbl$hyp_star),
+    "| hyp-minus-nor:", sum(summary_tbl$delta_star), "\n")
+```
+
+```{r wilcoxon_summary}
+wilcox_tbl <- imap_dfr(fig_results, function(res, nm) {
+  parts <- str_split_fixed(nm, "__", 2)
+  tibble(
+    condition   = parts[1],
+    ces_scheme  = parts[2],
+    n_favored   = res$n_fav,
+    n_disfav    = res$n_dis,
+    wilcox_p    = res$wilcox$p.value
+  )
+}) %>%
+  arrange(ces_scheme, condition)
+
+cat("Wilcoxon of the frame-0 statistic, DHX29-favored vs disfavored codons:\n")
+print(wilcox_tbl)
+
+write_csv(wilcox_tbl,
+          here("output", "predictive_modeling", "93_dhx29_class_wilcoxon.csv"))
+
+cat("\nCES-vs-RSCU correlations (raw CES):\n");  print(stats_raw  %>% dplyr::select(-label))
+cat("\nCES-vs-RSCU correlations (abundance-normalized CES):\n")
+print(stats_norm %>% dplyr::select(-label))
+```
+
+```{r session_info}
+sessionInfo()
+```
