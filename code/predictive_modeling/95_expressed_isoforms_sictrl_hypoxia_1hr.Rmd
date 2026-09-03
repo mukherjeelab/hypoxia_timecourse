@@ -1,0 +1,596 @@
+---
+title: "95 — Expressed isoforms per gene, siCTRL hypoxia 1hr"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+params:
+  treatment: "siCTRL"
+  condition: "hypoxia"
+  timepoint: 1
+  tpm_min: 1
+  frac_min: 0.10
+---
+
+Step 1 of the CDS-3'-end question: **are there even multiple isoforms of the same gene
+expressed in the siCTRL hypoxia 1hr data?** If most genes run a single isoform, the
+planned within-gene AU-ending vs GC-ending contrast has nothing to compare.
+
+Three questions, in order:
+
+1. How many isoforms per gene are expressed (section 3)?
+2. Are the multi-isoform genes real co-expression, or one dominant isoform plus noise
+   (section 5)?
+3. Do the co-expressed isoforms of a gene differ by **synonymous codon choice**, or do
+   they encode different proteins (section 6)? This decides whether a codon or GC
+   difference between two isoforms of one gene can be read as a translational signal at
+   all, or whether it is just amino-acid composition following an alternative exon.
+
+**Definitions used here** (all set in `params`):
+
+| Choice | Value | Note |
+|---|---|---|
+| Expression source | salmon TPM, `Input_Ribo_RNAseq`, siCTRL hypoxia 1hr, 3 reps | RiboSeq not used; this is the mRNA pool |
+| Eligible transcript | `transcript_type == "protein_coding"` **and** has a CDS in the v49 TxDb | NMD and retained-intron isoforms excluded |
+| Expressed isoform | mean TPM >= `tpm_min` **and** isoform fraction >= `frac_min` | fraction denominator is the eligible transcripts of that gene only |
+| Where defined | siCTRL hypoxia 1hr only | si3d is not used to define the isoform set |
+
+TPM is reported by salmon over the full index, which includes the Drosophila spike-ins,
+so the absolute TPM cut is very slightly conservative. Isoform *fractions* are computed
+within a gene and are unaffected.
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+if (!exists("params") || !is.list(params)) {
+  params <- list(treatment = "siCTRL", condition = "hypoxia", timepoint = 1,
+                 tpm_min = 1, frac_min = 0.10)
+}
+set.seed(9)
+```
+
+# Load inputs
+
+```{r samples}
+metadata <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
+                     show_col_types = FALSE)
+
+sample_ids <- metadata %>%
+  filter(type == "Input_Ribo_RNAseq",
+         treatment == params$treatment,
+         condition == params$condition,
+         hours == params$timepoint) %>%
+  pull(id)
+
+stopifnot("no RNA-seq samples matched the params" = length(sample_ids) > 0)
+cat("Samples:", paste(sample_ids, collapse = ", "), "\n")
+```
+
+```{r salmon}
+tpm <- sample_ids %>%
+  set_names() %>%
+  map_dfr(~ read_tsv(here("2025_MDAcells_riboseq", "salmon", .x, "quant.sf.gz"),
+                     show_col_types = FALSE) %>%
+            dplyr::select(transcript_id = Name, TPM),
+          .id = "sample") %>%
+  pivot_wider(names_from = sample, values_from = TPM)
+
+tpm <- tpm %>%
+  mutate(mean_tpm = rowMeans(across(all_of(sample_ids))),
+         n_reps_detected = rowSums(across(all_of(sample_ids)) > 0))
+
+cat("Transcripts quantified:", nrow(tpm), "\n")
+```
+
+```{r annotation}
+tx2gene <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                    col_names = c("transcript_id", "gene_id"), show_col_types = FALSE) %>%
+  filter(str_starts(transcript_id, "ENST"))
+
+gene_symbols <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                         col_names = c("gene_id", "symbol", "type", "organism", "source"),
+                         show_col_types = FALSE) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::select(gene_id, symbol)
+
+# Transcript biotypes are not stored in the TxDb, so they come from the GTF.
+# Built once and cached; rebuilding takes ~2 min.
+biotype_path <- here("accessories", "human", "tx_biotype_v49.tsv.gz")
+if (!file.exists(biotype_path)) {
+  gtf <- read_tsv(here("accessories", "human", "gencode.v49.annotation.gtf.gz"),
+                  comment = "#", col_names = FALSE,
+                  col_types = cols_only(X3 = col_character(), X9 = col_character())) %>%
+    filter(X3 == "transcript")
+  tibble(transcript_id   = str_match(gtf$X9, 'transcript_id "([^"]+)"')[, 2],
+         transcript_type = str_match(gtf$X9, 'transcript_type "([^"]+)"')[, 2],
+         gene_type       = str_match(gtf$X9, 'gene_type "([^"]+)"')[, 2]) %>%
+    write_tsv(biotype_path)
+}
+tx_biotype <- read_tsv(biotype_path, show_col_types = FALSE)
+
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds_by_tx <- cdsBy(txdb, by = "tx", use.names = TRUE)
+
+mane <- read_csv(here("accessories", "human", "mane_select_v49.csv"),
+                 col_names = c("gene_id_clean", "mane_tx_clean", "symbol"),
+                 show_col_types = FALSE)
+
+cat("Transcripts with an annotated CDS:", length(cds_by_tx), "\n")
+```
+
+# Eligible transcripts and the expressed isoform set
+
+```{r eligible}
+eligible <- tpm %>%
+  inner_join(tx2gene, by = "transcript_id") %>%
+  left_join(tx_biotype, by = "transcript_id") %>%
+  filter(transcript_type == "protein_coding",
+         gene_type == "protein_coding",
+         transcript_id %in% names(cds_by_tx)) %>%
+  group_by(gene_id) %>%
+  mutate(gene_tpm = sum(mean_tpm),
+         iso_frac = if_else(gene_tpm > 0, mean_tpm / gene_tpm, 0)) %>%
+  ungroup() %>%
+  mutate(gene_id_clean       = sub("\\..*", "", gene_id),
+         transcript_id_clean = sub("\\..*", "", transcript_id)) %>%
+  left_join(gene_symbols, by = "gene_id")
+
+expressed <- eligible %>%
+  filter(mean_tpm >= params$tpm_min, iso_frac >= params$frac_min)
+
+cat("Eligible transcripts:", nrow(eligible), "in", n_distinct(eligible$gene_id), "genes\n")
+cat("Expressed isoforms:  ", nrow(expressed), "in", n_distinct(expressed$gene_id), "genes\n")
+```
+
+```{r census}
+census <- expressed %>%
+  group_by(gene_id, gene_id_clean, symbol) %>%
+  summarize(n_isoforms = n(),
+            gene_tpm   = dplyr::first(gene_tpm),
+            top_frac   = max(iso_frac),
+            .groups    = "drop")
+
+census %>%
+  dplyr::count(n_isoforms, name = "n_genes") %>%
+  mutate(pct = round(100 * n_genes / sum(n_genes), 1)) %>%
+  knitr::kable(caption = "Genes by number of expressed isoforms")
+
+cat("\nGenes with >= 2 expressed isoforms:", sum(census$n_isoforms >= 2),
+    sprintf("(%.1f%%)\n", 100 * mean(census$n_isoforms >= 2)))
+cat("Median top-isoform fraction, multi-isoform genes:",
+    round(median(census$top_frac[census$n_isoforms >= 2]), 3), "\n")
+```
+
+## Threshold sensitivity
+
+The multi-isoform fraction is a function of where the cuts are put, so the chosen
+thresholds are shown next to the alternatives rather than on their own.
+
+```{r sensitivity}
+threshold_grid <- expand_grid(tpm_cut = c(0.5, 1, 5), frac_cut = c(0, 0.05, 0.10, 0.20))
+
+threshold_grid %>%
+  pmap_dfr(function(tpm_cut, frac_cut) {
+    g <- eligible %>%
+      filter(mean_tpm >= tpm_cut, iso_frac >= frac_cut) %>%
+      dplyr::count(gene_id, name = "n_iso")
+    tibble(tpm_cut, frac_cut,
+           genes = nrow(g),
+           pct_multi = round(100 * mean(g$n_iso >= 2), 1),
+           max_iso = max(g$n_iso))
+  }) %>%
+  knitr::kable(caption = "Multi-isoform percentage across thresholds (chosen: tpm 1, frac 0.10)")
+```
+
+# Validation
+
+## Computational checks
+
+```{r checks_computational}
+stopifnot(
+  "negative TPM"                  = all(eligible$mean_tpm >= 0),
+  "isoform fraction out of [0,1]" = all(eligible$iso_frac >= 0 & eligible$iso_frac <= 1),
+  "expressed set has genes"       = nrow(expressed) > 0,
+  "n_isoforms below 1"            = all(census$n_isoforms >= 1),
+  "missing expected columns"      = all(c("transcript_id", "transcript_id_clean", "gene_id",
+                                          "gene_id_clean", "symbol", "mean_tpm", "iso_frac")
+                                        %in% colnames(expressed)),
+  "no TE columns should be here"  = !any(c("te_lfc", "te_padj") %in% colnames(expressed))
+)
+
+# Isoform fractions must sum to 1 within each expressed gene, over ALL eligible isoforms
+frac_sums <- eligible %>%
+  filter(gene_tpm > 0) %>%
+  group_by(gene_id) %>%
+  summarize(total = sum(iso_frac), .groups = "drop")
+stopifnot("isoform fractions do not sum to 1" = all(abs(frac_sums$total - 1) < 1e-8))
+
+cat("Computational checks passed\n")
+```
+
+## Biological spot-checks
+
+```{r checks_biological}
+# 1. Two separate things, deliberately not conflated:
+#    (a) the ID join and the index. The MANE Select transcript must be PRESENT in the
+#        eligible pool for essentially every gene. Anything below ~95% means versioned
+#        vs unversioned IDs, a different annotation, or a salmon index mismatch.
+#    (b) whether MANE is actually EXPRESSED. This is biology, not a bug: MANE Select is
+#        the reference isoform, not necessarily the one this cell line runs.
+mane_genes <- census %>% inner_join(mane, by = "gene_id_clean")
+
+mane_status <- mane_genes %>%
+  left_join(eligible %>% dplyr::select(gene_id_clean, transcript_id_clean) %>%
+              mutate(in_pool = TRUE),
+            by = c("gene_id_clean", "mane_tx_clean" = "transcript_id_clean")) %>%
+  left_join(expressed %>% dplyr::select(gene_id_clean, transcript_id_clean) %>%
+              mutate(is_expressed = TRUE),
+            by = c("gene_id_clean", "mane_tx_clean" = "transcript_id_clean")) %>%
+  group_by(gene_id_clean) %>%
+  summarize(in_pool        = any(!is.na(in_pool)),
+            mane_expressed = any(!is.na(is_expressed)),
+            .groups = "drop")
+
+cat(sprintf("MANE Select present in the eligible pool: %.1f%% of genes (n = %d)\n",
+            100 * mean(mane_status$in_pool), nrow(mane_status)))
+cat(sprintf("MANE Select actually expressed:           %.1f%% of genes (n = %d)\n",
+            100 * mean(mane_status$mane_expressed), nrow(mane_status)))
+stopifnot("MANE transcripts missing from the pool - ID join or index mismatch" =
+            mean(mane_status$in_pool) > 0.95)
+# Well above the ~35% a broken join would give, and low enough to allow the real rate,
+# which is roughly 73%: in about a quarter of genes this cell line does not run MANE.
+stopifnot("MANE Select rarely expressed - check the quantification" =
+            mean(mane_status$mane_expressed) > 0.60)
+
+# 2. ACTB is one of the most abundant mRNAs in these cells and is isoform-dominant.
+actb <- census %>% filter(symbol == "ACTB")
+cat("ACTB: gene TPM", round(actb$gene_tpm, 1),
+    "| isoforms", actb$n_isoforms, "| top fraction", round(actb$top_frac, 3), "\n")
+stopifnot("ACTB not highly expressed" = nrow(actb) == 1 && actb$gene_tpm > 100,
+          "ACTB not isoform-dominant" = actb$top_frac > 0.5)
+
+# 3. Genes with more ANNOTATED coding isoforms should express more of them. Tested as
+#    monotonicity across annotation bins, not as a correlation magnitude: n_isoforms is
+#    heavily tied at 1, which caps Spearman near 0.2 even though the trend is clean.
+annot_vs_expressed <- eligible %>%
+  dplyr::count(gene_id, name = "n_annotated") %>%
+  inner_join(census, by = "gene_id") %>%
+  mutate(annot_bin = cut(n_annotated, c(0, 1, 2, 4, 8, 16, Inf)))
+
+bin_means <- annot_vs_expressed %>%
+  group_by(annot_bin) %>%
+  summarize(genes = n(), mean_expressed = mean(n_isoforms), .groups = "drop")
+print(bin_means)
+
+rho <- cor(annot_vs_expressed$n_annotated, annot_vs_expressed$n_isoforms,
+           method = "spearman")
+cat("Spearman(annotated coding isoforms, expressed isoforms) =", round(rho, 3),
+    ", n =", nrow(annot_vs_expressed), "\n")
+stopifnot("expressed isoform count does not rise with annotation" =
+            all(diff(bin_means$mean_expressed) > 0),
+          "no positive annotation trend" = rho > 0.1)
+
+# 4. Isoform count also rises with expression level, which is a detection confound, not
+#    biology. Asserted so the plot in section 5 cannot silently stop being true.
+rho_depth <- cor(log2(census$gene_tpm), census$n_isoforms, method = "spearman")
+cat("Spearman(log2 gene TPM, expressed isoforms) =", round(rho_depth, 3),
+    ", n =", nrow(census), "\n")
+stopifnot("expected a positive depth-isoform relationship" = rho_depth > 0.2)
+```
+
+# Are the multi-isoform genes real co-expression?
+
+A gene can clear the "2 isoforms" bar with one dominant isoform at 92% and a minor one at
+10%. The top-isoform fraction separates that case from genuine co-expression.
+
+```{r plot_census}
+p_census <- census %>%
+  mutate(n_lab = if_else(n_isoforms >= 5, "5+", as.character(n_isoforms))) %>%
+  dplyr::count(n_lab) %>%
+  ggplot(aes(n_lab, n)) +
+  geom_col(fill = "grey70", colour = "black", linewidth = 0.3) +
+  geom_text(aes(label = n), vjust = -0.4, size = 3.2) +
+  labs(x = "Expressed isoforms per gene",
+       y = "Genes",
+       title = sprintf("Expressed coding isoforms per gene, %s %s %shr",
+                       params$treatment, params$condition, params$timepoint),
+       subtitle = sprintf("mean TPM >= %g and isoform fraction >= %g, n = %d genes",
+                          params$tpm_min, params$frac_min, nrow(census))) +
+  theme_classic(base_size = 12)
+p_census
+ggsave(here("plots", "95a_expressed_isoforms_per_gene.pdf"), p_census,
+       width = 5.5, height = 4)
+```
+
+```{r plot_topfrac}
+multi <- census %>% filter(n_isoforms >= 2)
+
+p_top <- ggplot(multi, aes(top_frac)) +
+  geom_histogram(binwidth = 0.02, fill = "grey70", colour = "black", linewidth = 0.2) +
+  geom_vline(xintercept = median(multi$top_frac), colour = "#0072B2", linewidth = 0.8) +
+  labs(x = "Fraction of gene TPM in the top isoform",
+       y = "Genes",
+       title = "Multi-isoform genes are not dominated by one isoform",
+       subtitle = sprintf("median = %.2f, dominant (> 0.8) = %d of %d genes",
+                          median(multi$top_frac), sum(multi$top_frac > 0.8), nrow(multi))) +
+  theme_classic(base_size = 12)
+p_top
+ggsave(here("plots", "95b_top_isoform_fraction.pdf"), p_top, width = 5.5, height = 4)
+```
+
+```{r plot_depth}
+# Detection confound: more highly expressed genes can support more detected isoforms.
+p_depth <- census %>%
+  mutate(n_lab = if_else(n_isoforms >= 5, "5+", as.character(n_isoforms))) %>%
+  ggplot(aes(n_lab, log2(gene_tpm))) +
+  geom_boxplot(fill = "grey70", outlier.size = 0.4, linewidth = 0.3) +
+  labs(x = "Expressed isoforms per gene",
+       y = "log2 gene TPM",
+       title = "Isoform count rises with expression level",
+       subtitle = "Part of the multi-isoform signal is detection power, not biology") +
+  theme_classic(base_size = 12)
+p_depth
+ggsave(here("plots", "95c_isoform_count_vs_expression.pdf"), p_depth, width = 5.5, height = 4)
+```
+
+# Do co-expressed isoforms differ by synonymous codon choice?
+
+Two isoforms of one gene can differ in codon usage two ways:
+
+- **Synonymous**: same protein, different codons. Only possible where the isoforms use
+  different exons that encode the same amino acids, e.g. duplicated or mutually exclusive
+  exons. This is what would let a codon or GC3 difference be read as a translational
+  signal with protein identity held constant.
+- **Compositional**: different protein. Any codon or GC difference then partly reports
+  which amino acids the alternative exon encodes, which is the confound CLAUDE.md flags
+  for raw codon frequency.
+
+Each pair of expressed isoforms within a gene is classified by comparing CDS nucleotide
+sequences and their translations.
+
+```{r cds_sequences}
+multi_tx <- expressed %>% filter(gene_id %in% multi$gene_id)
+
+cds_seqs <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                  cds_by_tx[multi_tx$transcript_id])
+
+# GENCODE CDS annotations can be incomplete at either end; only in-frame CDS can be
+# translated or split into codons.
+in_frame <- width(cds_seqs) %% 3 == 0 & width(cds_seqs) >= 60
+cat("Isoforms of multi-isoform genes:", length(cds_seqs),
+    "| in-frame and >= 60 nt:", sum(in_frame), "\n")
+
+cds_seqs <- cds_seqs[in_frame]
+prot_seqs <- Biostrings::translate(cds_seqs, if.fuzzy.codon = "solve")
+stopifnot("CDS and protein sets out of sync" = length(cds_seqs) == length(prot_seqs))
+```
+
+```{r pairs}
+# All within-gene pairs of expressed, in-frame isoforms
+pairs <- multi_tx %>%
+  filter(transcript_id %in% names(cds_seqs)) %>%
+  dplyr::select(gene_id, symbol, transcript_id) %>%
+  group_by(gene_id, symbol) %>%
+  filter(n() >= 2) %>%
+  summarize(tx = list(transcript_id), .groups = "drop") %>%
+  mutate(combo = map(tx, ~ as_tibble(t(combn(.x, 2)), .name_repair = ~ c("tx_a", "tx_b")))) %>%
+  dplyr::select(gene_id, symbol, combo) %>%
+  unnest(combo)
+
+cat("Within-gene isoform pairs:", nrow(pairs), "in", n_distinct(pairs$gene_id), "genes\n")
+
+classify_pair <- function(tx_a, tx_b) {
+  cds_a <- as.character(cds_seqs[[tx_a]]); cds_b <- as.character(cds_seqs[[tx_b]])
+  aa_a  <- as.character(prot_seqs[[tx_a]]); aa_b  <- as.character(prot_seqs[[tx_b]])
+  short <- if (nchar(cds_a) <= nchar(cds_b)) cds_a else cds_b
+  long  <- if (nchar(cds_a) <= nchar(cds_b)) cds_b else cds_a
+  tibble(
+    cds_identical     = cds_a == cds_b,
+    protein_identical = aa_a == aa_b,
+    cds_nested        = !(cds_a == cds_b) && grepl(short, long, fixed = TRUE)
+  )
+}
+
+pairs <- pairs %>%
+  bind_cols(map2_dfr(pairs$tx_a, pairs$tx_b, classify_pair)) %>%
+  mutate(class = case_when(
+    cds_identical                      ~ "identical CDS",
+    protein_identical                  ~ "synonymous (same protein, different CDS)",
+    cds_nested                         ~ "nested (one CDS contained in the other)",
+    TRUE                               ~ "divergent protein"
+  ))
+
+pairs %>%
+  dplyr::count(class, name = "n_pairs") %>%
+  mutate(pct = round(100 * n_pairs / sum(n_pairs), 1)) %>%
+  arrange(desc(n_pairs)) %>%
+  knitr::kable(caption = "How pairs of co-expressed isoforms of the same gene differ")
+```
+
+```{r codon_distance}
+# Codon usage distance per pair, on two scales:
+#   codon frequency  - tracks amino-acid composition (CLAUDE.md)
+#   RSCU             - normalized within each synonymous family, so it isolates wobble
+codon_counts <- trinucleotideFrequency(cds_seqs, step = 3)
+# trinucleotideFrequency drops names, so the transcript IDs must be put back before
+# anything is looked up by ID.
+rownames(codon_counts) <- names(cds_seqs)
+stopifnot("codon matrix lost its transcript IDs" =
+            identical(rownames(codon_counts), names(cds_seqs)))
+
+codon_aa <- tibble(codon = names(GENETIC_CODE), aa = as.character(GENETIC_CODE)) %>%
+  filter(aa != "*") %>%
+  group_by(aa) %>%
+  filter(n() > 1) %>%          # Met and Trp have no synonymous choice
+  ungroup()
+
+codon_long <- codon_counts %>%
+  as_tibble(rownames = "transcript_id") %>%
+  pivot_longer(-transcript_id, names_to = "codon", values_to = "count") %>%
+  inner_join(codon_aa, by = "codon") %>%
+  group_by(transcript_id) %>%
+  mutate(codon_freq = count / sum(count)) %>%
+  group_by(transcript_id, aa) %>%
+  mutate(rscu = if (sum(count) > 0) count / mean(count) else NA_real_) %>%
+  ungroup()
+
+to_matrix <- function(value_col) {
+  codon_long %>%
+    dplyr::select(transcript_id, codon, all_of(value_col)) %>%
+    pivot_wider(names_from = codon, values_from = all_of(value_col)) %>%
+    column_to_rownames("transcript_id") %>%
+    as.matrix()
+}
+freq_mat <- to_matrix("codon_freq")
+rscu_mat <- to_matrix("rscu")
+
+euclid <- function(mat, a, b) {
+  d <- mat[a, ] - mat[b, ]
+  sqrt(sum(d^2, na.rm = TRUE))
+}
+gc3 <- codon_counts %>%
+  as_tibble(rownames = "transcript_id") %>%
+  pivot_longer(-transcript_id, names_to = "codon", values_to = "count") %>%
+  filter(!codon %in% c("TAA", "TAG", "TGA")) %>%
+  group_by(transcript_id) %>%
+  summarize(gc3 = 100 * sum(count[str_sub(codon, 3, 3) %in% c("G", "C")]) / sum(count),
+            .groups = "drop")
+
+pairs <- pairs %>%
+  mutate(freq_dist = map2_dbl(tx_a, tx_b, ~ euclid(freq_mat, .x, .y)),
+         rscu_dist = map2_dbl(tx_a, tx_b, ~ euclid(rscu_mat, .x, .y))) %>%
+  left_join(gc3 %>% dplyr::rename(gc3_a = gc3), by = c("tx_a" = "transcript_id")) %>%
+  left_join(gc3 %>% dplyr::rename(gc3_b = gc3), by = c("tx_b" = "transcript_id")) %>%
+  mutate(delta_gc3 = abs(gc3_a - gc3_b))
+
+stopifnot("GC3 outside [0,100]" = all(dplyr::between(gc3$gc3, 0, 100)),
+          "negative distance"   = all(pairs$freq_dist >= 0 & pairs$rscu_dist >= 0))
+```
+
+```{r null_pairs}
+# Null: pairs of isoforms drawn from DIFFERENT genes. Within-gene pairs share most of
+# their exons, so they should be far more similar than this.
+tx_gene <- multi_tx %>%
+  filter(transcript_id %in% rownames(freq_mat)) %>%
+  dplyr::select(transcript_id, gene_id)
+
+set.seed(9)
+null_pairs <- tibble(
+  tx_a = sample(tx_gene$transcript_id, nrow(pairs), replace = TRUE),
+  tx_b = sample(tx_gene$transcript_id, nrow(pairs), replace = TRUE)
+) %>%
+  left_join(tx_gene %>% dplyr::rename(gene_a = gene_id), by = c("tx_a" = "transcript_id")) %>%
+  left_join(tx_gene %>% dplyr::rename(gene_b = gene_id), by = c("tx_b" = "transcript_id")) %>%
+  filter(gene_a != gene_b) %>%
+  mutate(freq_dist = map2_dbl(tx_a, tx_b, ~ euclid(freq_mat, .x, .y)),
+         rscu_dist = map2_dbl(tx_a, tx_b, ~ euclid(rscu_mat, .x, .y))) %>%
+  left_join(gc3 %>% dplyr::rename(gc3_a = gc3), by = c("tx_a" = "transcript_id")) %>%
+  left_join(gc3 %>% dplyr::rename(gc3_b = gc3), by = c("tx_b" = "transcript_id")) %>%
+  mutate(delta_gc3 = abs(gc3_a - gc3_b))
+
+dist_long <- bind_rows(
+  pairs      %>% mutate(set = "same gene"),
+  null_pairs %>% mutate(set = "different genes")
+) %>%
+  dplyr::select(set, freq_dist, rscu_dist, delta_gc3) %>%
+  pivot_longer(-set, names_to = "metric", values_to = "value") %>%
+  mutate(metric = dplyr::recode(metric,
+                         freq_dist = "codon frequency distance",
+                         rscu_dist = "RSCU distance (synonymous only)",
+                         delta_gc3 = "abs delta GC3 (%)"),
+         set = factor(set, levels = c("same gene", "different genes")))
+
+dist_long %>%
+  group_by(metric, set) %>%
+  summarize(median = round(median(value, na.rm = TRUE), 3), n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = set, values_from = c(median, n)) %>%
+  knitr::kable(caption = "Codon usage difference between isoform pairs")
+
+p_dist <- ggplot(dist_long, aes(value, fill = set, colour = set)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ metric, scales = "free") +
+  scale_fill_manual(values = c("same gene" = "black", "different genes" = "grey70")) +
+  scale_colour_manual(values = c("same gene" = "black", "different genes" = "grey70")) +
+  labs(x = "Distance between the two isoforms", y = "Density",
+       title = "Isoforms of one gene differ far less in codon usage than unrelated mRNAs",
+       subtitle = sprintf("same gene n = %d pairs, different genes n = %d pairs",
+                          nrow(pairs), nrow(null_pairs)),
+       fill = NULL, colour = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+p_dist
+ggsave(here("plots", "95d_isoform_codon_distance.pdf"), p_dist, width = 8, height = 3.5)
+```
+
+The pooled within-gene medians are diluted by the identical-CDS pairs, which are exactly
+zero by construction. Split by class, the pairs that actually differ in their CDS are the
+only ones that carry any signal for the CDS-3'-end question.
+
+```{r pair_class_distances}
+pairs %>%
+  group_by(class) %>%
+  summarize(n_pairs          = n(),
+            median_rscu_dist = round(median(rscu_dist), 3),
+            median_abs_dGC3  = round(median(delta_gc3), 2),
+            pct_dGC3_over_5  = round(100 * mean(delta_gc3 > 5), 1),
+            .groups = "drop") %>%
+  arrange(desc(n_pairs)) %>%
+  knitr::kable(caption = "Codon usage difference by pair class")
+
+cat("Genes with at least one CDS-differing pair:",
+    n_distinct(pairs$gene_id[pairs$class != "identical CDS"]), "\n")
+```
+
+```{r synonymous_summary}
+syn <- pairs %>% filter(class == "synonymous (same protein, different CDS)")
+cat("Isoform pairs that are purely synonymous (identical protein, different CDS):",
+    nrow(syn), sprintf("(%.2f%% of %d pairs)\n", 100 * nrow(syn) / nrow(pairs), nrow(pairs)))
+if (nrow(syn) > 0) {
+  syn %>%
+    arrange(desc(rscu_dist)) %>%
+    dplyr::select(symbol, tx_a, tx_b, rscu_dist, delta_gc3) %>%
+    head(20) %>%
+    knitr::kable(caption = "Genes with synonymously distinct co-expressed isoforms")
+}
+```
+
+# Save
+
+```{r save}
+write_rds(expressed, here("output", "predictive_modeling",
+                          sprintf("95_expressed_isoforms_%s_%s_%shr.rds",
+                                  params$treatment, params$condition, params$timepoint)))
+write_csv(census, here("output", "predictive_modeling",
+                       sprintf("95_isoform_census_%s_%s_%shr.csv",
+                               params$treatment, params$condition, params$timepoint)))
+write_csv(pairs %>% dplyr::select(-starts_with("gc3_")),
+          here("output", "predictive_modeling", "95_isoform_pair_classes.csv"))
+cat("Saved expressed isoform table, gene census and pair classification\n")
+```
+
+# What this settles for the next step
+
+```{r conclusion, echo=FALSE, results='asis'}
+cat(sprintf("- %d of %d expressed genes (%.1f%%) run more than one coding isoform, so a within-gene contrast is available.\n",
+            sum(census$n_isoforms >= 2), nrow(census), 100 * mean(census$n_isoforms >= 2)))
+cat(sprintf("- Among those, the median top isoform holds %.0f%% of the gene's mRNA, so the minor isoform is not a trace.\n",
+            100 * median(multi$top_frac)))
+cat(sprintf("- %.1f%% of within-gene isoform pairs encode a different protein; only %.2f%% differ synonymously.\n",
+            100 * mean(pairs$class == "divergent protein" | pairs$class == "nested (one CDS contained in the other)"),
+            100 * mean(pairs$class == "synonymous (same protein, different CDS)")))
+```
