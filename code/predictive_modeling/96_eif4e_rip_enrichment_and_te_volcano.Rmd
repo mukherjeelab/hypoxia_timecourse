@@ -1,0 +1,725 @@
+---
+title: "eIF4E RIP enrichment and TE volcano, 4E-resistant vs 4E-sensitive"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Roiuk et al. (GSE243708), reanalysed here: TE from notebook 76, eIF4E-IP from
+notebook 77. Sets are the two FASTA files in `output/fasta/`.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r settings}
+if (!isTRUE(getOption("knitr.in.progress"))) params <- list(save_plots = TRUE)
+set.seed(9)
+
+# Same two hues as notebooks 79 and 92, which describe these same sets.
+class_colors <- c("4E-resistant"    = "#D55E00",
+                  "4E-sensitive"    = "#0072B2",
+                  "All other genes" = "grey70")
+
+# Paper-matched pair: the muted red / blue used for factor-dependent vs
+# factor-independent transcripts, with the pale tints those figures shade under
+# their curves. Outline carries the hue, fill is the tint at near-full opacity,
+# so the panel reads the way the published figure does. Used by the vehicle
+# violin below; swap the other panels over by pointing their two scales at
+# `paper_lines` / `paper_fills` as well.
+paper_lines <- c("4E-resistant"    = "#A8322D",
+                 "4E-sensitive"    = "#2F6CA8",
+                 "All other genes" = "grey55")
+paper_fills <- c("4E-resistant"    = "#F2CFC9",
+                 "4E-sensitive"    = "#CFDDEC",
+                 "All other genes" = "grey88")
+
+# Shared figure styling. Text is sized for a printed panel rather than the HTML
+# preview, and the n row gets its own strip of panel: `n_pad()` (for plots whose
+# limits come from `coord_cartesian`) and `n_expand` (for plots that keep the data
+# limits) push the lower bound down by `n_frac`, so a `y = -Inf` label lands below
+# the violins instead of on top of a tail.
+fig_theme <- function(base_size = 18) {
+  theme_classic(base_size = base_size) +
+    theme(axis.text        = element_text(size = base_size - 2, colour = "black"),
+          axis.title       = element_text(size = base_size),
+          legend.text      = element_text(size = base_size - 2),
+          strip.text       = element_text(size = base_size - 2),
+          strip.background = element_blank(),
+          plot.subtitle    = element_text(size = base_size - 5, colour = "grey30"))
+}
+
+# Class on the x axis: angled labels, so the panel can stay narrow at this type size.
+theme_class_x <- theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+n_size <- 4.8   # geom_text size for the n row, ~13.5 pt
+n_frac <- 0.16  # share of the y range reserved for it
+
+n_pad <- function(lims, frac = n_frac, top = 0) {
+  lims <- as.numeric(lims)
+  c(lims[1] - diff(lims) * frac, lims[2] + diff(lims) * top)
+}
+n_expand <- scale_y_continuous(expand = expansion(mult = c(n_frac, 0.05)))
+# Faceted panels also need headroom for the per-facet p, which sits top-right.
+n_expand_p <- scale_y_continuous(expand = expansion(mult = c(n_frac, 0.13)))
+
+# One Wilcoxon p per facet. The single-panel plots carry theirs in the subtitle;
+# a faceted panel has one test per facet, so it is annotated in each corner from
+# the same `*_tests` frame that gets written to CSV.
+p_label <- function(tests) {
+  dplyr::mutate(tests, label = paste("p =", format.pval(wilcox_p, digits = 3,
+                                                        eps = 2.2e-16)))
+}
+geom_p_label <- function(tests) {
+  geom_text(data = p_label(tests), aes(x = Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 1.05, vjust = 1.4, size = 4.2,
+            colour = "grey30")
+}
+```
+
+# Data
+
+```{r load}
+te_all <- read_csv(here("output", "teleman_riboseq_te_all_genes.csv"),
+                   show_col_types = FALSE)
+pos    <- read_csv(here("output", "genesets", "teleman_4e_resistant_TE_1hr_lfc0.5.csv"),
+                   show_col_types = FALSE)
+neg    <- read_csv(here("output", "genesets", "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"),
+                   show_col_types = FALSE)
+fm     <- readRDS(here("output", "predictive_modeling", "feature_matrix_teleman_4e.rds"))
+
+ip <- read_csv(here("output", "teleman_eif4e_ip_vehicle_corrected.csv"),
+               show_col_types = FALSE) %>%
+  dplyr::select(gene_id, symbol, vehicle = log2FoldChange) %>%
+  inner_join(read_csv(here("output", "teleman_eif4e_ip_inhibitor_corrected.csv"),
+                      show_col_types = FALSE) %>%
+               dplyr::select(gene_id, inhibitor = log2FoldChange), by = "gene_id") %>%
+  inner_join(read_csv(here("output", "teleman_eif4e_ip_interaction_corrected.csv"),
+                      show_col_types = FALSE) %>%
+               dplyr::select(gene_id, interaction = log2FoldChange,
+                             interaction_padj = padj), by = "gene_id")
+
+# The *original* Teleman tables carried 12 PAR duplicate gene_id keys; nb76 and nb77
+# both removed them, so all four files read here are already one row per gene. The guard
+# stays because a duplicated key in any of them multiplies rows on join and silently
+# inflates every n, median and Wilcoxon p below -- and it is guarded on all three joined
+# keys, not just `ip`: `te_all` is inner_joined to `ip` for the Fig 4E rho, and `classes`
+# is left_joined into every IP, GC and volcano statistic. nb81 guards `ip` the same way.
+stopifnot("ip gene_id must be unique"     = !any(duplicated(ip$gene_id)),
+          "te_all gene_id must be unique" = !any(duplicated(te_all$gene_id)))
+
+# Gene -> class, from the FASTA headers rather than the CSVs, so the figures describe
+# exactly the sequences that were sent out.
+classes <- fm %>%
+  dplyr::select(gene_id_clean, transcript_id_clean) %>%
+  mutate(class = case_when(
+    transcript_id_clean %in% sub("^>", "", grep("^>", readLines(
+      here("output", "fasta", "teleman_4e_resistant_transcripts.fa")), value = TRUE)) ~ "4E-resistant",
+    transcript_id_clean %in% sub("^>", "", grep("^>", readLines(
+      here("output", "fasta", "teleman_4e_sensitive_transcripts.fa")), value = TRUE)) ~ "4E-sensitive")) %>%
+  filter(!is.na(class)) %>%
+  dplyr::select(gene_id = gene_id_clean, class)
+
+# One row per gene: `fm` is gene-deduplicated upstream, but `classes` is left_joined into
+# every statistic below, so assert it here rather than trusting that.
+stopifnot("classes gene_id must be unique" = !any(duplicated(classes$gene_id)))
+
+print(dplyr::count(classes, class) %>% as.data.frame(), row.names = FALSE)
+```
+
+```{r checks}
+stopifnot(
+  "FASTA sets do not match the gene set CSVs" =
+    setequal(classes$gene_id[classes$class == "4E-resistant"], pos$ensembl_gene) &&
+    setequal(classes$gene_id[classes$class == "4E-sensitive"], neg$ensembl_gene),
+  "class direction flipped" =
+    median(pos$log2FoldChange) > 0 && median(neg$log2FoldChange) < 0,
+  "CDKN2B not resistant / GLO1 not sensitive" =
+    "CDKN2B" %in% pos$db_gene_symbol && "GLO1" %in% neg$db_gene_symbol,
+  "padj outside [0,1]" = all(te_all$padj >= 0 & te_all$padj <= 1, na.rm = TRUE),
+  # is.finite(NA) is FALSE, not NA, so na.rm would not skip NAs here -- drop them
+  # explicitly or the check aborts on any filtered gene.
+  "non-finite log2FC" =
+    all(is.finite(te_all$log2FoldChange[!is.na(te_all$log2FoldChange)]))
+)
+
+# Fig 4E: TE change and change in eIF4E binding are negatively correlated.
+rho <- te_all %>%
+  inner_join(ip, by = "gene_id") %>%
+  summarise(r = cor(log2FoldChange, interaction, method = "spearman",
+                    use = "complete.obs"), n = n())
+print(as.data.frame(rho), digits = 3, row.names = FALSE)
+stopifnot("Fig 4E not reproduced" = rho$r < -0.15)
+```
+
+# eIF4E RIP enrichment
+
+## The genes the paper names as losing eIF4E binding
+
+Integrity check on the IP arm at gene level. Roiuk et al. write that "the 'resistant'
+mRNAs (shown in yellow) such as RPP25 or CDKN2B were amongst the mRNAs that showed the
+largest drop in eIF4E binding upon 4E-BP-4A expression (Fig. 4B, C)", and validate eight
+transcripts by Q-RT-PCR on eIF4E IPs in Fig. 4D. Those eight are the labelled points in
+Fig. 4B. Their published E.V.-versus-4E-BP1-4A adjusted p-values, transcribed from the
+Fig. 4 sheet of the article's Source Data, are the `paper_*` columns below. (The paper
+writes ACTB as "ATCB" in that sheet.)
+
+The comparison is not like-for-like: Fig. 4D is Q-RT-PCR normalised to total cellular
+mRNA, while `interaction` is the DESeq2 IP/input interaction from notebook 77. Direction
+and rank are the meaningful part, not the p-value.
+
+```{r paper-named-genes}
+# Roiuk et al. 2024, Nat Commun 15:6692, Fig. 4D source data. paper_call is the
+# direction the paper reports for eIF4E binding on 4E-BP1-4A expression.
+paper_ip <- tibble::tribble(
+  ~symbol,   ~paper_call, ~paper_padj,
+  "CDKN2B",  "down",      4.772e-3,
+  "RPP25",   "down",      4.772e-3,
+  "RPL13A",  "down",      2.730e-2,
+  "WARS",    "down",      8.318e-3,
+  "TIA1",    "down",      2.730e-2,
+  "GAPDH",   "ns",        3.129e-1,
+  "ACTB",    "ns",        3.202e-1,
+  "GLO1",    "ns",        3.129e-1)
+
+named <- ip %>%
+  mutate(pct = 100 * rank(interaction) / n()) %>%
+  inner_join(paper_ip, by = "symbol") %>%
+  arrange(interaction) %>%
+  dplyr::select(symbol, paper_call, paper_padj,
+                interaction, padj = interaction_padj, pct)
+
+# inner_join would drop a gene silently, and every assertion below indexes by symbol,
+# so a missing row would make its check vacuous rather than failing.
+stopifnot("a paper-named gene is missing from the IP table" =
+            nrow(named) == nrow(paper_ip))
+print(as.data.frame(named), digits = 3, row.names = FALSE)
+
+val <- function(sym, col) named[[col]][match(sym, named$symbol)]
+
+stopifnot(
+  # The paper's own text claim: these two are among the largest losses transcriptome-wide.
+  "RPP25 / CDKN2B are not among the largest losses of eIF4E binding" =
+    all(val(c("RPP25", "CDKN2B"), "pct") < 5) &&
+    all(val(c("RPP25", "CDKN2B"), "padj") < 0.05),
+  # padj here is 0.043, close enough to the cut that the direction is the durable claim.
+  "RPL13A does not lose eIF4E binding" = val("RPL13A", "interaction") < 0,
+  "a gene the paper calls unchanged is significant here" =
+    all(val(c("GAPDH", "ACTB", "GLO1"), "padj") > 0.05))
+
+cat("\nWARS and TIA1 do not reproduce: WARS", round(val("WARS", "interaction"), 3),
+    "(padj", signif(val("WARS", "padj"), 3), "), TIA1",
+    round(val("TIA1", "interaction"), 3),
+    "(padj", signif(val("TIA1", "padj"), 3), ")\n")
+```
+
+**Six of the eight reproduce, and the two that do not fail the same way in the authors'
+own output.** RPP25 and CDKN2B, the two named in the text, sit in the bottom 1.5% and 3.8%
+of the transcriptome-wide change in eIF4E binding, both significant, which is what
+"amongst the mRNAs that showed the largest drop" asserts. RPL13A is down. GAPDH, ACTB and
+GLO1 are flat, as the paper reports.
+
+WARS and TIA1 are called significantly down by the Fig. 4D Q-RT-PCR but are at zero here
+(-0.04 and +0.02, padj 0.89 and 0.97). This is **not** a defect of the notebook 77
+re-run: the authors' own uncorrected DESeq2 table for this contrast,
+`mpra_preliminary/res_eif4e_ip_inhib_vs_vehicle.csv`, gives -0.031 (padj 0.92) and +0.021
+(padj 0.94) for the same two genes, agreeing with the values here to three decimals. The
+divergence is between the paper's Q-RT-PCR and the paper's own RNA-seq, and it exists in
+the published data. Both genes are highly expressed (baseMean 31,000 and 3,000), so it is
+not a coverage problem.
+
+## Class distributions
+
+`vehicle` and `inhibitor` are separate DESeq2 fits, so the offset between the two
+conditions is not anchored. The paired quantity is `interaction`.
+
+The IP arm has its own expression filter, and the sensitive set is the more highly
+expressed of the two, so the classes are not equally covered here.
+
+```{r ip-long}
+ip_long <- ip %>%
+  # padj belongs to the interaction fit alone; carrying it into the long frame would
+  # stamp it onto rows labelled Vehicle and Inhibited, where it is not that fit's padj.
+  dplyr::select(-interaction_padj) %>%
+  left_join(classes, by = "gene_id") %>%
+  mutate(class = factor(replace_na(class, "All other genes"),
+                        levels = names(class_colors))) %>%
+  pivot_longer(c(vehicle, inhibitor, interaction),
+               names_to = "contrast", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(contrast = factor(contrast, levels = c("vehicle", "inhibitor", "interaction"),
+                           labels = c("Vehicle (E.V.)", "eIF4E inhibited (4E-BP1-4A)",
+                                      "Inhibited / vehicle")))
+
+ip_stats <- ip_long %>%
+  group_by(contrast, class) %>%
+  summarise(n = n(), median = median(value), .groups = "drop")
+print(as.data.frame(ip_stats), digits = 3, row.names = FALSE)
+
+ip_tests <- ip_long %>%
+  filter(class != "All other genes") %>%
+  group_by(contrast) %>%
+  summarise(wilcox_p = wilcox.test(value ~ class)$p.value, .groups = "drop")
+print(as.data.frame(ip_tests), digits = 3, row.names = FALSE)
+
+classes %>%
+  mutate(measured = gene_id %in% ip$gene_id) %>%
+  group_by(class) %>%
+  summarise(n_set = n(), n_with_ip = sum(measured),
+            pct = round(100 * mean(measured), 1), .groups = "drop") %>%
+  as.data.frame() %>% print(row.names = FALSE)
+
+# Fig 4C: resistant mRNAs lose eIF4E binding relative to the bulk.
+stopifnot("Fig 4C not reproduced" =
+  ip_stats$median[ip_stats$contrast == "Inhibited / vehicle" &
+                  ip_stats$class == "4E-resistant"] <
+  median(ip$interaction, na.rm = TRUE))
+
+if (params$save_plots) write_csv(left_join(ip_stats, ip_tests, by = "contrast"),
+                                 here("output", "96_eif4e_rip_enrichment_stats.csv"))
+```
+
+## Both conditions together
+
+Shown for the two levels side by side, **not** to read a change off. `vehicle` and
+`inhibitor` are separate DESeq2 fits with an unanchored offset, so differencing them is not
+the same quantity as the interaction: by class median it gives resistant -0.240 /
+sensitive +0.261 against the paired interaction's -0.117 / +0.177, overstating the
+resistant shift about twofold. The change is the next-but-two section, off `interaction`.
+
+```{r violin-both, fig.width = 9, fig.height = 5.5}
+both     <- filter(ip_long,  contrast != "Inhibited / vehicle")
+both_lab <- filter(ip_stats, contrast != "Inhibited / vehicle")
+
+# Faceted rather than dodged: at this type size three dodged `n = ` labels ran
+# into each other inside one x slot.
+p_both <- ggplot(both, aes(class, value, fill = class, colour = class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = both_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  geom_p_label(filter(ip_tests, contrast != "Inhibited / vehicle")) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  coord_cartesian(ylim = n_pad(quantile(both$value, c(0.001, 0.999)), top = 0.12)) +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive, per panel.",
+                        "Separate fits, unanchored offset: levels only, not a change.",
+                        "\nFor the change in binding see the interaction contrast."),
+       x = NULL, y = "log2 (eIF4E IP / input)") +
+  fig_theme() +
+  theme_class_x
+
+print(p_both)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_rip_enrichment_violin.pdf"),
+                              p_both, width = 9, height = 5.5)
+```
+
+```{r ip-density-helper}
+# One density panel per contrast: the three classes, their medians, and the
+# resistant-vs-sensitive Wilcoxon in the subtitle.
+ip_density_plot <- function(contrast_name, xlab) {
+  d   <- filter(ip_long,  contrast == contrast_name)
+  lab <- filter(ip_stats, contrast == contrast_name) %>% arrange(class)
+
+  ggplot(d, aes(value, colour = class)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+    geom_density(fill = NA, linewidth = 0.9) +
+    geom_vline(data = lab, aes(xintercept = median, colour = class),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    scale_colour_manual(values = class_colors, name = NULL,
+                        labels = paste0(lab$class, " (n = ", lab$n, ")")) +
+    coord_cartesian(xlim = quantile(d$value, c(0.005, 0.995))) +
+    labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                          format.pval(ip_tests$wilcox_p[ip_tests$contrast == contrast_name],
+                                      digits = 3, eps = 2.2e-16)),
+         x = xlab, y = "Density") +
+    fig_theme() +
+    theme(legend.position = "top")
+}
+```
+
+## eIF4E IP / input, vehicle
+
+```{r violin-vehicle, fig.width = 4.6, fig.height = 5.5}
+veh_d   <- filter(ip_long,  contrast == "Vehicle (E.V.)")
+veh_lab <- filter(ip_stats, contrast == "Vehicle (E.V.)")
+
+p_vehicle <- ggplot(veh_d, aes(class, value, fill = class, colour = class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_violin(alpha = 0.85, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = veh_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  scale_fill_manual(values = paper_fills, guide = "none") +
+  scale_colour_manual(values = paper_lines, guide = "none") +
+  coord_cartesian(ylim = n_pad(quantile(veh_d$value, c(0.001, 0.999)))) +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                        format.pval(ip_tests$wilcox_p[ip_tests$contrast == "Vehicle (E.V.)"],
+                                    digits = 3, eps = 2.2e-16)),
+       x = NULL, y = "log2 (eIF4E IP / input), vehicle") +
+  fig_theme() +
+  theme_class_x
+
+print(p_vehicle)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_ip_vehicle_violin.pdf"),
+                              p_vehicle, width = 4.6, height = 5.5)
+```
+
+```{r density-vehicle, fig.width = 7.5, fig.height = 5.5}
+p_vehicle_density <- ip_density_plot("Vehicle (E.V.)",
+                                     "log2( eIF4E IP / input ), E.V. cells")
+print(p_vehicle_density)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_ip_vehicle_density.pdf"),
+                              p_vehicle_density, width = 7.5, height = 5.5)
+```
+
+## eIF4E IP / input, 4E-BP1-4A
+
+```{r violin-inhibitor, fig.width = 4.6, fig.height = 5.5}
+inh_d   <- filter(ip_long,  contrast == "eIF4E inhibited (4E-BP1-4A)")
+inh_lab <- filter(ip_stats, contrast == "eIF4E inhibited (4E-BP1-4A)")
+
+p_inhibitor <- ggplot(inh_d, aes(class, value, fill = class, colour = class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = inh_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  coord_cartesian(ylim = n_pad(quantile(inh_d$value, c(0.001, 0.999)))) +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                        format.pval(ip_tests$wilcox_p[ip_tests$contrast == "eIF4E inhibited (4E-BP1-4A)"],
+                                    digits = 3, eps = 2.2e-16)),
+       x = NULL, y = "log2 (eIF4E IP / input), 4E-BP1-4A") +
+  fig_theme() +
+  theme_class_x
+
+print(p_inhibitor)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_ip_inhibitor_violin.pdf"),
+                              p_inhibitor, width = 4.6, height = 5.5)
+```
+
+```{r density-inhibitor, fig.width = 7.5, fig.height = 5.5}
+p_inhibitor_density <- ip_density_plot("eIF4E inhibited (4E-BP1-4A)",
+                                       "log2( eIF4E IP / input ), 4E-BP1-4A cells")
+print(p_inhibitor_density)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_ip_inhibitor_density.pdf"),
+                              p_inhibitor_density, width = 7.5, height = 5.5)
+```
+
+## Change in binding: 4E-BP1-4A over vehicle
+
+```{r violin-interaction, fig.width = 4.6, fig.height = 5.5}
+int_d   <- filter(ip_long,  contrast == "Inhibited / vehicle")
+int_lab <- filter(ip_stats, contrast == "Inhibited / vehicle")
+
+p_interaction <- ggplot(int_d, aes(class, value, fill = class, colour = class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = int_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  coord_cartesian(ylim = n_pad(quantile(int_d$value, c(0.001, 0.999)))) +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                        format.pval(ip_tests$wilcox_p[ip_tests$contrast == "Inhibited / vehicle"],
+                                    digits = 3, eps = 2.2e-16)),
+       x = NULL, y = "log2( 4E-BP1-4A IP/input  /  E.V. IP/input )") +
+  fig_theme() +
+  theme_class_x
+
+print(p_interaction)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_binding_change_violin.pdf"),
+                              p_interaction, width = 4.6, height = 5.5)
+```
+
+```{r density-interaction, fig.width = 7.5, fig.height = 5.5}
+p_interaction_density <- ip_density_plot(
+  "Inhibited / vehicle", "log2( 4E-BP1-4A IP/input  /  E.V. IP/input )")
+print(p_interaction_density)
+if (params$save_plots) ggsave(here("plots", "96_eif4e_binding_change_density.pdf"),
+                              p_interaction_density, width = 7.5, height = 5.5)
+```
+
+# TE volcano
+
+Positive log2FC = TE held up when eIF4E is inhibited. Coloured points are the FASTA sets,
+cut at padj < 0.05 and |log2FC| > 0.5. That cut leaves 1,258 resistant and 1,195 sensitive
+genes, and nb76 caps each class at `N_PER_CLASS = 1,195` -- the sensitive class's own size,
+which is what size-matches the two sets. **Only the resistant class is actually truncated.**
+So the two colour boundaries have different meanings: the sensitive one is the 0.5 threshold
+itself, the resistant one is the truncation, and the 63 genes with 0.5 < log2FC < 0.654 are
+resistant by the stated cut but plotted grey. Dashed lines are the paper's Fig 1A thresholds,
+for reference.
+
+```{r volcano, fig.width = 8, fig.height = 6.5}
+volc <- te_all %>%
+  filter(!is.na(padj)) %>%
+  left_join(classes, by = "gene_id") %>%
+  mutate(class = factor(replace_na(class, "All other genes"),
+                        levels = names(class_colors)))
+
+print(dplyr::count(volc, class) %>% as.data.frame(), row.names = FALSE)
+stopifnot(
+  # all(logical(0)) is TRUE, so the sign checks below pass vacuously if the class
+  # join drops out (e.g. a versioned gene_id). Assert the sets landed first.
+  "class join did not reach the volcano" =
+    sum(volc$class == "4E-resistant") == nrow(pos) &&
+    sum(volc$class == "4E-sensitive") == nrow(neg),
+  "resistant points are not on the positive side" =
+    all(volc$log2FoldChange[volc$class == "4E-resistant"] > 0),
+  "sensitive points are not on the negative side" =
+    all(volc$log2FoldChange[volc$class == "4E-sensitive"] < 0)
+)
+
+# Where each colour boundary actually sits, and which class the 1,195 cap bound. Computed
+# rather than quoted, so the caption above cannot drift from the files.
+passing <- volc %>%
+  dplyr::filter(!is.na(padj), padj < 0.05, abs(log2FoldChange) > 0.5) %>%
+  dplyr::mutate(side = dplyr::if_else(log2FoldChange > 0, "resistant", "sensitive")) %>%
+  dplyr::count(side, name = "n_passing_cut")
+
+dplyr::tibble(
+  side          = c("resistant", "sensitive"),
+  n_in_set      = c(sum(volc$class == "4E-resistant"), sum(volc$class == "4E-sensitive")),
+  colour_bound  = c(min(volc$log2FoldChange[volc$class == "4E-resistant"]),
+                    max(volc$log2FoldChange[volc$class == "4E-sensitive"]))) %>%
+  dplyr::left_join(passing, by = "side") %>%
+  dplyr::mutate(truncated_by_cap = n_passing_cut > n_in_set,
+                n_passing_but_grey = n_passing_cut - n_in_set) %>%
+  as.data.frame() %>% print(digits = 3, row.names = FALSE)
+
+p_volcano <- ggplot(volc, aes(log2FoldChange, -log10(padj))) +
+  geom_point(data = filter(volc, class == "All other genes"),
+             colour = "grey70", size = 0.5, alpha = 0.4) +
+  geom_point(data = filter(volc, class != "All other genes"),
+             aes(colour = class), size = 0.6, alpha = 0.75) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey40",
+             linewidth = 0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40",
+             linewidth = 0.4) +
+  scale_colour_manual(values = class_colors, breaks = names(class_colors)[1:2],
+                      name = NULL) +
+  labs(subtitle = paste0(sum(volc$class == "4E-resistant"), " resistant, ",
+                         sum(volc$class == "4E-sensitive"), " sensitive, n = ",
+                         scales::comma(nrow(volc)), " genes tested"),
+       x = "log2( TE in 4E-BP1-4A / TE in E.V. )", y = "-log10(adj. p-value)") +
+  fig_theme() +
+  theme(legend.position = "top")
+
+print(p_volcano)
+if (params$save_plots) ggsave(here("plots", "96_te_volcano_fasta_sets.pdf"),
+                              p_volcano, width = 8, height = 6.5)
+```
+
+```{r volcano-labelled, fig.width = 8, fig.height = 6.5}
+p_volcano_labelled <- p_volcano +
+  ggrepel::geom_text_repel(data = filter(volc, symbol %in% c("CDKN2B", "RPP25", "GLO1")),
+                           aes(label = symbol), size = 5.5, min.segment.length = 0,
+                           segment.size = 0.3)
+
+print(p_volcano_labelled)
+if (params$save_plots) ggsave(here("plots", "96_te_volcano_fasta_sets_labelled.pdf"),
+                              p_volcano_labelled, width = 8, height = 6.5)
+```
+
+# GC content by region
+
+```{r gc-long}
+gc_long <- fm %>%
+  dplyr::select(gene_id = gene_id_clean, utr5_gc, cds_gc, utr3_gc) %>%
+  left_join(classes, by = "gene_id") %>%
+  mutate(class = factor(replace_na(class, "All other genes"),
+                        levels = names(class_colors))) %>%
+  pivot_longer(c(utr5_gc, cds_gc, utr3_gc), names_to = "region", values_to = "gc") %>%
+  filter(!is.na(gc)) %>%
+  mutate(region = factor(region, levels = c("utr5_gc", "cds_gc", "utr3_gc"),
+                         labels = c("5'UTR", "CDS", "3'UTR")))
+
+stopifnot("GC outside [0, 100]" = all(gc_long$gc >= 0 & gc_long$gc <= 100))
+
+gc_stats <- gc_long %>%
+  group_by(region, class) %>%
+  summarise(n = n(), median = median(gc), .groups = "drop")
+print(as.data.frame(gc_stats), digits = 3, row.names = FALSE)
+
+gc_tests <- gc_long %>%
+  filter(class != "All other genes") %>%
+  group_by(region) %>%
+  summarise(wilcox_p = wilcox.test(gc ~ class)$p.value, .groups = "drop")
+print(as.data.frame(gc_tests), digits = 3, row.names = FALSE)
+
+if (params$save_plots) write_csv(left_join(gc_stats, gc_tests, by = "region"),
+                                 here("output", "96_gc_by_region_stats.csv"))
+```
+
+## All three regions together
+
+```{r gc-violin-all, fig.width = 9, fig.height = 5.5}
+p_gc_all <- ggplot(gc_long, aes(class, gc, fill = class, colour = class)) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = gc_stats, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  geom_p_label(gc_tests) +
+  facet_wrap(~ region, nrow = 1) +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  n_expand_p +
+  labs(subtitle = "Wilcoxon, resistant vs sensitive, per region",
+       x = NULL, y = "GC content (%)") +
+  fig_theme() +
+  theme_class_x
+
+print(p_gc_all)
+if (params$save_plots) ggsave(here("plots", "96_gc_by_region_violin.pdf"),
+                              p_gc_all, width = 9, height = 5.5)
+```
+
+## 5'UTR
+
+```{r gc-violin-utr5, fig.width = 4.6, fig.height = 5.5}
+utr5_d   <- filter(gc_long,  region == "5'UTR")
+utr5_lab <- filter(gc_stats, region == "5'UTR")
+
+p_gc_utr5 <- ggplot(utr5_d, aes(class, gc, fill = class, colour = class)) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = utr5_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  n_expand +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                        format.pval(gc_tests$wilcox_p[gc_tests$region == "5'UTR"],
+                                    digits = 3, eps = 2.2e-16)),
+       x = NULL, y = "5'UTR GC content (%)") +
+  fig_theme() +
+  theme_class_x
+
+print(p_gc_utr5)
+if (params$save_plots) ggsave(here("plots", "96_gc_utr5_violin.pdf"),
+                              p_gc_utr5, width = 4.6, height = 5.5)
+```
+
+## CDS
+
+```{r gc-violin-cds, fig.width = 4.6, fig.height = 5.5}
+cds_d   <- filter(gc_long,  region == "CDS")
+cds_lab <- filter(gc_stats, region == "CDS")
+
+p_gc_cds <- ggplot(cds_d, aes(class, gc, fill = class, colour = class)) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = cds_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  n_expand +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                        format.pval(gc_tests$wilcox_p[gc_tests$region == "CDS"],
+                                    digits = 3, eps = 2.2e-16)),
+       x = NULL, y = "CDS GC content (%)") +
+  fig_theme() +
+  theme_class_x
+
+print(p_gc_cds)
+if (params$save_plots) ggsave(here("plots", "96_gc_cds_violin.pdf"),
+                              p_gc_cds, width = 4.6, height = 5.5)
+```
+
+## 3'UTR
+
+```{r gc-violin-utr3, fig.width = 4.6, fig.height = 5.5}
+utr3_d   <- filter(gc_long,  region == "3'UTR")
+utr3_lab <- filter(gc_stats, region == "3'UTR")
+
+p_gc_utr3 <- ggplot(utr3_d, aes(class, gc, fill = class, colour = class)) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = utr3_lab, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  n_expand +
+  labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                        format.pval(gc_tests$wilcox_p[gc_tests$region == "3'UTR"],
+                                    digits = 3, eps = 2.2e-16)),
+       x = NULL, y = "3'UTR GC content (%)") +
+  fig_theme() +
+  theme_class_x
+
+print(p_gc_utr3)
+if (params$save_plots) ggsave(here("plots", "96_gc_utr3_violin.pdf"),
+                              p_gc_utr3, width = 4.6, height = 5.5)
+```
+
+# GC by codon position in the CDS
+
+```{r gc-position, fig.width = 9.5, fig.height = 5.5}
+pos_long <- fm %>%
+  dplyr::select(gene_id = gene_id_clean, gc1, gc2, gc3) %>%
+  left_join(classes, by = "gene_id") %>%
+  mutate(class = factor(replace_na(class, "All other genes"),
+                        levels = names(class_colors))) %>%
+  pivot_longer(c(gc1, gc2, gc3), names_to = "position", values_to = "gc") %>%
+  filter(!is.na(gc)) %>%
+  mutate(position = factor(position, levels = c("gc1", "gc2", "gc3"),
+                           labels = c("GC1", "GC2", "GC3")))
+
+stopifnot("GC outside [0, 100]" = all(pos_long$gc >= 0 & pos_long$gc <= 100))
+
+pos_stats <- pos_long %>%
+  group_by(position, class) %>%
+  summarise(n = n(), median = median(gc), .groups = "drop")
+print(as.data.frame(pos_stats), digits = 3, row.names = FALSE)
+
+pos_tests <- pos_long %>%
+  filter(class != "All other genes") %>%
+  group_by(position) %>%
+  summarise(wilcox_p = wilcox.test(gc ~ class)$p.value, .groups = "drop")
+print(as.data.frame(pos_tests), digits = 3, row.names = FALSE)
+
+if (params$save_plots) write_csv(left_join(pos_stats, pos_tests, by = "position"),
+                                 here("output", "96_gc_by_codon_position_stats.csv"))
+
+p_gc_position <- ggplot(pos_long, aes(class, gc, fill = class, colour = class)) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, width = 0.75) +
+  geom_boxplot(width = 0.1, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_text(data = pos_stats, aes(y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.6, size = n_size, colour = "grey30") +
+  geom_p_label(pos_tests) +
+  facet_wrap(~ position, nrow = 1) +
+  scale_fill_manual(values = class_colors, guide = "none") +
+  scale_colour_manual(values = class_colors, guide = "none") +
+  n_expand_p +
+  labs(subtitle = "Wilcoxon, resistant vs sensitive, per codon position",
+       x = NULL, y = "GC content (%)") +
+  fig_theme() +
+  theme_class_x
+
+print(p_gc_position)
+if (params$save_plots) ggsave(here("plots", "96_gc_codon_position_violin.pdf"),
+                              p_gc_position, width = 9.5, height = 5.5)
+```
+
+```{r session}
+sessionInfo()
+```

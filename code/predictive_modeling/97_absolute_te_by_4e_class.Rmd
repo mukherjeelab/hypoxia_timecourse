@@ -1,0 +1,516 @@
+---
+title: "Absolute TE by 4E-resistant / 4E-sensitive class"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  mpra_repo: "/Users/katematlin/github/mpra_preliminary"
+  refit: FALSE
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+nb96 showed the Teleman 4E-resistant and 4E-sensitive sets separate on eIF4E binding and
+GC. The open question is where they sit on the **TE level** axis: are 4E-resistant mRNAs
+well translated to begin with, and where do they land once eIF4E is inhibited?
+
+The repo cannot answer that today. The only Teleman TE quantity that exists is
+`te_all$log2FoldChange` from nb76, the interaction coefficient
+`treatmentBP_inhib.typeribo` -- a TE **change**. The three classes are defined by
+thresholding exactly that column, so its distribution by class is three non-overlapping
+blocks that restate the cut.
+
+So this notebook computes **absolute TE, `log2(ribo/rna)`, separately in E.V. and in
+4E-BP1-4A cells**, following the pattern in `code/individual_te_per_sample.Rmd` (the only
+place in the project where a TE *level* rather than a *change* is computed).
+
+**Read section 5 before quoting anything from section 4.** The classes are defined by
+`TE_BP - TE_EV`, so selecting on that difference splits the two levels in opposite
+directions on its own. Section 5 measures how much of section 4 is that artifact. The
+short version: the 4E-BP1-4A separation is real and large, the baseline separation is
+mostly artifact.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(DESeq2)
+library(janitor)
+```
+
+```{r settings}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(mpra_repo = "/Users/katematlin/github/mpra_preliminary",
+                 refit = FALSE, save_plots = TRUE)
+}
+set.seed(9)
+
+MPRA_REPO <- params$mpra_repo
+FIT_RDS   <- here("output", "predictive_modeling", "teleman_absolute_te.rds")
+
+# Same hues as nb96 and nb79, which describe these same sets. Okabe-Ito vermillion and
+# dark blue; eIF3d amber and eIF3e sky blue stay reserved for those factors.
+class_colors <- c("4E-resistant"    = "#D55E00",
+                  "4E-sensitive"    = "#0072B2",
+                  "All other genes" = "grey70")
+
+# The eight riboseq-arm libraries of GSE243708, named rather than indexed (nb76). The GEO
+# header is case-inconsistent (4EBP1_4a_1 vs 4EBP1_4A_2); the regexes below are
+# case-insensitive to that by construction.
+RIBO_COLS <- c(
+  "Riboseq_Empty_vector_1", "Riboseq_Empty_vector_2",
+  "Riboseq_4EBP1_4a_1", "Riboseq_4EBP1_4A_2",
+  "Total_RNA_Riboseq_Empty_vector_1", "Total_RNA_Riboseq_Empty_vector_2",
+  "Total_RNA_Riboseq_4EBP1_4A_1", "Total_RNA_Riboseq_4EBP1_4A_2"
+)
+```
+
+# 1. Compute absolute TE for the two conditions
+
+The gene universe is taken from nb76's output rather than re-deriving its protein-coding
+and `log2(rowSums) > 10` filters. That guarantees this notebook covers exactly the genes
+nb76 tested and nb96 plots, and it is far less code.
+
+GSE243708 carries no spike-ins, so size factors are plain DESeq2 defaults -- the
+`controlGenes` and spike-removal steps in `individual_te_per_sample.Rmd` do not apply.
+
+```{r fit}
+te_all <- read_csv(here("output", "teleman_riboseq_te_all_genes.csv"), show_col_types = FALSE)
+
+fit_absolute_te <- function() {
+  raw <- read_csv(file.path(MPRA_REPO, "data/GSE243708_raw_counts_matrix_Roiuk.csv"),
+                  show_col_types = FALSE)
+  pcr <- read_csv(file.path(MPRA_REPO, "data/pcr_artifacts_sup8.csv"), show_col_types = FALSE)
+
+  cts <- raw %>%
+    dplyr::filter(!`Transcript stable ID` %in% pcr$Transcript_id) %>%
+    dplyr::select(`Gene stable ID`, all_of(RIBO_COLS)) %>%
+    dplyr::group_by(`Gene stable ID`) %>%
+    dplyr::summarise(across(everything(), \(x) sum(x, na.rm = TRUE)), .groups = "drop") %>%
+    clean_names() %>%
+    column_to_rownames("gene_stable_id")
+
+  stopifnot("nb76 universe is not fully present in the count matrix" =
+              all(te_all$gene_id %in% rownames(cts)))
+  cts <- cts[te_all$gene_id, , drop = FALSE]
+
+  meta <- tibble::tibble(sample_name = RIBO_COLS) %>%
+    dplyr::mutate(
+      treatment = if_else(str_detect(sample_name, "4EBP"), "BP_inhib", "vehicle"),
+      library   = if_else(str_detect(sample_name, "Total_RNA"), "rna", "ribo"),
+      rep       = if_else(str_detect(sample_name, "_1$"), "1", "2"),
+      group     = factor(paste(treatment, library, sep = "_"))
+    ) %>%
+    as.data.frame()
+  rownames(meta) <- make_clean_names(meta$sample_name)
+
+  stopifnot("metadata rows do not match count matrix columns" =
+              identical(rownames(meta), colnames(cts)))
+  stopifnot("expected 2 replicates in each of 4 groups" = all(table(meta$group) == 2))
+
+  dds <- DESeq(DESeqDataSetFromMatrix(round(cts), colData = meta, design = ~ group),
+               quiet = TRUE)
+
+  # TE level = ribo vs rna WITHIN one condition. Written ribo-first so positive means more
+  # footprints per mRNA, i.e. better translated. ashr rather than apeglm because an
+  # arbitrary contrast is not a named model coefficient (see individual_te_per_sample.Rmd).
+  te_of <- function(treat) {
+    ribo <- paste0(treat, "_ribo"); rna <- paste0(treat, "_rna")
+    res <- results(dds, contrast = c("group", ribo, rna),
+                   independentFiltering = FALSE, cooksCutoff = FALSE)
+    lfcShrink(dds, contrast = c("group", ribo, rna), res = res, type = "ashr",
+              quiet = TRUE) %>%
+      as.data.frame() %>%
+      rownames_to_column("gene_id")
+  }
+
+  list(vehicle  = te_of("vehicle"),
+       inhibitor = te_of("BP_inhib"),
+       norm = counts(dds, normalized = TRUE),
+       meta = meta,
+       size_factors = sizeFactors(dds))
+}
+
+if (params$refit || !file.exists(FIT_RDS)) {
+  fit <- fit_absolute_te()
+  saveRDS(fit, FIT_RDS)
+} else {
+  fit <- readRDS(FIT_RDS)
+  cat("loaded cached fit from", basename(FIT_RDS), "\n")
+}
+
+print(fit$meta[, c("treatment", "library", "rep", "group")])
+cat("\nsize factors:\n"); print(round(fit$size_factors, 3))
+```
+
+# 2. The same TE the naive way, and the correlation between them
+
+The DESeq2 contrast is one estimate of `log2(ribo/rna)`; the direct arithmetic is another.
+Computing both checks the contrast is written ribo-first and that the `group` levels map to
+the libraries intended. If these disagree the DESeq version is wrong, not subtle.
+
+The `+ 1` pseudocount is on normalized counts. It is what keeps a gene with zero RNA in one
+condition finite, and those genes are exactly where the two methods diverge.
+
+```{r naive}
+grp_cols <- function(g) rownames(fit$meta)[fit$meta$group == g]
+
+naive <- tibble::tibble(
+  gene_id  = rownames(fit$norm),
+  ev_naive = log2((rowMeans(fit$norm[, grp_cols("vehicle_ribo"),  drop = FALSE]) + 1) /
+                  (rowMeans(fit$norm[, grp_cols("vehicle_rna"),   drop = FALSE]) + 1)),
+  bp_naive = log2((rowMeans(fit$norm[, grp_cols("BP_inhib_ribo"), drop = FALSE]) + 1) /
+                  (rowMeans(fit$norm[, grp_cols("BP_inhib_rna"),  drop = FALSE]) + 1))
+)
+
+te <- fit$vehicle %>%
+  dplyr::select(gene_id, ev = log2FoldChange, lfcSE_ev = lfcSE,
+                padj_ev = padj, baseMean = baseMean) %>%
+  dplyr::inner_join(fit$inhibitor %>%
+                      dplyr::select(gene_id, bp = log2FoldChange, lfcSE_bp = lfcSE,
+                                    padj_bp = padj), by = "gene_id") %>%
+  dplyr::inner_join(naive, by = "gene_id") %>%
+  dplyr::inner_join(te_all %>% dplyr::select(gene_id, symbol,
+                                             nb76_interaction = log2FoldChange),
+                    by = "gene_id") %>%
+  dplyr::mutate(delta = bp - ev)
+
+agreement <- purrr::map_dfr(c(ev = "ev", bp = "bp"), function(k) {
+  tibble::tibble(condition = k,
+                 pearson  = cor(te[[k]], te[[paste0(k, "_naive")]]),
+                 spearman = cor(te[[k]], te[[paste0(k, "_naive")]], method = "spearman"),
+                 n = nrow(te))
+})
+print(as.data.frame(agreement), digits = 4, row.names = FALSE)
+
+stopifnot("DESeq and naive TE do not agree in E.V." =
+            agreement$pearson[agreement$condition == "ev"] > 0.85,
+          "DESeq and naive TE do not agree in 4E-BP1-4A" =
+            agreement$pearson[agreement$condition == "bp"] > 0.85)
+
+# Where they diverge: ashr shrinks low-count ratios toward zero, the naive ratio does not.
+te %>%
+  dplyr::mutate(tertile = ntile(baseMean, 3)) %>%
+  dplyr::group_by(tertile) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   median_baseMean = round(median(baseMean)),
+                   r_ev = round(cor(ev, ev_naive), 4),
+                   r_bp = round(cor(bp, bp_naive), 4), .groups = "drop") %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+```{r naive-scatter, fig.width = 9, fig.height = 4.5}
+p_naive <- te %>%
+  dplyr::select(gene_id, baseMean, ev, bp, ev_naive, bp_naive) %>%
+  tidyr::pivot_longer(c(ev, bp), names_to = "condition", values_to = "deseq") %>%
+  dplyr::mutate(naive = if_else(condition == "ev", ev_naive, bp_naive),
+                condition = factor(condition, levels = c("ev", "bp"),
+                                   labels = c("E.V.", "4E-BP1-4A"))) %>%
+  ggplot(aes(naive, deseq)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = "dashed") +
+  geom_point(size = 0.4, alpha = 0.25, colour = "grey30") +
+  facet_wrap(~ condition) +
+  labs(x = "naive log2(ribo / rna), normalized counts + 1",
+       y = "DESeq2 group contrast, ashr shrunk") +
+  theme_classic(base_size = 14)
+
+print(p_naive)
+if (params$save_plots) ggsave(here("plots", "97_deseq_vs_naive_te_scatter.pdf"),
+                              p_naive, width = 9, height = 4.5)
+```
+
+The two agree closely, and the residual disagreement is confined to the low-expression
+tertile exactly as expected. **Everything below uses the DESeq2 values**: they shrink noisy
+low-count ratios, carry `lfcSE` and `padj`, and need no pseudocount. The naive values are
+kept in the exported table so this comparison stays reproducible.
+
+# 3. Validation
+
+```{r validation}
+# Directionality anchor. TE_BP - TE_EV must reproduce nb76's interaction coefficient. The
+# shrinkage differs (ashr here, apeglm there) so this is a correlation, not an equality.
+anchor <- tibble::tibble(
+  pearson  = cor(te$delta, te$nb76_interaction),
+  spearman = cor(te$delta, te$nb76_interaction, method = "spearman"),
+  sign_agreement = mean(sign(te$delta) == sign(te$nb76_interaction)),
+  n = nrow(te))
+print(as.data.frame(anchor), digits = 4, row.names = FALSE)
+
+stopifnot("TE levels do not reproduce nb76's TE change: contrast may be inverted" =
+            anchor$pearson > 0.9)
+
+# Orientation on the genes nb76 anchors direction with: CDKN2B resistant, GLO1 sensitive.
+te %>%
+  dplyr::filter(symbol %in% c("CDKN2B", "RPP25", "GLO1", "RPS6")) %>%
+  dplyr::select(symbol, ev, bp, delta, nb76_interaction) %>%
+  dplyr::arrange(dplyr::desc(delta)) %>%
+  as.data.frame() %>% print(digits = 3, row.names = FALSE)
+
+te_of_sym <- function(g, col) te[[col]][match(g, te$symbol)]
+stopifnot(
+  "CDKN2B TE does not rise under eIF4E inhibition" =
+    te_of_sym("CDKN2B", "bp") > te_of_sym("CDKN2B", "ev"),
+  "GLO1 TE does not fall under eIF4E inhibition" =
+    te_of_sym("GLO1", "bp") < te_of_sym("GLO1", "ev"),
+  "non-finite TE" = all(is.finite(te$ev)) && all(is.finite(te$bp)),
+  "padj outside [0,1]" = all(te$padj_ev >= 0 & te$padj_ev <= 1, na.rm = TRUE) &&
+                         all(te$padj_bp >= 0 & te$padj_bp <= 1, na.rm = TRUE),
+  "negative baseMean" = all(te$baseMean >= 0),
+  "duplicate gene_id" = !any(duplicated(te$gene_id)),
+  "gene set does not match nb76" = setequal(te$gene_id, te_all$gene_id)
+)
+cat("\nall validation checks passed;", nrow(te), "genes\n")
+```
+
+```{r classes}
+pos <- read_csv(here("output", "genesets", "teleman_4e_resistant_TE_1hr_lfc0.5.csv"),
+                show_col_types = FALSE)
+neg <- read_csv(here("output", "genesets", "teleman_4e_sensitive_TE_1hr_lfc0.5.csv"),
+                show_col_types = FALSE)
+
+# nb96 asserts these CSVs are setequal to the FASTA headers, so reading them directly gives
+# the identical genes in three lines instead of nine.
+te <- te %>%
+  dplyr::mutate(class = factor(dplyr::case_when(
+    gene_id %in% pos$ensembl_gene ~ "4E-resistant",
+    gene_id %in% neg$ensembl_gene ~ "4E-sensitive",
+    TRUE                          ~ "All other genes"), levels = names(class_colors)))
+
+print(dplyr::count(te, class) %>% as.data.frame(), row.names = FALSE)
+stopifnot("class sizes do not match nb96" =
+            sum(te$class == "4E-resistant") == nrow(pos) &&
+            sum(te$class == "4E-sensitive") == nrow(neg))
+
+if (params$save_plots) {
+  write_csv(te %>%
+              dplyr::select(gene_id, symbol, class, baseMean,
+                            te_ev = ev, te_bp = bp,
+                            te_ev_naive = ev_naive, te_bp_naive = bp_naive,
+                            lfcSE_ev, lfcSE_bp, padj_ev, padj_bp, delta),
+            here("output", "teleman_absolute_te_by_condition.csv"))
+}
+```
+
+# 4. TE distribution by class, one plot per condition
+
+```{r stats}
+te_long <- te %>%
+  dplyr::select(gene_id, class, ev, bp) %>%
+  tidyr::pivot_longer(c(ev, bp), names_to = "condition", values_to = "te") %>%
+  dplyr::mutate(condition = factor(condition, levels = c("ev", "bp"),
+                                   labels = c("E.V.", "4E-BP1-4A")))
+
+te_stats <- te_long %>%
+  dplyr::group_by(condition, class) %>%
+  dplyr::summarise(n = dplyr::n(), median = median(te), .groups = "drop")
+print(as.data.frame(te_stats), digits = 3, row.names = FALSE)
+
+te_tests <- te_long %>%
+  dplyr::filter(class != "All other genes") %>%
+  dplyr::group_by(condition) %>%
+  dplyr::summarise(wilcox_p = wilcox.test(te ~ class)$p.value, .groups = "drop")
+print(as.data.frame(te_tests), digits = 3, row.names = FALSE)
+
+if (params$save_plots) write_csv(left_join(te_stats, te_tests, by = "condition"),
+                                 here("output", "97_absolute_te_by_class_stats.csv"))
+```
+
+```{r density-helper}
+# One density panel per condition: three classes, their medians, n in the legend, and the
+# resistant-vs-sensitive Wilcoxon in the subtitle. Same shape as nb96's ip_density_plot().
+te_density_plot <- function(condition_name, xlab) {
+  d   <- dplyr::filter(te_long,  condition == condition_name)
+  lab <- dplyr::filter(te_stats, condition == condition_name) %>% dplyr::arrange(class)
+
+  ggplot(d, aes(te, colour = class)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+    geom_density(fill = NA, linewidth = 0.9) +
+    geom_vline(data = lab, aes(xintercept = median, colour = class),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    scale_colour_manual(values = class_colors, name = NULL,
+                        labels = paste0(lab$class, " (n = ", lab$n, ")")) +
+    coord_cartesian(xlim = quantile(d$te, c(0.005, 0.995))) +
+    labs(subtitle = paste("Wilcoxon, resistant vs sensitive: p =",
+                          format.pval(te_tests$wilcox_p[te_tests$condition == condition_name],
+                                      digits = 3, eps = 2.2e-16)),
+         x = xlab, y = "Density") +
+    theme_classic(base_size = 14) +
+    theme(legend.position = "top",
+          plot.subtitle = element_text(size = 11, colour = "grey40"))
+}
+```
+
+## E.V. cells
+
+```{r density-ev, fig.width = 7, fig.height = 5}
+p_ev <- te_density_plot("E.V.", "Absolute TE, log2( ribo / rna ), E.V. cells")
+print(p_ev)
+if (params$save_plots) ggsave(here("plots", "97_absolute_te_vehicle_density.pdf"),
+                              p_ev, width = 7, height = 5)
+```
+
+## 4E-BP1-4A cells
+
+```{r density-bp, fig.width = 7, fig.height = 5}
+p_bp <- te_density_plot("4E-BP1-4A", "Absolute TE, log2( ribo / rna ), 4E-BP1-4A cells")
+print(p_bp)
+if (params$save_plots) ggsave(here("plots", "97_absolute_te_inhibitor_density.pdf"),
+                              p_bp, width = 7, height = 5)
+```
+
+## Both conditions
+
+```{r violin-both, fig.width = 8, fig.height = 5}
+p_violin <- ggplot(te_long, aes(condition, te, fill = class, colour = class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_violin(alpha = 0.15, linewidth = 0.8, position = position_dodge(0.9)) +
+  geom_boxplot(width = 0.12, alpha = 0, linewidth = 0.5, outlier.shape = NA,
+               position = position_dodge(0.9), show.legend = FALSE) +
+  geom_text(data = te_stats, aes(y = -Inf, label = paste0("n = ", n)),
+            position = position_dodge(0.9), vjust = -0.6, size = 3.5,
+            colour = "grey30", show.legend = FALSE) +
+  scale_fill_manual(values = class_colors, name = NULL) +
+  scale_colour_manual(values = class_colors, name = NULL) +
+  coord_cartesian(ylim = quantile(te_long$te, c(0.005, 0.995))) +
+  labs(subtitle = "Both conditions are TE levels from the same model, so this axis is anchored.",
+       x = NULL, y = "Absolute TE, log2( ribo / rna )") +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(size = 11, colour = "grey40"))
+
+print(p_violin)
+if (params$save_plots) ggsave(here("plots", "97_absolute_te_by_class_violin.pdf"),
+                              p_violin, width = 8, height = 5)
+```
+
+Unlike nb96's `vehicle` / `inhibitor` IP panels, these two conditions come from a single
+`~ group` model on a shared set of size factors, so the offset between them **is** anchored
+and the two levels can be compared directly.
+
+# 5. How much of section 4 is selection on the difference?
+
+The classes are the top and bottom of `TE_BP - TE_EV`. Selecting on a difference pushes its
+two components apart on its own: the highest-delta genes are enriched for low `ev` and high
+`bp` whether or not anything biological distinguishes them. Section 4 therefore cannot be
+read as-is, and this section measures the artifact two ways.
+
+## 5a. A null that keeps the marginals but destroys the pairing
+
+```{r selection-null}
+set.seed(9)
+null_draws <- replicate(200, {
+  e <- sample(te$ev); b <- sample(te$bp); d <- b - e
+  res <- order(d, decreasing = TRUE)[1:nrow(pos)]
+  sen <- order(d)[1:nrow(neg)]
+  c(res_ev = median(e[res]), res_bp = median(b[res]),
+    sen_ev = median(e[sen]), sen_bp = median(b[sen]))
+})
+
+dplyr::bind_rows(
+  tibble::tibble(source = "null (random pairing, same selection)",
+                 !!!round(apply(null_draws, 1, median), 3)),
+  tibble::tibble(source = "observed",
+                 res_ev = round(median(te$ev[te$class == "4E-resistant"]), 3),
+                 res_bp = round(median(te$bp[te$class == "4E-resistant"]), 3),
+                 sen_ev = round(median(te$ev[te$class == "4E-sensitive"]), 3),
+                 sen_bp = round(median(te$bp[te$class == "4E-sensitive"]), 3))
+) %>% as.data.frame() %>% print(row.names = FALSE)
+
+cat("\ncor(ev, bp) genome-wide:", round(cor(te$ev, te$bp), 3), "\n")
+```
+
+Selecting on a difference reproduces a crossover **at least as large as the observed one**.
+The observed split is if anything smaller, because `ev` and `bp` are genuinely strongly
+correlated, which damps the selection-induced spread relative to the independent null. On
+this evidence section 4's crossover is not yet evidence of anything.
+
+## 5b. Split-half: select on one replicate, measure on the other
+
+The decisive test. Both conditions have two replicates, so the classes can be defined from
+replicate 1 and the levels measured on replicate 2. Selection noise is then independent of
+measurement noise, and the regression-to-the-mean component of the artifact disappears.
+
+Per-replicate TE has no replication left for DESeq2 to model dispersions from, so this
+section uses the naive log-ratio, which section 2 showed tracks the DESeq2 values at
+r > 0.98.
+
+```{r split-half}
+rep_col <- function(treat, lib, rp)
+  rownames(fit$meta)[fit$meta$treatment == treat & fit$meta$library == lib &
+                     fit$meta$rep == rp]
+te_rep <- function(treat, rp)
+  log2(fit$norm[, rep_col(treat, "ribo", rp)] + 1) -
+  log2(fit$norm[, rep_col(treat, "rna",  rp)] + 1)
+
+ev1 <- te_rep("vehicle", "1"); bp1 <- te_rep("BP_inhib", "1")
+ev2 <- te_rep("vehicle", "2"); bp2 <- te_rep("BP_inhib", "2")
+
+cat("cor(delta rep1, delta rep2):", round(cor(bp1 - ev1, bp2 - ev2), 3),
+    "   cor(ev rep1, ev rep2):", round(cor(ev1, ev2), 3), "\n\n")
+
+pick <- function(sel) list(res = order(sel, decreasing = TRUE)[1:nrow(pos)],
+                           sen = order(sel)[1:nrow(neg)])
+sel1 <- pick(bp1 - ev1)
+
+set.seed(9)
+sh_null <- replicate(200, {
+  s <- pick(sample(bp1 - ev1))
+  c(res_ev = median(ev2[s$res]), res_bp = median(bp2[s$res]),
+    sen_ev = median(ev2[s$sen]), sen_bp = median(bp2[s$sen]))
+})
+
+dplyr::bind_rows(
+  tibble::tibble(source = "same replicate (circular)",
+                 res_ev = median(ev1[sel1$res]), res_bp = median(bp1[sel1$res]),
+                 sen_ev = median(ev1[sel1$sen]), sen_bp = median(bp1[sel1$sen])),
+  tibble::tibble(source = "split-half (select rep1, measure rep2)",
+                 res_ev = median(ev2[sel1$res]), res_bp = median(bp2[sel1$res]),
+                 sen_ev = median(ev2[sel1$sen]), sen_bp = median(bp2[sel1$sen])),
+  tibble::tibble(source = "null (shuffled selector, measure rep2)",
+                 !!!apply(sh_null, 1, median))
+) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 3)),
+                ev_gap = res_ev - sen_ev, bp_gap = res_bp - sen_bp) %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+```{r split-half-assertions}
+gap <- function(x, y) median(x[sel1$res]) - median(y[sel1$sen])
+bp_gap_obs   <- median(bp2[sel1$res]) - median(bp2[sel1$sen])
+bp_gap_null  <- median(sh_null["res_bp", ] - sh_null["sen_bp", ])
+
+stopifnot("the 4E-BP1-4A separation does not survive split-half" =
+            bp_gap_obs > 10 * abs(bp_gap_null))
+cat("4E-BP1-4A gap: observed", round(bp_gap_obs, 3),
+    "vs null", round(bp_gap_null, 3), "\n")
+```
+
+**Conclusion, and it is not the one section 4 suggests on its own.**
+
+- **Under 4E-BP1-4A the separation is real and large.** Selecting on replicate 1 and
+  measuring on replicate 2 still puts the resistant class far above the sensitive class,
+  against a null of ~0. This survives independent selection.
+- **At baseline it very largely does not.** The apparent E.V. gap collapses once selection
+  and measurement are independent, leaving a small residual, and the sign of the residual is
+  the opposite of the dramatic crossover in section 4. Most of that crossover was selection
+  on the difference, amplified by the fact that `delta` is only moderately reproducible
+  between replicates (r ~ 0.4), which is what leaves so much room for regression to the mean.
+
+So the defensible statement is: **4E-resistant mRNAs are distinguished by holding high
+translation efficiency when eIF4E is inhibited, not by being unusually poorly translated to
+start with.** Section 4's E.V. panel should be read as a description of the selected sets,
+not as a claim about baseline biology.
+
+```{r session}
+sessionInfo()
+```
