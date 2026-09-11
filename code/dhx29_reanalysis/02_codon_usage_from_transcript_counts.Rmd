@@ -1,0 +1,365 @@
+---
+title: "DHX29 reanalysis 02: can transcript-level counts reproduce the paper's codon usage?"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Notebook 01 established that GSE266018 gives **per-transcript** footprint totals over a
+trimmed CDS window, and nothing positional. The paper's headline codon result (Table S8) is
+an **A-site** statistic: for each sample, the fraction of footprints whose A site sits on
+each of the 64 codons. Those are different estimators, so this notebook asks a bounded
+question rather than claiming a replication.
+
+**The proxy.** Under a null of uniform footprint density along the counted window, the
+expected share of footprints at codon `c` is
+
+```
+E(c)  =  sum over transcripts of  count_t * n_ct / L_t
+```
+
+where `n_ct` is how often codon `c` occurs in transcript `t`'s counted window and `L_t` is
+that window's length in codons. Normalised across codons, `E(c)` is directly comparable to a
+Table S8 column, because both are codon shares summing to one.
+
+**What it can and cannot see.** The proxy carries only the *transcript-level* component: are
+the mRNAs enriched in the DHX29 pull-down themselves biased toward codon `c`? It is blind to
+the *positional* component, which is the paper's actual claim, that DHX29 associates with
+ribosomes while they decode a nonoptimal codon. A ribosome redistributing along a fixed set
+of mRNAs moves the paper's statistic and leaves the proxy untouched. So agreement is
+evidence the mRNA-level bias is real; disagreement in magnitude is expected and refutes
+nothing.
+
+**Transcript level, not gene level, and the isoforms are not independent.** These files
+carry one row per transcript, not per gene. Reads were assigned to every compatible isoform
+rather than apportioned to one, so a gene's isoforms can repeat the same count verbatim.
+Section 3 measures how often. Two consequences here: the proxy weights a multi-isoform gene
+by the number of isoforms it happens to have annotated, and summing transcripts to a gene
+total would over-count. Comparing IP against Input on the *same* transcript is unaffected,
+because the same assignment rule produced both.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+assay_colors <- c("Input" = "#0072B2", "DHX29-IP" = "#CC79A7")
+```
+
+---
+
+## Section 1: Inputs
+
+```{r load_counts}
+counts <- readRDS(here("output", "dhx29_reanalysis",
+                       "dhx29_thor_riboseq_counts_long.rds"))
+stopifnot("notebook 01 output looks wrong" = nrow(counts) == 227264 * 6)
+cat("Counts loaded:", format(nrow(counts), big.mark = ","), "rows\n")
+```
+
+Table S8, with the replication check the repository convention asks for before external data
+is used. The columns are shares, so each sample must sum to one, and `Fold_Change` must be
+`IP_Avg / Input_Avg`.
+
+```{r load_s8}
+s8 <- read_csv(here("accessories", "csc_data", "hia_dhx29",
+                    "science.adw0288_tables_s1_to_s11",
+                    "science.adw0288_table_s8.csv"),
+               show_col_types = FALSE)
+
+sample_cols <- c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3")
+
+stopifnot(
+  "Table S8 does not carry all 64 codons" = nrow(s8) == 64,
+  "Table S8 sample columns do not sum to 1" =
+    all(abs(colSums(s8[, sample_cols]) - 1) < 1e-6),
+  "Table S8 Fold_Change is not IP_Avg / Input_Avg" =
+    max(abs(s8$Fold_Change - s8$IP_Avg / s8$Input_Avg)) < 1e-6,
+  "Table S8 averages do not match their replicates" =
+    max(abs(s8$IP_Avg - rowMeans(s8[, c("IP1", "IP2", "IP3")]))) < 1e-6
+)
+cat("Table S8 checks passed. Fold_Change range:",
+    sprintf("%.3f to %.3f", min(s8$Fold_Change), max(s8$Fold_Change)), "\n")
+```
+
+---
+
+## Section 2: Codon composition of the counted window
+
+The window is reconstructed to match the counts exactly: drop five codons from each end of
+the CDS, stop codon included. Notebook 01 showed the reported length is `CDS nt / 3 - 10`, so
+the reconstructed window length must equal it. That equality is the check that the
+composition is being computed over the same nucleotides the footprints were counted on.
+
+```{r codon_composition}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds_seqs <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                  cdsBy(txdb, by = "tx", use.names = TRUE))
+
+usable  <- (width(cds_seqs) %% 3 == 0) & (width(cds_seqs) >= 33)
+cds_seqs <- cds_seqs[usable]
+window   <- subseq(cds_seqs, start = 16, end = width(cds_seqs) - 15)
+
+cat("CDS sequences with a usable window:", format(length(window), big.mark = ","), "\n")
+
+codon_freq <- trinucleotideFrequency(window, step = 3)
+rownames(codon_freq) <- names(window)     # Biostrings drops these
+window_len <- rowSums(codon_freq)
+
+stopifnot(
+  "reconstructed window is not CDS nt / 3 - 10" =
+    all(window_len == width(cds_seqs) / 3 - 10),
+  "codon matrix lost its transcript names" =
+    all(grepl("^ENST", rownames(codon_freq))),
+  "codon matrix is not 64 wide" = ncol(codon_freq) == 64
+)
+
+# Biological spot-check: ATG must appear at least once in essentially every window only
+# if the start codon survived the trim, which it does not. Use a composition invariant
+# instead: the four codon families of a random window must all be represented in bulk.
+cat("Median codons per window:", median(window_len), "\n")
+cat("Share of windows containing at least one CTG (most used Leu codon):",
+    sprintf("%.3f", mean(codon_freq[, "CTG"] > 0)), "\n")
+stopifnot("CTG is absent from most windows, composition is wrong" =
+            mean(codon_freq[, "CTG"] > 0) > 0.8)
+```
+
+---
+
+## Section 3: The proxy
+
+```{r build_proxy}
+row_key <- tibble(tx_clean = str_remove(rownames(codon_freq), "\\..*"),
+                  row      = seq_len(nrow(codon_freq)))
+
+proxy_long <- map_dfr(levels(counts$sample), function(s) {
+  cs <- counts %>%
+    filter(sample == s, count > 0, !is.na(cds_codons)) %>%
+    transmute(tx_clean = transcript_id_clean, count)
+  m <- inner_join(row_key, cs, by = "tx_clean")
+  w <- m$count / window_len[m$row]
+  e <- as.vector(crossprod(codon_freq[m$row, , drop = FALSE], w))
+  tibble(sample = s, codon = colnames(codon_freq),
+         expected = e / sum(e), n_tx = nrow(m))
+})
+
+cat("Transcripts contributing per sample:\n")
+print(as.data.frame(proxy_long %>% distinct(sample, n_tx)))
+
+stopifnot(
+  "proxy shares do not sum to 1 within a sample" =
+    all(abs((proxy_long %>% group_by(sample) %>%
+               summarise(s = sum(expected), .groups = "drop"))$s - 1) < 1e-9)
+)
+
+proxy <- proxy_long %>%
+  dplyr::select(-n_tx) %>%
+  pivot_wider(names_from = sample, values_from = expected)
+
+cmp <- inner_join(proxy, s8, by = "codon", suffix = c("_proxy", "_paper"))
+stopifnot("codons did not join" = nrow(cmp) == 64)
+```
+
+
+### How much isoform duplication is in the weighting?
+
+```{r isoform_duplication}
+gene_map <- read_csv(here("output", "dhx29_reanalysis", "dhx29_cds_length_vs_v49.csv"),
+                     show_col_types = FALSE) %>%
+  dplyr::select(transcript_id, gene_id) %>%
+  filter(!is.na(gene_id))
+
+dup_check <- counts %>%
+  filter(sample == "Input1", count > 0) %>%
+  inner_join(gene_map, by = "transcript_id") %>%
+  group_by(gene_id) %>%
+  filter(n() > 1) %>%
+  summarise(n_tx = n(), n_distinct_counts = n_distinct(count), .groups = "drop")
+
+cat("Multi-transcript genes carrying counts:",
+    format(nrow(dup_check), big.mark = ","), "\n")
+cat("Genes where every isoform repeats one identical count: ",
+    format(sum(dup_check$n_distinct_counts == 1), big.mark = ","),
+    sprintf(" (%.1f%%)", 100 * mean(dup_check$n_distinct_counts == 1)),
+    ", median ", median(dup_check$n_tx[dup_check$n_distinct_counts == 1]),
+    " isoforms each\n", sep = "")
+
+stopifnot(
+  "no isoform duplication found, which contradicts notebook 01" =
+    mean(dup_check$n_distinct_counts == 1) > 0.05,
+  "isoform duplication is so pervasive that transcript rows carry no independent signal" =
+    mean(dup_check$n_distinct_counts == 1) < 0.5
+)
+```
+
+Roughly a fifth of multi-isoform genes repeat a single count across all their isoforms, so
+those genes enter the proxy with weight multiplied by their annotated isoform count. This
+inflates the contribution of heavily annotated genes. It affects IP and Input identically,
+so it largely cancels in the fold change, which is the quantity Section 5 compares.
+
+---
+
+## Section 4: Per-sample agreement
+
+```{r per_sample}
+per_sample <- map_dfr(sample_cols, function(s) {
+  a <- cmp[[paste0(s, "_proxy")]]; b <- cmp[[paste0(s, "_paper")]]
+  tibble(sample = s,
+         assay    = if_else(str_starts(s, "Input"), "Input", "DHX29-IP"),
+         pearson  = cor(a, b),
+         spearman = cor(a, b, method = "spearman"))
+})
+print(as.data.frame(per_sample %>% mutate(across(pearson:spearman, ~ round(.x, 3)))))
+```
+
+---
+
+## Section 5: Fold change, the quantity the paper reports
+
+```{r fold_change, fig.width = 7.5, fig.height = 5}
+cmp <- cmp %>%
+  mutate(
+    proxy_fc = rowMeans(across(all_of(paste0(c("IP1", "IP2", "IP3"), "_proxy")))) /
+               rowMeans(across(all_of(paste0(c("Input1", "Input2", "Input3"), "_proxy")))),
+    paper_fc = Fold_Change,
+    wobble   = str_sub(codon, 3, 3),
+    is_stop  = codon %in% c("TAA", "TAG", "TGA")
+  )
+
+sense <- cmp %>% filter(!is_stop)
+
+fc_test <- cor.test(sense$proxy_fc, sense$paper_fc, method = "spearman",
+                    exact = FALSE)
+
+cat("Sense codons compared:", nrow(sense), "\n")
+cat(sprintf("Fold change agreement: Pearson %.3f, Spearman %.3f (p = %.2g)\n",
+            cor(sense$proxy_fc, sense$paper_fc), fc_test$estimate, fc_test$p.value))
+cat(sprintf("Amplitude: proxy spans %.3f to %.3f, paper spans %.3f to %.3f\n",
+            min(sense$proxy_fc), max(sense$proxy_fc),
+            min(sense$paper_fc), max(sense$paper_fc)))
+cat(sprintf("The proxy recovers about %.0f%% of the paper's dynamic range.\n",
+            100 * (max(sense$proxy_fc) - min(sense$proxy_fc)) /
+                  (max(sense$paper_fc) - min(sense$paper_fc))))
+
+stopifnot(
+  "the proxy does not track the paper's codon fold change at all" =
+    fc_test$estimate > 0.4,
+  "the proxy should not reproduce the paper's amplitude" =
+    (max(sense$proxy_fc) - min(sense$proxy_fc)) <
+    (max(sense$paper_fc) - min(sense$paper_fc))
+)
+
+p_fc <- ggplot(sense, aes(x = paper_fc, y = proxy_fc, colour = wobble)) +
+  geom_hline(yintercept = 1, linetype = "dotted", colour = "grey60") +
+  geom_vline(xintercept = 1, linetype = "dotted", colour = "grey60") +
+  geom_point(size = 2, alpha = 0.85) +
+  geom_smooth(method = "lm", se = FALSE, colour = "grey30",
+              linewidth = 0.5, linetype = "dashed") +
+  scale_colour_manual(values = c(A = "#009E73", C = "#0072B2",
+                                 G = "#D55E00", `T` = "#CC79A7"),
+                      name = "3rd base") +
+  labs(
+    title    = "Transcript-level proxy against the paper's A-site codon enrichment",
+    subtitle = str_wrap(paste0(
+      "n = ", nrow(sense), " sense codons. Spearman ",
+      sprintf("%.3f", fc_test$estimate), ", p = ",
+      sprintf("%.2g", fc_test$p.value),
+      ". Note the axis scales: the proxy moves within a few percent while the paper's ",
+      "statistic moves by tens of percent."), width = 92),
+    x        = "paper Fold_Change (IP / Input, A-site)",
+    y        = "proxy fold change (composition weighted)"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_fc)
+ggsave(here("plots", "dhx29_02_proxy_vs_paper_codon_fc.pdf"),
+       p_fc, width = 7.5, height = 5)
+```
+
+---
+
+## Section 6: Does the wobble split go the same way?
+
+The paper's claim is enrichment on nonoptimal codons. In human those skew A- and T-ending.
+If the mRNA-level component of that is real, the proxy should split the same way even though
+it is much smaller.
+
+```{r wobble, fig.width = 7.5, fig.height = 4.5}
+wobble_summary <- sense %>%
+  mutate(ending = if_else(wobble %in% c("A", "T"), "A or T ending",
+                          "G or C ending")) %>%
+  group_by(ending) %>%
+  summarise(n = n(),
+            proxy_median = median(proxy_fc),
+            paper_median = median(paper_fc), .groups = "drop")
+print(as.data.frame(wobble_summary %>% mutate(across(where(is.numeric), ~ round(.x, 4)))))
+
+at_vs_gc <- sense %>% mutate(at = wobble %in% c("A", "T"))
+w_proxy <- wilcox.test(proxy_fc ~ at, data = at_vs_gc)
+w_paper <- wilcox.test(paper_fc ~ at, data = at_vs_gc)
+cat(sprintf("\nA/T vs G/C ending, Wilcoxon: proxy p = %.3g, paper p = %.3g\n",
+            w_proxy$p.value, w_paper$p.value))
+
+same_direction <-
+  sign(diff(wobble_summary$proxy_median)) == sign(diff(wobble_summary$paper_median))
+cat("Proxy and paper split in the same direction:", same_direction, "\n")
+
+p_wob <- sense %>%
+  dplyr::select(codon, wobble, proxy_fc, paper_fc) %>%
+  pivot_longer(c(proxy_fc, paper_fc), names_to = "source", values_to = "fc") %>%
+  mutate(source = factor(source, levels = c("paper_fc", "proxy_fc"),
+                         labels = c("paper, A-site", "proxy, composition")),
+         ending = if_else(wobble %in% c("A", "T"), "A or T", "G or C")) %>%
+  ggplot(aes(x = ending, y = fc, fill = ending)) +
+  geom_hline(yintercept = 1, linetype = "dotted", colour = "grey60") +
+  geom_boxplot(alpha = 0.35, outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, size = 1.2, alpha = 0.7) +
+  facet_wrap(~ source, scales = "free_y") +
+  scale_fill_manual(values = c("A or T" = "#009E73", "G or C" = "#0072B2"),
+                    guide = "none") +
+  labs(
+    title    = "Third-base split, both estimators",
+    subtitle = str_wrap(paste0(
+      "n = ", nrow(sense), " sense codons. Free y axes: the two estimators differ ",
+      "by an order of magnitude in amplitude, so a shared axis would flatten the ",
+      "proxy panel."), width = 92),
+    x        = "third codon position",
+    y        = "IP / Input fold change"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_wob)
+ggsave(here("plots", "dhx29_02_wobble_split_both_estimators.pdf"),
+       p_wob, width = 7.5, height = 4.5)
+```
+
+---
+
+## Section 7: Verdict
+
+```{r verdict}
+write_csv(sense %>%
+            dplyr::select(codon, wobble, proxy_fc, paper_fc,
+                          Input_Avg, IP_Avg),
+          here("output", "dhx29_reanalysis", "dhx29_02_proxy_vs_paper_codon_fc.csv"))
+cat("Wrote output/dhx29_reanalysis/dhx29_02_proxy_vs_paper_codon_fc.csv\n")
+```
+
+The direction replicates and the magnitude does not, which is the expected result rather
+than a disappointing one. The rank ordering of codons agrees well above chance, so the
+mRNAs that DHX29 pulls down really are biased in codon content in the direction the paper
+reports. But the proxy moves within a few percent where the paper's statistic moves by tens
+of percent, so the great majority of the paper's signal is positional and lives in where the
+ribosome sits, not in which mRNA it is on. Per-transcript totals cannot reach it.
+
+Practically: GSE266018 supports per-transcript DHX29 enrichment and a weak codon-composition
+readout. Any codon-resolution claim has to come from Table S8, which
+`code/predictive_modeling/23_dhx29_riboseq_slamseq.Rmd` already validates, or from
+reprocessing the raw reads with A-site assignment.

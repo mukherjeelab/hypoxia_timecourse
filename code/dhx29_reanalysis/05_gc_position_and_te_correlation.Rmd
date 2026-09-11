@@ -1,0 +1,455 @@
+---
+title: "DHX29 reanalysis 05: GC by codon position, and DHX29 against eIF3d TE"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Two follow-ons to the enrichment measured in notebook 04.
+
+1. GC content of the most and least DHX29-bound mRNAs, split by codon position. The paper's
+   mechanism is wobble-position codon choice, so GC3 should move more than GC1 or GC2 if the
+   effect is real.
+2. DHX29 binding against eIF3d-dependent translation efficiency.
+
+**Cross-cell-line caveat.** DHX29 enrichment is HEK293T. The eIF3d TE data is MDA-MB-231.
+Sections 4 to 6 compare a measurement in one cell line against a measurement in another.
+
+GC is computed on our own HEK293T representative transcripts rather than joined from
+`feature_matrix_positional_gc.rds`, which is keyed on MDA-MB-231 dominant transcripts and
+would put a different isoform against our measurement.
+
+```{r libs}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+group_cols <- c("DHX29 top 500" = "#CC79A7", "DHX29 bottom 500" = "#0072B2",
+                "all other genes" = "grey70")
+```
+
+---
+
+## Section 1: Groups, and whether they are significant
+
+Top and bottom 500 by enrichment, from the genes already clearing the notebook 03 floor of a
+minimum count of 3 in every sample. That floor is the expression cutoff; nothing further is
+applied.
+
+```{r groups}
+enr <- readRDS(here("output", "dhx29_reanalysis", "dhx29_enrichment_gene.rds"))
+cat("Genes carried from notebook 04:", format(nrow(enr), big.mark = ","), "\n")
+
+enr <- enr %>%
+  arrange(desc(lfc_simple)) %>%
+  mutate(rank = row_number(),
+         group = case_when(rank <= 500                ~ "DHX29 top 500",
+                           rank >  n() - 500          ~ "DHX29 bottom 500",
+                           TRUE                       ~ "all other genes"),
+         group = factor(group, levels = names(group_cols)))
+
+cat("\nTranscriptome-wide counts at padj < 0.05 and |LFC| > 0.5:\n")
+print(as.data.frame(tibble(
+  estimator = c("shrunken", "unshrunk"),
+  enriched  = c(sum(enr$padj_simple < 0.05 & enr$lfc_simple     >  0.5, na.rm = TRUE),
+                sum(enr$padj_simple < 0.05 & enr$lfc_raw_simple >  0.5, na.rm = TRUE)),
+  depleted  = c(sum(enr$padj_simple < 0.05 & enr$lfc_simple     < -0.5, na.rm = TRUE),
+                sum(enr$padj_simple < 0.05 & enr$lfc_raw_simple < -0.5, na.rm = TRUE))
+)))
+
+cat("\nHow extreme are the two groups, and do they pass those cutoffs?\n")
+print(as.data.frame(
+  enr %>% filter(group != "all other genes") %>%
+    group_by(group) %>%
+    summarise(n = n(),
+              lfc_min = round(min(lfc_simple), 3),
+              lfc_max = round(max(lfc_simple), 3),
+              passing_cutoff = sum(padj_simple < 0.05 & abs(lfc_simple) > 0.5, na.rm = TRUE),
+              .groups = "drop")
+))
+
+stopifnot(
+  "group sizes are wrong" =
+    all(table(enr$group)[c("DHX29 top 500", "DHX29 bottom 500")] == 500),
+  "groups overlap" = nrow(enr) == n_distinct(enr$gene_id_clean)
+)
+```
+
+The groups are extreme by ranking, not by significance. The `passing_cutoff` column says how
+few of each 500 clear `padj < 0.05` with `|LFC| > 0.5`, and everything downstream should be
+read with that in mind.
+
+---
+
+## Section 2: GC by codon position
+
+Full CDS in frame, stop codon removed, GC taken over the whole CDS and at each codon
+position.
+
+```{r gc_position}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds_all <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                 cdsBy(txdb, by = "tx", use.names = TRUE))
+cds_all <- cds_all[width(cds_all) %% 3 == 0 & width(cds_all) >= 60]
+cds_all <- subseq(cds_all, start = 1, end = width(cds_all) - 3)   # drop the stop codon
+names(cds_all) <- str_remove(names(cds_all), "\\..*")
+
+# Per-position GC from codon counts: exact, and avoids a per-sequence loop.
+codon_n <- trinucleotideFrequency(cds_all, step = 3)
+bases   <- do.call(rbind, strsplit(colnames(codon_n), ""))        # 64 codons x 3 positions
+is_gc   <- matrix(bases %in% c("G", "C"), nrow = 64)
+n_codon <- rowSums(codon_n)
+
+gc_tbl <- tibble(
+  transcript_id_clean = names(cds_all),
+  cds_gc = 100 * letterFrequency(cds_all, "GC", as.prob = TRUE)[, 1],
+  gc1 = 100 * as.vector(codon_n %*% is_gc[, 1]) / n_codon,
+  gc2 = 100 * as.vector(codon_n %*% is_gc[, 2]) / n_codon,
+  gc3 = 100 * as.vector(codon_n %*% is_gc[, 3]) / n_codon
+)
+
+# Two routes to the same number: the three positions must average to the whole-CDS value.
+stopifnot("positional GC does not average to CDS GC" =
+            max(abs(rowMeans(as.matrix(gc_tbl[, c("gc1", "gc2", "gc3")])) -
+                    gc_tbl$cds_gc)) < 1e-8)
+
+gc_dat <- enr %>%
+  mutate(transcript_id_clean = str_remove(transcript_id, "\\..*")) %>%
+  inner_join(gc_tbl, by = "transcript_id_clean")
+
+cat("Genes with a usable CDS:", format(nrow(gc_dat), big.mark = ","),
+    "of", format(nrow(enr), big.mark = ","), "\n")
+print(as.data.frame(
+  gc_dat %>% group_by(group) %>%
+    summarise(n = n(), across(c(cds_gc, gc1, gc2, gc3), ~ round(median(.x), 2)),
+              .groups = "drop")
+))
+
+actb <- gc_dat$cds_gc[gc_dat$symbol == "ACTB"]
+stopifnot(
+  "a GC value is outside [0, 100]" =
+    all(map_lgl(gc_dat[c("cds_gc", "gc1", "gc2", "gc3")],
+                ~ all(.x >= 0 & .x <= 100, na.rm = TRUE))),
+  "GC3 median is outside the expected 40 to 65 percent" =
+    between(median(gc_dat$gc3), 40, 65),
+  "ACTB CDS GC is outside 50 to 70 percent" =
+    length(actb) == 1 && between(actb, 50, 70)
+)
+cat("ACTB CDS GC:", round(actb, 2), "%\n")
+```
+
+---
+
+## Section 3: The figure
+
+```{r gc_figure, fig.width = 8, fig.height = 9}
+gc_long <- gc_dat %>%
+  dplyr::select(group, `CDS GC` = cds_gc, GC1 = gc1, GC2 = gc2, GC3 = gc3) %>%
+  pivot_longer(-group, names_to = "measure", values_to = "gc") %>%
+  mutate(measure = factor(measure, levels = c("CDS GC", "GC1", "GC2", "GC3")))
+
+gc_meds <- gc_long %>% group_by(measure, group) %>%
+  summarise(med = median(gc), .groups = "drop")
+
+gc_tests <- gc_long %>%
+  filter(group != "all other genes") %>%
+  group_by(measure) %>%
+  summarise(p = wilcox.test(gc ~ droplevels(group))$p.value,
+            delta = median(gc[group == "DHX29 top 500"]) -
+                    median(gc[group == "DHX29 bottom 500"]),
+            .groups = "drop") %>%
+  mutate(lab = paste0("top - bottom = ", sprintf("%+.2f", delta),
+                      "\nWilcoxon p = ", signif(p, 3)))
+print(as.data.frame(gc_tests %>% mutate(p = signif(p, 3), delta = round(delta, 3))))
+
+grp_n <- gc_dat %>% dplyr::count(group) %>%
+  mutate(lab = paste0(group, " (n = ", format(n, big.mark = ","), ")"))
+
+p_gc <- ggplot(gc_long, aes(gc, colour = group)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = gc_meds, aes(xintercept = med, colour = group),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  geom_text(data = gc_tests, aes(x = Inf, y = Inf, label = lab),
+            hjust = 1.1, vjust = 1.4, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ measure, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = group_cols, labels = grp_n$lab, name = NULL) +
+  labs(title = "GC by codon position, most against least DHX29-bound",
+       subtitle = str_wrap(paste0(
+         "HEK293T representative transcripts. Top and bottom 500 by measured IP over ",
+         "Input enrichment among genes clearing a floor of 3. Dashed lines are group ",
+         "medians."), width = 88),
+       x = "GC (%)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_gc)
+ggsave(here("plots", "dhx29_05_gc_position_density.pdf"), p_gc, width = 8, height = 9)
+```
+
+---
+
+## Section 4: eIF3d TE data, with the direction check
+
+`translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv` is named in the opposite order from
+the coefficient it contains. The coefficient is `sictrl_vs_si3d`, so every column is
+**log2(sictrl / si3d)** and a positive `te_lfc` means eIF3d promotes. Labels below say so.
+
+```{r load_te}
+te <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+               show_col_types = FALSE) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+promoted <- te %>% filter(te_lfc > 0.5, te_padj < 0.05)
+geneset  <- read_csv(here("output", "genesets",
+                          "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+
+eif3d_rna <- te$rna_lfc[te$symbol == "EIF3D"]
+cat("EIF3D rna_lfc:", round(eif3d_rna, 3),
+    "(must be strongly positive; the siRNA depletes its own target)\n")
+cat("Genes with te_lfc > 0.5 and te_padj < 0.05:", nrow(promoted), "\n")
+cat("Genes in hypoxia_3d_promotes_TE_1hr_lfc0.5.csv:", nrow(geneset), "\n")
+cat("Overlap:", length(intersect(promoted$gene_id_clean, geneset$ensembl_gene)), "\n")
+
+stopifnot(
+  "EIF3D is not depleted by its own siRNA, so the contrast direction has flipped" =
+    length(eif3d_rna) == 1 && eif3d_rna > 2,
+  "the promoted set is not 1604 genes" = nrow(promoted) == 1604,
+  "the promoted set does not match the stored gene set" =
+    length(intersect(promoted$gene_id_clean, geneset$ensembl_gene)) == 1604
+)
+cat("Spot check passed: 1,604 mRNAs promoted by eIF3d at LFC 0.5, padj 0.05.\n")
+```
+
+---
+
+## Section 5: DHX29 enrichment against eIF3d TE
+
+```{r te_correlation, fig.width = 7.5, fig.height = 5.5}
+comb <- enr %>%
+  inner_join(te %>% dplyr::select(gene_id_clean, te_lfc, te_padj, rna_lfc),
+             by = "gene_id_clean") %>%
+  mutate(eif3d = if_else(gene_id_clean %in% promoted$gene_id_clean,
+                         "eIF3d promoted", "other"),
+         eif3d = factor(eif3d, levels = c("other", "eIF3d promoted")))
+
+cat("Genes shared between the DHX29 and TE tables:",
+    format(nrow(comb), big.mark = ","), "\n")
+cat("  of which eIF3d promoted:", sum(comb$eif3d == "eIF3d promoted"), "\n\n")
+
+ct <- cor.test(comb$lfc_simple, comb$te_lfc, method = "spearman", exact = FALSE)
+cat("Pooled Spearman:", round(ct$estimate, 4), " p =", signif(ct$p.value, 3),
+    " Pearson:", round(cor(comb$lfc_simple, comb$te_lfc), 4), "\n\n")
+
+cat("Within expression quintiles, since notebook 04 showed attenuation:\n")
+print(as.data.frame(
+  comb %>% mutate(q = ntile(base_mean, 5)) %>%
+    group_by(expr_quintile = q) %>%
+    summarise(n = n(),
+              spearman = round(cor(lfc_simple, te_lfc, method = "spearman"), 4),
+              .groups = "drop")
+))
+
+p_cor <- ggplot(comb, aes(te_lfc, lfc_simple)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_point(data = comb %>% filter(eif3d == "other"),
+             colour = "grey70", size = 0.5, alpha = 0.4) +
+  geom_point(data = comb %>% filter(eif3d == "eIF3d promoted"),
+             colour = "#E69F00", size = 0.7, alpha = 0.7) +
+  labs(title = "DHX29 ribosome enrichment against eIF3d-dependent TE",
+       subtitle = str_wrap(paste0(
+         "n = ", format(nrow(comb), big.mark = ","), " genes, Spearman ",
+         sprintf("%.4f", ct$estimate), ", p = ", signif(ct$p.value, 3),
+         ". Orange marks the ", sum(comb$eif3d == "eIF3d promoted"),
+         " eIF3d-promoted genes present here. DHX29 is HEK293T, TE is MDA-MB-231."),
+         width = 95),
+       x = "TE log2(sictrl / si3d), hypoxia 1hr. Positive means eIF3d promotes",
+       y = "DHX29 log2 IP / Input") +
+  theme_classic(base_size = 12)
+
+print(p_cor)
+ggsave(here("plots", "dhx29_05_te_correlation.pdf"), p_cor, width = 7.5, height = 5.5)
+```
+
+Almost the whole distribution sits within a few hundredths of zero, so the plot above is
+mostly empty space around a line. Same data, y clipped to plus or minus 0.1.
+
+```{r te_correlation_zoom, fig.width = 7.5, fig.height = 5.5}
+n_out <- sum(abs(comb$lfc_simple) > 0.1)
+
+p_zoom <- p_cor +
+  coord_cartesian(ylim = c(-0.1, 0.1)) +
+  labs(title = "DHX29 enrichment against eIF3d TE, y clipped",
+       subtitle = str_wrap(paste0(
+         "n = ", format(nrow(comb), big.mark = ","), " genes, of which ",
+         format(n_out, big.mark = ","), " fall outside the plus or minus 0.1 window and ",
+         "are not drawn. Statistics are unchanged: Spearman ",
+         sprintf("%.4f", ct$estimate), ", p = ", signif(ct$p.value, 3),
+         ". Orange marks the ", sum(comb$eif3d == "eIF3d promoted"),
+         " eIF3d-promoted genes."), width = 95))
+
+print(p_zoom)
+ggsave(here("plots", "dhx29_05_te_correlation_zoom.pdf"), p_zoom,
+       width = 7.5, height = 5.5)
+
+cat("Genes outside the clipped window:", n_out,
+    sprintf("(%.2f%%)", 100 * n_out / nrow(comb)), "\n")
+```
+
+---
+
+## Section 6: The gene-set contrast
+
+Most genes have a DHX29 enrichment near zero, so a correlation is a weak instrument. Asking
+whether the eIF3d-promoted set differs from the rest tests the same hypothesis with more
+power.
+
+```{r geneset_contrast, fig.width = 7.5, fig.height = 4.5}
+w <- wilcox.test(lfc_simple ~ eif3d, data = comb)
+meds <- comb %>% group_by(eif3d) %>%
+  summarise(n = n(), median_lfc = median(lfc_simple), .groups = "drop")
+print(as.data.frame(meds %>% mutate(median_lfc = round(median_lfc, 4))))
+cat("Wilcoxon p =", signif(w$p.value, 3),
+    " difference in medians =",
+    round(diff(meds$median_lfc), 4), "\n")
+
+p_set <- ggplot(comb, aes(lfc_simple, colour = eif3d)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = meds, aes(xintercept = median_lfc, colour = eif3d),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  annotate("text", x = Inf, y = Inf,
+           label = paste0("Wilcoxon p = ", signif(w$p.value, 3)),
+           hjust = 1.1, vjust = 1.4, size = 3.2) +
+  coord_cartesian(xlim = quantile(comb$lfc_simple, c(0.005, 0.995))) +
+  scale_colour_manual(values = c("other" = "grey70",
+                                 "eIF3d promoted" = "#E69F00"),
+                      labels = paste0(meds$eif3d, " (n = ",
+                                      format(meds$n, big.mark = ","), ")"),
+                      name = NULL) +
+  labs(title = "DHX29 enrichment, eIF3d-promoted genes against the rest",
+       subtitle = "Axis clipped to the central 99%. Dashed lines are group medians.",
+       x = "DHX29 log2 IP / Input", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_set)
+ggsave(here("plots", "dhx29_05_te_geneset_contrast.pdf"), p_set, width = 7.5, height = 4.5)
+```
+
+### Does the null depend on how "promoted" is defined?
+
+The contrast above is asymmetric: the promoted group requires both `te_lfc > 0.5` and
+`te_padj < 0.05`, while the comparator is everything else, which includes genes that clear
+the fold-change bar but miss significance. Those belong to neither a clean positive nor a
+clean negative set. This section checks whether the null survives dropping the significance
+requirement entirely.
+
+```{r definition_sensitivity, fig.width = 8, fig.height = 4.5}
+cat("What is actually inside the comparator group:\n")
+print(as.data.frame(
+  comb %>% filter(eif3d == "other") %>%
+    mutate(what = case_when(
+      te_lfc >  0.5 & (is.na(te_padj) | te_padj >= 0.05) ~ "promoted by LFC, not significant",
+      te_lfc < -0.5 & te_padj < 0.05                     ~ "significantly inhibited",
+      te_lfc < -0.5                                      ~ "inhibited by LFC, not significant",
+      TRUE                                               ~ "within +/- 0.5 LFC")) %>%
+    dplyr::count(what) %>% mutate(pct = round(100 * n / sum(n), 1)) %>% arrange(desc(n))
+))
+
+cat("\nPromoted in the overlap: ", sum(comb$te_lfc > 0.5 & comb$te_padj < 0.05, na.rm = TRUE),
+    " with significance, ", sum(comb$te_lfc > 0.5, na.rm = TRUE),
+    " on fold change alone\n\n", sep = "")
+
+# 1. Every gene, binned by TE fold change, no significance filter anywhere.
+binned <- comb %>%
+  mutate(bin = cut(te_lfc, breaks = c(-Inf, -1, -0.5, -0.1, 0.1, 0.5, 1, 1.5, 2, Inf),
+                   labels = c("< -1", "-1 to -0.5", "-0.5 to -0.1", "-0.1 to 0.1",
+                              "0.1 to 0.5", "0.5 to 1", "1 to 1.5",
+                              "1.5 to 2", "> 2"))) %>%
+  group_by(bin) %>%
+  summarise(n = n(), median_dhx29 = median(lfc_simple),
+            q25 = quantile(lfc_simple, 0.25), q75 = quantile(lfc_simple, 0.75),
+            .groups = "drop")
+cat("DHX29 enrichment by TE fold-change bin, all genes:\n")
+print(as.data.frame(binned %>% mutate(across(where(is.numeric), ~ signif(.x, 3)))))
+
+# 2. Three disjoint classes on fold change alone.
+lfc_only <- comb %>%
+  mutate(cls = case_when(te_lfc >  0.5 ~ "promoted (LFC only)",
+                         te_lfc < -0.5 ~ "inhibited (LFC only)",
+                         TRUE          ~ "unchanged"))
+kw <- kruskal.test(lfc_simple ~ cls, data = lfc_only)
+cat("\nFold change only, three classes:\n")
+print(as.data.frame(
+  lfc_only %>% group_by(cls) %>%
+    summarise(n = n(), median_dhx29 = signif(median(lfc_simple), 3), .groups = "drop")
+))
+cat("Kruskal-Wallis p =", signif(kw$p.value, 3), "\n")
+
+p_bin <- ggplot(binned, aes(bin, median_dhx29)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.2, colour = "grey50") +
+  geom_point(size = 3, colour = "#E69F00") +
+  geom_text(aes(label = paste0("n = ", format(n, big.mark = ","))),
+            vjust = -1.2, size = 2.8) +
+  labs(title = "DHX29 enrichment across the full eIF3d TE range",
+       subtitle = str_wrap(paste0(
+         "Every gene in the overlap, binned on TE log2(sictrl / si3d) with no ",
+         "significance filter. Points are medians, bars the interquartile range. ",
+         "Positive TE means eIF3d promotes."), width = 92),
+       x = "TE log2(sictrl / si3d), hypoxia 1hr", y = "median DHX29 log2 IP / Input") +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_bin)
+ggsave(here("plots", "dhx29_05_te_bins_all_genes.pdf"), p_bin, width = 8, height = 4.5)
+```
+
+The null holds under every definition. Binning all 8,710 genes on fold change alone moves the
+median DHX29 enrichment by about 0.003 in log2 units across the whole range, and the ordering
+is not monotone. Dropping the significance requirement raises the promoted group from 1,315 to
+2,561 genes and changes nothing. The small Kruskal-Wallis p is n again, not effect.
+
+---
+
+### Is the TE result null, or just attenuated?
+
+Notebook 04 used a specific diagnostic: a real signal buried in measurement noise should
+strengthen as measurement improves. There, the correlation with predicted codon occupancy
+rose monotonically across expression quintiles, from about zero to 0.375.
+
+Neither the quintile table above nor the fold-change bins do that. It is flat and sits near zero throughout, so the
+same diagnostic that certified the codon result as real certifies this one as genuinely
+absent. The Wilcoxon p of the gene-set contrast is small only because n is 8,710; the
+difference in medians is about 0.001 in log2 units, which is nothing.
+
+Read together: DHX29 ribosome occupancy is predicted by codon content, and is unrelated to
+eIF3d-dependent translation efficiency. The cross-cell-line design is a genuine limitation
+here, since a HEK293T measurement cannot rule out a relationship that exists in MDA-MB-231.
+
+---
+
+## Section 7: Save
+
+```{r save}
+out <- here("output", "dhx29_reanalysis")
+saveRDS(gc_dat %>% dplyr::select(gene_id_clean, symbol, transcript_id, group,
+                                 lfc_simple, padj_simple, cds_gc, gc1, gc2, gc3),
+        file.path(out, "dhx29_gc_by_position.rds"))
+write_csv(comb %>% dplyr::select(gene_id_clean, symbol, lfc_simple, padj_simple,
+                                 base_mean, te_lfc, te_padj, rna_lfc, eif3d),
+          file.path(out, "dhx29_vs_te_hypoxia1hr.csv"))
+cat("Wrote dhx29_gc_by_position.rds (", nrow(gc_dat), " rows) and ",
+    "dhx29_vs_te_hypoxia1hr.csv (", nrow(comb), " rows)\n", sep = "")
+```
+
+```{r session_info}
+sessionInfo()
+```

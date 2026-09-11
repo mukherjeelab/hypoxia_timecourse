@@ -1,0 +1,1328 @@
+---
+title: "DHX29 reanalysis 01: Thor-Ribo-seq count distributions (GSE266018)"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Raw selective ribosome profiling counts behind Hia et al., *Human DHX29 detects nonoptimal
+codon usage to regulate mRNA stability* (GEO **GSE266018**). HEK293T cells expressing
+FLAG-DHX29; ribosome footprints from the input and from the FLAG-DHX29 pull-down were
+subjected to Thor-Ribo-Seq. Three Input replicates, three DHX29-IP replicates.
+
+The repo already touches this paper through its supplementary tables in
+`code/predictive_modeling/23_dhx29_riboseq_slamseq.Rmd` (Table S8 codon enrichment, Table S6
+SLAM-seq half-lives). Starting from the raw per-transcript counts instead opens up per-gene
+IP/Input enrichment, which the supplementary tables do not provide.
+
+**Scope.** This notebook is an ingest and QC step. It loads all six files, shows the
+distribution of both data columns, and then verifies the annotation the files carry. Nothing
+here reaches a feature matrix. Per the repository convention on external data, the paper's
+codon-level result is already replicated against Table S8 in notebook 23; reproducing that
+codon enrichment from these raw counts belongs to the next notebook in this folder, and must
+happen before these counts are joined to any feature matrix.
+
+**File format.** Tab-delimited, no header, three columns. GEO's own processing note says
+"comma-delimited"; it is wrong. Column 1 is a versioned ENSEMBL transcript ID, column 2 is a
+CDS length in codons with a literal `N/A` for non-coding transcripts, column 3 is the raw
+footprint count. The section below verifies that column 3 is raw counts; sections 5b and 5d
+test the identity of column 2. Neither is taken on the documentation's word.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(DBI)
+library(RSQLite)
+
+assay_colors <- c("Input" = "#0072B2", "DHX29-IP" = "#CC79A7")
+```
+
+---
+
+## Section 0: Sample manifest
+
+Typed out from the GEO series metadata.
+
+```{r samples}
+samples <- tibble(
+  gsm    = c("GSM8239469", "GSM8239470", "GSM8239471",
+             "GSM8239472", "GSM8239473", "GSM8239474"),
+  sample = c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3"),
+  assay  = c("Input", "Input", "Input", "DHX29-IP", "DHX29-IP", "DHX29-IP"),
+  rep    = c(1L, 2L, 3L, 1L, 2L, 3L)
+) %>%
+  mutate(
+    path   = here("accessories", "dhx29", "GSE266018_RAW",
+                  paste0(gsm, "_", sample, ".txt.gz")),
+    assay  = factor(assay, levels = c("Input", "DHX29-IP")),
+    sample = factor(sample, levels = c("Input1", "Input2", "Input3",
+                                       "IP1", "IP2", "IP3"))
+  )
+
+stopifnot("GSE266018 count file missing" = all(file.exists(samples$path)))
+print(samples %>% dplyr::select(gsm, sample, assay, rep))
+```
+
+---
+
+## Section 1: Load all six files
+
+`read_tsv` reads the vector of gzipped paths in one call and tags each row with its source
+file via `id`, so no loop and no helper are needed.
+
+```{r load_counts}
+counts <- read_tsv(
+  samples$path,
+  col_names = c("transcript_id", "cds_codons", "count"),
+  na        = "N/A",
+  col_types = "cii",
+  id        = "path"
+) %>%
+  left_join(samples, by = "path") %>%
+  mutate(transcript_id_clean = str_remove(transcript_id, "\\..*")) %>%
+  dplyr::select(transcript_id, transcript_id_clean, cds_codons, count,
+                sample, assay, rep, gsm)
+
+cat("Rows loaded:", format(nrow(counts), big.mark = ","), "\n")
+cat("Distinct transcripts:",
+    format(n_distinct(counts$transcript_id), big.mark = ","), "\n")
+
+# The length column is an annotation, not a measurement: one row per transcript.
+tx_annot <- counts %>%
+  distinct(transcript_id, transcript_id_clean, cds_codons)
+
+n_tx        <- nrow(tx_annot)
+n_coding    <- sum(!is.na(tx_annot$cds_codons))
+n_noncoding <- sum(is.na(tx_annot$cds_codons))
+n_neg_len   <- sum(tx_annot$cds_codons < 0, na.rm = TRUE)
+
+cat("Transcripts:", format(n_tx, big.mark = ","),
+    "| length present:", format(n_coding, big.mark = ","),
+    "| N/A:", format(n_noncoding, big.mark = ","),
+    "| length < 0:", n_neg_len, "\n")
+```
+
+---
+
+### Is column 3 really raw counts?
+
+GEO's processing note says so, but the same sentence calls these files comma-delimited when
+they are tab-delimited, so it is corroborated here rather than trusted. Each check below
+eliminates a specific alternative.
+
+```{r verify_counts_are_counts}
+wide_chk <- counts %>%
+  dplyr::select(transcript_id, cds_codons, sample, count) %>%
+  pivot_wider(names_from = sample, values_from = count)
+sample_cols <- c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3")
+
+# 1. Integer-valued throughout.
+n_noninteger <- sum(counts$count != as.integer(counts$count))
+cat("1. Non-integer values across all", format(nrow(counts), big.mark = ","),
+    "numbers:", n_noninteger, "\n")
+
+# 2. Library sizes differ. CPM and TPM sum to exactly 1e6 in every column.
+lib <- colSums(wide_chk[, sample_cols])
+cat("2. Column sums span", format(min(lib), big.mark = ","), "to",
+    format(max(lib), big.mark = ","),
+    sprintf("(%.2f-fold). CPM/TPM would be identical.\n", max(lib) / min(lib)))
+
+# 3. Counts rise with CDS length. TPM, RPKM and FPKM divide length out.
+# Non-coding rows carry no length, so restrict to coding transcripts.
+coding_chk <- wide_chk %>% filter(!is.na(cds_codons))
+rho_len <- cor(coding_chk$Input1, coding_chk$cds_codons, method = "spearman")
+cat("3. Spearman(count, CDS codons) =", round(rho_len, 3),
+    "over", format(nrow(coding_chk), big.mark = ","),
+    "coding transcripts -> not a length-normalised measure\n")
+
+# 4. The smallest non-zero value is the quantum of a count.
+cat("4. Smallest non-zero value per sample:",
+    paste(sapply(wide_chk[, sample_cols], function(x) min(x[x > 0])), collapse = " "), "\n")
+
+# 5. Mean-variance follows a negative binomial: Poisson at low mean, overdispersed at high.
+mv <- tibble(m = rowMeans(coding_chk[, c("Input1", "Input2", "Input3")]),
+             v = apply(coding_chk[, c("Input1", "Input2", "Input3")], 1, var)) %>%
+  filter(m > 0) %>%
+  mutate(bin = cut(m, breaks = c(0, 1, 2, 5, 10, 50, 200, Inf),
+                   labels = c("<=1", "1-2", "2-5", "5-10", "10-50", "50-200", ">200")))
+mv_tab <- mv %>%
+  group_by(mean_bin = bin) %>%
+  summarise(n = n(), median_mean = median(m), median_var = median(v), .groups = "drop") %>%
+  mutate(var_over_mean = median_var / median_mean,
+         implied_dispersion = (var_over_mean - 1) / median_mean)
+cat("\n5. Mean-variance across the three Input replicates:\n")
+print(as.data.frame(mv_tab %>% mutate(across(where(is.numeric), ~ round(.x, 3)))))
+
+stopifnot(
+  "column 3 contains non-integer values, so it is not raw counts" = n_noninteger == 0,
+  "library sizes are identical, which would indicate a normalised measure" =
+    max(lib) / min(lib) > 1.05,
+  "counts do not scale with CDS length, which would indicate length normalisation" =
+    rho_len > 0.1,
+  "the smallest non-zero value is not 1" =
+    all(sapply(wide_chk[, sample_cols], function(x) min(x[x > 0])) == 1),
+  "variance does not approach the mean at low counts, so the Poisson limit is absent" =
+    between(mv_tab$var_over_mean[mv_tab$mean_bin == "5-10"], 0.8, 1.2),
+  "overdispersion does not grow with the mean as a negative binomial requires" =
+    mv_tab$var_over_mean[mv_tab$mean_bin == ">200"] >
+    mv_tab$var_over_mean[mv_tab$mean_bin == "10-50"]
+)
+cat("\nAll format checks passed.\n")
+```
+
+```{r plot_mean_variance, fig.width = 7, fig.height = 5}
+phi <- median(mv_tab$implied_dispersion[mv_tab$median_mean > 10])
+curve_df <- tibble(m = 10^seq(log10(min(mv$m)), log10(max(mv$m)), length.out = 200)) %>%
+  mutate(poisson = m, nb = m + phi * m^2)
+
+p_mv <- ggplot(mv, aes(m, v)) +
+  geom_point(size = 0.3, alpha = 0.12, colour = "grey40") +
+  geom_line(data = curve_df, aes(m, poisson), colour = "#0072B2",
+            linewidth = 0.9, linetype = "dashed") +
+  geom_line(data = curve_df, aes(m, nb), colour = "#CC79A7", linewidth = 0.9) +
+  geom_point(data = mv_tab, aes(median_mean, median_var), colour = "black",
+             size = 2.5, inherit.aes = FALSE) +
+  scale_x_log10() + scale_y_log10() +
+  annotate("text", x = min(mv$m), y = max(mv$v),
+           label = paste0("dashed: Poisson, variance = mean\n",
+                          "solid: negative binomial, dispersion = ",
+                          sprintf("%.3f", phi)),
+           hjust = 0, vjust = 1, size = 3.2) +
+  labs(title = "Column 3 behaves like counts, not like a normalised measure",
+       subtitle = str_wrap(paste0(
+         "Per-transcript mean against variance across the three Input replicates, n = ",
+         format(nrow(mv), big.mark = ","),
+         ". Black points are the bin medians. Low counts sit on the Poisson line and ",
+         "overdispersion grows with the mean, as a negative binomial requires. The ",
+         "horizontal banding at low mean is integer discreteness."), width = 84),
+       x = "mean count across Input replicates", y = "variance") +
+  theme_classic(base_size = 12)
+
+print(p_mv)
+ggsave(here("plots", "dhx29_01_mean_variance.pdf"), p_mv, width = 7, height = 5)
+```
+
+The fifth check is the positive evidence; the others eliminate alternatives. Variance over
+mean approaches 1 at low counts, the Poisson limit of sampling discrete molecules, then rises
+linearly as `var = mean + dispersion * mean^2`. The implied dispersion is roughly constant
+near 0.03 across the well-measured bins, which is a single sensible parameter rather than an
+arbitrary shape. No normalised quantity reproduces that.
+
+The low-mean bins fall slightly below 1 because a variance estimated from three replicates is
+noisy and discreteness bites at counts near zero. That is expected and not evidence against.
+
+---
+
+## Section 2: Per-sample summary
+
+```{r sample_summary}
+sample_summary <- counts %>%
+  group_by(gsm, sample, assay, rep) %>%
+  summarise(
+    n_rows                = n(),
+    n_length_present      = sum(!is.na(cds_codons)),
+    n_detected            = sum(count > 0),
+    library_size          = sum(count),
+    median_count_detected = median(count[count > 0]),
+    p90_count_detected    = quantile(count[count > 0], 0.90),
+    .groups = "drop"
+  )
+
+print(as.data.frame(sample_summary))
+
+ip_input_ratio <- sum(sample_summary$library_size[sample_summary$assay == "DHX29-IP"]) /
+  sum(sample_summary$library_size[sample_summary$assay == "Input"])
+cat("\nTotal DHX29-IP / Input library size ratio:", round(ip_input_ratio, 3), "\n")
+```
+
+---
+
+## Section 3: Plot 1, footprint count distribution
+
+All rows, `log2(count + 1)`, six curves. The spike at zero is mostly the non-coding
+transcripts, which carry no counts at all; the subtitle gives the split so the spike is
+readable.
+
+```{r plot_count_distribution, fig.width = 9, fig.height = 4.5}
+count_caption <- counts %>%
+  group_by(sample) %>%
+  summarise(n_det = sum(count > 0), .groups = "drop") %>%
+  mutate(lab = paste0(sample, " ", format(n_det, big.mark = ","))) %>%
+  pull(lab) %>%
+  paste(collapse = "   ")
+
+# Both panels are the same data. The right panel drops nothing from the analysis; it
+# only lets the shape above zero be seen past the spike that the left panel is made of.
+counts_panelled <- bind_rows(
+  counts %>% mutate(panel = "all transcripts"),
+  counts %>% filter(count > 0) %>% mutate(panel = "count > 0")
+) %>%
+  mutate(panel = factor(panel, levels = c("all transcripts", "count > 0")))
+
+p_counts <- ggplot(counts_panelled, aes(x = log2(count + 1),
+                                        colour = assay, fill = assay,
+                                        group = sample, linetype = factor(rep))) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ panel, scales = "free_y") +
+  scale_colour_manual(values = assay_colors, name = "Assay") +
+  scale_fill_manual(values = assay_colors, name = "Assay") +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted"), name = "Replicate") +
+  labs(
+    title    = "Thor-Ribo-seq footprint counts, GSE266018",
+    subtitle = str_wrap(paste0(
+      "n = ", format(n_tx, big.mark = ","), " transcripts per sample: ",
+      format(n_coding, big.mark = ","), " with a CDS length and ",
+      format(n_noncoding, big.mark = ","),
+      " non-coding, the latter all zero in all six files."), width = 95),
+    caption  = str_wrap(paste0("transcripts with count > 0 per sample:  ",
+                               count_caption), width = 95),
+    x        = "log2(count + 1)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.caption = element_text(hjust = 0))
+
+print(p_counts)
+ggsave(here("plots", "dhx29_01_count_distribution.pdf"),
+       p_counts, width = 9, height = 4.5)
+```
+
+---
+
+## Section 4: Plot 2, CDS length distribution
+
+Column 2 is byte-identical in all six files, so there is nothing per-sample to overlay: this
+is one curve over the distinct transcript set. `log2` is undefined on the negative lengths,
+so those rows are dropped here; they carry no counts anywhere.
+
+```{r plot_length_distribution, fig.width = 8, fig.height = 4.5}
+len_plot_data <- tx_annot %>% filter(!is.na(cds_codons), cds_codons >= 0)
+
+cat("Transcripts in the length plot:",
+    format(nrow(len_plot_data), big.mark = ","), "\n")
+cat("Dropped for negative length:", n_neg_len,
+    "| their total count across all six samples:",
+    sum(counts$count[!is.na(counts$cds_codons) & counts$cds_codons < 0]), "\n\n")
+
+# The log2 axis is readable but not interpretable, so report the native units too.
+len_median <- median(len_plot_data$cds_codons)
+cat("Column 2 in its native units (codons):\n")
+print(round(quantile(len_plot_data$cds_codons,
+                     c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99))))
+cat("mean", round(mean(len_plot_data$cds_codons), 1),
+    "| min", min(len_plot_data$cds_codons),
+    "| max", max(len_plot_data$cds_codons), "\n")
+
+p_len <- ggplot(len_plot_data, aes(x = log2(cds_codons + 1))) +
+  geom_density(alpha = 0.15, linewidth = 0.8,
+               colour = "grey20", fill = "grey70") +
+  geom_vline(xintercept = log2(len_median + 1), linetype = "dashed",
+             colour = "#0072B2") +
+  annotate("text", x = log2(len_median + 1), y = Inf,
+           label = paste0("median = ", len_median, " codons"),
+           hjust = -0.08, vjust = 2, size = 3.2, colour = "#0072B2") +
+  labs(
+    title    = "CDS length column, GSE266018",
+    subtitle = str_wrap(paste0(
+      "n = ", format(nrow(len_plot_data), big.mark = ","),
+      " transcripts. This column is identical in all six files, so there is one ",
+      "curve, not six."), width = 90),
+    x        = "log2(CDS codons + 1)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_len)
+ggsave(here("plots", "dhx29_01_cds_length_distribution.pdf"),
+       p_len, width = 8, height = 4.5)
+```
+
+---
+
+## Section 5: Is column 2 really CDS length, and are the transcript versions right
+
+### 5a: Pull CDS lengths independently from the repo transcript database
+
+`accessories/human/txdb.gencode49.sqlite` stores CDS ranges with the stop codon merged in.
+
+```{r txdb_cds_lengths}
+con <- dbConnect(RSQLite::SQLite(),
+                 here("accessories", "human", "txdb.gencode49.sqlite"))
+
+v49_tx    <- tbl(con, "transcript") %>% dplyr::select(`_tx_id`, tx_name) %>% collect()
+v49_splic <- tbl(con, "splicing")   %>% dplyr::select(`_tx_id`, `_cds_id`) %>% collect()
+v49_cdsr  <- tbl(con, "cds")        %>% dplyr::select(`_cds_id`, cds_start, cds_end) %>% collect()
+v49_gene  <- tbl(con, "gene")       %>% collect() %>% distinct(`_tx_id`, .keep_all = TRUE)
+
+v49_cds <- v49_splic %>%
+  filter(!is.na(`_cds_id`)) %>%
+  inner_join(v49_cdsr, by = "_cds_id") %>%
+  group_by(`_tx_id`) %>%
+  summarise(cds_len = sum(cds_end - cds_start + 1), .groups = "drop") %>%
+  inner_join(v49_tx, by = "_tx_id") %>%
+  left_join(v49_gene, by = "_tx_id") %>%
+  mutate(tx_clean = str_remove(tx_name, "\\..*")) %>%
+  dplyr::select(tx_name, tx_clean, gene_id, cds_len)
+
+cat("v49 transcripts total:", format(nrow(v49_tx), big.mark = ","), "\n")
+cat("v49 transcripts with a CDS:", format(nrow(v49_cds), big.mark = ","), "\n")
+```
+
+#### Plot 3: annotated CDS length in nucleotides
+
+The Section 4 figure for the length just pulled here, same construction, native nucleotides.
+Restricted to the transcripts that appear in these GEO files, so it describes the same
+population rather than all of GENCODE.
+
+```{r plot_cds_length_nt, fig.width = 8, fig.height = 4.5}
+nt_plot_data <- tx_annot %>%
+  inner_join(v49_cds, by = c("transcript_id_clean" = "tx_clean")) %>%
+  filter(cds_len > 0)
+
+nt_median <- median(nt_plot_data$cds_len)
+
+cat("Transcripts in these files with a v49 CDS:",
+    format(nrow(nt_plot_data), big.mark = ","), "\n")
+cat("Annotated CDS length in nucleotides:\n")
+print(round(quantile(nt_plot_data$cds_len,
+                     c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99))))
+cat("mean", round(mean(nt_plot_data$cds_len), 1),
+    "| min", min(nt_plot_data$cds_len),
+    "| max", max(nt_plot_data$cds_len), "\n")
+
+p_len_nt <- ggplot(nt_plot_data, aes(x = log2(cds_len + 1))) +
+  geom_density(alpha = 0.15, linewidth = 0.8,
+               colour = "grey20", fill = "grey70") +
+  geom_vline(xintercept = log2(nt_median + 1), linetype = "dashed",
+             colour = "#0072B2") +
+  annotate("text", x = log2(nt_median + 1), y = Inf,
+           label = paste0("median = ", nt_median, " nucleotides"),
+           hjust = -0.08, vjust = 2, size = 3.2, colour = "#0072B2") +
+  labs(
+    title    = "Annotated CDS length, GENCODE v49",
+    subtitle = str_wrap(paste0(
+      "n = ", format(nrow(nt_plot_data), big.mark = ","),
+      " transcripts from these files that carry a v49 CDS. Pulled from the transcript ",
+      "database above, not read from the GEO files."), width = 90),
+    x        = "log2(CDS nucleotides + 1)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_len_nt)
+ggsave(here("plots", "dhx29_01_cds_length_nt_distribution.pdf"),
+       p_len_nt, width = 8, height = 4.5)
+```
+
+
+### 5b: Are the `N/A` rows really non-coding
+
+Tested against `accessories/human/tx_biotype_v49.tsv.gz`, a transcript-level biotype table.
+It is a separate file read on a separate path from the sqlite database, so this is
+independent evidence rather than the same evidence twice.
+
+```{r biotype_check}
+tx_biotype <- read_tsv(here("accessories", "human", "tx_biotype_v49.tsv.gz"),
+                       col_types = cols(.default = col_character())) %>%
+  mutate(
+    tx_clean        = str_remove(transcript_id, "\\..*"),
+    v49_cds_bearing = transcript_type %in% c("protein_coding", "nonsense_mediated_decay",
+                                             "non_stop_decay", "protein_coding_LoF",
+                                             "polymorphic_pseudogene") |
+                      str_detect(transcript_type, "^(IG|TR)_[VDJC]_gene$")
+  ) %>%
+  dplyr::select(tx_clean, v49_transcript_type = transcript_type, v49_cds_bearing)
+
+annot_check <- tx_annot %>%
+  mutate(
+    tx_clean   = transcript_id_clean,
+    geo_coding = if_else(is.na(cds_codons), "GEO N/A", "GEO length present")
+  ) %>%
+  left_join(tx_biotype, by = "tx_clean") %>%
+  left_join(v49_cds, by = "tx_clean") %>%
+  mutate(
+    in_v49         = !is.na(v49_cds_bearing),
+    v49_has_cds_row = !is.na(cds_len),
+    match_class    = case_when(
+      transcript_id %in% v49_tx$tx_name ~ "exact",
+      tx_clean %in% str_remove(v49_tx$tx_name, "\\..*") ~ "drift",
+      TRUE ~ "absent"
+    ),
+    match_class = factor(match_class, levels = c("exact", "drift", "absent"))
+  )
+
+stopifnot("annot_check gained or lost rows in the joins" = nrow(annot_check) == n_tx)
+
+cat("Transcripts absent from v49 and therefore unjudged:",
+    format(sum(!annot_check$in_v49), big.mark = ","), "\n\n")
+
+cat("GEO coding status vs independent v49 biotype (v49-recognised transcripts only):\n")
+two_by_two <- annot_check %>%
+  filter(in_v49) %>%
+  dplyr::count(geo_coding, v49_cds_bearing) %>%
+  pivot_wider(names_from = v49_cds_bearing, values_from = n,
+              names_prefix = "v49_cds_bearing_", values_fill = 0)
+print(as.data.frame(two_by_two))
+
+concord_na <- annot_check %>%
+  filter(in_v49, geo_coding == "GEO N/A") %>%
+  summarise(n = n(), ok = sum(!v49_cds_bearing)) %>%
+  mutate(frac = ok / n)
+concord_cd <- annot_check %>%
+  filter(in_v49, geo_coding == "GEO length present") %>%
+  summarise(n = n(), ok = sum(v49_cds_bearing)) %>%
+  mutate(frac = ok / n)
+
+cat("\nN/A rows independently non-coding:  ",
+    format(concord_na$ok, big.mark = ","), "/", format(concord_na$n, big.mark = ","),
+    " = ", sprintf("%.2f%%", 100 * concord_na$frac), "\n", sep = "")
+cat("Length-bearing rows independently CDS-bearing:  ",
+    format(concord_cd$ok, big.mark = ","), "/", format(concord_cd$n, big.mark = ","),
+    " = ", sprintf("%.2f%%", 100 * concord_cd$frac), "\n\n", sep = "")
+
+cat("Where the disagreement sits, by v49 biotype:\n")
+print(as.data.frame(
+  annot_check %>%
+    filter(in_v49,
+           (geo_coding == "GEO N/A") == v49_cds_bearing) %>%
+    dplyr::count(geo_coding, v49_transcript_type, sort = TRUE) %>%
+    head(12)
+))
+
+# Two routes to the same call: the biotype label, and presence of CDS ranges in the database.
+route_agreement <- annot_check %>%
+  filter(in_v49) %>%
+  dplyr::count(v49_cds_bearing, v49_has_cds_row)
+cat("\nBiotype label vs presence of CDS ranges in the txdb:\n")
+print(as.data.frame(route_agreement))
+
+stopifnot(
+  "under 99% of GEO N/A rows are independently non-coding" = concord_na$frac >= 0.99,
+  "under 99% of GEO length-bearing rows are independently CDS-bearing" = concord_cd$frac >= 0.99,
+  "biotype label and txdb CDS ranges disagree about which transcripts are coding" =
+    all(annot_check$v49_cds_bearing[annot_check$in_v49] ==
+        annot_check$v49_has_cds_row[annot_check$in_v49])
+)
+```
+
+#### Is the disagreement annotation vintage, and what does it cost?
+
+If the ~1,780 disagreements are GENCODE moving between the paper's release and v49, they
+should concentrate on transcripts whose version also moved. They do, but only partly, and the
+remainder is informative: a biotype relabelling changes no sequence, so it carries no version
+bump. The second half of the chunk prices the disagreement in footprints, which is what
+matters when these counts later meet a v49-keyed table.
+
+```{r biotype_disagreement_vintage}
+disagree <- annot_check %>%
+  filter(in_v49) %>%
+  mutate(agree = (geo_coding == "GEO length present") == v49_cds_bearing,
+         match_class = droplevels(match_class))
+
+cat("Disagreement rate by transcript version class:\n")
+print(as.data.frame(
+  disagree %>%
+    dplyr::count(match_class, agree) %>%
+    pivot_wider(names_from = agree, values_from = n, values_fill = 0) %>%
+    dplyr::rename(n_disagree = `FALSE`, n_agree = `TRUE`) %>%
+    mutate(pct_disagree = round(100 * n_disagree / (n_disagree + n_agree), 2))
+))
+
+cat("\nDirection of the disagreement, by version class:\n")
+print(as.data.frame(disagree %>% filter(!agree) %>% dplyr::count(match_class, geo_coding)))
+
+na_but_coding  <- disagree %>% filter(!agree, geo_coding == "GEO N/A")
+coding_but_not <- disagree %>% filter(!agree, geo_coding == "GEO length present")
+
+na_footprints <- sum(counts$count[counts$transcript_id %in% na_but_coding$transcript_id])
+exposure <- counts %>%
+  filter(transcript_id %in% coding_but_not$transcript_id) %>%
+  group_by(transcript_id) %>%
+  summarise(total = sum(count), .groups = "drop")
+
+cat("\nWhat the disagreement costs:\n")
+cat("  v49-coding transcripts the GEO pipeline never counted: ",
+    format(nrow(na_but_coding), big.mark = ","),
+    ", carrying ", na_footprints, " footprints.\n",
+    "    These are structural zeros. The pipeline saw no CDS, so it counted nothing.\n",
+    "    They are not evidence that the transcript is untranslated.\n", sep = "")
+cat("  v49-non-coding transcripts that do carry footprints: ",
+    format(sum(exposure$total > 0), big.mark = ","), " of ",
+    format(nrow(exposure), big.mark = ","), ", ",
+    format(sum(exposure$total), big.mark = ","), " footprints, ",
+    sprintf("%.3f%%", 100 * sum(exposure$total) / sum(counts$count)),
+    " of the library.\n",
+    "    Filtering a downstream table on v49 coding status drops these silently.\n", sep = "")
+
+rate <- disagree %>%
+  group_by(match_class) %>%
+  summarise(r = mean(!agree), .groups = "drop")
+
+stopifnot(
+  "version drift does not raise the biotype disagreement rate, so the vintage reading fails" =
+    rate$r[rate$match_class == "drift"] > rate$r[rate$match_class == "exact"],
+  "a transcript the GEO files call non-coding carries footprints" = na_footprints == 0,
+  "more than 1% of footprints sit on transcripts v49 calls non-coding" =
+    sum(exposure$total) / sum(counts$count) < 0.01
+)
+```
+
+Drift raises the rate roughly tenfold, so vintage is real. It is not the whole story: a large
+minority of disagreements sit on transcripts with an identical version, and there the
+dominant direction is coding becoming non-coding. That is the signature of GENCODE
+withdrawing CDS definitions from alternative isoforms and relabelling them, which leaves the
+sequence untouched.
+
+
+### 5c: Transcript version match against v49
+
+```{r version_classes}
+cat("Version match class vs GEO coding status:\n")
+print(as.data.frame(
+  annot_check %>%
+    dplyr::count(geo_coding, match_class) %>%
+    pivot_wider(names_from = match_class, values_from = n, values_fill = 0)
+))
+
+coding_match_rate <- annot_check %>%
+  filter(geo_coding == "GEO length present") %>%
+  summarise(frac = mean(match_class != "absent")) %>%
+  pull(frac)
+
+cat("\nCoding GEO transcripts matching a v49 transcript on the unversioned ID: ",
+    sprintf("%.2f%%", 100 * coding_match_rate), "\n", sep = "")
+```
+
+### 5d: Test the rule `cds_codons == round(cds_len / 3) - 10`
+
+Rounding matters. About a fifth of v49 transcripts have a CDS length that is not a multiple
+of three, and `floor` fails on a third of those while `round` does not. `cds_len / 3` is
+never exactly `.5`, so R's round-half-to-even never comes into play.
+
+```{r length_rule}
+rule <- annot_check %>%
+  filter(!is.na(cds_codons), !is.na(cds_len), match_class != "absent") %>%
+  mutate(
+    cds_codons_v49 = round(cds_len / 3) - 10,
+    delta          = cds_codons - cds_codons_v49
+  )
+
+rule_summary <- rule %>%
+  group_by(match_class) %>%
+  summarise(
+    n            = n(),
+    agreement    = mean(delta == 0),
+    pearson_r    = cor(cds_codons, cds_codons_v49),
+    median_delta = median(delta),
+    .groups = "drop"
+  ) %>%
+  filter(n > 0)
+
+cat("Agreement with round(cds_len / 3) - 10, split by transcript version match:\n")
+print(as.data.frame(rule_summary %>% mutate(agreement = round(agreement, 4),
+                                            pearson_r = round(pearson_r, 4))))
+
+cat("\nCDS lengths not a multiple of 3 in the joined set: ",
+    sprintf("%.1f%%", 100 * mean(rule$cds_len %% 3 != 0)), "\n", sep = "")
+```
+
+The split is the result. Where the transcript version is identical the rule holds almost
+perfectly, which is what identifies the column as CDS length. Where the version drifted the
+CDS genuinely changed between the paper's annotation and v49, and the rule degrades in
+exactly the way it should.
+
+#### Plot 4: is column 2 a codon count or a nucleotide length?
+
+Codons. The division by three in the rule above is the whole answer, but correlation cannot
+show it, because a nucleotide length and a codon count are proportional and so correlate
+identically. The **slope** distinguishes them, and so does the offset.
+
+```{r codons_or_nucleotides, fig.width = 8, fig.height = 4.5}
+# Exact-version transcripts whose CDS is a whole number of codons, so that nt / 3 is
+# exact and the offset can be read without rounding in the way.
+codon_test <- rule %>% filter(match_class == "exact", cds_len %% 3 == 0)
+
+slope_nt <- unname(coef(lm(cds_codons ~ cds_len, data = codon_test))[2])
+offset   <- codon_test$cds_len / 3 - codon_test$cds_codons
+
+cat("On the ", format(nrow(codon_test), big.mark = ","),
+    " exact-version transcripts with a CDS length divisible by 3:\n\n", sep = "")
+cat("  median column 2                 ", median(codon_test$cds_codons), " codons\n", sep = "")
+cat("  median v49 CDS                  ", median(codon_test$cds_len), " nucleotides\n", sep = "")
+cat("  median v49 CDS / 3              ", median(codon_test$cds_len) / 3, "\n", sep = "")
+cat("  regression slope on CDS nt      ", sprintf("%.4f", slope_nt),
+    "   (1/3 = 0.3333 for codons, 1 for nucleotides)\n", sep = "")
+cat("  CDS nt / 3 minus column 2       median ", median(offset),
+    ", equal to 10 in ", sprintf("%.2f%%", 100 * mean(offset == 10)),
+    " of cases\n", sep = "")
+
+stopifnot(
+  "slope on CDS nucleotides is not 1/3, so column 2 is not a codon count" =
+    abs(slope_nt - 1/3) < 0.01,
+  "the gap between CDS nt / 3 and column 2 is not 10 codons" =
+    median(offset) == 10,
+  "the 10-codon gap is not near-universal" = mean(offset == 10) > 0.99
+)
+
+codon_long <- codon_test %>%
+  transmute(
+    `GEO column 2`                = cds_codons,
+    `v49 CDS in codons (nt / 3)`  = cds_len / 3,
+    `v49 CDS in nucleotides`      = cds_len
+  ) %>%
+  pivot_longer(everything(), names_to = "quantity", values_to = "value") %>%
+  mutate(quantity = factor(quantity, levels = c("GEO column 2",
+                                                "v49 CDS in codons (nt / 3)",
+                                                "v49 CDS in nucleotides")))
+
+p_codon <- ggplot(codon_long, aes(x = log2(value + 1),
+                                  colour = quantity, fill = quantity)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  scale_colour_manual(values = c("GEO column 2" = "#0072B2",
+                                 "v49 CDS in codons (nt / 3)" = "#CC79A7",
+                                 "v49 CDS in nucleotides" = "grey40"),
+                      name = NULL) +
+  scale_fill_manual(values = c("GEO column 2" = "#0072B2",
+                               "v49 CDS in codons (nt / 3)" = "#CC79A7",
+                               "v49 CDS in nucleotides" = "grey40"),
+                    name = NULL) +
+  labs(
+    title    = "Column 2 is a codon count, not a nucleotide length",
+    subtitle = str_wrap(paste0(
+      "n = ", format(nrow(codon_test), big.mark = ","),
+      " transcripts. The GEO column overlays the v49 CDS divided by three and sits ",
+      "log2(3) = 1.58 units left of the nucleotide length."), width = 82),
+    x        = "log2(value + 1)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_codon)
+ggsave(here("plots", "dhx29_01_codons_vs_nucleotides.pdf"),
+       p_codon, width = 8, height = 4.5)
+```
+
+The offset is a flat ten codons rather than a proportion, which says the column counts
+codons over a trimmed window rather than the whole CDS. Ten is what you get by dropping five codons
+at each end, the usual guard against the initiation and termination peaks in ribosome
+profiling. The arithmetic is verified; the reason for the trim is an inference, since GEO
+documents neither column.
+
+
+#### Plot 5: nucleotides per codon
+
+The same conclusion read the simplest possible way. Carry the externally gathered CDS length
+alongside column 2 and divide one by the other. If column 2 counts codons the ratio must land
+on three.
+
+```{r nt_per_codon, fig.width = 8, fig.height = 4.5}
+codon_ratio <- annot_check %>%
+  filter(!is.na(cds_codons), !is.na(cds_len), cds_codons > 0) %>%
+  left_join(rule %>% dplyr::select(transcript_id, delta), by = "transcript_id") %>%
+  mutate(
+    cds_length_external        = cds_len,
+    nt_per_codon               = cds_length_external / cds_codons,
+    nt_per_codon_trim_restored = cds_length_external / (cds_codons + 10)
+  )
+
+cat("Transcripts with both a column 2 value and an external CDS length: ",
+    format(nrow(codon_ratio), big.mark = ","), "\n", sep = "")
+cat("Excluded for a column 2 value of zero or less: ",
+    sum(annot_check$cds_codons <= 0, na.rm = TRUE), "\n\n", sep = "")
+
+cat("external CDS nt / column 2, as reported:\n")
+print(round(quantile(codon_ratio$nt_per_codon,
+                     c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99)), 3))
+cat("within 0.1 of 3: ",
+    sprintf("%.1f%%", 100 * mean(abs(codon_ratio$nt_per_codon - 3) < 0.1)),
+    "\n\n", sep = "")
+
+cat("external CDS nt / (column 2 + 10), the trim added back:\n")
+print(round(quantile(codon_ratio$nt_per_codon_trim_restored,
+                     c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99)), 4))
+cat("within 0.01 of 3: ",
+    sprintf("%.1f%%", 100 * mean(abs(codon_ratio$nt_per_codon_trim_restored - 3) < 0.01)),
+    "\n\n", sep = "")
+
+# Where the ratio is not near 3 at all, it is never a transcript the rule fits.
+cat("Ratios below 3: ", sum(codon_ratio$nt_per_codon < 3),
+    " of ", format(nrow(codon_ratio), big.mark = ","),
+    ".  Of those, the number where the CDS length rule already fails: ",
+    sum(codon_ratio$nt_per_codon < 3 & codon_ratio$delta != 0), "\n\n", sep = "")
+
+print(as.data.frame(
+  codon_ratio %>%
+    group_by(match_class) %>%
+    summarise(n = n(),
+              median_as_reported   = round(median(nt_per_codon), 3),
+              median_trim_restored = round(median(nt_per_codon_trim_restored), 4),
+              .groups = "drop") %>%
+    filter(n > 1)
+))
+
+stopifnot(
+  "a transcript the CDS length rule fits has fewer than 3 nucleotides per codon" =
+    all(codon_ratio$nt_per_codon[codon_ratio$delta == 0] >= 3),
+  "every sub-3 ratio should be a transcript where the rule already fails" =
+    all(codon_ratio$delta[codon_ratio$nt_per_codon < 3] != 0),
+  "fewer than 98% of ratios reach 3" =
+    mean(codon_ratio$nt_per_codon >= 3) > 0.98,
+  "the as-reported ratio does not sit just above 3" =
+    between(median(codon_ratio$nt_per_codon), 3, 3.3),
+  "adding the 10-codon trim back does not give exactly 3" =
+    median(codon_ratio$nt_per_codon_trim_restored) == 3,
+  "the trim-restored ratio is not concentrated on 3" =
+    mean(abs(codon_ratio$nt_per_codon_trim_restored - 3) < 0.01) > 0.85
+)
+
+ratio_long <- codon_ratio %>%
+  transmute(`as reported: nt / column 2`            = nt_per_codon,
+            `trim added back: nt / (column 2 + 10)` = nt_per_codon_trim_restored) %>%
+  pivot_longer(everything(), names_to = "variant", values_to = "ratio") %>%
+  mutate(variant = factor(variant,
+                          levels = c("as reported: nt / column 2",
+                                     "trim added back: nt / (column 2 + 10)")))
+
+# A kernel density would be fit across the full range, which runs past 11, and would
+# come out flat inside the window worth looking at. Fixed bins on the window instead.
+ratio_window <- ratio_long %>% filter(between(ratio, 2.8, 4.1))
+n_outside <- ratio_long %>% filter(!between(ratio, 2.8, 4.1)) %>% nrow()
+
+p_ratio <- ggplot(ratio_window, aes(x = ratio, fill = variant, colour = variant)) +
+  geom_histogram(binwidth = 0.02, alpha = 0.55, linewidth = 0.2) +
+  geom_vline(xintercept = 3, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~ variant, scales = "free_y") +
+  scale_colour_manual(values = c("#0072B2", "#CC79A7"), guide = "none") +
+  scale_fill_manual(values = c("#0072B2", "#CC79A7"), guide = "none") +
+  labs(
+    title    = "Nucleotides per codon",
+    subtitle = str_wrap(paste0(
+      "n = ", format(nrow(codon_ratio), big.mark = ","),
+      " transcripts, of which ", format(n_outside, big.mark = ","),
+      " fall outside the 2.8 to 4.1 window shown. Dashed line at 3. Bins of 0.02. ",
+      "The as-reported ratio clears 3 and trails right, because a constant 10-codon ",
+      "trim costs a short CDS proportionally more."), width = 88),
+    x        = "external CDS nucleotides per codon",
+    y        = "Transcripts"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_ratio)
+ggsave(here("plots", "dhx29_01_nt_per_codon.pdf"), p_ratio, width = 8, height = 4.5)
+```
+
+So the ratio is three, and neither departure from it is noise. The upward drift is the trim,
+re-derived here from a direction the rule test never used. The handful of ratios that fall
+below three are, without exception, transcripts whose CDS was reannotated between the paper's
+GENCODE and v49, the same population that fails the rule in 5d.
+
+
+#### Plot 6: codons and nucleotides, side by side
+
+The same comparison as a picture in the style of Section 4: column 2 on the left, the CDS
+length pulled from GENCODE v49 on the right, in its own native nucleotides, on a shared axis.
+Restricted to transcripts that carry both values, so the two panels describe the same genes.
+The units differ on purpose: the offset between the curves is what the next plot measures.
+
+```{r length_column_vs_external, fig.width = 9, fig.height = 4.5}
+len_pair <- annot_check %>%
+  filter(!is.na(cds_codons), cds_codons >= 0, !is.na(cds_len)) %>%
+  left_join(rule %>% dplyr::select(transcript_id, delta), by = "transcript_id") %>%
+  mutate(rule_holds = if_else(!is.na(delta) & delta == 0,
+                              "CDS length rule holds", "rule fails"))
+
+len_compare <- len_pair %>%
+  transmute(rule_holds,
+            `column 2 (codons)`     = cds_codons,
+            `v49 CDS (nucleotides)` = cds_len) %>%
+  pivot_longer(-rule_holds, names_to = "source", values_to = "value") %>%
+  mutate(source = factor(source, levels = c("column 2 (codons)",
+                                            "v49 CDS (nucleotides)")))
+
+len_medians <- len_compare %>%
+  group_by(source) %>%
+  summarise(med = median(value), n = n(), .groups = "drop") %>%
+  mutate(unit = if_else(source == "column 2 (codons)", "codons", "nucleotides"),
+         lab  = paste0("median = ", round(med, 1), " ", unit))
+
+cat("Shared transcripts: ", format(len_medians$n[1], big.mark = ","), "\n\n", sep = "")
+print(as.data.frame(
+  len_compare %>%
+    group_by(source) %>%
+    summarise(q25 = round(quantile(value, 0.25), 1),
+              median = round(median(value), 1),
+              q75 = round(quantile(value, 0.75), 1),
+              mean = round(mean(value), 1), .groups = "drop")
+))
+
+# The pooled gap between the panel medians is wider than the trim. Split it: the trim
+# accounts for the gap wherever the rule holds, and reannotated transcripts do the rest.
+gap_split <- len_pair %>%
+  group_by(rule_holds) %>%
+  summarise(n                  = n(),
+            median_col2_nt     = median(cds_codons) * 3,
+            median_v49_nt      = median(cds_len),
+            .groups = "drop") %>%
+  mutate(median_gap_nt = median_v49_nt - median_col2_nt)
+
+cat("\nOn a common footing, column 2 times 3 against the v49 CDS in nucleotides:\n")
+print(as.data.frame(gap_split))
+
+stopifnot(
+  "where the CDS length rule holds, the median gap is not the 30-nucleotide trim" =
+    between(gap_split$median_gap_nt[gap_split$rule_holds == "CDS length rule holds"], 27, 33)
+)
+
+p_len_pair <- ggplot(len_compare, aes(x = log2(value + 1))) +
+  geom_density(alpha = 0.15, linewidth = 0.8, colour = "grey20", fill = "grey70") +
+  geom_vline(data = len_medians, aes(xintercept = log2(med + 1)),
+             linetype = "dashed", colour = "#0072B2") +
+  geom_text(data = len_medians, aes(x = log2(med + 1), y = Inf, label = lab),
+            hjust = -0.08, vjust = 2, size = 3.2, colour = "#0072B2") +
+  facet_wrap(~ source) +
+  labs(
+    title    = "The length column against the CDS length pulled from GENCODE v49",
+    subtitle = str_wrap(paste0(
+      "n = ", format(len_medians$n[1], big.mark = ","),
+      " transcripts carrying both values, same genes in both panels. Left is codons read ",
+      "straight from column 2, right is the annotated CDS in nucleotides. The curves sit ",
+      "log2(3) = 1.58 apart because of the units, not because the transcripts differ."),
+      width = 100),
+    x        = "log2(value + 1)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_len_pair)
+ggsave(here("plots", "dhx29_01_length_column_vs_external.pdf"),
+       p_len_pair, width = 9, height = 4.5)
+```
+
+
+#### Plot 7: codons times three against annotated nucleotides
+
+If column 2 is a codon count over a trimmed window, then multiplying it by three should
+recover the annotated CDS in nucleotides, short by a constant. Fitting that line puts a
+number on the constant without ever using the rule from 5d.
+
+```{r codons_x3_vs_nt, fig.width = 8, fig.height = 5}
+nt_corr <- len_pair %>%
+  mutate(nt_from_col2 = cds_codons * 3)
+
+fit_all  <- lm(cds_len ~ nt_from_col2, data = nt_corr)
+nt_ok    <- nt_corr %>% filter(rule_holds == "CDS length rule holds")
+fit_ok   <- lm(cds_len ~ nt_from_col2, data = nt_ok)
+
+corr_summary <- tibble(
+  subset    = c("all shared transcripts", "CDS length rule holds"),
+  n         = c(nrow(nt_corr), nrow(nt_ok)),
+  pearson_r = c(cor(nt_corr$nt_from_col2, nt_corr$cds_len),
+                cor(nt_ok$nt_from_col2, nt_ok$cds_len)),
+  spearman  = c(cor(nt_corr$nt_from_col2, nt_corr$cds_len, method = "spearman"),
+                cor(nt_ok$nt_from_col2, nt_ok$cds_len, method = "spearman")),
+  slope     = c(coef(fit_all)[2], coef(fit_ok)[2]),
+  intercept = c(coef(fit_all)[1], coef(fit_ok)[1])
+)
+
+print(as.data.frame(corr_summary %>%
+                      mutate(across(pearson_r:slope, ~ round(.x, 5)),
+                             intercept = round(intercept, 2))))
+
+stopifnot(
+  "slope of annotated nucleotides on column 2 times 3 is not 1" =
+    abs(coef(fit_ok)[2] - 1) < 0.001,
+  "intercept is not the 30-nucleotide trim" =
+    abs(coef(fit_ok)[1] - 30) < 1,
+  "column 2 times 3 does not track annotated nucleotides" =
+    cor(nt_ok$nt_from_col2, nt_ok$cds_len) > 0.9999,
+  "rank correlation across all shared transcripts is below 0.95" =
+    cor(nt_corr$nt_from_col2, nt_corr$cds_len, method = "spearman") > 0.95
+)
+
+win <- 6000
+n_out <- sum(nt_corr$nt_from_col2 > win | nt_corr$cds_len > win)
+
+corr_lab <- paste0(
+  "n = ", format(nrow(nt_corr), big.mark = ","),
+  "\nPearson R = ", sprintf("%.4f", corr_summary$pearson_r[1]),
+  "\nSpearman = ", sprintf("%.4f", corr_summary$spearman[1]),
+  "\nwhere the rule holds (n = ", format(nrow(nt_ok), big.mark = ","), "):",
+  "\n   slope = ", sprintf("%.4f", corr_summary$slope[2]),
+  ", intercept = ", sprintf("%.1f", corr_summary$intercept[2]), " nt")
+
+p_nt_corr <- ggplot(nt_corr, aes(x = nt_from_col2, y = cds_len, colour = rule_holds)) +
+  geom_point(size = 0.4, alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 30, linetype = "dashed",
+              colour = "grey15", linewidth = 0.4) +
+  annotate("text", x = -Inf, y = Inf, label = corr_lab,
+           hjust = -0.05, vjust = 1.1, size = 3) +
+  coord_cartesian(xlim = c(0, win), ylim = c(0, win)) +
+  scale_colour_manual(values = c("CDS length rule holds" = "#0072B2",
+                                 "rule fails" = "#CC79A7"),
+                      name = NULL) +
+  labs(
+    title    = "Column 2 times three against the annotated CDS in nucleotides",
+    subtitle = str_wrap(paste0(
+      "Dashed line is y = x + 30, the 10-codon trim expressed in nucleotides. ",
+      "Axes clipped at ", format(win, big.mark = ","), " nt; ",
+      format(n_out, big.mark = ","), " transcripts fall outside and are not drawn, ",
+      "though every statistic above uses all of them."), width = 92),
+    x        = "column 2 times 3 (nucleotides)",
+    y        = "annotated v49 CDS (nucleotides)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_nt_corr)
+ggsave(here("plots", "dhx29_01_codons_x3_vs_nucleotides.pdf"),
+       p_nt_corr, width = 8, height = 5)
+```
+
+Slope one, intercept thirty nucleotides. The trim falls out of the regression as an
+intercept, independently of how it was derived in 5d.
+
+
+### 5e: Plot 8, the CDS length this project computes elsewhere
+
+The feature matrices carry a `cds_length` built by a different code path in
+`code/predictive_modeling/01_feature_extraction.Rmd`, on the most abundant transcript per
+gene rather than on the full annotation. It is the length these counts would eventually have
+to line up with, so it is worth checking directly.
+
+Two caveats on what this does and does not show. It is an independent **code path**, not an
+independent **annotation**: both routes trace back to GENCODE v49, and the printout below
+confirms they are identical on every shared transcript. So this validates the extraction,
+not the annotation. And the feature matrix keeps one transcript per gene, chosen for
+abundance, so the shared set is skewed toward stable, well-expressed annotations. That is
+why agreement here runs higher than the blended figure in 5d.
+
+```{r feature_matrix_cds}
+fm_path <- here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+stopifnot("feature matrix not found; knit the 01x_ chain first" = file.exists(fm_path))
+
+fm_cds <- readRDS(fm_path) %>%
+  dplyr::select(transcript_id_clean, cds_length) %>%
+  filter(!is.na(cds_length)) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
+
+cat("Feature matrix transcripts with a CDS length:",
+    format(nrow(fm_cds), big.mark = ","), "\n")
+
+fm_join <- annot_check %>%
+  filter(!is.na(cds_codons)) %>%
+  inner_join(fm_cds, by = "transcript_id_clean") %>%
+  mutate(
+    cds_codons_fm = round(cds_length / 3) - 10,
+    delta_fm      = cds_codons - cds_codons_fm
+  )
+
+cat("Transcripts shared with the feature matrix:",
+    format(nrow(fm_join), big.mark = ","), "\n\n")
+
+fm_overall <- fm_join %>%
+  summarise(
+    n         = n(),
+    agreement = mean(delta_fm == 0),
+    pearson_r = cor(cds_codons, cds_codons_fm),
+    spearman  = cor(cds_codons, cds_codons_fm, method = "spearman")
+  )
+
+cat("GEO column 2 vs feature matrix cds_length, all shared transcripts:\n")
+print(as.data.frame(fm_overall %>% mutate(across(agreement:spearman, ~ round(.x, 4)))))
+
+cat("\nSame comparison split by transcript version match against v49:\n")
+print(as.data.frame(
+  fm_join %>%
+    group_by(match_class) %>%
+    summarise(n = n(), agreement = round(mean(delta_fm == 0), 4),
+              pearson_r = round(cor(cds_codons, cds_codons_fm), 4),
+              .groups = "drop") %>%
+    filter(n > 1)
+))
+
+# The two independent sources against each other, on the transcripts both cover.
+both_sources <- fm_join %>% filter(!is.na(cds_len))
+cat("\nThe two independent sources against each other (txdb vs feature matrix), n = ",
+    format(nrow(both_sources), big.mark = ","), ":  Pearson R = ",
+    sprintf("%.4f", cor(both_sources$cds_len, both_sources$cds_length)),
+    ", identical in ",
+    sprintf("%.2f%%", 100 * mean(both_sources$cds_len == both_sources$cds_length)),
+    " of cases\n", sep = "")
+
+stopifnot(
+  "correlation with the feature matrix CDS length is below 0.98" =
+    fm_overall$pearson_r > 0.98,
+  "under 95% exact agreement with the feature matrix CDS length" =
+    fm_overall$agreement > 0.95,
+  "the two independent CDS length sources disagree with each other" =
+    cor(both_sources$cds_len, both_sources$cds_length) > 0.99
+)
+```
+
+```{r plot_length_vs_feature_matrix, fig.width = 8, fig.height = 4.5}
+fm_lab <- paste0("n = ", format(fm_overall$n, big.mark = ","),
+                 "\nPearson R = ", sprintf("%.4f", fm_overall$pearson_r),
+                 "\nSpearman = ", sprintf("%.4f", fm_overall$spearman),
+                 "\nexact match = ", sprintf("%.2f%%", 100 * fm_overall$agreement))
+
+p_fm <- fm_join %>%
+  filter(cds_codons >= 0, cds_codons_fm >= 0) %>%
+  ggplot(aes(x = log2(cds_codons_fm + 1), y = log2(cds_codons + 1),
+             colour = match_class)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 0.5, alpha = 0.35) +
+  annotate("text", x = -Inf, y = Inf, label = fm_lab,
+           hjust = -0.1, vjust = 1.15, size = 3) +
+  scale_colour_manual(values = c("exact" = "#0072B2", "drift" = "#CC79A7",
+                                 "absent" = "grey60"),
+                      name = "v49 version match") +
+  labs(
+    title    = "GEO length column vs the CDS length this project computes elsewhere",
+    subtitle = str_wrap(paste0(
+      "Feature matrix cds_length from 01_feature_extraction.Rmd, converted with ",
+      "round(CDS nt / 3) - 10. Dashed line is y = x."), width = 78),
+    x        = "log2(expected codons from the feature matrix + 1)",
+    y        = "log2(GEO column 2 + 1)"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_fm)
+ggsave(here("plots", "dhx29_01_cds_length_vs_feature_matrix.pdf"),
+       p_fm, width = 8, height = 4.5)
+```
+
+### 5f: Plot 9, observed against expected CDS length
+
+```{r plot_length_vs_v49, fig.width = 7.5, fig.height = 4}
+rule_labels <- rule_summary %>%
+  mutate(lab = paste0("n = ", format(n, big.mark = ","),
+                      "\nR = ", sprintf("%.4f", pearson_r),
+                      "\nexact match = ", sprintf("%.2f%%", 100 * agreement)))
+
+p_scatter <- rule %>%
+  filter(cds_codons >= 0, cds_codons_v49 >= 0) %>%
+  ggplot(aes(x = log2(cds_codons_v49 + 1), y = log2(cds_codons + 1))) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "#0072B2") +
+  geom_point(size = 0.3, alpha = 0.12, colour = "grey20") +
+  geom_text(data = rule_labels, aes(x = -Inf, y = Inf, label = lab),
+            hjust = -0.1, vjust = 1.2, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ match_class) +
+  labs(
+    title    = "GEO length column vs CDS length from GENCODE v49",
+    subtitle = "Expected = round(CDS nt / 3) - 10. Dashed line is y = x.",
+    x        = "log2(expected codons from v49 + 1)",
+    y        = "log2(GEO column 2 + 1)"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_scatter)
+ggsave(here("plots", "dhx29_01_cds_length_vs_v49.pdf"),
+       p_scatter, width = 7.5, height = 4)
+```
+
+### 5g: Plot 10, the residual
+
+`delta` is exactly zero for the overwhelming majority of the exact-version class and has a
+long integer tail, so a density curve would smooth the one thing worth seeing. Binned
+proportions instead.
+
+```{r plot_length_delta, fig.width = 8, fig.height = 4.5}
+delta_buckets <- rule %>%
+  mutate(bucket = cut(abs(delta), breaks = c(-1, 0, 9, 99, Inf),
+                      labels = c("0", "1 to 9", "10 to 99", "100 or more"))) %>%
+  dplyr::count(match_class, bucket) %>%
+  group_by(match_class) %>%
+  mutate(frac = n / sum(n), n_class = sum(n)) %>%
+  ungroup() %>%
+  arrange(match_class) %>%
+  mutate(class_lab = factor(paste0(match_class, " (n = ",
+                                   format(n_class, big.mark = ","), ")"),
+                            levels = unique(paste0(match_class, " (n = ",
+                                                   format(n_class, big.mark = ","), ")"))))
+
+print(as.data.frame(delta_buckets %>% dplyr::select(match_class, bucket, n) %>%
+                      pivot_wider(names_from = bucket, values_from = n, values_fill = 0)))
+
+p_delta <- ggplot(delta_buckets, aes(x = bucket, y = frac, fill = class_lab)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7,
+           colour = "grey20", linewidth = 0.3) +
+  geom_text(aes(label = format(n, big.mark = ",")),
+            position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 2.8) +
+  scale_y_continuous(limits = c(0, 1.08), breaks = seq(0, 1, 0.25)) +
+  scale_fill_manual(values = setNames(c("#0072B2", "#CC79A7"),
+                                      levels(delta_buckets$class_lab)),
+                    name = "Version match") +
+  labs(
+    title    = "Residual between the GEO length column and GENCODE v49",
+    subtitle = str_wrap(paste0(
+      "delta = column 2 minus round(CDS nt / 3) - 10, bucketed by absolute value. ",
+      "Bar labels are transcript counts."), width = 90),
+    x        = "absolute delta (codons)",
+    y        = "Fraction of the class"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_delta)
+ggsave(here("plots", "dhx29_01_cds_length_delta.pdf"),
+       p_delta, width = 8, height = 4.5)
+```
+
+### 5h: The disagreements
+
+Printed rather than summarised away, so a systematic offset would be visible.
+
+```{r worst_mismatches}
+cat("Largest disagreements within the exact-version class:\n")
+print(as.data.frame(
+  rule %>%
+    filter(match_class == "exact", delta != 0) %>%
+    arrange(desc(abs(delta))) %>%
+    dplyr::select(transcript_id, gene_id, v49_transcript_type,
+                  cds_codons, cds_len, cds_codons_v49, delta) %>%
+    head(15)
+))
+
+cat("\nDelta values within the exact-version class, most common first:\n")
+print(as.data.frame(
+  rule %>%
+    filter(match_class == "exact") %>%
+    dplyr::count(delta, sort = TRUE) %>%
+    head(8)
+))
+```
+
+The 159 exact-version disagreements are dominated by `nonsense_mediated_decay`
+transcripts, where GENCODE moved the annotated CDS boundary without bumping the transcript
+version. That is annotation churn on the v49 side, not a misread column.
+
+### 5i: Assertions
+
+```{r assertions}
+rows_per_sample <- counts %>% dplyr::count(sample) %>% pull(n)
+
+len_by_sample <- counts %>%
+  dplyr::select(sample, transcript_id, cds_codons) %>%
+  pivot_wider(names_from = sample, values_from = cds_codons)
+
+exact_row <- rule_summary %>% filter(match_class == "exact")
+drift_row <- rule_summary %>% filter(match_class == "drift")
+
+stopifnot(
+  "samples differ in row count" = n_distinct(rows_per_sample) == 1,
+  "unexpected row count per sample" = rows_per_sample[1] == 227264,
+  "counts are not finite non-negative integers" =
+    all(is.finite(counts$count)) && all(counts$count >= 0),
+  "the length column is not identical across all six samples" =
+    all(len_by_sample$Input1 == len_by_sample$Input2 &
+        len_by_sample$Input1 == len_by_sample$Input3 &
+        len_by_sample$Input1 == len_by_sample$IP1 &
+        len_by_sample$Input1 == len_by_sample$IP2 &
+        len_by_sample$Input1 == len_by_sample$IP3, na.rm = TRUE),
+  "N/A rows disagree between samples" =
+    all(rowSums(is.na(len_by_sample[, -1])) %in% c(0L, 6L)),
+  "a non-coding row carries counts" =
+    all(counts$count[is.na(counts$cds_codons)] == 0),
+  "a negative-length row carries counts" =
+    all(counts$count[!is.na(counts$cds_codons) & counts$cds_codons < 0] == 0),
+  "exact-version agreement with the CDS length rule is below 0.99" =
+    exact_row$agreement > 0.99,
+  "exact-version correlation with v49 CDS length is below 0.99" =
+    exact_row$pearson_r > 0.99,
+  "version drift did not degrade agreement, so the join is not doing what it claims" =
+    drift_row$agreement < exact_row$agreement,
+  "under 90% of coding GEO transcripts match a v49 transcript" =
+    coding_match_rate > 0.90
+)
+
+cat("All Section 5 assertions passed.\n")
+```
+
+### 5j: Biological spot-checks
+
+Canonical housekeeping transcripts must sit at the top of the count distribution in every
+sample. One that does not would mean the wrong column was read.
+
+```{r housekeeping}
+hk <- tibble(
+  symbol         = c("ACTB", "GAPDH", "EEF1A1"),
+  gene_id_clean  = c("ENSG00000075624", "ENSG00000111640", "ENSG00000156508")
+)
+
+hk_check <- counts %>%
+  left_join(annot_check %>%
+              transmute(transcript_id, gene_id_clean = str_remove(gene_id, "\\..*")),
+            by = "transcript_id") %>%
+  filter(count > 0) %>%
+  group_by(sample) %>%
+  mutate(pct = percent_rank(count)) %>%
+  ungroup() %>%
+  inner_join(hk, by = "gene_id_clean") %>%
+  group_by(sample, assay, symbol) %>%
+  summarise(top_pct = max(pct), top_count = max(count), .groups = "drop")
+
+print(as.data.frame(
+  hk_check %>%
+    mutate(top_pct = round(top_pct, 4)) %>%
+    pivot_wider(id_cols = c(sample, assay), names_from = symbol,
+                values_from = top_pct)
+))
+
+stopifnot(
+  "a housekeeping transcript is not in the top 5% of counts in every sample" =
+    all(hk_check$top_pct > 0.95),
+  "housekeeping check did not cover all three genes in all six samples" =
+    nrow(hk_check) == 18,
+  "DHX29-IP libraries are not smaller than Input, unexpected for a pull-down" =
+    ip_input_ratio < 1
+)
+
+cat("Housekeeping and library-size checks passed.\n")
+```
+
+---
+
+## Section 6: Save
+
+```{r save_outputs}
+out_dir <- here("output", "dhx29_reanalysis")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(counts, file.path(out_dir, "dhx29_thor_riboseq_counts_long.rds"))
+write_csv(sample_summary, file.path(out_dir, "dhx29_thor_riboseq_sample_summary.csv"))
+
+annot_check %>%
+  left_join(rule %>% dplyr::select(transcript_id, cds_codons_v49, delta),
+            by = "transcript_id") %>%
+  left_join(fm_join %>% dplyr::select(transcript_id, cds_length,
+                                      cds_codons_fm, delta_fm),
+            by = "transcript_id") %>%
+  left_join(codon_ratio %>% dplyr::select(transcript_id, nt_per_codon,
+                                          nt_per_codon_trim_restored),
+            by = "transcript_id") %>%
+  dplyr::select(transcript_id, transcript_id_clean, gene_id,
+                cds_codons, cds_length_external = cds_len,
+                nt_per_codon, nt_per_codon_trim_restored,
+                cds_codons_v49, delta,
+                cds_length_feature_matrix = cds_length,
+                cds_codons_fm, delta_fm,
+                match_class, v49_transcript_type, v49_cds_bearing) %>%
+  write_csv(file.path(out_dir, "dhx29_cds_length_vs_v49.csv"))
+
+dbDisconnect(con)
+
+cat("Wrote:\n",
+    " ", file.path(out_dir, "dhx29_thor_riboseq_counts_long.rds"), "\n",
+    " ", file.path(out_dir, "dhx29_thor_riboseq_sample_summary.csv"), "\n",
+    " ", file.path(out_dir, "dhx29_cds_length_vs_v49.csv"), "\n", sep = "")
+```
+
+```{r session_info}
+sessionInfo()
+```

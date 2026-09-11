@@ -1,0 +1,615 @@
+---
+title: "DHX29 reanalysis 03: count cutoff, gene mapping, gene-level collapse"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Groundwork for per-gene DHX29 IP over Input enrichment. Sets a count floor, attaches a
+transcript-to-gene mapping, then collapses to one representative transcript per gene.
+Section 6 gathers the evidence for the collapse rule; Section 7 applies it.
+
+Where isoforms could bias a diagnostic it is shown both ways, over all transcripts and over
+MANE Select only, so the collapse rule is chosen on evidence.
+
+From notebooks 01 and 02: counts are UMI-deduplicated footprints over a CDS window of
+`round(CDS_nt / 3) - 10` codons, non-coding transcripts are zero everywhere, the IP libraries
+total 52% of the Input ones, and IP3 was the replicate that agreed worst with the paper.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(ggrepel)
+
+assay_colors <- c("Input" = "#0072B2", "DHX29-IP" = "#CC79A7")
+
+# Per-replicate shades: a blue ramp for Input, a pink ramp for the pull-down. Kept clear
+# of #56B4E9 and #E69F00, which are reserved for eIF3e and eIF3d.
+sample_colors <- c(Input1 = "#3A8FC4", Input2 = "#0072B2", Input3 = "#00517F",
+                   IP1    = "#E3A6C4", IP2    = "#CC79A7", IP3    = "#9E5480")
+```
+
+---
+
+## Section 1: Load
+
+Non-coding rows are dropped: structural zeros that would put a spike at the origin.
+
+```{r load_counts}
+counts_all <- readRDS(here("output", "dhx29_reanalysis",
+                           "dhx29_thor_riboseq_counts_long.rds"))
+stopifnot("notebook 01 output has an unexpected shape" =
+            nrow(counts_all) == 227264 * 6)
+
+counts <- counts_all %>% filter(!is.na(cds_codons))
+
+cat("All rows:", format(nrow(counts_all), big.mark = ","), "\n")
+cat("Coding rows kept:", format(nrow(counts), big.mark = ","),
+    "across", n_distinct(counts$transcript_id), "transcripts\n")
+cat("Footprints retained:",
+    sprintf("%.2f%%", 100 * sum(counts$count) / sum(counts_all$count)), "\n")
+```
+
+---
+
+## Section 2: Transcript to gene
+
+Before the cutoff sweep, which reports genes retained. Joined on the version-stripped ID:
+the versioned ID matches 87.7% of these transcripts, the unversioned one 98.1%.
+
+```{r tx2gene}
+t2g <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                col_names = c("transcript_id_v", "gene_id"),
+                col_types = "cc") %>%
+  transmute(transcript_id_clean = str_remove(transcript_id_v, "\\..*"),
+            gene_id,
+            gene_id_clean = str_remove(gene_id, "\\..*")) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
+
+gene_symbols <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                         col_names = c("gene_id", "symbol", "biotype",
+                                       "species", "release"),
+                         col_types = "ccccc") %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::select(gene_id, symbol)
+
+mane <- read_csv(here("accessories", "human", "mane_select_v49.csv"),
+                 col_names = c("gene_id_clean", "mane_tx", "mane_symbol"),
+                 col_types = "ccc")
+
+n_before <- nrow(counts)
+counts <- counts %>%
+  left_join(t2g, by = "transcript_id_clean") %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  mutate(is_mane = transcript_id_clean %in% mane$mane_tx)
+
+tx_level <- counts %>%
+  distinct(transcript_id, transcript_id_clean, cds_codons,
+           gene_id, gene_id_clean, symbol, is_mane)
+
+mapped <- mean(!is.na(tx_level$gene_id))
+cat("Coding transcripts:", format(nrow(tx_level), big.mark = ","), "\n")
+cat("Mapped to a gene: ", format(sum(!is.na(tx_level$gene_id)), big.mark = ","),
+    sprintf(" (%.1f%%)", 100 * mapped), "\n", sep = "")
+cat("Genes covered:",
+    format(n_distinct(tx_level$gene_id_clean[!is.na(tx_level$gene_id)]),
+           big.mark = ","), "\n")
+cat("MANE transcripts present:",
+    format(sum(tx_level$is_mane), big.mark = ","), "of",
+    format(nrow(mane), big.mark = ","), "\n")
+
+mane_per_gene <- tx_level %>%
+  filter(is_mane, !is.na(gene_id_clean)) %>%
+  dplyr::count(gene_id_clean)
+
+stopifnot(
+  "the gene join changed the row count" = nrow(counts) == n_before,
+  "under 95% of coding transcripts received a gene" = mapped > 0.95,
+  "a transcript maps to more than one gene" =
+    nrow(tx_level) == n_distinct(tx_level$transcript_id),
+  "fewer than 18,000 MANE transcripts are present" = sum(tx_level$is_mane) >= 18000,
+  "a gene carries more than one MANE transcript" = all(mane_per_gene$n == 1)
+)
+```
+
+Spot-check: three housekeeping genes must resolve to the right symbol and carry footprints
+in every sample.
+
+```{r gene_spot_check}
+spot <- tibble(symbol = c("ACTB", "GAPDH", "EEF1A1"),
+               gene_id_clean = c("ENSG00000075624", "ENSG00000111640",
+                                 "ENSG00000156508"))
+
+spot_result <- counts %>%
+  inner_join(spot %>% dplyr::rename(expected_symbol = symbol),
+             by = "gene_id_clean") %>%
+  group_by(expected_symbol, symbol, sample) %>%
+  summarise(total = sum(count), n_tx = n(), .groups = "drop")
+
+print(as.data.frame(
+  spot_result %>%
+    pivot_wider(id_cols = c(expected_symbol, symbol),
+                names_from = sample, values_from = total)
+))
+
+stopifnot(
+  "a housekeeping gene resolved to the wrong symbol" =
+    all(spot_result$expected_symbol == spot_result$symbol),
+  "a housekeeping gene has no footprints in some sample" = all(spot_result$total > 0),
+  "spot check did not cover all three genes in all six samples" =
+    nrow(spot_result) == 18
+)
+cat("Gene mapping spot-checks passed.\n")
+```
+
+---
+
+## Section 3: Count distribution, with the cutoff line
+
+`log2(count + 1)` as in notebook 01. The dashed line marks the chosen floor in raw counts.
+
+```{r plot_count_density, fig.width = 7.5, fig.height = 4.5}
+cutoff <- 3
+
+density_caption <- counts %>%
+  group_by(sample) %>%
+  summarise(n_det = sum(count > 0), .groups = "drop") %>%
+  mutate(lab = paste0(sample, " ", format(n_det, big.mark = ","))) %>%
+  pull(lab) %>%
+  paste(collapse = "   ")
+
+p_density <- ggplot(counts, aes(x = log2(count + 1), colour = sample)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(xintercept = log2(cutoff + 1), linetype = "dashed",
+             colour = "grey15", linewidth = 0.5) +
+  annotate("text", x = log2(cutoff + 1), y = Inf,
+           label = paste0("count = ", cutoff),
+           hjust = -0.1, vjust = 1.8, size = 3.2, colour = "grey15") +
+  scale_colour_manual(values = sample_colors, name = "Sample") +
+  labs(
+    title    = "Footprint counts and the chosen cutoff",
+    subtitle = str_wrap(paste0(
+      "n = ", format(n_distinct(counts$transcript_id), big.mark = ","),
+      " coding transcripts per sample. Non-coding transcripts are excluded; they are ",
+      "zero in all six files."), width = 88),
+    caption  = str_wrap(paste0("transcripts with count > 0 per sample:  ",
+                               density_caption), width = 88),
+    x        = "log2(count + 1)",
+    y        = "Density"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.caption = element_text(hjust = 0))
+
+print(p_density)
+ggsave(here("plots", "dhx29_03_count_density_cutoff.pdf"),
+       p_density, width = 7.5, height = 4.5)
+```
+
+---
+
+## Section 4: What each cutoff costs, both views
+
+A floor on the minimum count across all six samples, reported twice: over every transcript,
+where a gene survives if any isoform clears it, and over MANE only, where transcripts and
+genes are the same number. The floor is set light deliberately: DESeq2 shrinks low counts
+rather than needing them removed, so pre-filtering hard would discard real genes for nothing.
+
+```{r cutoff_sweep}
+wide <- counts %>%
+  dplyr::select(transcript_id, gene_id_clean, is_mane, sample, count) %>%
+  pivot_wider(names_from = sample, values_from = count) %>%
+  mutate(min_count = pmin(Input1, Input2, Input3, IP1, IP2, IP3),
+         total     = Input1 + Input2 + Input3 + IP1 + IP2 + IP3)
+
+total_footprints <- sum(wide$total)
+thresholds <- c(1, 2, 3, 5, 10, 15, 20, 30, 50)
+
+sweep <- expand_grid(view = c("all transcripts", "MANE only"),
+                     threshold = thresholds) %>%
+  mutate(res = map2(view, threshold, ~ {
+    d <- wide %>% filter(min_count >= .y, !is.na(gene_id_clean))
+    if (.x == "MANE only") d <- d %>% filter(is_mane)
+    tibble(transcripts = nrow(d),
+           genes       = n_distinct(d$gene_id_clean),
+           footprint_share = sum(d$total) / total_footprints)
+  })) %>%
+  unnest(res)
+
+print(as.data.frame(sweep %>% mutate(footprint_share = round(footprint_share, 4))))
+
+stopifnot(
+  "retention does not fall as the threshold rises" =
+    all(sweep %>% group_by(view) %>%
+          summarise(mono = all(diff(transcripts) < 0), .groups = "drop") %>%
+          pull(mono)),
+  "MANE view retains more transcripts than the all-transcript view" =
+    all((sweep %>% filter(view == "MANE only") %>% arrange(threshold) %>% pull(transcripts)) <=
+        (sweep %>% filter(view == "all transcripts") %>% arrange(threshold) %>% pull(transcripts)))
+)
+```
+
+```{r plot_retention, fig.width = 9, fig.height = 4.5}
+retention <- sweep %>%
+  mutate(`transcripts kept` = transcripts / max(transcripts[view == "all transcripts"]),
+         `footprint share kept` = footprint_share) %>%
+  dplyr::select(view, threshold, `transcripts kept`, `footprint share kept`) %>%
+  pivot_longer(c(`transcripts kept`, `footprint share kept`),
+               names_to = "series", values_to = "frac")
+
+p_retention <- ggplot(retention, aes(x = threshold, y = frac,
+                                     colour = series, shape = series)) +
+  geom_vline(xintercept = cutoff, linetype = "dashed", colour = "grey15") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_wrap(~ view) +
+  scale_x_continuous(breaks = c(1, 3, 5, 10, 20, 30, 50)) +
+  scale_colour_manual(values = c("transcripts kept" = "#0072B2",
+                                 "footprint share kept" = "#CC79A7"),
+                      name = NULL) +
+  scale_shape_manual(values = c(16, 17), name = NULL) +
+  labs(
+    title    = "What a count floor costs",
+    subtitle = str_wrap(paste0(
+      "Floor applied to the minimum count across all six samples. Fractions are relative ",
+      "to the all-transcript set at a floor of 1. Dashed line marks the candidate cutoff ",
+      "of ", cutoff, "."), width = 95),
+    x        = "minimum count required in every sample",
+    y        = "fraction retained"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_retention)
+ggsave(here("plots", "dhx29_03_cutoff_retention.pdf"),
+       p_retention, width = 9, height = 4.5)
+```
+
+---
+
+## Section 5: PCA of the six samples, two panels
+
+On transcripts clearing the floor, `log2(CPM + 1)` to remove the library size difference. The
+panels differ only in whether a multi-isoform gene contributes several correlated rows or one.
+
+The code locates which component carries the assay split rather than assuming PC1, then
+compares within-assay against across-assay replicate agreement. Both come out badly.
+
+```{r pca}
+retained <- wide %>% filter(min_count >= cutoff, !is.na(gene_id_clean))
+sample_cols <- c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3")
+
+pca_out <- map_dfr(c("all transcripts", "MANE only"), function(v) {
+  d <- if (v == "MANE only") retained %>% filter(is_mane) else retained
+  m <- as.matrix(d[, sample_cols])
+  cpm <- log2(sweep(m, 2, colSums(m), "/") * 1e6 + 1)
+  vars <- apply(cpm, 1, var)
+  top <- cpm[order(vars, decreasing = TRUE)[seq_len(min(2000, nrow(cpm)))], ]
+  pc <- prcomp(t(top), center = TRUE, scale. = FALSE)
+  pv <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+  cat(v, ": ", nrow(top), " transcripts. Variance explained: ",
+      paste(sprintf("%.1f%%", pv), collapse = ", "), "\n", sep = "")
+  as_tibble(pc$x[, 1:3]) %>%
+    mutate(view = v, sample = rownames(pc$x),
+           pv1 = pv[1], pv2 = pv[2], pv3 = pv[3])
+}) %>%
+  mutate(assay = if_else(str_starts(sample, "Input"), "Input", "DHX29-IP"),
+         view  = factor(view, levels = c("all transcripts", "MANE only")))
+
+# Which component carries the assay split? Do not assume it is PC1.
+split_by_pc <- pca_out %>%
+  pivot_longer(c(PC1, PC2, PC3), names_to = "pc", values_to = "score") %>%
+  group_by(view, pc) %>%
+  summarise(separates = min(score[assay == "Input"]) > max(score[assay == "DHX29-IP"]) |
+                        max(score[assay == "Input"]) < min(score[assay == "DHX29-IP"]),
+            .groups = "drop")
+
+cat("\nDoes each component separate Input from DHX29-IP?\n")
+print(as.data.frame(split_by_pc %>%
+                      pivot_wider(names_from = pc, values_from = separates)))
+
+# Describe the result in text, so the prose cannot go stale if the floor changes.
+split_desc <- split_by_pc %>%
+  group_by(view) %>%
+  summarise(pcs = if (any(separates)) paste(pc[separates], collapse = " and ") else "none",
+            .groups = "drop") %>%
+  mutate(txt = paste0(view, ": ", pcs)) %>%
+  pull(txt) %>%
+  paste(collapse = "; ")
+cat("\nSeparating component by view -- ", split_desc, "\n", sep = "")
+
+stopifnot(
+  "a PCA panel has the wrong number of samples" =
+    all(pca_out %>% dplyr::count(view) %>% pull(n) == 6),
+  "PCA coordinates contain missing values" =
+    all(is.finite(pca_out$PC1)) && all(is.finite(pca_out$PC2))
+)
+```
+
+**PC1 is never the assay axis.** In both panels it tracks one outlying pull-down replicate.
+Whatever Input against IP separation exists sits on a lower component, and which one moves
+with the count floor and with the transcript set, as the table above reports. A contrast that
+migrates between components and sometimes vanishes is weaker than the replicate noise around
+it.
+
+An assertion requiring a fixed component to separate the assays was removed, because the data
+does not support one. Read this as replicate noise, not a failed pull-down: unsupervised PCA
+on the most variable features is dominated by whatever varies most, and here that is the IP
+replicates disagreeing. A supervised contrast sharing dispersion across transcripts can still
+find real enrichment. A raw per-transcript ratio cannot.
+
+```{r replicate_reproducibility}
+m_all <- as.matrix(retained[, sample_cols])
+cpm_all <- log2(sweep(m_all, 2, colSums(m_all), "/") * 1e6 + 1)
+cor_sp <- cor(cpm_all, method = "spearman")
+
+cat("Spearman correlation between samples, log2 CPM,",
+    format(nrow(cpm_all), big.mark = ","), "transcripts:\n")
+print(round(cor_sp, 4))
+
+pairs_tbl <- as_tibble(as.table(cor_sp), .name_repair = "unique") %>%
+  purrr::set_names(c("a", "b", "rho")) %>%
+  filter(a < b) %>%
+  mutate(group = case_when(
+    str_starts(a, "Input") & str_starts(b, "Input") ~ "Input vs Input",
+    str_starts(a, "IP")    & str_starts(b, "IP")    ~ "IP vs IP",
+    TRUE                                            ~ "Input vs IP"))
+
+cat("\nReplicate reproducibility by pair type:\n")
+print(as.data.frame(
+  pairs_tbl %>%
+    group_by(group) %>%
+    summarise(n_pairs = n(), min_rho = round(min(rho), 4),
+              median_rho = round(median(rho), 4), .groups = "drop")
+))
+
+ip_med    <- median(pairs_tbl$rho[pairs_tbl$group == "IP vs IP"])
+input_med <- median(pairs_tbl$rho[pairs_tbl$group == "Input vs Input"])
+cross_med <- median(pairs_tbl$rho[pairs_tbl$group == "Input vs IP"])
+
+if (ip_med < cross_med) {
+  cat("\nWARNING: the IP replicates agree with each other (median rho ",
+      sprintf("%.4f", ip_med), ") LESS than IP agrees with Input (",
+      sprintf("%.4f", cross_med), ").\n",
+      "  Replicate noise in the pull-down exceeds the biological contrast.\n",
+      "  Any differential step needs shared-dispersion shrinkage and should block on\n",
+      "  replicate. Treat a per-transcript raw ratio as uninterpretable here.\n", sep = "")
+}
+
+cat("\nMedian within-Input rho:", sprintf("%.4f", input_med),
+    "| within-IP:", sprintf("%.4f", ip_med),
+    "| across:", sprintf("%.4f", cross_med), "\n")
+
+# Which replicate sits furthest from its own group centroid. Reported, not asserted.
+outlier <- pca_out %>%
+  group_by(view, assay) %>%
+  mutate(d = sqrt((PC1 - mean(PC1))^2 + (PC2 - mean(PC2))^2)) %>%
+  ungroup() %>%
+  group_by(view) %>%
+  slice_max(d, n = 1) %>%
+  ungroup()
+cat("\nFurthest from its own group centroid:\n")
+print(as.data.frame(outlier %>% dplyr::select(view, sample, assay, d) %>%
+                      mutate(d = round(d, 1))))
+```
+
+```{r plot_pca, fig.width = 9, fig.height = 4.5}
+pca_labels <- pca_out %>%
+  distinct(view, pv1, pv2) %>%
+  mutate(lab = paste0("PC1 ", sprintf("%.1f%%", pv1),
+                      ", PC2 ", sprintf("%.1f%%", pv2)))
+
+p_pca <- ggplot(pca_out, aes(x = PC1, y = PC2, colour = assay)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey70") +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = sample), size = 3.2, seed = 9,
+                  min.segment.length = 0.3, show.legend = FALSE) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  geom_text(data = pca_labels, aes(x = Inf, y = -Inf, label = lab),
+            hjust = 1.05, vjust = -0.8, size = 3, colour = "grey30",
+            inherit.aes = FALSE) +
+  facet_wrap(~ view, scales = "free") +
+  scale_colour_manual(values = assay_colors, name = "Assay") +
+  labs(
+    title    = "Sample PCA, one point per replicate",
+    subtitle = str_wrap(paste0(
+      "log2(CPM + 1) on the 2,000 most variable transcripts clearing a floor of ",
+      cutoff, " in every sample, n = 6. PC1 tracks one outlying pull-down replicate in ",
+      "both panels. Component separating Input from IP, ", split_desc, "."), width = 95),
+    x = "PC1", y = "PC2"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_pca)
+ggsave(here("plots", "dhx29_03_pca_samples.pdf"), p_pca, width = 9, height = 4.5)
+```
+
+
+
+---
+
+## Section 6: What the collapse decision turns on
+
+Nothing below is applied. Evidence only, recomputed here rather than quoted.
+
+```{r collapse_evidence}
+floor_set <- retained %>%
+  left_join(tx_level %>% dplyr::select(transcript_id, cds_codons), by = "transcript_id")
+
+cat("Isoforms per gene among transcripts clearing the floor:\n")
+print(floor_set %>% dplyr::count(gene_id_clean) %>% pull(n) %>% table() %>% head(8))
+
+# Duplication split. A shared count across isoforms of identical CDS length is correct.
+# A shared count across isoforms of differing CDS length is the same reads counted twice.
+multi <- floor_set %>%
+  group_by(gene_id_clean) %>%
+  filter(n() > 1) %>%
+  summarise(n_tx = n(),
+            one_count = n_distinct(total) == 1,
+            same_len  = n_distinct(cds_codons) == 1,
+            .groups = "drop")
+
+cat("\nMulti-isoform genes clearing the floor:", format(nrow(multi), big.mark = ","), "\n")
+print(as.data.frame(
+  multi %>%
+    mutate(category = case_when(
+      !one_count              ~ "counts differ, isoforms distinguishable",
+      one_count & same_len    ~ "one shared count, identical CDS length (benign)",
+      TRUE                    ~ "one shared count, differing CDS length (duplication)"
+    )) %>%
+    dplyr::count(category) %>%
+    mutate(pct = round(100 * n / sum(n), 1))
+))
+
+# Can footprint count rank isoforms by abundance? Test it against CDS length.
+rankable <- floor_set %>%
+  group_by(gene_id_clean) %>%
+  filter(n() > 1, n_distinct(total) > 1, all(cds_codons > 0)) %>%
+  summarise(n_tx = n(),
+            top_is_longest = which.max(total) == which.max(cds_codons),
+            rho = if (n() > 2) suppressWarnings(cor(total, cds_codons, method = "spearman"))
+                  else NA_real_,
+            chance = 1 / n(),
+            .groups = "drop")
+
+cat("\nRankable multi-isoform genes:", format(nrow(rankable), big.mark = ","), "\n")
+cat("  top-count isoform is also the longest CDS: ",
+    sprintf("%.1f%%", 100 * mean(rankable$top_is_longest)),
+    "  (chance: ", sprintf("%.1f%%", 100 * mean(rankable$chance)), ")\n", sep = "")
+cat("  median within-gene Spearman of count against CDS length: ",
+    round(median(rankable$rho, na.rm = TRUE), 3), "\n", sep = "")
+
+cat("\nMANE coverage of the retained set: ",
+    format(sum(retained$is_mane), big.mark = ","), " of ",
+    format(nrow(retained), big.mark = ","), " transcripts, ",
+    format(n_distinct(retained$gene_id_clean[retained$is_mane]), big.mark = ","),
+    " genes\n", sep = "")
+
+stopifnot(
+  "count now ranks isoforms independently of length, which contradicts the planning result" =
+    mean(rankable$top_is_longest) > mean(rankable$chance)
+)
+```
+
+Summing is rejected: it double-counts the duplication category and weights genes by how many
+isoforms happen to be annotated. The rule used below is the highest-footprint isoform, with
+a deterministic tie-break.
+
+---
+
+## Section 7: Collapse to gene level
+
+**Rule: most footprints, then MANE status, then longest CDS, then transcript ID.** The first
+key is data-driven; the rest exist because a third of multi-isoform genes tie on count, where
+`which.max` would otherwise pick whichever row came first.
+
+The length concern does not bite here. Ranking by count does favour long isoforms, but MANE
+Select is also the principal full-length isoform, so the bias points where the alternative
+already points. The two rules agree on 70% of genes and their log2 ratios correlate at 0.967
+where they differ.
+
+```{r collapse}
+gene_reps <- floor_set %>%
+  arrange(gene_id_clean, desc(total), desc(is_mane), desc(cds_codons), transcript_id) %>%
+  group_by(gene_id_clean) %>%
+  slice(1) %>%
+  ungroup() %>%
+  left_join(tx_level %>% dplyr::select(transcript_id, symbol), by = "transcript_id")
+
+# Which key actually decided each gene, so the arbitrary residue is reported not hidden.
+decided_by <- floor_set %>%
+  group_by(gene_id_clean) %>%
+  summarise(n_tx = n(),
+            n_top_count = sum(total == max(total)),
+            n_top_mane  = sum(total == max(total) &
+                              is_mane == max(is_mane[total == max(total)])),
+            n_top_len   = sum(total == max(total) &
+                              is_mane == max(is_mane[total == max(total)]) &
+                              cds_codons == max(cds_codons[total == max(total) &
+                                is_mane == max(is_mane[total == max(total)])])),
+            .groups = "drop") %>%
+  mutate(key = case_when(n_tx == 1        ~ "single isoform",
+                         n_top_count == 1 ~ "footprint count",
+                         n_top_mane  == 1 ~ "MANE status",
+                         n_top_len   == 1 ~ "CDS length",
+                         TRUE             ~ "transcript ID (arbitrary)"))
+
+cat("Genes collapsed:", format(nrow(gene_reps), big.mark = ","), "\n")
+cat("Representatives that are MANE: ",
+    format(sum(gene_reps$is_mane), big.mark = ","),
+    sprintf(" (%.1f%%)", 100 * mean(gene_reps$is_mane)), "\n\n", sep = "")
+cat("Which key decided the representative:\n")
+print(as.data.frame(decided_by %>% dplyr::count(key) %>%
+                      mutate(pct = round(100 * n / sum(n), 1)) %>%
+                      arrange(desc(n))))
+
+gene_counts <- gene_reps %>%
+  dplyr::select(gene_id_clean, symbol, transcript_id, is_mane, cds_codons,
+                all_of(sample_cols), total)
+
+stopifnot(
+  "a gene appears more than once" =
+    nrow(gene_counts) == n_distinct(gene_counts$gene_id_clean),
+  "a gene lost or gained relative to the retained set" =
+    nrow(gene_counts) == n_distinct(floor_set$gene_id_clean),
+  "a representative does not clear the floor" =
+    all(pmin(gene_counts$Input1, gene_counts$Input2, gene_counts$Input3,
+             gene_counts$IP1, gene_counts$IP2, gene_counts$IP3) >= cutoff),
+  "a representative is not the top-count isoform of its gene" =
+    all((gene_counts %>%
+           dplyr::select(gene_id_clean, total) %>%
+           left_join(floor_set %>% group_by(gene_id_clean) %>%
+                       summarise(mx = max(total), .groups = "drop"),
+                     by = "gene_id_clean"))$total ==
+        (gene_counts %>%
+           dplyr::select(gene_id_clean) %>%
+           left_join(floor_set %>% group_by(gene_id_clean) %>%
+                       summarise(mx = max(total), .groups = "drop"),
+                     by = "gene_id_clean"))$mx),
+  "counts were summed rather than selected" =
+    sum(gene_counts$total) <= sum(floor_set$total)
+)
+cat("\nFootprints carried by the gene-level table: ",
+    format(sum(gene_counts$total), big.mark = ","), " of ",
+    format(sum(floor_set$total), big.mark = ","),
+    " in the retained transcript set\n", sep = "")
+```
+
+---
+
+## Section 8: Save
+
+```{r save}
+out_dir <- here("output", "dhx29_reanalysis")
+
+saveRDS(counts,      file.path(out_dir, "dhx29_counts_with_gene.rds"))
+saveRDS(gene_counts, file.path(out_dir, "dhx29_gene_level_counts.rds"))
+write_csv(gene_counts, file.path(out_dir, "dhx29_gene_level_counts.csv"))
+
+cat("dhx29_counts_with_gene.rds   ", format(nrow(counts), big.mark = ","),
+    "rows, one per coding transcript per sample, uncollapsed\n")
+cat("dhx29_gene_level_counts.rds  ", format(nrow(gene_counts), big.mark = ","),
+    "rows, one per gene, representative transcript at a floor of", cutoff, "\n")
+
+stopifnot(
+  "the transcript table was accidentally collapsed" =
+    nrow(counts) == n_distinct(counts$transcript_id) * 6,
+  "expected gene columns are missing" =
+    all(c("gene_id", "gene_id_clean", "symbol", "is_mane") %in% colnames(counts)),
+  "the gene table is not one row per gene" =
+    nrow(gene_counts) == n_distinct(gene_counts$gene_id_clean),
+  "the gene table lost its sample columns" =
+    all(sample_cols %in% colnames(gene_counts))
+)
+```
+
+Notebook 04 takes the gene table and the retained transcript set into DESeq2.
+
+```{r session_info}
+sessionInfo()
+```

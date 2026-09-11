@@ -1,0 +1,610 @@
+---
+title: "DHX29 reanalysis 04: IP over Input enrichment, transcript and gene level"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Measured DHX29 enrichment per transcript and per gene, from the counts prepared in notebooks
+01 to 03. This is the quantity GSE266018 supports and the paper's supplementary tables do
+not provide.
+
+DESeq2 is the statistic, with a plain normalised log2 ratio alongside as a sanity column. A
+raw ratio on its own is not usable here: the IP libraries are 52% the size of Input, most
+features carry single-digit counts even at a floor of 3, and notebook 03 found the IP
+replicates agree with each other less than they agree with Input.
+
+That last point sets expectations. Read the p-value histogram before anything else. A flat
+histogram would say there is no detectable per-feature signal, which is an answer, not a
+failure.
+
+**Sign convention: Input is the reference, so a positive log2 fold change means enriched in
+the DHX29 pull-down.** Asserted below.
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(DESeq2)
+library(apeglm)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+```
+
+---
+
+## Section 1: Load
+
+```{r load_inputs}
+sample_cols <- c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3")
+cutoff <- 3
+
+gene_counts <- readRDS(here("output", "dhx29_reanalysis",
+                            "dhx29_gene_level_counts.rds"))
+
+tx_counts <- readRDS(here("output", "dhx29_reanalysis",
+                          "dhx29_counts_with_gene.rds")) %>%
+  dplyr::select(transcript_id, transcript_id_clean, gene_id_clean, symbol,
+                is_mane, cds_codons, sample, count) %>%
+  pivot_wider(names_from = sample, values_from = count) %>%
+  filter(!is.na(gene_id_clean),
+         pmin(Input1, Input2, Input3, IP1, IP2, IP3) >= cutoff)
+
+cat("Transcripts clearing the floor:", format(nrow(tx_counts), big.mark = ","), "\n")
+cat("Genes after collapse:", format(nrow(gene_counts), big.mark = ","), "\n")
+
+col_data <- tibble(sample = sample_cols) %>%
+  mutate(assay = factor(if_else(str_starts(sample, "Input"), "Input", "IP"),
+                        levels = c("Input", "IP")),
+         rep   = factor(str_extract(sample, "\\d$"))) %>%
+  column_to_rownames("sample")
+
+stopifnot(
+  "feature counts disagree with notebook 03" =
+    nrow(tx_counts) == 41679 && nrow(gene_counts) == 10493,
+  "Input is not the reference level" = levels(col_data$assay)[1] == "Input",
+  "counts are not clean non-negative integers" =
+    all(map_lgl(tx_counts[sample_cols], ~ all(is.finite(.x)) && all(.x >= 0))) &&
+    all(map_lgl(gene_counts[sample_cols], ~ all(is.finite(.x)) && all(.x >= 0)))
+)
+print(col_data)
+```
+
+---
+
+## Section 2: DESeq2, transcript level
+
+Both designs fitted. `lfcShrink` with apeglm on the assay coefficient.
+
+```{r deseq_transcript}
+mat_tx <- as.matrix(tx_counts[, sample_cols])
+rownames(mat_tx) <- tx_counts$transcript_id
+
+dds_tx_paired <- DESeqDataSetFromMatrix(mat_tx, col_data, ~ rep + assay) %>% DESeq(quiet = TRUE)
+dds_tx_simple <- DESeqDataSetFromMatrix(mat_tx, col_data, ~ assay)       %>% DESeq(quiet = TRUE)
+
+cat("Size factors:\n"); print(round(sizeFactors(dds_tx_paired), 4))
+
+raw_tx_paired <- results(dds_tx_paired, name = "assay_IP_vs_Input")
+raw_tx_simple <- results(dds_tx_simple, name = "assay_IP_vs_Input")
+res_tx_paired <- lfcShrink(dds_tx_paired, coef = "assay_IP_vs_Input",
+                           type = "apeglm", quiet = TRUE)
+res_tx_simple <- lfcShrink(dds_tx_simple, coef = "assay_IP_vs_Input",
+                           type = "apeglm", quiet = TRUE)
+
+# Companion column: plain log2 ratio of normalised means, same size factors.
+norm_tx <- counts(dds_tx_paired, normalized = TRUE)
+ratio_tx <- log2((rowMeans(norm_tx[, 4:6]) + 1) / (rowMeans(norm_tx[, 1:3]) + 1))
+
+tx_res <- tx_counts %>%
+  dplyr::select(transcript_id, transcript_id_clean, gene_id_clean, symbol,
+                is_mane, cds_codons) %>%
+  mutate(base_mean       = res_tx_paired$baseMean,
+         lfc_paired      = res_tx_paired$log2FoldChange,
+         padj_paired     = res_tx_paired$padj,
+         pvalue_paired   = raw_tx_paired$pvalue,
+         lfc_raw_paired  = raw_tx_paired$log2FoldChange,
+         lfc_simple      = res_tx_simple$log2FoldChange,
+         padj_simple     = res_tx_simple$padj,
+         pvalue_simple   = raw_tx_simple$pvalue,
+         lfc_raw_simple  = raw_tx_simple$log2FoldChange,
+         log2_ratio      = ratio_tx)
+
+cat("\nSignificant transcripts, FDR 0.10:  paired",
+    sum(tx_res$padj_paired < 0.10, na.rm = TRUE),
+    " unpaired", sum(tx_res$padj_simple < 0.10, na.rm = TRUE),
+    " of", format(nrow(tx_res), big.mark = ","), "\n")
+
+# Is the p-value distribution enriched near zero, or depleted?
+pb <- hist(tx_res$pvalue_paired, breaks = seq(0, 1, 0.02), plot = FALSE)$counts
+cat("First p-value bin, paired: observed", pb[1],
+    "against", round(sum(!is.na(tx_res$pvalue_paired)) * 0.02),
+    "expected if uniform\n")
+```
+
+```{r plot_diagnostics, fig.width = 9, fig.height = 7}
+diag_df <- tx_res %>%
+  filter(!is.na(padj_paired)) %>%
+  mutate(sig = padj_paired < 0.1)
+
+p_ma <- ggplot(diag_df, aes(x = base_mean, y = lfc_paired, colour = sig)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_point(size = 0.4, alpha = 0.3) +
+  scale_x_log10() +
+  scale_colour_manual(values = c(`FALSE` = "grey60", `TRUE` = "#CC79A7"),
+                      name = "FDR < 0.1") +
+  labs(title = "MA, transcript level", x = "base mean", y = "shrunken log2 IP / Input") +
+  theme_classic(base_size = 12)
+
+p_pval <- ggplot(tx_res %>% filter(!is.na(pvalue_paired)), aes(x = pvalue_paired)) +
+  geom_histogram(breaks = seq(0, 1, 0.02), fill = "#0072B2",
+                 colour = "grey20", alpha = 0.6, linewidth = 0.2) +
+  geom_hline(yintercept = sum(!is.na(tx_res$pvalue_paired)) * 0.02,
+             linetype = "dashed", colour = "#CC79A7") +
+  labs(title = "p-value histogram, transcript level",
+       subtitle = "Dashed line is the uniform expectation. Below it means conservative.",
+       x = "unadjusted p", y = "transcripts") +
+  theme_classic(base_size = 12)
+
+p_disp <- tibble(mean = mcols(dds_tx_paired)$baseMean,
+                 disp = dispersions(dds_tx_paired)) %>%
+  filter(mean > 0, !is.na(disp)) %>%
+  ggplot(aes(mean, disp)) +
+  geom_point(size = 0.3, alpha = 0.2, colour = "grey40") +
+  scale_x_log10() + scale_y_log10() +
+  labs(title = "Dispersion", x = "mean of normalised counts", y = "dispersion") +
+  theme_classic(base_size = 12)
+
+p_ratio <- ggplot(tx_res, aes(x = log2_ratio, y = lfc_paired)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 0.3, alpha = 0.2, colour = "#0072B2") +
+  labs(title = "Shrinkage against the plain ratio",
+       subtitle = paste0("Pearson R = ",
+                         sprintf("%.3f", cor(tx_res$log2_ratio, tx_res$lfc_paired))),
+       x = "plain normalised log2 ratio", y = "shrunken log2 fold change") +
+  theme_classic(base_size = 12)
+
+p_all <- gridExtra::grid.arrange(p_ma, p_pval, p_disp, p_ratio, ncol = 2)
+ggsave(here("plots", "dhx29_04_ma_and_pvalues.pdf"), p_all, width = 11, height = 8)
+```
+
+---
+
+## Section 3: DESeq2, gene level
+
+```{r deseq_gene}
+mat_gene <- as.matrix(gene_counts[, sample_cols])
+rownames(mat_gene) <- gene_counts$gene_id_clean
+
+dds_g_paired <- DESeqDataSetFromMatrix(mat_gene, col_data, ~ rep + assay) %>% DESeq(quiet = TRUE)
+dds_g_simple <- DESeqDataSetFromMatrix(mat_gene, col_data, ~ assay)       %>% DESeq(quiet = TRUE)
+
+raw_g_paired <- results(dds_g_paired, name = "assay_IP_vs_Input")
+raw_g_simple <- results(dds_g_simple, name = "assay_IP_vs_Input")
+res_g_paired <- lfcShrink(dds_g_paired, coef = "assay_IP_vs_Input",
+                          type = "apeglm", quiet = TRUE)
+res_g_simple <- lfcShrink(dds_g_simple, coef = "assay_IP_vs_Input",
+                          type = "apeglm", quiet = TRUE)
+
+norm_g <- counts(dds_g_paired, normalized = TRUE)
+
+gene_res <- gene_counts %>%
+  dplyr::select(gene_id_clean, symbol, transcript_id, is_mane, cds_codons) %>%
+  mutate(base_mean      = res_g_paired$baseMean,
+         lfc_paired     = res_g_paired$log2FoldChange,
+         padj_paired    = res_g_paired$padj,
+         lfc_raw_paired = raw_g_paired$log2FoldChange,
+         pvalue_paired  = raw_g_paired$pvalue,
+         lfc_simple     = res_g_simple$log2FoldChange,
+         padj_simple    = res_g_simple$padj,
+         lfc_raw_simple = raw_g_simple$log2FoldChange,
+         pvalue_simple  = raw_g_simple$pvalue,
+         log2_ratio  = log2((rowMeans(norm_g[, 4:6]) + 1) /
+                            (rowMeans(norm_g[, 1:3]) + 1)))
+
+cat("Significant genes, FDR 0.10:  paired", sum(gene_res$padj_paired < 0.10, na.rm = TRUE),
+    " unpaired", sum(gene_res$padj_simple < 0.10, na.rm = TRUE),
+    " of", format(nrow(gene_res), big.mark = ","), "\n\n")
+cat("Top 10 enriched genes by unpaired shrunken fold change, passing FDR 0.1:\n")
+print(as.data.frame(
+  gene_res %>% filter(padj_simple < 0.1) %>% arrange(desc(lfc_simple)) %>%
+    dplyr::select(symbol, base_mean, lfc_simple, padj_simple) %>%
+    mutate(across(where(is.numeric), ~ signif(.x, 3))) %>% head(10)
+))
+
+# Self-enrichment control. The bait's own transcript should be strongly enriched, the same
+# check code/predictive_modeling/01n_feature_extraction_ripseq.Rmd applies to EIF3D.
+dhx29_row <- gene_res %>% filter(symbol == "DHX29")
+cat("\nDHX29 self-enrichment: log2FC", round(dhx29_row$lfc_simple, 3),
+    " padj", signif(dhx29_row$padj_simple, 3),
+    " rank", which(order(gene_res$lfc_simple, decreasing = TRUE) ==
+                   which(gene_res$symbol == "DHX29")), "of",
+    format(nrow(gene_res), big.mark = ","), "\n")
+
+stopifnot(
+  "DHX29 is not present in the gene table" = nrow(dhx29_row) == 1,
+  "the bait transcript is not enriched in its own pull-down, so the sign is wrong" =
+    dhx29_row$lfc_simple > 1,
+  "DHX29 self-enrichment is not significant" = dhx29_row$padj_simple < 0.01
+)
+```
+
+---
+
+## Section 4: Do the two designs agree?
+
+Compared on the **unshrunk** fold change, which is the estimate the design produces. Shrunken
+values are compared too, but by rank: apeglm pulls almost everything to zero here, so their
+Pearson correlation is dominated by a handful of survivors and says little.
+
+```{r design_comparison, fig.width = 9, fig.height = 4.5}
+design_cmp <- bind_rows(
+  tx_res   %>% transmute(level = "transcript", lfc_paired, lfc_simple,
+                         lfc_raw_paired, lfc_raw_simple),
+  gene_res %>% transmute(level = "gene", lfc_paired, lfc_simple,
+                         lfc_raw_paired, lfc_raw_simple)
+) %>% filter(is.finite(lfc_raw_paired), is.finite(lfc_raw_simple))
+
+design_stats <- design_cmp %>%
+  group_by(level) %>%
+  summarise(n = n(),
+            unshrunk_pearson = cor(lfc_raw_paired, lfc_raw_simple),
+            shrunk_pearson   = cor(lfc_paired, lfc_simple),
+            shrunk_spearman  = cor(lfc_paired, lfc_simple, method = "spearman"),
+            sd_unshrunk      = sd(lfc_raw_simple),
+            sd_shrunk        = sd(lfc_simple),
+            .groups = "drop")
+print(as.data.frame(design_stats %>% mutate(across(-c(level, n), ~ round(.x, 4)))))
+
+sig_counts <- bind_rows(
+  tx_res %>% summarise(level = "transcript",
+                       paired_fdr10 = sum(padj_paired < 0.1, na.rm = TRUE),
+                       unpaired_fdr10 = sum(padj_simple < 0.1, na.rm = TRUE)),
+  gene_res %>% summarise(level = "gene",
+                         paired_fdr10 = sum(padj_paired < 0.1, na.rm = TRUE),
+                         unpaired_fdr10 = sum(padj_simple < 0.1, na.rm = TRUE))
+)
+cat("\nFeatures passing FDR 0.1 under each design:\n")
+print(as.data.frame(sig_counts))
+
+stopifnot(
+  "the two designs estimate different effects" =
+    all(design_stats$unshrunk_pearson > 0.9),
+  "shrunken fold changes do not even agree by rank" =
+    all(design_stats$shrunk_spearman > 0.8)
+)
+
+p_design <- ggplot(design_cmp, aes(lfc_raw_simple, lfc_raw_paired)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 0.3, alpha = 0.2, colour = "#0072B2") +
+  geom_text(data = design_stats, aes(x = -Inf, y = Inf,
+            label = paste0("n = ", format(n, big.mark = ","),
+                           "\nunshrunk Pearson ", sprintf("%.4f", unshrunk_pearson))),
+            hjust = -0.1, vjust = 1.2, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ level, scales = "free") +
+  labs(title = "Blocking on replicate against not",
+       subtitle = "Unshrunk log2 fold change, the estimate each design produces",
+       x = "~ assay", y = "~ rep + assay") +
+  theme_classic(base_size = 12)
+print(p_design)
+ggsave(here("plots", "dhx29_04_design_comparison.pdf"), p_design, width = 9, height = 4.5)
+```
+
+**Blocking does not pay for itself, so the unpaired design is carried forward.** The two
+designs estimate the same effect, but blocking spends two of four residual degrees of freedom
+on a replicate term that does not explain the variance, and recovers fewer features. The
+`sig_counts` table above records the difference.
+
+The shrunken-Pearson column is the artefact it looks like. Shrinkage collapses the fold-change
+distribution by roughly a factor of three, so what survives is a small number of large values
+whose Pearson correlation is unstable. The rank correlation is the honest summary.
+
+---
+
+## Section 4b: Volcano plots, all four fits
+
+Both levels, both designs. The x axis is the **unshrunk** log2 fold change, because that is
+the estimate the Wald test on the y axis is computed from; pairing a shrunken effect with an
+unshrunk p would be inconsistent. Shrunken values are in the saved tables.
+
+```{r volcanoes, fig.width = 10, fig.height = 8}
+volc <- bind_rows(
+  tx_res %>% transmute(level = "transcript", design = "~ rep + assay", label = symbol,
+                       lfc = lfc_raw_paired, pval = pvalue_paired, padj = padj_paired),
+  tx_res %>% transmute(level = "transcript", design = "~ assay", label = symbol,
+                       lfc = lfc_raw_simple, pval = pvalue_simple, padj = padj_simple),
+  gene_res %>% transmute(level = "gene", design = "~ rep + assay", label = symbol,
+                         lfc = lfc_raw_paired, pval = pvalue_paired, padj = padj_paired),
+  gene_res %>% transmute(level = "gene", design = "~ assay", label = symbol,
+                         lfc = lfc_raw_simple, pval = pvalue_simple, padj = padj_simple)
+) %>%
+  filter(is.finite(lfc), is.finite(pval)) %>%
+  mutate(level  = factor(level, levels = c("transcript", "gene")),
+         design = factor(design, levels = c("~ assay", "~ rep + assay")),
+         call   = case_when(is.na(padj) | padj >= 0.1 ~ "not significant",
+                            lfc > 0                   ~ "enriched in IP",
+                            TRUE                      ~ "depleted in IP"))
+
+volc_counts <- volc %>%
+  group_by(level, design) %>%
+  summarise(n = n(),
+            n_sig = sum(call != "not significant"),
+            n_up = sum(call == "enriched in IP"),
+            n_down = sum(call == "depleted in IP"),
+            .groups = "drop")
+print(as.data.frame(volc_counts))
+
+# DHX29 reaches p ~ 1e-100 and would flatten every other point, so the axis is capped
+# and capped points are drawn as triangles.
+y_cap <- 30
+volc <- volc %>%
+  mutate(y = pmin(-log10(pval), y_cap), capped = -log10(pval) > y_cap)
+
+volc_labs <- volc %>%
+  filter(call != "not significant", !is.na(label)) %>%
+  group_by(level, design, label) %>%
+  slice_min(padj, n = 1, with_ties = FALSE) %>%      # one row per symbol per panel
+  group_by(level, design) %>%
+  slice_min(padj, n = 8, with_ties = FALSE) %>%
+  ungroup()
+
+p_volc <- ggplot(volc, aes(lfc, y)) +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey70") +
+  geom_point(aes(colour = call, shape = capped), size = 0.5, alpha = 0.35) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+  ggrepel::geom_text_repel(data = volc_labs, aes(label = label), size = 2.8,
+                           box.padding = 0.4,
+                           seed = 9, max.overlaps = 20, min.segment.length = 0.2) +
+  facet_grid(design ~ level, scales = "free") +
+  scale_colour_manual(values = c("not significant" = "grey70",
+                                 "enriched in IP"  = "#CC79A7",
+                                 "depleted in IP"  = "#0072B2"),
+                      name = "FDR < 0.1") +
+  labs(title = "DHX29-IP against Input",
+       subtitle = str_wrap(paste0(
+         "Unshrunk log2 fold change against the Wald p. Positive means enriched in the ",
+         "pull-down. Counts per panel are tabulated above; the unpaired design recovers ",
+         "more at both levels. The y axis is capped at ", y_cap,
+         "; triangles are capped points, DHX29 among them."), width = 100),
+       x = "log2 IP / Input", y = "-log10(p), capped") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_volc)
+ggsave(here("plots", "dhx29_04_volcanoes.pdf"), p_volc, width = 10, height = 8)
+
+stopifnot(
+  "a volcano panel is missing" = nrow(volc_counts) == 4,
+  "DHX29 is not a significant enriched call at gene level" =
+    volc %>% filter(level == "gene", design == "~ assay", label == "DHX29") %>%
+      pull(call) == "enriched in IP"
+)
+```
+
+---
+
+## Section 5: Transcript against gene
+
+The gene table is built from these same representative transcripts, so this checks that the
+collapse and the refit introduced nothing. Divergence comes from size factors being estimated
+on different feature sets.
+
+```{r tx_vs_gene, fig.width = 6.5, fig.height = 5}
+tg <- gene_res %>%
+  dplyr::select(gene_id_clean, symbol, lfc_gene = lfc_simple, transcript_id) %>%
+  inner_join(tx_res %>% dplyr::select(transcript_id, lfc_tx = lfc_simple),
+             by = "transcript_id")
+
+cat("Genes compared:", format(nrow(tg), big.mark = ","), "\n")
+cat("Pearson:", round(cor(tg$lfc_gene, tg$lfc_tx), 4),
+    " Spearman:", round(cor(tg$lfc_gene, tg$lfc_tx, method = "spearman"), 4),
+    " median |difference|:", round(median(abs(tg$lfc_gene - tg$lfc_tx)), 4), "\n")
+
+p_tg <- ggplot(tg, aes(lfc_tx, lfc_gene)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 0.4, alpha = 0.25, colour = "#CC79A7") +
+  labs(title = "Same transcript, fitted two ways",
+       subtitle = paste0("n = ", format(nrow(tg), big.mark = ","),
+                         ", Pearson R = ", sprintf("%.4f", cor(tg$lfc_gene, tg$lfc_tx))),
+       x = "log2 fold change, transcript-level fit",
+       y = "log2 fold change, gene-level fit") +
+  theme_classic(base_size = 12)
+print(p_tg)
+ggsave(here("plots", "dhx29_04_transcript_vs_gene.pdf"), p_tg, width = 6.5, height = 5)
+```
+
+---
+
+## Section 6 and 7: Validation
+
+Two comparisons against the paper's expectation that DHX29 rides ribosomes decoding
+nonoptimal codons. Section 6 recomputes the prediction on **our own** representative
+transcripts, so predicted and measured describe the same sequence. Section 7 joins notebook
+23's stored score, which was built on MDA-MB-231-selected transcripts and so may use a
+different isoform of the same gene. Section 6 is the stronger test for that reason.
+
+```{r validation, fig.width = 9, fig.height = 4.5}
+s8 <- read_csv(here("accessories", "csc_data", "hia_dhx29",
+                    "science.adw0288_tables_s1_to_s11",
+                    "science.adw0288_table_s8.csv"), show_col_types = FALSE)
+stopifnot("Table S8 is not 64 codons" = nrow(s8) == 64)
+
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds_seqs <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                  cdsBy(txdb, by = "tx", use.names = TRUE))
+cds_seqs <- cds_seqs[(width(cds_seqs) %% 3 == 0) & (width(cds_seqs) >= 33)]
+win <- subseq(cds_seqs, start = 16, end = width(cds_seqs) - 15)
+cf <- trinucleotideFrequency(win, step = 3)
+rownames(cf) <- str_remove(names(win), "\\..*")     # Biostrings drops these
+
+ces <- s8$Fold_Change[match(colnames(cf), s8$codon)]
+pred <- tibble(transcript_id_clean = rownames(cf),
+               predicted_occupancy = as.vector(cf %*% ces) / rowSums(cf))
+
+val <- gene_res %>%
+  mutate(transcript_id_clean = str_remove(transcript_id, "\\..*")) %>%
+  left_join(pred, by = "transcript_id_clean") %>%
+  left_join(readRDS(here("output", "predictive_modeling",
+                         "dhx29_riboseq_occupancy.rds")) %>%
+              distinct(ensembl_gene, .keep_all = TRUE) %>%
+              dplyr::select(gene_id_clean = ensembl_gene,
+                            nb23_occupancy = dhx29_occupancy_score),
+            by = "gene_id_clean")
+
+val_long <- val %>%
+  dplyr::select(symbol, lfc_paired = lfc_simple,
+                `our isoforms (Table S8 applied here)` = predicted_occupancy,
+                `notebook 23 stored score` = nb23_occupancy) %>%
+  pivot_longer(-c(symbol, lfc_paired), names_to = "source", values_to = "predicted") %>%
+  filter(is.finite(predicted), is.finite(lfc_paired))
+
+val_stats <- val_long %>%
+  group_by(source) %>%
+  summarise(n = n(),
+            spearman = cor(predicted, lfc_paired, method = "spearman"),
+            p = cor.test(predicted, lfc_paired, method = "spearman",
+                         exact = FALSE)$p.value,
+            .groups = "drop")
+print(as.data.frame(val_stats %>% mutate(spearman = round(spearman, 4),
+                                         p = signif(p, 3))))
+
+stopifnot(
+  "measured enrichment does not track predicted occupancy in the predicted direction" =
+    all(val_stats$spearman > 0),
+  "the correlation with predicted occupancy is not significant" =
+    all(val_stats$p < 0.01)
+)
+
+p_val <- ggplot(val_long, aes(predicted, lfc_paired)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_point(size = 0.4, alpha = 0.25, colour = "#0072B2") +
+  geom_smooth(method = "lm", se = FALSE, colour = "#CC79A7", linewidth = 0.6) +
+  geom_text(data = val_stats, aes(x = -Inf, y = Inf,
+            label = paste0("n = ", format(n, big.mark = ","),
+                           "\nSpearman ", sprintf("%.3f", spearman),
+                           "\np = ", signif(p, 2))),
+            hjust = -0.1, vjust = 1.2, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ source, scales = "free_x") +
+  labs(title = "Measured enrichment against predicted DHX29 occupancy",
+       subtitle = "Positive log2 fold change means enriched in the pull-down",
+       x = "predicted occupancy", y = "measured log2 IP / Input") +
+  theme_classic(base_size = 12)
+print(p_val)
+ggsave(here("plots", "dhx29_04_validation.pdf"), p_val, width = 9, height = 4.5)
+
+# Monotone gradient across enrichment quintiles is the cleanest form of this result.
+cat("\nWhere the most-enriched genes sit on predicted occupancy:\n")
+print(as.data.frame(
+  val %>% filter(is.finite(predicted_occupancy)) %>%
+    mutate(bin = ntile(lfc_simple, 5)) %>%
+    group_by(enrichment_quintile = bin) %>%
+    summarise(n = n(), median_predicted = median(predicted_occupancy),
+              .groups = "drop") %>%
+    mutate(median_predicted = round(median_predicted, 4)) %>%
+    { stopifnot("predicted occupancy is not monotone across enrichment quintiles" =
+                  all(diff(.$median_predicted) > 0)); . }
+))
+```
+
+
+### Is that correlation real, or an artefact?
+
+The scatter above looks alarming: 98.7% of genes have a shrunken fold change within 0.05 of
+zero, so a rank correlation on it could be ranking noise, and n = 10,396 will hand back a
+tiny p for almost anything. Three checks.
+
+```{r validation_is_it_real, fig.width = 9, fig.height = 4.5}
+vv <- val %>% filter(is.finite(predicted_occupancy), is.finite(lfc_simple),
+                     is.finite(lfc_raw_simple))
+sp <- function(a, b) cor(a, b, method = "spearman")
+
+cat("1. Does shrinkage manufacture it? Same correlation, three estimators:\n")
+cat("   shrunken log2FC:", round(sp(vv$lfc_simple,     vv$predicted_occupancy), 4), "\n")
+cat("   unshrunk log2FC:", round(sp(vv$lfc_raw_simple, vv$predicted_occupancy), 4), "\n")
+cat("   plain log2 ratio:", round(sp(vv$log2_ratio,    vv$predicted_occupancy), 4), "\n")
+cat("   fraction of genes with |shrunken log2FC| < 0.05:",
+    round(mean(abs(vv$lfc_simple) < 0.05), 4), "\n\n")
+
+cat("2. Is it expression in disguise?\n")
+lbm <- log10(vv$base_mean + 1)
+pyz <- sp(vv$predicted_occupancy, lbm)
+pxy <- sp(vv$lfc_simple, pyz * 0 + vv$predicted_occupancy)
+pxz <- sp(vv$lfc_simple, lbm)
+cat("   predicted occupancy vs expression:", round(pyz, 4), "\n")
+cat("   partial Spearman, expression removed:",
+    round((pxy - pxz * pyz) / sqrt((1 - pxz^2) * (1 - pyz^2)), 4), "\n\n")
+
+cat("3. Does it strengthen where measurement is better?\n")
+by_expr <- vv %>%
+  mutate(expr_quintile = ntile(base_mean, 5)) %>%
+  group_by(expr_quintile) %>%
+  summarise(n = n(), median_base_mean = round(median(base_mean), 1),
+            rho_unshrunk = sp(lfc_raw_simple, predicted_occupancy),
+            rho_shrunk   = sp(lfc_simple, predicted_occupancy),
+            .groups = "drop")
+print(as.data.frame(by_expr %>% mutate(across(starts_with("rho"), ~ round(.x, 4)))))
+
+stopifnot(
+  "the correlation only exists after shrinkage, so it is an artefact" =
+    sp(vv$lfc_raw_simple, vv$predicted_occupancy) > 0.05,
+  "the correlation does not survive removing expression" =
+    (pxy - pxz * pyz) / sqrt((1 - pxz^2) * (1 - pyz^2)) > 0.05,
+  "the correlation does not strengthen with better-measured genes" =
+    by_expr$rho_unshrunk[5] > by_expr$rho_unshrunk[1]
+)
+
+p_real <- by_expr %>%
+  dplyr::select(expr_quintile, unshrunk = rho_unshrunk, shrunk = rho_shrunk) %>%
+  pivot_longer(-expr_quintile, names_to = "estimator", values_to = "rho") %>%
+  ggplot(aes(expr_quintile, rho, colour = estimator, shape = estimator)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
+  scale_colour_manual(values = c(unshrunk = "#0072B2", shrunk = "#CC79A7"), name = NULL) +
+  scale_shape_manual(values = c(16, 17), name = NULL) +
+  labs(title = "The signal is attenuated by measurement noise, not absent",
+       subtitle = str_wrap(paste0(
+         "Spearman of measured enrichment against predicted occupancy, within bins of ",
+         "expression. n = ", format(nrow(vv), big.mark = ","),
+         " genes, about ", format(round(nrow(vv)/5), big.mark = ","), " per bin."), width = 90),
+       x = "expression quintile (1 = lowest base mean)",
+       y = "Spearman rho") +
+  theme_classic(base_size = 12)
+print(p_real)
+ggsave(here("plots", "dhx29_04_validation_by_expression.pdf"),
+       p_real, width = 9, height = 4.5)
+```
+
+The pooled 0.156 is a diluted average, not the effect size. The correlation is absent in the
+worst-measured fifth of genes and reaches 0.375 in the best-measured fifth, which is the
+signature of attenuation by measurement error rather than of a spurious association. It is
+not shrinkage, since the unshrunk and plain-ratio estimates give the same answer, and it is
+not expression, which is essentially uncorrelated with predicted occupancy at 0.040.
+
+
+---
+
+## Section 8: Save
+
+```{r save}
+out_dir <- here("output", "dhx29_reanalysis")
+saveRDS(tx_res,   file.path(out_dir, "dhx29_enrichment_transcript.rds"))
+saveRDS(val,      file.path(out_dir, "dhx29_enrichment_gene.rds"))
+write_csv(val,    file.path(out_dir, "dhx29_enrichment_gene.csv"))
+
+cat("transcript-level:", format(nrow(tx_res), big.mark = ","), "rows\n")
+cat("gene-level:", format(nrow(val), big.mark = ","), "rows\n")
+
+stopifnot(
+  "output row counts changed unexpectedly" =
+    nrow(tx_res) == nrow(tx_counts) && nrow(val) == nrow(gene_counts)
+)
+```
+
+```{r session_info}
+sessionInfo()
+```
