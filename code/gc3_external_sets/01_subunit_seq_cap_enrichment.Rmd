@@ -1,0 +1,838 @@
+---
+title: "GC3 external sets 01: eIF3d subunit-seq cap-binding enrichment distributions"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  lamper_lfc: 2
+  lamper_padj: 0.005
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r drop_stale_params}
+# `params` only exists during knit. Interactively it may be a stale list left behind by
+# another notebook, which would pass an exists()-only guard and then feed NULLs downstream,
+# so drop it first and rebuild it in full below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+First notebook of the `gc3_external_sets` folder. It ingests the eIF3d **subunit-seq**
+cap-binding tables and does nothing but describe them: how enriched the reported mRNAs are
+at the cap, in each condition, before any gene set is cut out of them.
+
+Subunit-seq is the Lee lab eIF3d-TEV assay: a TEV protease domain releases and sequences
+only the transcripts held at the 5' cap by eIF3d. Three conditions across two papers:
+
+| condition | source | meaning |
+|---|---|---|
+| **CM** | Lamper et al. 2020, Table S3 | complete media, unstressed baseline |
+| **GLU** | Lamper et al. 2020, Table S3 | glucose deprivation, metabolic stress |
+| **ISR** | Lee lab 2023, Table S2 | integrated stress response, chronic stress |
+
+Both files live outside this repo, in `mpra_preliminary/data/`. The loading and the two
+replication checks follow `code/predictive_modeling/85_subunit_seq_3d_bound_features.Rmd`,
+which consumes the same tables; the thresholds match
+`code/clip_binding_sites.Rmd` and `code/ecdf_plots_3e_and_3d.Rmd`.
+
+## What these distributions are and are not
+
+**1. Both tables are gene-level.** `ensembl_gene_id` and `hgnc_symbol` and nothing else.
+No transcript IDs, no cluster coordinates, so nothing here can be resolved to an isoform.
+
+**2. These are published tables, not transcriptome-wide results.** Lamper reports 1,141
+genes and the ISR table 563. The distributions below therefore describe *the reported
+mRNAs*, and there is no unbound comparison group inside these files. A density here says
+how strong binding is among genes the papers chose to report, not what fraction of the
+transcriptome binds eIF3d.
+
+**3. The ISR table is already filtered.** Every entry has log2FC > 0 by construction, so its
+distribution is truncated at zero and its left tail is missing, not empty. Plotted beside
+the two Lamper conditions it will always look shifted right. That is the filter, not a
+stronger effect, and the panels below are annotated accordingly.
+
+**4. The Lamper file carries less independent information than its 13 columns suggest.**
+`IP/IN (AVG)` is *exactly* the mean of the two `RPKM_rep` columns for its condition, to
+within floating point (section 1, RPKM identity check). So one of those labels is wrong:
+either the per-replicate columns are already IP/input ratios rather than RPKM, or the
+averaged column is not a ratio. Nothing in the file resolves which, and there is no
+separate input-abundance column either way.
+
+**5. `log2FoldChange` is a shifted copy of the ratio, not an independently shrunk estimate.**
+Regressed on `log2(IP/IN)` it gives slope 1.00 and r = 1.000 under GLU, slope 1.03 and
+r = 0.987 under CM, with a constant offset of about 2.1 and 1.7 log2 units. That offset is
+a normalisation constant between the two libraries. Shrinkage would bend the low end toward
+zero and pull the slope below 1; it does not. The column names (`log2FoldChange`, `padj`,
+and the full DESeq2 column set in the sister ISR table) point at a DESeq2 origin, but that
+is an inference from naming, not something this file establishes.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(janitor)
+```
+
+```{r params}
+# Defaults for interactive use; the YAML params win when knitting.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    lamper_lfc  = 2,
+    lamper_padj = 0.005,
+    save_plots  = TRUE
+  )
+}
+stopifnot(
+  "params is incomplete" =
+    all(c("lamper_lfc", "lamper_padj", "save_plots") %in% names(params)),
+  "lamper_lfc must be a single finite number"  = is.numeric(params$lamper_lfc)  &&
+    length(params$lamper_lfc) == 1 && is.finite(params$lamper_lfc),
+  "lamper_padj must be a single number in (0, 1]" = is.numeric(params$lamper_padj) &&
+    length(params$lamper_padj) == 1 && params$lamper_padj > 0 && params$lamper_padj <= 1,
+  "save_plots must be TRUE or FALSE" = is.logical(params$save_plots) &&
+    length(params$save_plots) == 1
+)
+
+LAMPER_LFC  <- params$lamper_lfc
+LAMPER_PADJ <- params$lamper_padj
+SAVE_PLOTS  <- params$save_plots
+
+SUBUNIT_SEQ_DIR <- "/Users/katematlin/github/mpra_preliminary/data"
+LAMPER_XLSX <- file.path(SUBUNIT_SEQ_DIR, "lamper-s3.xlsx")
+ISR_XLSX    <- file.path(SUBUNIT_SEQ_DIR, "integrated_stress_response.xlsx")
+
+stopifnot("Lamper Table S3 not found" = file.exists(LAMPER_XLSX),
+          "ISR Table S2 not found"    = file.exists(ISR_XLSX))
+
+# All three conditions are eIF3d, so orange alone cannot separate them. GLU keeps eIF3d's
+# reserved orange as the headline stress condition; CM and ISR take remaining Okabe-Ito
+# hues, avoiding #56B4E9 which is reserved for eIF3e. Same assignment as notebook 85.
+cond_colors <- c(
+  "CM (complete media)"       = "#CC79A7",
+  "GLU (glucose deprivation)" = "#E69F00",
+  "ISR (chronic stress)"      = "#009E73"
+)
+COND_LEVELS <- names(cond_colors)
+
+# n belongs on every panel, so build the legend labels from the plotted rows.
+label_with_n <- function(x, n) paste0(x, "  (n = ", format(n, big.mark = ","), ")")
+```
+
+---
+
+# Section 1: Load the two tables
+
+```{r load_lamper}
+lamper <- read_excel(LAMPER_XLSX) %>%
+  clean_names() %>%
+  dplyr::mutate(dplyr::across(
+    c(log2fold_change_cm, padj_cm, log2fold_change_glu, padj_glu,
+      ip_in_cm_avg, ip_in_glu_avg, fold_enrichment_glu_cm),
+    ~ suppressWarnings(as.numeric(.))
+  )) %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", ensembl_gene_id))
+
+lamper_cols <- c("gene_id_clean", "hgnc_symbol",
+                 "log2fold_change_cm", "padj_cm", "log2fold_change_glu", "padj_glu",
+                 "ip_in_cm_avg", "ip_in_glu_avg", "fold_enrichment_glu_cm")
+stopifnot("Lamper table is missing an expected column" =
+            all(lamper_cols %in% names(lamper)))
+
+cat("Lamper Table S3 rows:", nrow(lamper), "\n")
+cat("  unique genes:", dplyr::n_distinct(lamper$gene_id_clean), "\n")
+cat("  rows with a testable CM  log2FC:", sum(!is.na(lamper$log2fold_change_cm)), "\n")
+cat("  rows with a testable GLU log2FC:", sum(!is.na(lamper$log2fold_change_glu)), "\n")
+
+# A duplicated gene key would double-count that gene in every density and quantile below.
+stopifnot("Lamper table is not one row per gene" =
+            !any(duplicated(lamper$gene_id_clean)))
+```
+
+```{r load_isr}
+isr <- read_excel(ISR_XLSX) %>%
+  clean_names() %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", ensembl_gene_id))
+
+stopifnot("ISR table is missing an expected column" =
+            all(c("gene_id_clean", "hgnc_symbol", "log2fold_change", "padj") %in% names(isr)))
+
+cat("ISR Table S2 rows:", nrow(isr), "\n")
+cat("  unique genes:", dplyr::n_distinct(isr$gene_id_clean), "\n")
+cat("  log2FoldChange range:", round(range(isr$log2fold_change, na.rm = TRUE), 2), "\n")
+cat("  max padj:", signif(max(isr$padj, na.rm = TRUE), 3), "\n")
+
+stopifnot("ISR table is not one row per gene" = !any(duplicated(isr$gene_id_clean)))
+```
+
+## Replication check: Lamper et al. 2020
+
+The paper's central claim is that eIF3d cap binding is **induced by glucose deprivation**
+rather than constitutive. The table has to reproduce that: median IP/input under GLU must
+exceed the CM baseline, and the reported per-gene GLU/CM fold enrichment must sit above 1.
+Checked before any threshold is applied, so a wrong file or a swapped column pair fails
+here rather than silently reversing the biology in every panel below.
+
+```{r replication_check_lamper}
+med_ip_cm  <- median(lamper$ip_in_cm_avg,  na.rm = TRUE)
+med_ip_glu <- median(lamper$ip_in_glu_avg, na.rm = TRUE)
+med_fold   <- median(lamper$fold_enrichment_glu_cm, na.rm = TRUE)
+
+cat("median IP/IN, complete media:      ", round(med_ip_cm, 2), "\n")
+cat("median IP/IN, glucose deprivation: ", round(med_ip_glu, 2), "\n")
+cat("median fold enrichment (GLU / CM): ", round(med_fold, 2),
+    " (expected > 1: cap binding is stress-induced)\n")
+
+stopifnot(
+  "Lamper2020: GLU IP/IN does not exceed CM - columns may be swapped" =
+    med_ip_glu > med_ip_cm,
+  "Lamper2020: median GLU/CM fold enrichment is not above 1" =
+    med_fold > 1
+)
+cat("Lamper 2020 replication check passed\n")
+```
+
+```{r plot_check_ip_by_condition, fig.width = 6, fig.height = 4.5}
+ip_check <- lamper %>%
+  dplyr::select(gene_id_clean,
+                `CM (complete media)`       = ip_in_cm_avg,
+                `GLU (glucose deprivation)` = ip_in_glu_avg) %>%
+  pivot_longer(-gene_id_clean, names_to = "condition", values_to = "ip_in") %>%
+  dplyr::filter(!is.na(ip_in), ip_in > 0) %>%
+  dplyr::mutate(condition = droplevels(factor(condition, levels = COND_LEVELS)))
+
+ip_check_stats <- ip_check %>%
+  group_by(condition) %>%
+  summarise(n = n(), median = median(ip_in), .groups = "drop")
+
+p_check_ip <- ggplot(ip_check, aes(condition, ip_in, fill = condition, colour = condition)) +
+  geom_violin(alpha = 0.15, linewidth = 0.8) +
+  geom_boxplot(width = 0.12, alpha = 0, linewidth = 0.5, outlier.shape = NA) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_text(data = ip_check_stats, inherit.aes = FALSE,
+            aes(condition, median, label = paste0("median ", round(median, 1))),
+            nudge_x = 0.34, size = 3.2, colour = "grey20") +
+  geom_text(data = ip_check_stats, inherit.aes = FALSE,
+            aes(condition, y = -Inf, label = paste0("n = ", format(n, big.mark = ","))),
+            vjust = -0.6, size = 3.2, colour = "grey30") +
+  scale_y_log10() +
+  scale_fill_manual(values = cond_colors, guide = "none") +
+  scale_colour_manual(values = cond_colors, guide = "none") +
+  labs(x = NULL, y = "IP / input enrichment (log10 scale)",
+       subtitle = "the replication check, drawn: GLU must sit above CM") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_check_ip)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_check_ip_by_condition.pdf"),
+                       p_check_ip, width = 6, height = 4.5)
+```
+
+The table also carries `Fold Enrichment (GLU/CM)` as its own column. It should be exactly
+the ratio of the two IP/IN columns; if it is not, the three columns do not describe the
+same pair of samples and the paired panels in section 4 would be comparing different things.
+
+```{r fold_enrichment_identity}
+fold_check <- lamper %>%
+  dplyr::filter(!is.na(fold_enrichment_glu_cm), !is.na(ip_in_cm_avg), !is.na(ip_in_glu_avg),
+                ip_in_cm_avg > 0) %>%
+  dplyr::mutate(recomputed = ip_in_glu_avg / ip_in_cm_avg,
+                rel_diff   = abs(recomputed - fold_enrichment_glu_cm) /
+                             pmax(fold_enrichment_glu_cm, .Machine$double.eps))
+
+cat("genes checked:", nrow(fold_check),
+    "| max relative difference:", signif(max(fold_check$rel_diff), 3), "\n")
+stopifnot("Fold Enrichment (GLU/CM) is not IP/IN GLU over IP/IN CM" =
+            max(fold_check$rel_diff) < 1e-6)
+```
+
+```{r plot_check_fold_identity, fig.width = 5.5, fig.height = 5}
+p_check_fold <- ggplot(fold_check, aes(recomputed, fold_enrichment_glu_cm)) +
+  geom_point(alpha = 0.25, size = 1, colour = "#E69F00") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_x_log10() + scale_y_log10() +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4, size = 3.2,
+           label = paste0("n = ", format(nrow(fold_check), big.mark = ","),
+                          "\nmax relative difference = ",
+                          signif(max(fold_check$rel_diff), 3))) +
+  labs(x = "IP/IN GLU divided by IP/IN CM, recomputed here (log10)",
+       y = "Fold Enrichment (GLU/CM) as stored (log10)",
+       subtitle = "every gene must sit on the dashed identity line") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_check_fold)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_check_fold_identity.pdf"),
+                       p_check_fold, width = 5.5, height = 5)
+```
+
+## Identity check: `IP/IN (AVG)` against the `RPKM` replicate columns
+
+The file presents four `RPKM_*_rep*` columns and two `IP/IN (AVG)` columns, which reads as
+per-sample abundance plus a derived ratio. It is not. Each `IP/IN (AVG)` value is the plain
+mean of its own two `RPKM` replicate columns, so one of the two labels is wrong and the six
+columns carry only two independent quantities. This is asserted rather than described,
+because a future revision of the table that made them genuinely different would change what
+every panel below is plotting, and should stop the notebook.
+
+```{r rpkm_identity_check}
+rpkm_check <- lamper %>%
+  dplyr::mutate(
+    mean_rpkm_cm  = (rpkm_cm_rep1  + rpkm_cm_rep2)  / 2,
+    mean_rpkm_glu = (rpkm_glu_rep1 + rpkm_glu_rep2) / 2
+  ) %>%
+  dplyr::transmute(
+    gene_id_clean,
+    `CM (complete media)`       = abs(mean_rpkm_cm  - ip_in_cm_avg)  / pmax(ip_in_cm_avg,  .Machine$double.eps),
+    `GLU (glucose deprivation)` = abs(mean_rpkm_glu - ip_in_glu_avg) / pmax(ip_in_glu_avg, .Machine$double.eps)
+  ) %>%
+  pivot_longer(-gene_id_clean, names_to = "condition", values_to = "rel_diff")
+
+print(rpkm_check %>%
+        group_by(condition) %>%
+        summarise(n = n(), max_rel_diff = signif(max(rel_diff, na.rm = TRUE), 3),
+                  .groups = "drop") %>%
+        as.data.frame(), row.names = FALSE)
+
+stopifnot(
+  "IP/IN (AVG) is no longer the mean of the two RPKM columns - re-read what the columns are" =
+    max(rpkm_check$rel_diff, na.rm = TRUE) < 1e-6
+)
+cat("IP/IN (AVG) is the mean of the two RPKM replicate columns in both conditions\n")
+```
+
+```{r plot_check_rpkm_identity, fig.width = 7.5, fig.height = 4.2}
+rpkm_pairs <- lamper %>%
+  dplyr::transmute(
+    gene_id_clean,
+    cm_mean  = (rpkm_cm_rep1  + rpkm_cm_rep2)  / 2, cm_ip  = ip_in_cm_avg,
+    glu_mean = (rpkm_glu_rep1 + rpkm_glu_rep2) / 2, glu_ip = ip_in_glu_avg
+  ) %>%
+  {bind_rows(
+    dplyr::transmute(., gene_id_clean, condition = "CM (complete media)",
+                     mean_rpkm = cm_mean,  ip_in = cm_ip),
+    dplyr::transmute(., gene_id_clean, condition = "GLU (glucose deprivation)",
+                     mean_rpkm = glu_mean, ip_in = glu_ip)
+  )} %>%
+  dplyr::filter(mean_rpkm > 0, ip_in > 0) %>%
+  dplyr::mutate(condition = droplevels(factor(condition, levels = COND_LEVELS)))
+
+p_check_rpkm <- ggplot(rpkm_pairs, aes(mean_rpkm, ip_in, colour = condition)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  facet_wrap(~ condition) +
+  scale_x_log10() + scale_y_log10() +
+  scale_colour_manual(values = cond_colors, guide = "none") +
+  labs(x = "mean of RPKM rep1 and rep2 (log10)",
+       y = "IP / IN (AVG) as stored (log10)",
+       subtitle = "the two are the same column under two names") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_check_rpkm)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_check_rpkm_identity.pdf"),
+                       p_check_rpkm, width = 7.5, height = 4.2)
+```
+
+## Replication check: Lee lab 2023 ISR table
+
+Published as the set of transcripts **enriched** in the eIF3d-TEV IP, so every entry must
+carry a positive log2FoldChange. A negative value would mean the file is a full DESeq2
+output rather than the hit table, and every ISR statement below would be describing a
+mixture of bound and depleted transcripts.
+
+```{r replication_check_isr}
+cat("ISR entries with log2FoldChange > 0:", sum(isr$log2fold_change > 0, na.rm = TRUE),
+    "of", nrow(isr), "\n")
+
+stopifnot(
+  "ISR table contains non-enriched entries - this is not the filtered hit table" =
+    all(isr$log2fold_change > 0, na.rm = TRUE),
+  "ISR log2FoldChange must be finite" =
+    all(is.finite(isr$log2fold_change[!is.na(isr$log2fold_change)]))
+)
+cat("ISR 2023 replication check passed\n")
+```
+
+The check passes with room to spare, and the margin is the point: the smallest reported ISR
+log2FC is 1.145, not something just above zero. The table is cut well inside the positive
+range, so its left tail is missing rather than empty.
+
+```{r plot_check_isr_truncation, fig.width = 6.5, fig.height = 4.2}
+isr_min <- min(isr$log2fold_change, na.rm = TRUE)
+
+p_check_isr <- ggplot(isr, aes(log2fold_change)) +
+  geom_histogram(bins = 60, fill = "#009E73", colour = "#009E73", alpha = 0.15,
+                 linewidth = 0.4) +
+  geom_vline(xintercept = 0,       linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = isr_min, linewidth = 0.8,     colour = "#009E73") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+           label = paste0("n = ", nrow(isr),
+                          "\nminimum = ", round(isr_min, 3),
+                          "\nentries at or below 0: ",
+                          sum(isr$log2fold_change <= 0, na.rm = TRUE))) +
+  labs(x = "log2 enrichment, eIF3d-TEV IP vs input (ISR)",
+       y = "Genes",
+       subtitle = "dashed line: zero. solid line: where the published table actually stops") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_check_isr)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_check_isr_truncation.pdf"),
+                       p_check_isr, width = 6.5, height = 4.2)
+```
+
+---
+
+# Section 2: One row per gene per condition
+
+The three conditions live in two files with different shapes, so everything below is drawn
+from a single long table: `condition`, `log2fc`, `padj`, and `ip_in` where the source
+provides it (Lamper only).
+
+```{r tidy_long}
+enrich <- bind_rows(
+  lamper %>%
+    dplyr::transmute(gene_id_clean, symbol = hgnc_symbol,
+                     condition = "CM (complete media)",
+                     log2fc = log2fold_change_cm, padj = padj_cm,
+                     ip_in  = ip_in_cm_avg),
+  lamper %>%
+    dplyr::transmute(gene_id_clean, symbol = hgnc_symbol,
+                     condition = "GLU (glucose deprivation)",
+                     log2fc = log2fold_change_glu, padj = padj_glu,
+                     ip_in  = ip_in_glu_avg),
+  isr %>%
+    dplyr::transmute(gene_id_clean, symbol = hgnc_symbol,
+                     condition = "ISR (chronic stress)",
+                     log2fc = log2fold_change, padj = padj,
+                     ip_in  = NA_real_)
+) %>%
+  dplyr::mutate(condition = factor(condition, levels = COND_LEVELS))
+
+stopifnot(
+  "an unexpected condition label reached the long table" =
+    !any(is.na(enrich$condition)),
+  "log2FC must be finite where present" =
+    all(is.finite(enrich$log2fc[!is.na(enrich$log2fc)])),
+  "padj must lie in [0, 1]" =
+    all(enrich$padj >= 0 & enrich$padj <= 1, na.rm = TRUE),
+  "IP/IN is a ratio of RPKM and cannot be negative" =
+    all(enrich$ip_in >= 0, na.rm = TRUE),
+  "each condition must be one row per gene" =
+    enrich %>% dplyr::count(condition, gene_id_clean) %>% dplyr::pull(n) %>% max() == 1
+)
+
+print(enrich %>%
+        group_by(condition) %>%
+        summarise(genes = n(),
+                  with_log2fc = sum(!is.na(log2fc)),
+                  with_padj   = sum(!is.na(padj)),
+                  with_ip_in  = sum(!is.na(ip_in)), .groups = "drop") %>%
+        as.data.frame())
+```
+
+---
+
+The counts in that table are not the same across conditions. All 1,141 Lamper genes carry
+an `IP/IN` value in both conditions, but only **770** carry a testable GLU `log2FoldChange`
+against 1,133 for CM: DESeq2 returned NA for the rest. So the two log2FC curves in 3b are
+drawn over different gene sets, and part of the GLU shift is the 371 genes with no GLU value
+rather than stronger binding. The `IP/IN` panel in 3d is the like-for-like marginal comparison, and
+section 4 is per gene.
+
+Those NAs are not a sensitivity floor, and they are not random. Every row of this file is a
+hit in at least one of the two conditions, so the table is the **union of the two published
+hit lists** rather than a results table over a fixed gene universe. The missing values fall
+exclusively on genes that entered through the other condition.
+
+```{r union_structure_check}
+hit_status <- lamper %>%
+  dplyr::transmute(
+    gene_id_clean,
+    cm_hit  = !is.na(log2fold_change_cm)  & log2fold_change_cm  > LAMPER_LFC &
+              padj_cm  < LAMPER_PADJ,
+    glu_hit = !is.na(log2fold_change_glu) & log2fold_change_glu > LAMPER_LFC &
+              padj_glu < LAMPER_PADJ,
+    na_cm   = is.na(log2fold_change_cm),
+    na_glu  = is.na(log2fold_change_glu)
+  )
+
+cat("hit status of every row:\n")
+print(with(hit_status, table(cm_hit = cm_hit, glu_hit = glu_hit)))
+
+cat("\nrows that are a hit in neither condition:",
+    sum(!hit_status$cm_hit & !hit_status$glu_hit), "\n")
+cat("genes with no GLU log2FC:", sum(hit_status$na_glu),
+    "of which CM hits:", sum(hit_status$na_glu & hit_status$cm_hit), "\n")
+cat("genes with no CM  log2FC:", sum(hit_status$na_cm),
+    "of which GLU hits:", sum(hit_status$na_cm & hit_status$glu_hit), "\n")
+
+# Only assert at the default cut, where the two published hit lists are what the
+# thresholds reproduce. A sweep to other values would break the union by construction.
+if (LAMPER_LFC == 2 && LAMPER_PADJ == 0.005) {
+  stopifnot(
+    "some rows are a hit in neither condition - this is not a union of two hit lists" =
+      all(hit_status$cm_hit | hit_status$glu_hit),
+    "a missing GLU log2FC lands on a gene that is not a CM hit" =
+      all(hit_status$cm_hit[hit_status$na_glu]),
+    "a missing CM log2FC lands on a gene that is not a GLU hit" =
+      all(hit_status$glu_hit[hit_status$na_cm])
+  )
+  cat("\nconfirmed: the table is the union of the CM and GLU hit lists,",
+      "and every NA sits on a gene admitted by the other condition\n")
+}
+```
+
+Two consequences for everything above and below. The per-condition curves are not "genes
+measured in that condition": the GLU curve is its 668 hits plus the CM hits that happened to
+retain a GLU value, so its sharp peak is the threshold, not the biology. And this file
+contains **no unbound mRNAs at all**, so any later comparison needs a background built from
+the expressed transcriptome rather than from non-hit rows here, of which there are none.
+
+---
+
+# Section 3: How enriched are the reported mRNAs?
+
+## 3a: Summary statistics
+
+```{r summary_stats}
+enrich_summary <- enrich %>%
+  dplyr::filter(!is.na(log2fc)) %>%
+  group_by(condition) %>%
+  summarise(
+    n          = n(),
+    min        = round(min(log2fc), 2),
+    q25        = round(quantile(log2fc, 0.25), 2),
+    median     = round(median(log2fc), 2),
+    q75        = round(quantile(log2fc, 0.75), 2),
+    max        = round(max(log2fc), 2),
+    frac_above_0 = round(mean(log2fc > 0), 3),
+    .groups = "drop"
+  )
+print(as.data.frame(enrich_summary), row.names = FALSE)
+
+ip_summary <- enrich %>%
+  dplyr::filter(!is.na(ip_in)) %>%
+  group_by(condition) %>%
+  summarise(n = n(),
+            q25    = round(quantile(ip_in, 0.25), 2),
+            median = round(median(ip_in), 2),
+            q75    = round(quantile(ip_in, 0.75), 2),
+            max    = round(max(ip_in), 1),
+            .groups = "drop")
+cat("\nIP / input enrichment (Lamper conditions only):\n")
+print(as.data.frame(ip_summary), row.names = FALSE)
+```
+
+## 3b: log2 enrichment density
+
+The dashed line is the project's established cut for the Lamper table
+(`log2FoldChange > 2`, used together with `padj < 0.005` in `clip_binding_sites.Rmd` and
+`ecdf_plots_3e_and_3d.Rmd`). It is drawn on all three panels for reference only. The ISR
+set takes no further cut, being a hit list already.
+
+```{r plot_log2fc_density, fig.width = 7.5, fig.height = 4.5}
+lfc_dat <- enrich %>% dplyr::filter(!is.na(log2fc))
+lfc_n   <- lfc_dat %>% dplyr::count(condition)
+lfc_lab <- setNames(label_with_n(as.character(lfc_n$condition), lfc_n$n),
+                    as.character(lfc_n$condition))
+
+p_lfc_density <- ggplot(lfc_dat, aes(log2fc, fill = condition, colour = condition)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = LAMPER_LFC, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = cond_colors, labels = lfc_lab, name = NULL) +
+  scale_colour_manual(values = cond_colors, labels = lfc_lab, name = NULL) +
+  labs(x = "log2 enrichment, eIF3d-TEV IP vs input",
+       y = "Density",
+       subtitle = paste0("dashed line: log2FC = ", LAMPER_LFC,
+                         ". ISR is a published hit table, truncated at 0 by construction")) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_lfc_density)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_log2fc_density.pdf"),
+                       p_lfc_density, width = 7.5, height = 4.5)
+```
+
+## 3c: The same distributions as cumulative curves
+
+Densities hide where the mass actually sits relative to a threshold. The ECDF reads the
+threshold directly: the height of each curve at the dashed line is the fraction of that
+condition's reported genes that fall below the cut.
+
+```{r plot_log2fc_ecdf, fig.width = 7.5, fig.height = 4.5}
+p_lfc_ecdf <- ggplot(lfc_dat, aes(log2fc, colour = condition)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = LAMPER_LFC, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(values = cond_colors, labels = lfc_lab, name = NULL) +
+  labs(x = "log2 enrichment, eIF3d-TEV IP vs input",
+       y = "Cumulative fraction of reported genes") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_lfc_ecdf)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_log2fc_ecdf.pdf"),
+                       p_lfc_ecdf, width = 7.5, height = 4.5)
+```
+
+## 3d: Raw IP / input ratios
+
+Plotted on a log10 axis because the ratios span orders of magnitude. Lamper conditions only;
+the ISR table reports no IP/input column. Section 3e shows how this scale relates to the
+log2FC one.
+
+```{r plot_ip_in_density, fig.width = 7.5, fig.height = 4.5}
+ip_dat <- enrich %>% dplyr::filter(!is.na(ip_in), ip_in > 0)
+ip_n   <- ip_dat %>% dplyr::count(condition, .drop = TRUE) %>% dplyr::filter(n > 0)
+ip_lab <- setNames(label_with_n(as.character(ip_n$condition), ip_n$n),
+                   as.character(ip_n$condition))
+
+cat("genes dropped from this panel for a non-positive IP/IN:",
+    sum(!is.na(enrich$ip_in) & enrich$ip_in <= 0), "\n")
+
+p_ip <- ggplot(ip_dat, aes(ip_in, fill = condition, colour = condition)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  scale_x_log10() +
+  scale_fill_manual(values = cond_colors, labels = ip_lab, name = NULL) +
+  scale_colour_manual(values = cond_colors, labels = ip_lab, name = NULL) +
+  labs(x = "IP / input enrichment (log10 scale)",
+       y = "Density",
+       subtitle = "dashed line: IP / input = 1, no enrichment over input") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_ip)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_ip_input_density.pdf"),
+                       p_ip, width = 7.5, height = 4.5)
+```
+
+## 3e: The two enrichment scales against each other
+
+Whether `log2FoldChange` adds anything over the stored ratio is testable rather than
+assumable. If it were a shrunk estimate, the low end would bend toward zero and the slope
+would fall below 1. It does not: the relationship is a straight line of slope 1 with a
+constant offset, which is a library normalisation constant, and under GLU it is exact.
+
+```{r plot_check_lfc_vs_ratio, fig.width = 7.5, fig.height = 4.2}
+scale_pair <- bind_rows(
+  lamper %>% dplyr::transmute(gene_id_clean, condition = "CM (complete media)",
+                              log2fc = log2fold_change_cm, ip_in = ip_in_cm_avg),
+  lamper %>% dplyr::transmute(gene_id_clean, condition = "GLU (glucose deprivation)",
+                              log2fc = log2fold_change_glu, ip_in = ip_in_glu_avg)
+) %>%
+  dplyr::filter(!is.na(log2fc), !is.na(ip_in), ip_in > 0) %>%
+  dplyr::mutate(condition = droplevels(factor(condition, levels = COND_LEVELS)),
+                log2_ip   = log2(ip_in))
+
+scale_fits <- scale_pair %>%
+  group_by(condition) %>%
+  summarise(
+    n         = n(),
+    slope     = coef(lm(log2fc ~ log2_ip))[2],
+    intercept = coef(lm(log2fc ~ log2_ip))[1],
+    r         = cor(log2fc, log2_ip),
+    .groups   = "drop"
+  )
+print(scale_fits %>%
+        dplyr::mutate(dplyr::across(c(slope, intercept, r), ~ round(., 3))) %>%
+        as.data.frame(), row.names = FALSE)
+
+p_check_scales <- ggplot(scale_pair, aes(log2_ip, log2fc, colour = condition)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_abline(data = scale_fits, inherit.aes = FALSE,
+              aes(slope = slope, intercept = intercept), linewidth = 0.8, colour = "grey20") +
+  geom_text(data = scale_fits, inherit.aes = FALSE,
+            aes(x = -Inf, y = Inf,
+                label = paste0("slope = ", round(slope, 3),
+                               "\nintercept = ", round(intercept, 2),
+                               "\nr = ", round(r, 3),
+                               "\nn = ", format(n, big.mark = ","))),
+            hjust = -0.1, vjust = 1.3, size = 3, colour = "grey20") +
+  facet_wrap(~ condition) +
+  scale_colour_manual(values = cond_colors, guide = "none") +
+  labs(x = "log2 of the stored IP / input ratio", y = "stored log2FoldChange",
+       subtitle = "dashed: equality. solid: the fitted line, slope 1 with an offset") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_check_scales)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_check_lfc_vs_ratio.pdf"),
+                       p_check_scales, width = 7.5, height = 4.2)
+
+stopifnot(
+  "log2FC is no longer a slope-1 shift of the stored ratio - the columns have changed" =
+    all(abs(scale_fits$slope - 1) < 0.1) && all(scale_fits$r > 0.98)
+)
+```
+
+---
+
+# Section 4: The two Lamper conditions are paired
+
+CM and GLU are measured on the same 1,141 genes, so they can be compared per gene rather
+than only as two marginal distributions.
+
+## 4a: Per-gene CM against GLU
+
+```{r plot_cm_vs_glu, fig.width = 6, fig.height = 5.5}
+paired <- lamper %>%
+  dplyr::filter(!is.na(ip_in_cm_avg), !is.na(ip_in_glu_avg),
+                ip_in_cm_avg > 0, ip_in_glu_avg > 0)
+
+frac_up <- mean(paired$ip_in_glu_avg > paired$ip_in_cm_avg)
+rho     <- cor(log10(paired$ip_in_cm_avg), log10(paired$ip_in_glu_avg),
+               method = "spearman")
+
+p_paired <- ggplot(paired, aes(ip_in_cm_avg, ip_in_glu_avg)) +
+  geom_point(alpha = 0.25, size = 1, colour = "#E69F00") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_x_log10() + scale_y_log10() +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.8, size = 3.2,
+           label = paste0("Spearman rho = ", round(rho, 3),
+                          "\nn = ", format(nrow(paired), big.mark = ","),
+                          "\nabove the diagonal: ", round(100 * frac_up), "%")) +
+  labs(x = "IP / input, complete media (log10)",
+       y = "IP / input, glucose deprivation (log10)",
+       subtitle = "dashed line: equal binding in the two conditions") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_paired)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_cm_vs_glu_scatter.pdf"),
+                       p_paired, width = 6, height = 5.5)
+```
+
+## 4b: Distribution of the induction itself
+
+```{r plot_glu_over_cm, fig.width = 7, fig.height = 4.5}
+induction <- lamper %>%
+  dplyr::filter(!is.na(fold_enrichment_glu_cm), fold_enrichment_glu_cm > 0) %>%
+  dplyr::mutate(log2_glu_over_cm = log2(fold_enrichment_glu_cm))
+
+med_ind <- median(induction$log2_glu_over_cm)
+
+p_induction <- ggplot(induction, aes(log2_glu_over_cm)) +
+  geom_density(alpha = 0.15, linewidth = 0.8, fill = "#E69F00", colour = "#E69F00") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = med_ind, linewidth = 0.6, colour = "#E69F00") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+           label = paste0("median = ", round(med_ind, 2),
+                          "\nn = ", format(nrow(induction), big.mark = ","),
+                          "\nabove 0: ", round(100 * mean(induction$log2_glu_over_cm > 0)), "%")) +
+  labs(x = "log2 fold enrichment, glucose deprivation over complete media",
+       y = "Density",
+       subtitle = "dashed line: no change. solid line: median") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_induction)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_glu_over_cm_density.pdf"),
+                       p_induction, width = 7, height = 4.5)
+```
+
+---
+
+# Section 5: Where the established threshold falls
+
+No gene sets are written here. This section only reports how many genes the existing cut
+would take out of each distribution, and checks that number against the counts the rest of
+the repo already uses, so a future change of file or threshold surfaces immediately.
+
+```{r threshold_counts}
+n_glu <- sum(lamper$log2fold_change_glu > LAMPER_LFC &
+               lamper$padj_glu < LAMPER_PADJ, na.rm = TRUE)
+n_cm  <- sum(lamper$log2fold_change_cm  > LAMPER_LFC &
+               lamper$padj_cm  < LAMPER_PADJ, na.rm = TRUE)
+n_isr <- dplyr::n_distinct(isr$gene_id_clean)
+
+threshold_tbl <- tibble(
+  condition   = COND_LEVELS,
+  reported    = c(nrow(lamper), nrow(lamper), nrow(isr)),
+  passing     = c(n_cm, n_glu, n_isr),
+  cut_applied = c(paste0("log2FC > ", LAMPER_LFC, " & padj < ", LAMPER_PADJ),
+                  paste0("log2FC > ", LAMPER_LFC, " & padj < ", LAMPER_PADJ),
+                  "none, published hit table")
+) %>%
+  dplyr::mutate(frac = round(passing / reported, 3))
+print(as.data.frame(threshold_tbl), row.names = FALSE)
+
+# The GLU and CM counts at the default threshold are fixed by clip_binding_sites.Rmd and
+# ecdf_plots_3e_and_3d.Rmd. Only assert them when running at that default, so a deliberate
+# parameter sweep is not treated as an error.
+if (LAMPER_LFC == 2 && LAMPER_PADJ == 0.005) {
+  stopifnot(
+    "GLU bound-set size disagrees with clip_binding_sites.Rmd (expected 668)" = n_glu == 668,
+    "CM bound-set size disagrees with clip_binding_sites.Rmd (expected 664)"  = n_cm  == 664
+  )
+  cat("bound-set sizes match the established repo counts: GLU 668, CM 664\n")
+}
+
+```
+
+```{r plot_check_threshold, fig.width = 8.5, fig.height = 4.2}
+# -log10(0) is Inf and would drop points silently, so clamp at the smallest padj the file
+# actually reports and say how many were clamped.
+padj_floor <- min(enrich$padj[enrich$padj > 0], na.rm = TRUE)
+n_clamped  <- sum(enrich$padj == 0, na.rm = TRUE)
+cat("padj values clamped at", signif(padj_floor, 3), ":", n_clamped, "\n")
+
+vol <- enrich %>%
+  dplyr::filter(!is.na(log2fc), !is.na(padj)) %>%
+  dplyr::mutate(
+    padj_plot = pmax(padj, padj_floor),
+    passes    = if_else(log2fc > LAMPER_LFC & padj < LAMPER_PADJ,
+                        "clears the cut", "does not")
+  )
+
+vol_counts <- vol %>% dplyr::count(condition, passes)
+print(as.data.frame(vol_counts), row.names = FALSE)
+
+pass_colors <- c("clears the cut" = "#0072B2", "does not" = "grey70")
+
+p_check_thresh <- ggplot(vol, aes(log2fc, -log10(padj_plot), colour = passes)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_vline(xintercept = LAMPER_LFC,        linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = -log10(LAMPER_PADJ), linetype = "dashed", colour = "grey40") +
+  facet_wrap(~ condition) +
+  scale_colour_manual(values = pass_colors, name = NULL) +
+  labs(x = "log2 enrichment, eIF3d-TEV IP vs input",
+       y = "-log10 adjusted p",
+       subtitle = paste0("dashed lines: log2FC > ", LAMPER_LFC, " and padj < ", LAMPER_PADJ,
+                         ". The ISR panel takes no such cut, it is shown for reference")) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+print(p_check_thresh)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_01_check_threshold.pdf"),
+                       p_check_thresh, width = 8.5, height = 4.2)
+```
+
+```{r write_summaries}
+if (SAVE_PLOTS) {
+  out_dir <- here("output", "gc3_external_sets")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  write_csv(enrich_summary, file.path(out_dir, "01_cap_enrichment_summary.csv"))
+  write_csv(threshold_tbl,  file.path(out_dir, "01_threshold_counts.csv"))
+  cat("wrote summary tables to", out_dir, "\n")
+}
+```
+
+---
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```
