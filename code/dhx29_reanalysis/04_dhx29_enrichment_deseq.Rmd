@@ -308,11 +308,19 @@ whose Pearson correlation is unstable. The rank correlation is the honest summar
 
 ## Section 4b: Volcano plots, all four fits
 
-Both levels, both designs. The x axis is the **unshrunk** log2 fold change, because that is
-the estimate the Wald test on the y axis is computed from; pairing a shrunken effect with an
-unshrunk p would be inconsistent. Shrunken values are in the saved tables.
+Both levels, both designs. Counts per panel are tabulated below, and the unpaired design
+recovers more at both levels.
 
-```{r volcanoes, fig.width = 10, fig.height = 8}
+The x axis is the **unshrunk** log2 fold change. DESeq2 produces one p-value per feature, from
+the Wald test on that estimate; `lfcShrink` replaces the effect size and carries the same
+p-value across unchanged. Plotting the shrunken effect against it would put a point's height
+and its horizontal position on two different estimates. Shrunken values are in the saved
+tables.
+
+```{r volcanoes, fig.width = 9, fig.height = 5}
+sig_p   <- 0.05
+sig_lfc <- 0.5
+
 volc <- bind_rows(
   tx_res %>% transmute(level = "transcript", design = "~ rep + assay", label = symbol,
                        lfc = lfc_raw_paired, pval = pvalue_paired, padj = padj_paired),
@@ -324,65 +332,152 @@ volc <- bind_rows(
                          lfc = lfc_raw_simple, pval = pvalue_simple, padj = padj_simple)
 ) %>%
   filter(is.finite(lfc), is.finite(pval)) %>%
-  mutate(level  = factor(level, levels = c("transcript", "gene")),
-         design = factor(design, levels = c("~ assay", "~ rep + assay")),
-         call   = case_when(is.na(padj) | padj >= 0.1 ~ "not significant",
-                            lfc > 0                   ~ "enriched in IP",
-                            TRUE                      ~ "depleted in IP"))
+  mutate(design = factor(design, levels = c("~ assay", "~ rep + assay")),
+         call = case_when(
+           is.na(padj) | padj >= sig_p | abs(lfc) <= sig_lfc ~ "not significant",
+           lfc >  sig_lfc ~ "Up",
+           TRUE           ~ "Down"),
+         call = factor(call, levels = c("Up", "Down", "not significant")))
 
 volc_counts <- volc %>%
   group_by(level, design) %>%
-  summarise(n = n(),
-            n_sig = sum(call != "not significant"),
-            n_up = sum(call == "enriched in IP"),
-            n_down = sum(call == "depleted in IP"),
-            .groups = "drop")
+  summarise(n = n(), up = sum(call == "Up"), down = sum(call == "Down"), .groups = "drop")
+cat("padj <", sig_p, "and |log2FC| >", sig_lfc, ":\n")
 print(as.data.frame(volc_counts))
 
-# DHX29 reaches p ~ 1e-100 and would flatten every other point, so the axis is capped
-# and capped points are drawn as triangles.
 y_cap <- 30
-volc <- volc %>%
-  mutate(y = pmin(-log10(pval), y_cap), capped = -log10(pval) > y_cap)
+volc <- volc %>% mutate(y = pmin(-log10(pval), y_cap), capped = -log10(pval) > y_cap)
+
+# Counts to print in each panel.
+volc_lab_up   <- volc_counts %>% mutate(lab = paste0("Up: ", up))
+volc_lab_down <- volc_counts %>% mutate(lab = paste0("Down: ", down))
+
+# The y axis is the raw Wald p, but the call uses padj. Benjamini-Hochberg adapts to the
+# data, so the p corresponding to padj < 0.05 differs per panel and must be found, not
+# assumed. Drawing the line at -log10(0.05) would mark 342 gene-level points as above
+# threshold that are not significant.
+sig_lines <- volc %>%
+  filter(!is.na(padj), padj < sig_p) %>%
+  group_by(level, design) %>%
+  summarise(yint = -log10(max(pval)), p_eff = max(pval), .groups = "drop")
+cat("\nRaw p corresponding to padj <", sig_p, "in each panel:\n")
+print(as.data.frame(sig_lines %>% mutate(p_eff = signif(p_eff, 3),
+                                         yint = round(yint, 2))))
 
 volc_labs <- volc %>%
   filter(call != "not significant", !is.na(label)) %>%
-  group_by(level, design, label) %>%
-  slice_min(padj, n = 1, with_ties = FALSE) %>%      # one row per symbol per panel
-  group_by(level, design) %>%
-  slice_min(padj, n = 8, with_ties = FALSE) %>%
+  group_by(level, design, label) %>% slice_min(padj, n = 1, with_ties = FALSE) %>%
+  group_by(level, design) %>% slice_min(padj, n = 8, with_ties = FALSE) %>%
   ungroup()
 
-p_volc <- ggplot(volc, aes(lfc, y)) +
-  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey70") +
-  geom_point(aes(colour = call, shape = capped), size = 0.5, alpha = 0.35) +
-  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
-  ggrepel::geom_text_repel(data = volc_labs, aes(label = label), size = 2.8,
-                           box.padding = 0.4,
+sig_cols <- c("Up" = "#D55E00", "Down" = "#0072B2", "not significant" = "grey75")
+```
+
+### Transcript level
+
+```{r volcano_transcript, fig.width = 9, fig.height = 5}
+p_volc_tx <- volc %>% filter(level == "transcript") %>%
+  ggplot(aes(lfc, y)) +
+  geom_vline(xintercept = c(-sig_lfc, sig_lfc), linetype = "dotted", colour = "grey60") +
+  geom_hline(data = sig_lines %>% filter(level == "transcript"), aes(yintercept = yint),
+             linetype = "dotted", colour = "grey60") +
+  geom_point(aes(colour = call, shape = capped, alpha = call, size = call)) +
+  geom_text(data = volc_lab_up %>% filter(level == "transcript"), aes(x = Inf, y = Inf, label = lab),
+            hjust = 1.15, vjust = 1.6, size = 3.4, colour = "#D55E00", inherit.aes = FALSE) +
+  geom_text(data = volc_lab_down %>% filter(level == "transcript"), aes(x = -Inf, y = Inf, label = lab),
+            hjust = -0.15, vjust = 1.6, size = 3.4, colour = "#0072B2", inherit.aes = FALSE) +
+  ggrepel::geom_text_repel(data = volc_labs %>% filter(level == "transcript"),
+                           aes(label = label), size = 2.8, box.padding = 0.4,
                            seed = 9, max.overlaps = 20, min.segment.length = 0.2) +
-  facet_grid(design ~ level, scales = "free") +
-  scale_colour_manual(values = c("not significant" = "grey70",
-                                 "enriched in IP"  = "#CC79A7",
-                                 "depleted in IP"  = "#0072B2"),
-                      name = "FDR < 0.1") +
-  labs(title = "DHX29-IP against Input",
-       subtitle = str_wrap(paste0(
-         "Unshrunk log2 fold change against the Wald p. Positive means enriched in the ",
-         "pull-down. Counts per panel are tabulated above; the unpaired design recovers ",
-         "more at both levels. The y axis is capped at ", y_cap,
-         "; triangles are capped points, DHX29 among them."), width = 100),
-       x = "log2 IP / Input", y = "-log10(p), capped") +
+  facet_wrap(~ design) +
+  scale_colour_manual(values = sig_cols, name = NULL) +
+  scale_alpha_manual(values = c("Up" = 0.9, "Down" = 0.9, "not significant" = 0.25),
+                     guide = "none") +
+  scale_size_manual(values = c("Up" = 1.3, "Down" = 1.3, "not significant" = 0.45),
+                    guide = "none") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+  labs(title = "DHX29-IP against Input, transcript level",
+       x = "log2 IP / Input",
+       y = paste0("-log10(Wald p), capped at ", y_cap)) +
   theme_classic(base_size = 12) +
   theme(legend.position = "bottom")
 
-print(p_volc)
-ggsave(here("plots", "dhx29_04_volcanoes.pdf"), p_volc, width = 10, height = 8)
+print(p_volc_tx)
+ggsave(here("plots", "dhx29_04_volcano_transcript.pdf"), p_volc_tx, width = 9, height = 5)
+```
+
+### Gene level
+
+```{r volcano_gene, fig.width = 9, fig.height = 5}
+p_volc_gene <- volc %>% filter(level == "gene") %>%
+  ggplot(aes(lfc, y)) +
+  geom_vline(xintercept = c(-sig_lfc, sig_lfc), linetype = "dotted", colour = "grey60") +
+  geom_hline(data = sig_lines %>% filter(level == "gene"), aes(yintercept = yint),
+             linetype = "dotted", colour = "grey60") +
+  geom_point(aes(colour = call, shape = capped, alpha = call, size = call)) +
+  geom_text(data = volc_lab_up %>% filter(level == "gene"), aes(x = Inf, y = Inf, label = lab),
+            hjust = 1.15, vjust = 1.6, size = 3.4, colour = "#D55E00", inherit.aes = FALSE) +
+  geom_text(data = volc_lab_down %>% filter(level == "gene"), aes(x = -Inf, y = Inf, label = lab),
+            hjust = -0.15, vjust = 1.6, size = 3.4, colour = "#0072B2", inherit.aes = FALSE) +
+  ggrepel::geom_text_repel(data = volc_labs %>% filter(level == "gene"),
+                           aes(label = label), size = 2.8, box.padding = 0.4,
+                           seed = 9, max.overlaps = 20, min.segment.length = 0.2) +
+  facet_wrap(~ design) +
+  scale_colour_manual(values = sig_cols, name = NULL) +
+  scale_alpha_manual(values = c("Up" = 0.9, "Down" = 0.9, "not significant" = 0.25),
+                     guide = "none") +
+  scale_size_manual(values = c("Up" = 1.3, "Down" = 1.3, "not significant" = 0.45),
+                    guide = "none") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+  labs(title = "DHX29-IP against Input, gene level",
+       x = "log2 IP / Input",
+       y = paste0("-log10(Wald p), capped at ", y_cap)) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_volc_gene)
+ggsave(here("plots", "dhx29_04_volcano_gene.pdf"), p_volc_gene, width = 9, height = 5)
+
+# Gene-level summary at the stated cutoffs, unpaired design.
+gene_sig <- volc %>%
+  filter(level == "gene", design == "~ assay") %>%
+  mutate(tested = !is.na(padj))
+
+cat("\nGENE LEVEL, ~ assay, padj <", sig_p, "and |log2FC| >", sig_lfc, "\n")
+cat("  genes in the table          ", format(nrow(gene_sig), big.mark = ","), "\n")
+cat("  testable (padj not NA)      ", format(sum(gene_sig$tested), big.mark = ","), "\n")
+cat("  significantly enriched (Up)  ", sum(gene_sig$call == "Up"), "\n")
+cat("  significantly depleted (Down)", sum(gene_sig$call == "Down"), "\n")
+
+cat("\n  effect sizes among significant genes:\n")
+print(as.data.frame(
+  gene_sig %>% filter(call != "not significant") %>%
+    group_by(call) %>%
+    summarise(n = n(),
+              median_lfc = round(median(lfc), 3),
+              min_lfc = round(min(lfc), 3),
+              max_lfc = round(max(lfc), 3),
+              median_padj = signif(median(padj), 3),
+              .groups = "drop") %>%
+    filter(n > 0)
+))
+
+cat("\n  most enriched genes:\n")
+print(as.data.frame(
+  gene_sig %>% filter(call == "Up") %>% arrange(desc(lfc)) %>%
+    transmute(symbol = label, log2FC = round(lfc, 2), padj = signif(padj, 3)) %>% head(10)
+))
+cat("\n  most depleted genes:\n")
+print(as.data.frame(
+  gene_sig %>% filter(call == "Down") %>% arrange(lfc) %>%
+    transmute(symbol = label, log2FC = round(lfc, 2), padj = signif(padj, 3)) %>% head(10)
+))
 
 stopifnot(
   "a volcano panel is missing" = nrow(volc_counts) == 4,
-  "DHX29 is not a significant enriched call at gene level" =
+  "DHX29 is not called Up at gene level" =
     volc %>% filter(level == "gene", design == "~ assay", label == "DHX29") %>%
-      pull(call) == "enriched in IP"
+      pull(call) == "Up"
 )
 ```
 
@@ -457,17 +552,17 @@ val <- gene_res %>%
             by = "gene_id_clean")
 
 val_long <- val %>%
-  dplyr::select(symbol, lfc_paired = lfc_simple,
+  dplyr::select(symbol, measured_lfc = lfc_simple,
                 `our isoforms (Table S8 applied here)` = predicted_occupancy,
                 `notebook 23 stored score` = nb23_occupancy) %>%
-  pivot_longer(-c(symbol, lfc_paired), names_to = "source", values_to = "predicted") %>%
-  filter(is.finite(predicted), is.finite(lfc_paired))
+  pivot_longer(-c(symbol, measured_lfc), names_to = "source", values_to = "predicted") %>%
+  filter(is.finite(predicted), is.finite(measured_lfc))
 
 val_stats <- val_long %>%
   group_by(source) %>%
   summarise(n = n(),
-            spearman = cor(predicted, lfc_paired, method = "spearman"),
-            p = cor.test(predicted, lfc_paired, method = "spearman",
+            spearman = cor(predicted, measured_lfc, method = "spearman"),
+            p = cor.test(predicted, measured_lfc, method = "spearman",
                          exact = FALSE)$p.value,
             .groups = "drop")
 print(as.data.frame(val_stats %>% mutate(spearman = round(spearman, 4),
@@ -480,7 +575,7 @@ stopifnot(
     all(val_stats$p < 0.01)
 )
 
-p_val <- ggplot(val_long, aes(predicted, lfc_paired)) +
+p_val <- ggplot(val_long, aes(predicted, measured_lfc)) +
   geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
   geom_point(size = 0.4, alpha = 0.25, colour = "#0072B2") +
   geom_smooth(method = "lm", se = FALSE, colour = "#CC79A7", linewidth = 0.6) +

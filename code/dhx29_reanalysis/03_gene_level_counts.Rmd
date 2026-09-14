@@ -151,7 +151,9 @@ cat("Gene mapping spot-checks passed.\n")
 
 ## Section 3: Count distribution, with the cutoff line
 
-`log2(count + 1)` as in notebook 01. The dashed line marks the chosen floor in raw counts.
+Two views. The six marginals show where the floor sits in each sample. The per-transcript
+minimum is what the filter actually cuts, since a transcript must clear the floor in **every**
+sample, not in one.
 
 ```{r plot_count_density, fig.width = 7.5, fig.height = 4.5}
 cutoff <- 3
@@ -189,6 +191,82 @@ print(p_density)
 ggsave(here("plots", "dhx29_03_count_density_cutoff.pdf"),
        p_density, width = 7.5, height = 4.5)
 ```
+
+```{r plot_min_count, fig.width = 7.5, fig.height = 4.5}
+min_tbl <- counts %>%
+  dplyr::select(transcript_id, sample, count) %>%
+  pivot_wider(names_from = sample, values_from = count) %>%
+  mutate(min_count = pmin(Input1, Input2, Input3, IP1, IP2, IP3))
+
+per_sample_keep <- counts %>%
+  group_by(sample) %>%
+  summarise(n = sum(count >= cutoff), .groups = "drop")
+joint_keep <- sum(min_tbl$min_count >= cutoff)
+
+cat("Reading the floor two ways:\n")
+cat("  count >=", cutoff, "in a single sample, by sample: ",
+    paste(format(per_sample_keep$n, big.mark = ","), collapse = ", "), "\n")
+cat("  count >=", cutoff, "in EVERY sample (the actual filter): ",
+    format(joint_keep, big.mark = ","), "\n")
+
+p_min <- ggplot(min_tbl, aes(log2(min_count + 1))) +
+  geom_density(linewidth = 0.8, colour = "grey20") +
+  geom_vline(xintercept = log2(cutoff + 1), linetype = "dashed",
+             colour = "grey15", linewidth = 0.5) +
+  annotate("text", x = log2(cutoff + 1), y = Inf,
+           label = paste0("count = ", cutoff),
+           hjust = -0.1, vjust = 1.8, size = 3.2, colour = "grey15") +
+  labs(
+    title    = "What the floor actually cuts: the per-transcript minimum",
+    subtitle = str_wrap(paste0(
+      "Smallest count a transcript has in any of the six samples. n = ",
+      format(nrow(min_tbl), big.mark = ","), " coding transcripts; ",
+      format(joint_keep, big.mark = ","), " sit at or above the line. Reading the floor ",
+      "off a single sample instead would keep ",
+      format(min(per_sample_keep$n), big.mark = ","), " to ",
+      format(max(per_sample_keep$n), big.mark = ","), "."), width = 90),
+    x = "log2(minimum count across the six samples + 1)", y = "Density"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_min)
+ggsave(here("plots", "dhx29_03_min_count_distribution.pdf"), p_min,
+       width = 7.5, height = 4.5)
+```
+
+### The floor is not neutral
+
+Requiring the floor in every sample removes the clearest depletion cases, because a transcript
+absent from the pull-down is what depletion looks like.
+
+```{r floor_asymmetry}
+asym <- min_tbl %>%
+  mutate(inp_min = pmin(Input1, Input2, Input3),
+         ip_min  = pmin(IP1, IP2, IP3),
+         inp_sum = Input1 + Input2 + Input3,
+         ip_sum  = IP1 + IP2 + IP3)
+
+excluded <- asym %>% filter(min_count < cutoff, inp_sum + ip_sum > 0)
+cat("Excluded transcripts carrying some signal:",
+    format(nrow(excluded), big.mark = ","), "\n")
+cat("  clear the floor on all three Input but fail on an IP sample:",
+    format(sum(excluded$inp_min >= cutoff), big.mark = ","), "\n")
+cat("  clear the floor on all three IP but fail on an Input sample:",
+    format(sum(excluded$ip_min >= cutoff), big.mark = ","), "\n")
+cat("Fully one-sided cases:",
+    sum(asym$inp_min >= cutoff & asym$ip_sum == 0), "covered in Input yet absent from IP;",
+    sum(asym$ip_min >= cutoff & asym$inp_sum == 0), "the other way\n")
+
+stopifnot(
+  "the floor is no longer asymmetric, so this caveat is stale" =
+    sum(excluded$inp_min >= cutoff) > sum(excluded$ip_min >= cutoff)
+)
+```
+
+The exclusion is an order of magnitude more likely to be triggered by a pull-down sample than
+by an input one. Few transcripts are fully one-sided, but the asymmetry plausibly contributes
+to the depleted side of the notebook 04 volcano being so thin. Read a shortage of depleted
+calls as partly a property of this filter, not only of the biology.
 
 ---
 
@@ -271,10 +349,10 @@ ggsave(here("plots", "dhx29_03_cutoff_retention.pdf"),
 
 ---
 
-## Section 5: PCA of the six samples, two panels
+## Section 5: PCA of the six samples
 
-On transcripts clearing the floor, `log2(CPM + 1)` to remove the library size difference. The
-panels differ only in whether a multi-isoform gene contributes several correlated rows or one.
+On the transcripts clearing the floor, `log2(CPM + 1)` to remove the library size difference,
+the 2,000 most variable rows, `prcomp` on the transpose.
 
 The code locates which component carries the assay split rather than assuming PC1, then
 compares within-assay against across-assay replicate agreement. Both come out badly.
@@ -283,64 +361,52 @@ compares within-assay against across-assay replicate agreement. Both come out ba
 retained <- wide %>% filter(min_count >= cutoff, !is.na(gene_id_clean))
 sample_cols <- c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3")
 
-pca_out <- map_dfr(c("all transcripts", "MANE only"), function(v) {
-  d <- if (v == "MANE only") retained %>% filter(is_mane) else retained
-  m <- as.matrix(d[, sample_cols])
-  cpm <- log2(sweep(m, 2, colSums(m), "/") * 1e6 + 1)
-  vars <- apply(cpm, 1, var)
-  top <- cpm[order(vars, decreasing = TRUE)[seq_len(min(2000, nrow(cpm)))], ]
-  pc <- prcomp(t(top), center = TRUE, scale. = FALSE)
-  pv <- 100 * pc$sdev^2 / sum(pc$sdev^2)
-  cat(v, ": ", nrow(top), " transcripts. Variance explained: ",
-      paste(sprintf("%.1f%%", pv), collapse = ", "), "\n", sep = "")
-  as_tibble(pc$x[, 1:3]) %>%
-    mutate(view = v, sample = rownames(pc$x),
-           pv1 = pv[1], pv2 = pv[2], pv3 = pv[3])
-}) %>%
-  mutate(assay = if_else(str_starts(sample, "Input"), "Input", "DHX29-IP"),
-         view  = factor(view, levels = c("all transcripts", "MANE only")))
+pca_mat <- as.matrix(retained[, sample_cols])
+pca_cpm <- log2(sweep(pca_mat, 2, colSums(pca_mat), "/") * 1e6 + 1)
+pca_top <- pca_cpm[order(apply(pca_cpm, 1, var), decreasing = TRUE)[1:2000], ]
+pc <- prcomp(t(pca_top), center = TRUE, scale. = FALSE)
+pv <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+
+cat("Transcripts entering the PCA:", format(nrow(retained), big.mark = ","),
+    "of which the 2,000 most variable are used\n")
+cat("Variance explained:", paste(sprintf("%.1f%%", pv), collapse = ", "), "\n")
+
+pca_out <- as_tibble(pc$x[, 1:3]) %>%
+  mutate(sample = rownames(pc$x),
+         assay  = if_else(str_starts(sample, "Input"), "Input", "DHX29-IP"))
 
 # Which component carries the assay split? Do not assume it is PC1.
 split_by_pc <- pca_out %>%
   pivot_longer(c(PC1, PC2, PC3), names_to = "pc", values_to = "score") %>%
-  group_by(view, pc) %>%
+  group_by(pc) %>%
   summarise(separates = min(score[assay == "Input"]) > max(score[assay == "DHX29-IP"]) |
                         max(score[assay == "Input"]) < min(score[assay == "DHX29-IP"]),
             .groups = "drop")
-
 cat("\nDoes each component separate Input from DHX29-IP?\n")
-print(as.data.frame(split_by_pc %>%
-                      pivot_wider(names_from = pc, values_from = separates)))
+print(as.data.frame(split_by_pc))
 
-# Describe the result in text, so the prose cannot go stale if the floor changes.
-split_desc <- split_by_pc %>%
-  group_by(view) %>%
-  summarise(pcs = if (any(separates)) paste(pc[separates], collapse = " and ") else "none",
-            .groups = "drop") %>%
-  mutate(txt = paste0(view, ": ", pcs)) %>%
-  pull(txt) %>%
-  paste(collapse = "; ")
-cat("\nSeparating component by view -- ", split_desc, "\n", sep = "")
+split_desc <- if (any(split_by_pc$separates))
+  paste(split_by_pc$pc[split_by_pc$separates], collapse = " and ") else "none"
+cat("Separating component:", split_desc, "\n")
 
 stopifnot(
-  "a PCA panel has the wrong number of samples" =
-    all(pca_out %>% dplyr::count(view) %>% pull(n) == 6),
+  "the PCA has the wrong number of samples" = nrow(pca_out) == 6,
   "PCA coordinates contain missing values" =
     all(is.finite(pca_out$PC1)) && all(is.finite(pca_out$PC2))
 )
 ```
 
-**PC1 is never the assay axis.** In both panels it tracks one outlying pull-down replicate.
-Whatever Input against IP separation exists sits on a lower component, and which one moves
-with the count floor and with the transcript set, as the table above reports. A contrast that
-migrates between components and sometimes vanishes is weaker than the replicate noise around
-it.
+**PC1 is not the assay axis.** It tracks one outlying pull-down replicate. Whatever Input
+against IP separation exists sits on a lower component, and which one moves with the count
+floor, as the table above reports. A contrast that migrates between components and sometimes
+vanishes is weaker than the replicate noise around it.
 
 An assertion requiring a fixed component to separate the assays was removed, because the data
 does not support one. Read this as replicate noise, not a failed pull-down: unsupervised PCA
 on the most variable features is dominated by whatever varies most, and here that is the IP
 replicates disagreeing. A supervised contrast sharing dispersion across transcripts can still
 find real enrichment. A raw per-transcript ratio cannot.
+
 
 ```{r replicate_reproducibility}
 m_all <- as.matrix(retained[, sample_cols])
@@ -386,23 +452,16 @@ cat("\nMedian within-Input rho:", sprintf("%.4f", input_med),
 
 # Which replicate sits furthest from its own group centroid. Reported, not asserted.
 outlier <- pca_out %>%
-  group_by(view, assay) %>%
+  group_by(assay) %>%
   mutate(d = sqrt((PC1 - mean(PC1))^2 + (PC2 - mean(PC2))^2)) %>%
   ungroup() %>%
-  group_by(view) %>%
-  slice_max(d, n = 1) %>%
-  ungroup()
-cat("\nFurthest from its own group centroid:\n")
-print(as.data.frame(outlier %>% dplyr::select(view, sample, assay, d) %>%
+  arrange(desc(d))
+cat("\nDistance from each sample to its own group centroid:\n")
+print(as.data.frame(outlier %>% dplyr::select(sample, assay, d) %>%
                       mutate(d = round(d, 1))))
 ```
 
-```{r plot_pca, fig.width = 9, fig.height = 4.5}
-pca_labels <- pca_out %>%
-  distinct(view, pv1, pv2) %>%
-  mutate(lab = paste0("PC1 ", sprintf("%.1f%%", pv1),
-                      ", PC2 ", sprintf("%.1f%%", pv2)))
-
+```{r plot_pca, fig.width = 7, fig.height = 5}
 p_pca <- ggplot(pca_out, aes(x = PC1, y = PC2, colour = assay)) +
   geom_hline(yintercept = 0, linetype = "dotted", colour = "grey70") +
   geom_vline(xintercept = 0, linetype = "dotted", colour = "grey70") +
@@ -410,28 +469,25 @@ p_pca <- ggplot(pca_out, aes(x = PC1, y = PC2, colour = assay)) +
   geom_text_repel(aes(label = sample), size = 3.2, seed = 9,
                   min.segment.length = 0.3, show.legend = FALSE) +
   scale_y_continuous(expand = expansion(mult = 0.15)) +
-  geom_text(data = pca_labels, aes(x = Inf, y = -Inf, label = lab),
-            hjust = 1.05, vjust = -0.8, size = 3, colour = "grey30",
-            inherit.aes = FALSE) +
-  facet_wrap(~ view, scales = "free") +
   scale_colour_manual(values = assay_colors, name = "Assay") +
   labs(
     title    = "Sample PCA, one point per replicate",
     subtitle = str_wrap(paste0(
-      "log2(CPM + 1) on the 2,000 most variable transcripts clearing a floor of ",
-      cutoff, " in every sample, n = 6. PC1 tracks one outlying pull-down replicate in ",
-      "both panels. Component separating Input from IP, ", split_desc, "."), width = 95),
-    x = "PC1", y = "PC2"
+      "log2(CPM + 1) on the 2,000 most variable of ",
+      format(nrow(retained), big.mark = ","),
+      " transcripts clearing a floor of ", cutoff,
+      " in every sample, n = 6 samples."), width = 88),
+    x = paste0("PC1 (", sprintf("%.1f%%", pv[1]), ")"),
+    y = paste0("PC2 (", sprintf("%.1f%%", pv[2]), ")")
   ) +
   theme_classic(base_size = 12)
 
 print(p_pca)
-ggsave(here("plots", "dhx29_03_pca_samples.pdf"), p_pca, width = 9, height = 4.5)
+ggsave(here("plots", "dhx29_03_pca_samples.pdf"), p_pca, width = 7, height = 5)
 ```
 
-
-
 ---
+
 
 ## Section 6: What the collapse decision turns on
 
@@ -579,6 +635,53 @@ cat("\nFootprints carried by the gene-level table: ",
     format(sum(floor_set$total), big.mark = ","),
     " in the retained transcript set\n", sep = "")
 ```
+
+---
+
+### Filter cascade
+
+Every transcript removed between the raw files and the gene table, in the order applied.
+
+```{r filter_cascade}
+n_all    <- n_distinct(counts_all$transcript_id)
+n_coding <- n_distinct(counts$transcript_id)
+n_gene   <- sum(!is.na(tx_level$gene_id))
+n_floor  <- nrow(retained)
+n_genes  <- nrow(gene_counts)
+
+cascade <- tibble(
+  step = c("all rows in each file",
+           "drop non-coding (column 2 is N/A)",
+           "drop no gene in tx2gene",
+           paste0("drop minimum count below ", cutoff, " in any sample"),
+           "enter transcript-level DESeq2",
+           "collapse to one transcript per gene"),
+  remaining = c(n_all, n_coding, n_gene, n_floor, n_floor, n_genes),
+  unit = c(rep("transcripts", 5), "genes")
+) %>%
+  mutate(lost = c(NA, -diff(remaining)))
+
+print(as.data.frame(cascade %>%
+  mutate(remaining = format(remaining, big.mark = ","),
+         lost = if_else(is.na(lost), "", format(lost, big.mark = ",")))))
+
+cat("\nThe transcript-level analysis uses all ", format(n_floor, big.mark = ","),
+    " transcripts; only the gene-level one collapses.\n", sep = "")
+cat("Applying the floor before the gene requirement instead gives ",
+    format(sum(wide$min_count >= cutoff), big.mark = ","),
+    ", so the two orderings meet at the same intersection.\n", sep = "")
+
+stopifnot(
+  "the cascade is not monotone" = all(diff(cascade$remaining) <= 0),
+  "the DESeq2 row should equal the floor row" =
+    cascade$remaining[4] == cascade$remaining[5]
+)
+```
+
+Three further filters appear downstream and are not applied here: DESeq2's own independent
+filtering leaves no adjusted p-value for some features in notebook 04, notebook 05's GC
+analysis needs a CDS that is a whole number of codons, and the eIF3d comparison needs the gene
+to exist in the MDA-MB-231 table as well.
 
 ---
 
