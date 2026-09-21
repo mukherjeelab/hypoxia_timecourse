@@ -160,16 +160,23 @@ tc <- read_csv(
 # eIF3d promotes. EIF3D's own rna_lfc must be strongly positive (~+3, the siRNA
 # depletes its target); if it is negative the contrast direction has flipped and
 # every "promoted" set below would be inverted.
-assert_eif3d_direction <- function(tbl, label) {
-  stopifnot("EIF3D row missing — cannot verify contrast direction" =
-              sum(tbl$symbol == "EIF3D", na.rm = TRUE) == 1)
-  eif3d_rna <- tbl$rna_lfc[which(tbl$symbol == "EIF3D")]
-  cat("EIF3D rna_lfc (", label, "):", round(eif3d_rna, 2),
-      "— expect strongly positive\n")
-  stopifnot("EIF3D rna_lfc not positive — contrast direction is flipped" =
-              is.finite(eif3d_rna) && eif3d_rna > 2)
-  invisible(eif3d_rna)
+# Parameterised on the knockdown target so the si3e contrasts loaded in Section 8b
+# can reuse it (EIF3E sits at ~+4.5 to +6.8 in the si3e files).
+assert_kd_direction <- function(tbl, label, kd_symbol = "EIF3D", min_rna_lfc = 2) {
+  stopifnot("rna_lfc column absent — cannot verify contrast direction" =
+              "rna_lfc" %in% colnames(tbl))
+  stopifnot("knockdown target row missing — cannot verify contrast direction" =
+              sum(tbl$symbol == kd_symbol, na.rm = TRUE) == 1)
+  kd_rna <- tbl$rna_lfc[which(tbl$symbol == kd_symbol)]
+  cat(kd_symbol, " rna_lfc (", label, "): ", round(kd_rna, 2),
+      " - expect strongly positive\n", sep = "")
+  stopifnot("knockdown target rna_lfc not positive — contrast direction is flipped" =
+              is.finite(kd_rna) && kd_rna > min_rna_lfc)
+  invisible(kd_rna)
 }
+
+# Kept as a named wrapper so the existing si3d call sites read unchanged.
+assert_eif3d_direction <- function(tbl, label) assert_kd_direction(tbl, label, "EIF3D")
 assert_eif3d_direction(tc, "normoxia 1+4hr")
 
 nor_gene_ids <- tc %>%
@@ -1622,8 +1629,15 @@ gc_scatter_layers <- list(
   coord_cartesian(ylim = c(-1, 2))
 )
 # Wrapped onto two lines so it fits the narrower whole-mRNA panel (8in wide).
-gc_scatter_subtitle <- paste0("One dot per mRNA; line = lm fit; Spearman rho per panel\n",
+gc_scatter_subtitle <- paste0("All expressed genes; one dot per mRNA; line = lm fit; Spearman rho per panel\n",
                              "Normoxia = 1+4hr, time regressed; hypoxia = 1hr")
+
+# Strip labels: the two panels are the only conditions on these figures, so the
+# strips carry just the timepoint and the contrast definitions stay in the
+# subtitle. Display only - the factor levels and the exported correlation tables
+# keep the full names, so a short strip cannot redefine which contrast is drawn.
+gc_facet_labels <- c("Normoxia 1+4hr" = "Norm", "Hypoxia 1hr" = "1 hr")
+gc_facet_labeller <- labeller(condition = gc_facet_labels)
 
 # --- Plot 1: whole mRNA, on its own ---
 p_te_gc_whole <- ggplot(lfc_gc_region %>% filter(gc_region == "Whole mRNA"),
@@ -1633,16 +1647,20 @@ p_te_gc_whole <- ggplot(lfc_gc_region %>% filter(gc_region == "Whole mRNA"),
             aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
             colour = "black", hjust = 1.1, vjust = 1.3, size = 4.5,
             inherit.aes = FALSE) +
-  facet_wrap(~ condition, nrow = 1) +
+  facet_wrap(~ condition, nrow = 1, labeller = gc_facet_labeller) +
   labs(
-    title    = "TE LFC vs whole-mRNA GC content (MDA-MB-231, all expressed genes)",
+    # "all expressed genes" moved into the subtitle: at base_size 16 the full
+    # one-line title overran the right edge of the 8in canvas and was clipped.
+    title    = "TE LFC vs whole-mRNA GC content (MDA-MB-231)",
     subtitle = gc_scatter_subtitle,
     x        = "Whole mRNA GC content (%)",
     y        = "TE LFC (positive = eIF3d promotes)"
   )
 p_te_gc_whole
+# 9 x 4.5, up from 8 x 4: the extra width clears the title and the extra height
+# keeps the 3-line header from squeezing the y-axis label off the canvas.
 ggsave(here("plots", "54_te_lfc_gc_whole_mrna_scatter.pdf"), p_te_gc_whole,
-       width = 8, height = 4)
+       width = 9, height = 4.5)
 
 # --- Plot 2: 5'UTR / CDS / 3'UTR ---
 sub_regions <- c("5' UTR", "CDS", "3' UTR")
@@ -1658,9 +1676,11 @@ p_te_gc_region <- ggplot(lfc_gc_region %>%
             aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
             colour = "black", hjust = 1.1, vjust = 1.3, size = 4,
             inherit.aes = FALSE) +
-  facet_grid(condition ~ gc_region) +
+  facet_grid(condition ~ gc_region,
+             labeller = labeller(condition = gc_facet_labels,
+                                 gc_region = label_value)) +
   labs(
-    title    = "TE LFC vs GC content by mRNA region (MDA-MB-231, all expressed genes)",
+    title    = "TE LFC vs GC content by mRNA region (MDA-MB-231)",
     subtitle = gc_scatter_subtitle,
     x        = "GC content (%)",
     y        = "TE LFC (positive = eIF3d promotes)"
@@ -1668,6 +1688,141 @@ p_te_gc_region <- ggplot(lfc_gc_region %>%
 p_te_gc_region
 ggsave(here("plots", "54_te_lfc_gc_by_region_scatter.pdf"), p_te_gc_region,
        width = 10, height = 6)
+```
+
+## TE LFC vs GC by codon position
+
+Same two-panel scatter as the whole-mRNA figure above, once per codon position.
+`feature_matrix_external_stability.rds` carries `gc3` but **not** `gc1` / `gc2`;
+those live in `feature_matrix_positional_gc.rds` (notebook 01v), which by design
+drops `cds_gc` so the forest cannot fall back on the aggregate. Neither matrix
+alone can draw all three panels, so they are joined on `transcript_id_clean` and
+the `gc3` column they share is asserted identical - the join key check that would
+otherwise let gc1/gc2 be attached to a different isoform than gc3.
+
+```{r gc_position_scatters, fig.width=9, fig.height=4.5}
+positional_gc <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_positional_gc.rds")
+)
+
+gc_pos_cols <- c("GC1, first codon position"  = "gc1",
+                 "GC2, second codon position" = "gc2",
+                 "GC3, third codon position"  = "gc3")
+stopifnot(
+  "positional GC columns missing"  = all(gc_pos_cols %in% colnames(positional_gc)),
+  "gc3 missing from base matrix"   = "gc3" %in% colnames(feature_matrix),
+  "transcript_id_clean missing"    =
+    all(c("transcript_id_clean") %in% colnames(positional_gc)) &&
+    all(c("transcript_id_clean") %in% colnames(feature_matrix))
+)
+
+# Join on the transcript key, then assert the shared gc3 column agrees. A silent
+# isoform mismatch would pass every range check below while attaching gc1/gc2 to
+# the wrong transcript.
+gc_pos_joined <- feature_matrix %>%
+  dplyr::select(gene_id_clean, transcript_id_clean, gc3_base = gc3) %>%
+  inner_join(positional_gc %>%
+               dplyr::select(transcript_id_clean, dplyr::all_of(unname(gc_pos_cols))),
+             by = "transcript_id_clean")
+
+stopifnot(
+  "positional GC join lost transcripts" = nrow(gc_pos_joined) == nrow(feature_matrix),
+  "gc3 differs between the two matrices" =
+    isTRUE(all.equal(gc_pos_joined$gc3_base, gc_pos_joined$gc3, tolerance = 1e-8))
+)
+cat("Positional GC matrix joined:", nrow(gc_pos_joined), "transcripts\n")
+
+gc_pos_gene <- gc_pos_joined %>%
+  dplyr::select(gene_id_clean, dplyr::all_of(unname(gc_pos_cols))) %>%
+  distinct(gene_id_clean, .keep_all = TRUE) %>%
+  pivot_longer(-gene_id_clean, names_to = "gc_col", values_to = "gc_pct") %>%
+  mutate(gc_position = factor(gc_col,
+                              levels = unname(gc_pos_cols),
+                              labels = names(gc_pos_cols))) %>%
+  filter(!is.na(gc_pct))
+
+stopifnot(
+  "positional GC out of [0,100]"      = all(gc_pos_gene$gc_pct >= 0 &
+                                            gc_pos_gene$gc_pct <= 100),
+  "not all 3 codon positions present" = n_distinct(gc_pos_gene$gc_position) == 3,
+  "unmapped GC column (NA facet)"     = !any(is.na(gc_pos_gene$gc_position))
+)
+
+# Biological spot-check, the positional counterpart to the 5'UTR > CDS > 3'UTR
+# ordering asserted for the regional figure: GC2 is the most constrained codon
+# position in human CDSs and GC3 the least, so median GC must order GC3 > GC1 > GC2.
+gc_pos_medians <- gc_pos_gene %>%
+  group_by(gc_position) %>%
+  summarise(med = round(median(gc_pct), 1), .groups = "drop")
+cat("Median GC% per codon position:\n"); print(gc_pos_medians)
+
+med_pos <- setNames(gc_pos_medians$med, as.character(gc_pos_medians$gc_position))
+stopifnot(
+  "GC3 should exceed GC1" = med_pos[["GC3, third codon position"]] >
+                            med_pos[["GC1, first codon position"]],
+  "GC1 should exceed GC2" = med_pos[["GC1, first codon position"]] >
+                            med_pos[["GC2, second codon position"]]
+)
+
+lfc_gc_pos <- bind_rows(
+  tc_nor_clean %>% dplyr::select(gene_id_clean, te_lfc) %>% mutate(condition = "Normoxia 1+4hr"),
+  tc_hyp       %>% dplyr::select(gene_id_clean, te_lfc) %>% mutate(condition = "Hypoxia 1hr")
+) %>%
+  inner_join(gc_pos_gene, by = "gene_id_clean", relationship = "many-to-many") %>%
+  filter(!is.na(te_lfc)) %>%
+  mutate(condition = factor(condition, levels = c("Normoxia 1+4hr", "Hypoxia 1hr")))
+
+stopifnot(
+  "lfc_gc_pos has no rows"          = nrow(lfc_gc_pos) > 100,
+  "both conditions not present"     = n_distinct(lfc_gc_pos$condition) == 2,
+  "non-finite te_lfc in lfc_gc_pos" = all(is.finite(lfc_gc_pos$te_lfc))
+)
+
+cor_gc_pos <- lfc_gc_pos %>%
+  group_by(condition, gc_position) %>%
+  summarise(rho = round(cor(gc_pct, te_lfc, method = "spearman", use = "complete.obs"), 3),
+            n   = n(), .groups = "drop")
+cat("Spearman rho (positional GC vs TE LFC, all genes):\n")
+print(as.data.frame(cor_gc_pos), row.names = FALSE)
+
+# One figure per codon position, reusing the whole-mRNA layer stack and strip
+# labels so all four GC figures are directly comparable. The y-window is the
+# shared c(-1, 2) from gc_scatter_layers, so the fitted slopes can be read
+# against each other and against the whole-mRNA panel.
+make_gc_pos_scatter <- function(pos_label, file) {
+  dat <- lfc_gc_pos %>% filter(gc_position == pos_label)
+  ann <- cor_gc_pos %>% filter(gc_position == pos_label)
+  stopifnot("no rows for this codon position" = nrow(dat) > 100,
+            "annotation rows do not match the two panels" = nrow(ann) == 2)
+
+  short <- sub(",.*$", "", pos_label)   # "GC1, first codon position" -> "GC1"
+
+  p <- ggplot(dat, aes(x = gc_pct, y = te_lfc)) +
+    gc_scatter_layers +
+    geom_text(data = ann,
+              aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
+              colour = "black", hjust = 1.1, vjust = 1.3, size = 4.5,
+              inherit.aes = FALSE) +
+    facet_wrap(~ condition, nrow = 1, labeller = gc_facet_labeller) +
+    labs(
+      title    = paste0("TE LFC vs ", short, " content (MDA-MB-231)"),
+      subtitle = gc_scatter_subtitle,
+      x        = paste0(pos_label, " GC content (%)"),
+      y        = "TE LFC (positive = eIF3d promotes)"
+    )
+  print(p)
+  ggsave(here("plots", file), p, width = 9, height = 4.5)
+  invisible(p)
+}
+
+p_gc1 <- make_gc_pos_scatter("GC1, first codon position",
+                             "54_te_lfc_gc1_scatter_norm_vs_1hr.pdf")
+p_gc2 <- make_gc_pos_scatter("GC2, second codon position",
+                             "54_te_lfc_gc2_scatter_norm_vs_1hr.pdf")
+p_gc3 <- make_gc_pos_scatter("GC3, third codon position",
+                             "54_te_lfc_gc3_scatter_norm_vs_1hr.pdf")
+
+write_csv(cor_gc_pos, here("output", "54_gc_position_te_correlations.csv"))
 ```
 
 ```{r aa_codon_proportion, fig.width=7, fig.height=4}
@@ -1842,6 +1997,257 @@ p_aa_prop_glu <- ggplot(prop_df_glu, aes(x = codon, y = prop * 100, fill = group
   theme(legend.position = "top", strip.text = element_text(face = "bold"))
 p_aa_prop_glu
 ggsave(here("plots", "54_glutamic_acid_codon_proportion.pdf"), p_aa_prop_glu, width = 4, height = 4)
+```
+
+---
+
+# Section 8b: TE LFC vs GC3, si3d and si3e across timepoints
+
+Extends the `te_lfc_gc3_scatter` figure above (si3d, normoxia 1+4hr vs hypoxia 1hr)
+in two directions: the si3e knockdown, and hypoxia 4hr / 24hr.
+
+Normoxia is the **time-regressed 1+4hr** fit for both knockdowns
+(`deFunction_time_normalized()`, design `~ hours + Condition + SeqType + Condition:SeqType`),
+so `hours` is absorbed as a batch covariate rather than pooled. Hypoxia is per
+timepoint. Every contrast runs sictrl as `test_condition`, so each `te_lfc` is
+log2(sictrl / siRNA) and positive means the factor **promotes** translation.
+
+```{r gc3_te_scatter_setup}
+# One row per contrast. The si3d files and all four hypoxia files are
+# translation_categories_* tables and carry rna_lfc, so each can be direction-
+# checked on the knockdown target's own RNA change. The si3e normoxia 1+4hr fit
+# is the one exception: eif3e_eif3d_normoxia_and_hypoxia.Rmd writes it as a
+# TE-only table (gene_id / te_lfc / te_padj / symbol) under a different prefix,
+# so it has no rna_lfc column and is checked separately below.
+kd_files <- tribble(
+  ~kd,    ~condition,       ~path,
+  "si3d", "Normoxia 1+4hr", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "si3d", "Hypoxia 1hr",    "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "si3d", "Hypoxia 4hr",    "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv",
+  "si3d", "Hypoxia 24hr",   "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv",
+  "si3e", "Normoxia 1+4hr", "te_si3e_vs_sictrl_normoxia_1and4hr.csv",
+  "si3e", "Hypoxia 1hr",    "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv",
+  "si3e", "Hypoxia 4hr",    "translation_categories_si3e_vs_sictrl_hypoxia_4hr.csv",
+  "si3e", "Hypoxia 24hr",   "translation_categories_si3e_vs_sictrl_hypoxia_24hr.csv"
+)
+stopifnot("contrast file missing from output/" =
+            all(file.exists(here("output", kd_files$path))))
+
+condition_levels <- c("Normoxia 1+4hr", "Hypoxia 1hr", "Hypoxia 4hr", "Hypoxia 24hr")
+# Strip label for the 4-panel timepoint figures only: the three hypoxia panels are
+# distinguished by their hour, so the normoxia panel needs no timepoint in its strip.
+# The 1+4hr time-regressed design stays stated in the subtitle.
+tp_facet_labels  <- c("Normoxia 1+4hr" = "Norm")
+kd_target        <- c(si3d = "EIF3D", si3e = "EIF3E")
+kd_label         <- c(si3d = "eIF3d", si3e = "eIF3e")
+# Project colour convention: Okabe-Ito orange is reserved for eIF3d / si3d,
+# Okabe-Ito sky blue for eIF3e / si3e.
+kd_fit_colours   <- c(si3d = "#E69F00", si3e = "#56B4E9")
+
+te_long <- pmap_dfr(kd_files, function(kd, condition, path) {
+  tbl <- read_csv(here("output", path), show_col_types = FALSE)
+  if ("rna_lfc" %in% colnames(tbl)) {
+    assert_kd_direction(tbl, paste(kd, condition), kd_target[[kd]])
+  }
+  tbl %>%
+    transmute(kd            = kd,
+              condition     = condition,
+              gene_id_clean = sub("\\..*", "", gene_id),
+              te_lfc        = te_lfc)
+})
+
+# si3e normoxia 1+4hr has no rna_lfc, so its sign convention is verified
+# indirectly: it must agree with the si3e normoxia 1hr contrast, whose direction
+# IS checkable on EIF3E's own rna_lfc. A flipped sign would drive rho negative.
+si3e_nor_1hr <- read_csv(
+  here("output", "translation_categories_si3e_vs_sictrl_normoxia_1hr.csv"),
+  show_col_types = FALSE
+)
+assert_kd_direction(si3e_nor_1hr, "si3e normoxia 1hr (sign reference)", "EIF3E")
+
+si3e_sign_ref <- te_long %>%
+  filter(kd == "si3e", condition == "Normoxia 1+4hr") %>%
+  inner_join(si3e_nor_1hr %>%
+               transmute(gene_id_clean = sub("\\..*", "", gene_id),
+                         te_lfc_1hr    = te_lfc),
+             by = "gene_id_clean")
+si3e_rho_ref <- cor(si3e_sign_ref$te_lfc, si3e_sign_ref$te_lfc_1hr,
+                    method = "spearman", use = "complete.obs")
+cat("si3e normoxia 1+4hr vs 1hr TE LFC, Spearman rho: ", round(si3e_rho_ref, 3),
+    " (n = ", nrow(si3e_sign_ref), ") - expect strongly positive\n", sep = "")
+stopifnot("si3e normoxia 1+4hr sign disagrees with the 1hr contrast" =
+            si3e_rho_ref > 0.5)
+
+# gc3_gene is gene-level (most-codons transcript per gene) and was built in
+# Section 8; only the GC3 value is taken here. Its `group` column is si3d-defined
+# and would be meaningless on the si3e panels, so it is deliberately not joined.
+gc3_te_long <- te_long %>%
+  inner_join(gc3_gene %>% dplyr::select(ensembl_gene, gc3_frac),
+             by = c("gene_id_clean" = "ensembl_gene")) %>%
+  filter(!is.na(te_lfc), !is.na(gc3_frac)) %>%
+  mutate(condition = factor(condition, levels = condition_levels))
+
+stopifnot(
+  "gc3_te_long has no rows"                 = nrow(gc3_te_long) > 100,
+  "not all 8 kd x condition combinations present" =
+    nrow(distinct(gc3_te_long, kd, condition)) == 8,
+  "non-finite te_lfc in gc3_te_long"        = all(is.finite(gc3_te_long$te_lfc)),
+  "gc3_frac out of [0,1]"                   = all(gc3_te_long$gc3_frac >= 0 &
+                                                  gc3_te_long$gc3_frac <= 1),
+  "unmapped condition label (NA facet)"     = !any(is.na(gc3_te_long$condition))
+)
+
+# Biological spot-check: GC3 is the same per-gene vector in every panel, so its
+# median must be identical across all 8 contrasts and sit in the human range.
+gc3_med_by_panel <- gc3_te_long %>%
+  group_by(kd, condition) %>%
+  summarise(med_gc3 = median(gc3_frac) * 100, .groups = "drop")
+stopifnot(
+  "GC3 median differs between panels - gene sets are not aligned" =
+    diff(range(gc3_med_by_panel$med_gc3)) < 1,
+  "GC3 median outside the expected human range [40, 65]%" =
+    all(between(gc3_med_by_panel$med_gc3, 40, 65))
+)
+
+gc3_te_cor <- gc3_te_long %>%
+  group_by(kd, condition) %>%
+  summarise(
+    rho    = round(cor(gc3_frac, te_lfc, method = "spearman", use = "complete.obs"), 3),
+    n      = n(),
+    med_te = round(median(te_lfc), 3),
+    .groups = "drop"
+  )
+cat("Spearman rho (GC3 vs TE LFC) and median TE LFC per contrast:\n")
+print(gc3_te_cor)
+```
+
+The median TE LFC column above is worth reading alongside rho: it is **not** near
+zero in every contrast (si3e normoxia 1+4hr sits at ~+0.62), so panels are offset
+from each other vertically. Spearman rho is rank-based and unaffected by that
+offset, but the height of the fitted line is, and intercepts should not be
+compared across panels.
+
+```{r gc3_te_scatter_builder}
+# Shared builder for the three figures below. Differs from the 2-panel si3d
+# figure in Section 8 only in the fit colour.
+#
+# `ylim` is a REQUIRED argument rather than something derived per figure. The
+# fitted GC3 slope is the thing these panels exist to compare, and a slope reads
+# steeper or shallower purely as a function of the y-window: deriving the window
+# from each figure's own spread gave the si3e 2-panel a 2.05-unit window against
+# Section 8's 3.00, and the si3d / si3e 4-panel figures 2.22 vs 3.07, so
+# identical slopes would have rendered ~35% apart. Figures meant to be read
+# against each other are therefore passed the same window explicitly.
+#
+# coord_cartesian, not ylim(): ylim() would drop out-of-range rows before
+# stat_smooth runs, fitting the line to a truncated sample while rho uses all
+# genes. This zooms the axis instead, leaving the fit on the full data.
+# `facet_labels` renames strips for display only. The factor levels, the rho
+# annotation join and the exported correlation CSV all keep the full condition
+# names, so a shortened strip cannot silently redefine which contrast is plotted.
+make_gc3_te_scatter <- function(which_kd, conditions, ylim, facet_labels = NULL) {
+  stopifnot("ylim must be two increasing finite numbers" =
+              is.numeric(ylim) && length(ylim) == 2 &&
+              all(is.finite(ylim)) && ylim[1] < ylim[2])
+  stopifnot("facet_labels must be a named character vector of existing conditions" =
+              is.null(facet_labels) ||
+              (is.character(facet_labels) && !is.null(names(facet_labels)) &&
+               all(names(facet_labels) %in% conditions)))
+  dat <- gc3_te_long %>%
+    filter(kd == which_kd, condition %in% conditions) %>%
+    mutate(condition = droplevels(condition))
+  ann <- gc3_te_cor %>%
+    filter(kd == which_kd, condition %in% conditions) %>%
+    mutate(condition = droplevels(condition))
+  stopifnot(
+    "no rows for this knockdown / condition combination" = nrow(dat) > 100,
+    "annotation facets do not match data facets"         =
+      identical(levels(dat$condition), levels(ann$condition))
+  )
+
+  # A shared window necessarily hides some points. Report how many per panel so
+  # the clipping is on the record rather than invisible.
+  clipped <- dat %>%
+    group_by(condition) %>%
+    summarise(n = n(),
+              n_clipped = sum(te_lfc < ylim[1] | te_lfc > ylim[2]),
+              pct_clipped = round(100 * n_clipped / n, 2),
+              .groups = "drop")
+  cat("Points outside the y-window (", which_kd, ", fit still uses all genes):\n", sep = "")
+  print(clipped)
+
+  ggplot(dat, aes(x = gc3_frac * 100, y = te_lfc)) +
+    geom_hline(yintercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.5) +
+    geom_point(size = 0.5, alpha = 0.2, colour = "grey40") +
+    geom_smooth(method = "lm", se = FALSE,
+                colour = kd_fit_colours[[which_kd]], linewidth = 0.9) +
+    geom_text(data = ann,
+              aes(x = Inf, y = Inf, label = paste0("rho=", rho, "\nn=", n)),
+              colour = "black", hjust = 1.1, vjust = 1.3, size = 4,
+              inherit.aes = FALSE) +
+    facet_wrap(~ condition, nrow = 1,
+               labeller = if (is.null(facet_labels)) "label_value"
+                          else labeller(condition = facet_labels)) +
+    labs(
+      # "all expressed genes" lives in the subtitle rather than the title: at
+      # base_size 16 the longer one-line title overruns the 8in 2-panel figure.
+      title    = paste0("TE LFC vs GC3 content (MDA-MB-231 ", kd_label[[which_kd]], ")"),
+      subtitle = paste0("All expressed genes; one dot per mRNA; line = lm fit\n",
+                        "Spearman rho per panel; log2(sictrl / ", which_kd, ")\n",
+                        "Normoxia = 1+4hr time regressed; hypoxia per timepoint"),
+      x        = "GC3 content (%)",
+      y        = paste0("TE LFC (positive = ", kd_label[[which_kd]], " promotes)")
+    ) +
+    theme_classic(base_size = 16) +
+    theme(strip.text = element_text(face = "bold")) +
+    coord_cartesian(ylim = ylim)
+}
+
+# Window 1: the 2-panel si3e figure is the counterpart to the Section 8 si3d
+# figure, so it reuses that figure's hardcoded window verbatim. The two are meant
+# to be laid side by side.
+ylim_2panel <- c(-1, 2)
+
+# Window 2: one window shared by both 4-panel timepoint figures, taken from the
+# 0.5/99.5 percentiles pooled over all eight contrasts. The Section 8 window
+# clips the 4hr and 24hr contrasts badly (their spread is 2-4x wider than 1hr),
+# and a per-knockdown window would make the si3d and si3e figures unreadable
+# against each other, which is the comparison they are for.
+ylim_timepoints <- unname(quantile(gc3_te_long$te_lfc, c(0.005, 0.995)))
+cat("Shared 4-panel y-window:", round(ylim_timepoints, 3), "\n")
+```
+
+## si3e counterpart to the Section 8 figure
+
+```{r gc3_te_scatter_si3e, fig.width=8, fig.height=5}
+p_gc3_te_si3e <- make_gc3_te_scatter("si3e", c("Normoxia 1+4hr", "Hypoxia 1hr"), ylim_2panel)
+p_gc3_te_si3e
+ggsave(here("plots", "54_te_lfc_gc3_scatter_si3e.pdf"), p_gc3_te_si3e,
+       width = 8, height = 5)
+```
+
+## All timepoints, each knockdown separately
+
+```{r gc3_te_scatter_timepoints_si3d, fig.width=14, fig.height=5}
+p_gc3_te_si3d_tp <- make_gc3_te_scatter("si3d", condition_levels, ylim_timepoints,
+                                        facet_labels = tp_facet_labels)
+p_gc3_te_si3d_tp
+ggsave(here("plots", "54_te_lfc_gc3_scatter_si3d_timepoints.pdf"), p_gc3_te_si3d_tp,
+       width = 14, height = 5)
+```
+
+```{r gc3_te_scatter_timepoints_si3e, fig.width=14, fig.height=5}
+p_gc3_te_si3e_tp <- make_gc3_te_scatter("si3e", condition_levels, ylim_timepoints,
+                                        facet_labels = tp_facet_labels)
+p_gc3_te_si3e_tp
+ggsave(here("plots", "54_te_lfc_gc3_scatter_si3e_timepoints.pdf"), p_gc3_te_si3e_tp,
+       width = 14, height = 5)
+```
+
+```{r gc3_te_scatter_save_cor}
+write_csv(gc3_te_cor,
+          here("output", "predictive_modeling", "54_gc3_te_lfc_spearman_by_kd_timepoint.csv"))
+cat("Saved to output/predictive_modeling/54_gc3_te_lfc_spearman_by_kd_timepoint.csv\n")
 ```
 
 ---

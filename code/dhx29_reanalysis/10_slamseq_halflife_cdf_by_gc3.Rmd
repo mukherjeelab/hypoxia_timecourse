@@ -1,0 +1,299 @@
+---
+title: "DHX29 reanalysis 10: SLAM-seq half-life change by GC3 bin"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Hia et al. 2026 (Science, adw0288) show cumulative distributions of the DHX29-depletion
+log-fold change split into six fixed GC3 bins, and the GC3-poor bin separates from the rest:
+K562 RNA-seq on CRISPRi knockdown (Fig 1F) and HEK293T RNA-seq on knockout (Fig 1G). This
+notebook draws the same figure on the paper's **stability** readout, Table S6, which is the
+SLAM-seq half-life time course in control against DHX29-knockout HEK293T cells.
+
+A few points fix what this figure is and is not:
+
+- **The contrast is knockout, not knockdown.** Table S6 carries only `Ctrl` and `KO` arms.
+  The knockdown data (Table S2) is K562 RNA-seq, a different cell line and a different
+  readout, and is not used here.
+- **`logFC` is log2(KO half-life / Ctrl half-life).** Positive means the message lives longer
+  when DHX29 is gone, so DHX29 normally destabilises it. mRNAs *stabilised by* DHX29 are the
+  negative tail. The identity is asserted against the two half-life columns at load.
+- **Transcript-level.** Table S6 is keyed on the transcript whose 3'UTR was assayed, so GC3
+  is computed from that same transcript's GENCODE v49 CDS. No gene-level aggregation and no
+  transcript selected in a different cell line enters the join.
+
+The reason the usual "replicate one number from the paper" check is not what guards this
+notebook: the panel being redrawn *is* the claim under test, so asserting it would assert the
+answer. Section 1 instead checks the structural identities the table must satisfy whatever
+the biology, and Section 2 checks the GC3 computation against an independent recomputation.
+
+```{r libs}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+# Six-step sequential ramp for the GC3 bins, GC3-rich to GC3-poor. Not the paper's
+# red-to-blue rainbow: the project reserves #E69F00 and #56B4E9 for eIF3d and eIF3e, and a
+# rainbow through those hues would read as a gene set. Anchored instead on three Okabe-Ito
+# colours, vermillion -> reddish purple -> dark blue. The intermediate anchor is what keeps
+# the middle bins legible; interpolating vermillion straight to blue passes through grey and
+# renders 50-60% and 60-70% nearly identical.
+gc3_levels <- c("> 80%", "70 ~ 80%", "60 ~ 70%", "50 ~ 60%", "40 ~ 50%", "< 40%")
+gc3_colors <- setNames(colorRampPalette(c("#D55E00", "#CC79A7", "#0072B2"))(6), gc3_levels)
+gc3_breaks <- c(-Inf, 40, 50, 60, 70, 80, Inf)
+```
+
+---
+
+## Section 1: Table S6, the SLAM-seq half-lives
+
+```{r load_s6}
+s6_path <- here("accessories", "csc_data", "hia_dhx29",
+                "science.adw0288_tables_s1_to_s11", "science.adw0288_table_s6.xlsx")
+stopifnot("Table S6 not found" = file.exists(s6_path))
+
+s6_raw <- read_excel(s6_path)
+cat("Table S6 rows as supplied:", format(nrow(s6_raw), big.mark = ","), "\n")
+
+s6 <- s6_raw %>%
+  transmute(transcript_id_clean = str_extract(gene_name, "^ENST[0-9]+"),
+            ctrl_hl = as.numeric(Ctrl_Half_life),
+            ko_hl   = as.numeric(KO_Half_life),
+            logfc   = as.numeric(logFC)) %>%
+  filter(!is.na(transcript_id_clean), is.finite(ctrl_hl), is.finite(ko_hl),
+         is.finite(logfc), ctrl_hl > 0, ko_hl > 0) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
+
+cat("transcripts with a usable half-life pair:", format(nrow(s6), big.mark = ","), "\n")
+cat("median control half-life:", round(median(s6$ctrl_hl), 2), "h",
+    " | median KO half-life:", round(median(s6$ko_hl), 2), "h\n")
+cat("median logFC:", round(median(s6$logfc), 4),
+    " | fraction stabilized on KO:", sprintf("%.1f%%", 100 * mean(s6$logfc > 0)), "\n")
+```
+
+```{r check_s6}
+# Structural identities the table must satisfy regardless of what the biology turns out to
+# be. The logFC identity is the important one: it pins the direction of the column, so a
+# supplement reissued with the ratio inverted would fail here rather than silently flip
+# every conclusion in this notebook.
+stopifnot(
+  "logFC is not log2(KO / Ctrl) half-life" =
+    max(abs(s6$logfc - log2(s6$ko_hl / s6$ctrl_hl))) < 1e-3,
+  "half-lives must be positive" = all(s6$ctrl_hl > 0 & s6$ko_hl > 0),
+  "logFC must be finite" = all(is.finite(s6$logfc)),
+  "control half-life median is outside a plausible mRNA range" =
+    between(median(s6$ctrl_hl), 1, 20),
+  "transcript IDs must be unique" = !any(duplicated(s6$transcript_id_clean))
+)
+
+# Direction check, stated as the paper's own model: DHX29 is proposed to drive decay, so
+# losing it should lengthen half-lives for most messages. This is a property of the loaded
+# table, not a quoted figure from the text.
+stopifnot("most messages are expected to lengthen on DHX29 KO" = median(s6$logfc) > 0)
+cat("Table S6 structural checks passed.\n")
+```
+
+---
+
+## Section 2: GC3 from the assayed transcript's CDS
+
+```{r gc3}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds  <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                              cdsBy(txdb, by = "tx", use.names = TRUE))
+cds  <- cds[width(cds) %% 3 == 0 & width(cds) >= 60]
+cds  <- subseq(cds, 1, width(cds) - 3)             # drop the stop codon
+names(cds) <- str_remove(names(cds), "\\..*")
+
+cn <- trinucleotideFrequency(cds, step = 3)
+# trinucleotideFrequency drops the sequence names, so row identity would silently become
+# row number without this.
+rownames(cn) <- names(cds)
+third <- do.call(rbind, strsplit(colnames(cn), ""))[, 3]
+
+gc3_tbl <- tibble(
+  transcript_id_clean = rownames(cn),
+  gc3     = 100 * as.vector(cn %*% as.numeric(third %in% c("G", "C"))) / rowSums(cn),
+  cds_gc  = 100 * as.vector(letterFrequency(cds, "GC")) / width(cds),
+  n_codon = rowSums(cn)
+)
+cat("transcripts with an in-frame CDS in v49:", format(nrow(gc3_tbl), big.mark = ","), "\n")
+```
+
+```{r check_gc3}
+# Independent recomputation of GC3 on a random subset, by pulling every third base out of
+# the sequence as a string. The matrix route above and this one share no code, so a wrong
+# codon-position index or a misaligned frame cannot pass both.
+set.seed(9)
+idx <- sample(seq_along(cds), 200)
+gc3_direct <- vapply(idx, function(i) {
+  s  <- as.character(cds[[i]])
+  p3 <- substring(s, seq(3, nchar(s), by = 3), seq(3, nchar(s), by = 3))
+  100 * mean(p3 %in% c("G", "C"))
+}, numeric(1))
+max_dev <- max(abs(gc3_direct - gc3_tbl$gc3[idx]))
+cat("max deviation, matrix GC3 vs direct string GC3 over 200 transcripts:",
+    signif(max_dev, 3), "\n")
+
+stopifnot(
+  "GC3 must lie in [0, 100]"     = all(gc3_tbl$gc3    >= 0 & gc3_tbl$gc3    <= 100),
+  "CDS GC must lie in [0, 100]"  = all(gc3_tbl$cds_gc >= 0 & gc3_tbl$cds_gc <= 100),
+  "matrix GC3 disagrees with a direct per-codon recomputation" = max_dev < 1e-9,
+  "median GC3 is outside the expected human range of 40-65%" =
+    between(median(gc3_tbl$gc3), 40, 65)
+)
+
+# Biological spot-check: ACTB CDS GC is expected at 50-70% (the convention used in 01_).
+tx_sym <- readRDS(here("output", "dhx29_reanalysis", "dhx29_counts_with_gene.rds")) %>%
+  distinct(transcript_id_clean, symbol) %>%
+  filter(!is.na(symbol))
+actb_gc <- gc3_tbl %>% inner_join(tx_sym, by = "transcript_id_clean") %>%
+  filter(symbol == "ACTB") %>% pull(cds_gc)
+cat("ACTB CDS GC% over", length(actb_gc), "coding transcripts:",
+    paste(round(range(actb_gc), 1), collapse = " to "), "\n")
+stopifnot("ACTB CDS GC% is outside the expected 50-70% window" =
+            length(actb_gc) > 0 && all(actb_gc >= 50 & actb_gc <= 70))
+cat("GC3 checks passed.\n")
+```
+
+```{r join}
+d <- s6 %>%
+  inner_join(gc3_tbl, by = "transcript_id_clean") %>%
+  mutate(gc3_bin = cut(gc3, breaks = gc3_breaks,
+                       labels = rev(gc3_levels), right = FALSE),
+         gc3_bin = factor(as.character(gc3_bin), levels = gc3_levels))
+
+cat("transcripts with both a half-life and a GC3:", format(nrow(d), big.mark = ","),
+    "of", format(nrow(s6), big.mark = ","), "\n")
+cat("lost to no in-frame v49 CDS:", nrow(s6) - nrow(d), "\n")
+
+stopifnot(
+  "every transcript must fall in exactly one GC3 bin" = !any(is.na(d$gc3_bin)),
+  "bin assignment must preserve the row count"        = sum(table(d$gc3_bin)) == nrow(d),
+  "each bin needs enough transcripts for a stable ECDF" = all(table(d$gc3_bin) >= 50)
+)
+```
+
+---
+
+## Section 3: The figure
+
+```{r bin_stats}
+bin_stats <- d %>%
+  group_by(gc3_bin) %>%
+  summarise(n            = n(),
+            median_gc3   = round(median(gc3), 1),
+            median_logfc = round(median(logfc), 4),
+            median_ctrl_hl = round(median(ctrl_hl), 2),
+            median_ko_hl   = round(median(ko_hl), 2),
+            .groups = "drop") %>%
+  arrange(factor(gc3_bin, levels = gc3_levels))
+print(as.data.frame(bin_stats))
+
+rho_logfc <- cor(d$gc3, d$logfc, method = "spearman")
+lo <- d$logfc[d$gc3_bin == "< 40%"]
+hi <- d$logfc[d$gc3_bin == "> 80%"]
+w_ext  <- wilcox.test(lo, hi)
+ks_ext <- suppressWarnings(ks.test(lo, hi))
+
+cat("\nSpearman(GC3, log2(KO/Ctrl) half-life) =", round(rho_logfc, 4),
+    " n =", format(nrow(d), big.mark = ","), "\n")
+cat("< 40% vs > 80%: Wilcoxon p =", signif(w_ext$p.value, 3),
+    " | KS D =", round(as.numeric(ks_ext$statistic), 4),
+    ", p =", signif(ks_ext$p.value, 3), "\n")
+cat("difference in medians (<40% minus >80%) =",
+    round(median(lo) - median(hi), 4), "log2 units\n")
+```
+
+```{r cdf_plot, fig.width = 6.5, fig.height = 5}
+leg_labels <- paste0(bin_stats$gc3_bin, " (n=", bin_stats$n, ")")
+names(leg_labels) <- as.character(bin_stats$gc3_bin)
+
+p <- ggplot(d, aes(x = logfc, colour = gc3_bin)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60", linewidth = 0.5) +
+  scale_colour_manual(values = gc3_colors, labels = leg_labels,
+                      breaks = gc3_levels, name = "GC3 content") +
+  scale_x_continuous(breaks = seq(-1, 1, 0.25)) +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(0, 1)) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.6, size = 3,
+           label = paste0("Spearman(GC3, logFC) = ", round(rho_logfc, 3),
+                          ", n = ", format(nrow(d), big.mark = ","),
+                          "\n< 40% vs > 80% Wilcoxon p = ", signif(w_ext$p.value, 3))) +
+  labs(title = "HEK293T SLAM-seq: mRNA half-life change on DHX29 loss",
+       subtitle = "Table S6. Positive means the message is stabilized when DHX29 is gone",
+       x = "log2 (DHX29-KO / Control) half-life", y = "Proportion") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_rect(fill = "white", colour = "grey80"),
+        legend.key.height = unit(0.8, "lines"))
+print(p)
+
+ggsave(here("plots", "dhx29_10_slamseq_logfc_cdf_by_gc3.pdf"), p, width = 6.5, height = 5)
+cat("Saved: plots/dhx29_10_slamseq_logfc_cdf_by_gc3.pdf\n")
+```
+
+---
+
+## Section 4: Is there any GC3 structure in this table at all?
+
+If the bins separate on the *change*, they should normally also separate on baseline
+stability, since GC3 tracks codon optimality. Testing the control arm on its own says
+whether the flat result above is specific to the DHX29 contrast or whether this half-life
+table carries no GC3 signal of any kind. Nothing here is a claim about the paper's RNA-seq
+panels, which are a different readout in a different experiment.
+
+```{r baseline, fig.width = 6.5, fig.height = 5}
+rho_ctrl <- cor(d$gc3, d$ctrl_hl, method = "spearman")
+rho_ko   <- cor(d$gc3, d$ko_hl,   method = "spearman")
+cat("Spearman(GC3, control half-life) =", round(rho_ctrl, 4), "\n")
+cat("Spearman(GC3, KO half-life)      =", round(rho_ko, 4), "\n")
+cat("n =", format(nrow(d), big.mark = ","), "\n")
+
+p_base <- ggplot(d, aes(x = ctrl_hl, colour = gc3_bin)) +
+  stat_ecdf(linewidth = 0.8) +
+  scale_colour_manual(values = gc3_colors, labels = leg_labels,
+                      breaks = gc3_levels, name = "GC3 content") +
+  coord_cartesian(xlim = quantile(d$ctrl_hl, c(0, 0.99)), ylim = c(0, 1)) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.6, size = 3,
+           label = paste0("Spearman(GC3, half-life) = ", round(rho_ctrl, 3),
+                          ", n = ", format(nrow(d), big.mark = ","))) +
+  labs(title = "Baseline mRNA stability by GC3 bin, control cells",
+       subtitle = "Same transcripts and bins as above, control arm only",
+       x = "Control half-life (h)", y = "Proportion") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_rect(fill = "white", colour = "grey80"),
+        legend.key.height = unit(0.8, "lines"))
+print(p_base)
+
+ggsave(here("plots", "dhx29_10_slamseq_baseline_halflife_cdf_by_gc3.pdf"),
+       p_base, width = 6.5, height = 5)
+cat("Saved: plots/dhx29_10_slamseq_baseline_halflife_cdf_by_gc3.pdf\n")
+```
+
+---
+
+## Section 5: Save
+
+```{r save}
+out <- d %>%
+  dplyr::select(transcript_id_clean, ctrl_hl, ko_hl, logfc, gc3, cds_gc, n_codon, gc3_bin)
+write_csv(out, here("output", "dhx29_reanalysis", "dhx29_10_slamseq_gc3_bins.csv"))
+write_csv(bin_stats, here("output", "dhx29_reanalysis", "dhx29_10_gc3_bin_summary.csv"))
+cat("Wrote dhx29_10_slamseq_gc3_bins.csv,", format(nrow(out), big.mark = ","), "transcripts\n")
+cat("Wrote dhx29_10_gc3_bin_summary.csv\n")
+```
+
+```{r session_info}
+sessionInfo()
+```

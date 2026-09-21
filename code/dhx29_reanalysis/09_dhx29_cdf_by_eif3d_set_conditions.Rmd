@@ -1,0 +1,201 @@
+---
+title: "DHX29 reanalysis 09: enrichment by eIF3d and eIF3e gene sets"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Measured DHX29 enrichment split by eIF3d or eIF3e gene set, across four contrasts: hypoxia
+1hr and the time-regressed normoxia 1+4hr, for each factor. Enrichment is the summed-gene
+estimate from notebook 06.
+
+Sets are `te_lfc > cut` with `te_padj < 0.05`, and each factor uses its own negative control
+pool. No stored gene set CSV exists for the 1+4hr contrasts, so they are built here and
+asserted against the count each file yields.
+
+**One contrast needs a centred cut.** si3e normoxia 1+4hr has a median `te_lfc` of 0.619, so a
+literal 0.5 sits *below* the median and would select 5,510 genes, 46% of the transcriptome.
+That is the trap the repository notes document for raw RNA fold changes, arriving here in a TE
+contrast. It uses `median + 0.5` instead, giving 1,537 genes, comparable to the other three.
+The other contrasts have medians of 0.13 to 0.29 where 0.5 is a real threshold, so they keep
+it. Every panel prints the cut it used.
+
+**Direction.** These files are named in the opposite order from the coefficient they hold.
+The coefficient is `sictrl_vs_si3d`, so every column is log2(sictrl / si3d) and a positive
+`te_lfc` means eIF3d promotes. Both files are checked on EIF3D's own RNA change.
+
+**Cross-cell-line caveat.** DHX29 is HEK293T, the eIF3d TE data is MDA-MB-231.
+
+```{r libs}
+library(tidyverse)
+library(here)
+
+# eIF3d orange and eIF3e light blue are the reserved hues for the two factors.
+factor_cols <- c("3d" = "#E69F00", "3e" = "#56B4E9")
+
+contrasts <- tibble(
+  factor_id = c("3d", "3d", "3e", "3e"),
+  label = c("eIF3d, hypoxia 1hr", "eIF3d, normoxia 1+4hr time regressed",
+            "eIF3e, hypoxia 1hr", "eIF3e, normoxia 1+4hr time regressed"),
+  te_file = c("translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+              "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+              "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv",
+              "te_si3e_vs_sictrl_normoxia_1and4hr.csv"),
+  # the te_ file carries no rna_lfc, so the knockdown-target check reads its rna_ partner
+  rna_file = c(NA, NA, NA, "rna_si3e_vs_sictrl_normoxia_1and4hr.csv"),
+  target   = c("EIF3D", "EIF3D", "EIF3E", "EIF3E"),
+  centred  = c(FALSE, FALSE, FALSE, TRUE),
+  expected = c(1604L, 426L, 1083L, 1537L),
+  outfile  = c("dhx29_09_cdf_3d_hypoxia1hr.pdf", "dhx29_09_cdf_3d_normoxia1and4hr.pdf",
+               "dhx29_09_cdf_3e_hypoxia1hr.pdf", "dhx29_09_cdf_3e_normoxia1and4hr.pdf"))
+print(as.data.frame(contrasts %>% dplyr::select(label, centred, expected)))
+```
+
+---
+
+## Section 1: Inputs
+
+```{r load}
+enr <- readRDS(here("output", "dhx29_reanalysis", "dhx29_gene_summed_enrichment.rds")) %>%
+  filter(is.finite(lfc_simple))
+cat("genes with a DHX29 enrichment estimate:", format(nrow(enr), big.mark = ","), "\n")
+
+neg_3d <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                   show_col_types = FALSE) %>%
+  transmute(gene_id_clean = str_remove(gene_id, "\\..*"))
+neg_3e <- read_csv(here("output", "genesets", "si3e_negative_controls_padj0.05.csv"),
+                   show_col_types = FALSE) %>%
+  transmute(gene_id_clean = str_remove(ensembl_gene, "\\..*"))
+neg_pools <- list(`3d` = neg_3d, `3e` = neg_3e)
+cat("negative control pools -- si3d:", format(nrow(neg_3d), big.mark = ","),
+    " si3e:", format(nrow(neg_3e), big.mark = ","), "\n")
+```
+
+---
+
+## Section 2: One figure per contrast
+
+```{r cdfs, fig.width = 7.5, fig.height = 5, results = "hold"}
+summary_rows <- list()
+
+for (i in seq_len(nrow(contrasts))) {
+  lab <- contrasts$label[i]
+  fid <- contrasts$factor_id[i]
+  te  <- read_csv(here("output", contrasts$te_file[i]), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+  # the knockdown-target check needs rna_lfc, which one te_ file does not carry
+  rna_src <- if (is.na(contrasts$rna_file[i])) te else
+    read_csv(here("output", contrasts$rna_file[i]), show_col_types = FALSE)
+  target_rna <- rna_src$rna_lfc[rna_src$symbol == contrasts$target[i]][1]
+
+  med_lfc <- median(te$te_lfc, na.rm = TRUE)
+  cut_at  <- if (contrasts$centred[i]) med_lfc + 0.5 else 0.5
+  promoted <- te %>% filter(te_lfc > cut_at, te_padj < 0.05)
+
+  cat("\n=====", lab, "=====\n")
+  cat(contrasts$target[i], "rna_lfc:", round(target_rna, 3), "\n")
+  cat("median te_lfc:", round(med_lfc, 3),
+      " | cut at:", round(cut_at, 3),
+      if (contrasts$centred[i]) " (median + 0.5)" else " (literal 0.5)", "\n")
+  cat("promoted genes:", nrow(promoted), "\n")
+
+  stopifnot(
+    "the knockdown target is not depleted, so the direction has flipped" =
+      is.finite(target_rna) && target_rna > 2,
+    "the promoted set is not the expected size" = nrow(promoted) == contrasts$expected[i]
+  )
+
+  shared    <- enr %>% inner_join(te %>% dplyr::select(gene_id_clean), by = "gene_id_clean")
+  prom_here <- intersect(promoted$gene_id_clean, shared$gene_id_clean)
+  pool      <- neg_pools[[fid]] %>%
+    filter(!gene_id_clean %in% promoted$gene_id_clean,
+           gene_id_clean %in% shared$gene_id_clean)
+
+  set.seed(9)
+  neg_ctrl <- sample(pool$gene_id_clean,
+                     size = min(length(prom_here), nrow(pool)), replace = FALSE)
+
+  cat("promoted present:", length(prom_here),
+      "| negative pool:", nrow(pool),
+      "| size-matched draw:", length(neg_ctrl), "\n")
+
+  grp_levels <- c(paste0("eIF", fid, " promotes"), "Negative control", "All other genes")
+  cols <- setNames(c(factor_cols[[fid]], "black", "grey70"), grp_levels)
+
+  d <- shared %>%
+    mutate(grp = case_when(gene_id_clean %in% prom_here ~ grp_levels[1],
+                           gene_id_clean %in% neg_ctrl ~ grp_levels[2],
+                           TRUE                        ~ grp_levels[3]),
+           grp = factor(grp, levels = grp_levels))
+
+  st <- d %>% group_by(grp) %>%
+    summarise(n = n(), med = median(lfc_simple), .groups = "drop")
+  print(as.data.frame(st %>% mutate(med = round(med, 5))))
+
+  pv <- d$lfc_simple[d$grp == grp_levels[1]]
+  nv <- d$lfc_simple[d$grp == grp_levels[2]]
+  w  <- wilcox.test(pv, nv)
+  ks <- suppressWarnings(ks.test(pv, nv))
+  cat("promoted vs control: Wilcoxon p =", signif(w$p.value, 3),
+      " KS p =", signif(ks$p.value, 3),
+      " difference in medians =", signif(median(pv) - median(nv), 3), "\n")
+
+  stopifnot(
+    "the gene sets overlap" = length(intersect(prom_here, neg_ctrl)) == 0,
+    "the negative control was not size-matched" =
+      length(neg_ctrl) == min(length(prom_here), nrow(pool))
+  )
+
+  summary_rows[[lab]] <- tibble(
+    contrast = lab, cut = round(cut_at, 3), centred = contrasts$centred[i],
+    n_promoted = length(prom_here),
+    median_promoted = median(pv), median_control = median(nv),
+    wilcox_p = w$p.value, ks_p = ks$p.value)
+
+  p <- ggplot(d, aes(lfc_simple, colour = grp)) +
+    stat_ecdf(linewidth = 0.9) +
+    geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60") +
+    coord_cartesian(xlim = c(-0.2, 0.2)) +
+    scale_colour_manual(values = cols,
+                        labels = paste0(st$grp, " (n = ",
+                                        format(st$n, big.mark = ","), ")"),
+                        name = NULL) +
+    annotate("text", x = Inf, y = Inf,
+             label = paste0("promoted vs control\nWilcoxon p = ", signif(w$p.value, 3),
+                            "\nKS p = ", signif(ks$p.value, 3),
+                            "\nTE cut > ", round(cut_at, 2)),
+             hjust = 1.1, vjust = 1.4, size = 3.2) +
+    labs(title = paste0("DHX29 enrichment, split by gene set: ", lab),
+         x = "DHX29 log2 IP / Input", y = "Cumulative fraction") +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  print(p)
+  ggsave(here("plots", contrasts$outfile[i]), p, width = 7.5, height = 5)
+}
+```
+
+---
+
+## Section 3: The four contrasts side by side
+
+```{r summary}
+summ <- bind_rows(summary_rows)
+print(as.data.frame(summ %>%
+  mutate(across(starts_with("median"), ~ signif(.x, 3)),
+         across(ends_with("_p"), ~ signif(.x, 3)))))
+write_csv(summ, here("output", "dhx29_reanalysis", "dhx29_09_geneset_contrasts.csv"))
+cat("\nWrote dhx29_09_geneset_contrasts.csv\n")
+
+stopifnot("all four contrasts should be summarised" = nrow(summ) == 4)
+```
+
+```{r session_info}
+sessionInfo()
+```

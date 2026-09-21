@@ -1,0 +1,404 @@
+---
+title: "DHX29 reanalysis 06: gene-level counts by summing transcripts, and DESeq2"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Notebook 03 collapsed to gene level by picking one representative transcript per gene. This
+notebook takes the other route: sum every transcript into its gene, pool the six samples into
+a single total, and look at that distribution to place a floor.
+
+A fork, not a replacement. Notebooks 03 to 05 continue to use the representative-transcript
+table; nothing here feeds them.
+
+**The caveat.** Summing double-counts reads wherever the same footprints were assigned to
+more than one isoform. Notebook 03 measured that population: 2.1% of multi-isoform genes
+share one identical count across isoforms of differing CDS length, the duplication signature,
+and a further 8.5% share a count across isoforms whose CDS lengths are genuinely identical,
+which is benign. Section 3 quantifies the combined inflation. The summed table is fine for a
+coverage question like where to put a floor. It is not appropriate as a differential input
+without this caveat attached, which is why notebook 03 chose a representative instead.
+
+```{r libs}
+library(tidyverse)
+library(here)
+library(DESeq2)
+library(apeglm)
+library(ggrepel)
+
+sample_cols <- c("Input1", "Input2", "Input3", "IP1", "IP2", "IP3")
+# Chosen to sit just above the threshold DESeq2 selects for itself. Notebook 04's
+# independent filtering picked a base mean of 11.48, which over six samples is a pooled
+# total of about 69, so a floor here of 70 stops being redone downstream. The summed
+# equivalent of notebook 03's "3 in every sample" would be 18, which leaves roughly
+# 4,000 genes for DESeq2 to discard later anyway.
+cutoff_total <- 70
+```
+
+---
+
+## Section 1: Aggregate transcripts to genes
+
+```{r aggregate}
+tx <- readRDS(here("output", "dhx29_reanalysis", "dhx29_counts_with_gene.rds")) %>%
+  filter(!is.na(cds_codons), !is.na(gene_id_clean))
+
+gene_sum <- tx %>%
+  group_by(gene_id_clean, sample) %>%
+  summarise(count = sum(count), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = count) %>%
+  mutate(total = rowSums(across(all_of(sample_cols))))
+
+sym <- tx %>% distinct(gene_id_clean, symbol)
+gene_sum <- gene_sum %>% left_join(sym, by = "gene_id_clean")
+
+cat("coding transcripts in: ",
+    format(n_distinct(tx$transcript_id), big.mark = ","), "\n", sep = "")
+cat("genes out:             ", format(nrow(gene_sum), big.mark = ","), "\n", sep = "")
+cat("genes carrying counts: ", format(sum(gene_sum$total > 0), big.mark = ","), "\n\n", sep = "")
+
+cat("per-gene total across all six samples:\n")
+print(round(quantile(gene_sum$total, c(0.10, 0.25, 0.50, 0.75, 0.90, 0.99))))
+```
+
+---
+
+## Section 2: Distribution and the floor
+
+The axis keeps log2 spacing but is labelled in counts, so the line sits on a readable tick.
+
+```{r plot_summed, fig.width = 7.5, fig.height = 4.5}
+retention <- tibble(floor = c(3, 18, 30, 50, 70, 100, 150)) %>%
+  mutate(genes = map_int(floor, ~ sum(gene_sum$total >= .x)),
+         pct   = round(100 * genes / nrow(gene_sum), 1))
+cat("genes retained at each candidate floor:\n")
+print(as.data.frame(retention))
+cat("\nchosen floor:", cutoff_total, "->",
+    format(sum(gene_sum$total >= cutoff_total), big.mark = ","), "genes\n")
+
+p_sum <- ggplot(gene_sum, aes(log2(total + 1))) +
+  geom_density(linewidth = 0.8, colour = "grey20") +
+  geom_vline(xintercept = log2(cutoff_total + 1), linetype = "dashed",
+             colour = "grey15", linewidth = 0.5) +
+  annotate("text", x = log2(cutoff_total + 1), y = Inf,
+           label = paste0("total = ", cutoff_total),
+           hjust = -0.1, vjust = 1.8, size = 3.2, colour = "grey15") +
+  scale_x_continuous(
+    breaks = log2(c(0, 1, 10, 70, 300, 1000, 10000, 1e5) + 1),
+    labels = c(0, 1, 10, 70, 300, 1000, 10000, 1e5)) +
+  labs(
+    title    = "Gene-level footprint totals, all six samples pooled",
+    subtitle = str_wrap(paste0(
+      "n = ", format(nrow(gene_sum), big.mark = ","),
+      " genes, counts summed across every transcript and every sample. The floor of ",
+      cutoff_total, " sits just above the base-mean threshold DESeq2 selects for itself."),
+      width = 88),
+    x = "total footprints per gene (log2 spacing)", y = "Density"
+  ) +
+  theme_classic(base_size = 12)
+
+print(p_sum)
+ggsave(here("plots", "dhx29_06_summed_count_distribution.pdf"),
+       p_sum, width = 7.5, height = 4.5)
+```
+
+---
+
+## Section 3: How much did summing inflate the counts?
+
+```{r inflation}
+max_tx <- tx %>%
+  group_by(gene_id_clean, sample) %>%
+  summarise(count = max(count), .groups = "drop") %>%
+  group_by(gene_id_clean) %>%
+  summarise(total_max_tx = sum(count), .groups = "drop")
+
+infl <- gene_sum %>%
+  dplyr::select(gene_id_clean, total) %>%
+  inner_join(max_tx, by = "gene_id_clean") %>%
+  filter(total_max_tx > 0) %>%
+  mutate(ratio = total / total_max_tx)
+
+cat("ratio of the gene sum to its largest single transcript, n = ",
+    format(nrow(infl), big.mark = ","), "\n", sep = "")
+print(round(quantile(infl$ratio, c(0.25, 0.50, 0.75, 0.90, 0.99)), 3))
+cat("\ngenes where summing changes nothing (single transcript carries all): ",
+    format(sum(infl$ratio == 1), big.mark = ","),
+    sprintf(" (%.1f%%)", 100 * mean(infl$ratio == 1)), "\n", sep = "")
+
+stopifnot(
+  "summing should never reduce a gene's count below its largest transcript" =
+    all(infl$ratio >= 1)
+)
+```
+
+Part of that ratio is genuine spread across isoforms and part is the same reads counted more
+than once. These files cannot separate the two.
+
+---
+
+## Section 4: Checks
+
+```{r checks}
+tx_total   <- sum(tx$count)
+gene_total <- sum(gene_sum$total)
+cat("footprints in the transcript table:", format(tx_total, big.mark = ","), "\n")
+cat("footprints in the gene table:      ", format(gene_total, big.mark = ","), "\n")
+
+hk <- tibble(symbol = c("ACTB", "GAPDH", "EEF1A1"),
+             gene_id_clean = c("ENSG00000075624", "ENSG00000111640", "ENSG00000156508"))
+hk_rank <- gene_sum %>%
+  mutate(pct = percent_rank(total)) %>%
+  inner_join(hk %>% dplyr::rename(expected = symbol), by = "gene_id_clean")
+print(as.data.frame(hk_rank %>%
+                      transmute(expected, total, percentile = round(pct, 4))))
+
+stopifnot(
+  "aggregation did not conserve footprints" = tx_total == gene_total,
+  "counts are not finite non-negative integers" =
+    all(map_lgl(gene_sum[sample_cols], ~ all(is.finite(.x)) && all(.x >= 0))),
+  "the gene table is not one row per gene" =
+    nrow(gene_sum) == n_distinct(gene_sum$gene_id_clean),
+  "gene count changed unexpectedly" = nrow(gene_sum) == 20322,
+  "a housekeeping gene is not in the top 1% of totals" =
+    nrow(hk_rank) == 3 && all(hk_rank$pct > 0.99)
+)
+cat("\nAll checks passed.\n")
+```
+
+The conservation check is the load-bearing one: summing must neither drop nor duplicate a
+footprint relative to its own input. It does not, and cannot, detect duplication that was
+already present in the GEO files.
+
+---
+
+## Section 6: Gene-level DESeq2 on the summed table
+
+Same contrast as notebook 04, but on genes built by summing transcripts and filtered at a
+pooled total of `r cutoff_total`. Both designs fitted so the blocking term can be judged
+rather than assumed.
+
+```{r deseq_summed}
+keep <- gene_sum %>% filter(total >= cutoff_total)
+mat  <- as.matrix(keep[, sample_cols])
+rownames(mat) <- keep$gene_id_clean
+
+col_data <- tibble(sample = sample_cols) %>%
+  mutate(assay = factor(if_else(str_starts(sample, "Input"), "Input", "IP"),
+                        levels = c("Input", "IP")),
+         rep   = factor(str_extract(sample, "\\d$"))) %>%
+  column_to_rownames("sample")
+
+stopifnot(
+  "Input is not the reference level" = levels(col_data$assay)[1] == "Input",
+  "counts entering DESeq2 are not clean" =
+    all(is.finite(mat)) && all(mat >= 0) && all(mat == round(mat))
+)
+
+dds_paired <- DESeqDataSetFromMatrix(mat, col_data, ~ rep + assay) %>% DESeq(quiet = TRUE)
+dds_simple <- DESeqDataSetFromMatrix(mat, col_data, ~ assay)       %>% DESeq(quiet = TRUE)
+
+raw_paired <- results(dds_paired, name = "assay_IP_vs_Input", alpha = 0.05)
+raw_simple <- results(dds_simple, name = "assay_IP_vs_Input", alpha = 0.05)
+shr_paired <- lfcShrink(dds_paired, coef = "assay_IP_vs_Input", type = "apeglm", quiet = TRUE)
+shr_simple <- lfcShrink(dds_simple, coef = "assay_IP_vs_Input", type = "apeglm", quiet = TRUE)
+
+res <- keep %>%
+  dplyr::select(gene_id_clean, symbol, total) %>%
+  mutate(base_mean      = raw_simple$baseMean,
+         lfc_raw_paired = raw_paired$log2FoldChange,
+         pvalue_paired  = raw_paired$pvalue,
+         padj_paired    = raw_paired$padj,
+         lfc_paired     = shr_paired$log2FoldChange,
+         lfc_raw_simple = raw_simple$log2FoldChange,
+         pvalue_simple  = raw_simple$pvalue,
+         padj_simple    = raw_simple$padj,
+         lfc_simple     = shr_simple$log2FoldChange)
+
+cat("genes tested:", format(nrow(res), big.mark = ","), "\n")
+cat("size factors:\n"); print(round(sizeFactors(dds_simple), 4))
+cat("\nDESeq2 independent filtering threshold (baseMean):",
+    round(metadata(raw_simple)$filterThreshold, 2),
+    " -> testable:", format(sum(!is.na(res$padj_simple)), big.mark = ","), "\n\n")
+
+sig <- tibble(
+  design   = c("~ assay", "~ rep + assay"),
+  fdr_0.05 = c(sum(res$padj_simple < 0.05, na.rm = TRUE),
+               sum(res$padj_paired < 0.05, na.rm = TRUE)),
+  fdr_0.10 = c(sum(res$padj_simple < 0.10, na.rm = TRUE),
+               sum(res$padj_paired < 0.10, na.rm = TRUE)),
+  up_0.05_lfc0.5 = c(sum(res$padj_simple < 0.05 & res$lfc_simple >  0.5, na.rm = TRUE),
+                     sum(res$padj_paired < 0.05 & res$lfc_paired >  0.5, na.rm = TRUE)),
+  down_0.05_lfc0.5 = c(sum(res$padj_simple < 0.05 & res$lfc_simple < -0.5, na.rm = TRUE),
+                       sum(res$padj_paired < 0.05 & res$lfc_paired < -0.5, na.rm = TRUE)))
+print(as.data.frame(sig))
+
+dhx29 <- res %>% filter(symbol == "DHX29")
+cat("\nDHX29 self-enrichment, unpaired: log2FC", round(dhx29$lfc_simple, 3),
+    " padj", signif(dhx29$padj_simple, 3), "\n")
+stopifnot(
+  "the bait is not enriched in its own pull-down, so the sign is wrong" =
+    nrow(dhx29) == 1 && dhx29$lfc_simple > 1 && dhx29$padj_simple < 0.01
+)
+```
+
+---
+
+## Section 7: Do the two designs agree?
+
+Compared on the unshrunk fold change, which is the estimate each design produces and the one
+the Wald test on it belongs to.
+
+Spearman throughout. The counts are not normal and their variance is not constant, so a
+product-moment correlation has no claim here. It is also unusable in practice: a pooled total
+does not guarantee a count in every sample, so a few genes carry a zero in one condition and
+their unshrunk estimate blows up to tens of log2 units, which dominates Pearson while barely
+touching the ranks.
+
+```{r design_correlation, fig.width = 6.5, fig.height = 5.5}
+cmp <- res %>% filter(is.finite(lfc_raw_paired), is.finite(lfc_raw_simple))
+
+zero_in_a_sample <- sum(pmin(keep$Input1, keep$Input2, keep$Input3,
+                             keep$IP1, keep$IP2, keep$IP3) == 0)
+cat("genes with a zero in at least one sample:", zero_in_a_sample,
+    sprintf(" (%.1f%%)", 100 * zero_in_a_sample / nrow(keep)),
+    "  <- a pooled floor cannot exclude these\n\n")
+
+stats <- tibble(
+  n                 = nrow(cmp),
+  unshrunk_spearman = cor(cmp$lfc_raw_paired, cmp$lfc_raw_simple, method = "spearman"),
+  shrunk_spearman   = cor(cmp$lfc_paired, cmp$lfc_simple, method = "spearman"),
+  sd_unshrunk       = sd(cmp$lfc_raw_simple),
+  sd_shrunk         = sd(cmp$lfc_simple))
+print(as.data.frame(stats %>% mutate(across(-n, ~ round(.x, 4)))))
+
+fit <- lm(lfc_raw_paired ~ lfc_raw_simple, data = cmp)
+cat("\nslope:", round(coef(fit)[2], 4), " intercept:", round(coef(fit)[1], 4), "\n")
+
+# Pearson is not asserted: it is hostage to a handful of blown-up estimates on genes with
+# a zero in one condition. Rank agreement is the robust statement.
+stopifnot(
+  "the two designs do not agree by rank on the unshrunk estimate" =
+    stats$unshrunk_spearman > 0.9,
+  "shrunken fold changes do not agree by rank" = stats$shrunk_spearman > 0.8
+)
+
+p_cmp <- ggplot(cmp, aes(lfc_raw_simple, lfc_raw_paired)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 0.4, alpha = 0.25, colour = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, colour = "#0072B2",
+              fill = "#0072B2", alpha = 0.15, linewidth = 0.8) +
+  annotate("text", x = -Inf, y = Inf,
+           label = paste0("n = ", format(stats$n, big.mark = ","),
+                          "\nSpearman ", sprintf("%.4f", stats$unshrunk_spearman),
+                          "\nslope ", sprintf("%.3f", coef(fit)[2])),
+           hjust = -0.1, vjust = 1.2, size = 3.2) +
+  coord_cartesian(xlim = quantile(cmp$lfc_raw_simple, c(0.001, 0.999)),
+                  ylim = quantile(cmp$lfc_raw_paired, c(0.001, 0.999))) +
+  labs(title = "Blocking on replicate against not",
+       subtitle = str_wrap(paste0(
+         "Unshrunk log2 IP over Input per gene, summed counts at a floor of ",
+         cutoff_total, ". Dashed line is y = x, blue is a linear fit. Axes show the ",
+         "central 99.8%; the excluded points are genes with a zero in one condition."),
+         width = 80),
+       x = "~ assay", y = "~ rep + assay") +
+  theme_classic(base_size = 12)
+
+print(p_cmp)
+ggsave(here("plots", "dhx29_06_design_correlation.pdf"), p_cmp, width = 6.5, height = 5.5)
+```
+
+---
+
+## Section 8: Volcano, both designs
+
+```{r volcano_summed, fig.width = 9, fig.height = 5}
+sig_p <- 0.05; sig_lfc <- 0.5; y_cap <- 30
+
+volc <- bind_rows(
+  res %>% transmute(design = "~ assay", label = symbol,
+                    lfc = lfc_raw_simple, pval = pvalue_simple, padj = padj_simple),
+  res %>% transmute(design = "~ rep + assay", label = symbol,
+                    lfc = lfc_raw_paired, pval = pvalue_paired, padj = padj_paired)
+) %>%
+  filter(is.finite(lfc), is.finite(pval)) %>%
+  mutate(design = factor(design, levels = c("~ assay", "~ rep + assay")),
+         call = case_when(is.na(padj) | padj >= sig_p | abs(lfc) <= sig_lfc ~ "not significant",
+                          lfc > sig_lfc ~ "Up", TRUE ~ "Down"),
+         call = factor(call, levels = c("Up", "Down", "not significant")),
+         y = pmin(-log10(pval), y_cap), capped = -log10(pval) > y_cap)
+
+counts_tbl <- volc %>%
+  group_by(design) %>%
+  summarise(n = n(), up = sum(call == "Up"), down = sum(call == "Down"), .groups = "drop")
+print(as.data.frame(counts_tbl))
+
+# The y axis is the raw Wald p but the call uses padj, so the line must be found per panel.
+sig_lines <- volc %>% filter(!is.na(padj), padj < sig_p) %>%
+  group_by(design) %>% summarise(yint = -log10(max(pval)), .groups = "drop")
+lab_up   <- counts_tbl %>% mutate(lab = paste0("Up: ", up))
+lab_down <- counts_tbl %>% mutate(lab = paste0("Down: ", down))
+
+volc_labs <- volc %>%
+  filter(call != "not significant", !is.na(label)) %>%
+  group_by(design, label) %>% slice_min(padj, n = 1, with_ties = FALSE) %>%
+  group_by(design) %>% slice_min(padj, n = 8, with_ties = FALSE) %>% ungroup()
+
+p_volc <- ggplot(volc, aes(lfc, y)) +
+  geom_vline(xintercept = c(-sig_lfc, sig_lfc), linetype = "dotted", colour = "grey60") +
+  geom_hline(data = sig_lines, aes(yintercept = yint), linetype = "dotted", colour = "grey60") +
+  geom_point(aes(colour = call, shape = capped, alpha = call, size = call)) +
+  geom_text(data = lab_up, aes(x = Inf, y = Inf, label = lab), hjust = 1.15, vjust = 1.6,
+            size = 3.4, colour = "#D55E00", inherit.aes = FALSE) +
+  geom_text(data = lab_down, aes(x = -Inf, y = Inf, label = lab), hjust = -0.15, vjust = 1.6,
+            size = 3.4, colour = "#0072B2", inherit.aes = FALSE) +
+  ggrepel::geom_text_repel(data = volc_labs, aes(label = label), size = 2.8,
+                           box.padding = 0.4, seed = 9, max.overlaps = 20,
+                           min.segment.length = 0.2) +
+  facet_wrap(~ design) +
+  scale_colour_manual(values = c("Up" = "#D55E00", "Down" = "#0072B2",
+                                 "not significant" = "grey75"), name = NULL) +
+  scale_alpha_manual(values = c("Up" = 0.9, "Down" = 0.9, "not significant" = 0.25),
+                     guide = "none") +
+  scale_size_manual(values = c("Up" = 1.3, "Down" = 1.3, "not significant" = 0.45),
+                    guide = "none") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+  coord_cartesian(xlim = quantile(volc$lfc, c(0.001, 0.999))) +
+  labs(title = "DHX29-IP against Input, summed gene counts",
+       x = "log2 IP / Input", y = paste0("-log10(Wald p), capped at ", y_cap)) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_volc)
+ggsave(here("plots", "dhx29_06_volcano_gene_summed.pdf"), p_volc, width = 9, height = 5)
+
+stopifnot(
+  "a volcano panel is missing" = nrow(counts_tbl) == 2,
+  "DHX29 is not called Up under the unpaired design" =
+    volc %>% filter(design == "~ assay", label == "DHX29") %>% pull(call) == "Up"
+)
+```
+
+---
+
+## Section 5: Save
+
+```{r save}
+out <- here("output", "dhx29_reanalysis", "dhx29_gene_summed_counts.rds")
+saveRDS(gene_sum %>% dplyr::select(gene_id_clean, symbol, all_of(sample_cols), total), out)
+res_out <- here("output", "dhx29_reanalysis", "dhx29_gene_summed_enrichment.rds")
+saveRDS(res, res_out)
+cat("Wrote", out, "\n  ", format(nrow(gene_sum), big.mark = ","), "genes, one row each\n")
+cat("Wrote", res_out, "\n  ", format(nrow(res), big.mark = ","),
+    "genes clearing the floor, both designs\n")
+```
+
+```{r session_info}
+sessionInfo()
+```

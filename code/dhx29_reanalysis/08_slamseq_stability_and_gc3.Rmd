@@ -1,0 +1,254 @@
+---
+title: "DHX29 reanalysis 08: SLAM-seq stability, DHX29 binding, and GC3"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+Three questions on the Hia 2026 SLAM-seq half-lives (Table S6), which measure mRNA stability
+in control against DHX29 knockout HEK293T cells. Positive `logFC` means stabilised on
+knockout, so a message DHX29 normally destabilises.
+
+1. Where do eIF3d-promoted genes sit on that axis? The notebook 23 figure, redrawn unfilled.
+2. Where do the transcripts we measured as most and least DHX29-bound sit on it?
+3. What is the GC3 of the most stabilised and most destabilised messages?
+
+Question 2 uses our own measured enrichment from notebook 04's **transcript-level** table,
+which joins natively to Table S6 since both are keyed on transcripts. Spearman throughout.
+
+```{r libs}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+eif3d_cols <- c("eIF3d hypoxia promotes" = "#E69F00",
+                "Negative control"       = "black",
+                "All other genes"        = "grey70")
+dhx29_cols <- c("DHX29 top 200"    = "#CC79A7",
+                "DHX29 bottom 200" = "#0072B2",
+                "All other genes"  = "grey70")
+stab_cols  <- c("Most stabilized"   = "#D55E00",
+                "Most destabilized" = "#0072B2",
+                "All other genes"   = "grey70")
+n_extreme <- 200
+```
+
+---
+
+## Section 1: SLAM-seq half-lives
+
+```{r load_s6}
+s6 <- read_excel(here("accessories", "csc_data", "hia_dhx29",
+                      "science.adw0288_tables_s1_to_s11",
+                      "science.adw0288_table_s6.xlsx")) %>%
+  transmute(transcript_id_clean = str_extract(gene_name, "^ENST[0-9]+"),
+            ctrl_hl = as.numeric(Ctrl_Half_life),
+            ko_hl   = as.numeric(KO_Half_life),
+            logfc   = as.numeric(logFC)) %>%
+  filter(!is.na(transcript_id_clean), is.finite(ctrl_hl), is.finite(ko_hl),
+         is.finite(logfc), ctrl_hl > 0, ko_hl > 0) %>%
+  distinct(transcript_id_clean, .keep_all = TRUE)
+
+cat("transcripts with a half-life pair:", format(nrow(s6), big.mark = ","), "\n")
+cat("median control half-life:", round(median(s6$ctrl_hl), 2), "h\n")
+cat("median logFC:", round(median(s6$logfc), 4),
+    " | fraction stabilized on KO:", sprintf("%.1f%%", 100 * mean(s6$logfc > 0)), "\n")
+
+stopifnot(
+  "logFC is not log2(KO / Ctrl)" =
+    max(abs(s6$logfc - log2(s6$ko_hl / s6$ctrl_hl))) < 1e-3,
+  "half-lives must be positive" = all(s6$ctrl_hl > 0 & s6$ko_hl > 0),
+  "control half-life is outside a plausible range" =
+    between(median(s6$ctrl_hl), 1, 20)
+)
+cat("Table S6 checks passed.\n")
+```
+
+---
+
+## Section 2: eIF3d gene sets on the stability axis
+
+The notebook 23 figure, unfilled.
+
+```{r eif3d_density, fig.width = 7.5, fig.height = 5}
+tx_gene <- readRDS(here("output", "dhx29_reanalysis", "dhx29_counts_with_gene.rds")) %>%
+  distinct(transcript_id_clean, gene_id_clean) %>%
+  filter(!is.na(gene_id_clean))
+
+te <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+               show_col_types = FALSE) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+promoted <- te %>% filter(te_lfc > 0.5, te_padj < 0.05)
+stopifnot("the promoted set is not 1604 genes" = nrow(promoted) == 1604,
+          "EIF3D direction has flipped" = te$rna_lfc[te$symbol == "EIF3D"] > 2)
+
+s6g <- s6 %>% inner_join(tx_gene, by = "transcript_id_clean")
+
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\..*")) %>%
+  filter(!gene_id_clean %in% promoted$gene_id_clean,
+         gene_id_clean %in% s6g$gene_id_clean)
+promoted_here <- intersect(promoted$gene_id_clean, s6g$gene_id_clean)
+set.seed(9)
+neg_ctrl <- sample(neg_pool$gene_id_clean,
+                   size = min(length(promoted_here), nrow(neg_pool)), replace = FALSE)
+
+d_eif3d <- s6g %>%
+  mutate(grp = case_when(gene_id_clean %in% promoted_here ~ "eIF3d hypoxia promotes",
+                         gene_id_clean %in% neg_ctrl      ~ "Negative control",
+                         TRUE                             ~ "All other genes"),
+         grp = factor(grp, levels = names(eif3d_cols)))
+
+st <- d_eif3d %>% group_by(grp) %>%
+  summarise(n = n(), med = median(logfc), .groups = "drop")
+print(as.data.frame(st %>% mutate(med = round(med, 4))))
+w1 <- wilcox.test(logfc ~ grp,
+                  data = d_eif3d %>% filter(grp != "All other genes") %>% droplevels())
+cat("promoted vs negative control: Wilcoxon p =", signif(w1$p.value, 3), "\n")
+
+p1 <- ggplot(d_eif3d, aes(logfc, colour = grp)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = st, aes(xintercept = med, colour = grp),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+           label = paste0("promoted vs control\nWilcoxon p = ", signif(w1$p.value, 3))) +
+  coord_cartesian(xlim = c(-0.5, 0.5)) +
+  scale_colour_manual(values = eif3d_cols,
+                      labels = paste0(st$grp, " (n = ", format(st$n, big.mark = ","), ")"),
+                      name = NULL) +
+  labs(title = "mRNA stabilization upon DHX29 KO: eIF3d gene sets",
+       x = "log2(KO / Ctrl) half-life ratio. Positive means stabilized on KO",
+       y = "Density") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+print(p1)
+ggsave(here("plots", "dhx29_08_slamseq_by_eif3d_set.pdf"), p1, width = 7.5, height = 5)
+```
+
+---
+
+## Section 3: Most and least DHX29-bound transcripts on the same axis
+
+```{r dhx29_density, fig.width = 7.5, fig.height = 5}
+tx_enr <- readRDS(here("output", "dhx29_reanalysis", "dhx29_enrichment_transcript.rds")) %>%
+  filter(is.finite(lfc_simple)) %>%
+  dplyr::select(transcript_id_clean, lfc_simple)
+
+# Rank within the transcripts that carry BOTH measurements. Ranking over the full
+# transcript table first would leave only ~27 of each extreme in the SLAM-seq set by
+# chance, since 5,581 of 41,679 transcripts have a half-life.
+d_dhx29 <- s6 %>%
+  inner_join(tx_enr, by = "transcript_id_clean") %>%
+  arrange(desc(lfc_simple)) %>%
+  mutate(rank = row_number(),
+         grp = case_when(rank <= n_extreme       ~ "DHX29 top 200",
+                         rank >  n() - n_extreme ~ "DHX29 bottom 200",
+                         TRUE                    ~ "All other genes"),
+         grp = factor(grp, levels = names(dhx29_cols)))
+cat("transcripts with both a half-life and an enrichment estimate:",
+    format(nrow(d_dhx29), big.mark = ","), "\n")
+
+st2 <- d_dhx29 %>% group_by(grp) %>%
+  summarise(n = n(), med = median(logfc), .groups = "drop") %>% filter(n > 0)
+print(as.data.frame(st2 %>% mutate(med = round(med, 4))))
+cat("\nSpearman(DHX29 enrichment, half-life logFC) over all shared transcripts:",
+    round(cor(d_dhx29$lfc_simple, d_dhx29$logfc, method = "spearman"), 4),
+    " n =", format(nrow(d_dhx29), big.mark = ","), "\n")
+
+ex <- d_dhx29 %>% filter(grp != "All other genes") %>% droplevels()
+w2 <- if (n_distinct(ex$grp) == 2) wilcox.test(logfc ~ grp, data = ex) else NULL
+if (!is.null(w2)) cat("top vs bottom 200: Wilcoxon p =", signif(w2$p.value, 3), "\n")
+
+p2 <- ggplot(d_dhx29, aes(logfc, colour = grp)) +
+  stat_ecdf(linewidth = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60") +
+  {if (!is.null(w2)) annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+        label = paste0("top vs bottom\nWilcoxon p = ", signif(w2$p.value, 3)))} +
+  coord_cartesian(xlim = c(-0.5, 0.5)) +
+  scale_colour_manual(values = dhx29_cols,
+                      labels = paste0(st2$grp, " (n = ", format(st2$n, big.mark = ","), ")"),
+                      name = NULL) +
+  labs(title = "mRNA stabilization upon DHX29 KO, by measured DHX29 binding",
+       x = "log2(KO / Ctrl) half-life ratio. Positive means stabilized on KO",
+       y = "Cumulative fraction") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+print(p2)
+ggsave(here("plots", "dhx29_08_slamseq_by_dhx29_binding.pdf"), p2, width = 7.5, height = 5)
+```
+
+---
+
+## Section 4: GC3 of the most stabilized and destabilized messages
+
+```{r gc3_stability, fig.width = 7.5, fig.height = 5}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                             cdsBy(txdb, by = "tx", use.names = TRUE))
+cds <- cds[width(cds) %% 3 == 0 & width(cds) >= 60]
+cds <- subseq(cds, 1, width(cds) - 3)              # drop the stop codon
+names(cds) <- str_remove(names(cds), "\\..*")
+
+cn <- trinucleotideFrequency(cds, step = 3)
+rownames(cn) <- names(cds)
+third <- do.call(rbind, strsplit(colnames(cn), ""))[, 3]
+gc3_tbl <- tibble(transcript_id_clean = rownames(cn),
+                  gc3 = 100 * as.vector(cn %*% as.numeric(third %in% c("G", "C"))) /
+                        rowSums(cn))
+
+d_gc3 <- s6 %>%
+  arrange(desc(logfc)) %>%
+  mutate(rank = row_number(),
+         grp = case_when(rank <= n_extreme       ~ "Most stabilized",
+                         rank >  n() - n_extreme ~ "Most destabilized",
+                         TRUE                    ~ "All other genes"),
+         grp = factor(grp, levels = names(stab_cols))) %>%
+  inner_join(gc3_tbl, by = "transcript_id_clean")
+
+st3 <- d_gc3 %>% group_by(grp) %>%
+  summarise(n = n(), med_gc3 = median(gc3), med_logfc = median(logfc), .groups = "drop")
+print(as.data.frame(st3 %>% mutate(across(where(is.numeric), ~ round(.x, 3)))))
+
+ex3 <- d_gc3 %>% filter(grp != "All other genes") %>% droplevels()
+w3 <- wilcox.test(gc3 ~ grp, data = ex3)
+cat("\nstabilized vs destabilized GC3: Wilcoxon p =", signif(w3$p.value, 3),
+    " difference in medians =",
+    round(st3$med_gc3[st3$grp == "Most stabilized"] -
+          st3$med_gc3[st3$grp == "Most destabilized"], 2), "\n")
+cat("Spearman(GC3, half-life logFC) over all transcripts:",
+    round(cor(d_gc3$gc3, d_gc3$logfc, method = "spearman"), 4),
+    " n =", format(nrow(d_gc3), big.mark = ","), "\n")
+
+p3 <- ggplot(d_gc3, aes(gc3, colour = grp)) +
+  geom_density(linewidth = 0.8) +
+  geom_vline(data = st3, aes(xintercept = med_gc3, colour = grp),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.2,
+           label = paste0("stabilized vs destabilized\nWilcoxon p = ",
+                          signif(w3$p.value, 3))) +
+  scale_colour_manual(values = stab_cols,
+                      labels = paste0(st3$grp, " (n = ", format(st3$n, big.mark = ","), ")"),
+                      name = NULL) +
+  labs(title = "GC3 of the most stabilized and destabilized mRNAs on DHX29 KO",
+       x = "GC3 (%)", y = "Density") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+print(p3)
+ggsave(here("plots", "dhx29_08_gc3_by_stability.pdf"), p3, width = 7.5, height = 5)
+```
+
+```{r save}
+write_csv(d_gc3 %>% dplyr::select(transcript_id_clean, ctrl_hl, ko_hl, logfc, gc3, grp),
+          here("output", "dhx29_reanalysis", "dhx29_08_stability_gc3.csv"))
+cat("Wrote dhx29_08_stability_gc3.csv,", format(nrow(d_gc3), big.mark = ","), "transcripts\n")
+```
+
+```{r session_info}
+sessionInfo()
+```

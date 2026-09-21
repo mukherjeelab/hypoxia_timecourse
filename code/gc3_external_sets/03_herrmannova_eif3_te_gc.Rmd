@@ -1,0 +1,827 @@
+---
+title: "GC3 external sets 03: Herrmannova eLife eIF3 riboseq - validation and GC"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  lfc_cutoff:  0.5
+  padj_cutoff: 0.05
+  save_plots:  TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Ingest Herrmannová et al., *eLife* 95846 (ribosome profiling of individual eIF3 subunit
+knockdowns in **HeLa**), validate it against values reported in the paper, then draw GC by
+codon position for the mRNAs each subunit **promotes**.
+
+This is an independent test of the GC3 signal seen in our own MDA-MB-231 data (notebook 89)
+and in the published cap-binding / PAR-CLIP sets (notebook 85).
+
+Source: `accessories/herrmannova elife riboseq/elife-95846-supp1-v1.xlsx`.
+
+## Three things that will bite if ignored
+
+**1. The sheets need different `skip` values.** `all data` and the `FP_*` sheets carry four
+legend rows above the header; the `TE_*` and gene-set sheets carry one. Reading an `FP_*`
+sheet at `skip = 1` silently turns four legend rows into data (4704 rows instead of 4700).
+
+**2. The contrast is inverted relative to our MDA-MB-231 files.** It is
+log2(knockdown / non-targeting), so **negative = the factor promotes**. Our
+`translation_categories_si3*_vs_sictrl_*.csv` files are the other way round (positive =
+promotes). Everything is negated on ingest so that positive = promotes project-wide.
+
+**3. The paper reports no transcripts.** Every sheet is gene-level, so an isoform has to be
+chosen for each gene. See Section 4.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+```
+
+```{r params_fallback}
+# `params` only exists during knit; running chunks by hand would otherwise resolve bare
+# `params` to an unrelated attached-package function. These match the YAML exactly.
+if (!exists("params") || !is.list(params)) {
+  params <- list(lfc_cutoff = 0.5, padj_cutoff = 0.05, save_plots = TRUE)
+}
+LFC_CUT    <- params$lfc_cutoff
+PADJ_CUT   <- params$padj_cutoff
+SAVE_PLOTS <- params$save_plots
+
+KD        <- c(d = "eIF3d", e = "eIF3e", h = "eIF3h")
+# CLAUDE.md reserves #E69F00 for eIF3d and #56B4E9 for eIF3e. eIF3h takes a third
+# Okabe-Ito hue; grey70 is the rest of the transcriptome.
+KD_COLORS <- c(eIF3d = "#E69F00", eIF3e = "#56B4E9", eIF3h = "#009E73")
+REST_LAB  <- "Rest of transcriptome"
+REST_COL  <- "grey70"
+
+GC_FEATURES <- c(cds_gc = "CDS GC, all positions",
+                 gc1    = "GC1, first codon position",
+                 gc2    = "GC2, second codon position",
+                 gc3    = "GC3, third codon position")
+
+# Regional GC, ordered 5' -> 3' along the transcript (the nb54 convention). CDS is kept as
+# the middle panel so the gradient is readable rather than two disconnected UTR panels.
+REGION_FEATURES <- c(utr5_gc = "5' UTR",
+                     cds_gc  = "CDS",
+                     utr3_gc = "3' UTR")
+
+cat("Params - lfc_cutoff:", LFC_CUT, "| padj_cutoff:", PADJ_CUT,
+    "| save_plots:", SAVE_PLOTS, "\n")
+```
+
+---
+
+# Section 1: Load
+
+```{r load}
+XLSX <- here("accessories", "herrmannova elife riboseq", "elife-95846-supp1-v1.xlsx")
+stopifnot("Herrmannova supplement not found" = file.exists(XLSX))
+
+# Columns 4:21 are the 18 log2FoldChange / padj values; some arrive as character.
+read_herr <- function(sheet, skip) {
+  suppressWarnings(read_excel(XLSX, sheet = sheet, skip = skip)) %>%
+    dplyr::mutate(dplyr::across(4:21, ~ suppressWarnings(as.numeric(.))))
+}
+
+# skip differs by sheet - see "Three things that will bite" above.
+all_data <- read_herr("all data", skip = 4)
+te_sheet <- setNames(lapply(names(KD),
+                            function(k) read_herr(paste0("TE_", k, " padj 0.05"), skip = 1)),
+                     names(KD))
+fp_sheet <- setNames(lapply(names(KD),
+                            function(k) read_herr(paste0("FP_", k, " padj 0.05"), skip = 4)),
+                     names(KD))
+gene_sets <- list(
+  cyto_rp = read_herr("Cytoplasmic RPs",   skip = 1),
+  mito_rp = read_herr("Mitochondrial RPs", skip = 1),
+  top     = read_herr("TOP mRNAs",         skip = 1),
+  mapk    = read_herr("MAPK signaling pathway hsa04010", skip = 1)
+)
+
+cat("all data:", nrow(all_data), "genes,", ncol(all_data), "columns\n")
+stopifnot(
+  "all data is not 17,520 genes - check the skip"   = nrow(all_data) == 17520,
+  "all data is not 22 columns"                      = ncol(all_data) == 22,
+  "gene_id column missing - wrong skip"             = "gene_id" %in% names(all_data),
+  "gene_id is not unique"                           = !any(duplicated(all_data$gene_id)),
+  "gene_id is versioned - expected bare ENSG"       = !any(grepl("\\.", all_data$gene_id))
+)
+```
+
+---
+
+# Section 2: Validation
+
+Every check here is a `stopifnot`, so a parsing or directionality regression fails the knit
+rather than propagating into the figures.
+
+## 2a. These really are the TE columns
+
+The sheet carries three column families — `FP_*` (footprints), `mRNA_*` (mRNA-seq) and
+`TE_*`. We use `TE_{d,e,h}_vs_nt.log2FoldChange` / `.padj` and never the other two. Since
+TE is defined as footprints over mRNA, the TE column must equal `FP - mRNA` exactly; if it
+does not, we are reading the wrong column.
+
+```{r validate_te_columns}
+te_col   <- function(k) paste0("TE_",   k, "_vs_nt.log2FoldChange")
+te_padj  <- function(k) paste0("TE_",   k, "_vs_nt.padj")
+fp_col   <- function(k) paste0("FP_",   k, "_vs_nt.log2FoldChange")
+rna_col  <- function(k) paste0("mRNA_", k, "_vs_nt.log2FoldChange")
+
+stopifnot("an expected TE / FP / mRNA column is missing" =
+  all(c(vapply(names(KD), te_col, ""),  vapply(names(KD), te_padj, ""),
+        vapply(names(KD), fp_col, ""),  vapply(names(KD), rna_col, "")) %in% names(all_data)))
+
+te_identity <- purrr::map_dfr(names(KD), function(k) {
+  te <- all_data[[te_col(k)]]; fp <- all_data[[fp_col(k)]]; mr <- all_data[[rna_col(k)]]
+  ok <- is.finite(te) & is.finite(fp) & is.finite(mr)
+  tibble::tibble(knockdown = KD[[k]], n = sum(ok),
+                 cor_te_vs_fp_minus_mrna = round(cor(te[ok], (fp - mr)[ok]), 4),
+                 max_abs_diff = max(abs(te - (fp - mr))[ok]))
+})
+print(as.data.frame(te_identity), row.names = FALSE)
+stopifnot("TE column is not FP - mRNA: wrong column picked" =
+            all(te_identity$max_abs_diff < 1e-6))
+```
+
+## 2b. Direction: the contrast is knockdown vs non-targeting
+
+Each subunit's own mRNA must be strongly **down** in its own knockdown, and flat in the
+other two. That fixes the sign of every other column.
+
+```{r validate_direction}
+diag_tbl <- purrr::map_dfr(names(KD), function(target) {
+  row <- all_data[match(toupper(KD[[target]]), all_data$hgnc_symbol), ]
+  tibble::tibble(gene = toupper(KD[[target]]),
+                 mRNA_d = row[[rna_col("d")]], mRNA_e = row[[rna_col("e")]],
+                 mRNA_h = row[[rna_col("h")]])
+}) %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ round(., 2)))
+cat("Knockdown diagonal (each factor's own mRNA, log2(KD / non-targeting)):\n")
+print(as.data.frame(diag_tbl), row.names = FALSE)
+
+diag_vals <- vapply(names(KD), function(k)
+  all_data[[rna_col(k)]][match(toupper(KD[[k]]), all_data$hgnc_symbol)], numeric(1))
+offdiag <- vapply(names(KD), function(k) {
+  others <- setdiff(names(KD), k)
+  max(abs(vapply(others, function(o)
+    all_data[[rna_col(o)]][match(toupper(KD[[k]]), all_data$hgnc_symbol)], numeric(1))))
+}, numeric(1))
+
+# The paper reports ~16-32 fold knockdown by qPCR; RNA-seq gives ~9 fold. Different assays,
+# so assert only that the depletion is unmistakable, not the exact magnitude.
+stopifnot(
+  "a knockdown target is not depleted in its own KD - direction is flipped" =
+    all(diag_vals < -2),
+  "a knockdown target moves in a condition that does not target it" =
+    all(offdiag < 1)
+)
+cat("\nDiagonal:", paste(sprintf("%s %.2f", toupper(KD), diag_vals), collapse = ", "),
+    "- all < -2, so negative = depleted by the knockdown\n")
+cat("=> negative TE_x_vs_nt means TE FELL when the factor was removed, i.e. the factor PROMOTES\n")
+```
+
+## 2c. Reproduce the paper's reported gene counts
+
+Herrmannová et al. report DTEG counts split by direction. Reproducing the **split**, not
+just the total, is what validates the sign convention above.
+
+```{r validate_dteg_counts}
+PAPER_DTEG <- tibble::tribble(
+  ~knockdown, ~paper_total, ~paper_down, ~paper_up,
+  "eIF3d",           1971L,       1040L,      931L,
+  "eIF3e",           1180L,        622L,      558L,
+  "eIF3h",             21L,         19L,        2L
+)
+
+obs_dteg <- purrr::map_dfr(names(KD), function(k) {
+  lf <- all_data[[te_col(k)]]; pa <- all_data[[te_padj(k)]]
+  sig <- !is.na(pa) & pa < 0.05 & !is.na(lf)
+  tibble::tibble(knockdown = KD[[k]], obs_total = sum(sig),
+                 obs_down = sum(sig & lf < 0), obs_up = sum(sig & lf > 0))
+})
+dteg <- dplyr::left_join(PAPER_DTEG, obs_dteg, by = "knockdown")
+print(as.data.frame(dteg), row.names = FALSE)
+stopifnot(
+  "DTEG totals do not match the paper"          = all(dteg$paper_total == dteg$obs_total),
+  "DTEG down counts do not match the paper"     = all(dteg$paper_down  == dteg$obs_down),
+  "DTEG up counts do not match the paper"       = all(dteg$paper_up    == dteg$obs_up)
+)
+
+# The paper's own filtered sheets must be exactly reproducible from the unfiltered one.
+for (k in names(KD)) {
+  mine <- all_data$gene_id[!is.na(all_data[[te_padj(k)]]) & all_data[[te_padj(k)]] < 0.05]
+  stopifnot(setNames(list(setequal(mine, te_sheet[[k]]$gene_id)),
+                     paste0("TE_", k, " sheet is not reproducible from 'all data'"))[[1]])
+  fpm <- all_data$gene_id[!is.na(all_data[[paste0("FP_", k, "_vs_nt.padj")]]) &
+                            all_data[[paste0("FP_", k, "_vs_nt.padj")]] < 0.05]
+  stopifnot(setNames(list(setequal(fpm, fp_sheet[[k]]$gene_id)),
+                     paste0("FP_", k, " sheet is not reproducible - check the skip"))[[1]])
+}
+cat("All six padj<0.05 sheets reproduced exactly from 'all data'\n")
+```
+
+## 2d. Reproduce the paper's ribosomal-protein result
+
+The paper reports 14 cytoplasmic and 18 mitochondrial RPs with significantly changed TE in
+eIF3eKD, against "only 16" in eIF3dKD.
+
+```{r validate_rp_counts}
+rp_counts <- purrr::map_dfr(c(cyto_rp = "cyto_rp", mito_rp = "mito_rp"), function(s) {
+  x <- gene_sets[[s]]
+  tibble::tibble(set = s, n = nrow(x),
+                 sig_d = sum(x$TE_d_vs_nt.padj < 0.05, na.rm = TRUE),
+                 sig_e = sum(x$TE_e_vs_nt.padj < 0.05, na.rm = TRUE),
+                 sig_h = sum(x$TE_h_vs_nt.padj < 0.05, na.rm = TRUE))
+}, .id = "which")
+print(as.data.frame(rp_counts), row.names = FALSE)
+stopifnot(
+  "cytoplasmic RPs significant in eIF3eKD != 14 (paper)" =
+    rp_counts$sig_e[rp_counts$set == "cyto_rp"] == 14,
+  "mitochondrial RPs significant in eIF3eKD != 18 (paper)" =
+    rp_counts$sig_e[rp_counts$set == "mito_rp"] == 18,
+  "RPs significant in eIF3dKD != 16 (paper)" = sum(rp_counts$sig_d) == 16
+)
+cat("Paper: 14 cytoplasmic + 18 mitochondrial RPs in eIF3eKD, 16 total in eIF3dKD - matched\n")
+```
+
+## 2e. TOP mRNAs are translationally activated in eIF3dKD and eIF3eKD, not eIF3hKD
+
+The paper's direction claim. "Activated" means TE goes **up** in the knockdown, i.e. the
+raw log2FoldChange is positive, i.e. eIF3d/e normally **repress** these. This anchors the
+sign from the opposite side to ATF4 below.
+
+```{r validate_top}
+top_tbl <- purrr::map_dfr(names(KD), function(k) {
+  tv <- gene_sets$top[[te_col(k)]]; bv <- all_data[[te_col(k)]]
+  tibble::tibble(knockdown = KD[[k]],
+                 top_median = round(median(tv, na.rm = TRUE), 3),
+                 background_median = round(median(bv, na.rm = TRUE), 3),
+                 wilcox_p = signif(suppressWarnings(wilcox.test(tv, bv)$p.value), 3))
+})
+print(as.data.frame(top_tbl), row.names = FALSE)
+stopifnot(
+  "TOP mRNAs are not shifted positive in eIF3dKD / eIF3eKD" =
+    all(top_tbl$top_median[top_tbl$knockdown %in% c("eIF3d", "eIF3e")] > 0),
+  "TOP mRNAs are not above background in eIF3dKD / eIF3eKD" =
+    all((top_tbl$top_median - top_tbl$background_median)[
+      top_tbl$knockdown %in% c("eIF3d", "eIF3e")] > 0),
+  "TOP mRNAs are not flat-or-down in eIF3hKD" =
+    top_tbl$top_median[top_tbl$knockdown == "eIF3h"] <= 0
+)
+# Reported, not asserted: the eIF3d shift is in the right direction but is not significant
+# against this background (the paper calls both d and e significant, likely against a
+# different comparator or with a different test).
+cat("\nNote: eIF3e clears Wilcoxon comfortably; eIF3d is directionally right but p = ",
+    top_tbl$wilcox_p[top_tbl$knockdown == "eIF3d"],
+    " against the whole transcriptome. Reported, not asserted.\n", sep = "")
+```
+
+## 2f. ATF4 — the opposite-direction anchor
+
+The paper reports ATF4 induction is "almost abolished" in eIF3dKD and eIF3eKD, so eIF3d/e
+are *required* for its translation and must come out as promoters: negative raw LFC.
+
+```{r validate_atf4}
+atf4 <- all_data[match("ATF4", all_data$hgnc_symbol), ]
+atf4_te <- vapply(names(KD), function(k) atf4[[te_col(k)]], numeric(1))
+cat("ATF4 raw TE LFC:", paste(sprintf("%s %.2f", KD, atf4_te), collapse = ", "), "\n")
+stopifnot(
+  "ATF4 is not TE-down in eIF3dKD / eIF3eKD - contradicts the paper" =
+    all(atf4_te[c("d", "e")] < -1)
+)
+cat("ATF4 negative in both => promoted by eIF3d and eIF3e, consistent with the paper.\n",
+    "TOP positive, ATF4 negative: the two anchors point opposite ways and both agree with\n",
+    "negative = promoted.\n", sep = "")
+```
+
+---
+
+# Section 3: Orient to the project convention
+
+Negate so that **positive `te_lfc` = the factor promotes**, matching
+`translation_categories_si3*` and MCF7-SIX1 usage elsewhere in this project.
+
+```{r orient}
+herr <- all_data %>%
+  dplyr::transmute(
+    gene_id_clean = gene_id,
+    symbol        = hgnc_symbol,
+    te_lfc_d  = -.data[[te_col("d")]], te_padj_d = .data[[te_padj("d")]],
+    te_lfc_e  = -.data[[te_col("e")]], te_padj_e = .data[[te_padj("e")]],
+    te_lfc_h  = -.data[[te_col("h")]], te_padj_h = .data[[te_padj("h")]]
+  )
+
+# Post-negation the anchors must flip: ATF4 positive (promoted), TOP negative (repressed).
+atf4_post <- herr %>% dplyr::filter(symbol == "ATF4")
+top_post  <- median(herr$te_lfc_d[herr$gene_id_clean %in% gene_sets$top$gene_id], na.rm = TRUE)
+stopifnot(
+  "negation failed: ATF4 should be positive (promoted) after negation" =
+    atf4_post$te_lfc_d > 1 && atf4_post$te_lfc_e > 1,
+  "negation failed: TOP mRNAs should be negative (repressed) after negation" =
+    top_post < 0
+)
+cat("After negation - ATF4 te_lfc_d =", round(atf4_post$te_lfc_d, 2),
+    "(promoted), TOP median te_lfc_d =", round(top_post, 3), "(repressed)\n")
+cat("Convention now matches the rest of the project: positive = the factor promotes.\n")
+```
+
+---
+
+# Section 4: Transcripts
+
+**The paper supplies none.** All twelve sheets are gene-level (`gene_id`, `ensembl`,
+`entrez`, `hgnc_symbol`); there are no transcript identifiers and no cluster coordinates, so
+an isoform has to be chosen for each gene before any sequence feature can be computed.
+
+We borrow the HeLa matrix from notebook 78 (`feature_matrix_teleman_4e.rds`) rather than the
+MDA-MB-231 one, because this study is HeLa.
+
+**How those transcripts were picked** (notebook 76): the **dominant transcript per gene,
+chosen by summed control-condition total-RNA counts** across the control libraries of
+**Roiuk et al., GSE243708** HeLa RNA-seq — one row per gene, 98.0% present in the GENCODE
+v49 TxDb.
+
+**Caveat.** Same cell line, but the isoform was selected from a *different HeLa experiment*
+than Herrmannová's. Notebook 78 measured that this choice matters: of genes shared with the
+MDA-MB-231 matrix, only 51.7% get the same isoform. So the transcript assignment is a
+modelling decision inherited from another dataset, not something this paper measured.
+
+```{r join_hela}
+# Both feature families are pulled here: the codon-position set (Section 6a-c) and the
+# regional set (Section 6d). cds_gc is in both, so take the union.
+ALL_GC_COLS <- union(names(GC_FEATURES), names(REGION_FEATURES))
+
+hela <- readRDS(here("output", "predictive_modeling", "feature_matrix_teleman_4e.rds")) %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol_hela = symbol,
+                dplyr::all_of(ALL_GC_COLS)) %>%
+  dplyr::distinct(gene_id_clean, .keep_all = TRUE)
+
+stopifnot("a GC feature is missing from the HeLa matrix" =
+            all(ALL_GC_COLS %in% names(hela)))
+for (f in ALL_GC_COLS) {
+  stopifnot(setNames(list(all(hela[[f]] >= 0 & hela[[f]] <= 100, na.rm = TRUE)),
+                     paste(f, "outside [0, 100]"))[[1]])
+}
+stopifnot("HeLa GC3 median outside the expected human range [40, 65]" =
+            dplyr::between(median(hela$gc3, na.rm = TRUE), 40, 65))
+
+gc_herr <- herr %>% dplyr::inner_join(hela, by = "gene_id_clean")
+cat("Herrmannova genes:", nrow(herr), "| HeLa matrix:", nrow(hela),
+    "| joined:", nrow(gc_herr), "\n")
+cat("Lost from Herrmannova (not in the HeLa matrix):", nrow(herr) - nrow(gc_herr), "\n")
+cat("HeLa background GC3 median:", round(median(gc_herr$gc3, na.rm = TRUE), 1), "%\n")
+stopifnot("join lost too many genes - check the ID convention" = nrow(gc_herr) > 10000)
+
+# A handful of genes have an NA for one GC feature. The legend n is counted before the
+# pivot to long form, so leaving them in makes the legend disagree with the panels by a
+# few genes. Restrict to complete cases per feature family instead; each figure then has
+# one n that is true for all of its panels.
+gc_codon <- gc_herr %>%
+  dplyr::filter(dplyr::if_all(dplyr::all_of(names(GC_FEATURES)), ~ !is.na(.)))
+cat("Complete on all four codon-position features:", nrow(gc_codon), "of", nrow(gc_herr),
+    sprintf("(%.1f%%)", 100 * nrow(gc_codon) / nrow(gc_herr)), "\n")
+```
+
+---
+
+# Section 5: Gene sets — promoted by each subunit
+
+`padj < PADJ_CUT` **and** `te_lfc > LFC_CUT` (post-negation, so this is the most-depleted-by-
+knockdown tail). Both filters, as specified.
+
+```{r gene_sets}
+promoted <- function(k, lfc = LFC_CUT, padj = PADJ_CUT) {
+  gc_herr$gene_id_clean[
+    !is.na(gc_herr[[paste0("te_padj_", k)]]) & gc_herr[[paste0("te_padj_", k)]] < padj &
+    !is.na(gc_herr[[paste0("te_lfc_",  k)]]) & gc_herr[[paste0("te_lfc_",  k)]] > lfc]
+}
+prom_sets <- setNames(lapply(names(KD), promoted), unname(KD))
+
+# Effect-size ranked variants (top N by te_lfc among significant genes), for the two
+# knockdowns large enough to support them.
+top_n_promoted <- function(k, n) {
+  gc_herr %>%
+    dplyr::filter(!is.na(.data[[paste0("te_padj_", k)]]),
+                  .data[[paste0("te_padj_", k)]] < PADJ_CUT,
+                  .data[[paste0("te_lfc_", k)]] > 0) %>%
+    dplyr::arrange(dplyr::desc(.data[[paste0("te_lfc_", k)]])) %>%
+    head(n) %>% dplyr::pull(gene_id_clean)
+}
+
+set_sizes <- purrr::map_dfr(names(KD), function(k) {
+  ids <- prom_sets[[KD[[k]]]]
+  avail <- sum(!is.na(gc_herr[[paste0("te_padj_", k)]]) &
+                 gc_herr[[paste0("te_padj_", k)]] < PADJ_CUT &
+                 gc_herr[[paste0("te_lfc_", k)]] > 0)
+  tibble::tibble(knockdown = KD[[k]], sig_and_positive = avail,
+                 at_lfc_cut = length(ids),
+                 can_top200 = avail >= 200, can_top500 = avail >= 500,
+                 min_lfc = if (length(ids)) round(min(gc_herr[[paste0("te_lfc_", k)]][
+                   gc_herr$gene_id_clean %in% ids]), 2) else NA_real_)
+})
+cat("Promoted sets in the HeLa matrix (padj <", PADJ_CUT, "& te_lfc >", LFC_CUT, "):\n")
+print(as.data.frame(set_sizes), row.names = FALSE)
+
+stopifnot(
+  "eIF3d promoted set is implausibly small" = length(prom_sets$eIF3d) > 500,
+  "eIF3e promoted set is implausibly small" = length(prom_sets$eIF3e) > 300,
+  "eIF3h promoted set should be tiny per the paper" = length(prom_sets$eIF3h) < 100
+)
+cat("\nNOTE: eIF3h has", length(prom_sets$eIF3h),
+    "genes. The paper's own result is that eIF3h knockdown barely changes TE",
+    "(21 DTEGs total), so its curve is shown for completeness only and must not be",
+    "read as a distribution.\n")
+```
+
+---
+
+# Section 6: Figures
+
+```{r plot_fn}
+# Stacked density over the four GC features, one or more labelled groups against the rest of
+# the transcriptome. Same layout as notebooks 85 and 89: unfilled curves, dashed per-group
+# medians, n in every legend label.
+gc_density_figure <- function(gc_table, groups, colors, title, subtitle, file = NULL,
+                              caution = NULL, features = GC_FEATURES) {
+  labelled <- unlist(groups, use.names = FALSE)
+  stopifnot("groups overlap each other" = !any(duplicated(labelled)),
+            "no groups supplied"        = length(groups) >= 1)
+
+  d <- gc_table %>% dplyr::mutate(group = REST_LAB)
+  for (nm in names(groups)) d$group[d$gene_id_clean %in% groups[[nm]]] <- nm
+
+  lev    <- c(names(groups), REST_LAB)
+  counts <- d %>% dplyr::count(group)
+  n_of   <- setNames(counts$n[match(lev, counts$group)], lev)
+  n_of[is.na(n_of)] <- 0L
+  lab_of <- setNames(sprintf("%s (n = %s)", lev, format(n_of, big.mark = ",", trim = TRUE)), lev)
+
+  d <- d %>% dplyr::mutate(group = factor(lab_of[group], levels = unname(lab_of)))
+  pal <- setNames(unname(colors[lev]), unname(lab_of))
+  stopifnot("a group has no colour" = !any(is.na(pal)))
+
+  long <- d %>%
+    tidyr::pivot_longer(dplyr::all_of(names(features)),
+                        names_to = "feature", values_to = "gc") %>%
+    dplyr::filter(!is.na(gc)) %>%
+    dplyr::mutate(feature = factor(features[feature], levels = unname(features)))
+  # The legend n is counted before this pivot, so it would overstate any panel where a
+  # feature is NA. Callers pass complete-case tables; assert that here rather than trust it.
+  stopifnot("a feature has NAs - legend n would not match the panels" =
+              dplyr::n_distinct(dplyr::count(long, feature)$n) == 1)
+  meds <- long %>% dplyr::group_by(feature, group) %>%
+    dplyr::summarise(median_gc = median(gc), n = dplyr::n(), .groups = "drop")
+
+  p <- ggplot(long, aes(x = gc, color = group)) +
+    geom_density(fill = NA, linewidth = 0.8) +
+    geom_vline(data = meds, aes(xintercept = median_gc, color = group),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    facet_wrap(~ feature, ncol = 1, scales = "free_y") +
+    scale_color_manual(values = pal, name = NULL) +
+    labs(title = title,
+         subtitle = paste0(subtitle, if (!is.null(caution)) paste0("\n", caution) else ""),
+         x = "GC content (%)", y = "Density") +
+    theme_classic(base_size = 15) +
+    theme(legend.position = "top", legend.direction = "vertical",
+          legend.key.height = unit(1, "lines"),
+          legend.text = element_text(size = 12),
+          plot.subtitle = element_text(size = 11, lineheight = 1.2),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 12))
+  print(p)
+  if (!is.null(file) && SAVE_PLOTS)
+    ggsave(here("plots", file), p, width = 8, height = 2 + 2.25 * length(features))
+
+  print(as.data.frame(meds %>% dplyr::mutate(median_gc = round(median_gc, 1)) %>%
+                        dplyr::select(feature, group, n, median_gc)), row.names = FALSE)
+  invisible(p)
+}
+
+TRANSCRIPT_NOTE <- paste0(
+  "Transcript: the paper is gene-level (no transcript IDs), so each gene uses the HeLa\n",
+  "dominant transcript from Roiuk et al. GSE243708, picked by summed control total-RNA\n",
+  "counts (nb76). Same cell line, different experiment - an inherited modelling choice")
+DIRECTION_NOTE <- "Promoted = TE fell on knockdown (log2(KD / non-targeting) negative), sign flipped here"
+```
+
+## 6a. Each subunit separately
+
+```{r fig_per_subunit, fig.width = 8, fig.height = 11}
+for (k in names(KD)) {
+  nm  <- KD[[k]]
+  ids <- prom_sets[[nm]]
+  lab <- paste0(nm, "-promoted")
+  caution <- if (length(ids) < 100)
+    paste0("CAUTION: n = ", length(ids),
+           ". eIF3h knockdown barely changes TE (21 DTEGs in the paper) - not a distribution")
+  else NULL
+  gc_density_figure(
+    gc_codon,
+    groups = setNames(list(ids), lab),
+    colors = setNames(c(KD_COLORS[[nm]], REST_COL), c(lab, REST_LAB)),
+    title  = paste0("GC by codon position: mRNAs promoted by ", nm, " (Herrmannova, HeLa)"),
+    subtitle = paste0(
+      "Positive: ", nm, " TE padj < ", PADJ_CUT, " & |TE LFC| > ", LFC_CUT,
+      ", most depleted by knockdown\n", DIRECTION_NOTE, "\n", TRANSCRIPT_NOTE),
+    caution = caution,
+    file = paste0("gc3ext_03_gc_by_codon_position_", nm, "_promoted.pdf"))
+  cat("\n")
+}
+```
+
+## 6b. Effect-size ranked, top 200 and top 500
+
+```{r fig_topn, fig.width = 8, fig.height = 11}
+for (k in c("d", "e")) {
+  nm <- KD[[k]]
+  for (N in c(200, 500)) {
+    ids <- top_n_promoted(k, N)
+    if (length(ids) < N) { cat("SKIPPED", nm, "top", N, "- only", length(ids), "available\n"); next }
+    lab <- paste0(nm, "-promoted, top ", N)
+    floor_lfc <- round(min(gc_herr[[paste0("te_lfc_", k)]][gc_herr$gene_id_clean %in% ids]), 2)
+    gc_density_figure(
+      gc_codon,
+      groups = setNames(list(ids), lab),
+      colors = setNames(c(KD_COLORS[[nm]], REST_COL), c(lab, REST_LAB)),
+      title  = paste0("GC by codon position: top ", N, " promoted by ", nm,
+                      " (Herrmannova, HeLa)"),
+      subtitle = paste0(
+        "Positive: the ", N, " largest ", nm, " TE increases after sign flip (padj < ",
+        PADJ_CUT, "), i.e. most depleted by knockdown. LFC floor ", floor_lfc, "\n",
+        DIRECTION_NOTE, "\n", TRANSCRIPT_NOTE),
+      file = paste0("gc3ext_03_gc_by_codon_position_", nm, "_promoted_top", N, ".pdf"))
+    cat("\n")
+  }
+}
+```
+
+## 6c. All three subunits on one grid
+
+```{r fig_grid, fig.width = 14, fig.height = 12}
+grid_long <- purrr::map_dfr(names(KD), function(k) {
+  nm  <- KD[[k]]
+  ids <- prom_sets[[nm]]
+  ids <- intersect(ids, gc_codon$gene_id_clean)
+  dplyr::bind_rows(
+    gc_codon %>% dplyr::filter(gene_id_clean %in% ids) %>% dplyr::mutate(group = nm),
+    gc_codon %>% dplyr::filter(!gene_id_clean %in% ids) %>% dplyr::mutate(group = REST_LAB)
+  ) %>% dplyr::mutate(subunit = nm)
+}) %>%
+  dplyr::select(subunit, group, dplyr::all_of(names(GC_FEATURES))) %>%
+  tidyr::pivot_longer(-c(subunit, group), names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(GC_FEATURES[feature], levels = unname(GC_FEATURES)),
+                subunit = factor(subunit, levels = unname(KD)))
+
+# n per group, counted on ONE column and ONE feature: the background is repeated once per
+# subunit, so counting across the whole frame would report three times the real background.
+grid_n <- c(vapply(unname(KD), function(nm)
+              length(intersect(prom_sets[[nm]], gc_codon$gene_id_clean)), integer(1)),
+            setNames(nrow(gc_codon) -
+                       length(intersect(prom_sets[[KD[["d"]]]], gc_codon$gene_id_clean)),
+                     REST_LAB))
+grid_lev <- c(unname(KD), REST_LAB)
+grid_lab <- setNames(sprintf("%s (n = %s)", grid_lev,
+                             format(grid_n[grid_lev], big.mark = ",", trim = TRUE)), grid_lev)
+
+grid_long <- grid_long %>%
+  dplyr::mutate(group = factor(grid_lab[group], levels = unname(grid_lab[grid_lev])))
+grid_meds <- grid_long %>% dplyr::group_by(subunit, feature, group) %>%
+  dplyr::summarise(median_gc = median(gc), .groups = "drop")
+grid_pal <- setNames(c(unname(KD_COLORS[unname(KD)]), REST_COL), unname(grid_lab[grid_lev]))
+
+p_grid <- ggplot(grid_long, aes(x = gc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  geom_vline(data = grid_meds, aes(xintercept = median_gc, color = group),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  facet_grid(feature ~ subunit, scales = "free_y") +
+  scale_color_manual(values = grid_pal, name = NULL) +
+  labs(title = "GC by codon position: mRNAs promoted by each eIF3 subunit (Herrmannova, HeLa)",
+       subtitle = paste0(
+         "Promoted: TE padj < ", PADJ_CUT, " & |TE LFC| > ", LFC_CUT,
+         ", most depleted by that subunit's knockdown\n", DIRECTION_NOTE, "\n",
+         TRANSCRIPT_NOTE, "\nGrey differs slightly per column (each excludes its own ",
+         "positive set); legend n is the eIF3d column's"),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "top", legend.direction = "vertical",
+        legend.key.height = unit(1, "lines"),
+        legend.text = element_text(size = 12),
+        plot.subtitle = element_text(size = 11, lineheight = 1.2),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+print(p_grid)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_03_gc_by_codon_position_by_subunit_grid.pdf"),
+                       p_grid, width = 14, height = 12)
+```
+
+## 6d. GC by mRNA region: 5'UTR, CDS, 3'UTR
+
+The same sets against the same background, but split by **region of the transcript** rather
+than by codon position. Ordered 5' -> 3'; CDS is kept as the middle panel so the gradient
+reads as a progression rather than two disconnected UTR panels.
+
+Restricted to genes with all three regions annotated, so the legend n is the n of every
+panel. Genes without an annotated UTR are dropped rather than silently shortening one curve.
+
+```{r region_setup}
+stopifnot("a regional GC column is missing from the HeLa matrix" =
+            all(names(REGION_FEATURES) %in% names(gc_herr)))
+for (f in names(REGION_FEATURES)) {
+  stopifnot(setNames(list(all(gc_herr[[f]] >= 0 & gc_herr[[f]] <= 100, na.rm = TRUE)),
+                     paste(f, "outside [0, 100]"))[[1]])
+}
+
+gc_region <- gc_herr %>%
+  dplyr::filter(dplyr::if_all(dplyr::all_of(names(REGION_FEATURES)), ~ !is.na(.)))
+cat("Genes with all three regions annotated:", nrow(gc_region), "of", nrow(gc_herr),
+    sprintf("(%.1f%%)", 100 * nrow(gc_region) / nrow(gc_herr)), "\n")
+
+# Biological spot-check: human mRNAs are GC-rich at the 5' end and AT-rich at the 3' end,
+# so the medians must order 5'UTR > CDS > 3'UTR. Catches a column/label swap, which the
+# range check above cannot.
+reg_med <- vapply(names(REGION_FEATURES), function(f) median(gc_region[[f]]), numeric(1))
+cat("Background median GC:",
+    paste(sprintf("%s %.1f", REGION_FEATURES, reg_med), collapse = " | "), "\n")
+stopifnot(
+  "5'UTR GC should exceed CDS GC" = reg_med[["utr5_gc"]] > reg_med[["cds_gc"]],
+  "CDS GC should exceed 3'UTR GC" = reg_med[["cds_gc"]]  > reg_med[["utr3_gc"]]
+)
+```
+
+```{r fig_region_per_subunit, fig.width = 8, fig.height = 9}
+for (k in names(KD)) {
+  nm  <- KD[[k]]
+  ids <- intersect(prom_sets[[nm]], gc_region$gene_id_clean)
+  lab <- paste0(nm, "-promoted")
+  caution <- if (length(ids) < 100)
+    paste0("CAUTION: n = ", length(ids),
+           ". eIF3h knockdown barely changes TE (21 DTEGs in the paper) - not a distribution")
+  else NULL
+  gc_density_figure(
+    gc_region,
+    groups = setNames(list(ids), lab),
+    colors = setNames(c(KD_COLORS[[nm]], REST_COL), c(lab, REST_LAB)),
+    title  = paste0("GC by mRNA region: mRNAs promoted by ", nm, " (Herrmannova, HeLa)"),
+    subtitle = paste0(
+      "Positive: ", nm, " TE padj < ", PADJ_CUT, " & |TE LFC| > ", LFC_CUT,
+      ", most depleted by knockdown\n", DIRECTION_NOTE, "\n",
+      "Genes lacking an annotated 5'UTR or 3'UTR are excluded, so all panels share one n\n",
+      TRANSCRIPT_NOTE),
+    caution = caution,
+    features = REGION_FEATURES,
+    file = paste0("gc3ext_03_gc_by_region_", nm, "_promoted.pdf"))
+  cat("\n")
+}
+```
+
+```{r fig_region_grid, fig.width = 14, fig.height = 9.5}
+reg_grid <- purrr::map_dfr(names(KD), function(k) {
+  nm  <- KD[[k]]
+  ids <- intersect(prom_sets[[nm]], gc_region$gene_id_clean)
+  dplyr::bind_rows(
+    gc_region %>% dplyr::filter(gene_id_clean %in% ids)  %>% dplyr::mutate(group = nm),
+    gc_region %>% dplyr::filter(!gene_id_clean %in% ids) %>% dplyr::mutate(group = REST_LAB)
+  ) %>% dplyr::mutate(subunit = nm)
+}) %>%
+  dplyr::select(subunit, group, dplyr::all_of(names(REGION_FEATURES))) %>%
+  tidyr::pivot_longer(-c(subunit, group), names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(feature = factor(REGION_FEATURES[feature], levels = unname(REGION_FEATURES)),
+                subunit = factor(subunit, levels = unname(KD)))
+
+# n counted from the gene sets, not the plotted rows: the background repeats once per column.
+reg_n <- c(vapply(unname(KD), function(nm)
+             length(intersect(prom_sets[[nm]], gc_region$gene_id_clean)), integer(1)),
+           setNames(nrow(gc_region) -
+                      length(intersect(prom_sets[[KD[["d"]]]], gc_region$gene_id_clean)),
+                    REST_LAB))
+reg_lev <- c(unname(KD), REST_LAB)
+reg_lab <- setNames(sprintf("%s (n = %s)", reg_lev,
+                            format(reg_n[reg_lev], big.mark = ",", trim = TRUE)), reg_lev)
+reg_grid <- reg_grid %>%
+  dplyr::mutate(group = factor(reg_lab[group], levels = unname(reg_lab[reg_lev])))
+reg_meds <- reg_grid %>% dplyr::group_by(subunit, feature, group) %>%
+  dplyr::summarise(median_gc = median(gc), .groups = "drop")
+reg_pal <- setNames(c(unname(KD_COLORS[unname(KD)]), REST_COL), unname(reg_lab[reg_lev]))
+
+p_reg <- ggplot(reg_grid, aes(x = gc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  geom_vline(data = reg_meds, aes(xintercept = median_gc, color = group),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  facet_grid(feature ~ subunit, scales = "free_y") +
+  scale_color_manual(values = reg_pal, name = NULL) +
+  labs(title = "GC by mRNA region: mRNAs promoted by each eIF3 subunit (Herrmannova, HeLa)",
+       subtitle = paste0(
+         "Promoted: TE padj < ", PADJ_CUT, " & |TE LFC| > ", LFC_CUT,
+         ", most depleted by that subunit's knockdown\n", DIRECTION_NOTE, "\n",
+         "Genes lacking an annotated 5'UTR or 3'UTR excluded (", nrow(gc_region), " of ",
+         nrow(gc_herr), " kept)\n", TRANSCRIPT_NOTE,
+         "\nGrey differs slightly per column (each excludes its own positive set); ",
+         "legend n is the eIF3d column's"),
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "top", legend.direction = "vertical",
+        legend.key.height = unit(1, "lines"),
+        legend.text = element_text(size = 12),
+        plot.subtitle = element_text(size = 11, lineheight = 1.2),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+print(p_reg)
+if (SAVE_PLOTS) ggsave(here("plots", "gc3ext_03_gc_by_region_by_subunit_grid.pdf"),
+                       p_reg, width = 14, height = 9.5)
+
+cat("\nRegional GC medians (background =", nrow(gc_region), "genes):\n")
+print(as.data.frame(reg_meds %>% dplyr::mutate(median_gc = round(median_gc, 1)) %>%
+  tidyr::pivot_wider(names_from = feature, values_from = median_gc)), row.names = FALSE)
+
+reg_wilcox <- purrr::map_dfr(names(KD), function(k) {
+  nm <- KD[[k]]; ids <- intersect(prom_sets[[nm]], gc_region$gene_id_clean)
+  if (length(ids) < 20) return(NULL)
+  purrr::map_dfr(names(REGION_FEATURES), function(f) {
+    a <- gc_region[[f]][gc_region$gene_id_clean %in% ids]
+    b <- gc_region[[f]][!gc_region$gene_id_clean %in% ids]
+    tibble::tibble(knockdown = nm, region = unname(REGION_FEATURES[f]), n = length(a),
+                   median_set = round(median(a), 1), median_rest = round(median(b), 1),
+                   delta = round(median(a) - median(b), 1),
+                   p_vs_rest = format.pval(suppressWarnings(wilcox.test(a, b)$p.value),
+                                           digits = 3, eps = 2.2e-16))
+  })
+})
+cat("\nRegional GC, promoted set vs rest:\n")
+print(as.data.frame(reg_wilcox), row.names = FALSE)
+```
+
+---
+
+# Section 7: Summary table
+
+```{r summary}
+bg_med <- vapply(names(GC_FEATURES), function(f) median(gc_codon[[f]]), numeric(1))
+
+summary_tbl <- purrr::map_dfr(names(KD), function(k) {
+  nm <- KD[[k]]
+  purrr::map_dfr(list(list(lab = paste0(nm, " promoted (lfc>", LFC_CUT, ")"),
+                           ids = prom_sets[[nm]]),
+                      list(lab = paste0(nm, " top 200"), ids = top_n_promoted(k, 200)),
+                      list(lab = paste0(nm, " top 500"), ids = top_n_promoted(k, 500))),
+                 function(s) {
+    if (length(s$ids) < 20) return(NULL)
+    x <- gc_codon %>% dplyr::filter(gene_id_clean %in% s$ids)
+    tibble::tibble(set = s$lab, n = nrow(x),
+                   cds_gc = round(median(x$cds_gc), 1), gc1 = round(median(x$gc1), 1),
+                   gc2 = round(median(x$gc2), 1), gc3 = round(median(x$gc3), 1),
+                   gc3_vs_bg = round(median(x$gc3) - bg_med[["gc3"]], 1))
+  })
+})
+summary_tbl <- dplyr::bind_rows(
+  tibble::tibble(set = "HeLa background (complete GC)", n = nrow(gc_codon),
+                 cds_gc = round(bg_med[["cds_gc"]], 1), gc1 = round(bg_med[["gc1"]], 1),
+                 gc2 = round(bg_med[["gc2"]], 1), gc3 = round(bg_med[["gc3"]], 1),
+                 gc3_vs_bg = 0),
+  summary_tbl)
+print(as.data.frame(summary_tbl), row.names = FALSE)
+
+cat("\nComparability: this is HeLa, on Roiuk-derived dominant transcripts. Notebook 89's\n",
+    "MDA-MB-231 numbers use a different cell line AND a different transcript matrix, so\n",
+    "the DIRECTION of any GC3 shift is comparable between them but the MAGNITUDE is not.\n",
+    sep = "")
+
+# Wilcoxon of each promoted set against everything else, per feature.
+wilcox_tbl <- purrr::map_dfr(names(KD), function(k) {
+  nm <- KD[[k]]; ids <- prom_sets[[nm]]
+  if (length(ids) < 20) return(NULL)
+  purrr::map_dfr(names(GC_FEATURES), function(f) {
+    a <- gc_codon[[f]][gc_codon$gene_id_clean %in% ids]
+    b <- gc_codon[[f]][!gc_codon$gene_id_clean %in% ids]
+    tibble::tibble(knockdown = nm, feature = unname(GC_FEATURES[f]), n = length(a),
+                   p_vs_rest = format.pval(suppressWarnings(wilcox.test(a, b)$p.value),
+                                           digits = 3, eps = 2.2e-16))
+  })
+})
+cat("\nWilcoxon, promoted set vs rest of transcriptome:\n")
+print(as.data.frame(wilcox_tbl), row.names = FALSE)
+```
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

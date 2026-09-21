@@ -1,0 +1,448 @@
+---
+title: "GC3 external sets 02: Okubo et al. iPSC EIF3D riboseq — validation and GC analysis"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Ingest Okubo et al., *Science Advances* 2025;11:eadq5484 — "EIF3D safeguards the homeostasis
+of key signaling pathways in human primed pluripotency" — validate it against the paper, then
+draw GC for the mRNAs EIF3D **promotes**.
+
+Third independent EIF3D dataset after our MDA-MB-231 (nb89) and Herrmannová HeLa (nb98), and
+the **first outside cancer cell lines**: human iPSC, primed pluripotency, CRISPRi rather than
+siRNA. If the AT-rich GC3 signature holds here it is a property of EIF3D-dependent translation
+rather than of one cell line or knockdown method.
+
+Data: `accessories/okubo sciadv riboseq/` — the Europe PMC supplementary bundle for
+PMC11980838, which contains `sciadv.adq5484_data_s1_to_s10.zip`. Science.org returns 403 to
+scripted requests; Europe PMC serves the same files openly.
+
+## What makes this dataset different
+
+**1. It is transcript-level.** Unlike Herrmannová (gene-level) and subunit-seq (gene-level),
+Data S3/S4 list versioned ENST IDs. That is more information than we have had before — but see
+Section 5 for why the figures still use MANE.
+
+**2. The files are pre-split by direction and pre-filtered**, so there is no tested-gene
+background. Section 5 states what that costs.
+
+**3. The supplement was corrected after publication.** The v2 PDF cover reads "Data S1 to S10
+CORRECTED 27 JUNE 2025". Inside the data zip, `data_s1`/`data_S2` are dated 30 May 2025 while
+`data_s3`–`data_s10` are dated 26 June 2025, i.e. S3–S10 were the ones revised. This matters:
+the gene counts in the corrected files **do not match the numbers printed in the paper's
+text** (Section 3).
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+```
+
+```{r params_fallback}
+if (!exists("params") || !is.list(params)) params <- list(save_plots = TRUE)
+SAVE_PLOTS <- params$save_plots
+
+OKUBO_DIR <- here("accessories", "okubo sciadv riboseq")
+EIF3D_COL <- "#E69F00"   # CLAUDE.md: reserved for eIF3d
+REST_COL  <- "grey70"
+REST_LAB  <- "Rest of transcriptome"
+
+GC_FEATURES <- c(cds_gc = "CDS GC, all positions",
+                 gc1    = "GC1, first codon position",
+                 gc2    = "GC2, second codon position",
+                 gc3    = "GC3, third codon position")
+REGION_FEATURES <- c(utr5_gc = "5' UTR", cds_gc = "CDS", utr3_gc = "3' UTR")
+
+# Paper's reported values, for the replication table.
+PAPER_DOWN <- 919L   # dDTEGs, main text
+PAPER_UP   <- 402L   # uDTEGs, main text
+```
+
+---
+
+# Section 1: Load
+
+`Data S3` = dDTEGs (TE **decreased** on knockdown), `Data S4` = uDTEGs (increased). Legends
+taken from the v2 supplement PDF.
+
+```{r load}
+stopifnot("Okubo data directory not found" = dir.exists(OKUBO_DIR))
+
+read_okubo <- function(tag) {
+  f <- file.path(OKUBO_DIR, paste0("adq5484_data_", tag, ".xlsx"))
+  stopifnot(setNames(list(file.exists(f)), paste("missing", basename(f)))[[1]])
+  d <- suppressWarnings(read_excel(f))
+  stopifnot("unexpected column layout" =
+              identical(names(d), c("Gene name", "Transcript ID", "FC", "Adjusted p-value")))
+  d %>%
+    transmute(symbol        = `Gene name`,
+              transcript_id = `Transcript ID`,
+              tx_clean      = sub("\\..*", "", `Transcript ID`),
+              fc            = suppressWarnings(as.numeric(FC)),
+              padj          = suppressWarnings(as.numeric(`Adjusted p-value`)))
+}
+
+dDTEG <- read_okubo("s3")   # TE down on KD  -> EIF3D promotes
+uDTEG <- read_okubo("s4")   # TE up on KD    -> EIF3D inhibits
+
+cat("Data S3 (dDTEGs):", nrow(dDTEG), "transcripts |",
+    n_distinct(dDTEG$symbol), "gene names\n")
+cat("Data S4 (uDTEGs):", nrow(uDTEG), "transcripts |",
+    n_distinct(uDTEG$symbol), "gene names\n")
+
+stopifnot(
+  "dDTEG table is empty"            = nrow(dDTEG) > 100,
+  "uDTEG table is empty"            = nrow(uDTEG) > 100,
+  "transcript IDs are not unique"   = !any(duplicated(dDTEG$transcript_id)) &&
+                                      !any(duplicated(uDTEG$transcript_id)),
+  "a transcript appears in both files" =
+    length(intersect(dDTEG$transcript_id, uDTEG$transcript_id)) == 0,
+  "missing gene names"              = !any(is.na(dDTEG$symbol)) && !any(is.na(uDTEG$symbol))
+)
+```
+
+---
+
+# Section 2: Validation — thresholds and direction
+
+## 2a. The published thresholds are exactly reproduced
+
+The paper states DTEGs are called at **|log2FC| > 1 and adjusted P < 0.05**. `FC` here is a
+**linear ratio**, not a log, so that cut should appear as `FC <= 0.5` in S3 and `FC >= 2` in
+S4. If the column were already logged this check would fail immediately.
+
+```{r validate_thresholds}
+thr <- bind_rows(
+  tibble(file = "Data S3 (dDTEGs)", n = nrow(dDTEG),
+         fc_min = min(dDTEG$fc), fc_max = max(dDTEG$fc),
+         log2fc_min = min(log2(dDTEG$fc)), log2fc_max = max(log2(dDTEG$fc)),
+         padj_max = max(dDTEG$padj)),
+  tibble(file = "Data S4 (uDTEGs)", n = nrow(uDTEG),
+         fc_min = min(uDTEG$fc), fc_max = max(uDTEG$fc),
+         log2fc_min = min(log2(uDTEG$fc)), log2fc_max = max(log2(uDTEG$fc)),
+         padj_max = max(uDTEG$padj))
+) %>% mutate(across(where(is.numeric), ~ signif(., 4)))
+print(as.data.frame(thr), row.names = FALSE)
+
+stopifnot(
+  "FC is not a linear ratio - values look already logged" =
+    all(dDTEG$fc > 0) && all(uDTEG$fc > 0),
+  "Data S3 is not entirely below the FC <= 0.5 cut (|log2FC| > 1)" =
+    all(dDTEG$fc <= 0.5 + 1e-9),
+  "Data S4 is not entirely above the FC >= 2 cut (|log2FC| > 1)" =
+    all(uDTEG$fc >= 2 - 1e-9),
+  "an adjusted p-value exceeds 0.05" =
+    max(dDTEG$padj) <= 0.05 && max(uDTEG$padj) <= 0.05
+)
+cat("\nThresholds match the paper exactly: S3 all FC <= 0.5, S4 all FC >= 2, all padj <= 0.05.\n")
+```
+
+## 2b. Direction
+
+Methods, quoted: `Fold change_i = TE_i(sgEIF3D) / TE_i(control)` — knockdown over control. So
+`FC < 1` means TE **fell** when EIF3D was repressed, i.e. **EIF3D promotes** that transcript.
+
+That is confirmed structurally by the file split: every S3 value is below 1 and every S4 value
+above 1, and the files are named d(own)DTEG / u(p)DTEG. Same orientation as Herrmannová
+(nb98) and MCF7-SIX1; **opposite** to `translation_categories_si3*_vs_sictrl_*`, where
+positive means promotes.
+
+```{r validate_direction}
+stopifnot(
+  "Data S3 should be entirely FC < 1 (TE down on knockdown)" = all(dDTEG$fc < 1),
+  "Data S4 should be entirely FC > 1 (TE up on knockdown)"   = all(uDTEG$fc > 1)
+)
+cat("Data S3: all", nrow(dDTEG), "transcripts have FC < 1 -> TE fell on knockdown -> EIF3D PROMOTES\n")
+cat("Data S4: all", nrow(uDTEG), "transcripts have FC > 1 -> TE rose on knockdown -> EIF3D inhibits\n")
+cat("\n=> the EIF3D-promoted set for the GC analysis is Data S3.\n")
+```
+
+---
+
+# Section 3: Replication — and a discrepancy with the printed text
+
+```{r validate_counts}
+counts_tbl <- tibble(
+  set          = c("dDTEGs (Data S3)", "uDTEGs (Data S4)"),
+  paper_text   = c(PAPER_DOWN, PAPER_UP),
+  obs_transcripts = c(nrow(dDTEG), nrow(uDTEG)),
+  obs_genes    = c(n_distinct(dDTEG$symbol), n_distinct(uDTEG$symbol))
+) %>% mutate(difference = obs_genes - paper_text)
+print(as.data.frame(counts_tbl), row.names = FALSE)
+
+stopifnot(
+  "gene counts are not in the neighbourhood of the published values" =
+    all(abs(counts_tbl$difference) < 25),
+  "gene sets overlap between the two files" =
+    length(intersect(unique(dDTEG$symbol), unique(uDTEG$symbol))) == 0
+)
+```
+
+**The corrected data files give 915 down / 394 up; the paper's text says 919 / 402.**
+
+This is not a parsing error, and it is asserted only loosely above (within 25) for that reason:
+
+- No missing or blank gene names, and no gene or transcript appears in both files.
+- Counting distinct GENCODE v49 **gene IDs** instead of gene names gives 911 / 388 — further
+  from the published numbers, not closer, because 2.6% / 3.4% of their transcripts are not in
+  v49 at all.
+- `data_s3`–`data_s10` are dated 26 June 2025 while `data_s1`/`data_S2` are dated 30 May, and
+  the supplement carries a "CORRECTED 27 JUNE 2025" notice. The most likely reading is that
+  **the text reports pre-correction counts and these files are post-correction.**
+
+Consequence for this repo: the hardcoded `Down 402 / Up 919` in
+`code/spikein_literature_comparison/03_bar_te_si3d_si3e_vs_literature.Rmd:304` and `04_...:202`
+are the **uncorrected** figures. Worth updating separately; not touched here.
+
+---
+
+# Section 4: Orient to the project convention
+
+```{r orient}
+# Gene-level effect size. A gene can list many transcripts (median 2, max 46 in S3) with
+# different fold changes, so collapse by the MEDIAN log2FC across its listed transcripts and
+# keep the spread for inspection. Negated so positive = EIF3D promotes, matching nb89/nb98.
+collapse_genes <- function(d, label) {
+  d %>%
+    mutate(te_lfc = -log2(fc)) %>%          # negate: positive = promotes
+    group_by(symbol) %>%
+    summarise(te_lfc     = median(te_lfc),
+              te_lfc_min = min(te_lfc), te_lfc_max = max(te_lfc),
+              n_tx       = n(), padj_min = min(padj), .groups = "drop") %>%
+    mutate(set = label)
+}
+gene_d <- collapse_genes(dDTEG, "EIF3D-promoted")
+gene_u <- collapse_genes(uDTEG, "EIF3D-inhibited")
+
+cat("Gene-level, after negation (positive = EIF3D promotes):\n")
+print(as.data.frame(bind_rows(gene_d, gene_u) %>%
+  group_by(set) %>%
+  summarise(n_genes = n(), median_te_lfc = round(median(te_lfc), 2),
+            min = round(min(te_lfc), 2), max = round(max(te_lfc), 2),
+            median_tx_per_gene = median(n_tx), .groups = "drop")), row.names = FALSE)
+
+stopifnot(
+  "promoted set is not positive after negation" = all(gene_d$te_lfc > 0),
+  "inhibited set is not negative after negation" = all(gene_u$te_lfc < 0)
+)
+cat("\nNegation verified: promoted all > 0, inhibited all < 0.\n")
+```
+
+---
+
+# Section 5: Transcript choice — MANE, and why not theirs
+
+Okubo report transcript IDs, which is more than Herrmannová or subunit-seq gave us. The
+figures nevertheless use **MANE Select**, for two reasons that only became visible on
+inspection:
+
+1. **Their transcripts are mostly not the canonical one** — only **18.3%** of the S3
+   transcripts and **11.5%** of S4 are their gene's MANE Select, and a gene lists a median of
+   2 (max 46) transcripts. There is no single "their transcript" per gene to use.
+2. **There is no tested-gene background in these files.** Data S3/S4 are the significant hits
+   only. A background therefore has to come from elsewhere, and if the foreground used their
+   isoforms while the background used MANE, the two groups would differ by isoform choice as
+   well as by biology.
+
+Using MANE for **both** groups keeps one consistent basis and makes the numbers directly
+comparable to nb85 (subunit-seq, also MANE). Their transcript-level calls are retained in the
+tables above as a sensitivity record.
+
+**Caveat that stands regardless:** the background is "all other MANE genes", which conflates
+*untested* with *unaffected* — the same limitation nb85 carries for published hit lists. It is
+stated on every figure.
+
+```{r join_mane}
+mane <- readRDS(here("output", "predictive_modeling", "feature_matrix_mane_gc_csc.rds")) %>%
+  select(transcript_id_clean, gene_id_clean, symbol,
+         all_of(union(names(GC_FEATURES), names(REGION_FEATURES))))
+cat("MANE matrix:", nrow(mane), "genes\n")
+
+for (f in union(names(GC_FEATURES), names(REGION_FEATURES))) {
+  stopifnot(setNames(list(all(mane[[f]] >= 0 & mane[[f]] <= 100, na.rm = TRUE)),
+                     paste(f, "outside [0, 100]"))[[1]])
+}
+stopifnot("MANE GC3 median outside the expected human range [40, 65]" =
+            between(median(mane$gc3, na.rm = TRUE), 40, 65))
+
+# Join on gene SYMBOL: Okubo give no gene IDs, and their transcript IDs are mostly non-MANE
+# so they cannot be joined to the MANE matrix directly.
+promoted_sym <- gene_d$symbol
+inhibited_sym <- gene_u$symbol
+cat("promoted genes matched into the MANE matrix:",
+    sum(promoted_sym %in% mane$symbol), "of", length(promoted_sym), "\n")
+cat("inhibited genes matched into the MANE matrix:",
+    sum(inhibited_sym %in% mane$symbol), "of", length(inhibited_sym), "\n")
+
+gc_okubo <- mane %>%
+  mutate(group = case_when(symbol %in% promoted_sym  ~ "EIF3D-promoted",
+                           symbol %in% inhibited_sym ~ "EIF3D-inhibited",
+                           TRUE                      ~ REST_LAB))
+print(as.data.frame(count(gc_okubo, group)), row.names = FALSE)
+stopifnot("too few promoted genes matched" = sum(gc_okubo$group == "EIF3D-promoted") > 500)
+```
+
+---
+
+# Section 6: Figures
+
+```{r plot_fn}
+# Same layout as nb85 / nb89 / nb98: unfilled densities stacked over the feature set, dashed
+# per-group medians, n in every legend label. `features` selects the family drawn.
+gc_density_figure <- function(gc_table, groups, colors, title, subtitle, file = NULL,
+                              features = GC_FEATURES) {
+  labelled <- unlist(groups, use.names = FALSE)
+  stopifnot("groups overlap each other" = !any(duplicated(labelled)))
+
+  d <- gc_table %>% mutate(group = REST_LAB)
+  for (nm in names(groups)) d$group[d$symbol %in% groups[[nm]]] <- nm
+
+  lev    <- c(names(groups), REST_LAB)
+  counts <- d %>% count(group)
+  n_of   <- setNames(counts$n[match(lev, counts$group)], lev); n_of[is.na(n_of)] <- 0L
+  lab_of <- setNames(sprintf("%s (n = %s)", lev, format(n_of, big.mark = ",", trim = TRUE)), lev)
+  d      <- d %>% mutate(group = factor(lab_of[group], levels = unname(lab_of)))
+  pal    <- setNames(unname(colors[lev]), unname(lab_of))
+  stopifnot("a group has no colour" = !any(is.na(pal)))
+
+  long <- d %>%
+    pivot_longer(all_of(names(features)), names_to = "feature", values_to = "gc") %>%
+    filter(!is.na(gc)) %>%
+    mutate(feature = factor(features[feature], levels = unname(features)))
+  stopifnot("a feature has NAs - legend n would not match the panels" =
+              n_distinct(count(long, feature)$n) == 1)
+
+  meds <- long %>% group_by(feature, group) %>%
+    summarise(median_gc = median(gc), n = n(), .groups = "drop")
+
+  p <- ggplot(long, aes(x = gc, color = group)) +
+    geom_density(fill = NA, linewidth = 0.8) +
+    geom_vline(data = meds, aes(xintercept = median_gc, color = group),
+               linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+    facet_wrap(~ feature, ncol = 1, scales = "free_y") +
+    scale_color_manual(values = pal, name = NULL) +
+    labs(title = title, subtitle = subtitle, x = "GC content (%)", y = "Density") +
+    theme_classic(base_size = 15) +
+    theme(legend.position = "top", legend.direction = "vertical",
+          legend.key.height = unit(1, "lines"), legend.text = element_text(size = 12),
+          plot.subtitle = element_text(size = 11, lineheight = 1.2),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 12))
+  print(p)
+  if (!is.null(file) && SAVE_PLOTS)
+    ggsave(here("plots", file), p, width = 8, height = 2 + 2.25 * length(features))
+  print(as.data.frame(meds %>% mutate(median_gc = round(median_gc, 1)) %>%
+                        select(feature, group, n, median_gc)), row.names = FALSE)
+  invisible(p)
+}
+
+OKUBO_NOTE <- paste0(
+  "Okubo et al. 2025 (Sci Adv eadq5484), human iPSC, EIF3D CRISPRi day 3\n",
+  "Promoted = TE fell on knockdown (their FC = TE(sgEIF3D)/TE(control) < 1), sign flipped here\n",
+  "Their cut is |log2FC| > 1 & padj < 0.05, DOUBLE our usual 0.5, so magnitudes are not\n",
+  "comparable to nb89 / nb98; direction is\n",
+  "Transcript: MANE Select for BOTH groups (only 18% of their listed transcripts are MANE)\n",
+  "Background is all other MANE genes, so it conflates untested with unaffected")
+```
+
+## 6a. GC by codon position
+
+```{r fig_codon, fig.width = 8, fig.height = 11}
+gc_codon <- gc_okubo %>% filter(if_all(all_of(names(GC_FEATURES)), ~ !is.na(.)))
+cat("Complete on all four codon-position features:", nrow(gc_codon), "of", nrow(gc_okubo), "\n")
+
+gc_density_figure(
+  gc_codon,
+  groups = list("EIF3D-promoted" = promoted_sym),
+  colors = setNames(c(EIF3D_COL, REST_COL), c("EIF3D-promoted", REST_LAB)),
+  title = "GC by codon position: mRNAs promoted by EIF3D (Okubo, human iPSC)",
+  subtitle = OKUBO_NOTE,
+  file = "gc3ext_02_okubo_gc_by_codon_position_promoted.pdf")
+```
+
+## 6b. GC by mRNA region
+
+```{r fig_region, fig.width = 8, fig.height = 9}
+gc_region <- gc_okubo %>% filter(if_all(all_of(names(REGION_FEATURES)), ~ !is.na(.)))
+cat("Complete on all three regions:", nrow(gc_region), "of", nrow(gc_okubo), "\n")
+
+reg_med <- vapply(names(REGION_FEATURES), function(f) median(gc_region[[f]]), numeric(1))
+cat("Background median GC:",
+    paste(sprintf("%s %.1f", REGION_FEATURES, reg_med), collapse = " | "), "\n")
+stopifnot(
+  "5'UTR GC should exceed CDS GC" = reg_med[["utr5_gc"]] > reg_med[["cds_gc"]],
+  "CDS GC should exceed 3'UTR GC" = reg_med[["cds_gc"]]  > reg_med[["utr3_gc"]]
+)
+
+gc_density_figure(
+  gc_region,
+  groups = list("EIF3D-promoted" = promoted_sym),
+  colors = setNames(c(EIF3D_COL, REST_COL), c("EIF3D-promoted", REST_LAB)),
+  title = "GC by mRNA region: mRNAs promoted by EIF3D (Okubo, human iPSC)",
+  subtitle = paste0(OKUBO_NOTE, "\nGenes lacking an annotated 5'UTR or 3'UTR excluded"),
+  features = REGION_FEATURES,
+  file = "gc3ext_02_okubo_gc_by_region_promoted.pdf")
+```
+
+---
+
+# Section 7: Summary
+
+```{r summary}
+bg <- gc_codon %>% filter(group == REST_LAB)
+summ <- bind_rows(
+  tibble(set = "MANE background", n = nrow(bg),
+         cds_gc = median(bg$cds_gc), gc1 = median(bg$gc1),
+         gc2 = median(bg$gc2), gc3 = median(bg$gc3)),
+  gc_codon %>% filter(group == "EIF3D-promoted") %>%
+    summarise(set = "EIF3D-promoted", n = n(), cds_gc = median(cds_gc),
+              gc1 = median(gc1), gc2 = median(gc2), gc3 = median(gc3)),
+  gc_codon %>% filter(group == "EIF3D-inhibited") %>%
+    summarise(set = "EIF3D-inhibited", n = n(), cds_gc = median(cds_gc),
+              gc1 = median(gc1), gc2 = median(gc2), gc3 = median(gc3))
+) %>% mutate(across(where(is.numeric), ~ round(., 1)),
+             gc3_vs_bg = round(gc3 - gc3[1], 1))
+print(as.data.frame(summ), row.names = FALSE)
+
+wil <- map_dfr(c("EIF3D-promoted", "EIF3D-inhibited"), function(g) {
+  map_dfr(names(GC_FEATURES), function(f) {
+    a <- gc_codon[[f]][gc_codon$group == g]
+    b <- gc_codon[[f]][gc_codon$group == REST_LAB]
+    tibble(set = g, feature = unname(GC_FEATURES[f]), n = length(a),
+           delta = round(median(a) - median(b), 1),
+           p_vs_background = format.pval(suppressWarnings(wilcox.test(a, b)$p.value),
+                                         digits = 3, eps = 2.2e-16))
+  })
+})
+cat("\nWilcoxon vs MANE background:\n"); print(as.data.frame(wil), row.names = FALSE)
+
+cat("\nCross-dataset context (direction comparable, magnitude NOT - different cell type,\n",
+    "transcript basis and LFC cut):\n",
+    "  nb89 MDA-MB-231, eIF3d hypoxia-promoted : GC3 50.0 vs bg 57.2  (-7.2)\n",
+    "  nb98 HeLa (Herrmannova), eIF3d-promoted : GC3 44.8 vs bg 57.9 (-13.1)\n", sep = "")
+```
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

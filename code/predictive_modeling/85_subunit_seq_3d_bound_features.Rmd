@@ -102,6 +102,7 @@ group_colors <- c(
   "All other genes"                       = "grey70"
 )
 GROUP_LEVELS <- names(group_colors)
+REST_COLOR_85 <- "grey70"   # CLAUDE.md: rest of the transcriptome
 ```
 
 # Section 1: Load subunit-seq data
@@ -502,6 +503,169 @@ if (SAVE_PLOTS) ggsave(here("plots", "85_gc_by_region_subunit_seq_bound.pdf"),
                        p_gc, width = 11, height = 6)
 ```
 
+The same density plot restricted to the four codon-position features (`cds_gc`, `gc1`,
+`gc2`, `gc3`), dropping the three UTR / whole-transcript panels. Identical data, groups,
+colours and background - only the feature list changes. This is the panel set used by
+notebook 89, so the two are directly readable against each other, with the caveat that nb85
+computes GC on **MANE Select** transcripts while nb89 uses the pipeline's most-abundant
+transcript, so gene-for-gene values differ.
+
+```{r density_gc_codon_position, fig.width = 11, fig.height = 3.5}
+gc_cols_codon <- c("cds_gc", "gc1", "gc2", "gc3")
+stopifnot("codon-position GC columns missing" = all(gc_cols_codon %in% gc_cols))
+
+gc_long_codon <- gc_long %>%
+  dplyr::filter(feature %in% gc_cols_codon) %>%
+  dplyr::mutate(feature = droplevels(feature))
+stopifnot("not all 4 codon-position features present" =
+            nlevels(gc_long_codon$feature) == length(gc_cols_codon))
+
+p_gc_codon <- ggplot(gc_long_codon, aes(x = gc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = group_colors, name = NULL) +
+  labs(title = "GC by codon position, eIF3d cap-bound (subunit-seq)",
+       subtitle = n_label,
+       x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  guides(color = guide_legend(nrow = 2))
+
+print(p_gc_codon)
+if (SAVE_PLOTS) ggsave(here("plots", "85_gc_by_codon_position_subunit_seq_bound.pdf"),
+                       p_gc_codon, width = 11, height = 3.5)
+
+# Medians per group per panel, so the shifts are on the record numerically too.
+codon_medians <- gc_long_codon %>%
+  dplyr::group_by(feature, group) %>%
+  dplyr::summarise(n = dplyr::n(), median_gc = round(median(gc), 1), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = feature, values_from = c(n, median_gc))
+cat("\nMedian GC by codon position, per group:\n")
+print(as.data.frame(codon_medians), row.names = FALSE)
+```
+
+The same four features again, but laid out as a grid: **rows are GC features, columns are
+the three subunit-seq experiments**, each experiment drawn against the background on its own
+so the three are read side by side rather than superimposed. Vertical stack and dashed
+per-group medians match the notebook 89 figures.
+
+The grey curve is the **same** in all three columns - genes not called bound in *any*
+subunit-seq condition - so the columns are directly comparable to each other.
+
+```{r density_gc_codon_grid, fig.width = 11, fig.height = 11}
+CODON_LABELS <- c(cds_gc = "CDS GC, all positions",
+                  gc1    = "GC1, first codon position",
+                  gc2    = "GC2, second codon position",
+                  gc3    = "GC3, third codon position")
+EXP_SHORT <- c("eIF3d cap-bound (glucose deprivation)" = "Glucose deprivation",
+               "eIF3d cap-bound (complete media)"      = "Complete media",
+               "eIF3d cap-bound (ISR)"                 = "ISR")
+REST_LAB <- "Rest of transcriptome"
+
+bg_features <- features %>% dplyr::filter(!gene_id_clean %in% bound_any)
+
+grid_long <- purrr::imap_dfr(bound_sets, function(genes, nm) {
+  dplyr::bind_rows(
+    features %>% dplyr::filter(gene_id_clean %in% genes) %>% dplyr::mutate(group = nm),
+    bg_features %>% dplyr::mutate(group = REST_LAB)
+  ) %>% dplyr::mutate(experiment = EXP_SHORT[[nm]])
+}) %>%
+  dplyr::select(experiment, group, dplyr::all_of(names(CODON_LABELS))) %>%
+  tidyr::pivot_longer(-c(experiment, group), names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(
+    feature    = factor(CODON_LABELS[feature], levels = unname(CODON_LABELS)),
+    experiment = factor(experiment, levels = unname(EXP_SHORT)),
+    group      = factor(group, levels = c(names(EXP_SHORT), REST_LAB)))
+
+stopifnot(
+  "not all 3 experiments present"       = nlevels(droplevels(grid_long$experiment)) == 3,
+  "not all 4 features present"          = nlevels(droplevels(grid_long$feature)) == 4,
+  "unmapped facet label (NA)"           = !any(is.na(grid_long$feature)) &&
+                                          !any(is.na(grid_long$experiment)),
+  "background differs between columns"  =
+    length(unique(with(dplyr::filter(grid_long, group == REST_LAB),
+                       tapply(gc, experiment, length)))) == 1)
+
+# n belongs on the legend beside each colour, not only in the subtitle (nb89 convention).
+# Counted on one feature, then asserted identical across the other three, so the label is
+# not quietly wrong for a panel where some genes lack a value.
+# Counted on ONE column, not on all plotted rows: the grey group is repeated once per
+# experiment, so counting rows across the whole frame reports 3x the real background.
+g_levels <- levels(grid_long$group)
+grid_n <- grid_long %>%
+  dplyr::filter(feature == levels(grid_long$feature)[1],
+                experiment == levels(grid_long$experiment)[1]) %>%
+  dplyr::count(group, name = "n") %>%
+  dplyr::mutate(n = dplyr::if_else(as.character(group) == REST_LAB,
+                                   nrow(bg_features), as.integer(n)))
+stopifnot("background n does not match the background table" =
+            grid_n$n[as.character(grid_n$group) == REST_LAB] == nrow(bg_features))
+per_feature_n <- grid_long %>% dplyr::count(group, feature, name = "n")
+stopifnot(
+  "group n differs between features - a legend label would be wrong on some panels" =
+    per_feature_n %>% dplyr::group_by(group) %>%
+      dplyr::summarise(k = dplyr::n_distinct(n), .groups = "drop") %>%
+      dplyr::pull(k) %>% max() == 1,
+  "n table has unexpected groups" = all(as.character(grid_n$group) %in% g_levels))
+
+# Column 1 contains only its own experiment plus the background, so fill the other two
+# experiments in from the gene-level sets rather than from the plotted frame.
+exp_n <- vapply(bound_sets, function(g) sum(features$gene_id_clean %in% g), integer(1))
+names(exp_n) <- unname(EXP_SHORT[names(exp_n)])
+grid_n <- tibble::tibble(
+  group = factor(g_levels, levels = g_levels),
+  n = c(unname(exp_n[unname(EXP_SHORT)]), nrow(bg_features)))
+stopifnot("a group is missing from the n table" = nrow(grid_n) == length(g_levels))
+
+lab_of     <- setNames(sprintf("%s (n = %s)", as.character(grid_n$group),
+                               format(grid_n$n, big.mark = ",", trim = TRUE)),
+                       as.character(grid_n$group))
+new_levels <- unname(lab_of[g_levels])
+grid_long  <- grid_long %>%
+  dplyr::mutate(group = factor(lab_of[as.character(group)], levels = new_levels))
+
+grid_meds <- grid_long %>%
+  dplyr::group_by(experiment, feature, group) %>%
+  dplyr::summarise(median_gc = median(gc), n = dplyr::n(), .groups = "drop")
+
+grid_pal <- setNames(c(unname(group_colors[names(EXP_SHORT)]), REST_COLOR_85), new_levels)
+
+grid_sub <- paste0(
+  "Transcript choice: all three tables report genes only (no transcript IDs, no cluster\n",
+  "coordinates), so the MANE Select transcript is PICKED as the sequence representative -\n",
+  "it is not what the assay measured\n",
+  "Grey is the same set in all three columns: genes not called bound in any condition. ",
+  "Dashed verticals are per-group medians\n",
+  "Lamper and Lee tables are published hit lists, so absence from them conflates untested ",
+  "with unbound")
+
+p_gc_grid <- ggplot(grid_long, aes(x = gc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  geom_vline(data = grid_meds, aes(xintercept = median_gc, color = group),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  facet_grid(feature ~ experiment, scales = "free_y") +
+  scale_color_manual(values = grid_pal, name = NULL) +
+  labs(title = "GC by codon position, eIF3d cap-bound (subunit-seq), by experiment",
+       subtitle = grid_sub, x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "top", legend.direction = "vertical",
+        legend.key.height = unit(1, "lines"),
+        legend.text = element_text(size = 12),
+        plot.subtitle = element_text(size = 11, lineheight = 1.2),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+
+print(p_gc_grid)
+if (SAVE_PLOTS) ggsave(here("plots", "85_gc_by_codon_position_by_experiment.pdf"),
+                       p_gc_grid, width = 11, height = 11)
+
+cat("\nMedian GC per experiment per feature (grey background is shared):\n")
+print(as.data.frame(grid_meds %>%
+  dplyr::mutate(median_gc = round(median_gc, 1)) %>%
+  tidyr::pivot_wider(names_from = feature, values_from = c(median_gc, n))), row.names = FALSE)
+```
+
 ```{r density_length, fig.width = 11, fig.height = 3.5}
 len_long <- d_long %>%
   dplyr::select(group, dplyr::all_of(len_cols)) %>%
@@ -552,6 +716,137 @@ p_csc <- ggplot(csc_d, aes(x = csc, color = group)) +
 print(p_csc)
 if (SAVE_PLOTS) ggsave(here("plots", "85_csc_subunit_seq_bound.pdf"),
                        p_csc, width = 7, height = 4.5)
+```
+
+# Section 6b: eIF3 PAR-CLIP binding, by subunit
+
+A different assay from subunit-seq: Lee et al. 2015 eIF3 PAR-CLIP, read straight from
+`lee_parclip.csv` so the four subunits (a, b, d, g) can be separated - the feature matrix
+only carries the pooled `a_b_d_g` and `d_only` flags.
+
+**Binding is "anywhere on the gene".** Every cluster for a gene is counted regardless of
+where the paper annotated it, so 5'UTR, CDS, 3'UTR, intron and ncRNA clusters are pooled
+into a single per-gene call. No regional split here - that comes later if wanted.
+
+**The liftOver is circumvented, deliberately.** The cluster coordinates are hg19, so mapping
+them to hg38 transcript models would need a liftOver. Instead this uses the paper's own
+`Ensembl ID` gene assignment and takes that gene's MANE Select transcript as the sequence
+representative - the same modelling choice as the subunit-seq figures above. **Consequence:
+these are gene-level binding calls. The cluster positions are discarded, so nothing here is
+transcript-resolved, and a gene whose cluster lies in an intron or a non-MANE isoform is
+still counted as bound.**
+
+```{r parclip_by_subunit, fig.width = 14, fig.height = 12}
+PARCLIP_CSV <- file.path(SUBUNIT_SEQ_DIR, "lee_parclip.csv")
+stopifnot("Lee 2015 PAR-CLIP table not found" = file.exists(PARCLIP_CSV))
+
+parclip <- readr::read_csv(PARCLIP_CSV, show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  dplyr::filter(!is.na(ensembl_id), ensembl_id != "") %>%
+  dplyr::mutate(gene_id_clean = sub("\\..*", "", ensembl_id))
+
+cat("PAR-CLIP clusters:", nrow(parclip),
+    "| distinct genes:", dplyr::n_distinct(parclip$gene_id_clean),
+    "| subunits:", paste(sort(unique(parclip$subunit)), collapse = ", "), "\n")
+cat("Cluster annotations (all pooled into 'bound anywhere'):\n")
+print(table(parclip$annotation))
+
+SUBUNITS <- c(a = "eIF3a", b = "eIF3b", d = "eIF3d", g = "eIF3g")
+stopifnot("unexpected subunit codes" = all(unique(parclip$subunit) %in% names(SUBUNITS)))
+
+# Okabe-Ito; eIF3d keeps its reserved orange, #56B4E9 stays reserved for eIF3e.
+subunit_colors <- c("eIF3a" = "#0072B2", "eIF3b" = "#CC79A7",
+                    "eIF3d" = "#E69F00", "eIF3g" = "#009E73")
+PC_REST <- "Rest of transcriptome"
+
+parclip_sets <- split(parclip$gene_id_clean, SUBUNITS[parclip$subunit]) %>% lapply(unique)
+parclip_any  <- unique(parclip$gene_id_clean)
+pc_bg <- features %>% dplyr::filter(!gene_id_clean %in% parclip_any)
+
+pc_n <- c(vapply(parclip_sets, function(g) sum(features$gene_id_clean %in% g), integer(1))[unname(SUBUNITS)],
+          setNames(nrow(pc_bg), PC_REST))
+cat("\nGenes per subunit present in the MANE feature table (background =",
+    nrow(pc_bg), "not bound by any subunit):\n")
+print(pc_n)
+stopifnot("a subunit has no genes in the feature table" = all(pc_n > 0))
+
+pc_levels <- c(unname(SUBUNITS), PC_REST)
+pc_lab    <- setNames(sprintf("%s (n = %s)", pc_levels,
+                              format(pc_n[pc_levels], big.mark = ",", trim = TRUE)),
+                      pc_levels)
+
+pc_long <- purrr::imap_dfr(parclip_sets[unname(SUBUNITS)], function(genes, nm) {
+  dplyr::bind_rows(
+    features %>% dplyr::filter(gene_id_clean %in% genes) %>% dplyr::mutate(group = nm),
+    pc_bg %>% dplyr::mutate(group = PC_REST)
+  ) %>% dplyr::mutate(subunit = nm)
+}) %>%
+  dplyr::select(subunit, group, dplyr::all_of(names(CODON_LABELS))) %>%
+  tidyr::pivot_longer(-c(subunit, group), names_to = "feature", values_to = "gc") %>%
+  dplyr::filter(!is.na(gc)) %>%
+  dplyr::mutate(
+    feature = factor(CODON_LABELS[feature], levels = unname(CODON_LABELS)),
+    subunit = factor(subunit, levels = unname(SUBUNITS)),
+    group   = factor(pc_lab[group], levels = unname(pc_lab[pc_levels])))
+
+stopifnot(
+  "not all 4 subunits present"  = nlevels(droplevels(pc_long$subunit)) == 4,
+  "not all 4 features present"  = nlevels(droplevels(pc_long$feature)) == 4,
+  "unmapped facet or group label (NA)" = !any(is.na(pc_long$feature)) &&
+    !any(is.na(pc_long$subunit)) && !any(is.na(pc_long$group)))
+
+pc_meds <- pc_long %>%
+  dplyr::group_by(subunit, feature, group) %>%
+  dplyr::summarise(median_gc = median(gc), n = dplyr::n(), .groups = "drop")
+
+pc_pal <- setNames(c(unname(subunit_colors[unname(SUBUNITS)]), REST_COLOR_85),
+                   unname(pc_lab[pc_levels]))
+
+p_parclip <- ggplot(pc_long, aes(x = gc, color = group)) +
+  geom_density(fill = NA, linewidth = 0.8) +
+  geom_vline(data = pc_meds, aes(xintercept = median_gc, color = group),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  facet_grid(feature ~ subunit, scales = "free_y") +
+  scale_color_manual(values = pc_pal, name = NULL) +
+  labs(
+    title = "GC by codon position, eIF3 PAR-CLIP bound (Lee 2015), by subunit",
+    subtitle = paste0(
+      "Bound = the gene carries at least one PAR-CLIP cluster for that subunit, ANYWHERE:\n",
+      "5'UTR, CDS, 3'UTR, intron and ncRNA annotations are all pooled into one per-gene call\n",
+      "Cluster coordinates are hg19 and are NOT lifted over - the paper's own gene assignment\n",
+      "is used and that gene's MANE Select transcript taken as sequence representative, so\n",
+      "these are gene-level calls with cluster positions discarded, not transcript-resolved\n",
+      "Grey is the same set in all four columns: genes with no cluster for any subunit"),
+    x = "GC content (%)", y = "Density") +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "top", legend.direction = "vertical",
+        legend.key.height = unit(1, "lines"),
+        legend.text = element_text(size = 12),
+        plot.subtitle = element_text(size = 11, lineheight = 1.2),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+
+print(p_parclip)
+if (SAVE_PLOTS) ggsave(here("plots", "85_gc_by_codon_position_parclip_by_subunit.pdf"),
+                       p_parclip, width = 14, height = 12)
+
+cat("\nMedian GC per subunit per feature:\n")
+print(as.data.frame(pc_meds %>%
+  dplyr::filter(!grepl("^Rest", as.character(group))) %>%
+  dplyr::mutate(median_gc = round(median_gc, 1)) %>%
+  dplyr::select(subunit, feature, n, median_gc) %>%
+  tidyr::pivot_wider(names_from = feature, values_from = c(n, median_gc))), row.names = FALSE)
+cat("\nBackground medians:\n")
+print(as.data.frame(pc_meds %>% dplyr::filter(grepl("^Rest", as.character(group)),
+                                              subunit == levels(pc_long$subunit)[1]) %>%
+  dplyr::transmute(feature, n, median_gc = round(median_gc, 1))), row.names = FALSE)
+
+# Overlap between subunits: the four sets are far from disjoint.
+cat("\nGene overlap between subunit sets (upper triangle = shared genes):\n")
+ov <- outer(unname(SUBUNITS), unname(SUBUNITS),
+            Vectorize(function(x, y) length(intersect(parclip_sets[[x]], parclip_sets[[y]]))))
+dimnames(ov) <- list(unname(SUBUNITS), unname(SUBUNITS))
+print(ov)
 ```
 
 # Section 7: Cumulative distributions

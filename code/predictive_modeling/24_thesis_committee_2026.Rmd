@@ -1683,6 +1683,199 @@ write_csv(ora_hallmark_3e, here("output/24_ora_hallmark_3e_hypoxia_1hr.csv"))
 cat("Exported ORA results\n")
 ```
 
+## Section 15b: ORA on all three dot-plot groups, normoxia 1+4hr and hypoxia 1hr
+
+Section 15 covers only the two specific groups (`3d only` / `3e only`) at hypoxia 1hr.
+The dot plot in Section 11 has a third colored group — `both`, the genes promoted by
+eIF3d *and* eIF3e — and the same three-way split exists in the normoxia panel. This
+section runs the identical ORA on all three groups in both panels, so every colored
+point in the figure has a matching enrichment result.
+
+Group definitions and colors are taken from the Section 11 dot plot, not redefined:
+orange `3d only`, blue `3e only`, dark red `both`, each at padj < 0.05 & te_lfc > 0.5.
+Background is all genes measured in that panel's si3d contrast.
+
+```{r ora-3groups-both-panels, fig.width=10, fig.height=7}
+# Local ORA runner: Section 15's run_ora() closes over the global `background_genes`
+# (the hypoxia 1hr background), which would be the wrong universe for the normoxia
+# panel. Take the universe as an argument instead.
+run_ora_bg <- function(gene_list, term2gene, label, universe, min_gs = 10) {
+  enricher(
+    gene          = gene_list,
+    universe      = universe,
+    TERM2GENE     = term2gene,
+    pAdjustMethod = "fdr",
+    pvalueCutoff  = 1,
+    qvalueCutoff  = 1,
+    minGSSize     = min_gs
+  ) %>%
+    as.data.frame() %>%
+    mutate(analysis = label)
+}
+
+grp_colors_ora <- c("3d specific" = "#E69F00", "3e specific" = "#56B4E9", "both" = "#8B0000")
+grp_tag_ora    <- c("3d specific" = "3d",      "3e specific" = "3e",      "both" = "both")
+grp_from_ora   <- c("3d specific" = "3d only", "3e specific" = "3e only", "both" = "both")
+
+ora_panels <- tribble(
+  ~label,           ~slug,              ~d_path,                                                             ~e_path,
+  "normoxia 1+4hr", "normoxia_1and4hr", "output/translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv", "output/te_si3e_vs_sictrl_normoxia_1and4hr.csv",
+  "hypoxia 1hr",    "hypoxia_1hr",      "output/translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",      "output/translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv"
+)
+
+# "x/y" -> x/y. GeneRatio and BgRatio come out of clusterProfiler as strings.
+ratio_num <- function(x) {
+  parts <- str_split_fixed(x, "/", 2)
+  as.numeric(parts[, 1]) / as.numeric(parts[, 2])
+}
+
+make_ora_plot_3grp <- function(res, prefix_pattern, title_str, n_bg, n_lab) {
+  sig_terms <- res %>% filter(p.adjust < 0.05) %>% pull(ID) %>% unique()
+  cat("Significant ORA terms:", length(sig_terms), "\n")
+  if (length(sig_terms) == 0) return(NULL)
+  plot_df <- res %>%
+    filter(ID %in% sig_terms) %>%
+    mutate(
+      term_clean = str_replace(ID, prefix_pattern, "") %>% str_replace_all("_", " ") %>% str_to_title(),
+      # ORA has no NES - that is a GSEA statistic and needs a ranked list, which these
+      # gene-list groups do not have. Fold enrichment is the ORA magnitude analogue:
+      # (genes in term / foreground size) / (genes in term / background size). 1 = no
+      # enrichment. Significance is carried by the alpha fade, not by bar length.
+      fold_enrichment = ratio_num(GeneRatio) / ratio_num(BgRatio),
+      sig        = p.adjust < 0.05,
+      # drop = FALSE on the scale keeps a group's color fixed even when it contributes
+      # no significant term, so the two panels' legends mean the same thing.
+      analysis   = factor(analysis, levels = names(grp_colors_ora))
+    ) %>%
+    group_by(ID) %>% mutate(max_fe = max(fold_enrichment)) %>% ungroup() %>%
+    mutate(term_clean = fct_reorder(term_clean, max_fe))
+
+  p <- ggplot(plot_df, aes(x = fold_enrichment, y = term_clean, fill = analysis, alpha = sig)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    # Fold enrichment alone is unreadable without its counts: KEGG_RIBOSOME in the
+    # normoxia 3d-specific group is 24x, but that is 6 genes out of a 27-gene
+    # foreground. Label every bar with its GeneRatio. alpha/color set as fixed
+    # values here so the labels do not inherit the significance fade.
+    geom_text(aes(label = GeneRatio), position = position_dodge(width = 0.8),
+              hjust = -0.15, size = 2.8, color = "grey25", alpha = 1, show.legend = FALSE) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+    scale_fill_manual(values = grp_colors_ora, drop = FALSE) +
+    scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.35), guide = "none") +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.14))) +
+    labs(x = "Fold enrichment", y = NULL, fill = NULL, title = title_str,
+         subtitle = paste0("Dashed line = 1 (no enrichment); faded bars are padj >= 0.05",
+                           "\nbar labels = genes in term / foreground size",
+                           "\nbackground = all measured genes, n = ", n_bg,
+                           "; foreground n: ", n_lab)) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top")
+
+  # Carry the term count so the caller can size the file to the content instead of
+  # stretching a single-term panel over 7 inches.
+  attr(p, "n_terms") <- length(sig_terms)
+  p
+}
+
+ora_3grp_summary <- list()
+
+for (i in seq_len(nrow(ora_panels))) {
+  lab <- ora_panels$label[i]; slug <- ora_panels$slug[i]
+  cat("\n########", toupper(lab), "########\n")
+
+  d_ora <- read_csv(here(ora_panels$d_path[i]), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+  e_ora <- read_csv(here(ora_panels$e_path[i]), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = str_remove(gene_id, "\\..*"))
+
+  # Direction check: the siRNA depletes its own target, so rna_lfc must be strongly
+  # positive under log2(sictrl / siX). The 1+4hr si3e export carries TE columns only,
+  # so the si3e side is unverifiable there and is skipped explicitly, not silently.
+  stopifnot("EIF3D rna_lfc not positive" = d_ora$rna_lfc[d_ora$symbol == "EIF3D"][1] > 1)
+  cat(sprintf("  direction check: EIF3D rna_lfc = %+.2f", d_ora$rna_lfc[d_ora$symbol == "EIF3D"][1]))
+  if ("rna_lfc" %in% names(e_ora)) {
+    stopifnot("EIF3E rna_lfc not positive" = e_ora$rna_lfc[e_ora$symbol == "EIF3E"][1] > 1)
+    cat(sprintf(" | EIF3E rna_lfc = %+.2f\n", e_ora$rna_lfc[e_ora$symbol == "EIF3E"][1]))
+  } else {
+    cat(" | EIF3E: no rna_lfc column in this export, check skipped\n")
+  }
+
+  joined_ora <- d_ora %>%
+    dplyr::select(gene_id_clean, te_lfc_3d = te_lfc, te_padj_3d = te_padj) %>%
+    inner_join(e_ora %>% dplyr::select(gene_id_clean, te_lfc_3e = te_lfc, te_padj_3e = te_padj),
+               by = "gene_id_clean") %>%
+    mutate(sig = case_when(
+      te_padj_3d < 0.05 & te_lfc_3d > 0.5 & te_padj_3e < 0.05 & te_lfc_3e > 0.5 ~ "both",
+      te_padj_3d < 0.05 & te_lfc_3d > 0.5                                       ~ "3d only",
+      te_padj_3e < 0.05 & te_lfc_3e > 0.5                                       ~ "3e only",
+      TRUE                                                                      ~ "neither"
+    ))
+
+  sym_map_ora <- d_ora %>% dplyr::select(gene_id_clean, symbol) %>% distinct()
+  bg_ora <- d_ora %>% pull(symbol) %>% na.omit() %>% unique()
+  cat("  background genes:", length(bg_ora), "\n")
+
+  groups_ora <- map(grp_from_ora, function(g) {
+    joined_ora %>% filter(sig == g) %>%
+      left_join(sym_map_ora, by = "gene_id_clean") %>%
+      mutate(symbol = coalesce(symbol, gene_id_clean)) %>%
+      pull(symbol) %>% na.omit() %>% unique()
+  })
+  names(groups_ora) <- names(grp_from_ora)
+  for (n in names(groups_ora)) cat(sprintf("    %-12s foreground: %d genes\n", n, length(groups_ora[[n]])))
+  n_lab <- paste(sprintf("%s %d", names(groups_ora), lengths(groups_ora)), collapse = ", ")
+
+  for (db in c("kegg", "hallmark")) {
+    t2g <- if (db == "kegg") kegg_sets else hallmark_sets
+    cat("\n  ===", toupper(db), "ORA -", lab, "===\n")
+
+    res_ora <- map_dfr(names(groups_ora), function(n) {
+      # A foreground this small cannot support ORA; skip loudly rather than reporting
+      # a term driven by 2-3 genes.
+      if (length(groups_ora[[n]]) < 5) {
+        cat(sprintf("    %-12s skipped (only %d genes)\n", n, length(groups_ora[[n]])))
+        return(NULL)
+      }
+      run_ora_bg(groups_ora[[n]], t2g, n, bg_ora)
+    })
+
+    for (n in names(groups_ora)) {
+      n_sig <- sum(res_ora$p.adjust[res_ora$analysis == n] < 0.05)
+      cat(sprintf("    %-12s significant terms (padj < 0.05): %d\n", n, n_sig))
+      ora_3grp_summary[[paste(slug, db, n)]] <- tibble(
+        panel = lab, db = db, group = n,
+        n_foreground = length(groups_ora[[n]]), n_sig_terms = n_sig
+      )
+      if (n %in% res_ora$analysis) {
+        write_csv(filter(res_ora, analysis == n),
+                  here(sprintf("output/24_ora_%s_%s_%s.csv", db, grp_tag_ora[[n]], slug)))
+      }
+    }
+
+    top_ora <- res_ora %>% filter(p.adjust < 0.05) %>% arrange(analysis, p.adjust) %>%
+      group_by(analysis) %>% slice_head(n = 8) %>% ungroup() %>%
+      dplyr::select(analysis, ID, GeneRatio, BgRatio, p.adjust)
+    if (nrow(top_ora) > 0) print(as.data.frame(top_ora), row.names = FALSE, digits = 3)
+
+    p_ora_3grp <- make_ora_plot_3grp(
+      res_ora,
+      if (db == "kegg") "^KEGG_" else "^HALLMARK_",
+      sprintf("%s ORA, eIF3d/eIF3e target groups, %s", if (db == "kegg") "KEGG" else "Hallmark", lab),
+      length(bg_ora), n_lab
+    )
+    if (!is.null(p_ora_3grp)) {
+      print(p_ora_3grp)
+      ggsave(here(sprintf("plots/24_ora_%s_3groups_%s.pdf", db, slug)),
+             p_ora_3grp, width = 10,
+             height = max(3.5, 2.2 + 0.9 * attr(p_ora_3grp, "n_terms")))
+    }
+  }
+}
+
+ora_3grp_summary <- bind_rows(ora_3grp_summary)
+print(as.data.frame(ora_3grp_summary), row.names = FALSE)
+write_csv(ora_3grp_summary, here("output/24_ora_3groups_summary.csv"))
+```
+
 ## eIF3d hypoxia-specific promoters (not normoxia, not eIF3e-regulated)
 
 Genes promoted by eIF3d at 1hr hypoxia, excluding:
