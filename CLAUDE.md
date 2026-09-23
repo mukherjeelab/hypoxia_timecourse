@@ -164,6 +164,92 @@ TE medians stay near zero (normoxia 0.109 → 0.164) because the ratio cancels t
 
 **Codon analysis: use bg-RSCU, not raw codon frequency, to test synonymous preference.** `codon_freq_AAA` and `codon_freq_AAG` both rise with lysine content, so raw-frequency features are dominated by amino-acid composition and report "same direction" whether or not a synonymous preference exists. `bg_rscu_*` is normalized within each synonymous family, so its SHAP direction isolates wobble choice. In the si3d hypoxia 1hr contrast these dissociate cleanly: raw frequency tracks codon positions 1–2 (ρ = −0.39, amino-acid identity) while bg-RSCU tracks position 3 (ρ = −0.67, synonymous choice). Aggregate `gc3` cannot substitute — it is 0.93-correlated with `cds_gc`, 0.66 with `gc1` via isochore structure, and nets out opposing within-family preferences.
 
+## Translational Control Overview (`code/translational_control_overview/`)
+
+A **fork** of the notebook-07 modelling question, built to run across many datasets.
+`code/predictive_modeling/07*` is **frozen** and remains the reproducible baseline; nothing
+here writes to `output/predictive_modeling/`. Outputs go to
+`output/translational_control_overview/`.
+
+| Notebook | Role |
+|---|---|
+| `00_feature_reconciliation.Rmd` | audit of our features vs the collaborator repo; writes `feature_inventory_comparison.csv` |
+| `01_build_feature_matrix.Rmd` | single builder -> `feature_matrix_tco.rds` + **`feature_annotation.csv`** |
+| `02_rf_model.Rmd` | fork of 07, driven by `include_blocks` instead of eight `feature_set` branches |
+| `02b_neg_subsample_sweep.R` | renders 02 across 20 `neg_seed` x 2 variant sets (~4.4 min) |
+| `02c_sweep_stability.Rmd` | reports the sweep; **the null band any claim must clear** |
+
+**`feature_annotation.csv` is the central artifact.** One row per column, with `block`
+(`id` / `label` / `qc` / `intrinsic` / `external` / `eif4e`), `family` (for exact SHAP
+summation, since SHAP is additive), and `variant`. Feature selection is a join against this
+table, not a regex cascade. Editing the CSV changes what the model sees.
+
+**Two gates, both asserted, both currently green.** `01_` checks that the block join
+reproduces notebook 07's 51 features exactly; `02_` checks that the resulting importance
+matches the frozen baseline CSV (max deviation 3.6e-15). The second runs only under
+`variant_set = "current"`, which is why superseded columns are **kept rather than deleted** -
+dropping them would make the baseline permanently unreproducible. Reproduction requires
+matching 07's **RNG call sequence and column order**, not just its logic: `sample()` must be
+the only RNG consumer after `set.seed(neg_seed)`, and ranger sees `train_data[, feature_cols]`,
+so reordering columns changes the forest even with identical seeds.
+
+**Variant pairs.** A corrected feature is added *alongside* the one it supersedes, never over
+it, and `02_`'s `variant_set` param (`"current"` | `"corrected"`, default `"corrected"`) picks
+one member of each pair. The two members are near-duplicates and must never enter the same
+forest, where they would split credit and hide the effect being measured.
+
+| current | corrected | change |
+|---|---|---|
+| `kozak_pwm_score` | `kozak_pwm_score_v2` | published Kozak 1987 PWM; see the bug note below |
+| `gc3` | `gc3_internal` | initiator and stop codon removed |
+| `cai` / `fop` | `cai_internal` / `fop_internal` | initiator AUG removed |
+| `csc` | `csc_internal` | iCodon given the internal-codon CDS, not the stop-containing one |
+| `tai` | `tai_gtrnadb` | collaborator's GtRNAdb copy number + explicit wobble table |
+
+**Always judge a change against the sweep, never against a single run.** Notebook 02 keeps
+every positive and draws a size-matched negative class, so one run reports the AUC and ranking
+of *one arbitrary draw*. On this model the draw alone moves test AUC by **0.069**
+(sd 0.0165, median 0.807). `neg_seed` seeds **only** the draw - split, forest and CV stay
+pinned at 9 - so the sweep is **paired**: within a seed both variant sets see identical genes,
+and the paired-difference sd (0.0029) is ~6x smaller than the draw-to-draw sd (0.0166). Effects
+invisible in a distribution comparison are readable when paired.
+
+## Findings that affect the EXISTING pipeline
+
+These are defects in `code/predictive_modeling/`, found by the reconciliation above. They are
+fixed only in the fork; the original notebooks are unchanged.
+
+**`kozak_pwm_score` is wrong (`01h_`).** The hand-typed Kozak 1987 matrix has `G = 0.13` at
+position -3; the published table and our own transcripts both give 0.36-0.41. Position -3 is
+the **purine** position (the R in GCCRCCATGG), so the PWM penalises G by 0.93 bits while
+`match_kozak()` in the same notebook scores `[AG]` as equivalent - the two Kozak features
+contradict each other for ~40% of transcripts. Position -6 is also wrong (argmax T, should be
+G). **The existing tier-monotonicity check cannot detect this** and passes under both matrices,
+because tiers are set mostly by +4 and by `[CT]`-vs-`[AG]`, so a within-tier error cancels in
+the tier means. Any PWM/tier feature needs a **within-tier** check. Practical impact on the
+si3d hypoxia 1hr model: none, because the feature ranks 31 of 51.
+
+**`csc` partly encodes stop-codon identity (`01g_`).** iCodon is given the stop-containing CDS.
+Removing the stop gives r = 0.939 and shifts the median 0.116 -> -0.015. Impact is **real and
+verified over 20 draws**: `csc` falls from median rank 3.5 to 10.0 with **non-overlapping**
+rank ranges (2-6 vs 7-12) and a -1.35 pp share drop that is negative in 20/20 seeds. `tai`
+falls similarly (-0.30 pp, 20/20). Test AUC is unaffected. CAI and FOP already excluded stops
+and barely move (r ~ 0.999). Treat published `csc` rankings with this in mind.
+
+**118 transcripts carry truncated CDS.** GENCODE `cds_end_NF`: the CDS starts at ATG but the
+annotation runs out, so there is no terminal stop. 65 are not divisible by 3 and `01g_`'s
+`%%3` filter already drops them, but **53 are in-frame and pass every existing filter**,
+receiving full `cai`/`tai`/`csc`/`fop` on an incomplete CDS (their `gc3` median is 48.9 vs
+57.2). The right mask is a **missing terminal stop**, not a bad frame. A separate 25
+transcripts start with a non-AUG codon (24 tagged `non_ATG_start`, 17 MANE Select) - these are
+**real biology, keep them**; only their Kozak score is meaningless.
+
+**Never transcribe reference values.** Import the file and parse constants from source, then
+assert the parse reproduces the already-saved feature column. `00_` does this for the `01h_`
+matrix (deviation exactly 0 over 10,140 transcripts) and `01_` does it for CAI/FOP against
+`01g_` (max deviation 0). Collaborator reference tables are mirrored byte-for-byte in
+`accessories/collaborator_reference/`.
+
 ## Integrating External Data from Papers
 
 Before incorporating any dataset from a published paper into the feature matrix or analysis code, first verify that the data reproduces a key result from that paper. This protects against using the wrong file, a misread column, or a pre/post-processing mismatch that would silently corrupt downstream models.
@@ -208,6 +294,9 @@ Established examples (copy/adapt for new notebooks):
 - **Ribosomal proteins have above-median CAI**: `median(ribo_cai) > median(all_cai)` (`01g_`)
 - **CTG is optimal Leu codon**: `w["CTG"] == 1` (`01g_`)
 - **Kozak PWM monotonicity**: mean PWM increases tier 0 → 3 (`01h_`, `43_`)
+- **Kozak within-tier purine check**: inside tier 2, mean PWM for A-at-−3 vs G-at-−3 must
+  differ by < 0.75 bits. Between-tier monotonicity passes even on a wrong matrix; this is
+  the check that catches it
 - **GC3 median in [40, 65]%** (`01_`, `43_`)
 
 Both check types must be present. `cat()` summaries are informative but are not substitutes for `stopifnot()`.

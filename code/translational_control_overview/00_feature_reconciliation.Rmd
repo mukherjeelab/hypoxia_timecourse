@@ -1,0 +1,526 @@
+---
+title: "Feature reconciliation: this repo vs 2026_TranslationResponseFeatureAnalysis"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Audit only. This notebook computes **no new features** and writes **no feature matrix**. It
+compares our feature definitions against the collaborator repo
+`mukherjeelab/2026_TranslationResponseFeatureAnalysis` and produces the discrepancy table that
+drives `01_build_feature_matrix.Rmd`.
+
+Two levels of comparison:
+
+1. **Name level** - which features exist on each side.
+2. **Value level** - for quantities both sides compute, recompute ours under *their* definition
+   and measure the disagreement. A feature that is nominally shared but disagrees numerically is
+   the failure a name-level audit cannot see.
+
+The collaborator pipeline has never been run end to end, so there are no computed values to
+pull. What we take from it is the **published reference tables** (checked into their repo,
+mirrored here under `accessories/collaborator_reference/`) and their scoring logic.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r load_data}
+features <- readRDS(here("output", "predictive_modeling",
+                         "feature_matrix_dhx29_kd_feature.rds"))
+seqs     <- readRDS(here("output", "predictive_modeling",
+                         "precomputed_kozak_sequences.rds"))
+
+ref_dir <- here("accessories", "collaborator_reference")
+
+cat("Feature matrix:", nrow(features), "transcripts x", ncol(features), "columns\n")
+
+# Restrict sequences to the transcripts actually in the feature matrix, so every
+# number below describes the modelled set rather than the full annotation.
+utr5 <- seqs$utr5_seq %>% filter(transcript_id_clean %in% features$transcript_id_clean)
+cds  <- seqs$cds_seq  %>% filter(transcript_id_clean %in% features$transcript_id_clean)
+
+stopifnot(
+  "not every feature-matrix transcript has a 5'UTR sequence" =
+    nrow(utr5) == nrow(features),
+  "not every feature-matrix transcript has a CDS sequence" =
+    nrow(cds) == nrow(features)
+)
+cat("Sequences available for all", nrow(cds), "modelled transcripts\n")
+```
+
+# 1. Reference tables: provenance and replication
+
+Each external table is checked against a published quantity **before** it is used anywhere,
+per the project convention for incorporating data from papers.
+
+```{r reference_tables}
+kozak_pub <- read_tsv(file.path(ref_dir, "kozak_1987_table1_frequencies.tsv"),
+                      show_col_types = FALSE)
+noderer   <- read_tsv(file.path(ref_dir, "noderer_2014_tis_efficiency.tsv"),
+                      skip = 1, show_col_types = FALSE)   # line 1 is the table caption
+cridge    <- read_tsv(file.path(ref_dir, "cridge2018_termination_contexts.tsv"),
+                      show_col_types = FALSE)
+
+# Kozak 1987 (NAR 15:8125) Table 1 - 7 variable positions, frequencies sum to 1 per position
+stopifnot(
+  "Kozak table is not 7 positions"        = nrow(kozak_pub) == 7,
+  "Kozak frequencies do not sum to 1"     =
+    all(abs(rowSums(kozak_pub[, c("A_frequency","C_frequency",
+                                  "G_frequency","T_frequency")]) - 1) < 1e-8)
+)
+cat("Kozak 1987: 7 positions, all rows sum to 1.00\n")
+
+# Noderer 2014 (MSB 10:748) Table S2 - all 65,536 -6..+5 contexts, efficiency 12-150
+stopifnot(
+  "Noderer table is not 65,536 contexts"  = nrow(noderer) == 65536L,
+  "Noderer contexts are not 11 nt"        = all(nchar(noderer$sequence) == 11L),
+  "Noderer efficiency outside 12-150"     =
+    all(noderer$efficiency >= 12 & noderer$efficiency <= 150)
+)
+cat("Noderer 2014:", nrow(noderer), "contexts, efficiency range",
+    paste(range(noderer$efficiency), collapse = "-"), "\n")
+
+# Cridge 2018 (NAR 46:1927) Table S1 - 3 stops x 64 triplets, paper median ~0.087%
+cridge_median <- median(cridge$readthrough_measure)
+stopifnot(
+  "Cridge table is not 192 contexts"      = nrow(cridge) == 192L,
+  "Cridge median readthrough off"         = between(cridge_median, 0.08, 0.095),
+  "Cridge readthrough not a percentage"   =
+    all(cridge$readthrough_measure > 0 & cridge$readthrough_measure < 5)
+)
+cat("Cridge 2018:", nrow(cridge), "contexts, median readthrough",
+    round(cridge_median, 4), "% (paper: ~0.087%)\n")
+```
+
+# 2. Kozak PWM: a confirmed error in `01h_`
+
+`01h_feature_extraction_kozak.Rmd` builds its position frequency matrix by hand. Comparing it
+against the published Kozak 1987 Table 1 **and** against the base frequencies observed in our
+own transcripts gives an independent, three-way check.
+
+```{r kozak_windows}
+# Rebuild the Kozak window exactly as 01h_ does: last 6 nt of 5'UTR + first 4 nt of CDS.
+kozak_win <- inner_join(utr5, cds, by = "transcript_id_clean") %>%
+  mutate(
+    utr5_len  = nchar(utr5_sequence),
+    utr5_tail = str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),
+    cds_head  = str_sub(cds_sequence, 1, 4),
+    window    = paste0(utr5_tail, cds_head)
+  ) %>%
+  filter(nchar(window) == 10L)
+
+# 01h_ never checks that the window is anchored on a real AUG. Transcripts whose annotated
+# CDS does not begin with ATG still receive a score, on a window that is not a start context.
+kozak_win <- kozak_win %>% mutate(anchored = str_sub(window, 7, 9) == "ATG")
+
+cat("10-nt windows:", nrow(kozak_win), "\n")
+cat("NOT anchored on ATG:", sum(!kozak_win$anchored),
+    sprintf("(%.2f%%) - these should be NA, 01h_ scores them anyway\n",
+            100 * mean(!kozak_win$anchored)))
+
+kozak_ok <- kozak_win %>% filter(anchored)
+```
+
+```{r kozak_pwm_three_way}
+# Window index of each scored position: -6..-1 are chars 1-6, +4 is char 10.
+win_idx <- c("-6" = 1, "-5" = 2, "-4" = 3, "-3" = 4, "-2" = 5, "-1" = 6, "+4" = 10)
+
+# Parse the in-use matrix straight out of 01h_'s source rather than restating it here.
+# Re-typing a matrix by hand is what produced the defect this section documents, so the
+# audit must not repeat it. Section 2b then proves the parse is faithful.
+kozak_src <- read_lines(here("code", "predictive_modeling",
+                             "01h_feature_extraction_kozak.Rmd"))
+mat_start <- grep("^kozak_pwm <- matrix\\(", kozak_src)
+stopifnot("could not locate the kozak_pwm matrix in 01h_" = length(mat_start) == 1)
+mat_end   <- grep("^\\)$|byrow = TRUE", kozak_src)
+mat_end   <- min(mat_end[mat_end > mat_start])
+
+pwm_nums <- kozak_src[mat_start:mat_end] %>%
+  str_remove("#.*$") %>%                       # drop the trailing position comments
+  str_extract_all("[0-9]*\\.[0-9]+") %>%
+  unlist() %>%
+  as.numeric()
+
+stopifnot("expected 28 frequencies (7 positions x 4 bases) in 01h_" =
+            length(pwm_nums) == 28L)
+
+pwm_ours <- matrix(pwm_nums, nrow = 7, byrow = TRUE,
+  dimnames = list(c("-6","-5","-4","-3","-2","-1","+4"), c("A","C","G","T")))
+
+stopifnot("parsed 01h_ matrix rows do not sum to 1" =
+            all(abs(rowSums(pwm_ours) - 1) < 1e-8))
+cat("Parsed the in-use PWM from 01h_ source; all 7 rows sum to 1.00\n")
+
+# Key on context_index (1-6 and 10), which is the window position directly. The `position`
+# column reads as a number ("+4" -> 4), so it is not safe as a row name.
+stopifnot("unexpected Kozak context_index set" =
+  setequal(kozak_pub$context_index, c(1:6, 10)))
+
+pwm_publ <- kozak_pub %>%
+  arrange(match(context_index, win_idx)) %>%
+  dplyr::select(A = A_frequency, C = C_frequency,
+                G = G_frequency, T = T_frequency) %>%
+  as.matrix()
+rownames(pwm_publ) <- names(win_idx)
+stopifnot("published PWM rows misaligned" =
+  identical(rownames(pwm_publ), rownames(pwm_ours)))
+
+# Base frequencies actually observed at each window position in our own transcripts
+pwm_obs <- t(sapply(win_idx, function(i) {
+  tab <- table(factor(str_sub(kozak_ok$window, i, i), levels = c("A","C","G","T")))
+  as.numeric(tab) / sum(tab)
+}))
+colnames(pwm_obs) <- c("A","C","G","T")
+
+three_way <- map_dfr(rownames(pwm_ours), function(p) {
+  tibble(position = p, base = c("A","C","G","T"),
+         ours = pwm_ours[p, ], published = pwm_publ[p, ], observed = pwm_obs[p, ])
+})
+
+cat("Argmax base per position (ours / published / observed in our data):\n")
+three_way %>%
+  group_by(position) %>%
+  summarise(ours      = base[which.max(ours)],
+            published = base[which.max(published)],
+            observed  = base[which.max(observed)],
+            .groups = "drop") %>%
+  mutate(position = factor(position, levels = rownames(pwm_ours))) %>%
+  arrange(position) %>%
+  mutate(ours_agrees = ours == published) %>%
+  print()
+```
+
+## 2b. Is the parsed matrix the one actually in use?
+
+The parse above is only trustworthy if scoring with it reproduces the `kozak_pwm_score` column
+that `01h_` already wrote to disk. This closes the loop: nothing about the in-use matrix is
+taken on trust, and a mis-parse fails here rather than propagating into the conclusions.
+
+```{r kozak_parse_verification}
+lo <- function(m) log2((m + 0.001) / 0.25)    # 01h_'s pseudocount
+
+score_pwm <- function(windows, pwm) {
+  logodds <- lo(pwm)
+  mat <- str_split_fixed(windows, "", 10)
+  rowSums(sapply(seq_along(win_idx), function(k) {
+    logodds[names(win_idx)[k], mat[, win_idx[k]]]
+  }))
+}
+
+saved_kozak <- readRDS(here("output", "predictive_modeling", "feature_matrix_kozak.rds")) %>%
+  dplyr::select(transcript_id_clean, kozak_pwm_score)
+
+# 01h_ scores every window of >= 10 nt, anchored on AUG or not, so verify against all of them.
+verify <- kozak_win %>%
+  mutate(rescored = score_pwm(window, pwm_ours)) %>%
+  inner_join(saved_kozak, by = "transcript_id_clean") %>%
+  filter(!is.na(kozak_pwm_score))
+
+max_dev <- max(abs(verify$rescored - verify$kozak_pwm_score))
+cat("Rescored vs saved kozak_pwm_score: n =", nrow(verify),
+    ", max |deviation| =", signif(max_dev, 3), "\n")
+
+stopifnot("parsed PWM does not reproduce the saved kozak_pwm_score column" =
+            max_dev < 1e-8)
+cat("Verified: the parsed matrix is the one that produced the feature on disk\n")
+```
+
+The published table and the frequencies observed in our own transcripts agree at every
+position. Our hand-typed matrix does not.
+
+```{r kozak_minus3}
+cat("\nPosition -3, the most informative position:\n")
+three_way %>% filter(position == "-3") %>%
+  dplyr::select(base, ours, published, observed) %>% print()
+
+gap_ours <- lo(pwm_ours)["-3","A"] - lo(pwm_ours)["-3","G"]
+gap_publ <- lo(pwm_publ)["-3","A"] - lo(pwm_publ)["-3","G"]
+
+n_g3 <- sum(str_sub(kozak_ok$window, 4, 4) == "G")
+cat(sprintf("\nA-vs-G log-odds gap at -3:  ours %.2f bits,  published %.2f bits\n",
+            gap_ours, gap_publ))
+cat(sprintf("Transcripts with G at -3: %d (%.1f%%)\n",
+            n_g3, 100 * n_g3 / nrow(kozak_ok)))
+```
+
+Position -3 is the **purine** position - the R in the GCC**R**CCATGG consensus, where A and G
+are both favourable. `01h_`'s own `match_kozak()` encodes this correctly, scoring `[AG]` as
+equivalent. Its PWM does not: it penalises G at -3 while rewarding A, so the two Kozak features
+in the same notebook contradict each other at the position that matters most.
+
+```{r kozak_impact}
+# Rescore every window under both matrices and measure the damage.
+# score_pwm() and lo() are defined in the verification chunk above.
+
+# 01h_'s ordinal tier, reproduced so the within-tier check below is exact
+match_kozak <- function(seq) {
+  if (grepl("^(GCCACC|GCCGCC)ATGG$", seq)) return(3L)
+  if (grepl("^...[AG]..ATGG$", seq))       return(2L)
+  if (grepl("^...[AG]..ATG[ACT]$", seq))   return(1L)
+  if (grepl("^...[CT]..ATGG$", seq))       return(1L)
+  0L
+}
+
+kozak_cmp <- kozak_ok %>%
+  mutate(
+    pwm_ours  = score_pwm(window, pwm_ours),
+    pwm_publ  = score_pwm(window, pwm_publ),
+    tier      = map_int(window, match_kozak),
+    base_m3   = str_sub(window, 4, 4)
+  )
+
+cat("Correlation between the two scorings: r =",
+    round(cor(kozak_cmp$pwm_ours, kozak_cmp$pwm_publ), 3),
+    ", n =", nrow(kozak_cmp), "\n")
+
+# The check that would have caught this. The existing tier-monotonicity check passes under
+# BOTH matrices, because tiers are set mostly by +4 and by [CT]-vs-[AG]: a within-tier error
+# at -3 cancels in the tier means. Comparing A-at--3 against G-at--3 INSIDE a tier does not.
+cat("\nWithin tier 2 ('strong' = [AG] at -3, G at +4), mean PWM by base at -3:\n")
+within_tier <- kozak_cmp %>%
+  filter(tier == 2L, base_m3 %in% c("A", "G")) %>%
+  group_by(base_m3) %>%
+  summarise(n = n(), mean_ours = mean(pwm_ours),
+            mean_published = mean(pwm_publ), .groups = "drop")
+print(within_tier)
+
+spread_ours <- diff(rev(within_tier$mean_ours))
+spread_publ <- diff(rev(within_tier$mean_published))
+cat(sprintf("\nA-minus-G spread within one tier: ours %.2f bits, published %.2f bits\n",
+            abs(spread_ours), abs(spread_publ)))
+cat("Both matrices pass the existing 'mean PWM increases tier 0->3' check;\n")
+cat("only the within-tier comparison separates them.\n")
+```
+
+```{r kozak_plot, fig.width = 7, fig.height = 6}
+p_kozak <- three_way %>%
+  mutate(position = factor(position, levels = rownames(pwm_ours))) %>%
+  pivot_longer(c(ours, published, observed),
+               names_to = "source", values_to = "freq") %>%
+  mutate(source = factor(source, levels = c("ours", "published", "observed"),
+                         labels = c("01h_ hand-typed", "Kozak 1987 Table 1",
+                                    "observed in our transcripts"))) %>%
+  ggplot(aes(x = base, y = freq, fill = source)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ position, nrow = 2) +
+  scale_fill_manual(values = c("01h_ hand-typed" = "#D55E00",
+                               "Kozak 1987 Table 1" = "#0072B2",
+                               "observed in our transcripts" = "grey70"),
+                    name = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom") +
+  labs(title = "Kozak position frequency matrix: hand-typed vs published vs observed",
+       subtitle = paste0("n = ", nrow(kozak_ok), " AUG-anchored windows"),
+       x = "Base", y = "Frequency")
+
+print(p_kozak)
+ggsave(here("plots", "00_kozak_pwm_three_way.pdf"), p_kozak, width = 7, height = 6)
+```
+
+**Resolution:** replace the hand-typed matrix with `kozak_1987_table1_frequencies.tsv`, NA the
+windows that are not AUG-anchored, and add the within-tier purine check to `01_`.
+
+# 3. GC content: units and denominator
+
+```{r gc_audit}
+gc_ours <- function(seq) {                       # 01h_/01_ definition
+  seq <- str_to_upper(seq)
+  100 * str_count(seq, "[GC]") / str_length(seq) # denominator includes ambiguous bases
+}
+gc_theirs <- function(seq) {                     # collaborator definition
+  seq <- str_to_upper(seq)
+  canonical <- str_count(seq, "[ACGT]")          # ambiguous bases excluded
+  str_count(seq, "[GC]") / canonical             # fraction, not percent
+}
+
+gc_cmp <- cds %>%
+  transmute(transcript_id_clean,
+            ours   = gc_ours(cds_sequence),
+            theirs = gc_theirs(cds_sequence),
+            theirs_as_pct = 100 * theirs,
+            n_ambiguous   = str_count(str_to_upper(cds_sequence), "[^ACGT]"))
+
+cat("CDS GC, n =", nrow(gc_cmp), "\n")
+cat("  transcripts containing an ambiguous base:", sum(gc_cmp$n_ambiguous > 0), "\n")
+cat("  max absolute difference once units are matched:",
+    signif(max(abs(gc_cmp$ours - gc_cmp$theirs_as_pct)), 3), "percentage points\n")
+cat("  Pearson r =", round(cor(gc_cmp$ours, gc_cmp$theirs_as_pct), 6), "\n")
+```
+
+The denominator difference is immaterial in this annotation: GENCODE v49 CDS sequences are
+essentially free of ambiguous bases. **The units are not immaterial.** Ours is a percentage and
+theirs is a fraction, a factor of 100 that would silently corrupt any shared threshold.
+Keep percent (the project validation convention asserts GC in `[0, 100]`), and record the unit
+explicitly in `feature_annotation.csv`.
+
+# 4. GC3: the stop codon
+
+```{r gc3_audit}
+gc3_ours <- function(seqs) {          # 01_ definition: every codon, stop included
+  vapply(seqs, function(s) {
+    n <- nchar(s) %/% 3L
+    if (n < 1L) return(NA_real_)
+    starts <- seq.int(3L, n * 3L, 3L)
+    sum(substr(rep.int(s, n), starts, starts) %in% c("G", "C")) * 100 / n
+  }, numeric(1L), USE.NAMES = FALSE)
+}
+gc3_theirs <- function(seqs) {        # collaborator definition: sense codons only
+  vapply(seqs, function(s) {
+    n <- nchar(s) %/% 3L
+    if (n < 2L) return(NA_real_)
+    last <- substr(s, (n - 1L) * 3L + 1L, n * 3L)
+    n_sense <- if (last %in% c("TAA", "TAG", "TGA")) n - 1L else n
+    starts <- seq.int(3L, n_sense * 3L, 3L)
+    sum(substr(rep.int(s, n_sense), starts, starts) %in% c("G", "C")) / n_sense
+  }, numeric(1L), USE.NAMES = FALSE)
+}
+
+gc3_cmp <- cds %>%
+  transmute(transcript_id_clean,
+            ours   = gc3_ours(str_to_upper(cds_sequence)),
+            theirs = 100 * gc3_theirs(str_to_upper(cds_sequence))) %>%
+  mutate(diff = ours - theirs)
+
+cat("GC3, n =", sum(!is.na(gc3_cmp$diff)), "\n")
+cat("  Pearson r =", round(cor(gc3_cmp$ours, gc3_cmp$theirs, use = "complete.obs"), 6), "\n")
+cat("  median difference (ours - theirs):", round(median(gc3_cmp$diff, na.rm = TRUE), 4),
+    "percentage points\n")
+cat("  max |difference|:", round(max(abs(gc3_cmp$diff), na.rm = TRUE), 3), "\n")
+```
+
+Stop codons are TAA / TAG / TGA, so their third base is A, G or A. Including the stop therefore
+pulls GC3 down by a predictable amount that scales as `1 / n_codons` - largest for short CDSs,
+which is where it is least affordable. The effect is small but is a **bias, not noise**: it has a
+sign. Adopt the sense-codon definition and keep percent units.
+
+```{r gc3_plot, fig.width = 6, fig.height = 5}
+p_gc3 <- ggplot(gc3_cmp, aes(x = theirs, y = ours)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.15, size = 0.6, colour = "grey30") +
+  theme_classic(base_size = 12) +
+  labs(title = "GC3: stop codon included vs excluded",
+       subtitle = sprintf("Pearson r = %.5f, n = %d",
+                          cor(gc3_cmp$ours, gc3_cmp$theirs, use = "complete.obs"),
+                          sum(!is.na(gc3_cmp$diff))),
+       x = "GC3, sense codons only (%)", y = "GC3, stop codon included (%)")
+
+print(p_gc3)
+ggsave(here("plots", "00_gc3_stop_codon_definition.pdf"), p_gc3, width = 6, height = 5)
+```
+
+# 5. log2 length
+
+```{r log2_length_audit}
+len_cmp <- features %>%
+  filter(!is.na(cds_length), cds_length > 0) %>%
+  transmute(cds_length,
+            ours   = log2(cds_length + 1),   # our convention, applied to all three regions
+            theirs = log2(cds_length))       # theirs, for CDS only
+
+cat("log2 CDS length, n =", nrow(len_cmp), "\n")
+cat("  max |difference|:", signif(max(abs(len_cmp$ours - len_cmp$theirs)), 3), "\n")
+cat("  shortest CDS in the matrix:", min(len_cmp$cds_length), "nt\n")
+```
+
+Numerically negligible, and our convention is the better one: `+1` is applied uniformly to
+5'UTR, CDS and 3'UTR, whereas theirs uses `+1` for the UTRs but not the CDS. The `+1` is what
+makes a zero-length UTR representable at all, so dropping it only for the CDS buys nothing and
+costs internal consistency. **Keep ours.**
+
+# 6. RNA structure: a name collision, not a shared feature
+
+Both sides emit columns named `struct_accessibility_*` from RNAplfold with **identical window
+parameters** (`-W 150 -L 100`). They are nonetheless different quantities:
+
+| | ours | theirs |
+|---|---|---|
+| Folding unit | each region folded in isolation | whole spliced transcript, folded once |
+| Retained | unpaired probability per region, plus min / sd / structured-region counts | mean unpaired probability per region, plus low-accessibility window fractions |
+
+Because `-W 150` caps base pairing at a 150-nt span either way, the two can only diverge
+**within 150 nt of a region boundary** - a rounding error for long CDSs. Not so for 5'UTRs,
+which are frequently shorter than 200 nt: there the whole region sits inside the boundary zone
+and isolated folding imposes an artificial free 3' end exactly at the start codon.
+
+**Resolution:** keep ours (the richer summary), rename to `tco_struct_*` so the columns can
+never be silently equated with theirs, and record the 5'UTR caveat. No refolding. If
+`tco_struct_accessibility_cap_proximal` or `..._aug_context` reaches the top of a SHAP ranking,
+revisit before interpreting it.
+
+# 7. Inventory
+
+```{r inventory}
+inventory <- tribble(
+  ~feature_ours,              ~feature_theirs,                   ~quantity,                  ~status,              ~recommendation,
+  "kozak_pwm_score",          "kozak1987_logodds_score",          "Kozak context log-odds",   "definition_differs", "FIX: adopt published Kozak 1987 Table 1; current -3 and -6 rows are wrong",
+  "kozak_score",              "kozak_context_class",              "Kozak ordinal tier",       "match",              "keep ours; NA the non-AUG-anchored windows",
+  NA,                         "noderer2014_tis_efficiency",       "measured TIS efficiency",  "theirs_only",        "ADOPT; same family as Kozak, never model both together",
+  "gc3",                      "gc3_fraction",                     "GC at codon position 3",   "definition_differs", "FIX: exclude the stop codon; keep percent units",
+  "cds_gc",                   "cds_gc",                           "CDS GC content",           "definition_differs", "units only (percent vs fraction); keep percent, record the unit",
+  "utr5_gc",                  "utr5_gc",                          "5'UTR GC content",         "definition_differs", "as cds_gc",
+  "utr3_gc",                  "utr3_gc",                          "3'UTR GC content",         "definition_differs", "as cds_gc",
+  "transcript_gc",            "transcript_gc",                    "transcript GC content",    "definition_differs", "ours is a length-weighted mean of regions; theirs is direct. Keep ours, document",
+  "log2_cds_length",          "log2_cds_length",                  "log2 CDS length",          "definition_differs", "keep ours (+1 applied uniformly); theirs is internally asymmetric",
+  "log2_utr5_length",         "log2_utr5_length",                 "log2 5'UTR length",        "match",              "keep ours",
+  "log2_utr3_length",         "log2_utr3_length",                 "log2 3'UTR length",        "match",              "keep ours",
+  "struct_accessibility_*",   "struct_accessibility_*",           "RNAplfold accessibility",  "definition_differs", "NAME COLLISION: rename ours to tco_struct_*; keep ours; do not refold",
+  "csc",                      "icodon_human_stability_score",     "iCodon codon stability",   "match",              "same tool; verify by value in 01_",
+  "csc_q1..q4, csc_first75",  NA,                                 "positional CSC",           "ours_only",          "DROP: collapses the worst correlated block",
+  "cai",                      NA,                                 "codon adaptation index",   "ours_only",          "keep, whole-CDS only",
+  "fop",                      NA,                                 "fraction optimal codons",  "ours_only",          "keep, whole-CDS only",
+  "tai",                      "tai_genomic_internal",             "tRNA adaptation index",    "definition_differs", "ADOPT theirs: explicit wobble table + GtRNAdb gene copy number; keep ours alongside for one release to measure the shift",
+  NA,                         "termination_context_minus9_plus9", "stop codon context",       "theirs_only",        "ADOPT: new family, nothing equivalent here",
+  NA,                         "cridge2018_readthrough_plus4_to_plus6", "readthrough propensity", "theirs_only",   "ADOPT: 192-context published lookup",
+  NA,                         "proline_fraction, PPP_motif_density, max_net_charge_30aa, ...", "nascent peptide", "theirs_only", "ADOPT: pure sequence, no external data",
+  NA,                         "max_consecutive_AAA_lys_codons / AAG",  "CDS poly(A) tracks",  "theirs_only",        "ADOPT: keep AAA and AAG separate by design",
+  NA,                         "control_ribo_frame0_fraction, control_ribo_cds_coverage_fraction, ...", "detectability", "theirs_only", "ADOPT as a separate 'technical' block",
+  "g4mer_*",                  NA,                                 "G-quadruplex propensity",  "ours_only",          "MERGE: already built, currently unused",
+  "clip_*",                   NA,                                 "eIF3 CLIP binding",        "ours_only",          "keep as 'external' block",
+  "zhu2024_*, hia2026_*, karner2026_*", NA,                        "SLAM-seq / perturbation", "ours_only",          "keep as 'external' block"
+)
+
+out_dir <- here("output", "translational_control_overview")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+write_csv(inventory, file.path(out_dir, "feature_inventory_comparison.csv"))
+
+cat("Inventory rows:", nrow(inventory), "\n\n")
+inventory %>% count(status, name = "n") %>% arrange(desc(n)) %>% print()
+
+stopifnot(
+  "unrecognised status value" =
+    all(inventory$status %in% c("match", "definition_differs", "ours_only", "theirs_only")),
+  "a row has neither side named" =
+    all(!(is.na(inventory$feature_ours) & is.na(inventory$feature_theirs)))
+)
+cat("\nWritten to", file.path(out_dir, "feature_inventory_comparison.csv"), "\n")
+```
+
+# Summary
+
+**One real bug.** `kozak_pwm_score` uses a hand-typed matrix that is wrong at -3 and -6.
+Position -3 is the purine position; the published table gives G a frequency of 0.36 and our own
+transcripts show 0.36, but `01h_` has 0.13. The result penalises G at -3 by 0.93 bits while
+`match_kozak()` in the same notebook treats it as favourable - the two Kozak features
+contradict each other for roughly a third of transcripts. The existing tier-monotonicity check
+passes under both matrices and cannot detect this; a within-tier purine comparison can, and is
+added to `01_`.
+
+**Three definition fixes**, all small and all signed rather than random: GC3 should exclude the
+stop codon, GC units must be recorded as percent, and non-AUG-anchored Kozak windows should be
+NA rather than scored.
+
+**Two places where ours is better** and stays: `log2_*_length` (uniform `+1`) and the structure
+features (richer per-region summary). The structure columns are renamed `tco_struct_*` because
+the names collide with a different quantity.
+
+**Five families to adopt** and one to merge, listed in the inventory.

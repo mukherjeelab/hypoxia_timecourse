@@ -1,0 +1,419 @@
+---
+title: "`r paste0('RF: eIF', params$gene, ' ', params$direction, ' (', params$condition, ', ', params$timepoint, ', LFC ', params$lfc, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  readout: "TE"
+  timepoint: "1hr"
+  lfc: "0.5"
+  include_blocks: "intrinsic,external"
+  clip_mode: "aggregate"
+  neg_geneset_csv: ""
+  matrix_rds: "feature_matrix_tco.rds"
+  feature_set_label: "tco"
+  variant_set: "corrected"
+  include_deprecated: FALSE
+  exclude_families: ""
+  shuffle_families: ""
+  neg_seed: 9
+  neg_tag: ""
+  save_plots: TRUE
+  gate_against_baseline: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Fork of `07_rf_classification_eif3d_targets_no_boruta.Rmd` for
+`code/translational_control_overview/`. Notebook 07 is frozen and remains the reproducible
+baseline; nothing here writes to `output/predictive_modeling/`.
+
+Two deliberate differences from 07, and no others:
+
+1. **One params block.** The YAML above is the only source of truth. Notebook 07 carries a
+   second, *disagreeing* set of interactive defaults, so knitting it gives a 56-feature
+   `external_stability` model while running it chunk-by-chunk gives a 51-feature
+   `dhx29_kd_feature` model. That trap is removed here.
+2. **`include_blocks` replaces the `feature_set` branches.** Feature selection is a join
+   against `feature_annotation.csv` from `01_`, not a cascade of eight `if (feature_set == ...)`
+   clauses and regexes.
+
+Everything about the *model* is deliberately identical to 07: the same negative draw, the same
+split, the same ranger call, the same seeds.
+
+## Reproducing the baseline is a constraint, not an aspiration
+
+`gate_against_baseline` asserts that the resulting importance equals the frozen baseline run
+exactly. It runs only under `variant_set = "current"`, which is why the superseded columns are
+**kept in the matrix rather than deleted**: dropping them would make the baseline permanently
+unreproducible. The default is `variant_set = "corrected"`; re-gating needs
+`variant_set = "current"` **and** `include_deprecated = TRUE`, since the baseline predates the
+positional-CSC deprecation. That requires replicating 07's **RNG call sequence**, not merely its logic:
+
+- Between `set.seed(neg_seed)` and the negative draw, `sample()` must be the only RNG consumer,
+  and must be called on the same vector with the same `n`.
+- `ranger` sees `train_data[, feature_cols]`, so **column order changes tree construction**.
+  `feature_cols` must stay in feature-matrix order.
+
+A tidier rewrite that reorders either would produce a different-but-equally-valid model and
+fail the gate for no real reason. Once the gate passes, every later difference is attributable
+to the feature change that caused it.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+```
+
+```{r derived_values}
+NEG_SEED <- as.integer(params$neg_seed)
+stopifnot("neg_tag must be alphanumeric/underscore" =
+            params$neg_tag == "" || grepl("^[A-Za-z0-9_]+$", params$neg_tag))
+
+include_blocks <- str_trim(str_split(params$include_blocks, ",")[[1]])
+stopifnot("include_blocks must name real blocks" =
+            all(include_blocks %in% c("intrinsic", "external", "eif4e", "technical")))
+
+pos_label <- params$direction
+neg_label <- paste0("does_not_", sub("s$", "", params$direction))
+
+suffix <- paste0(
+  "eif3", params$gene, "_", params$direction, "_",
+  if (params$readout != "TE") paste0(tolower(params$readout), "_") else "",
+  params$condition, "_", params$timepoint, "_lfc", params$lfc,
+  "_", params$feature_set_label,
+  if (params$variant_set != "current") paste0("_", params$variant_set) else "",
+  "_clip", params$clip_mode,
+  if (params$neg_tag != "") paste0("_", params$neg_tag) else "",
+  if (NEG_SEED != 9L) paste0("_negseed", NEG_SEED) else ""
+)
+
+out_dir <- here("output", "translational_control_overview")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
+
+cat("Suffix:", suffix, "\n")
+cat("Blocks included:", paste(include_blocks, collapse = ", "), "\n")
+```
+
+# Load
+
+```{r load_data}
+features   <- readRDS(file.path(out_dir, params$matrix_rds))
+annotation <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+
+stopifnot("annotation does not match the matrix" =
+            setequal(annotation$feature, colnames(features)))
+cat("Matrix:", nrow(features), "x", ncol(features), "\n")
+
+geneset_csv <- paste0(params$condition, "_", params$gene, "_", params$direction,
+                      "_", params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")
+positive_genes <- read_csv(here("output", "genesets", geneset_csv), show_col_types = FALSE)
+cat("Positive genes:", nrow(positive_genes), "from", geneset_csv, "\n")
+
+if (params$neg_geneset_csv != "") {
+  negative_control_genes <- read_csv(here("output", "genesets", params$neg_geneset_csv),
+                                     show_col_types = FALSE) %>%
+    mutate(gene_id_clean = ensembl_gene)
+  neg_file <- file.path("output/genesets", params$neg_geneset_csv)
+} else {
+  neg_csv  <- if (params$gene == "3e") "negative_control_genes_si3e.csv"
+              else "negative_control_genes.csv"
+  negative_control_genes <- read_csv(here("output", "predictive_modeling", neg_csv),
+                                     show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id))
+  neg_file <- file.path("output/predictive_modeling", neg_csv)
+}
+cat("Negative pool:", nrow(negative_control_genes), "from", neg_file, "\n")
+```
+
+# Target
+
+```{r create_target}
+# RNG contract: set.seed(NEG_SEED) seeds ONLY this draw. The split, the forest and the CV stay
+# pinned at 9, so across a seed sweep every difference is negative-class composition. The
+# sample() below must remain the only RNG consumer after the seed, in this order.
+set.seed(NEG_SEED)
+
+pos_in_features <- positive_genes %>%
+  filter(ensembl_gene %in% features$gene_id_clean)
+
+neg_in_features <- negative_control_genes %>%
+  filter(gene_id_clean %in% features$gene_id_clean)
+n_before <- nrow(neg_in_features)
+
+# Drop positives from the pool BEFORE sampling. The case_when below resolves the positive
+# branch first, so a sampled gene that is also positive would be relabelled positive and the
+# negative class would silently end up smaller than number_to_match.
+neg_in_features <- neg_in_features %>%
+  filter(!gene_id_clean %in% pos_in_features$ensembl_gene)
+if (n_before > nrow(neg_in_features))
+  cat("Removed", n_before - nrow(neg_in_features), "positives from the negative pool\n")
+
+stopifnot("negative pool still overlaps the positive set" =
+  length(intersect(neg_in_features$gene_id_clean, pos_in_features$ensembl_gene)) == 0)
+
+number_to_match <- min(nrow(pos_in_features), nrow(neg_in_features))
+
+if (nrow(neg_in_features) <= nrow(pos_in_features)) {
+  cat("NOTE: pool (", nrow(neg_in_features), ") is not larger than the positive set (",
+      nrow(pos_in_features), ") - the draw is degenerate and every neg_seed",
+      "selects the same genes.\n")
+} else {
+  cat("Drawing", number_to_match, "of", nrow(neg_in_features),
+      "pool genes with neg_seed =", NEG_SEED, "\n")
+}
+
+features <- features %>%
+  mutate(eif3d_target = case_when(
+    gene_id_clean %in% positive_genes$ensembl_gene ~ pos_label,
+    gene_id_clean %in% sample(neg_in_features$gene_id_clean, number_to_match) ~ neg_label,
+    TRUE ~ NA_character_
+  ))
+
+model_genes <- features %>%
+  filter(!is.na(eif3d_target)) %>%
+  mutate(eif3d_target = factor(eif3d_target, levels = c(neg_label, pos_label)))
+
+cat("Positive:", sum(model_genes$eif3d_target == pos_label),
+    " Negative:", sum(model_genes$eif3d_target == neg_label),
+    " Total:", nrow(model_genes), "\n")
+```
+
+# Select features
+
+```{r select_features}
+aggregate_clip <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                    "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                    "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment")
+
+# One member of each variant pair. The two members are near-duplicates (e.g. kozak_pwm_score
+# and kozak_pwm_score_v2); together in one forest they would split credit between themselves
+# and hide the very effect the correction is meant to expose.
+stopifnot("variant_set must be 'current' or 'corrected'" =
+            params$variant_set %in% c("current", "corrected"))
+sel <- annotation %>%
+  filter(block %in% include_blocks, variant %in% c("single", params$variant_set))
+
+# Deprecated features (positional CSC) are excluded unless explicitly asked for. The baseline
+# predates the deprecation, so re-gating needs include_deprecated = TRUE.
+# Drop whole families by name, so a new family's contribution can be isolated from other
+# changes made in the same pass.
+if (nzchar(params$exclude_families)) {
+  drop_fams <- str_trim(str_split(params$exclude_families, ",")[[1]])
+  stopifnot("exclude_families names an unknown family" = all(drop_fams %in% annotation$family))
+  n_drop <- sum(sel$family %in% drop_fams)
+  sel <- sel %>% filter(!family %in% drop_fams)
+  cat("Excluded", n_drop, "features from families:", paste(drop_fams, collapse = ", "), "\n")
+}
+
+if (!isTRUE(params$include_deprecated)) {
+  n_dep <- sum(sel$deprecated)
+  sel <- sel %>% filter(!deprecated)
+  if (n_dep > 0) cat("Excluded", n_dep, "deprecated features (positional CSC)\n")
+}
+
+if (params$clip_mode == "aggregate") {
+  sel <- sel %>% filter(!(family == "clip" & !feature %in% aggregate_clip))
+} else if (params$clip_mode == "individual") {
+  sel <- sel %>% filter(!(family == "clip" & feature %in% aggregate_clip))
+}
+
+# log2 versions are always present and preferred; keeping both splits importance across two
+# near-collinear columns.
+sel <- sel %>% filter(!str_detect(feature, "^(utr5|utr3|cds|total)_length$"))
+
+# Preserve feature-matrix column order: ranger's mtry sampling depends on it, so reordering
+# here would change the forest even with identical seeds.
+feature_cols <- colnames(features)[colnames(features) %in% sel$feature]
+
+# Sparse features inflate impurity importance, because median imputation manufactures a split
+# between real and imputed values.
+non_na <- map_dbl(feature_cols, ~ mean(!is.na(unlist(model_genes[[.x]]))))
+sparse <- feature_cols[non_na < 0.5]
+feature_cols <- setdiff(feature_cols, sparse)
+if (length(sparse))
+  cat("Dropped", length(sparse), "sparse features (<50% non-NA):",
+      paste(sparse, collapse = ", "), "\n")
+
+list_cols <- feature_cols[map_lgl(feature_cols, ~ is.list(model_genes[[.x]]))]
+for (col in list_cols) model_genes[[col]] <- as.numeric(unlist(model_genes[[col]]))
+
+cat("Features:", length(feature_cols), "\n")
+
+stopifnot(
+  "an outcome-derived column reached the feature set" =
+    !any(str_detect(feature_cols, "^te_lfc$|^te_padj$|^sig_|^indiv_te_|^delta_te_")),
+  "feature_cols is not in matrix column order" =
+    identical(feature_cols, colnames(features)[colnames(features) %in% feature_cols])
+)
+```
+
+# Split, impute, train
+
+```{r train_test_split}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, eif3d_target, all_of(feature_cols))
+
+# Shuffled-family null. Permuting a family's values across transcripts destroys its link to
+# the target while preserving every marginal distribution, the NA pattern and the correlation
+# structure WITHIN the family. Whatever importance the shuffled family still absorbs is what
+# a family of that size and shape gets for free - the floor a real family has to clear.
+# Impurity importance is non-negative, so an uninformative feature never scores zero.
+if (nzchar(params$shuffle_families)) {
+  shuf <- str_trim(str_split(params$shuffle_families, ",")[[1]])
+  stopifnot("shuffle_families names an unknown family" = all(shuf %in% annotation$family))
+  shuf_cols <- annotation$feature[annotation$family %in% shuf]
+  shuf_cols <- intersect(feature_cols, shuf_cols)
+  set.seed(NEG_SEED)                      # tied to the draw, so the sweep stays paired
+  perm <- sample(nrow(model_data))        # one permutation for all of them, preserving
+  for (cc in shuf_cols) model_data[[cc]] <- model_data[[cc]][perm]   # within-family structure
+  cat("SHUFFLED", length(shuf_cols), "features in families:", paste(shuf, collapse = ", "), "\n")
+}
+
+set.seed(9)
+train_idx  <- createDataPartition(model_data$eif3d_target, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+
+# Medians from the TRAINING split only, then applied to both.
+train_medians <- train_data %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~ median(., na.rm = TRUE)))
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  df
+}
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+
+cat("Train:", nrow(train_data), " Test:", nrow(test_data), "\n")
+cat("Remaining NAs:", sum(is.na(train_data[, feature_cols])),
+    "/", sum(is.na(test_data[, feature_cols])), "\n")
+```
+
+```{r train_rf}
+# Classes are pre-balanced by the draw, so no case weights.
+set.seed(9)
+rf_model <- ranger(
+  x = train_data[, feature_cols],
+  y = train_data$eif3d_target,
+  num.trees   = 500,
+  importance  = "impurity",
+  probability = TRUE,
+  seed        = 9
+)
+print(rf_model)
+```
+
+# Evaluate
+
+```{r evaluate}
+test_prob <- predict(rf_model, test_data[, feature_cols])$predictions[, pos_label]
+roc_obj   <- roc(response = test_data$eif3d_target, predictor = test_prob,
+                 levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+test_auc  <- as.numeric(auc(roc_obj))
+
+# Youden threshold from TRAINING OOB predictions, not from the test set.
+oob <- rf_model$predictions[, pos_label]
+roc_oob <- roc(response = train_data$eif3d_target, predictor = oob,
+               levels = c(neg_label, pos_label), direction = "<", quiet = TRUE)
+# coords() can return several tied Youden points; take the first so thresh is scalar.
+thresh <- as.numeric(coords(roc_oob, "best", best.method = "youden",
+                            ret = "threshold")[[1]])[1]
+stopifnot("Youden threshold is not scalar" = length(thresh) == 1L)
+
+cat("Test AUC:", round(test_auc, 4), " | OOB Youden threshold:", round(thresh, 4), "\n")
+```
+
+```{r cross_validation}
+set.seed(9)
+folds <- createFolds(model_data$eif3d_target, k = 5)
+cv_auc <- map_dbl(folds, function(idx) {
+  tr <- model_data[-idx, ]; te <- model_data[idx, ]
+  med <- tr %>% dplyr::select(all_of(feature_cols)) %>%
+    summarise(across(everything(), ~ median(., na.rm = TRUE)))
+  tr <- impute_with_medians(tr, med); te <- impute_with_medians(te, med)
+  fit <- ranger(x = tr[, feature_cols], y = tr$eif3d_target,
+                num.trees = 500, probability = TRUE, seed = 9)
+  p <- predict(fit, te[, feature_cols])$predictions[, pos_label]
+  as.numeric(auc(roc(te$eif3d_target, p, levels = c(neg_label, pos_label),
+                     direction = "<", quiet = TRUE)))
+})
+cat("5-fold CV AUC: mean", round(mean(cv_auc), 4), " sd", round(sd(cv_auc), 4), "\n")
+```
+
+# Importance
+
+```{r importance}
+importance_df <- tibble(
+  feature    = names(rf_model$variable.importance),
+  importance = as.numeric(rf_model$variable.importance)
+) %>%
+  left_join(annotation %>% dplyr::select(feature, family, block), by = "feature") %>%
+  arrange(desc(importance))
+
+print(head(importance_df, 20))
+```
+
+# Reproduction gate
+
+```{r gate, eval = params$gate_against_baseline && params$variant_set == "current" && params$include_deprecated}
+baseline_path <- here("output", "predictive_modeling",
+  paste0("rf_classification_importance_eif33d_promotes_hypoxia_1hr_lfc0.5_",
+         "dhx29_kd_feature_clipaggregate_no_boruta_no4e_noOwnTE.csv"))
+baseline <- read_csv(baseline_path, show_col_types = FALSE)
+
+cmp <- baseline %>%
+  dplyr::select(feature, importance_baseline = importance) %>%
+  inner_join(importance_df %>% dplyr::select(feature, importance_new = importance),
+             by = "feature")
+
+max_dev <- max(abs(cmp$importance_baseline - cmp$importance_new))
+cat("Gate: features", nrow(importance_df), "vs baseline", nrow(baseline),
+    "| matched", nrow(cmp), "\n")
+cat("Max |importance deviation|:", signif(max_dev, 4), "\n")
+cat("Spearman rank correlation:",
+    round(cor(cmp$importance_baseline, cmp$importance_new, method = "spearman"), 6), "\n")
+
+stopifnot(
+  "gate: feature set differs from the baseline" =
+    setequal(importance_df$feature, baseline$feature),
+  "gate: importance values differ from the baseline" = max_dev < 1e-8
+)
+cat("\nGATE PASSED: this fork reproduces the frozen baseline exactly\n")
+```
+
+# Export
+
+```{r export}
+saveRDS(rf_model, file.path(out_dir, paste0("rf_classifier_", suffix, ".rds")))
+write_csv(importance_df, file.path(out_dir, paste0("rf_importance_", suffix, ".csv")))
+
+write_csv(
+  tibble(metric = c("test_auc", "cv_auc_mean", "cv_auc_sd", "n_features",
+                    "n_train", "n_test", "n_pos", "n_neg", "oob_threshold"),
+         value  = c(test_auc, mean(cv_auc), sd(cv_auc), length(feature_cols),
+                    nrow(train_data), nrow(test_data),
+                    sum(model_data$eif3d_target == pos_label),
+                    sum(model_data$eif3d_target == neg_label), thresh)),
+  file.path(out_dir, paste0("rf_performance_", suffix, ".csv")))
+
+write_csv(model_data %>% dplyr::select(gene_id_clean, symbol, eif3d_target),
+          file.path(out_dir, paste0("rf_model_gene_sets_", suffix, ".csv")))
+
+cat("Wrote 4 files with suffix:", suffix, "\n")
+```

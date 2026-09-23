@@ -1,0 +1,815 @@
+---
+title: "Build the translational-control feature matrix"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  pass_through: FALSE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Single auditable builder for `code/translational_control_overview/`. Replaces the nine-notebook
+chain (`01_` -> `01b_` -> `01d_` -> `22_` -> `23_` -> `01i_` -> `01j_` -> `01k_` -> `87_`), two
+of which overwrite `feature_matrix_external_stability.rds` in place. Nothing under
+`output/predictive_modeling/` is read-modify-written here; this notebook only reads.
+
+Two artifacts:
+
+| Output | Role |
+|---|---|
+| `feature_matrix_tco.rds` | the matrix, keyed on `transcript_id_clean` |
+| `feature_annotation.csv` | one row per column: `block`, `family`, `source`, `definition` |
+
+**`feature_annotation.csv` is the central artifact.** It replaces notebook 07's eight
+`if (feature_set == ...)` branches and its regex cascade with an explicit, inspectable table.
+`02_rf_model.Rmd` selects features by joining against it (`include_blocks`), and `03_shap.Rmd`
+aggregates SHAP by `family` - which is exact, because SHAP is additive.
+
+## `pass_through`
+
+With `params$pass_through = TRUE` the matrix is copied from the baseline **unchanged** and only
+the annotation is new. That is deliberate and is the first thing to run: it lets
+`02_rf_model.Rmd` be checked against the frozen baseline before any definition is corrected or
+any feature added. Until that reproduction gate passes, no later difference is interpretable -
+a fork that silently fails to rebuild the baseline looks exactly like a real feature effect.
+
+Definition fixes (Kozak PWM, GC3 stop codon, `tco_struct_*` rename) and the new feature
+families land in later passes, with `pass_through = FALSE`.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r load_baseline}
+baseline_rds <- "feature_matrix_dhx29_kd_feature.rds"
+features <- readRDS(here("output", "predictive_modeling", baseline_rds))
+
+out_dir <- here("output", "translational_control_overview")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Recorded before anything is added, so the gate can always tell baseline-era columns from
+# ones this notebook introduced. Self-maintaining: every new family is "tco" automatically.
+baseline_cols <- colnames(features)
+
+cat("Baseline matrix:", baseline_rds, "\n")
+cat(nrow(features), "transcripts x", ncol(features), "columns\n")
+
+stopifnot(
+  "matrix is not keyed on transcript_id_clean" =
+    "transcript_id_clean" %in% colnames(features),
+  "transcript_id_clean is not unique" =
+    !any(duplicated(features$transcript_id_clean)),
+  "gene identifier trio is incomplete" =
+    all(c("gene_id", "gene_id_clean", "symbol") %in% colnames(features))
+)
+```
+
+# 1. Corrected feature variants
+
+Three columns are known to be wrong or superseded (audited in `00_`). Each correction is added
+as a **parallel column** rather than overwriting the original, so `04_` can measure how much
+each one moves the ranking instead of only showing the endpoint. `02_rf_model.Rmd` selects one
+of each pair via `variant_set`; the two members of a pair are near-duplicates and must never
+enter the same forest, where they would split credit and hide the effect being measured.
+
+| current | corrected | why |
+|---|---|---|
+| `kozak_pwm_score` | `kozak_pwm_score_v2` | hand-typed PWM is wrong at -6 and -3 |
+| `gc3` | `gc3_internal` | initiator and stop codon were both counted |
+| `cai` | `cai_internal` | initiator AUG was counted |
+| `fop` | `fop_internal` | initiator AUG was counted |
+| `csc` | `csc_internal` | iCodon was given the stop-containing CDS |
+| `tai` | `tai_gtrnadb` | collaborator variant: explicit wobble table + GtRNAdb copy number |
+
+```{r corrected_features, eval = !params$pass_through}
+ref_dir <- here("accessories", "collaborator_reference")
+seqs <- readRDS(here("output", "predictive_modeling", "precomputed_kozak_sequences.rds"))
+
+utr5 <- seqs$utr5_seq %>% filter(transcript_id_clean %in% features$transcript_id_clean)
+cds  <- seqs$cds_seq  %>% filter(transcript_id_clean %in% features$transcript_id_clean)
+stopifnot("sequences missing for some transcripts" =
+            nrow(utr5) == nrow(features) && nrow(cds) == nrow(features))
+
+## --- kozak_pwm_score_v2 -------------------------------------------------------------
+# Published Kozak 1987 Table 1, imported as a file. Never transcribed: a hand-typed copy is
+# what produced the defect this replaces.
+kozak_pub <- read_tsv(file.path(ref_dir, "kozak_1987_table1_frequencies.tsv"),
+                      show_col_types = FALSE)
+win_idx <- c("-6" = 1, "-5" = 2, "-4" = 3, "-3" = 4, "-2" = 5, "-1" = 6, "+4" = 10)
+stopifnot("unexpected Kozak context_index set" =
+            setequal(kozak_pub$context_index, c(1:6, 10)))
+
+pwm_publ <- kozak_pub %>%
+  arrange(match(context_index, win_idx)) %>%
+  dplyr::select(A = A_frequency, C = C_frequency, G = G_frequency, T = T_frequency) %>%
+  as.matrix()
+rownames(pwm_publ) <- names(win_idx)
+stopifnot("published Kozak rows do not sum to 1" =
+            all(abs(rowSums(pwm_publ) - 1) < 1e-8))
+
+kozak_tbl <- inner_join(utr5, cds, by = "transcript_id_clean") %>%
+  mutate(
+    utr5_len = nchar(utr5_sequence),
+    window   = paste0(str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),
+                      str_sub(cds_sequence, 1, 4)),
+    # 01h_ scored any >=10 nt window. A window whose CDS does not start with ATG is not a
+    # start context at all, so it is NA here rather than silently scored as weak.
+    usable   = nchar(window) == 10L & str_sub(window, 7, 9) == "ATG"
+  )
+
+logodds <- log2((pwm_publ + 0.001) / 0.25)
+score_window <- function(win) {
+  mat <- str_split_fixed(win, "", 10)
+  rowSums(sapply(seq_along(win_idx), function(k)
+    logodds[names(win_idx)[k], mat[, win_idx[k]]]))
+}
+kozak_tbl$kozak_pwm_score_v2 <- NA_real_
+kozak_tbl$kozak_pwm_score_v2[kozak_tbl$usable] <-
+  score_window(kozak_tbl$window[kozak_tbl$usable])
+
+cat("kozak_pwm_score_v2: scored", sum(kozak_tbl$usable), "of", nrow(kozak_tbl),
+    "; NA (not AUG-anchored or too short):", sum(!kozak_tbl$usable), "\n")
+
+## --- CDS eligibility ----------------------------------------------------------------
+# GENCODE carries 3'-incomplete CDS annotations (cds_end_NF): the CDS starts correctly at ATG
+# but runs off the end of the annotation, so its length is not a multiple of 3. 01g_ already
+# refuses to score these (coRdon requires %%3 == 0), which is why cai/tai/csc/fop are NA for
+# them - but gc3 computes on the truncated fragment anyway, giving a median ~8.7 points below
+# the rest of the transcriptome. Flag the condition explicitly and apply it uniformly, so a
+# codon-derived feature is never computed on a CDS that cannot support codons.
+cds <- cds %>%
+  mutate(
+    sq_upper       = str_to_upper(cds_sequence),
+    cds_n          = nchar(sq_upper),
+    cds_frame_ok   = cds_n %% 3L == 0L,
+    cds_has_start  = str_sub(sq_upper, 1, 3) == "ATG",
+    cds_has_stop   = str_sub(sq_upper, (cds_n %/% 3L - 1L) * 3L + 1L,
+                             (cds_n %/% 3L) * 3L) %in% c("TAA", "TAG", "TGA"),
+    cds_complete   = cds_frame_ok & cds_has_start & cds_has_stop
+  )
+
+cat("CDS eligibility:\n")
+cat("  frame divisible by 3 :", sum(cds$cds_frame_ok),
+    sprintf("(%.2f%%)\n", 100 * mean(cds$cds_frame_ok)))
+cat("  starts with ATG      :", sum(cds$cds_has_start),
+    sprintf("(%.2f%%)\n", 100 * mean(cds$cds_has_start)))
+cat("  ends with a stop     :", sum(cds$cds_has_stop),
+    sprintf("(%.2f%%)\n", 100 * mean(cds$cds_has_stop)))
+cat("  complete             :", sum(cds$cds_complete),
+    sprintf("(%.2f%%)\n", 100 * mean(cds$cds_complete)))
+
+# The right mask is a MISSING TERMINAL STOP, not a bad frame. Checked against the GENCODE v49
+# tags, the three irregular classes are:
+#
+#   65  out of frame, ATG, no stop   -> 62 tagged cds_end_NF   (3'-incomplete)
+#   53  in frame,     ATG, no stop   -> 52 tagged cds_end_NF   (3'-incomplete, truncation
+#                                       happens to land on a codon boundary)
+#   25  in frame,     no ATG, stop   -> 24 tagged non_ATG_start, 17 of them MANE Select
+#
+# Only the first two are truncated annotations. Masking on frame alone catches 65 and misses
+# the 53, which pass every existing filter and receive full cai/tai/csc/fop scores computed on
+# an incomplete CDS. The third class is real biology - genuine non-AUG initiation, mostly MANE
+# Select - and must be KEPT: it has a complete CDS and only its Kozak score is meaningless.
+## --- internal-codon variants: gc3, cai, fop, csc ---------------------------------
+# "Internal" = initiator AUG and terminal stop codon both removed. Neither is decoded the way
+# a sense codon is: every transcript has exactly one initiator, so it carries no information
+# between genes, and the stop is released rather than decoded by a tRNA.
+#
+# CAI and FOP already excluded stops (via sense_codons / sense_cols in 01g_), so only the
+# initiator changes them. CSC does not: iCodon is given the sequence, and it is sensitive to
+# what the sequence contains.
+suppressMessages({library(coRdon); library(Biostrings); library(iCodon)})
+
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+stop_codons  <- names(gen_code[gen_code == "*"])
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+
+# 01g_ scores only in-frame CDS, so the reproduction below must use the same subset.
+codon_tbl <- cds %>% filter(cds_frame_ok)
+cat("In-frame CDS for codon scoring:", nrow(codon_tbl), "\n")
+
+counts_of <- function(d) { m <- codonCounts(codonTable(d)); rownames(m) <- names(d); m }
+build_w <- function(cm, idx) {
+  ref <- colSums(cm[idx, , drop = FALSE])
+  w <- setNames(rep(NA_real_, length(gen_code)), names(gen_code)); w[stop_codons] <- 0
+  for (aa in names(aa_to_codons)) {
+    cod <- aa_to_codons[[aa]]; cnt <- ref[cod]; tot <- sum(cnt)
+    if (tot == 0) { w[cod] <- 1; next }
+    rscu <- cnt / (tot / length(cod)); mx <- max(rscu)
+    w[cod] <- if (mx == 0) 0 else pmin(rscu / mx, 1)
+  }
+  w
+}
+cai_of <- function(cm, w) {
+  use <- sense_codons[!is.na(w[sense_codons]) & w[sense_codons] > 0]
+  apply(cm, 1, function(g) { cu <- g[use]; n <- sum(cu)
+    if (n == 0) NA_real_ else exp(sum(cu * log(w[use])) / n) })
+}
+fop_of <- function(cm, opt) {
+  sc <- setdiff(colnames(cm), stop_codons)
+  tot <- rowSums(cm[, sc, drop = FALSE]); o <- rowSums(cm[, opt, drop = FALSE])
+  r <- o / tot; r[tot == 0] <- NA_real_; r
+}
+
+full_ss <- DNAStringSet(codon_tbl$sq_upper); names(full_ss) <- codon_tbl$transcript_id_clean
+cm_full <- counts_of(full_ss)
+
+ribo_tx  <- features %>% filter(str_detect(symbol, "^RPL|^RPS")) %>% pull(transcript_id_clean)
+ribo_idx <- rownames(cm_full) %in% ribo_tx
+w_full   <- build_w(cm_full, ribo_idx)
+
+te_rank <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE) %>%
+  filter(condition == "normoxia", treatment == "sictrl") %>%
+  group_by(gene_id) %>% summarise(mte = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(mte)) %>% arrange(desc(mte))
+top10  <- sub("\\..*", "", te_rank$gene_id[seq_len(ceiling(nrow(te_rank) * 0.10))])
+ref_tx <- features$transcript_id_clean[sub("\\..*", "", features$gene_id) %in% top10]
+ref_tx <- ref_tx[ref_tx %in% rownames(cm_full)]
+opt_full <- unname(sapply(aa_to_codons, function(c_)
+  c_[which.max(colSums(cm_full[ref_tx, , drop = FALSE])[c_])]))
+
+# VERIFY before trusting: recomputing on the FULL CDS must reproduce 01g_'s stored values
+# exactly. If it does not, the reference sets or the weights have been rebuilt wrongly and
+# nothing downstream is safe.
+verify <- tibble(transcript_id_clean = rownames(cm_full),
+                 cai_rep = cai_of(cm_full, w_full),
+                 fop_rep = fop_of(cm_full, opt_full)) %>%
+  inner_join(features %>% dplyr::select(transcript_id_clean, cai, fop),
+             by = "transcript_id_clean")
+cai_dev <- max(abs(verify$cai_rep - verify$cai), na.rm = TRUE)
+fop_dev <- max(abs(verify$fop_rep - verify$fop), na.rm = TRUE)
+cat("Reproduction of 01g_ on the full CDS: CAI max|dev| =", signif(cai_dev, 3),
+    ", FOP max|dev| =", signif(fop_dev, 3), ", n =", sum(complete.cases(verify)), "\n")
+stopifnot("recomputation does not reproduce 01g_'s CAI" = cai_dev < 1e-9,
+          "recomputation does not reproduce 01g_'s FOP" = fop_dev < 1e-9)
+cat("Verified: the codon pipeline here matches 01g_ exactly\n")
+
+# Now the internal-codon versions.
+trim_internal <- function(x) {
+  n <- nchar(x) %/% 3L
+  a <- ifelse(substr(x, 1, 3) == "ATG", 4L, 1L)
+  b <- ifelse(substr(x, (n - 1) * 3L + 1L, n * 3L) %in% stop_codons, (n - 1) * 3L, n * 3L)
+  substr(x, a, b)
+}
+codon_tbl <- codon_tbl %>% mutate(s_int = trim_internal(sq_upper))
+stopifnot("internal sequences lost frame" = all(nchar(codon_tbl$s_int) %% 3 == 0))
+
+int_ss <- DNAStringSet(codon_tbl$s_int); names(int_ss) <- codon_tbl$transcript_id_clean
+cm_int  <- counts_of(int_ss)
+w_int   <- build_w(cm_int, ribo_idx)
+opt_int <- unname(sapply(aa_to_codons, function(c_)
+  c_[which.max(colSums(cm_int[ref_tx, , drop = FALSE])[c_])]))
+cat("Optimal codons changed by trimming:", sum(opt_int != opt_full), "of 20\n")
+
+predict_human <- predict_stability("human")
+uniq <- unique(codon_tbl$s_int)
+uscore <- as.numeric(predict_human(uniq)); names(uscore) <- uniq
+
+gc3_from <- function(x) vapply(x, function(z) {
+  n <- nchar(z) %/% 3L; if (n < 1L) return(NA_real_)
+  k <- seq.int(3L, n * 3L, 3L)
+  sum(substr(rep.int(z, n), k, k) %in% c("G", "C")) * 100 / n
+}, numeric(1L), USE.NAMES = FALSE)
+
+codon_internal <- tibble(
+  transcript_id_clean = codon_tbl$transcript_id_clean,
+  gc3_internal = gc3_from(codon_tbl$s_int),
+  cai_internal = cai_of(cm_int, w_int),
+  fop_internal = fop_of(cm_int, opt_int),
+  csc_internal = unname(uscore[codon_tbl$s_int])
+)
+
+## --- tai_gtrnadb --------------------------------------------------------------------
+# dos Reis-style tAI over the collaborator's GtRNAdb gene-copy table and wobble scheme.
+# Anticodon (5'->3') = [wobble base] + complement(codon[2]) + complement(codon[1]).
+gcn    <- read_tsv(file.path(ref_dir, "human_trna_gene_copy_hg38.tsv"),
+                   comment = "#", show_col_types = FALSE)
+wobble <- read_tsv(file.path(ref_dir, "trna_wobble_scheme_v1.tsv"), show_col_types = FALSE)
+wob <- wobble %>% transmute(w  = chartr("U", "T", anticodon_wobble_base_rna),
+                            n3 = chartr("U", "T", codon_third_base_rna),
+                            s  = penalty_s)
+
+comp   <- c(A = "T", C = "G", G = "C", T = "A")
+bases  <- c("T", "C", "A", "G")
+stops  <- c("TAA", "TAG", "TGA")
+sense_codons <- setdiff(as.vector(outer(outer(bases, bases, paste0), bases, paste0)), stops)
+
+W <- map_dbl(sense_codons, function(cod) {
+  rules <- wob %>% filter(n3 == substr(cod, 3, 3))
+  if (!nrow(rules)) return(0)
+  anti <- paste0(rules$w, comp[[substr(cod, 2, 2)]], comp[[substr(cod, 1, 1)]])
+  cn <- gcn$gene_copy_number[match(anti, gcn$anticodon)]
+  cn[is.na(cn)] <- 0
+  sum((1 - rules$s) * cn)
+})
+names(W) <- sense_codons
+tai_w <- W / max(W)
+n_zero_w <- sum(tai_w == 0)
+if (n_zero_w > 0) tai_w[tai_w == 0] <- exp(mean(log(tai_w[tai_w > 0])))  # dos Reis substitution
+
+cat("tAI weights: 61 sense codons, ", n_zero_w, " with no decoding tRNA; range ",
+    paste(round(range(tai_w), 3), collapse = "-"), "\n", sep = "")
+
+cds$tai_gtrnadb <- map_dbl(cds$sq_upper, function(sq) {
+  n <- nchar(sq) %/% 3L
+  if (n < 3L) return(NA_real_)
+  cods <- substring(sq, seq(1, n * 3L, 3L), seq(3L, n * 3L, 3L))
+  cods <- cods[-1]                                                   # drop initiator
+  if (tail(cods, 1) %in% stops) cods <- head(cods, -1)               # drop terminal stop
+  ww <- tai_w[cods]; ww <- ww[!is.na(ww)]
+  if (!length(ww)) return(NA_real_)
+  exp(mean(log(ww)))                                                 # geometric mean
+})
+
+truncated <- !cds$cds_has_stop
+cds$tai_gtrnadb[truncated] <- NA_real_
+codon_internal <- codon_internal %>%
+  mutate(across(c(gc3_internal, cai_internal, fop_internal, csc_internal),
+                ~ if_else(transcript_id_clean %in% cds$transcript_id_clean[truncated],
+                          NA_real_, .x)))
+cat("Masked", sum(truncated), "transcripts with no terminal stop (cds_end_NF)",
+    "across every codon-derived feature\n")
+cat("  of which out-of-frame:", sum(truncated & !cds$cds_frame_ok),
+    " in-frame but truncated:", sum(truncated & cds$cds_frame_ok), "\n")
+cat("Kept", sum(!cds$cds_has_start & cds$cds_has_stop),
+    "non-AUG-start transcripts: complete CDS, real initiation biology\n")
+
+## --- termination context + Cridge 2018 readthrough --------------------------------
+# New family, nothing equivalent in the existing pipeline. Motivated by the csc result: after
+# the terminal stop was removed from the iCodon input, csc lost 1.35 pp of importance share
+# (20/20 seeds), which means it had been carrying stop-codon identity. That signal belongs
+# here, under its own name, rather than smuggled into a codon-optimality score.
+utr3_cache <- file.path(out_dir, "precomputed_utr3_seqs.rds")
+if (file.exists(utr3_cache)) {
+  utr3_tbl <- readRDS(utr3_cache)
+} else {
+  suppressMessages({library(GenomicFeatures); library(BSgenome.Hsapiens.UCSC.hg38)})
+  txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+  u3   <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                threeUTRsByTranscript(txdb, use.names = TRUE))
+  utr3_tbl <- tibble(transcript_id_clean = sub("\\..*", "", names(u3)),
+                     utr3_seq = as.character(u3))
+  saveRDS(utr3_tbl, utr3_cache)
+}
+utr3_tbl <- utr3_tbl %>% filter(transcript_id_clean %in% features$transcript_id_clean)
+cat("3'UTR sequences available:", nrow(utr3_tbl), "of", nrow(features), "\n")
+
+cridge <- read_tsv(file.path(ref_dir, "cridge2018_termination_contexts.tsv"),
+                   show_col_types = FALSE)
+cridge_med <- median(cridge$readthrough_measure)
+stopifnot(
+  "Cridge table is not 192 contexts"    = nrow(cridge) == 192L,
+  "Cridge median readthrough off"       = between(cridge_med, 0.08, 0.095),
+  "Cridge readthrough not a percentage" = all(cridge$readthrough_measure > 0 &
+                                              cridge$readthrough_measure < 5)
+)
+cat("Cridge 2018:", nrow(cridge), "contexts, median", round(cridge_med, 4),
+    "% (paper ~0.087%)\n")
+
+# Codons to the next in-frame stop downstream of the annotated one: how far a readthrough
+# ribosome would travel before terminating again.
+next_inframe_stop <- function(u) {
+  n <- nchar(u) %/% 3L
+  if (n < 1L) return(NA_integer_)
+  cod <- substring(u, seq(1, n * 3L, 3L), seq(3L, n * 3L, 3L))
+  w <- which(cod %in% c("TAA", "TAG", "TGA"))
+  if (!length(w)) NA_integer_ else w[1]
+}
+
+term <- cds %>%
+  dplyr::select(transcript_id_clean, sq_upper, cds_has_stop) %>%
+  filter(cds_has_stop) %>%
+  mutate(ncod = nchar(sq_upper) %/% 3L,
+         stop_codon = substr(sq_upper, (ncod - 1L) * 3L + 1L, ncod * 3L)) %>%
+  inner_join(utr3_tbl, by = "transcript_id_clean") %>%
+  mutate(
+    u3   = str_to_upper(utr3_seq),
+    ctx6 = paste0(stop_codon, str_sub(u3, 1, 3)),    # +1..+6, the Cridge reporter window
+    ctx9 = paste0(stop_codon, str_sub(u3, 1, 6)),    # +1..+9
+    term_stop_TAA = as.integer(stop_codon == "TAA"),
+    term_stop_TAG = as.integer(stop_codon == "TAG"),
+    term_stop_TGA = as.integer(stop_codon == "TGA"),
+    p4 = str_sub(u3, 1, 1),
+    term_plus4_A = as.integer(p4 == "A"), term_plus4_C = as.integer(p4 == "C"),
+    term_plus4_G = as.integer(p4 == "G"), term_plus4_T = as.integer(p4 == "T"),
+    term_window_gc = if_else(nchar(ctx9) == 9L,
+                             100 * str_count(ctx9, "[GC]") / 9, NA_real_),
+    term_interval_codons = map_int(u3, next_inframe_stop)
+  ) %>%
+  left_join(cridge %>% dplyr::select(ctx6 = termination_context_plus1_to_plus6,
+                                     term_readthrough_cridge = readthrough_measure),
+            by = "ctx6") %>%
+  mutate(term_log1p_readthrough = log1p(term_readthrough_cridge))
+
+cat("Cridge join coverage:", sum(!is.na(term$term_readthrough_cridge)), "/", nrow(term),
+    sprintf(" (%.1f%%)\n", 100 * mean(!is.na(term$term_readthrough_cridge))))
+
+term_cols <- c("term_stop_TAA", "term_stop_TAG", "term_stop_TGA",
+               "term_plus4_A", "term_plus4_C", "term_plus4_G", "term_plus4_T",
+               "term_window_gc", "term_interval_codons",
+               "term_readthrough_cridge", "term_log1p_readthrough")
+term <- term %>% dplyr::select(transcript_id_clean, all_of(term_cols))
+## --- join --------------------------------------------------------------------------
+features <- features %>%
+  left_join(kozak_tbl %>% dplyr::select(transcript_id_clean, kozak_pwm_score_v2),
+            by = "transcript_id_clean") %>%
+  left_join(cds %>% dplyr::select(transcript_id_clean, tai_gtrnadb,
+                                  cds_frame_ok, cds_has_start, cds_has_stop, cds_complete),
+            by = "transcript_id_clean") %>%
+  left_join(codon_internal, by = "transcript_id_clean") %>%
+  left_join(term, by = "transcript_id_clean")
+
+corrected_cols <- c("kozak_pwm_score_v2", "tai_gtrnadb",
+                    "gc3_internal", "cai_internal", "fop_internal", "csc_internal")
+stopifnot("termination columns did not attach" = all(term_cols %in% colnames(features)))
+eligibility_cols <- c("cds_frame_ok", "cds_has_start", "cds_has_stop", "cds_complete")
+stopifnot(
+  "corrected columns did not all attach" = all(corrected_cols %in% colnames(features)),
+  "eligibility columns did not all attach" = all(eligibility_cols %in% colnames(features)),
+  "a codon feature survived on a truncated (cds_end_NF) CDS" =
+    all(vapply(c("gc3_internal","cai_internal","fop_internal","csc_internal","tai_gtrnadb"),
+               function(f) all(is.na(features[[f]][!features$cds_has_stop])), logical(1))),
+  "non-AUG-start transcripts were masked, but they are real" =
+    any(!is.na(features$gc3_internal[!features$cds_has_start & features$cds_has_stop]))
+)
+cat("Matrix now", nrow(features), "x", ncol(features), "\n")
+```
+
+### Termination validation
+
+```{r validate_termination, eval = !params$pass_through}
+stopifnot(
+  "readthrough outside (0, 5]%" =
+    all(term$term_readthrough_cridge > 0 & term$term_readthrough_cridge <= 5, na.rm = TRUE),
+  "termination window GC outside [0, 100]" =
+    all(term$term_window_gc >= 0 & term$term_window_gc <= 100, na.rm = TRUE),
+  "readthrough interval not positive" =
+    all(term$term_interval_codons > 0, na.rm = TRUE),
+  "stop indicators do not sum to 1" =
+    all(term$term_stop_TAA + term$term_stop_TAG + term$term_stop_TGA == 1L),
+  "plus4 indicators do not sum to 1" =
+    all(term$term_plus4_A + term$term_plus4_C + term$term_plus4_G + term$term_plus4_T == 1L)
+)
+
+# Biological spot-check: TGA is the leakiest stop codon and TAA the tightest. This is the
+# check that would catch a scrambled Cridge join - a shuffled table still passes every range
+# assertion above.
+by_stop <- term %>%
+  mutate(stop = case_when(term_stop_TAA == 1 ~ "TAA", term_stop_TAG == 1 ~ "TAG",
+                          TRUE ~ "TGA")) %>%
+  group_by(stop) %>%
+  summarise(n = n(), median_rt = median(term_readthrough_cridge, na.rm = TRUE),
+            .groups = "drop")
+print(as.data.frame(by_stop))
+
+rt <- setNames(by_stop$median_rt, by_stop$stop)
+stopifnot("TGA is not the leakiest stop codon" = rt["TGA"] > rt["TAG"],
+          "TAA is not the tightest stop codon" = rt["TAG"] > rt["TAA"])
+cat("Spot-check passed: TGA >", "TAG >", "TAA median readthrough\n")
+```
+
+
+## Validation
+
+Range checks plus biological spot-checks, both required. The within-tier Kozak check is new:
+it is the one that would have caught the `01h_` defect, which the existing tier-monotonicity
+check cannot.
+
+```{r validate_corrected, eval = !params$pass_through}
+# --- computational ---
+stopifnot(
+  "gc3_internal outside [0, 100]" =
+    all(features$gc3_internal >= 0 & features$gc3_internal <= 100, na.rm = TRUE),
+  "cai_internal outside [0, 1]" =
+    all(features$cai_internal >= 0 & features$cai_internal <= 1 + 1e-9, na.rm = TRUE),
+  "fop_internal outside [0, 1]" =
+    all(features$fop_internal >= 0 & features$fop_internal <= 1 + 1e-9, na.rm = TRUE),
+  "tai_gtrnadb outside (0, 1]" =
+    all(features$tai_gtrnadb > 0 & features$tai_gtrnadb <= 1, na.rm = TRUE),
+  "kozak_pwm_score_v2 not finite" =
+    all(is.finite(features$kozak_pwm_score_v2[!is.na(features$kozak_pwm_score_v2)]))
+)
+
+# --- biological spot-checks ---
+gc3_med <- median(features$gc3_internal, na.rm = TRUE)
+stopifnot("GC3 median outside [40, 65]%" = between(gc3_med, 40, 65))
+cat("GC3 (sense codons) median:", round(gc3_med, 1), "%\n")
+
+# Ribosomal proteins are highly translated and should sit above the median on tRNA supply.
+rp <- features %>% filter(str_detect(symbol, "^RP[LS][0-9]"))
+stopifnot("too few ribosomal proteins to test" = nrow(rp) >= 20,
+          "ribosomal proteins are not above median tAI" =
+            median(rp$tai_gtrnadb, na.rm = TRUE) > median(features$tai_gtrnadb, na.rm = TRUE))
+cat("tAI: ribosomal proteins (n = ", nrow(rp), ") median ",
+    round(median(rp$tai_gtrnadb, na.rm = TRUE), 3), " vs all ",
+    round(median(features$tai_gtrnadb, na.rm = TRUE), 3), "\n", sep = "")
+
+# THE NEW CHECK. Position -3 is the purine position: A and G are both favourable, so within a
+# single ordinal tier they must score comparably. Under the old PWM they differ by ~2.3 bits.
+kozak_tier <- kozak_tbl %>%
+  filter(usable) %>%
+  mutate(tier = case_when(
+           str_detect(window, "^(GCCACC|GCCGCC)ATGG$") ~ 3L,
+           str_detect(window, "^...[AG]..ATGG$")       ~ 2L,
+           str_detect(window, "^...[AG]..ATG[ACT]$")   ~ 1L,
+           str_detect(window, "^...[CT]..ATGG$")       ~ 1L,
+           TRUE                                        ~ 0L),
+         base_m3 = str_sub(window, 4, 4)) %>%
+  filter(tier == 2L, base_m3 %in% c("A", "G")) %>%
+  group_by(base_m3) %>%
+  summarise(n = n(), mean_v2 = mean(kozak_pwm_score_v2), .groups = "drop")
+print(kozak_tier)
+
+purine_gap <- abs(diff(kozak_tier$mean_v2))
+cat("A-minus-G spread within tier 2:", round(purine_gap, 3), "bits\n")
+stopifnot("within-tier purine gap too large: the -3 row is wrong again" = purine_gap < 0.75)
+cat("Within-tier purine check passed\n")
+```
+
+## How much did each correction move?
+
+```{r correction_deltas, eval = !params$pass_through}
+pairs_tbl <- tribble(~current, ~corrected,
+  "kozak_pwm_score", "kozak_pwm_score_v2", "gc3", "gc3_internal",
+  "tai", "tai_gtrnadb", "cai", "cai_internal",
+  "fop", "fop_internal", "csc", "csc_internal")
+
+deltas <- pairs_tbl %>%
+  mutate(pearson  = map2_dbl(current, corrected,
+           ~ cor(features[[.x]], features[[.y]], use = "complete.obs")),
+         spearman = map2_dbl(current, corrected,
+           ~ cor(features[[.x]], features[[.y]], use = "complete.obs", method = "spearman")),
+         median_current   = map_dbl(current,   ~ median(features[[.x]], na.rm = TRUE)),
+         median_corrected = map_dbl(corrected, ~ median(features[[.x]], na.rm = TRUE)),
+         n = map2_int(current, corrected,
+           ~ sum(complete.cases(features[[.x]], features[[.y]]))))
+print(as.data.frame(deltas))
+
+cat("\nCorrelation with gc3_internal:\n")
+cat("  tai (ours)     :", round(cor(features$tai,         features$gc3_internal, use = "complete.obs"), 3), "\n")
+cat("  tai_gtrnadb    :", round(cor(features$tai_gtrnadb, features$gc3_internal, use = "complete.obs"), 3), "\n")
+```
+
+# 2. Annotate every column
+
+`block` decides whether a column can ever be a feature; `family` groups correlated columns so
+SHAP can be summed over them exactly.
+
+```{r assign_block}
+assign_block <- function(x) {
+  case_when(
+    # Identifiers. Matches 07's id_cols plus its id_pattern_cols regex.
+    str_detect(x, "gene_id|transcript_id|^symbol$")                 ~ "id",
+    # Outcome and anything derived from it. Never a feature: these define the target.
+    x %in% c("te_lfc", "te_padj", "te_lfc_bin")                     ~ "label",
+    str_detect(x, "^sig_|^indiv_te_|^delta_te_")                    ~ "label",
+    # eIF4E-derived. Circular for a 4E model, so separable on its own.
+    str_detect(x, "4e_resistance|^eif4e_ip|^is_4e_|_4e_|^eif4e_")   ~ "eif4e",
+    # Measured in some other experiment. Will not exist for most new datasets.
+    str_detect(x, "^clip_|^cnot3_|^zhu2024_|^hia2026_|^karner2026_|^dap5_|^is_dap5_") ~ "external",
+    # CDS eligibility flags: QC about whether a codon feature is meaningful, not a feature.
+    str_detect(x, "^cds_(frame_ok|has_start|has_stop|complete)$")   ~ "qc",
+    # Computable from the transcript sequence alone. These are what transfer.
+    TRUE                                                            ~ "intrinsic"
+  )
+}
+
+assign_family <- function(x) {
+  case_when(
+    str_detect(x, "gene_id|transcript_id|^symbol$")              ~ "id",
+    str_detect(x, "^cds_(frame_ok|has_start|has_stop|complete)$") ~ "cds_eligibility",
+    x %in% c("te_lfc", "te_padj", "te_lfc_bin")                  ~ "outcome",
+    str_detect(x, "^sig_|^indiv_te_|^delta_te_")                 ~ "outcome_derived",
+    str_detect(x, "_length$|^log2_.*_length$")                   ~ "length",
+    str_detect(x, "^term_")                                      ~ "termination",
+    str_detect(x, "_gc$|^gc3")                                   ~ "gc",
+    # Order matters: the CDS and 3'UTR structure columns carry a suffix, the 5'UTR ones
+    # do not, so the suffixed patterns must be tested first.
+    str_detect(x, "^struct_.*_cds$")                             ~ "structure_cds",
+    str_detect(x, "^struct_.*_utr3$")                            ~ "structure_utr3",
+    str_detect(x, "^struct_")                                    ~ "structure_utr5",
+    str_detect(x, "^csc|^cai|^tai|^fop")                         ~ "codon_optimality",
+    str_detect(x, "^kozak_")                                     ~ "initiation",
+    str_detect(x, "^clip_")                                      ~ "clip",
+    str_detect(x, "^zhu2024_|^hia2026_|^karner2026_|^cnot3_")    ~ "stability_external",
+    str_detect(x, "^dap5_|^is_dap5_")                            ~ "dap5",
+    str_detect(x, "4e")                                          ~ "eif4e",
+    TRUE                                                         ~ "other"
+  )
+}
+
+# variant pairs a corrected column with the one it supersedes. 02_ picks one member of each
+# pair via variant_set; both together in one forest would split credit between near-duplicates.
+variant_pairs <- tribble(
+  ~current,           ~corrected,
+  "kozak_pwm_score",  "kozak_pwm_score_v2",
+  "gc3",              "gc3_internal",
+  "tai",              "tai_gtrnadb",
+  "cai",              "cai_internal",
+  "fop",              "fop_internal",
+  "csc",              "csc_internal"
+)
+
+annotation <- tibble(feature = colnames(features)) %>%
+  mutate(
+    block  = assign_block(feature),
+    family = assign_family(feature),
+    variant = case_when(
+      feature %in% variant_pairs$current   ~ "current",
+      feature %in% variant_pairs$corrected ~ "corrected",
+      TRUE                                 ~ "single"
+    ),
+    source = if_else(feature %in% variant_pairs$corrected,
+                     "01_ (corrected, see 00_)", baseline_rds),
+    definition = NA_character_
+  )
+
+# Deprecated features stay in the matrix but are not selected by default. Positional CSC is
+# dropped by decision: csc_q1-q4 and csc_first75 are five near-collinear arms of one quantity,
+# which is the worst case for credit-splitting and the thing SHAP family summation exists to
+# avoid. They are flagged rather than deleted so the baseline gate stays runnable - the
+# baseline's 51 features include all five.
+deprecated_features <- c("csc_q1", "csc_q2", "csc_q3", "csc_q4", "csc_first75")
+
+annotation <- annotation %>%
+  mutate(deprecated = feature %in% deprecated_features,
+         added_in   = if_else(feature %in% baseline_cols, "baseline", "tco"))
+cat("Columns added by this notebook:", sum(annotation$added_in == "tco"), "\n")
+cat("Deprecated (kept in the matrix, not selected by default):",
+    sum(annotation$deprecated), "-", paste(deprecated_features, collapse = ", "), "\n")
+
+# A corrected column is only meaningful if its partner is present, and vice versa.
+if (!isTRUE(params$pass_through)) {
+  stopifnot("a variant pair is incomplete" =
+    all(c(variant_pairs$current, variant_pairs$corrected) %in% annotation$feature))
+}
+
+annotation %>% count(block, family, name = "n") %>% arrange(block, desc(n)) %>% print(n = 40)
+```
+
+```{r annotate_definitions}
+# Record the definitions that differ from the collaborator repo, so the unit and the convention
+# travel with the column rather than living only in a notebook comment. Audited in 00_.
+definitions <- tribble(
+  ~feature,           ~definition,
+  "utr5_gc",          "percent (0-100); denominator includes ambiguous bases",
+  "utr3_gc",          "percent (0-100); denominator includes ambiguous bases",
+  "cds_gc",           "percent (0-100); denominator includes ambiguous bases",
+  "transcript_gc",    "percent (0-100); length-weighted mean of the three regional GCs",
+  "gc3",              "percent (0-100); INCLUDES the stop codon - to be fixed, see 00_",
+  "log2_cds_length",  "log2(x + 1); +1 applied uniformly across all three regions",
+  "log2_utr5_length", "log2(x + 1)",
+  "log2_utr3_length", "log2(x + 1)",
+  "kozak_pwm_score",  "Kozak 1987 log-odds; PWM is WRONG at -6 and -3 - to be fixed, see 00_",
+  "tai",              "coRdon tAI; collaborator variant to be adopted, see 00_",
+  "csc",              "iCodon::predict_stability('human'), whole stop-free CDS",
+  "kozak_pwm_score_v2", "Kozak 1987 Table 1 log-odds (imported file); NA unless AUG-anchored",
+  "gc3_internal",     "percent (0-100); internal codons: initiator and stop removed",
+  "cai_internal",     "Sharp & Li CAI, RPL/RPS reference; internal codons only",
+  "fop_internal",     "FOP, top-10%-TE reference; internal codons only",
+  "csc_internal",     "iCodon::predict_stability('human') on the internal-codon CDS",
+  "tai_gtrnadb",      "dos Reis-style tAI; GtRNAdb hg38 copy number + collaborator wobble v1"
+)
+
+definitions <- definitions %>% filter(feature %in% annotation$feature)
+annotation <- annotation %>%
+  rows_update(definitions, by = "feature", unmatched = "error")
+
+# Every struct_* column is region-isolated RNAplfold (-W 150 -L 100), NOT the collaborator's
+# whole-transcript fold. Renamed to tco_struct_* in a later pass so the two cannot be confused.
+annotation <- annotation %>%
+  mutate(definition = if_else(
+    str_starts(feature, "struct_"),
+    "RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6)",
+    definition))
+
+cat("Columns carrying an explicit definition:", sum(!is.na(annotation$definition)), "\n")
+```
+
+# 3. Annotation integrity
+
+The annotation and the matrix must never drift apart. These are the checks that guarantee
+`02_` cannot silently select the wrong columns.
+
+```{r validate_annotation}
+stopifnot(
+  "annotation does not cover the matrix exactly" =
+    setequal(annotation$feature, colnames(features)),
+  "annotation has duplicate rows" =
+    !any(duplicated(annotation$feature)),
+  "a column has no block" =
+    all(!is.na(annotation$block)),
+  "a column has no family" =
+    all(!is.na(annotation$family)),
+  "unrecognised block" =
+    all(annotation$block %in% c("id", "label", "intrinsic", "external", "eif4e",
+                                "technical", "qc")),
+  "no family may be assigned 'other'" =
+    !any(annotation$family == "other"),
+  "unrecognised variant" =
+    all(annotation$variant %in% c("single", "current", "corrected")),
+  "a deprecated feature is missing from the matrix" =
+    all(deprecated_features %in% annotation$feature),
+  "unrecognised added_in" =
+    all(annotation$added_in %in% c("baseline", "tco"))
+)
+cat("Annotation integrity: OK\n")
+
+# Leakage guard. What matters is not which block an outcome-derived column lands in, but that
+# it is not SELECTABLE - i.e. never in intrinsic/external, the only blocks 02_ draws features
+# from. (te_4e_resistance_lfc is outcome-shaped but blocked as eif4e, which is also fine.)
+selectable_blocks <- c("intrinsic", "external")
+leak <- annotation %>%
+  filter(block %in% selectable_blocks,
+         str_detect(feature, "^te_|^sig_|^indiv_te_|^delta_te_"))
+stopifnot("an outcome-derived column is selectable as a feature" = nrow(leak) == 0)
+cat("Leakage guard: no outcome-derived column is selectable\n")
+```
+
+# 4. Reproduction gate: does the annotation rebuild the baseline 51?
+
+Notebook 07 arrives at its feature set by a regex cascade. This notebook arrives at one by a
+block join. They must agree exactly, or `02_` is not modelling the same thing as the baseline.
+
+```{r reproduce_baseline}
+baseline_importance <- read_csv(
+  here("output", "predictive_modeling",
+       paste0("rf_classification_importance_eif33d_promotes_hypoxia_1hr_lfc0.5_",
+              "dhx29_kd_feature_clipaggregate_no_boruta_no4e_noOwnTE.csv")),
+  show_col_types = FALSE)
+
+# Selection rule, mirroring the baseline run (no4e, noOwnTE, clip aggregate).
+aggregate_clip <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                    "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                    "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment")
+
+# The gate reproduces the BASELINE, so it takes the current member of every variant pair.
+# The gate reproduces the BASELINE: baseline-era columns only, current variants, and the five
+# deprecated positional-CSC features, which the baseline included.
+selected <- annotation %>%
+  filter(block %in% c("intrinsic", "external"), variant != "corrected",
+         added_in == "baseline") %>%
+  filter(!(family == "clip" & !feature %in% aggregate_clip)) %>%   # aggregate CLIP mode
+  filter(!str_detect(feature, "^(utr5|utr3|cds|total)_length$")) %>%  # log2 versions kept
+  pull(feature)
+
+# Sparsity filter is data-dependent, so it is applied on values, not on names.
+# 07 computes it on the labelled genes; on this matrix the same 7 columns fall out.
+non_na_frac <- map_dbl(selected, ~ mean(!is.na(unlist(features[[.x]]))))
+sparse <- selected[non_na_frac < 0.5]
+selected <- setdiff(selected, sparse)
+
+cat("Selected by block join:", length(selected), "\n")
+cat("Baseline importance CSV:", nrow(baseline_importance), "\n")
+cat("Dropped as sparse (<50% non-NA):", length(sparse), "-",
+    paste(sparse, collapse = ", "), "\n")
+
+stopifnot(
+  "block join does not reproduce the baseline feature set" =
+    setequal(selected, baseline_importance$feature)
+)
+cat("\nGATE PASSED: the annotation reproduces the baseline 51 features exactly\n")
+```
+
+# 5. Write
+
+```{r write_outputs}
+matrix_out <- features
+cat(if (isTRUE(params$pass_through))
+      "pass_through = TRUE: baseline copied unchanged\n"
+    else
+      "pass_through = FALSE: corrected variants added alongside the originals\n")
+
+saveRDS(matrix_out, file.path(out_dir, "feature_matrix_tco.rds"))
+write_csv(annotation, file.path(out_dir, "feature_annotation.csv"))
+
+stopifnot("written matrix lost rows" = nrow(matrix_out) == nrow(features))
+
+cat("\nWrote:\n")
+cat(" ", file.path(out_dir, "feature_matrix_tco.rds"), "-",
+    nrow(matrix_out), "x", ncol(matrix_out), "\n")
+cat(" ", file.path(out_dir, "feature_annotation.csv"), "-",
+    nrow(annotation), "rows\n")
+
+annotation %>% count(block, name = "columns") %>% arrange(desc(columns)) %>% print()
+```
+
+# Summary
+
+The annotation reproduces the baseline feature set exactly by block join, so `02_rf_model.Rmd`
+can drop notebook 07's `feature_set` branches without changing what is modelled. `block` makes
+the intrinsic-vs-external split a data decision you can revise by editing a CSV, and `family`
+is what lets `03_shap.Rmd` sum SHAP over correlated columns exactly.
+
+Still pass-through: no definition is corrected and no feature is added yet. Next pass applies
+the Kozak PWM fix, the GC3 stop-codon fix and the `tco_struct_*` rename, then merges G4 and the
+adopted families.
