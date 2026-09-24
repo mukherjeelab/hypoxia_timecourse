@@ -386,6 +386,29 @@ already the model's strongest single feature. **All of these features are delibe
 they are validated and cheap, and the fork exists to run on other mRNA sets where they may
 matter.
 
+**Independent audit findings, all fixed in the fork (`01_`).** An independent agent recomputed
+the matrix from primary sources and found seven real defects that every existing check passed.
+Each is now also a standing structural invariant in `01_`, because each was a *class* of bug:
+
+| # | defect | fix |
+|---|---|---|
+| F6 | six `tco_struct_*` CDS/3'UTR columns filed under `structure_utr5` - `assign_family()` anchored the region tag with `$`, but those names end in `_mean`/`_min`/`_sd` | regex now matches the tag anywhere; asserted 6/6/6 |
+| F1 | 1,689 transcripts had every structure column **zero-filled instead of NA** (`replace_na(., 0)` in `01d_`/`01k_`), so 0 read as "maximally structured" and every NA-based guard downstream missed them | sentinel (mean == 0 **and** sd == 0) restored to NA |
+| F2 | `tco_struct_num_structured_regions*` is region length in disguise (Spearman ~1.000, and the "count" exceeds the length) | deprecated |
+| F5 | `tco_struct_accessibility_*_min` identically 0 everywhere - `min()` taken after NA became 0 | deprecated; `02_` also drops zero-variance columns generally |
+| F3 | `hia2026_dhx29_occupancy` joined at **gene** level from a transcript-keyed source, so ~1,013 transcripts carry another isoform's occupancy | `hia2026_dhx29_occupancy_tx` added as the corrected variant |
+| F4 | `clip_lee_complete_media_bound` is bit-identical to `clip_lee_glu_dep_bound` (already identical upstream), so `clip_cap_binding_count` counted one dataset twice | duplicate deprecated; `clip_cap_binding_count_v2` counts the 2 distinct conditions |
+| F7 | `te_lfc` / `te_padj` / `te_lfc_bin` are the **siCTRL hypoxia-vs-normoxia** contrast, not a knockdown contrast (bit-for-bit `translation_categories_1hr.csv`, max dev 0) | no model impact (`block = label`, asserted out), but the identity is now pinned by an assertion and stated in the definition |
+
+**The repairs make bit-exact baseline reproduction impossible, deliberately.** F1 changes values,
+so `01_` takes `apply_audit_repairs` (default TRUE): build with it **FALSE** to reproduce the
+historical matrix, then run `02_`'s gate. `02_` skips its zero-variance drop on a gate run for
+the same reason. Both gates are green on that path.
+
+**Consequences for results already reported.** F6 means any `structure_utr5` number from before
+the fix was a mixture of all three regions: corrected, the split is CDS 5.78%, 5'UTR 2.62%,
+3'UTR 1.49% of SHAP. The model is 66 features after the deprecations.
+
 ## Findings that affect the EXISTING pipeline
 
 These are defects in `code/predictive_modeling/`, found by the reconciliation above. They are

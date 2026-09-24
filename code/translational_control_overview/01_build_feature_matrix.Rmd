@@ -6,6 +6,7 @@ output: html_document
 params:
   pass_through: FALSE
   mutate_input: ""
+  apply_audit_repairs: TRUE
 editor_options:
   chunk_output_type: console
 ---
@@ -615,6 +616,29 @@ g4_cols <- c(paste0("g4mer_max_resid_", g4_regions),
              paste0("g4mer_frac_above_", g4_regions))
 g4 <- g4_join %>% dplyr::select(transcript_id_clean, all_of(g4_cols))
 
+## --- audit corrections added as variant pairs (F3, F4) -------------------------------
+# Both supersede a BASELINE column, so neither is applied in place: the originals stay so the
+# reproduction gates keep working, and 02_'s variant_set picks the corrected member by default.
+
+# F3. hia2026_dhx29_occupancy was joined at GENE level from a transcript-keyed source, so
+# ~1,013 transcripts carry a different isoform's occupancy. Ribosome occupancy is
+# isoform-specific, so that is a value/key mix-up rather than a rounding issue.
+dhx29_occ <- readRDS(here("output", "predictive_modeling", "dhx29_riboseq_occupancy.rds"))
+stopifnot("dhx29 occupancy source is not transcript-keyed" =
+            "transcript_id_clean" %in% colnames(dhx29_occ),
+          "dhx29 occupancy source has duplicate transcripts" =
+            !any(duplicated(dhx29_occ$transcript_id_clean)))
+occ_tx <- dhx29_occ %>%
+  dplyr::select(transcript_id_clean, hia2026_dhx29_occupancy_tx = dhx29_occupancy_score)
+
+# F4. clip_lee_complete_media_bound is bit-identical to clip_lee_glu_dep_bound - the two
+# columns are already identical in the upstream score_card.csv - so clip_cap_binding_count,
+# which sums all three *_bound columns, counts one dataset twice. The corrected count uses the
+# two distinct conditions. Which NAME is the duplicate cannot be decided from our data, so the
+# second is kept and the third dropped, and both facts are recorded.
+stopifnot("the CLIP duplicate this correction assumes is no longer present" =
+            identical(features$clip_lee_complete_media_bound, features$clip_lee_glu_dep_bound))
+
 ## --- join --------------------------------------------------------------------------
 features <- features %>%
   left_join(kozak_tbl %>% dplyr::select(transcript_id_clean, kozak_pwm_score_v2),
@@ -627,6 +651,7 @@ features <- features %>%
   left_join(codon_internal, by = "transcript_id_clean") %>%
   left_join(pep, by = "transcript_id_clean") %>%
   left_join(g4, by = "transcript_id_clean") %>%
+  left_join(occ_tx, by = "transcript_id_clean") %>%
   left_join(term, by = "transcript_id_clean")
 
 corrected_cols <- c("kozak_pwm_score_v2", "tai_gtrnadb",
@@ -636,7 +661,24 @@ stopifnot("termination columns did not attach" = all(term_cols %in% colnames(fea
             "noderer_tis_efficiency" %in% colnames(features),
           "nascent peptide / poly(A) columns did not attach" =
             all(pep_cols %in% colnames(features)),
-          "g4mer columns did not attach" = all(g4_cols %in% colnames(features)))
+          "g4mer columns did not attach" = all(g4_cols %in% colnames(features)),
+          "corrected dhx29 occupancy did not attach" =
+            "hia2026_dhx29_occupancy_tx" %in% colnames(features))
+
+# F4 corrected count, built after the join so it sits beside the column it supersedes.
+features <- features %>%
+  mutate(clip_cap_binding_count_v2 =
+           as.integer(clip_lee_int_stress_bound) + as.integer(clip_lee_glu_dep_bound))
+cat("clip_cap_binding_count: original sums 3 columns of which 2 are identical;",
+    "v2 sums the 2 distinct conditions\n")
+cat("  transcripts changed:",
+    sum(features$clip_cap_binding_count != features$clip_cap_binding_count_v2, na.rm = TRUE),
+    "\n")
+cat("hia2026_dhx29_occupancy: gene-level", sum(!is.na(features$hia2026_dhx29_occupancy)),
+    "non-NA vs transcript-level", sum(!is.na(features$hia2026_dhx29_occupancy_tx)), "\n")
+cat("  transcripts whose value changes:",
+    sum(features$hia2026_dhx29_occupancy != features$hia2026_dhx29_occupancy_tx,
+        na.rm = TRUE), "\n")
 eligibility_cols <- c("cds_frame_ok", "cds_has_start", "cds_has_stop", "cds_complete")
 stopifnot(
   "corrected columns did not all attach" = all(corrected_cols %in% colnames(features)),
@@ -663,6 +705,47 @@ stopifnot("tco_struct_ rename did not apply" =
 # added_in = "tco" and both gates silently drop all 18.
 baseline_cols <- sub("^struct_", "tco_struct_", baseline_cols)
 cat("Renamed", length(struct_old), "struct_* columns to tco_struct_*\n")
+
+## --- structure repairs (audit findings F1, F2, F5) -----------------------------------
+# F1. 01d_/01k_ apply replace_na(., 0) to the RNAplfold columns, so transcripts the cluster
+# run never scored arrive as ZERO rather than NA. Zero means "maximally structured" to the
+# forest, and because the NA is gone, 02_'s sparsity filter and median imputation both miss
+# them. The sentinel is unambiguous: mean accessibility exactly 0 AND sd exactly 0 over a
+# whole region is not a measurement. Restored to NA per region.
+struct_region <- list(
+  utr5 = grep("^tco_struct_", colnames(features), value = TRUE) %>%
+           setdiff(grep("_cds(_|$)|_utr3(_|$)", ., value = TRUE)),
+  cds  = grep("^tco_struct_.*_cds(_|$)",  colnames(features), value = TRUE),
+  utr3 = grep("^tco_struct_.*_utr3(_|$)", colnames(features), value = TRUE)
+)
+# The zero-fill repair CHANGES VALUES, so it is the one correction that makes bit-exact
+# baseline reproduction impossible. It is therefore switchable: build with
+# apply_audit_repairs = FALSE to reproduce the historical matrix and re-run 02_'s gate.
+if (!isTRUE(params$apply_audit_repairs))
+  cat("apply_audit_repairs = FALSE: leaving the 01d_/01k_ zero-fill in place\n")
+for (rg in if (isTRUE(params$apply_audit_repairs)) names(struct_region) else character(0)) {
+  cols <- struct_region[[rg]]
+  mn <- grep(paste0("accessibility_", rg, "_mean$"), cols, value = TRUE)
+  sdc <- grep(paste0("accessibility_", rg, "_sd$"),  cols, value = TRUE)
+  stopifnot("could not identify the mean/sd pair for a structure region" =
+              length(mn) == 1 && length(sdc) == 1)
+  sentinel <- features[[mn]] == 0 & features[[sdc]] == 0
+  sentinel[is.na(sentinel)] <- FALSE
+  features[sentinel, cols] <- NA
+  cat(sprintf("  %-4s: %d transcripts restored from zero-fill to NA across %d columns\n",
+              rg, sum(sentinel), length(cols)))
+}
+
+# F5. accessibility_*_min is identically 0 everywhere, because 01d_ takes min() AFTER
+# replacing NA with 0. A constant carries no information and cannot be repaired from the
+# summaries we hold. F2. num_structured_regions* is region length in disguise: Spearman
+# ~1.000 against its own region length, and the "count" EXCEEDS the length by 1 for
+# thousands of transcripts, which is impossible for a count of positions. Both are deprecated
+# rather than deleted, so the baseline stays reproducible under include_deprecated = TRUE.
+broken_structure <- grep("^tco_struct_(accessibility_.*_min|num_structured_regions)",
+                         colnames(features), value = TRUE)
+cat("Deprecating", length(broken_structure), "structure columns (constant, or length proxies):",
+    paste(broken_structure, collapse = ", "), "\n")
 
 cat("Matrix now", nrow(features), "x", ncol(features), "\n")
 ```
@@ -1029,8 +1112,11 @@ assign_family <- function(x) {
     str_detect(x, "_gc$|^gc3")                                   ~ "gc",
     # Order matters: the CDS and 3'UTR structure columns carry a suffix, the 5'UTR ones
     # do not, so the suffixed patterns must be tested first.
-    str_detect(x, "^tco_struct_.*_cds$")                         ~ "structure_cds",
-    str_detect(x, "^tco_struct_.*_utr3$")                        ~ "structure_utr3",
+    # The region tag is not always the LAST token: tco_struct_accessibility_cds_mean ends in
+    # _mean. Anchoring on "$" filed six CDS/3'UTR columns under structure_utr5, which silently
+    # broke the exact family summation feature_annotation.csv exists for.
+    str_detect(x, "^tco_struct_.*_cds(_|$)")                     ~ "structure_cds",
+    str_detect(x, "^tco_struct_.*_utr3(_|$)")                    ~ "structure_utr3",
     str_detect(x, "^tco_struct_")                                ~ "structure_utr5",
     str_detect(x, "^csc|^cai|^tai|^fop")                         ~ "codon_optimality",
     str_detect(x, "^kozak_|^noderer_")                           ~ "initiation",
@@ -1055,7 +1141,9 @@ variant_pairs <- tribble(
   "tai",              "tai_gtrnadb",
   "cai",              "cai_internal",
   "fop",              "fop_internal",
-  "csc",              "csc_internal"
+  "csc",              "csc_internal",
+  "hia2026_dhx29_occupancy", "hia2026_dhx29_occupancy_tx",   # F3: gene-level -> transcript
+  "clip_cap_binding_count",  "clip_cap_binding_count_v2"     # F4: drops a duplicated dataset
 )
 
 annotation <- tibble(feature = colnames(features)) %>%
@@ -1077,7 +1165,9 @@ annotation <- tibble(feature = colnames(features)) %>%
 # which is the worst case for credit-splitting and the thing SHAP family summation exists to
 # avoid. They are flagged rather than deleted so the baseline gate stays runnable - the
 # baseline's 51 features include all five.
-deprecated_features <- c("csc_q1", "csc_q2", "csc_q3", "csc_q4", "csc_first75")
+deprecated_features <- c("csc_q1", "csc_q2", "csc_q3", "csc_q4", "csc_first75",
+                         broken_structure,            # F2 + F5, see the structure repairs
+                         "clip_lee_complete_media_bound")   # F4, duplicate of glu_dep
 
 annotation <- annotation %>%
   mutate(deprecated = feature %in% deprecated_features,
@@ -1144,7 +1234,13 @@ definitions <- tribble(
   "g4mer_mean_utr3",      "mean G4mer window score, 3'UTR; no length bias",
   "g4mer_frac_above_utr5", "fraction of 5'UTR windows above the rG4 threshold",
   "g4mer_frac_above_cds",  "fraction of CDS windows above the rG4 threshold",
-  "g4mer_frac_above_utr3", "fraction of 3'UTR windows above the rG4 threshold"
+  "g4mer_frac_above_utr3", "fraction of 3'UTR windows above the rG4 threshold",
+  "hia2026_dhx29_occupancy_tx",
+    "Hia 2026 DHX29 ribosome occupancy, joined on transcript_id_clean (the source key)",
+  "clip_cap_binding_count_v2",
+    "cap-binding CLIP datasets with evidence, counting the 2 distinct conditions (0-2)",
+  "te_lfc",
+    "WARNING: this is the siCTRL hypoxia-vs-normoxia 1hr contrast (translation_categories_1hr.csv), NOT an si3d knockdown contrast. Never read it as the eIF3d TE change."
 )
 
 definitions <- definitions %>% filter(feature %in% annotation$feature)
@@ -1184,6 +1280,13 @@ stopifnot(
     !any(annotation$family == "other"),
   "unrecognised variant" =
     all(annotation$variant %in% c("single", "current", "corrected")),
+  # F6 regression guard: the six _cds/_utr3 columns ending in _mean/_min/_sd were filed under
+  # structure_utr5 for as long as the anchor was "$". 18 columns, 6 per region, always.
+  "structure families are not 6/6/6 - the region regex is wrong again" =
+    identical(as.integer(table(factor(
+      annotation$family[str_starts(annotation$feature, "tco_struct_")],
+      levels = c("structure_utr5", "structure_cds", "structure_utr3")))),
+      c(6L, 6L, 6L)),
   "a deprecated feature is missing from the matrix" =
     all(deprecated_features %in% annotation$feature),
   "unrecognised added_in" =
@@ -1200,6 +1303,110 @@ leak <- annotation %>%
          str_detect(feature, "^te_|^sig_|^indiv_te_|^delta_te_"))
 stopifnot("an outcome-derived column is selectable as a feature" = nrow(leak) == 0)
 cat("Leakage guard: no outcome-derived column is selectable\n")
+```
+
+## Structural invariants
+
+Every bug the independent audit found was a *class* of bug, not a one-off. These turn each
+class into a standing check, so the same shape of error cannot return silently. They run on
+the modelled columns only (identifiers, labels and deprecated columns are exempt).
+
+```{r feature_invariants, eval = !params$pass_through}
+modelled <- annotation %>%
+  filter(block %in% c("intrinsic", "external"), !deprecated) %>% pull(feature)
+num_mod <- modelled[map_lgl(modelled, ~ is.numeric(features[[.x]]))]
+vals <- features[, num_mod]
+
+# A. No two modelled features may be bit-identical. F4: clip_lee_complete_media_bound was a
+#    byte-for-byte copy of clip_lee_glu_dep_bound, and a count summing both double-counted it.
+dup_pairs <- list()
+for (i in seq_along(num_mod)) for (j in seq_len(i - 1)) {
+  if (identical(vals[[i]], vals[[j]])) dup_pairs[[length(dup_pairs) + 1]] <-
+    paste(num_mod[j], "==", num_mod[i])
+}
+cat("A. identical modelled columns:", length(dup_pairs), "\n")
+if (length(dup_pairs)) cat("   ", paste(unlist(dup_pairs), collapse = "; "), "\n")
+
+# B. No modelled feature may be constant. F5: three accessibility_*_min columns were
+#    identically 0, because min() was taken after NA had been replaced with 0.
+sds <- map_dbl(num_mod, ~ stats::sd(features[[.x]], na.rm = TRUE))
+const_feats <- num_mod[!is.na(sds) & sds == 0]
+cat("B. constant modelled columns:", length(const_feats),
+    if (length(const_feats)) paste("-", paste(const_feats, collapse = ", ")) else "", "\n")
+
+# C. Nothing outside the length family may be a near-perfect proxy for a region length.
+#    F2: num_structured_regions* was Spearman ~1.000 with its own region length, and its
+#    "count" exceeded that length, so length entered the forest three more times in disguise.
+len_cols <- intersect(c("utr5_length", "cds_length", "utr3_length", "total_length"),
+                      colnames(features))
+proxies <- list()
+for (f in setdiff(num_mod, len_cols)) {
+  if (annotation$family[match(f, annotation$feature)] == "length") next
+  for (L in len_cols) {
+    ok <- stats::complete.cases(features[[f]], features[[L]])
+    if (sum(ok) < 100) next
+    r <- suppressWarnings(cor(features[[f]][ok], features[[L]][ok], method = "spearman"))
+    if (!is.na(r) && abs(r) > 0.999)
+      proxies[[length(proxies) + 1]] <- sprintf("%s ~ %s (rho %.5f)", f, L, r)
+  }
+}
+cat("C. length proxies outside the length family:", length(proxies), "\n")
+if (length(proxies)) cat("   ", paste(unlist(proxies), collapse = "; "), "\n")
+
+stopifnot(
+  "two modelled features are bit-identical"          = length(dup_pairs) == 0,
+  "a modelled feature is constant"                   = length(const_feats) == 0,
+  "a non-length feature is a near-perfect length proxy" = length(proxies) == 0
+)
+
+# D. Sentinel blocks, REPORTED not asserted: a continuous feature where one exact value is
+#    shared by a large block of rows is how F1 hid - 1,689 transcripts zero-filled rather than
+#    NA, which defeats every NA-based guard downstream. Some features are legitimately
+#    zero-heavy (g4mer_frac_above, ppp_motif_density), so this is a prompt to look, not a gate.
+cat("D. continuous columns where one exact value covers >5% of rows:\n")
+flagged <- 0
+for (f in num_mod) {
+  v <- features[[f]]; v <- v[!is.na(v)]
+  if (length(unique(v)) < 100) next                 # not continuous
+  tb <- sort(table(v), decreasing = TRUE)
+  if (tb[1] / length(v) > 0.05) {
+    cat(sprintf("     %-42s value %s in %.1f%% of rows\n", f, names(tb)[1],
+                100 * tb[1] / length(v)))
+    flagged <- flagged + 1
+  }
+}
+if (!flagged) cat("     none\n")
+```
+
+## What `te_lfc` actually is (audit finding F7)
+
+`te_lfc` / `te_padj` / `te_lfc_bin` are **not** an si3d knockdown contrast. They are a
+bit-for-bit copy of `output/translation_categories_1hr.csv`, the siCTRL
+hypoxia-vs-normoxia 1hr contrast. Two independent signs of it: EIF3D's own `te_lfc` is
+**negative** (the documented direction check requires strongly positive under its own
+knockdown), and `sig_hypoxia_3d_promotes_TE_1hr_lfc0.5` flags 1,446 transcripts of which only
+11 have `te_lfc > 0.5`.
+
+No model is affected - these are `block = label` and `02_` asserts them out of the feature set
+- but anything reading `te_lfc` as "the eIF3d TE change" is wrong. The identity is asserted
+here so the definition cannot go stale without failing.
+
+```{r verify_te_lfc_provenance, eval = !params$pass_through}
+hyp_1hr <- read_csv(here("output", "translation_categories_1hr.csv"), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  dplyr::select(gene_id_clean, src_te_lfc = te_lfc)
+
+chk <- features %>% dplyr::select(gene_id_clean, te_lfc) %>%
+  inner_join(hyp_1hr, by = "gene_id_clean")
+ok  <- stats::complete.cases(chk$te_lfc, chk$src_te_lfc)
+dev <- max(abs(chk$te_lfc[ok] - chk$src_te_lfc[ok]))
+cat("te_lfc vs translation_categories_1hr.csv: max |dev| =", signif(dev, 3),
+    ", n =", sum(ok), "\n")
+cat("EIF3D own te_lfc:", round(features$te_lfc[features$symbol == "EIF3D"], 3),
+    "(negative confirms this is NOT the si3d contrast)\n")
+stopifnot(
+  "te_lfc is no longer the hypoxia-response contrast - update its definition" = dev < 1e-9
+)
 ```
 
 # 4. Reproduction gate: does the annotation rebuild the baseline 51?

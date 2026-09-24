@@ -7,8 +7,8 @@ Regenerate after any change to `01_build_feature_matrix.Rmd`:
 Rscript code/translational_control_overview/01b_feature_dictionary.R
 ```
 
-Matrix: **10172 transcripts x 171 columns**, keyed on `transcript_id_clean`.
-Of these, **106 are modelled** by default (blocks `intrinsic` + `external`, excluding deprecated); the rest are identifiers, labels or QC flags.
+Matrix: **10172 transcripts x 173 columns**, keyed on `transcript_id_clean`.
+Of these, **101 are modelled** by default (blocks `intrinsic` + `external`, excluding deprecated); the rest are identifiers, labels or QC flags.
 
 ## How to read the columns
 
@@ -47,23 +47,6 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `fop_internal` | corrected | tco | 98.8 | FOP, top-10%-TE reference; internal codons only | 01_build_feature_matrix | corrected |
 | `tai` | current | baseline | 99.4 | coRdon tAI; collaborator variant to be adopted, see 00_ | 01g_feature_extraction_codon_optimality, 17_frame_control_codon_scores, 27_txn_reporter_codon_usage, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
 | `tai_gtrnadb` | corrected | tco | 98.8 | dos Reis-style tAI; GtRNAdb hg38 copy number + collaborator wobble v1 | 01_build_feature_matrix | corrected |
-
-### `structure_utr5` (12)
-
-| feature | variant | added_in | cov% | definition | assigned in | checks |
-|---|---|---|---|---|---|---|
-| `tco_struct_accessibility_aug_context` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_cap_proximal` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_cds_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_cds_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_cds_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_utr3_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_utr3_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_utr3_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_utr5_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_utr5_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_utr5_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_num_structured_regions` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
 
 ### `termination` (11)
 
@@ -119,6 +102,39 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `utr3_gc` | single | baseline | 98.7 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
 | `utr5_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
 
+### `structure_cds` (6)
+
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `tco_struct_accessibility_cds_mean` | single | baseline | 84.3 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cds_min` | single | baseline | 84.3 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cds_sd` | single | baseline | 84.3 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_start_proximal_cds` | single | baseline | 84.3 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_stop_proximal_cds` | single | baseline | 84.3 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions_cds` | single | baseline | 84.3 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+
+### `structure_utr3` (6)
+
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `tco_struct_accessibility_distal_utr3` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_stop_proximal_utr3` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr3_mean` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr3_min` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr3_sd` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions_utr3` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+
+### `structure_utr5` (6)
+
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `tco_struct_accessibility_aug_context` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cap_proximal` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr5_mean` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr5_min` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr5_sd` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions` | single | baseline | 83.4 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+
 ### `initiation` (5)
 
 | feature | variant | added_in | cov% | definition | assigned in | checks |
@@ -137,22 +153,6 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `ppp_motif_density` | single | tco | 98.8 | PPP occurrences per 100 residues; overlapping matches counted | 01_build_feature_matrix | peptide |
 | `proline_fraction` | single | tco | 98.8 | fraction (0-1) of internal-codon residues that are proline | 01_build_feature_matrix | peptide |
 
-### `structure_cds` (3)
-
-| feature | variant | added_in | cov% | definition | assigned in | checks |
-|---|---|---|---|---|---|---|
-| `tco_struct_accessibility_start_proximal_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_stop_proximal_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_num_structured_regions_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-
-### `structure_utr3` (3)
-
-| feature | variant | added_in | cov% | definition | assigned in | checks |
-|---|---|---|---|---|---|---|
-| `tco_struct_accessibility_distal_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_accessibility_stop_proximal_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_num_structured_regions_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-
 ### `polya_track` (2)
 
 | feature | variant | added_in | cov% | definition | assigned in | checks |
@@ -160,15 +160,16 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `max_consecutive_aaa` | single | tco | 98.8 | longest in-frame run of AAA lysine codons | 01_build_feature_matrix | peptide |
 | `max_consecutive_aag` | single | tco | 98.8 | longest in-frame run of AAG lysine codons | 01_build_feature_matrix | peptide |
 
-## Block: `external` (36)
+## Block: `external` (38)
 
 Measured in some other experiment. Will not exist for most new datasets.
 
-### `clip` (23)
+### `clip` (24)
 
 | feature | variant | added_in | cov% | definition | assigned in | checks |
 |---|---|---|---|---|---|---|
-| `clip_cap_binding_count` | single | baseline | 91.4 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_cap_binding_count` | current | baseline | 91.4 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_cap_binding_count_v2` | corrected | tco | 100.0 | cap-binding CLIP datasets with evidence, counting the 2 distinct conditions (0-2) | 01_build_feature_matrix |  |
 | `clip_cate_diff_npcs_3utr` | single | baseline | 100.0 |  |  |  |
 | `clip_cate_diff_npcs_5utr` | single | baseline | 100.0 |  |  |  |
 | `clip_cate_diff_npcs_bound` | single | baseline | 100.0 |  |  |  |
@@ -192,7 +193,7 @@ Measured in some other experiment. Will not exist for most new datasets.
 | `clip_lee_parclip_d_only_bound` | single | baseline | 100.0 |  |  |  |
 | `clip_lee_parclip_d_only_cds` | single | baseline | 100.0 |  |  |  |
 
-### `stability_external` (9)
+### `stability_external` (10)
 
 | feature | variant | added_in | cov% | definition | assigned in | checks |
 |---|---|---|---|---|---|---|
@@ -201,7 +202,8 @@ Measured in some other experiment. Will not exist for most new datasets.
 | `hia2026_ctrl_halflife` | single | baseline | 43.3 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
 | `hia2026_dhx29_halflife_logfc` | single | baseline | 43.3 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
 | `hia2026_dhx29_kd_rna_lfc` | single | baseline | 89.0 |  | 87_dhx29_rnaseq_gc3_sensitivity |  |
-| `hia2026_dhx29_occupancy` | single | baseline | 93.8 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `hia2026_dhx29_occupancy` | current | baseline | 93.8 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `hia2026_dhx29_occupancy_tx` | corrected | tco | 83.8 | Hia 2026 DHX29 ribosome occupancy, joined on transcript_id_clean (the source key) | 01_build_feature_matrix |  |
 | `karner2026_mda231_log2_ct` | single | baseline | 68.2 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
 | `zhu2024_cnot3ko_halflife_logfc` | single | baseline | 83.2 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
 | `zhu2024_ctrl_halflife` | single | baseline | 88.5 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
@@ -285,7 +287,7 @@ The target and anything derived from it. Never a feature.
 
 | feature | variant | added_in | cov% | definition | assigned in | checks |
 |---|---|---|---|---|---|---|
-| `te_lfc` | single | baseline | 100.0 |  | 01u_feature_extraction_g4mer, 10_rf_classification_eif3d_vs_eif4e, 24_thesis_committee_2026, 26_eif3d_reporter_candidates, 29_eif3e_elongation_eif3d_model, 41_rscu_mcf7six1_hypoxia, 42_prepare_mcf7six1_genesets, 50_rscu_cross_cellline_correlation, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 56_candidate_mrna_gc3_analysis, 70_rna_genesets_si3d, 77_teleman_eif4e_ip_corrected, 80_teleman_rna_ribo_separately, 81_4e_ip_enrichment_resistant_vs_sensitive, 86_te_change_barplots_with_normoxia_regressed, FEATURE_DECISION_LOG |  |
+| `te_lfc` | single | baseline | 100.0 | WARNING: this is the siCTRL hypoxia-vs-normoxia 1hr contrast (translation_categories_1hr.csv), NOT an si3d knockdown contrast. Never read it as the eIF3d TE change. | 01u_feature_extraction_g4mer, 10_rf_classification_eif3d_vs_eif4e, 24_thesis_committee_2026, 26_eif3d_reporter_candidates, 29_eif3e_elongation_eif3d_model, 41_rscu_mcf7six1_hypoxia, 42_prepare_mcf7six1_genesets, 50_rscu_cross_cellline_correlation, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 56_candidate_mrna_gc3_analysis, 70_rna_genesets_si3d, 77_teleman_eif4e_ip_corrected, 80_teleman_rna_ribo_separately, 81_4e_ip_enrichment_resistant_vs_sensitive, 86_te_change_barplots_with_normoxia_regressed, FEATURE_DECISION_LOG |  |
 | `te_lfc_bin` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, FEATURE_DECISION_LOG |  |
 | `te_padj` | single | baseline | 99.9 |  | 10_rf_classification_eif3d_vs_eif4e, 26_eif3d_reporter_candidates, 42_prepare_mcf7six1_genesets, 80_teleman_rna_ribo_separately, FEATURE_DECISION_LOG |  |
 
@@ -311,8 +313,8 @@ Identifiers.
 | feature | variant | added_in | cov% | definition | assigned in | checks |
 |---|---|---|---|---|---|---|
 | `gene_id` | single | baseline | 100.0 |  | 01_feature_extraction, 01c_feature_extraction_combined, 02_negative_control_set, 02_random_forest_model, 02b_negative_control_set_si3e, 03_rf_classification_eif3d_targets, 04_rf_classification_eif3d_targets_hypoxia, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07c_rf_shap_eif3d_targets, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 10_rf_hypoxia_specific_vs_normoxia_specific, 20_csc_mrna_stability, 27_txn_reporter_codon_usage, 31_rf_regression_te_lfc, 65_benchling_construct_design, 70_rna_genesets_si3d, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 80_teleman_rna_ribo_separately, 82_manual_gc3_check, 96_eif4e_rip_enrichment_and_te_volcano, 97_absolute_te_by_4e_class, FEATURE_DECISION_LOG |  |
-| `gene_id_clean` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, 01c_kmer_motif_precompute, 01e_feature_extraction_clip_split, 01f_feature_extraction_te_lfc, 01g_feature_extraction_codon_optimality, 01j_feature_extraction_csc_positional, 01l_feature_extraction_codon_features, 01u_feature_extraction_g4mer, 02c_expressed_background_pool_si3e, 03_rf_classification_eif3d_targets, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07b_rf_permutation_importance_eif3d_targets, 07c_rf_shap_eif3d_targets, 08_feature_directionality_analysis, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 14_ecdf_clip_eif3_count, 16_rf_no_te_features_normoxia_hypoxia, 17_frame_control_codon_scores, 18_fop_reference_comparison, 23_dhx29_riboseq_slamseq, 24_thesis_committee_2026, 26_eif3d_reporter_candidates, 31_rf_regression_te_lfc, 32_cap_binding_density, 33_utr_cds_length_gc, 35_rf_regression_residuals, 36_eif4e_vehicle_by_condition, 37_rf_regression_residuals_lfc0, 39_ssmart_input_transcript_hypoxia_1hr, 40_ssmart_input_utr5_hypoxia_1hr, 41_rscu_mcf7six1_hypoxia, 42_prepare_mcf7six1_genesets, 43_feature_extraction_mcf7six1_codon, 48_te_quartile_sequence_features, 49_te_quartile_sequence_features_mcf7six1, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 56_candidate_mrna_gc3_analysis, 60_ribowaltz_epa_codon_occupancy_pos_neg_sets, 62_cds_length_gc_hypoxia_promotes, 63_cds_length_gc_negative_controls, 64_nanoluc_codon_adaptation, 65_benchling_construct_design, 66_rna_changes_si3d_si3e, 67_rna_vs_ribo_si3d_genesets, 68_cds_length_gc_red_beetle_luciferase, 69_eif3d_promoted_genes_all_conditions, 71_gc_content_vs_rna_changes_transcriptome, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 78_feature_matrix_teleman_4e, 80_teleman_rna_ribo_separately, 83_gc_csc_3d_promoted_hypoxia_1hr, 85_subunit_seq_3d_bound_features, 87_dhx29_rnaseq_gc3_sensitivity, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG, 02_rf_model |  |
-| `symbol` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, 02_random_forest_model, 03_rf_classification_eif3d_targets, 04_rf_classification_eif3d_targets_hypoxia, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07c_rf_shap_eif3d_targets, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 10_rf_hypoxia_specific_vs_normoxia_specific, 20_csc_mrna_stability, 22_cnot3_riboseq_slamseq, 23_dhx29_riboseq_slamseq, 24_thesis_committee_2026, 25_goodarzi_231_decay_rates, 31_rf_regression_te_lfc, 35_rf_regression_residuals, 37_rf_regression_residuals_lfc0, 43_feature_extraction_mcf7six1_codon, 56_candidate_mrna_gc3_analysis, 65_benchling_construct_design, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `gene_id_clean` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, 01c_kmer_motif_precompute, 01e_feature_extraction_clip_split, 01f_feature_extraction_te_lfc, 01g_feature_extraction_codon_optimality, 01j_feature_extraction_csc_positional, 01l_feature_extraction_codon_features, 01u_feature_extraction_g4mer, 02c_expressed_background_pool_si3e, 03_rf_classification_eif3d_targets, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07b_rf_permutation_importance_eif3d_targets, 07c_rf_shap_eif3d_targets, 08_feature_directionality_analysis, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 14_ecdf_clip_eif3_count, 16_rf_no_te_features_normoxia_hypoxia, 17_frame_control_codon_scores, 18_fop_reference_comparison, 23_dhx29_riboseq_slamseq, 24_thesis_committee_2026, 26_eif3d_reporter_candidates, 31_rf_regression_te_lfc, 32_cap_binding_density, 33_utr_cds_length_gc, 35_rf_regression_residuals, 36_eif4e_vehicle_by_condition, 37_rf_regression_residuals_lfc0, 39_ssmart_input_transcript_hypoxia_1hr, 40_ssmart_input_utr5_hypoxia_1hr, 41_rscu_mcf7six1_hypoxia, 42_prepare_mcf7six1_genesets, 43_feature_extraction_mcf7six1_codon, 48_te_quartile_sequence_features, 49_te_quartile_sequence_features_mcf7six1, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 56_candidate_mrna_gc3_analysis, 60_ribowaltz_epa_codon_occupancy_pos_neg_sets, 62_cds_length_gc_hypoxia_promotes, 63_cds_length_gc_negative_controls, 64_nanoluc_codon_adaptation, 65_benchling_construct_design, 66_rna_changes_si3d_si3e, 67_rna_vs_ribo_si3d_genesets, 68_cds_length_gc_red_beetle_luciferase, 69_eif3d_promoted_genes_all_conditions, 71_gc_content_vs_rna_changes_transcriptome, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 78_feature_matrix_teleman_4e, 80_teleman_rna_ribo_separately, 83_gc_csc_3d_promoted_hypoxia_1hr, 85_subunit_seq_3d_bound_features, 87_dhx29_rnaseq_gc3_sensitivity, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG, 01_build_feature_matrix, 02_rf_model, 03_shap |  |
+| `symbol` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, 02_random_forest_model, 03_rf_classification_eif3d_targets, 04_rf_classification_eif3d_targets_hypoxia, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07c_rf_shap_eif3d_targets, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 10_rf_hypoxia_specific_vs_normoxia_specific, 20_csc_mrna_stability, 22_cnot3_riboseq_slamseq, 23_dhx29_riboseq_slamseq, 24_thesis_committee_2026, 25_goodarzi_231_decay_rates, 31_rf_regression_te_lfc, 35_rf_regression_residuals, 37_rf_regression_residuals_lfc0, 43_feature_extraction_mcf7six1_codon, 56_candidate_mrna_gc3_analysis, 65_benchling_construct_design, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG, 03_shap |  |
 | `transcript_id` | single | baseline | 100.0 |  | 02_random_forest_model, 65_benchling_construct_design, 76_teleman_4e_riboseq_te_validation, 82_manual_gc3_check, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG |  |
 | `transcript_id_clean` | single | baseline | 100.0 |  | 01_feature_extraction, 01c_feature_extraction_combined, 01c_kmer_motif_precompute, 01d_feature_extraction_structure, 01g_feature_extraction_codon_optimality, 01h_feature_extraction_kozak, 01j_feature_extraction_csc_positional, 01k_feature_extraction_cds_utr3_structure, 01u_feature_extraction_g4mer, 01v_feature_extraction_positional_gc, 17_frame_control_codon_scores, 18_fop_reference_comparison, 19_nucleotide_composition, 20_csc_mrna_stability, 22_cnot3_riboseq_slamseq, 23_dhx29_riboseq_slamseq, 28_csc_full_vs_75codon, 30_condition_specific_codon_usage, 38_rscu_hypoxia_1hr, 39_ssmart_input_transcript_hypoxia_1hr, 40_ssmart_input_utr5_hypoxia_1hr, 41_rscu_mcf7six1_hypoxia, 43_feature_extraction_mcf7six1_codon, 44_rscu_normoxia_1and4hr, 46_rscu_mcf7six1_normoxia_1hr, 51_rscu_231_promoted_hyp_vs_nor, 52_rscu_mcf7six1_promoted_hyp_vs_nor, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 62_cds_length_gc_hypoxia_promotes, 63_cds_length_gc_negative_controls, 64_nanoluc_codon_adaptation, 65_benchling_construct_design, 68_cds_length_gc_red_beetle_luciferase, 78_feature_matrix_teleman_4e, 85_subunit_seq_3d_bound_features, 93_rscu_frame_control_dhx29_codons, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG, 01_build_feature_matrix |  |
 
@@ -321,9 +323,9 @@ Identifiers.
 | | modelled features |
 |---|---|
 | exercised by a `validate_*` chunk here | 32 |
-| no check in this fork | 74 |
+| no check in this fork | 69 |
 
-Unchecked here, by family: `clip` (23), `structure_utr5` (12), `stability_external` (9), `length` (8), `codon_optimality` (5), `gc` (5), `dap5` (4), `structure_cds` (3), `structure_utr3` (3), `initiation` (2).
+Unchecked here, by family: `clip` (23), `stability_external` (10), `length` (8), `codon_optimality` (5), `gc` (5), `dap5` (4), `structure_cds` (4), `structure_utr3` (4), `structure_utr5` (4), `initiation` (2).
 
 These are inherited features whose checks live in `code/predictive_modeling/`. They are not
 unverified, but they are not verified *here*, and the reproduction gate would not notice if
