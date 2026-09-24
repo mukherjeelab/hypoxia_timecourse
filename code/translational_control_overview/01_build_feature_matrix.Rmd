@@ -40,7 +40,7 @@ the annotation is new. That is deliberate and is the first thing to run: it lets
 any feature added. Until that reproduction gate passes, no later difference is interpretable -
 a fork that silently fails to rebuild the baseline looks exactly like a real feature effect.
 
-Definition fixes (Kozak PWM, GC3 stop codon, `tco_struct_*` rename) and the new feature
+Definition fixes (Kozak PWM, GC3 stop codon), the `tco_struct_*` rename and the new feature
 families land in later passes, with `pass_through = FALSE`.
 
 ```{r libraries}
@@ -608,6 +608,23 @@ stopifnot(
   "non-AUG-start transcripts were masked, but they are real" =
     any(!is.na(features$gc3_internal[!features$cds_has_start & features$cds_has_stop]))
 )
+## --- tco_struct_* rename -------------------------------------------------------------
+# NAME COLLISION (00_ inventory): the collaborator also has struct_accessibility_*, but
+# theirs is a whole-transcript fold while ours is region-isolated RNAplfold (-W 150 -L 100).
+# Same names, different quantities - the one case in the inventory where a name, not a
+# definition, is the problem. Ours is renamed; nothing is refolded.
+# Renaming does not reorder columns, so the forest is unaffected at equal seeds.
+struct_old <- grep("^struct_", colnames(features), value = TRUE)
+features <- features %>% dplyr::rename_with(~ paste0("tco_", .x), all_of(struct_old))
+stopifnot("tco_struct_ rename did not apply" =
+            length(grep("^struct_", colnames(features))) == 0L &&
+            length(grep("^tco_struct_", colnames(features))) == length(struct_old))
+# These are baseline-era columns under a new spelling, not new features, so the record of
+# what the baseline contained has to follow the rename. Without this they are tagged
+# added_in = "tco" and both gates silently drop all 18.
+baseline_cols <- sub("^struct_", "tco_struct_", baseline_cols)
+cat("Renamed", length(struct_old), "struct_* columns to tco_struct_*\n")
+
 cat("Matrix now", nrow(features), "x", ncol(features), "\n")
 ```
 
@@ -946,9 +963,9 @@ assign_family <- function(x) {
     str_detect(x, "_gc$|^gc3")                                   ~ "gc",
     # Order matters: the CDS and 3'UTR structure columns carry a suffix, the 5'UTR ones
     # do not, so the suffixed patterns must be tested first.
-    str_detect(x, "^struct_.*_cds$")                             ~ "structure_cds",
-    str_detect(x, "^struct_.*_utr3$")                            ~ "structure_utr3",
-    str_detect(x, "^struct_")                                    ~ "structure_utr5",
+    str_detect(x, "^tco_struct_.*_cds$")                         ~ "structure_cds",
+    str_detect(x, "^tco_struct_.*_utr3$")                        ~ "structure_utr3",
+    str_detect(x, "^tco_struct_")                                ~ "structure_utr5",
     str_detect(x, "^csc|^cai|^tai|^fop")                         ~ "codon_optimality",
     str_detect(x, "^kozak_|^noderer_")                           ~ "initiation",
     x %in% c("proline_fraction", "ppp_motif_density",
@@ -1056,11 +1073,11 @@ definitions <- definitions %>% filter(feature %in% annotation$feature)
 annotation <- annotation %>%
   rows_update(definitions, by = "feature", unmatched = "error")
 
-# Every struct_* column is region-isolated RNAplfold (-W 150 -L 100), NOT the collaborator's
-# whole-transcript fold. Renamed to tco_struct_* in a later pass so the two cannot be confused.
+# Every tco_struct_* column is region-isolated RNAplfold (-W 150 -L 100), NOT the
+# collaborator's whole-transcript fold. The tco_ prefix is what keeps the two apart.
 annotation <- annotation %>%
   mutate(definition = if_else(
-    str_starts(feature, "struct_"),
+    str_starts(feature, "tco_struct_"),
     "RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6)",
     definition))
 
@@ -1145,9 +1162,24 @@ cat("Baseline importance CSV:", nrow(baseline_importance), "\n")
 cat("Dropped as sparse (<50% non-NA):", length(sparse), "-",
     paste(sparse, collapse = ", "), "\n")
 
+# The frozen baseline CSV predates the tco_struct_* rename, so the gate compares on the
+# baseline's spelling. This is a rename and nothing else: the columns, their values and their
+# order are untouched, and the count is asserted on both sides.
+selected_baseline_names <- sub("^tco_struct_", "struct_", selected)
+
+if (!setequal(selected_baseline_names, baseline_importance$feature)) {
+  cat("only in block join:",
+      paste(setdiff(selected_baseline_names, baseline_importance$feature), collapse = ", "),
+      "\nonly in baseline  :",
+      paste(setdiff(baseline_importance$feature, selected_baseline_names), collapse = ", "),
+      "\n")
+}
 stopifnot(
+  "the rename changed how many struct columns are selected" =
+    sum(str_starts(selected, "tco_struct_")) ==
+    sum(str_starts(selected_baseline_names, "struct_")),
   "block join does not reproduce the baseline feature set" =
-    setequal(selected, baseline_importance$feature)
+    setequal(selected_baseline_names, baseline_importance$feature)
 )
 cat("\nGATE PASSED: the annotation reproduces the baseline 51 features exactly\n")
 ```
@@ -1182,6 +1214,17 @@ can drop notebook 07's `feature_set` branches without changing what is modelled.
 the intrinsic-vs-external split a data decision you can revise by editing a CSV, and `family`
 is what lets `03_shap.Rmd` sum SHAP over correlated columns exactly.
 
-Still pass-through: no definition is corrected and no feature is added yet. Next pass applies
-the Kozak PWM fix, the GC3 stop-codon fix and the `tco_struct_*` rename, then merges G4 and the
-adopted families.
+**State of the build.** Six definitions are corrected (`kozak_pwm_score_v2`, `gc3_internal`,
+`cai_internal`, `fop_internal`, `csc_internal`, `tai_gtrnadb`), each kept *alongside* the
+column it supersedes so the baseline stays reproducible. The `tco_struct_*` rename is applied.
+Five families have been added: `initiation` (Noderer TIS efficiency), `termination` (stop
+context + Cridge readthrough), `nascent_peptide`, `polya_track` and `g4` (G4mer, merged from
+`output/g4mer/` - no inference re-run).
+
+Every added family must be judged against its own shuffled null via `02b_`/`02c_`, never
+against zero: impurity importance is non-negative, so an uninformative family never scores
+zero. Of the five, only `g4` clears that floor on AUC, and none beats the no-family arm.
+
+Remaining from `00_`'s inventory: the detectability block
+(`control_ribo_frame0_fraction`, `control_ribo_cds_coverage_fraction`), which needs riboseq
+coverage rather than a lookup and is deferred.

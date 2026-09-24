@@ -1,45 +1,55 @@
 # Negative-subsample sweep for 02_rf_model.Rmd
 #
-# Notebook 02 keeps every positive and draws a size-matched negative class from the pool
-# (1,436 of 2,789 here), so a single run reports the AUC and feature ranking of ONE arbitrary
-# draw. Any current-vs-corrected difference has to be read against that spread, not against
-# zero. This renders 02 once per neg_seed for both variant sets; 02c_ reports the result.
+# Notebook 02 keeps every positive and draws a size-matched negative class from the pool, so a
+# single run reports the AUC and feature ranking of ONE arbitrary draw. On this model the draw
+# alone moves test AUC by ~0.07. No claim is readable against zero; it has to be read against
+# an arm that differs only in the thing being tested.
 #
 # neg_seed seeds ONLY the negative draw - the split, the forest and the CV stay pinned at 9 -
-# so every difference across seeds is negative-class composition and nothing else.
+# so within a seed every arm sees identical genes in an identical split. The sweep is paired
+# by construction, and the paired-difference sd runs ~5-10x smaller than the draw-to-draw sd.
 #
-# Usage:  Rscript code/translational_control_overview/02b_neg_subsample_sweep.R
+# Arms come from 02_sweep_presets.R, shared with 02c_sweep_stability.Rmd which reports them.
+#
+# Usage:
+#   Rscript code/translational_control_overview/02b_neg_subsample_sweep.R g4
+#   Rscript code/translational_control_overview/02b_neg_subsample_sweep.R      # lists presets
 suppressMessages({library(here); library(rmarkdown)})
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
 
 if (Sys.getenv("RSTUDIO_PANDOC") == "")
   Sys.setenv(RSTUDIO_PANDOC = "/Applications/RStudio.app/Contents/Resources/app/quarto/bin/tools")
 
-SEEDS <- 1:20
+args   <- commandArgs(trailingOnly = TRUE)
+preset <- if (length(args)) args[1] else NA_character_
 
-# Each config is one arm of a paired comparison. Because neg_seed seeds only the draw, two
-# arms at the same seed see identical genes, so differences are the config alone.
-CONFIGS <- list(
-  no_g4   = list(feature_set_label = "tco_g4none", exclude_families = "g4"),
-  with_g4 = list(feature_set_label = "tco_g4real"),
-  shuf_g4 = list(feature_set_label = "tco_g4shuf", shuffle_families = "g4")
-)
-rmd      <- here("code", "translational_control_overview", "02_rf_model.Rmd")
-scratch  <- file.path(tempdir(), "tco_sweep"); dir.create(scratch, showWarnings = FALSE)
+if (is.na(preset) || !preset %in% names(SWEEP_PRESETS)) {
+  cat("Usage: Rscript 02b_neg_subsample_sweep.R <preset>\n\nAvailable presets:\n")
+  for (nm in names(SWEEP_PRESETS))
+    cat(sprintf("  %-12s %d arms: %s\n", nm, length(SWEEP_PRESETS[[nm]]),
+                paste(names(SWEEP_PRESETS[[nm]]), collapse = ", ")))
+  if (!is.na(preset)) cat("\nUnknown preset:", preset, "\n")
+  quit(status = if (is.na(preset)) 0 else 1)
+}
 
-grid <- expand.grid(seed = SEEDS, config = names(CONFIGS), stringsAsFactors = FALSE)
-cat("Rendering", nrow(grid), "models (", length(SEEDS), "seeds x",
-    length(CONFIGS), "configs )\n\n")
+CONFIGS <- SWEEP_PRESETS[[preset]]
+rmd     <- here("code", "translational_control_overview", "02_rf_model.Rmd")
+scratch <- file.path(tempdir(), "tco_sweep"); dir.create(scratch, showWarnings = FALSE)
+
+grid <- expand.grid(seed = SWEEP_SEEDS, config = names(CONFIGS), stringsAsFactors = FALSE)
+cat("Preset:", preset, "-", nrow(grid), "models (", length(SWEEP_SEEDS), "seeds x",
+    length(CONFIGS), "arms )\n\n")
 
 t0 <- Sys.time()
 for (i in seq_len(nrow(grid))) {
   s <- grid$seed[i]; nm <- grid$config[i]; cfg <- CONFIGS[[nm]]
-  cat(sprintf("[%2d/%d] config=%-17s neg_seed=%2d ... ", i, nrow(grid), nm, s))
+  cat(sprintf("[%2d/%d] arm=%-12s neg_seed=%2d ... ", i, nrow(grid), nm, s))
   ok <- tryCatch({
     render(rmd,
-           params = c(cfg, list(variant_set = "corrected", neg_seed = s,
-                                gate_against_baseline = FALSE, save_plots = FALSE)),
-           # keep the 40 throwaway HTML files out of the repo
-           output_file = sprintf("sweep_%s_seed%02d.html", nm, s),
+           params = c(cfg, list(neg_seed = s, gate_against_baseline = FALSE,
+                                save_plots = FALSE)),
+           # keep the throwaway HTML out of the repo
+           output_file = sprintf("sweep_%s_%s_seed%02d.html", preset, nm, s),
            output_dir  = scratch,
            quiet = TRUE)
     TRUE
@@ -47,5 +57,5 @@ for (i in seq_len(nrow(grid))) {
   if (ok) cat("ok\n")
 }
 cat("\nElapsed:", round(difftime(Sys.time(), t0, units = "mins"), 1), "min\n")
-cat("Outputs in output/translational_control_overview/ with suffix _negseed<N>\n")
+cat("Report it with 02c_sweep_stability.Rmd, params: preset =", shQuote(preset), "\n")
 cat("(seed 9 writes no suffix - it is the default draw)\n")

@@ -176,8 +176,20 @@ here writes to `output/predictive_modeling/`. Outputs go to
 | `00_feature_reconciliation.Rmd` | audit of our features vs the collaborator repo; writes `feature_inventory_comparison.csv` |
 | `01_build_feature_matrix.Rmd` | single builder -> `feature_matrix_tco.rds` + **`feature_annotation.csv`** |
 | `02_rf_model.Rmd` | fork of 07, driven by `include_blocks` instead of eight `feature_set` branches |
-| `02b_neg_subsample_sweep.R` | renders 02 across 20 `neg_seed` x N arms (~4-5 min; edit `CONFIGS` per question) |
-| `02c_sweep_stability.Rmd` | reports the sweep; **the null band any claim must clear** |
+| `01b_feature_dictionary.R` | regenerates **`FEATURES.md`**, the committed feature dictionary |
+| `02_sweep_presets.R` | the sweep arms, shared by `02b_` and `02c_` so a reported result stays re-runnable |
+| `02b_neg_subsample_sweep.R` | `Rscript 02b_... <preset>`; 20 `neg_seed` x N arms (~5 min for 3 arms). No argument lists the presets |
+| `02c_sweep_stability.Rmd` | reports any preset (`params$preset`); **the null band any claim must clear** |
+
+**`FEATURES.md` is the committed feature dictionary** - one row per column with variant,
+origin, coverage and definition, plus which `validate_*` chunk exercises it. Regenerate with
+`01b_feature_dictionary.R` after any change to `01_`; never edit it by hand. It exists because
+`feature_annotation.csv` lives in `output/`, which is gitignored, so the matrix's contents are
+otherwise invisible to anyone reading the repo. Its **verification-coverage table is the point**:
+32 of 106 modelled features are checked in this fork, and the other 74 are inherited, checked
+only in their original `code/predictive_modeling/` notebook. The reproduction gates would not
+notice if one of those had always been wrong - which is exactly how the `01h_` Kozak and `01g_`
+`csc` bugs survived. Blank in the `checks` column means *not checked here*, not *correct*.
 
 **`feature_annotation.csv` is the central artifact.** One row per column, with `block`
 (`id` / `label` / `qc` / `intrinsic` / `external` / `eif4e`), `family` (for exact SHAP
@@ -212,6 +224,13 @@ forest, where they would split credit and hide the effect being measured.
 | `csc` | `csc_internal` | iCodon given the internal-codon CDS, not the stop-containing one |
 | `tai` | `tai_gtrnadb` | collaborator's GtRNAdb copy number + explicit wobble table |
 
+**`struct_*` is renamed `tco_struct_*` in this fork** (the inventory's one NAME COLLISION row).
+The collaborator has `struct_accessibility_*` too, but theirs is a whole-transcript fold while
+ours is region-isolated RNAplfold (`-W 150 -L 100`) - same name, different quantity, and
+nothing is refolded. `code/predictive_modeling/` is untouched and keeps the old names. Both
+gates compare on the baseline's spelling, and the rename has to be applied to `baseline_cols`
+as well, or all 18 columns are tagged `added_in = "tco"` and silently dropped from both gates.
+
 **G4mer (`g4` family) is ours alone** - `00_`'s inventory has no collaborator counterpart
 (`ours_only`), so unlike `struct_*` there is no name to collide. Three things govern its use:
 inference is **already complete** in `output/g4mer/` (not the `g4mer/output/` in `.gitignore`);
@@ -245,8 +264,19 @@ invisible in a distribution comparison are readable when paired.
 target while preserving every marginal, the NA pattern and the within-family correlation
 structure. Impurity importance is non-negative, so an uninformative family never scores zero -
 the shuffled arm is the floor a real one has to clear. Three arms per question
-(`exclude_families` / default / `shuffle_families`), 20 seeds each, ~5 min. Give each arm its
-own `feature_set_label`, or they overwrite each other.
+(`exclude_families` / default / `shuffle_families`), 20 seeds each, ~5 min.
+
+**Arms live in `02_sweep_presets.R`, never inline.** `family_arms()` builds the three-arm shape
+and gives each arm its own `feature_set_label`, since two arms sharing a label overwrite each
+other's outputs. Presets sit side by side: `02b_`'s config list used to be *overwritten* by
+each new question, so the termination arms survived only in one commit and the peptide arms in
+another, and every number below needed a different checkout to reproduce.
+
+**Importance shares are denominator-dependent.** A family's share falls as unrelated features
+are added (this matrix went 57 -> 63 -> 72 features across three additions), so shares from
+different builds are not comparable. The table below was re-run end to end on the current
+matrix for that reason. The real-vs-shuffled *difference within one sweep* is unaffected, since
+both arms see the same matrix.
 
 Results so far on si3d / hypoxia / 1hr, **all of which are per-dataset and must be re-run on a
 new mRNA set rather than inherited**:

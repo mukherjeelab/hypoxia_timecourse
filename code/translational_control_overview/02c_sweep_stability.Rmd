@@ -1,10 +1,10 @@
 ---
-title: "Negative-subsample stability: is the codon correction real?"
+title: "`r paste0('Sweep stability: ', params$preset)`"
 author: "Kate"
 date: "`r Sys.Date()`"
 output: html_document
 params:
-  seeds: 20
+  preset: "g4"
 editor_options:
   chunk_output_type: console
 ---
@@ -16,175 +16,144 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 # Overview
 
 Notebook 02 keeps every positive and draws a size-matched negative class from the pool, so a
-single run reports the AUC and the feature ranking of **one arbitrary draw**. Reading a
-current-vs-corrected difference against zero is therefore meaningless; it has to be read
-against the spread produced by the draw itself.
-
-`02b_neg_subsample_sweep.R` renders 02 once per `neg_seed` for both variant sets.
+single run reports the AUC and the feature ranking of **one arbitrary draw**. Reading any
+difference against zero is meaningless; it has to be read against an arm that differs only in
+the thing being tested.
 
 **The sweep is paired by construction, and that is the point.** `neg_seed` seeds *only* the
-negative draw; the train/test split, the forest and the CV all stay pinned at 9. So for a given
-seed the two variant sets see the **same genes in the same split** and differ only in the six
-corrected feature columns. Paired differences therefore isolate the feature change exactly,
-and are far more sensitive than comparing two distributions of 20 runs.
+negative draw; the train/test split, the forest and the CV all stay pinned at 9. So within a
+seed every arm sees the **same genes in the same split**. Paired differences isolate the arm
+exactly, and are far more sensitive than comparing two distributions of 20 runs.
+
+For a **family** preset the three arms are `none` (family excluded), `real` (as built) and
+`shuf` (values permuted across transcripts). `shuf` is the floor, not a formality: impurity
+importance is non-negative, so an uninformative family never scores zero. A family that does
+not beat its own permuted copy has shown nothing.
+
+Run `02b_neg_subsample_sweep.R <preset>` first. Arms are defined in `02_sweep_presets.R`.
 
 ```{r libraries}
 library(tidyverse)
 library(here)
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
 ```
 
 ```{r load_sweep}
+stopifnot("unknown preset" = params$preset %in% names(SWEEP_PRESETS))
+arms    <- SWEEP_PRESETS[[params$preset]]
+fams    <- PRESET_FAMILIES[[params$preset]]
 out_dir <- here("output", "translational_control_overview")
 
-# Seed 9 is the default draw and writes no _negseed suffix (02 appends it only when != 9).
-suffix_for <- function(variant, seed) {
-  paste0("eif33d_promotes_hypoxia_1hr_lfc0.5_tco",
-         if (variant != "current") paste0("_", variant) else "",
-         "_clipaggregate",
-         if (seed != 9L) paste0("_negseed", seed) else "")
-}
-
-read_run <- function(variant, seed, kind) {
-  f <- file.path(out_dir, paste0("rf_", kind, "_", suffix_for(variant, seed), ".csv"))
+read_run <- function(arm_name, seed, kind) {
+  f <- file.path(out_dir, paste0("rf_", kind, "_",
+                                 sweep_suffix(arms[[arm_name]], seed), ".csv"))
   if (!file.exists(f)) return(NULL)
-  read_csv(f, show_col_types = FALSE) %>% mutate(variant = variant, seed = seed)
+  read_csv(f, show_col_types = FALSE) %>% mutate(arm = arm_name, seed = seed)
 }
 
-grid <- expand_grid(variant = c("current", "corrected"), seed = seq_len(params$seeds))
+grid <- expand_grid(arm = names(arms), seed = SWEEP_SEEDS)
+perf <- pmap_dfr(grid, function(arm, seed) read_run(arm, seed, "performance"))
+imp  <- pmap_dfr(grid, function(arm, seed) read_run(arm, seed, "importance"))
 
-perf <- pmap_dfr(grid, function(variant, seed) read_run(variant, seed, "performance"))
-imp  <- pmap_dfr(grid, function(variant, seed) read_run(variant, seed, "importance"))
-
-stopifnot("no sweep output found - run 02b_neg_subsample_sweep.R first" = nrow(perf) > 0)
-cat("Runs loaded:", n_distinct(paste(perf$variant, perf$seed)), "of", nrow(grid), "\n")
+stopifnot("no sweep output found - run 02b_neg_subsample_sweep.R <preset> first" =
+            nrow(perf) > 0)
+cat("Preset:", params$preset, "| arms:", paste(names(arms), collapse = ", "), "\n")
+cat("Runs loaded:", n_distinct(paste(perf$arm, perf$seed)), "of", nrow(grid), "\n")
+if (n_distinct(paste(perf$arm, perf$seed)) < nrow(grid))
+  cat("INCOMPLETE - re-run the preset before reading anything below\n")
 
 auc <- perf %>% filter(metric == "test_auc") %>%
-  dplyr::select(variant, seed, test_auc = value) %>%
-  left_join(perf %>% filter(metric == "cv_auc_mean") %>%
-              dplyr::select(variant, seed, cv_auc = value), by = c("variant", "seed"))
+  dplyr::select(arm, seed, test_auc = value)
 ```
 
 # 1. How much does the draw alone move the AUC?
 
 ```{r auc_spread}
-auc %>%
-  group_by(variant) %>%
+auc %>% group_by(arm) %>%
   summarise(n = n(), median = median(test_auc), sd = sd(test_auc),
             min = min(test_auc), max = max(test_auc), .groups = "drop") %>%
-  mutate(across(where(is.numeric) & !n, ~ round(., 4))) %>%
-  as.data.frame() %>% print()
+  mutate(across(where(is.numeric) & !n, ~ round(., 4))) %>% as.data.frame() %>% print()
 
 cat("\nRange of test AUC attributable to the negative draw alone:",
-    round(diff(range(auc$test_auc[auc$variant == "current"])), 4), "\n")
+    round(diff(range(auc$test_auc[auc$arm == names(arms)[1]])), 4), "\n")
 ```
 
-# 2. Paired current-vs-corrected difference
+# 2. Paired differences
 
-```{r paired_auc}
-paired <- auc %>%
-  dplyr::select(variant, seed, test_auc) %>%
-  pivot_wider(names_from = variant, values_from = test_auc) %>%
-  mutate(delta = corrected - current)
+```{r paired}
+w <- auc %>% pivot_wider(names_from = arm, values_from = test_auc)
 
-cat("Paired delta (corrected - current), n =", nrow(paired), "seeds\n")
-cat("  median :", round(median(paired$delta), 5), "\n")
-cat("  mean   :", round(mean(paired$delta), 5), "\n")
-cat("  sd     :", round(sd(paired$delta), 5), "\n")
-cat("  range  :", paste(round(range(paired$delta), 5), collapse = " to "), "\n")
-cat("  seeds where corrected wins:", sum(paired$delta > 0), "of", nrow(paired), "\n")
+pair <- function(a, b) {
+  d <- w[[a]] - w[[b]]
+  cat(sprintf("%-16s median %+0.4f  mean %+0.4f  sd %0.4f  positive %2d/%d  wilcox p = %.4f\n",
+              paste0(a, " - ", b), median(d), mean(d), sd(d), sum(d > 0), length(d),
+              suppressWarnings(wilcox.test(w[[a]], w[[b]], paired = TRUE)$p.value)))
+}
+cmb <- combn(names(arms), 2)
+for (i in seq_len(ncol(cmb))) pair(cmb[2, i], cmb[1, i])
 
-wt <- wilcox.test(paired$corrected, paired$current, paired = TRUE)
-cat("\nPaired Wilcoxon p =", signif(wt$p.value, 3), "\n")
-cat("Draw-to-draw sd within a variant:", round(sd(auc$test_auc[auc$variant=="current"]), 5),
-    "vs paired-difference sd:", round(sd(paired$delta), 5), "\n")
+cat("\nDraw-to-draw sd:", round(sd(w[[names(arms)[1]]]), 4),
+    " vs smallest paired-difference sd:",
+    round(min(apply(cmb, 2, function(k) sd(w[[k[2]]] - w[[k[1]]]))), 4), "\n")
 ```
 
-```{r auc_plot, fig.width = 7, fig.height = 5}
-p_auc <- auc %>%
-  mutate(variant = factor(variant, levels = c("current", "corrected"))) %>%
-  ggplot(aes(x = variant, y = test_auc)) +
-  geom_line(aes(group = seed), colour = "grey70", linewidth = 0.4) +
-  geom_point(aes(colour = variant), size = 2.5, alpha = 0.85) +
-  scale_colour_manual(values = c(current = "grey40", corrected = "#E69F00"), guide = "none") +
-  theme_classic(base_size = 12) +
-  labs(title = "Test AUC per negative draw, paired by seed",
-       subtitle = paste0("n = ", nrow(paired), " seeds; each grey line is one negative draw"),
-       x = NULL, y = "Test AUC")
-print(p_auc)
-ggsave(here("plots", "02c_sweep_auc_paired.pdf"), p_auc, width = 7, height = 5)
+# 3. Does the family clear its own shuffled floor?
+
+```{r family_share, eval = !all(is.na(fams))}
+share <- imp %>% filter(arm %in% c("real", "shuf")) %>%
+  group_by(arm, seed) %>% mutate(share = 100 * importance / sum(importance)) %>%
+  ungroup() %>% filter(family %in% fams) %>%
+  group_by(arm, seed, family) %>% summarise(share = sum(share), .groups = "drop")
+
+share %>% group_by(arm, family) %>%
+  summarise(median_share = round(median(share), 3), min = round(min(share), 3),
+            max = round(max(share), 3), .groups = "drop") %>% as.data.frame() %>% print()
+
+for (fm in fams) {
+  sw <- share %>% filter(family == fm) %>% dplyr::select(arm, seed, share) %>%
+    pivot_wider(names_from = arm, values_from = share)
+  cat(sprintf("\n%-18s real - shuffled: median %+0.3f pp, positive %2d/%d, wilcox p = %.4f\n",
+              fm, median(sw$real - sw$shuf), sum(sw$real > sw$shuf), nrow(sw),
+              suppressWarnings(wilcox.test(sw$real, sw$shuf, paired = TRUE)$p.value)))
+}
 ```
 
-# 3. Does the `csc` shift survive the draw?
+# 4. Per-feature rank against its own permuted copy
 
-The single run showed `csc` falling from rank 3 to rank 7 (-1.41 percentage points of
-importance share). That has to clear the rank movement the draw alone produces.
+A feature is only worth ranking if it beats the rank its shuffled twin gets for free.
 
-```{r csc_shift}
-canon <- function(x) recode(x,
-  kozak_pwm_score_v2 = "kozak_pwm_score", gc3_internal = "gc3", tai_gtrnadb = "tai",
-  cai_internal = "cai", fop_internal = "fop", csc_internal = "csc", .default = x)
+```{r feature_ranks, eval = !all(is.na(fams))}
+ranks <- imp %>% filter(arm %in% c("real", "shuf")) %>%
+  group_by(arm, seed) %>% mutate(rk = rank(-importance), nfeat = n()) %>% ungroup() %>%
+  filter(family %in% fams) %>%
+  group_by(arm, family, feature) %>%
+  summarise(median_rank = median(rk), nfeat = first(nfeat), .groups = "drop")
 
-ranked <- imp %>%
-  group_by(variant, seed) %>%
-  mutate(pct = 100 * importance / sum(importance),
-         rank = rank(-pct), feature = canon(feature)) %>%
-  ungroup()
+ranks %>%
+  pivot_wider(names_from = arm, values_from = median_rank,
+              names_prefix = "rank_") %>%
+  mutate(gain = rank_shuf - rank_real) %>%     # positive = better than its own null
+  arrange(desc(gain)) %>% as.data.frame() %>% print()
 
-focus <- c("csc", "tai", "gc3", "cai", "fop", "kozak_pwm_score")
-
-ranked %>%
-  filter(feature %in% focus) %>%
-  group_by(feature, variant) %>%
-  summarise(median_rank = median(rank), median_pct = median(pct),
-            rank_range = paste(range(rank), collapse = "-"), .groups = "drop") %>%
-  pivot_wider(names_from = variant, values_from = c(median_rank, median_pct, rank_range)) %>%
-  mutate(across(starts_with("median_pct"), ~ round(., 2))) %>%
-  as.data.frame() %>% print()
-
-cat("\nPaired per-seed change in importance share:\n")
-ranked %>%
-  filter(feature %in% focus) %>%
-  dplyr::select(feature, variant, seed, pct) %>%
-  pivot_wider(names_from = variant, values_from = pct) %>%
-  group_by(feature) %>%
-  summarise(median_delta = round(median(corrected - current), 3),
-            sd_delta     = round(sd(corrected - current), 3),
-            n_negative   = sum(corrected < current), n = n(), .groups = "drop") %>%
-  arrange(median_delta) %>% as.data.frame() %>% print()
+cat("\ngain = shuffled rank - real rank. Positive means the real values earn the place;\n")
+cat("zero or negative means the column is indistinguishable from noise.\n")
 ```
 
-# 4. Feature-ranking stability
+# 5. Top-20 stability across draws
 
-```{r top20_stability}
-top20 <- ranked %>% filter(rank <= 20) %>%
-  group_by(variant, seed) %>% summarise(set = list(feature), .groups = "drop")
+```{r top20}
+top20 <- imp %>% filter(arm == if ("real" %in% names(arms)) "real" else names(arms)[1]) %>%
+  group_by(seed) %>% slice_max(importance, n = 20) %>%
+  summarise(fs = list(feature), .groups = "drop")
 
-jaccard <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+jac <- combn(nrow(top20), 2, function(k) {
+  a <- top20$fs[[k[1]]]; b <- top20$fs[[k[2]]]
+  length(intersect(a, b)) / length(union(a, b))
+})
+cat("Top-20 Jaccard across seed pairs: median", round(median(jac), 3),
+    " range", paste(round(range(jac), 3), collapse = " - "), "\n")
 
-pairwise <- top20 %>%
-  group_by(variant) %>%
-  group_modify(~ {
-    s <- .x$set; idx <- combn(length(s), 2)
-    tibble(j = map_dbl(seq_len(ncol(idx)), ~ jaccard(s[[idx[1, .x]]], s[[idx[2, .x]]])))
-  }) %>% ungroup()
-
-pairwise %>% group_by(variant) %>%
-  summarise(median_jaccard = round(median(j), 3), min = round(min(j), 3), .groups = "drop") %>%
-  as.data.frame() %>% print()
-
-always <- ranked %>% filter(rank <= 20) %>%
-  count(variant, feature, name = "n_runs") %>%
-  filter(n_runs == params$seeds)
-
-cat("\nFeatures top-20 in EVERY replicate:\n")
-always %>% count(variant, name = "n_features") %>% as.data.frame() %>% print()
-cat("\ncorrected:\n")
-cat(paste(" ", sort(always$feature[always$variant == "corrected"])), sep = "\n")
+always <- Reduce(intersect, top20$fs)
+cat("\nTop-20 in EVERY draw (", length(always), "):\n", paste(always, collapse = ", "), "\n")
+cat("\nRank a feature off a single run only if it clears that bar.\n")
 ```
-
-# Interpretation
-
-Rank a feature off a single 02 run only if it clears the bar set here. The paired design is
-what makes a small effect readable: comparing two 20-run distributions would be swamped by
-draw-to-draw variance, but within a seed both models see identical genes, so the difference is
-the feature change alone.
