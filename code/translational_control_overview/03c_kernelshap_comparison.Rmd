@@ -1,0 +1,147 @@
+---
+title: "Kernel SHAP on the real model vs TreeSHAP on the surrogate"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  readout: "TE"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set_label: "tco"
+  variant_set: "corrected"
+  initiation_score: "both"
+  clip_mode: "aggregate"
+  neg_seed: 9
+  explain_n: 200
+  bg_n: 100
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Why
+
+`03_shap.Rmd` cannot explain the model we actually fit. `treeshap` does not support ranger
+**probability** forests, so it explains a *surrogate* regression forest and then has to prove
+the surrogate behaves like the real one. That proof has weakened as the matrix grew: the
+fidelity check's nearest `mtry` misconfiguration separated at 1.77x when the model had 72
+features and only **1.49x** at 69, and `min.node.size` has never been detectable by fidelity
+at all. Rather than lower a threshold until it passes, this notebook asks whether the
+surrogate was ever distorting the answer.
+
+`kernelshap` is **model-agnostic**: it takes a predict function, so it explains the real
+probability forest. There is no surrogate and no fidelity check to calibrate.
+
+**The approximation does not disappear, it moves.** TreeSHAP approximates the *model* and is
+exact on it; Kernel SHAP keeps the model exact and approximates the *Shapley values* by
+sampling coalitions. Its discretionary choice is the **background dataset** - what a "missing"
+feature is marginalised over - which is the role the surrogate played. Convergence is
+diagnosed per gene and asserted below.
+
+One caveat this does not resolve: marginal Kernel SHAP substitutes background values
+independently, so it can evaluate the model on feature combinations that do not occur - a
+real concern with blocks as correlated as `cds_gc` / `gc3_internal` / `csc_internal`.
+Conditional SHAP (`shapr`) addresses that and is slower and more assumption-laden; not
+attempted here.
+
+**If the two agree, the surrogate was harmless and the fidelity apparatus can be retired. If
+they disagree, numbers already reported are wrong.**
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(kernelshap)
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+set.seed(9)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+suffix <- sweep_suffix(list(condition = params$condition, gene = params$gene,
+                            direction = params$direction, readout = params$readout,
+                            timepoint = params$timepoint, lfc = params$lfc,
+                            feature_set_label = params$feature_set_label,
+                            variant_set = params$variant_set,
+                            initiation_score = params$initiation_score,
+                            clip_mode = params$clip_mode), params$neg_seed)
+
+rf <- readRDS(file.path(out_dir, paste0("rf_classifier_", suffix, ".rds")))
+md <- readRDS(file.path(out_dir, paste0("rf_model_data_", suffix, ".rds")))
+ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+tree_tbl <- read_csv(file.path(out_dir, paste0("shap_feature_", suffix, ".csv")),
+                     show_col_types = FALSE)
+feature_cols <- md$feature_cols
+cat("Model:", rf$treetype, "|", length(feature_cols), "features\n")
+stopifnot("this is not the probability forest kernelshap is meant to explain" =
+            rf$treetype == "Probability estimation")
+```
+
+```{r kernelshap}
+# The real model's positive-class probability. No surrogate anywhere in this chain.
+pred_fun <- function(m, newdata) predict(m, data = newdata)$predictions[, md$pos_label]
+
+test_df <- as.data.frame(md$test[, feature_cols])
+set.seed(9)
+explain_idx <- sample(nrow(test_df), min(params$explain_n, nrow(test_df)))
+X  <- test_df[explain_idx, , drop = FALSE]
+set.seed(9)
+bg <- as.data.frame(md$train[sample(nrow(md$train), params$bg_n), feature_cols])
+
+t0 <- Sys.time()
+ks <- kernelshap(rf, X = X, bg_X = bg, pred_fun = pred_fun, verbose = FALSE)
+cat("kernelshap on", nrow(X), "genes in",
+    round(difftime(Sys.time(), t0, units = "mins"), 2), "min\n")
+
+cat("converged:", sum(ks$converged), "of", length(ks$converged), "\n")
+stopifnot("kernelshap did not converge for every gene" = all(ks$converged))
+```
+
+```{r compare}
+ks_tbl <- tibble(feature = colnames(ks$S),
+                 kernel_abs = colMeans(abs(ks$S))) %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+  mutate(kernel_share = 100 * kernel_abs / sum(kernel_abs),
+         kernel_rank  = rank(-kernel_abs))
+
+cmp <- tree_tbl %>%
+  dplyr::select(feature, family, tree_abs = mean_abs_shap, tree_rank = rank_shap) %>%
+  mutate(tree_share = 100 * tree_abs / sum(tree_abs)) %>%
+  inner_join(ks_tbl %>% dplyr::select(feature, kernel_abs, kernel_share, kernel_rank),
+             by = "feature")
+
+cat("\nFeature level, n =", nrow(cmp), "\n")
+cat("  Spearman of mean|SHAP|:",
+    round(cor(cmp$tree_abs, cmp$kernel_abs, method = "spearman"), 4), "\n")
+cat("  Pearson of share:", round(cor(cmp$tree_share, cmp$kernel_share), 4), "\n")
+cat("  top-20 overlap:",
+    length(intersect(cmp$feature[cmp$tree_rank <= 20],
+                     cmp$feature[cmp$kernel_rank <= 20])), "of 20\n")
+cat("  max |rank shift|:", max(abs(cmp$tree_rank - cmp$kernel_rank)), "\n")
+
+cat("\nLargest rank disagreements:\n")
+print(as.data.frame(cmp %>% mutate(shift = kernel_rank - tree_rank) %>%
+        arrange(desc(abs(shift))) %>% slice_head(n = 8) %>%
+        transmute(feature, family, tree_rank, kernel_rank, shift,
+                  tree_share = round(tree_share, 2), kernel_share = round(kernel_share, 2))))
+```
+
+```{r family_compare}
+fam <- cmp %>% group_by(family) %>%
+  summarise(n = n(), tree = sum(tree_share), kernel = sum(kernel_share), .groups = "drop") %>%
+  mutate(delta = kernel - tree) %>% arrange(desc(tree))
+print(as.data.frame(fam %>% mutate(across(where(is.numeric), ~ round(., 2)))))
+cat("\nmax family share difference:", round(max(abs(fam$delta)), 2), "percentage points\n")
+cat("Spearman of family ranking:",
+    round(cor(fam$tree, fam$kernel, method = "spearman"), 4), "\n")
+
+write_csv(cmp, file.path(out_dir, paste0("shap_kernel_vs_tree_", suffix, ".csv")))
+write_csv(fam, file.path(out_dir, paste0("shap_kernel_vs_tree_family_", suffix, ".csv")))
+cat("\nWrote 2 comparison files with suffix:", suffix, "\n")
+```
