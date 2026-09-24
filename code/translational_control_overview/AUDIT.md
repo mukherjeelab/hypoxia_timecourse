@@ -111,12 +111,34 @@ a gate run for the same reason. Both gates are green on that path.
 - **RNAplfold and G4mer values themselves were never verified** — both were computed off-repo
   and only summary files are present. Joins and derived columns are verified; the underlying
   numbers are not.
-- **Unresolved: an RNAplfold parameter conflict.** The annotation says `-W 150 -L 100`;
-  `01d_`'s own inline documentation says `-W 80 -L 40 -u 30`. These cannot both be right.
-- **Open lead, unverified:** a second audit reported "confirmed off-by-one in the `_lunp`
-  parser" before being cut off, and never quantified it. If true it would shift which window
-  each `tco_struct_*` accessibility value belongs to. That family has already produced three
-  confirmed defects (F1, F2, F5), so treat its attributions as provisional until checked.
+- **RESOLVED — the RNAplfold parameters differ by region, which neither document said.**
+  Verified by re-running RNAplfold 2.7.2 on ENST00000000233 and reproducing the stored
+  `_lunp` files bit-for-bit:
+
+  | region | parameters |
+  |---|---|
+  | 5'UTR | `-W 80 -L 40 -u 30` |
+  | CDS | `-W 150 -L 100 -u 30` |
+  | 3'UTR | `-W 150 -L 100 -u 30` |
+
+  The annotation claimed `-W 150 -L 100` for all three; `01d_`'s inline docs claimed
+  `-W 80 -L 40 -u 30` for all three. Each was right about its own region. **A larger window
+  sees more folding context, so accessibility is not comparable across regions** — the same
+  caveat the `g4` family carries for its differing stride. Any statement ranking CDS
+  structure against 5'UTR structure (e.g. the SHAP shares 5.78% vs 2.62%) is confounded by
+  window size and must not be read as biology. The annotation now records the parameters and
+  the non-comparability per column.
+
+- **RESOLVED — the reported `_lunp` off-by-one is NOT confirmed.** A cut-off audit claimed
+  one without evidence. The primary accessibility column is `df[[2]]`, the `l=1` column, and
+  for a 1-mer "ending at position i" *is* position i, so that parse is correct. What is real
+  is a different defect in the `l=30` column: it is NA for rows 1-29 (a 30-mer cannot end
+  before position 30) and the parser zero-fills those, which reads as "maximally structured".
+
+- **Root cause of F2 established.** The "structured region" count thresholds the 30-nt window
+  at `< 0.2`, but the probability of a full 30-mer being unpaired is around **1e-9**, so
+  **100% of positions pass**. The feature never counted structure; it counted positions, which
+  is why it equalled region length. Already deprecated.
 - **Not re-derived at all:** `kozak_score` / `kozak_optimal` tiers, `cnot3_weighted_codon_score`,
   positional CSC, and `clip_lee_glu_vs_cm_enrichment` — which is *not*
   `glu_dep_lfc − complete_media_lfc` despite the name (max dev 21.8) and whose definition is
