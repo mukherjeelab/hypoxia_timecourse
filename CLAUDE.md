@@ -212,6 +212,16 @@ forest, where they would split credit and hide the effect being measured.
 | `csc` | `csc_internal` | iCodon given the internal-codon CDS, not the stop-containing one |
 | `tai` | `tai_gtrnadb` | collaborator's GtRNAdb copy number + explicit wobble table |
 
+**G4mer (`g4` family) is ours alone** - `00_`'s inventory has no collaborator counterpart
+(`ours_only`), so unlike `struct_*` there is no name to collide. Three things govern its use:
+inference is **already complete** in `output/g4mer/` (not the `g4mer/output/` in `.gitignore`);
+**stride differs by region** (5'UTR 10, CDS/3'UTR 20), so the three columns are not comparable
+to each other and are never differenced - `01u_` holds the harmonised version for cross-region
+work; and `g4mer_max` rises with region length by construction and tracks GC because rG4 needs
+G-runs, so the modelled column is `g4mer_max_resid_*`, residualised on log2 region length +
+region GC (verified r = 0.000 against both). `g4mer_mean_*` and `g4mer_frac_above_*` are
+per-window averages and fractions with no length bias and enter raw.
+
 **`initiation_score` is a separate axis from `variant_set`** (`"both"` (default) | `"pwm"` |
 `"noderer"`). `kozak_pwm_score_v2` and `noderer_tis_efficiency` are both start-context
 strength - one estimated from Kozak's 1987 frequency table, the other measured by FACS-seq.
@@ -246,10 +256,20 @@ new mRNA set rather than inherited**:
 | `termination` (11) | 6.29 vs 6.10 pp (+0.17, p = 0.003) | at the floor; best feature ranks 31 vs 32 shuffled |
 | `nascent_peptide` (3) | 3.70 vs 3.00 pp (+0.76, 20/20, p < 1e-4) | **real, but carried entirely by `proline_fraction`** (rank 16 vs 27 shuffled) |
 | `polya_track` (2) | 0.674 vs 0.610 pp (+0.05) | at the floor |
+| `g4` (9) | 10.24 vs 8.72 pp (+1.52, 20/20, p < 1e-4) | **clears the floor**, and is the only family to beat its shuffled arm on AUC (+0.0023, p = 0.036) |
 
 `max_net_charge_30aa`, `ppp_motif_density`, `max_consecutive_aag` and `max_consecutive_aaa`
-are **rank-identical to their shuffled copies** (44/46/48/49 of 63). None of the three families
-moves test AUC. `proline_fraction` carries genuine signal that the forest can mostly get
+are **rank-identical to their shuffled copies** (44/46/48/49 of 63). No family beats the
+*no-family* arm on AUC: `g4` recovers the dilution cost that 9 noise columns impose
+(`shuffled - none` = -0.0015, p = 0.03) without adding beyond it.
+
+**Within `g4` the regions separate, and that is the result.** `g4mer_mean_cds` (rank 21 vs 36.5
+shuffled), `g4mer_max_resid_cds` (25 vs 33.5), `g4mer_mean_utr5` (28.5 vs 37.5) and
+`g4mer_max_resid_utr5` (31 vs 37) sit well above their nulls; both 3'UTR columns sit *below*
+theirs (44/45.5 vs 36.5/33.5). CDS and 5'UTR are what a scanning or elongating ribosome
+traverses. This is measured on residualised columns, so it is not GC in disguise.
+`g4mer_frac_above_*` is bottom-ranked in both arms in all three regions (median 0 across the
+transcriptome), as is `ppp_motif_density`. `proline_fraction` carries genuine signal that the forest can mostly get
 elsewhere: it correlates with `cds_gc` at rho = 0.44 (proline codons are CCN) and `cds_gc` is
 already the model's strongest single feature. **All of these features are deliberately kept** -
 they are validated and cheap, and the fork exists to run on other mRNA sets where they may

@@ -517,6 +517,65 @@ term_cols <- c("term_stop_TAA", "term_stop_TAG", "term_stop_TGA",
                "term_window_gc", "term_interval_codons",
                "term_readthrough_cridge", "term_log1p_readthrough")
 term <- term %>% dplyr::select(transcript_id_clean, all_of(term_cols))
+## --- G4mer rG4 propensity ------------------------------------------------------------
+# Inference is already done - g4mer/02_run_g4mer.py scored every region and wrote
+# output/g4mer/g4mer_summary_<region>.tsv (note: output/g4mer/, NOT the g4mer/output/ named
+# in .gitignore). Nothing is re-run here; this is a join.
+#
+# The collaborator has NO G-quadruplex feature (00_ inventory: status "ours_only"), so unlike
+# struct_* there is nothing to reconcile against and no name can collide.
+#
+# Stride differs by region: 5'UTR was scored at stride 10, CDS and 3'UTR at stride 20. Denser
+# sampling raises the expected maximum, so the three columns are NOT comparable to each other.
+# Each is modelled as its own column and never differenced, so within-region calibration is
+# all that is needed; 01u_ holds the harmonised version for cross-region work.
+g4_dir     <- here("output", "g4mer")
+g4_regions <- c("utr5", "cds", "utr3")
+g4_raw <- map_dfr(g4_regions, function(rg)
+  read_tsv(file.path(g4_dir, paste0("g4mer_summary_", rg, ".tsv")), show_col_types = FALSE))
+
+stopifnot(
+  "g4mer scores outside [0, 1]" =
+    all(between(g4_raw$g4mer_max, 0, 1)) && all(between(g4_raw$g4mer_mean, 0, 1)) &&
+    all(between(g4_raw$g4mer_frac_above, 0, 1)),
+  "g4mer_max below g4mer_mean" = all(g4_raw$g4mer_max >= g4_raw$g4mer_mean),
+  "g4mer argmax outside its region" =
+    all(g4_raw$g4mer_argmax_start >= 0 & g4_raw$g4mer_argmax_start < g4_raw$region_length)
+)
+cat("G4mer summaries loaded:",
+    paste(sprintf("%s %d", names(table(g4_raw$region)), table(g4_raw$region)),
+          collapse = "; "), "\n")
+
+g4_wide <- g4_raw %>%
+  dplyr::select(transcript_id_clean, region, g4mer_max, g4mer_mean,
+                g4mer_frac_above, region_length) %>%
+  pivot_wider(names_from = region,
+              values_from = c(g4mer_max, g4mer_mean, g4mer_frac_above, region_length))
+
+# g4mer_max is a maximum over windows, so it rises with region length by construction, and
+# rG4 formation needs G-runs so it also tracks GC. The modelled column is therefore the
+# residual on log2 length + region GC, following the gc3_residual precedent in 01v_: left raw,
+# it would let the forest reach length and GC a second time under a structural name.
+# g4mer_mean and g4mer_frac_above are per-window averages and fractions, carrying no length
+# bias, so those enter raw.
+g4_join <- features %>%
+  dplyr::select(transcript_id_clean, utr5_gc, cds_gc, utr3_gc) %>%
+  left_join(g4_wide, by = "transcript_id_clean")
+
+for (rg in g4_regions) {
+  mx <- paste0("g4mer_max_", rg); ln <- paste0("region_length_", rg)
+  gcc <- paste0(rg, "_gc")
+  fit <- lm(g4_join[[mx]] ~ log2(g4_join[[ln]] + 1) + g4_join[[gcc]], na.action = na.exclude)
+  g4_join[[paste0("g4mer_max_resid_", rg)]] <- as.numeric(residuals(fit))
+  cat(sprintf("  g4mer_max_%-4s ~ log2(length) + GC: R2 = %.3f, n = %d\n",
+              rg, summary(fit)$r.squared, sum(!is.na(residuals(fit)))))
+}
+
+g4_cols <- c(paste0("g4mer_max_resid_", g4_regions),
+             paste0("g4mer_mean_", g4_regions),
+             paste0("g4mer_frac_above_", g4_regions))
+g4 <- g4_join %>% dplyr::select(transcript_id_clean, all_of(g4_cols))
+
 ## --- join --------------------------------------------------------------------------
 features <- features %>%
   left_join(kozak_tbl %>% dplyr::select(transcript_id_clean, kozak_pwm_score_v2),
@@ -528,6 +587,7 @@ features <- features %>%
             by = "transcript_id_clean") %>%
   left_join(codon_internal, by = "transcript_id_clean") %>%
   left_join(pep, by = "transcript_id_clean") %>%
+  left_join(g4, by = "transcript_id_clean") %>%
   left_join(term, by = "transcript_id_clean")
 
 corrected_cols <- c("kozak_pwm_score_v2", "tai_gtrnadb",
@@ -536,7 +596,8 @@ stopifnot("termination columns did not attach" = all(term_cols %in% colnames(fea
           "noderer_tis_efficiency did not attach" =
             "noderer_tis_efficiency" %in% colnames(features),
           "nascent peptide / poly(A) columns did not attach" =
-            all(pep_cols %in% colnames(features)))
+            all(pep_cols %in% colnames(features)),
+          "g4mer columns did not attach" = all(g4_cols %in% colnames(features)))
 eligibility_cols <- c("cds_frame_ok", "cds_has_start", "cds_has_stop", "cds_complete")
 stopifnot(
   "corrected columns did not all attach" = all(corrected_cols %in% colnames(features)),
@@ -639,6 +700,62 @@ purine_gap <- abs(diff(kozak_tier$mean_v2))
 cat("A-minus-G spread within tier 2:", round(purine_gap, 3), "bits\n")
 stopifnot("within-tier purine gap too large: the -3 row is wrong again" = purine_gap < 0.75)
 cat("Within-tier purine check passed\n")
+```
+
+```{r validate_g4mer, eval = !params$pass_through}
+stopifnot(
+  "g4mer_mean outside [0, 1]" =
+    all(between(features$g4mer_mean_utr5, 0, 1), na.rm = TRUE) &&
+    all(between(features$g4mer_mean_cds,  0, 1), na.rm = TRUE) &&
+    all(between(features$g4mer_mean_utr3, 0, 1), na.rm = TRUE),
+  "g4mer_frac_above outside [0, 1]" =
+    all(between(features$g4mer_frac_above_utr5, 0, 1), na.rm = TRUE) &&
+    all(between(features$g4mer_frac_above_cds,  0, 1), na.rm = TRUE) &&
+    all(between(features$g4mer_frac_above_utr3, 0, 1), na.rm = TRUE),
+  "g4mer residual not finite" =
+    all(vapply(paste0("g4mer_max_resid_", g4_regions),
+               function(f) all(is.finite(features[[f]][!is.na(features[[f]])])), logical(1)))
+)
+for (f in g4_cols)
+  cat(sprintf("  %-22s non-NA %5d  median %7.4f\n", f, sum(!is.na(features[[f]])),
+              median(features[[f]], na.rm = TRUE)))
+
+# The residual must have removed the length and GC it was fitted on. A residual still
+# correlated with either would mean the model can reach them under a structural name.
+for (rg in g4_regions) {
+  rcol <- features[[paste0("g4mer_max_resid_", rg)]]
+  lcol <- features[[paste0("log2_", rg, "_length")]]
+  gcol <- features[[paste0(rg, "_gc")]]
+  if (is.null(lcol)) next
+  ok <- complete.cases(rcol, lcol, gcol)
+  cat(sprintf("  %-4s residual vs log2 length r = %+0.3f, vs GC r = %+0.3f, n = %d\n",
+              rg, cor(rcol[ok], lcol[ok]), cor(rcol[ok], gcol[ok]), sum(ok)))
+  stopifnot("g4mer residual still carries its own length term" =
+              abs(cor(rcol[ok], gcol[ok])) < 0.1)
+}
+
+# Biological spot-check: regions carrying a canonical G4 motif must score above those that
+# do not. Same regex as 01u_. Range checks pass on a scrambled join; this does not.
+g4_regex <- "([Gg]{3,}[ACGTNacgtn]{1,7}){3,}[Gg]{3,}"
+g4_motif <- bind_rows(
+  tibble(transcript_id_clean = utr5$transcript_id_clean, region = "utr5",
+         sequence = utr5$utr5_sequence),
+  tibble(transcript_id_clean = seqs$cds_seq$transcript_id_clean, region = "cds",
+         sequence = seqs$cds_seq$cds_sequence),
+  tibble(transcript_id_clean = utr3_tbl$transcript_id_clean, region = "utr3",
+         sequence = utr3_tbl$utr3_seq)
+) %>% mutate(has_g4 = str_detect(sequence, g4_regex))
+
+g4_spot <- g4_raw %>%
+  inner_join(g4_motif, by = c("transcript_id_clean", "region")) %>%
+  group_by(region) %>%
+  summarise(n = n(), pct_motif = round(100 * mean(has_g4), 1),
+            med_motif    = round(median(g4mer_max[has_g4]), 4),
+            med_no_motif = round(median(g4mer_max[!has_g4]), 4), .groups = "drop")
+print(as.data.frame(g4_spot))
+stopifnot("motif-containing regions do not outscore motif-free ones" =
+            all(g4_spot$med_motif > g4_spot$med_no_motif))
+cat("G4 motif spot-check passed in all three regions\n")
 ```
 
 ```{r validate_peptide, eval = !params$pass_through}
@@ -837,6 +954,7 @@ assign_family <- function(x) {
     x %in% c("proline_fraction", "ppp_motif_density",
              "max_net_charge_30aa")                               ~ "nascent_peptide",
     x %in% c("max_consecutive_aaa", "max_consecutive_aag")        ~ "polya_track",
+    str_detect(x, "^g4mer_")                                     ~ "g4",
     str_detect(x, "^clip_")                                      ~ "clip",
     str_detect(x, "^zhu2024_|^hia2026_|^karner2026_|^cnot3_")    ~ "stability_external",
     str_detect(x, "^dap5_|^is_dap5_")                            ~ "dap5",
@@ -922,7 +1040,16 @@ definitions <- tribble(
   "ppp_motif_density",   "PPP occurrences per 100 residues; overlapping matches counted",
   "max_net_charge_30aa", "max (K+R) - (D+E) over any 30-aa window; whole chain if shorter",
   "max_consecutive_aaa", "longest in-frame run of AAA lysine codons",
-  "max_consecutive_aag", "longest in-frame run of AAG lysine codons"
+  "max_consecutive_aag", "longest in-frame run of AAG lysine codons",
+  "g4mer_max_resid_utr5", "G4mer max, residual on log2 5'UTR length + utr5_gc (stride 10)",
+  "g4mer_max_resid_cds",  "G4mer max, residual on log2 CDS length + cds_gc (stride 20)",
+  "g4mer_max_resid_utr3", "G4mer max, residual on log2 3'UTR length + utr3_gc (stride 20)",
+  "g4mer_mean_utr5",      "mean G4mer window score, 5'UTR; no length bias",
+  "g4mer_mean_cds",       "mean G4mer window score, CDS; no length bias",
+  "g4mer_mean_utr3",      "mean G4mer window score, 3'UTR; no length bias",
+  "g4mer_frac_above_utr5", "fraction of 5'UTR windows above the rG4 threshold",
+  "g4mer_frac_above_cds",  "fraction of CDS windows above the rG4 threshold",
+  "g4mer_frac_above_utr3", "fraction of 3'UTR windows above the rG4 threshold"
 )
 
 definitions <- definitions %>% filter(feature %in% annotation$feature)
