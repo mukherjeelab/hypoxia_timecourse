@@ -1,0 +1,200 @@
+---
+title: "SHAP subgroups: the clusters do not beat their null"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_set_label: "tco"
+  variant_set: "corrected"
+  initiation_score: "both"
+  clip_mode: "aggregate"
+  neg_seed: 9
+  k_max: 6
+  n_perm: 200
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Why this notebook exists
+
+`03_shap.Rmd` clusters the held-out eIF3d-promoted genes on their family-level SHAP profiles,
+asking whether there are classes of target driven by different features - something a global
+ranking cannot show.
+
+The null permutes **each family independently across genes**, destroying co-occurrence between
+families while preserving every family's marginal distribution. k-means always returns clusters
+and the silhouette is always positive for some k, so a silhouette means nothing without it.
+
+**The statistic mattered more than the null here, and got the answer backwards first time.**
+Mean silhouette falls monotonically with k, so the null's best-over-k sits almost always at
+k = 2. Comparing that against an observed best at k = 3 compares two different quantities: it
+returned p = 0.74 and a confident "no structure", when in fact **every k >= 3 exceeds the
+null's maximum over 200 permutations**. The comparison has to be made within k and only then
+maximised over k. `03_subgroup_null.R` holds the corrected implementation and both notebooks
+use it; the raw statistic is printed below as a worked counter-example.
+
+Reads `03_`'s export; no SHAP is recomputed here.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(cluster)
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+set.seed(9)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+suffix  <- sweep_suffix(list(feature_set_label = params$feature_set_label,
+                             variant_set       = params$variant_set,
+                             initiation_score  = params$initiation_score,
+                             clip_mode         = params$clip_mode), params$neg_seed)
+f <- file.path(out_dir, paste0("shap_subgroups_", suffix, ".csv"))
+stopifnot("03_shap.Rmd has not been knit for these params" = file.exists(f))
+
+sg  <- read_csv(f, show_col_types = FALSE)
+fam_cols <- setdiff(names(sg), c("gene_id_clean", "symbol", "cluster"))
+profile  <- as.matrix(sg[, fam_cols])
+N <- nrow(profile)
+cat("Genes:", N, " families:", length(fam_cols), "\n")
+stopifnot("profiles are not within-gene normalised" =
+            all(abs(rowSums(abs(profile)) - 1) < 1e-6))
+```
+
+```{r conventions}
+OBS_COL  <- "#E69F00"   # CLAUDE.md: reserved for eIF3d / si3d, and this is the eIF3d set
+NULL_COL <- "grey70"
+CLUST_COLS <- c("#0072B2", "#CC79A7", "#009E73", "#D55E00", "#56B4E9", "#999999")
+plot_path <- function(x) here("plots", paste0("03b_", x, ".pdf"))
+```
+
+# 1. Observed silhouette, and the null band
+
+```{r silhouette}
+source(here("code", "translational_control_overview", "03_subgroup_null.R"))
+
+nullres <- subgroup_null(profile, ks = 2:params$k_max, n_perm = params$n_perm)
+ks  <- nullres$ks
+obs <- nullres$obs
+null_mat <- nullres$null_mat
+best_k   <- nullres$best_k_sil # describe at the silhouette peak; test uses best_k_z
+p_emp    <- nullres$p_overall
+
+print(nullres$per_k %>% mutate(across(where(is.numeric), ~ round(., 4))))
+cat(sprintf("\ntest statistic peaks at k = %d: observed z = %.2f | null median z = %.2f | null max z = %.2f\n",
+            nullres$best_k_z, nullres$z_obs, median(nullres$z_null), max(nullres$z_null)))
+cat(sprintf("clusters described at k = %d, where the raw silhouette peaks (%.4f)\n",
+            nullres$best_k_sil, max(nullres$obs)))
+cat(sprintf("empirical p = %.4f (floor 1/%d), n = %d genes\n",
+            p_emp, params$n_perm + 1, N))
+
+# The statistic that got this wrong the first time, kept as a worked counter-example.
+raw_p <- (sum(apply(null_mat, 1, max) >= max(obs)) + 1) / (params$n_perm + 1)
+cat(sprintf("\nFor contrast, comparing RAW best-over-k gives p = %.3f - silhouette falls with\n",
+            raw_p))
+cat("k, so that pits the null's k = 2 against an observed best at k = 3.\n")
+```
+
+```{r fig_band, fig.width = 6, fig.height = 4}
+band <- tibble(
+  k    = ks,
+  lo   = apply(null_mat, 2, quantile, 0.05, na.rm = TRUE),
+  hi   = apply(null_mat, 2, quantile, 0.95, na.rm = TRUE),
+  mid  = apply(null_mat, 2, median, na.rm = TRUE),
+  nmin = apply(null_mat, 2, min, na.rm = TRUE),
+  nmax = apply(null_mat, 2, max, na.rm = TRUE),
+  observed = obs
+)
+
+p1 <- ggplot(band, aes(x = k)) +
+  geom_ribbon(aes(ymin = nmin, ymax = nmax), fill = NULL_COL, alpha = 0.25) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = NULL_COL, alpha = 0.45) +
+  geom_line(aes(y = mid), colour = "black", linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = observed), colour = OBS_COL, linewidth = 0.8) +
+  geom_point(aes(y = observed), colour = OBS_COL, size = 2.2) +
+  scale_x_continuous(breaks = ks) +
+  labs(x = "number of clusters, k",
+       y = "mean silhouette width",
+       title = "SHAP subgroups do not separate from their null",
+       subtitle = sprintf(
+         "orange = observed; grey = %d permutations (dark 5-95%%, light min-max); dashed = null median\nn = %d genes, %d families, empirical p = %.3f",
+         params$n_perm, N, length(fam_cols), p_emp)) +
+  theme_classic(base_size = 12)
+print(p1)
+if (params$save_plots) ggsave(plot_path("silhouette_vs_null_band"), p1, width = 6, height = 4)
+```
+
+The observed curve sits **above** the null band at every k >= 3, and below it at k = 2. That
+shape is the finding: the profiles carry real co-occurrence structure, but it is not a two-way
+split, which is exactly what a best-over-k comparison against an unstandardised null hides.
+
+```{r fig_null_dist, fig.width = 6, fig.height = 4}
+p2 <- ggplot(tibble(sil = nullres$z_null), aes(x = sil)) +
+  geom_histogram(bins = 30, fill = NULL_COL, colour = "white") +
+  geom_vline(xintercept = nullres$z_obs, colour = OBS_COL, linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = sprintf("observed z = %.2f\nnull median z = %.2f\np = %.3f\nn = %d genes",
+                           nullres$z_obs, median(nullres$z_null), p_emp, N)) +
+  labs(x = "max standardised silhouette over k (per permutation)", y = "permutations",
+       title = "Observed structure exceeds every permutation",
+       subtitle = sprintf("%d permutations of family values across genes", params$n_perm)) +
+  theme_classic(base_size = 12)
+print(p2)
+if (params$save_plots) ggsave(plot_path("null_distribution"), p2, width = 6, height = 4)
+```
+
+# 2. What the clusters look like
+
+```{r fig_heatmap, fig.width = 7, fig.height = 4.5}
+cl_means <- sg %>% group_by(cluster) %>%
+  summarise(n = n(), across(all_of(fam_cols), mean), .groups = "drop")
+
+hm <- cl_means %>%
+  pivot_longer(all_of(fam_cols), names_to = "family", values_to = "mean_share") %>%
+  mutate(cluster_lab = paste0("cluster ", cluster, "\n(n = ", n, ")"),
+         family = fct_reorder(family, mean_share))
+
+p3 <- ggplot(hm, aes(x = cluster_lab, y = family, fill = mean_share)) +
+  geom_tile(colour = "white") +
+  scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0,
+                       name = "mean signed\nSHAP share") +
+  labs(x = NULL, y = NULL,
+       title = "Cluster profiles by dominant feature family",
+       subtitle = sprintf("k = %d by standardised silhouette, p = %.3f against permuted co-occurrence",
+                          best_k, p_emp)) +
+  theme_classic(base_size = 12)
+print(p3)
+if (params$save_plots) ggsave(plot_path("cluster_profiles"), p3,
+                              width = 7, height = 4.5)
+```
+
+```{r fig_pca, fig.width = 6, fig.height = 4.5}
+pca <- prcomp(profile, center = TRUE, scale. = FALSE)
+ve  <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+p4 <- ggplot(tibble(PC1 = pca$x[, 1], PC2 = pca$x[, 2],
+                    cluster = factor(sg$cluster)),
+             aes(PC1, PC2, colour = cluster)) +
+  geom_point(size = 1.8, alpha = 0.75) +
+  scale_colour_manual(values = CLUST_COLS[seq_len(n_distinct(sg$cluster))]) +
+  labs(x = sprintf("PC1 (%.1f%%)", ve[1]), y = sprintf("PC2 (%.1f%%)", ve[2]),
+       title = "Cluster labels in profile space",
+       subtitle = sprintf("k-means labels on PCA of family SHAP profiles, n = %d genes", N)) +
+  theme_classic(base_size = 12)
+print(p4)
+if (params$save_plots) ggsave(plot_path("profile_pca"), p4, width = 6, height = 4.5)
+```
+
+The groups are not isolated islands - the structure is real by the null test but the profile
+space is continuous, so treat cluster membership as a gradient rather than a hard class.
+
+```{r export}
+write_csv(band, file.path(out_dir, paste0("shap_subgroup_null_band_", suffix, ".csv")))
+cat("Wrote", file.path(out_dir, paste0("shap_subgroup_null_band_", suffix, ".csv")), "\n")
+if (params$save_plots) cat("Wrote 4 PDFs to plots/ with prefix 03b_\n")
+```

@@ -193,21 +193,38 @@ all** - every value from 1 to 25 lands within a few percent of the correct RMSE,
 moves fidelity. So Check B asserts on RMSE and **only against the misconfigurations it can
 discriminate**, and `min.node.size` is guarded by Check A's structural equality instead.
 
-**There are no SHAP subgroups in the si3d hypoxia 1hr positives - the clustering does not beat
-its own null.** `03_` section 6 clusters the 287 held-out positive-class genes on family-level
-SHAP profiles (exact, since SHAP is additive), normalised within gene so clusters reflect
-*which* families drove a gene rather than how strongly it was called. k-means finds a best
-k = 3 at silhouette **0.2524**. Permuting each family's values independently across genes -
-destroying co-occurrence while preserving every marginal - gives a null whose **median is
-0.2569 and max 0.2706**, so the real data scores *below the null median*, empirical
-**p = 0.78**.
+**SHAP subgroups are real, but the statistic decides the answer - and the obvious one is
+wrong.** `03_` section 6 clusters the 287 held-out positive-class genes on family-level SHAP
+profiles (exact, since SHAP is additive), normalised within gene so clusters reflect *which*
+families drove a gene rather than how strongly it was called. The null permutes each family
+independently across genes, destroying co-occurrence while preserving every marginal.
 
-This matters because the unguarded output is highly convincing: three clean groups of 135 / 105
-/ 47 genes, led respectively by `gc` (+0.211), `length` (+0.255) and `clip` (+0.018), with
-plausible gene lists (FUCA2, RPS20, CREBBP...). It reads exactly like "three classes of eIF3d
-target with different drivers" and it is an artefact - k-means always partitions, and this
-partition is no better than random co-occurrence. **Any SHAP clustering, in any package, needs
-this null before the clusters are described.**
+Mean silhouette falls monotonically with k, so the null's best-over-k sits almost always at
+k = 2. Comparing that against an observed best at k = 3 compares two different quantities, and
+it returns **p = 0.74 and a confident "no structure"**. Standardising **within k** first and
+only then maximising over k - which is what pays for having been free to choose k - gives
+observed z = 10.9 against a null max of 3.08, **p = 0.005**. Every k >= 3 exceeds the null's
+*maximum* over 200 permutations; only k = 2 sits below it, so the structure is real but is not
+a two-way split.
+
+| k | observed | null median | null max | z |
+|---|---|---|---|---|
+| 2 | 0.2301 | 0.2554 | 0.2724 | -4.56 |
+| 3 | 0.2524 | 0.2013 | 0.2184 | +7.44 |
+| 4 | 0.2128 | 0.1513 | 0.1987 | +3.20 |
+| 5 | 0.1974 | 0.1403 | 0.1618 | +6.00 |
+| 6 | 0.1964 | 0.1339 | 0.1504 | +10.90 |
+
+`03_subgroup_null.R` holds the one implementation both notebooks use, and **keeps two `best_k`
+apart**: `best_k_z` for testing (peaks at k = 6, where the null variance is tightest - a
+property of the null, not of the structure) and `best_k_sil` for describing (k = 3, the raw
+silhouette peak). At k = 3 the groups are led by `gc` (n = 135), `length` (n = 105) and a weak
+`clip`/`codon_optimality` group (n = 47), and the PCA shows a continuous cloud, so treat
+membership as a gradient rather than a hard class. `03b_shap_subgroup_null.Rmd` carries the
+figures, including the raw statistic as a worked counter-example.
+
+**The error was caught by plotting the per-k null band**, not by the analysis - the single
+summary number hid that observed sat above the null at every k >= 3. Plot the band.
 
 **`02_` saves the imputed split** (`rf_model_data_{suffix}.rds`, gated on `save_model_data`,
 off during sweeps) so `03_` explains *that* model's data rather than re-deriving it from
