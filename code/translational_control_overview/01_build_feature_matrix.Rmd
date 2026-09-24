@@ -138,6 +138,49 @@ kozak_tbl$kozak_pwm_score_v2[kozak_tbl$usable] <-
 cat("kozak_pwm_score_v2: scored", sum(kozak_tbl$usable), "of", nrow(kozak_tbl),
     "; NA (not AUG-anchored or too short):", sum(!kozak_tbl$usable), "\n")
 
+## --- noderer_tis_efficiency ---------------------------------------------------------
+# Noderer 2014 (MSB 10:748) Table S2: initiation efficiency MEASURED by FACS-seq for all
+# 65,536 AUG contexts, -6..+5. Imported, never transcribed. This is the same quantity
+# kozak_pwm_score_v2 estimates from a 1987 frequency table - but measured, not estimated, and
+# the two agree only weakly (rho ~0.15, see the validation below), so 02_ keeps both by
+# default. Its initiation_score param can still isolate either one.
+noderer <- read_tsv(file.path(ref_dir, "noderer_2014_tis_efficiency.tsv"),
+                    skip = 1, show_col_types = FALSE) %>%   # line 1 is the table caption
+  mutate(context = str_replace_all(sequence, "U", "T"))     # source alphabet is RNA
+
+stopifnot(
+  "Noderer table is not 65,536 contexts"  = nrow(noderer) == 65536L,
+  "Noderer contexts are not 11 nt"        = all(nchar(noderer$context) == 11L),
+  "Noderer contexts are not AUG-anchored" = all(str_sub(noderer$context, 7, 9) == "ATG"),
+  "Noderer efficiency outside 12-150"     = all(between(noderer$efficiency, 12, 150)),
+  "Noderer contexts are not unique"       = !any(duplicated(noderer$context))
+)
+cat("Noderer 2014:", nrow(noderer), "contexts, efficiency",
+    paste(range(noderer$efficiency), collapse = "-"), "\n")
+
+# -6..+5 is six nt of 5'UTR then the first five of the CDS: one nt longer than the Kozak
+# window, so it is built separately rather than reused.
+noderer_tbl <- inner_join(utr5, cds, by = "transcript_id_clean") %>%
+  mutate(
+    utr5_len = nchar(utr5_sequence),
+    context  = paste0(str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),
+                      str_sub(cds_sequence, 1, 5)),
+    usable   = nchar(context) == 11L & str_sub(context, 7, 9) == "ATG"
+  ) %>%
+  left_join(noderer %>% dplyr::select(context, noderer_tis_efficiency = efficiency),
+            by = "context")
+noderer_tbl$noderer_tis_efficiency[!noderer_tbl$usable] <- NA_real_
+
+# The lookup is exhaustive over ACGT, so a usable window that fails to match can only contain
+# an N. Anything else means the window or the alphabet is wrong.
+unmatched <- sum(noderer_tbl$usable & is.na(noderer_tbl$noderer_tis_efficiency))
+stopifnot("usable windows failed the exhaustive Noderer lookup" =
+            unmatched == sum(noderer_tbl$usable & str_detect(noderer_tbl$context, "[^ACGT]")))
+cat("noderer_tis_efficiency: scored",
+    sum(!is.na(noderer_tbl$noderer_tis_efficiency)), "of", nrow(noderer_tbl),
+    "; NA (not AUG-anchored or too short):", sum(!noderer_tbl$usable),
+    "; unmatched (non-ACGT):", unmatched, "\n")
+
 ## --- CDS eligibility ----------------------------------------------------------------
 # GENCODE carries 3'-incomplete CDS annotations (cds_end_NF): the CDS starts correctly at ATG
 # but runs off the end of the annotation, so its length is not a multiple of 3. 01g_ already
@@ -343,6 +386,62 @@ cat("  of which out-of-frame:", sum(truncated & !cds$cds_frame_ok),
 cat("Kept", sum(!cds$cds_has_start & cds$cds_has_stop),
     "non-AUG-start transcripts: complete CDS, real initiation biology\n")
 
+## --- nascent peptide + poly(A) tracks -----------------------------------------------
+# Two stalling families read off the CDS already in hand. A proline-rich or strongly basic
+# nascent chain slows the peptide exit tunnel; consecutive lysine codons make an mRNA poly(A)
+# stretch the ribosome slides on. Built on s_int (initiator and terminal stop removed), so
+# they inherit the codon features' frame guarantee and the same truncation mask.
+pep_ss <- DNAStringSet(codon_tbl$s_int)
+# translate() is masked here by another attached package, so it is qualified.
+pep_aa <- Biostrings::translate(pep_ss, if.fuzzy.codon = "solve")
+pep_len <- nchar(pep_aa)
+
+# Net charge: K/R +1, D/E -1, maximised over any 30-aa window. Chains shorter than the window
+# score their whole length, so the feature is defined for every peptide.
+charge_window_max <- function(aa, w = 30L) {
+  ch <- strsplit(aa, "", fixed = TRUE)[[1]]
+  if (!length(ch)) return(NA_real_)
+  v <- integer(length(ch))
+  v[ch %in% c("K", "R")] <-  1L
+  v[ch %in% c("D", "E")] <- -1L
+  if (length(v) <= w) return(as.numeric(sum(v)))
+  cs <- cumsum(c(0L, v))
+  as.numeric(max(cs[(w + 1L):length(cs)] - cs[seq_len(length(cs) - w)]))
+}
+
+# Longest in-frame run of one codon repeated. AAA and AAG are kept apart by design: both rise
+# with lysine content, so a merged "poly-lysine" feature would report amino-acid composition
+# rather than the slippery A-rich tract that actually stalls.
+max_codon_run <- function(s, codon) {
+  n <- nchar(s) %/% 3L
+  if (n < 1L) return(0L)
+  hit <- substring(s, seq.int(1L, n * 3L, 3L), seq.int(3L, n * 3L, 3L)) == codon
+  r <- rle(hit)
+  if (!any(r$values)) 0L else max(r$lengths[r$values])
+}
+
+aa_chr <- as.character(pep_aa)
+pep <- tibble(
+  transcript_id_clean = codon_tbl$transcript_id_clean,
+  proline_fraction    = as.numeric(letterFrequency(pep_aa, "P", as.prob = TRUE)),
+  ppp_motif_density   = if_else(pep_len > 0,
+                                100 * vcountPattern("PPP", pep_aa) / pep_len, NA_real_),
+  max_net_charge_30aa = vapply(aa_chr, charge_window_max, numeric(1), USE.NAMES = FALSE),
+  max_consecutive_aaa = vapply(codon_tbl$s_int, max_codon_run, integer(1), "AAA",
+                               USE.NAMES = FALSE),
+  max_consecutive_aag = vapply(codon_tbl$s_int, max_codon_run, integer(1), "AAG",
+                               USE.NAMES = FALSE)
+)
+pep_cols <- setdiff(names(pep), "transcript_id_clean")
+pep <- pep %>%
+  mutate(across(all_of(pep_cols), as.numeric)) %>%
+  mutate(across(all_of(pep_cols),
+                ~ if_else(transcript_id_clean %in% cds$transcript_id_clean[truncated],
+                          NA_real_, .x)))
+cat("nascent peptide + poly(A): scored", sum(!is.na(pep$proline_fraction)), "of", nrow(pep),
+    "; median proline", round(median(pep$proline_fraction, na.rm = TRUE), 4),
+    "; median max AAG run", median(pep$max_consecutive_aag, na.rm = TRUE), "\n")
+
 ## --- termination context + Cridge 2018 readthrough --------------------------------
 # New family, nothing equivalent in the existing pipeline. Motivated by the csc result: after
 # the terminal stop was removed from the iCodon input, csc lost 1.35 pp of importance share
@@ -422,15 +521,22 @@ term <- term %>% dplyr::select(transcript_id_clean, all_of(term_cols))
 features <- features %>%
   left_join(kozak_tbl %>% dplyr::select(transcript_id_clean, kozak_pwm_score_v2),
             by = "transcript_id_clean") %>%
+  left_join(noderer_tbl %>% dplyr::select(transcript_id_clean, noderer_tis_efficiency),
+            by = "transcript_id_clean") %>%
   left_join(cds %>% dplyr::select(transcript_id_clean, tai_gtrnadb,
                                   cds_frame_ok, cds_has_start, cds_has_stop, cds_complete),
             by = "transcript_id_clean") %>%
   left_join(codon_internal, by = "transcript_id_clean") %>%
+  left_join(pep, by = "transcript_id_clean") %>%
   left_join(term, by = "transcript_id_clean")
 
 corrected_cols <- c("kozak_pwm_score_v2", "tai_gtrnadb",
                     "gc3_internal", "cai_internal", "fop_internal", "csc_internal")
-stopifnot("termination columns did not attach" = all(term_cols %in% colnames(features)))
+stopifnot("termination columns did not attach" = all(term_cols %in% colnames(features)),
+          "noderer_tis_efficiency did not attach" =
+            "noderer_tis_efficiency" %in% colnames(features),
+          "nascent peptide / poly(A) columns did not attach" =
+            all(pep_cols %in% colnames(features)))
 eligibility_cols <- c("cds_frame_ok", "cds_has_start", "cds_has_stop", "cds_complete")
 stopifnot(
   "corrected columns did not all attach" = all(corrected_cols %in% colnames(features)),
@@ -535,6 +641,135 @@ stopifnot("within-tier purine gap too large: the -3 row is wrong again" = purine
 cat("Within-tier purine check passed\n")
 ```
 
+```{r validate_peptide, eval = !params$pass_through}
+stopifnot(
+  "proline_fraction outside [0, 1]" =
+    all(between(features$proline_fraction, 0, 1), na.rm = TRUE),
+  "ppp_motif_density negative" = all(features$ppp_motif_density >= 0, na.rm = TRUE),
+  "poly(A) runs negative" =
+    all(features$max_consecutive_aaa >= 0, na.rm = TRUE) &&
+    all(features$max_consecutive_aag >= 0, na.rm = TRUE),
+  "net charge not finite" =
+    all(is.finite(features$max_net_charge_30aa[!is.na(features$max_net_charge_30aa)]))
+)
+
+# Biological spot-checks. Range checks pass on a scrambled join; these do not.
+# 1. Collagens are the canonical proline-rich proteins.
+col_p  <- features$proline_fraction[str_detect(features$symbol, "^COL[0-9]")]
+med_p  <- median(features$proline_fraction, na.rm = TRUE)
+cat("proline_fraction: collagen median", round(median(col_p, na.rm = TRUE), 4),
+    "vs transcriptome", round(med_p, 4), ", n =", sum(!is.na(col_p)), "\n")
+stopifnot("collagens are not proline-rich - check the translation frame" =
+            median(col_p, na.rm = TRUE) > med_p)
+
+# 2. Ribosomal proteins are strongly basic, so they carry high positive windows.
+rp_q   <- features$max_net_charge_30aa[str_detect(features$symbol, "^RP[LS][0-9]")]
+med_q  <- median(features$max_net_charge_30aa, na.rm = TRUE)
+cat("max_net_charge_30aa: ribosomal protein median", median(rp_q, na.rm = TRUE),
+    "vs transcriptome", med_q, ", n =", sum(!is.na(rp_q)), "\n")
+stopifnot("ribosomal proteins are not basic - check the charge mapping" =
+            median(rp_q, na.rm = TRUE) > med_q)
+
+# 3. PPP density must track proline content; if it does not, the motif count is wrong.
+#    ~77% of transcripts carry no PPP at all, and that tie block holds the rank correlation
+#    near 0.45, so the presence/absence contrast is the sharper statement of the same thing.
+okp   <- complete.cases(features$ppp_motif_density, features$proline_fraction)
+rho_p <- cor(features$ppp_motif_density[okp], features$proline_fraction[okp],
+             method = "spearman")
+has_ppp <- features$ppp_motif_density > 0
+cat("ppp_motif_density vs proline_fraction: Spearman rho =", round(rho_p, 3),
+    ", n =", sum(okp), "; zero-PPP fraction", round(mean(!has_ppp, na.rm = TRUE), 3), "\n")
+cat("  median proline with PPP",
+    round(median(features$proline_fraction[has_ppp], na.rm = TRUE), 4),
+    "vs without", round(median(features$proline_fraction[!has_ppp], na.rm = TRUE), 4), "\n")
+stopifnot(
+  "PPP density does not track proline content" = rho_p > 0.3,
+  "PPP-containing transcripts are not proline-rich - check the motif count" =
+    median(features$proline_fraction[has_ppp], na.rm = TRUE) >
+    median(features$proline_fraction[!has_ppp], na.rm = TRUE)
+)
+
+# 4. AAA and AAG are deliberately separate columns, not a merged lysine count.
+cat("poly(A) tracks: max AAA run", max(features$max_consecutive_aaa, na.rm = TRUE),
+    ", max AAG run", max(features$max_consecutive_aag, na.rm = TRUE),
+    "; transcripts with an AAA run >= 3:",
+    sum(features$max_consecutive_aaa >= 3, na.rm = TRUE), "\n")
+stopifnot("AAA and AAG runs are identical - the codons were merged" =
+            !identical(features$max_consecutive_aaa, features$max_consecutive_aag))
+```
+
+```{r validate_noderer, eval = !params$pass_through}
+# The coordinate convention is the silent failure mode here: the lookup is exhaustive over
+# ACGT, so a window built one nucleotide off still joins - it just returns some other
+# context's efficiency. Three checks pin it down.
+
+# 1. Coverage. A frame-shifted window would not carry ATG at 7..9 and would fall out as
+#    unusable, so coverage is itself the frame check.
+cov_noderer <- mean(!is.na(features$noderer_tis_efficiency))
+cat("noderer_tis_efficiency coverage:", sprintf("%.1f%%", 100 * cov_noderer),
+    "  median:", round(median(features$noderer_tis_efficiency, na.rm = TRUE), 1), "\n")
+stopifnot(
+  "Noderer coverage collapsed - check the window offset" = cov_noderer > 0.90,
+  "Noderer efficiency outside the published 12-150 range" =
+    all(between(features$noderer_tis_efficiency, 12, 150), na.rm = TRUE)
+)
+
+# 2. Published determinants: Noderer 2014 reports -3 and +4 as dominant, purine at -3 and G
+#    at +4 being favourable. In a -6..+5 window -3 is index 4 and +4 is index 10.
+nod_ctx <- noderer %>%
+  mutate(purine_minus3 = str_sub(context, 4, 4) %in% c("A", "G"),
+         g_plus4       = str_sub(context, 10, 10) == "G")
+m3 <- nod_ctx %>% group_by(purine_minus3) %>%
+  summarise(n = n(), mean_eff = round(mean(efficiency), 1), .groups = "drop")
+g4 <- nod_ctx %>% group_by(g_plus4) %>%
+  summarise(n = n(), mean_eff = round(mean(efficiency), 1), .groups = "drop")
+print(as.data.frame(m3)); print(as.data.frame(g4))
+stopifnot(
+  "-3 purine does not raise Noderer efficiency" =
+    m3$mean_eff[m3$purine_minus3] > m3$mean_eff[!m3$purine_minus3],
+  "+4 G does not raise Noderer efficiency" =
+    g4$mean_eff[g4$g_plus4] > g4$mean_eff[!g4$g_plus4]
+)
+
+# 3. The same determinants must be visible on OUR transcripts, not just in the reference
+#    table - this is what confirms the join is correctly framed on real 5'UTRs.
+our_ctx <- noderer_tbl %>% filter(usable, !is.na(noderer_tis_efficiency)) %>%
+  mutate(purine_minus3 = str_sub(context, 4, 4) %in% c("A", "G"),
+         g_plus4       = str_sub(context, 10, 10) == "G")
+om3 <- our_ctx %>% group_by(purine_minus3) %>%
+  summarise(n = n(), mean_eff = mean(noderer_tis_efficiency), .groups = "drop")
+og4 <- our_ctx %>% group_by(g_plus4) %>%
+  summarise(n = n(), mean_eff = mean(noderer_tis_efficiency), .groups = "drop")
+cat("our transcripts, -3 purine:", round(om3$mean_eff[om3$purine_minus3], 1), "vs pyrimidine",
+    round(om3$mean_eff[!om3$purine_minus3], 1),
+    "| +4 G:", round(og4$mean_eff[og4$g_plus4], 1), "vs non-G",
+    round(og4$mean_eff[!og4$g_plus4], 1), "\n")
+stopifnot(
+  "-3 purine effect absent on our transcripts - check the window offset" =
+    om3$mean_eff[om3$purine_minus3] > om3$mean_eff[!om3$purine_minus3],
+  "+4 G effect absent on our transcripts - check the window offset" =
+    og4$mean_eff[og4$g_plus4] > og4$mean_eff[!og4$g_plus4]
+)
+
+# 4. Two independent readings of the same quantity - a 1987 frequency table and a FACS-seq
+#    measurement - must at least agree in SIGN. They agree only weakly (rho ~0.15), which is
+#    itself worth knowing: the inventory's "never model both together" was written assuming
+#    near-duplication, and on these transcripts they are far from duplicates.
+ok  <- complete.cases(features$noderer_tis_efficiency, features$kozak_pwm_score_v2)
+rho <- cor(features$noderer_tis_efficiency[ok], features$kozak_pwm_score_v2[ok],
+           method = "spearman")
+cat("noderer_tis_efficiency vs kozak_pwm_score_v2: Spearman rho =", round(rho, 3),
+    ", n =", sum(ok), "\n")
+stopifnot("Noderer and the Kozak PWM disagree in sign" = rho > 0)
+
+# Tier agreement, reported not asserted: efficiency rises steeply across kozak_score tiers
+# 0-2, then falls back at tier 3, which holds only ~99 transcripts.
+print(features %>% filter(!is.na(noderer_tis_efficiency), !is.na(kozak_score)) %>%
+        group_by(kozak_score) %>%
+        summarise(n = n(), median_eff = round(median(noderer_tis_efficiency), 1),
+                  .groups = "drop") %>% as.data.frame())
+```
+
 ## How much did each correction move?
 
 ```{r correction_deltas, eval = !params$pass_through}
@@ -598,7 +833,10 @@ assign_family <- function(x) {
     str_detect(x, "^struct_.*_utr3$")                            ~ "structure_utr3",
     str_detect(x, "^struct_")                                    ~ "structure_utr5",
     str_detect(x, "^csc|^cai|^tai|^fop")                         ~ "codon_optimality",
-    str_detect(x, "^kozak_")                                     ~ "initiation",
+    str_detect(x, "^kozak_|^noderer_")                           ~ "initiation",
+    x %in% c("proline_fraction", "ppp_motif_density",
+             "max_net_charge_30aa")                               ~ "nascent_peptide",
+    x %in% c("max_consecutive_aaa", "max_consecutive_aag")        ~ "polya_track",
     str_detect(x, "^clip_")                                      ~ "clip",
     str_detect(x, "^zhu2024_|^hia2026_|^karner2026_|^cnot3_")    ~ "stability_external",
     str_detect(x, "^dap5_|^is_dap5_")                            ~ "dap5",
@@ -677,7 +915,14 @@ definitions <- tribble(
   "cai_internal",     "Sharp & Li CAI, RPL/RPS reference; internal codons only",
   "fop_internal",     "FOP, top-10%-TE reference; internal codons only",
   "csc_internal",     "iCodon::predict_stability('human') on the internal-codon CDS",
-  "tai_gtrnadb",      "dos Reis-style tAI; GtRNAdb hg38 copy number + collaborator wobble v1"
+  "tai_gtrnadb",      "dos Reis-style tAI; GtRNAdb hg38 copy number + collaborator wobble v1",
+  "noderer_tis_efficiency",
+    "Noderer 2014 FACS-seq TIS efficiency (12-150), -6..+5 lookup; NA unless AUG-anchored",
+  "proline_fraction",    "fraction (0-1) of internal-codon residues that are proline",
+  "ppp_motif_density",   "PPP occurrences per 100 residues; overlapping matches counted",
+  "max_net_charge_30aa", "max (K+R) - (D+E) over any 30-aa window; whole chain if shorter",
+  "max_consecutive_aaa", "longest in-frame run of AAA lysine codons",
+  "max_consecutive_aag", "longest in-frame run of AAG lysine codons"
 )
 
 definitions <- definitions %>% filter(feature %in% annotation$feature)

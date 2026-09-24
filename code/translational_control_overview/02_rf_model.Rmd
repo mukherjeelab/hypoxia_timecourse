@@ -16,6 +16,7 @@ params:
   matrix_rds: "feature_matrix_tco.rds"
   feature_set_label: "tco"
   variant_set: "corrected"
+  initiation_score: "both"
   include_deprecated: FALSE
   exclude_families: ""
   shuffle_families: ""
@@ -94,6 +95,7 @@ suffix <- paste0(
   params$condition, "_", params$timepoint, "_lfc", params$lfc,
   "_", params$feature_set_label,
   if (params$variant_set != "current") paste0("_", params$variant_set) else "",
+  if (params$initiation_score != "pwm") paste0("_", params$initiation_score) else "",
   "_clip", params$clip_mode,
   if (params$neg_tag != "") paste0("_", params$neg_tag) else "",
   if (NEG_SEED != 9L) paste0("_negseed", NEG_SEED) else ""
@@ -206,6 +208,39 @@ stopifnot("variant_set must be 'current' or 'corrected'" =
             params$variant_set %in% c("current", "corrected"))
 sel <- annotation %>%
   filter(block %in% include_blocks, variant %in% c("single", params$variant_set))
+
+# A gate run reproduces the BASELINE feature set, so it sees baseline-era columns only - the
+# same rule 01_'s gate applies via added_in. Without it, every feature the fork adds later
+# enters the current-variant run and fails a gate that is about reproduction, not about what
+# the fork models today. The termination family did exactly that.
+gate_run <- isTRUE(params$gate_against_baseline) &&
+            params$variant_set == "current" && isTRUE(params$include_deprecated)
+if (gate_run) {
+  n_post <- sum(sel$added_in != "baseline")
+  sel <- sel %>% filter(added_in == "baseline")
+  if (n_post > 0)
+    cat("Gate run: excluded", n_post, "features added to the fork after the baseline\n")
+}
+
+# kozak_pwm_score_v2 and noderer_tis_efficiency are both start-context strength: one
+# estimated from Kozak's 1987 frequency table, the other measured by FACS-seq. 00_'s inventory
+# says never to model both, on the assumption they are near-duplicates - but on these
+# transcripts they correlate at only rho = 0.15, and swapping one for the other moves test AUC
+# by -0.0001 (p = 0.29, 20 paired seeds). They are therefore kept together by default and the
+# exclusive modes are retained for that comparison.
+stopifnot("initiation_score must be 'both', 'pwm' or 'noderer'" =
+            params$initiation_score %in% c("both", "pwm", "noderer"))
+drop_init <- switch(params$initiation_score,
+  both    = character(0),
+  pwm     = "noderer_tis_efficiency",
+  noderer = c("kozak_pwm_score", "kozak_pwm_score_v2"))
+sel <- sel %>% filter(!feature %in% drop_init)
+n_init <- sum(sel$feature %in% c("kozak_pwm_score", "kozak_pwm_score_v2",
+                                 "noderer_tis_efficiency"))
+stopifnot("an exclusive initiation_score let two start-context scores through" =
+            params$initiation_score == "both" || n_init <= 1L)
+cat("Start-context scores in the forest:", n_init,
+    "(initiation_score =", params$initiation_score, ")\n")
 
 # Deprecated features (positional CSC) are excluded unless explicitly asked for. The baseline
 # predates the deprecation, so re-gating needs include_deprecated = TRUE.

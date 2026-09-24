@@ -176,7 +176,7 @@ here writes to `output/predictive_modeling/`. Outputs go to
 | `00_feature_reconciliation.Rmd` | audit of our features vs the collaborator repo; writes `feature_inventory_comparison.csv` |
 | `01_build_feature_matrix.Rmd` | single builder -> `feature_matrix_tco.rds` + **`feature_annotation.csv`** |
 | `02_rf_model.Rmd` | fork of 07, driven by `include_blocks` instead of eight `feature_set` branches |
-| `02b_neg_subsample_sweep.R` | renders 02 across 20 `neg_seed` x 2 variant sets (~4.4 min) |
+| `02b_neg_subsample_sweep.R` | renders 02 across 20 `neg_seed` x N arms (~4-5 min; edit `CONFIGS` per question) |
 | `02c_sweep_stability.Rmd` | reports the sweep; **the null band any claim must clear** |
 
 **`feature_annotation.csv` is the central artifact.** One row per column, with `block`
@@ -184,14 +184,20 @@ here writes to `output/predictive_modeling/`. Outputs go to
 summation, since SHAP is additive), and `variant`. Feature selection is a join against this
 table, not a regex cascade. Editing the CSV changes what the model sees.
 
-**Two gates, both asserted, both currently green.** `01_` checks that the block join
-reproduces notebook 07's 51 features exactly; `02_` checks that the resulting importance
-matches the frozen baseline CSV (max deviation 3.6e-15). The second runs only under
+**Two gates, both asserted, both green.** `01_` checks that the block join reproduces
+notebook 07's 51 features exactly; `02_` checks that the resulting importance matches the
+frozen baseline CSV (max deviation 3.6e-15). The second runs only under
 `variant_set = "current"`, which is why superseded columns are **kept rather than deleted** -
 dropping them would make the baseline permanently unreproducible. Reproduction requires
 matching 07's **RNG call sequence and column order**, not just its logic: `sample()` must be
 the only RNG consumer after `set.seed(neg_seed)`, and ranger sees `train_data[, feature_cols]`,
 so reordering columns changes the forest even with identical seeds.
+
+**A gate run sees baseline-era columns only.** Both gates filter `added_in == "baseline"`.
+Without that, every family added to the fork afterwards enters the `variant_set = "current"`
+run and fails a gate that is about *reproduction*, not about what the fork models today - the
+`termination` family did exactly that and left the `02_` gate red until it was fixed. New
+feature families therefore need no gate bookkeeping.
 
 **Variant pairs.** A corrected feature is added *alongside* the one it supersedes, never over
 it, and `02_`'s `variant_set` param (`"current"` | `"corrected"`, default `"corrected"`) picks
@@ -206,6 +212,16 @@ forest, where they would split credit and hide the effect being measured.
 | `csc` | `csc_internal` | iCodon given the internal-codon CDS, not the stop-containing one |
 | `tai` | `tai_gtrnadb` | collaborator's GtRNAdb copy number + explicit wobble table |
 
+**`initiation_score` is a separate axis from `variant_set`** (`"both"` (default) | `"pwm"` |
+`"noderer"`). `kozak_pwm_score_v2` and `noderer_tis_efficiency` are both start-context
+strength - one estimated from Kozak's 1987 frequency table, the other measured by FACS-seq.
+`00_`'s inventory says never to model both, on the assumption they are near-duplicates. They
+are not: on these transcripts they correlate at **Spearman 0.154**, swapping one for the other
+moves test AUC by -0.0001 (p = 0.29, 20 paired seeds), and together they hold 1.60 + 1.42 pp
+against the 1.71 pp the PWM holds alone - so they are not splitting credit. Both are kept by
+default; the exclusive modes are retained for that comparison. The suffix carries
+`initiation_score` whenever it is not `"pwm"`, so a `"both"` run cannot overwrite a `"pwm"` one.
+
 **Always judge a change against the sweep, never against a single run.** Notebook 02 keeps
 every positive and draws a size-matched negative class, so one run reports the AUC and ranking
 of *one arbitrary draw*. On this model the draw alone moves test AUC by **0.069**
@@ -213,6 +229,31 @@ of *one arbitrary draw*. On this model the draw alone moves test AUC by **0.069*
 pinned at 9 - so the sweep is **paired**: within a seed both variant sets see identical genes,
 and the paired-difference sd (0.0029) is ~6x smaller than the draw-to-draw sd (0.0166). Effects
 invisible in a distribution comparison are readable when paired.
+
+**Run every new family against its own shuffled null, not against zero.** `02_`'s
+`shuffle_families` permutes a family's values across transcripts, destroying its link to the
+target while preserving every marginal, the NA pattern and the within-family correlation
+structure. Impurity importance is non-negative, so an uninformative family never scores zero -
+the shuffled arm is the floor a real one has to clear. Three arms per question
+(`exclude_families` / default / `shuffle_families`), 20 seeds each, ~5 min. Give each arm its
+own `feature_set_label`, or they overwrite each other.
+
+Results so far on si3d / hypoxia / 1hr, **all of which are per-dataset and must be re-run on a
+new mRNA set rather than inherited**:
+
+| family | real vs shuffled share | verdict |
+|---|---|---|
+| `termination` (11) | 6.29 vs 6.10 pp (+0.17, p = 0.003) | at the floor; best feature ranks 31 vs 32 shuffled |
+| `nascent_peptide` (3) | 3.70 vs 3.00 pp (+0.76, 20/20, p < 1e-4) | **real, but carried entirely by `proline_fraction`** (rank 16 vs 27 shuffled) |
+| `polya_track` (2) | 0.674 vs 0.610 pp (+0.05) | at the floor |
+
+`max_net_charge_30aa`, `ppp_motif_density`, `max_consecutive_aag` and `max_consecutive_aaa`
+are **rank-identical to their shuffled copies** (44/46/48/49 of 63). None of the three families
+moves test AUC. `proline_fraction` carries genuine signal that the forest can mostly get
+elsewhere: it correlates with `cds_gc` at rho = 0.44 (proline codons are CCN) and `cds_gc` is
+already the model's strongest single feature. **All of these features are deliberately kept** -
+they are validated and cheap, and the fork exists to run on other mRNA sets where they may
+matter.
 
 ## Findings that affect the EXISTING pipeline
 
@@ -398,3 +439,4 @@ Negative controls: `output/predictive_modeling/negative_control_genes.csv`, size
 | `output/predictive_modeling/negative_control_genes.csv` | Negative control gene pool (MDA-MB-231 si3d) |
 | `counts/all_combined_sigs_1_28_26.csv` | All gene signatures across conditions and cell lines; column `gs_name` identifies set (e.g. `MCF7-SIX1_hypoxia_3d_promotes_TE`) |
 | `accessories/human/human_trna_gcn.csv` | tRNA gene copy numbers (GCN) per codon; used as background for RSCU computation in codon optimality notebooks |
+| `output/g4mer/g4mer_summary_{utr5,cds,utr3}.tsv` | G4mer rG4 scores per transcript (`g4mer_max`, `_mean`, `_frac_above`, `_argmax_start`). **Inference is already done for all three regions** (9.5-10k transcripts each) - note the path is `output/g4mer/`, not the `g4mer/output/` in `.gitignore`. The 4.5 h GPU figures in `g4mer/README.md` are for re-running at stride 1, which is only needed for exact reproduction of published values. Loaded and range-checked by `code/predictive_modeling/01u_feature_extraction_g4mer.Rmd` |

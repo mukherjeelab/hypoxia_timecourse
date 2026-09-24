@@ -19,7 +19,11 @@ SEEDS <- 1:20
 # Each config is one arm of a paired comparison. Because neg_seed seeds only the draw, two
 # arms at the same seed see identical genes, so differences are the config alone.
 CONFIGS <- list(
-  shuffled_termination = list(feature_set_label = "tco_termshuf", shuffle_families = "termination")
+  no_peptide  = list(feature_set_label = "tco_pepnone",
+                     exclude_families  = "nascent_peptide,polya_track"),
+  with_peptide = list(feature_set_label = "tco_pepreal"),
+  shuf_peptide = list(feature_set_label = "tco_pepshuf",
+                      shuffle_families  = "nascent_peptide,polya_track")
 )
 rmd      <- here("code", "translational_control_overview", "02_rf_model.Rmd")
 scratch  <- file.path(tempdir(), "tco_sweep"); dir.create(scratch, showWarnings = FALSE)
