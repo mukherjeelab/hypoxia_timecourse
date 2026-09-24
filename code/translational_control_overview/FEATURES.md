@@ -74,7 +74,7 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `g4mer_max_resid_cds` | single | tco | 84.3 | G4mer max, residual on log2 CDS length + cds_gc (stride 20) |  | g4mer |
 | `g4mer_max_resid_utr3` | single | tco | 83.3 | G4mer max, residual on log2 3'UTR length + utr3_gc (stride 20) |  | g4mer |
 | `g4mer_max_resid_utr5` | single | tco | 83.4 | G4mer max, residual on log2 5'UTR length + utr5_gc (stride 10) |  | g4mer |
-| `g4mer_mean_cds` | single | tco | 84.3 | mean G4mer window score, CDS; no length bias |  | g4mer |
+| `g4mer_mean_cds` | single | tco | 84.3 | mean G4mer window score, CDS; no length bias | 01_build_feature_matrix | g4mer |
 | `g4mer_mean_utr3` | single | tco | 83.3 | mean G4mer window score, 3'UTR; no length bias |  | g4mer |
 | `g4mer_mean_utr5` | single | tco | 83.4 | mean G4mer window score, 5'UTR; no length bias |  | g4mer |
 
@@ -95,7 +95,7 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 
 | feature | variant | added_in | cov% | definition | assigned in | checks |
 |---|---|---|---|---|---|---|
-| `cds_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 01v_feature_extraction_positional_gc, 43_feature_extraction_mcf7six1_codon, 80_teleman_rna_ribo_separately, 85_subunit_seq_3d_bound_features, 88_lm_gc3_4e_resistance, 89_gc_position_density_by_geneset, FEATURE_DECISION_LOG |  |
+| `cds_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 01v_feature_extraction_positional_gc, 43_feature_extraction_mcf7six1_codon, 80_teleman_rna_ribo_separately, 85_subunit_seq_3d_bound_features, 88_lm_gc3_4e_resistance, 89_gc_position_density_by_geneset, FEATURE_DECISION_LOG, 01_build_feature_matrix |  |
 | `gc3` | current | baseline | 100.0 | percent (0-100); INCLUDES the stop codon - to be fixed, see 00_ | 01_feature_extraction, 01c_feature_extraction_combined, 21_csc_vs_gc3_correlation, 23_dhx29_riboseq_slamseq, 38_rscu_hypoxia_1hr, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, 80_teleman_rna_ribo_separately, 85_subunit_seq_3d_bound_features, 88_lm_gc3_4e_resistance, 89_gc_position_density_by_geneset, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG |  |
 | `gc3_internal` | corrected | tco | 98.8 | percent (0-100); internal codons: initiator and stop removed | 01_build_feature_matrix | corrected |
 | `transcript_gc` | single | baseline | 98.7 | percent (0-100); length-weighted mean of the three regional GCs | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |

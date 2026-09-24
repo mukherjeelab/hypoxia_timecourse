@@ -36,7 +36,27 @@ MUTATIONS <- list(
        expect = "collagens are proline-rich"),
   list(name = "g4_region_swap",
        breaks = "5'UTR and 3'UTR G4mer summaries exchanged",
-       expect = "G4 motif spot-check / residual orthogonality")
+       expect = "G4 motif spot-check / residual orthogonality"),
+  # One per defect class the independent audit found. Each of these WAS a real bug that
+  # every check of the day passed, so each now has a mutation proving the new check fires.
+  list(name = "struct_zero_fill",
+       breaks = "F1 class: structure NA refilled with the 0 sentinel",
+       expect = "invariant D, unexplained sentinel block"),
+  list(name = "gene_level_join",
+       breaks = "F3 class: transcript-keyed source joined on gene",
+       expect = "invariant E, occupancy vs a fresh transcript-level join"),
+  list(name = "duplicate_feature",
+       breaks = "F4 class: two modelled columns made bit-identical",
+       expect = "invariant A, identical modelled columns"),
+  list(name = "constant_feature",
+       breaks = "F5 class: a modelled feature made constant",
+       expect = "invariant B, constant modelled columns"),
+  list(name = "length_proxy_feature",
+       breaks = "F2 class: a non-length feature set to a region length",
+       expect = "invariant C, length proxy outside the length family"),
+  list(name = "golden_drift",
+       breaks = "every cds_gc shifted by 1e-6 - too small for any range or family check",
+       expect = "golden-transcript snapshot")
 )
 
 rmd     <- here("code", "translational_control_overview", "01_build_feature_matrix.Rmd")

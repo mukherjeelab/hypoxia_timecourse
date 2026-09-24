@@ -109,7 +109,10 @@ stopifnot("sequences missing for some transcripts" =
 # Guard: a mutation run never writes feature_matrix_tco.rds (see the write chunk).
 MUT <- params$mutate_input
 KNOWN_MUTATIONS <- c("", "noderer_window_shift", "cridge_permute", "term_stop_shuffle",
-                     "peptide_frame_shift", "g4_region_swap", "kozak_minus3_bug")
+                     "peptide_frame_shift", "g4_region_swap", "kozak_minus3_bug",
+                     # one per defect class the independent audit found
+                     "struct_zero_fill", "gene_level_join", "duplicate_feature",
+                     "constant_feature", "length_proxy_feature", "golden_drift")
 stopifnot("unknown mutate_input" = MUT %in% KNOWN_MUTATIONS)
 if (nzchar(MUT)) {
   cat("\n*** MUTATION RUN:", MUT, "- outputs will NOT be written ***\n\n")
@@ -628,8 +631,19 @@ stopifnot("dhx29 occupancy source is not transcript-keyed" =
             "transcript_id_clean" %in% colnames(dhx29_occ),
           "dhx29 occupancy source has duplicate transcripts" =
             !any(duplicated(dhx29_occ$transcript_id_clean)))
-occ_tx <- dhx29_occ %>%
-  dplyr::select(transcript_id_clean, hia2026_dhx29_occupancy_tx = dhx29_occupancy_score)
+occ_tx <- if (MUT == "gene_level_join") {
+  # F3 class: join a transcript-keyed source on gene, so the modelled transcript receives
+  # whichever isoform the source happened to hold.
+  dhx29_occ %>% mutate(gene_id_clean = sub("\\..*", "", ensembl_gene)) %>%
+    group_by(gene_id_clean) %>% slice(1) %>% ungroup() %>%
+    dplyr::select(gene_id_clean, hia2026_dhx29_occupancy_tx = dhx29_occupancy_score) %>%
+    inner_join(features %>% dplyr::select(transcript_id_clean, gene_id_clean),
+               by = "gene_id_clean") %>%
+    dplyr::select(transcript_id_clean, hia2026_dhx29_occupancy_tx)
+} else {
+  dhx29_occ %>%
+    dplyr::select(transcript_id_clean, hia2026_dhx29_occupancy_tx = dhx29_occupancy_score)
+}
 
 # F4. clip_lee_complete_media_bound is bit-identical to clip_lee_glu_dep_bound - the two
 # columns are already identical in the upstream score_card.csv - so clip_cap_binding_count,
@@ -742,6 +756,11 @@ for (rg in if (isTRUE(params$apply_audit_repairs)) names(struct_region) else cha
 # ~1.000 against its own region length, and the "count" EXCEEDS the length by 1 for
 # thousands of transcripts, which is impossible for a count of positions. Both are deprecated
 # rather than deleted, so the baseline stays reproducible under include_deprecated = TRUE.
+if (MUT == "struct_zero_fill") {     # F1 class: NA back to the 0 sentinel
+  sc <- grep("^tco_struct_", colnames(features), value = TRUE)
+  for (cc in sc) features[[cc]][is.na(features[[cc]])] <- 0
+}
+
 broken_structure <- grep("^tco_struct_(accessibility_.*_min|num_structured_regions)",
                          colnames(features), value = TRUE)
 cat("Deprecating", length(broken_structure), "structure columns (constant, or length proxies):",
@@ -1312,6 +1331,16 @@ class into a standing check, so the same shape of error cannot return silently. 
 the modelled columns only (identifiers, labels and deprecated columns are exempt).
 
 ```{r feature_invariants, eval = !params$pass_through}
+# Mutations that target the structural invariants themselves.
+if (MUT == "duplicate_feature")                       # F4 class
+  features$g4mer_mean_cds <- features$g4mer_mean_utr5
+if (MUT == "constant_feature")                        # F5 class
+  features$proline_fraction <- 0.05
+if (MUT == "length_proxy_feature")                    # F2 class
+  features$term_interval_codons <- features$utr3_length
+if (MUT == "golden_drift")                            # silent per-transcript drift
+  features$cds_gc <- features$cds_gc + 1e-6
+
 modelled <- annotation %>%
   filter(block %in% c("intrinsic", "external"), !deprecated) %>% pull(feature)
 num_mod <- modelled[map_lgl(modelled, ~ is.numeric(features[[.x]]))]
@@ -1359,23 +1388,113 @@ stopifnot(
   "a non-length feature is a near-perfect length proxy" = length(proxies) == 0
 )
 
-# D. Sentinel blocks, REPORTED not asserted: a continuous feature where one exact value is
-#    shared by a large block of rows is how F1 hid - 1,689 transcripts zero-filled rather than
-#    NA, which defeats every NA-based guard downstream. Some features are legitimately
-#    zero-heavy (g4mer_frac_above, ppp_motif_density), so this is a prompt to look, not a gate.
+# D. Sentinel blocks. A continuous feature where one exact value is shared by a large block of
+#    rows is how F1 hid: 1,689 transcripts zero-filled rather than NA, which defeats every
+#    NA-based guard downstream. Asserted, with an explicit allowlist - a feature is exempt only
+#    by being named here with a reason, never by silently slipping under a threshold.
+ZERO_HEAVY_OK <- c(
+  "ppp_motif_density"     = "PPP is genuinely absent from ~77% of proteins",
+  "g4mer_frac_above_utr5" = "most 5'UTRs have no window above the rG4 threshold",
+  "g4mer_frac_above_cds"  = "as above, CDS",
+  "g4mer_frac_above_utr3" = "as above, 3'UTR",
+  "cnot3_ribo_enrichment" = "-log10 FDR, floored at 0 for non-enriched genes"
+)
 cat("D. continuous columns where one exact value covers >5% of rows:\n")
-flagged <- 0
+sentinel_hits <- character(0)
 for (f in num_mod) {
   v <- features[[f]]; v <- v[!is.na(v)]
   if (length(unique(v)) < 100) next                 # not continuous
   tb <- sort(table(v), decreasing = TRUE)
   if (tb[1] / length(v) > 0.05) {
-    cat(sprintf("     %-42s value %s in %.1f%% of rows\n", f, names(tb)[1],
-                100 * tb[1] / length(v)))
-    flagged <- flagged + 1
+    exempt <- f %in% names(ZERO_HEAVY_OK)
+    cat(sprintf("     %-42s value %s in %.1f%% of rows%s\n", f, names(tb)[1],
+                100 * tb[1] / length(v),
+                if (exempt) paste0("  [expected: ", ZERO_HEAVY_OK[[f]], "]") else "  <- UNEXPECTED"))
+    if (!exempt) sentinel_hits <- c(sentinel_hits, f)
   }
 }
-if (!flagged) cat("     none\n")
+if (!length(sentinel_hits)) cat("     no unexpected sentinel blocks\n")
+stopifnot("an unexplained sentinel block appeared - is a NA being filled with a constant?" =
+            length(sentinel_hits) == 0)
+
+# E. Join level. F3 was a transcript-keyed source joined at GENE level, so the transcript we
+#    model received a different isoform's value.
+#
+#    The obvious fingerprint - "a gene-level join is constant within gene" - DOES NOT WORK
+#    here, and that is worth stating: this matrix holds exactly one transcript per gene, so
+#    there are no sibling isoforms to compare. That is precisely why F3 was silent. A
+#    gene-level join does not fail or duplicate; it quietly returns whichever isoform the
+#    source happened to carry.
+#
+#    So the only real check is against the SOURCE, which is possible for the external files
+#    this notebook reads itself. Inherited external columns are built in
+#    code/predictive_modeling/ and cannot be key-checked from here - see FEATURES.md, whose
+#    "assigned in" column names the notebook where each one is built.
+stopifnot("the matrix is no longer one transcript per gene - re-derive invariant E" =
+            !any(duplicated(features$gene_id_clean)))
+
+occ_check <- features %>%
+  dplyr::select(transcript_id_clean, stored = hia2026_dhx29_occupancy_tx) %>%
+  left_join(dhx29_occ %>% dplyr::select(transcript_id_clean,
+                                        src = dhx29_occupancy_score),
+            by = "transcript_id_clean")
+occ_dev <- max(abs(occ_check$stored - occ_check$src), na.rm = TRUE)
+cat("E. hia2026_dhx29_occupancy_tx vs a fresh transcript-level join: max |dev| =",
+    signif(occ_dev, 3), ", non-NA", sum(!is.na(occ_check$stored)),
+    "(gene-level original had", sum(!is.na(features$hia2026_dhx29_occupancy)), ")\n")
+stopifnot(
+  "the corrected dhx29 occupancy does not match a transcript-level join" = occ_dev < 1e-12,
+  "the corrected dhx29 occupancy has NA where the transcript-level source has a value" =
+    !any(is.na(occ_check$stored) & !is.na(occ_check$src))
+)
+cat("   external columns inherited from predictive_modeling cannot be key-checked here;",
+    "FEATURES.md names where each is built\n")
+```
+
+## Golden transcripts
+
+A frozen snapshot of 20 transcripts x every modelled feature, committed at
+`golden_transcripts.csv`. Range checks pass on a scrambled join and family statistics pass on
+a drifted value; this catches "that number is not what it was" whatever the cause. The
+transcripts deliberately include the awkward cases: the named spot-check genes, the F1 group
+whose structure is NA, truncated CDS and non-AUG starts.
+
+Regenerate **on purpose** with `01d_golden_transcripts.R` when a feature is legitimately
+corrected - the commit diff then shows exactly which transcripts and columns moved. A silent
+change fails here instead.
+
+```{r golden_transcripts, eval = !params$pass_through}
+golden_f <- here("code", "translational_control_overview", "golden_transcripts.csv")
+if (!file.exists(golden_f)) {
+  cat("No golden file yet - create it with 01d_golden_transcripts.R\n")
+} else {
+  golden <- read_csv(golden_f, show_col_types = FALSE)
+  now <- features %>%
+    filter(transcript_id_clean %in% golden$transcript_id_clean) %>%
+    dplyr::select(transcript_id_clean, any_of(unique(golden$feature))) %>%
+    pivot_longer(-transcript_id_clean, names_to = "feature", values_to = "value_now")
+
+  cmp <- golden %>% left_join(now, by = c("transcript_id_clean", "feature"))
+  missing_col <- cmp %>% filter(is.na(value_now) & !is.na(value))
+  na_flip     <- cmp %>% filter(!is.na(value_now) & is.na(value))
+  moved <- cmp %>% filter(!is.na(value), !is.na(value_now),
+                          abs(value - value_now) > 1e-9)
+
+  cat("Golden check:", n_distinct(golden$transcript_id_clean), "transcripts x",
+      n_distinct(golden$feature), "features\n")
+  cat("  values that moved:", nrow(moved),
+      " | became NA:", nrow(missing_col), " | were NA, now present:", nrow(na_flip), "\n")
+  if (nrow(moved))
+    print(moved %>% arrange(desc(abs(value - value_now))) %>% head(10) %>% as.data.frame())
+
+  stopifnot(
+    "a golden feature is missing from the matrix" =
+      all(unique(golden$feature) %in% colnames(features)),
+    "golden transcript values changed - if this was intended, re-run 01d_golden_transcripts.R" =
+      nrow(moved) == 0 && nrow(missing_col) == 0 && nrow(na_flip) == 0
+  )
+  cat("  golden snapshot matches\n")
+}
 ```
 
 ## What `te_lfc` actually is (audit finding F7)
