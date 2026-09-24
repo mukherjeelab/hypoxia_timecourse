@@ -193,6 +193,22 @@ all** - every value from 1 to 25 lands within a few percent of the correct RMSE,
 moves fidelity. So Check B asserts on RMSE and **only against the misconfigurations it can
 discriminate**, and `min.node.size` is guarded by Check A's structural equality instead.
 
+**There are no SHAP subgroups in the si3d hypoxia 1hr positives - the clustering does not beat
+its own null.** `03_` section 6 clusters the 287 held-out positive-class genes on family-level
+SHAP profiles (exact, since SHAP is additive), normalised within gene so clusters reflect
+*which* families drove a gene rather than how strongly it was called. k-means finds a best
+k = 3 at silhouette **0.2524**. Permuting each family's values independently across genes -
+destroying co-occurrence while preserving every marginal - gives a null whose **median is
+0.2569 and max 0.2706**, so the real data scores *below the null median*, empirical
+**p = 0.78**.
+
+This matters because the unguarded output is highly convincing: three clean groups of 135 / 105
+/ 47 genes, led respectively by `gc` (+0.211), `length` (+0.255) and `clip` (+0.018), with
+plausible gene lists (FUCA2, RPS20, CREBBP...). It reads exactly like "three classes of eIF3d
+target with different drivers" and it is an artefact - k-means always partitions, and this
+partition is no better than random co-occurrence. **Any SHAP clustering, in any package, needs
+this null before the clusters are described.**
+
 **`02_` saves the imputed split** (`rf_model_data_{suffix}.rds`, gated on `save_model_data`,
 off during sweeps) so `03_` explains *that* model's data rather than re-deriving it from
 params as `07c_` must. That removes a whole class of drift rather than asserting its way back.

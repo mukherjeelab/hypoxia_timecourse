@@ -12,6 +12,8 @@ params:
   explain_n: 200
   explain_sizes: "50,100,200,400"
   run_interactions: FALSE
+  cluster_k_max: 6
+  cluster_n_null: 50
 editor_options:
   chunk_output_type: console
 ---
@@ -283,9 +285,104 @@ cat("\nSpearman of family ranking, smallest vs largest explain set:",
     round(cor(rank_cor[[2]], rank_cor[[ncol(rank_cor)]], method = "spearman"), 3), "\n")
 ```
 
+# 6. Are there subgroups of targets with different drivers?
+
+Everything above is a **global** ranking: one feature order averaged over all genes. It cannot
+say whether there are distinct classes of eIF3d target driven by different features - a
+GC/structure-driven set versus a codon-driven set, say. Given that several feature families
+turned out real-but-redundant globally, a family that matters for only a subset of genes is
+exactly the pattern a global mean hides.
+
+This is the one idea worth borrowing from the `explainer` package (`SHAPclust()`), done here on
+our **exact** SHAP values rather than through an mlr3 wrapper with a sampling estimator.
+
+Clustering is on the **positive class only** - including negatives would mostly recover the
+class split, which we already know - and on **family-level** profiles, which is exact because
+SHAP is additive. Each gene's profile is normalised by its own total absolute contribution, so
+clusters reflect *which* families drove a gene, not how confidently it was called.
+
+```{r subgroup_shap}
+pos_test <- which(test_data$eif3d_target == md$pos_label)
+cat("Positive-class genes in the held-out set:", length(pos_test), "\n")
+
+pos_x    <- as.data.frame(test_data[pos_test, feature_cols])
+shap_pos <- as.data.frame(treeshap(unified, pos_x, interactions = FALSE,
+                                   verbose = FALSE)$shaps)
+
+fam_of <- ann$family[match(feature_cols, ann$feature)]
+fam_mat <- t(rowsum(t(as.matrix(shap_pos)), group = fam_of))   # exact family sums per gene
+
+# Normalise within gene: the profile is the share of that gene's attribution, signed.
+denom   <- rowSums(abs(fam_mat)); denom[denom == 0] <- NA
+profile <- fam_mat / denom
+profile <- profile[stats::complete.cases(profile), , drop = FALSE]
+cat("Profiles:", nrow(profile), "genes x", ncol(profile), "families\n")
+```
+
+```{r subgroup_k}
+library(cluster)
+
+sil_for <- function(m, k) {
+  set.seed(9)
+  km <- kmeans(m, centers = k, nstart = 25)
+  if (length(unique(km$cluster)) < 2) return(NA_real_)
+  mean(silhouette(km$cluster, dist(m))[, 3])
+}
+ks  <- 2:params$cluster_k_max
+sil <- map_dbl(ks, ~ sil_for(profile, .x))
+print(data.frame(k = ks, mean_silhouette = round(sil, 4)))
+
+# A silhouette is always positive for some k, so it means nothing on its own. The null keeps
+# each family's marginal distribution and destroys only the CO-OCCURRENCE between families -
+# the same logic as the shuffled-family arm in 02c_: what does structure of this shape score
+# when there is no joint structure to find?
+null_sil <- map_dbl(seq_len(params$cluster_n_null), function(i) {
+  set.seed(1000 + i)
+  perm <- apply(profile, 2, sample)
+  max(map_dbl(ks, ~ sil_for(perm, .x)), na.rm = TRUE)
+})
+best_k   <- ks[which.max(sil)]
+best_sil <- max(sil, na.rm = TRUE)
+p_emp    <- (sum(null_sil >= best_sil) + 1) / (length(null_sil) + 1)
+
+cat(sprintf("\nbest k = %d, silhouette %.4f\n", best_k, best_sil))
+cat(sprintf("null (%d permutations): median %.4f, max %.4f\n",
+            length(null_sil), median(null_sil), max(null_sil)))
+cat(sprintf("empirical p = %.4f  (floor is 1/%d)\n", p_emp, length(null_sil) + 1))
+if (p_emp > 0.05)
+  cat("\nNOT separable from the null: report this as no detectable subgroup structure,\n",
+      "not as k clusters. The cluster means below are then descriptive only.\n")
+```
+
+```{r subgroup_characterise}
+set.seed(9)
+km  <- kmeans(profile, centers = best_k, nstart = 25)
+gid <- test_data$gene_id_clean[pos_test][stats::complete.cases(fam_mat / denom)]
+sym <- test_data$symbol[pos_test][stats::complete.cases(fam_mat / denom)]
+
+cluster_means <- as_tibble(profile) %>%
+  mutate(cluster = km$cluster) %>%
+  group_by(cluster) %>%
+  summarise(n = n(), across(everything(), mean), .groups = "drop")
+print(as.data.frame(cluster_means %>% mutate(across(where(is.numeric), ~ round(., 3)))))
+
+cat("\nTop drivers per cluster (largest mean signed share):\n")
+for (k in sort(unique(km$cluster))) {
+  v <- colMeans(profile[km$cluster == k, , drop = FALSE])
+  top <- sort(v, decreasing = TRUE)[1:3]
+  cat(sprintf("  cluster %d (n = %3d): %s\n", k, sum(km$cluster == k),
+              paste(sprintf("%s %+.3f", names(top), top), collapse = " | ")))
+  cat("      e.g. ", paste(head(sym[km$cluster == k], 6), collapse = ", "), "\n")
+}
+
+subgroups <- tibble(gene_id_clean = gid, symbol = sym, cluster = km$cluster) %>%
+  bind_cols(as_tibble(profile))
+```
+
 ```{r export}
 write_csv(shap_tbl, file.path(out_dir, paste0("shap_feature_", suffix, ".csv")))
 write_csv(fam_tbl,  file.path(out_dir, paste0("shap_family_", suffix, ".csv")))
 write_csv(stab,     file.path(out_dir, paste0("shap_explain_stability_", suffix, ".csv")))
-cat("Wrote 3 SHAP files with suffix:", suffix, "\n")
+write_csv(subgroups, file.path(out_dir, paste0("shap_subgroups_", suffix, ".csv")))
+cat("Wrote 4 SHAP files with suffix:", suffix, "\n")
 ```
