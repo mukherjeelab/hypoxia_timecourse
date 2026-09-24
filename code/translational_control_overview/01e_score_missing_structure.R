@@ -57,14 +57,17 @@ cols <- switch(region,
   utr5 = c(cap = "tco_struct_accessibility_cap_proximal",
            aug = "tco_struct_accessibility_aug_context",
            mean = "tco_struct_accessibility_utr5_mean",
+           min  = "tco_struct_accessibility_utr5_min",
            sd   = "tco_struct_accessibility_utr5_sd"),
   cds  = c(cap = "tco_struct_accessibility_start_proximal_cds",
            aug = "tco_struct_accessibility_stop_proximal_cds",
            mean = "tco_struct_accessibility_cds_mean",
+           min  = "tco_struct_accessibility_cds_min",
            sd   = "tco_struct_accessibility_cds_sd"),
   utr3 = c(cap = "tco_struct_accessibility_stop_proximal_utr3",
            aug = "tco_struct_accessibility_distal_utr3",
            mean = "tco_struct_accessibility_utr3_mean",
+           min  = "tco_struct_accessibility_utr3_min",
            sd   = "tco_struct_accessibility_utr3_sd"))
 
 # 01d_/01k_ index the two positional features from opposite ends depending on region:
@@ -81,13 +84,20 @@ score_one <- function(lunp_file, tx) {
          cap  = mean(acc[1:min(30, n)], na.rm = TRUE),
          aug  = mean(acc[max(1, n - 29):n], na.rm = TRUE),
          mean = mean(acc, na.rm = TRUE),
+         min  = min(acc, na.rm = TRUE),
          sd   = sd(acc, na.rm = TRUE))
 }
 
+# The folded _lunp files are ARCHIVED, not discarded: re-folding 1,600 CDS sequences costs
+# 13 minutes, and any future accessibility feature should be derivable from the files rather
+# than from another fold.
+archive_dir <- here("accessories", "plfold_output", paste0("rescued_", region))
+
 run_plfold <- function(tbl, label) {
   if (!nrow(tbl)) return(tibble())
-  wd <- file.path(tempdir(), paste0("plf_", region, "_", label))
-  unlink(wd, recursive = TRUE); dir.create(wd, recursive = TRUE)
+  wd <- if (label == "missing") archive_dir else
+          file.path(tempdir(), paste0("plf_", region, "_", label))
+  unlink(wd, recursive = TRUE); dir.create(wd, recursive = TRUE, showWarnings = FALSE)
   fa <- file.path(wd, "in.fa")
   writeLines(as.vector(rbind(paste0(">", tbl$transcript_id_clean), tbl$seq)), fa)
   t0 <- Sys.time()
@@ -95,6 +105,7 @@ run_plfold <- function(tbl, label) {
                  PARAMS))
   cat("  folded", nrow(tbl), label, "sequences in",
       round(difftime(Sys.time(), t0, units = "mins"), 2), "min\n")
+  if (label == "missing") cat("  _lunp archived in", wd, "\n")
   map_dfr(tbl$transcript_id_clean, function(tx) {
     f <- file.path(wd, paste0(tx, "_lunp"))
     if (!file.exists(f)) return(tibble())
