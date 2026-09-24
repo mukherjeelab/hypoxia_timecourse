@@ -47,7 +47,7 @@ for (i in seq_len(nrow(grid))) {
   ok <- tryCatch({
     render(rmd,
            params = c(cfg, list(neg_seed = s, gate_against_baseline = FALSE,
-                                save_plots = FALSE)),
+                                save_plots = FALSE, save_model_data = FALSE)),
            # keep the throwaway HTML out of the repo
            output_file = sprintf("sweep_%s_%s_seed%02d.html", preset, nm, s),
            output_dir  = scratch,

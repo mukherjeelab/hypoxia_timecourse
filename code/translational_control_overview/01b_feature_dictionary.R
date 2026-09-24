@@ -68,6 +68,39 @@ ann$checked_in <- map_chr(seq_len(nrow(ann)), function(i) {
   if (length(hit)) paste(sort(sub("^validate_", "", hit)), collapse = ", ") else ""
 })
 
+# --- provenance -----------------------------------------------------------------------
+# Most columns are inherited and their definitions were written by whoever built them. Rather
+# than paraphrase those notebooks - which would be inventing a definition and calling it
+# documentation - the dictionary records WHERE each column is assigned, so a reader goes to
+# the code. Only columns whose definition is written deliberately in 01_ carry prose.
+#
+# Reported as every file containing an assignment to that name, not a single "the" source:
+# a column is often created in one notebook and re-derived or coerced in another, and
+# picking one would be a guess about which is definitive.
+src_files <- c(
+  list.files(here("code", "predictive_modeling"), pattern = "\\.Rmd$", full.names = TRUE),
+  list.files(here("code", "translational_control_overview"), pattern = "\\.Rmd$",
+             full.names = TRUE)
+)
+src <- set_names(map(src_files, ~ paste(readLines(.x, warn = FALSE), collapse = "\n")),
+                 basename(src_files))
+
+assigned_in <- function(f) {
+  # tco_struct_* is this fork's rename of struct_*, so the notebooks that build it use the
+  # pre-rename name. Searching only the new spelling finds nothing and reports 18 columns as
+  # having no origin, which would be an artefact of the rename, not a fact about the code.
+  names_to_try <- unique(c(f, sub("^tco_struct_", "struct_", f)))
+  pats <- paste0("(?<![A-Za-z0-9_.])", str_escape(names_to_try), "[[:space:]]*(=[^=]|<-)")
+  hit <- names(src)[map_lgl(src, function(txt) any(map_lgl(pats, ~ str_detect(txt, .x))))]
+  if (length(hit)) paste(sub("\\.Rmd$", "", hit), collapse = ", ") else ""
+}
+ann$assigned_in <- map_chr(ann$feature, assigned_in)
+
+cat("Columns with a written definition:", sum(!is.na(ann$definition) & ann$definition != ""),
+    "| with a located assignment:", sum(ann$assigned_in != ""),
+    "| with neither:", sum((is.na(ann$definition) | ann$definition == "") &
+                           ann$assigned_in == ""), "\n")
+
 # --- render ----------------------------------------------------------------------------
 esc <- function(x) str_replace_all(replace_na(as.character(x), ""), "\\|", "\\\\|")
 
@@ -107,6 +140,8 @@ lines <- c(
   "- **variant** - `single`, or one member of a variant pair (`current` / `corrected`). `02_rf_model.Rmd` takes one member per pair via `variant_set`; both in one forest would split credit between near-duplicates.",
   "- **added_in** - `baseline` means inherited unchanged from `feature_matrix_dhx29_kd_feature.rds`; `tco` means built or corrected in this fork.",
   "- **cov%** - percent of transcripts with a non-NA value. `02_` drops any feature below 50% as sparse, because median imputation manufactures a split between real and imputed values.",
+  "- **definition** - written only where `01_build_feature_matrix.Rmd` states one deliberately. Blank is not an oversight: the column is inherited, and paraphrasing the notebook that built it would be inventing documentation. Use **assigned in** instead.",
+  "- **assigned in** - every notebook containing an assignment to this column name, found by search. Listed in full rather than picking one, because a column is often created in one notebook and re-derived or coerced in another. `tco_struct_*` is searched under its pre-rename `struct_*` name as well. **Blank means no literal assignment to that name exists in any notebook**, which happens when the name is built programmatically - the `g4mer_*` columns come out of a `pivot_wider` over regions, and the four `clip_*_bound` columns are assembled from a condition vector. Blank is a fact about how the name is constructed, not a missing source.",
   "- **checks** - which `validate_*` chunk of `01_build_feature_matrix.Rmd` exercises this feature. **Blank means no check in this fork**: for `added_in = baseline` features the checks live in their original `code/predictive_modeling/` notebook, and are not re-run here.",
   "",
   "> **What the checks do and do not establish.** Range checks pass on a scrambled join, and a",
@@ -126,11 +161,11 @@ for (bl in block_order) {
   for (fam in sub %>% count(family, sort = TRUE) %>% pull(family)) {
     fs <- sub %>% filter(family == fam) %>% arrange(feature)
     lines <- c(lines, sprintf("### `%s` (%d)", fam, nrow(fs)), "",
-               "| feature | variant | added_in | cov% | definition | checks |",
-               "|---|---|---|---|---|---|")
-    lines <- c(lines, sprintf("| `%s` | %s | %s | %.1f | %s | %s |",
+               "| feature | variant | added_in | cov% | definition | assigned in | checks |",
+               "|---|---|---|---|---|---|---|")
+    lines <- c(lines, sprintf("| `%s` | %s | %s | %.1f | %s | %s | %s |",
                               fs$feature, esc(fs$variant), esc(fs$added_in), fs$coverage,
-                              esc(fs$definition), esc(fs$checked_in)))
+                              esc(fs$definition), esc(fs$assigned_in), esc(fs$checked_in)))
     lines <- c(lines, "")
   }
 }

@@ -5,6 +5,7 @@ date: "`r Sys.Date()`"
 output: html_document
 params:
   pass_through: FALSE
+  mutate_input: ""
 editor_options:
   chunk_output_type: console
 ---
@@ -98,6 +99,22 @@ cds  <- seqs$cds_seq  %>% filter(transcript_id_clean %in% features$transcript_id
 stopifnot("sequences missing for some transcripts" =
             nrow(utr5) == nrow(features) && nrow(cds) == nrow(features))
 
+## --- deliberate corruption, for 01c_mutation_test_checks.R --------------------------
+# A check that has never been shown to FAIL is uninformative: the 01h_ Kozak PWM passed its
+# own tier-monotonicity check while being wrong. mutate_input applies one named corruption to
+# an INPUT, so 01c_ can assert that the corresponding check fires. Mutations that slip through
+# are recorded as blind spots rather than quietly ignored.
+#
+# Guard: a mutation run never writes feature_matrix_tco.rds (see the write chunk).
+MUT <- params$mutate_input
+KNOWN_MUTATIONS <- c("", "noderer_window_shift", "cridge_permute", "term_stop_shuffle",
+                     "peptide_frame_shift", "g4_region_swap", "kozak_minus3_bug")
+stopifnot("unknown mutate_input" = MUT %in% KNOWN_MUTATIONS)
+if (nzchar(MUT)) {
+  cat("\n*** MUTATION RUN:", MUT, "- outputs will NOT be written ***\n\n")
+  set.seed(9)
+}
+
 ## --- kozak_pwm_score_v2 -------------------------------------------------------------
 # Published Kozak 1987 Table 1, imported as a file. Never transcribed: a hand-typed copy is
 # what produced the defect this replaces.
@@ -112,6 +129,11 @@ pwm_publ <- kozak_pub %>%
   dplyr::select(A = A_frequency, C = C_frequency, G = G_frequency, T = T_frequency) %>%
   as.matrix()
 rownames(pwm_publ) <- names(win_idx)
+if (MUT == "kozak_minus3_bug") {
+  # The historical 01h_ defect: G at -3 typed as 0.13 instead of the published ~0.36-0.41.
+  pwm_publ["-3", "G"] <- 0.13
+  pwm_publ["-3", ]    <- pwm_publ["-3", ] / sum(pwm_publ["-3", ])
+}
 stopifnot("published Kozak rows do not sum to 1" =
             all(abs(rowSums(pwm_publ) - 1) < 1e-8))
 
@@ -163,8 +185,12 @@ cat("Noderer 2014:", nrow(noderer), "contexts, efficiency",
 noderer_tbl <- inner_join(utr5, cds, by = "transcript_id_clean") %>%
   mutate(
     utr5_len = nchar(utr5_sequence),
-    context  = paste0(str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),
-                      str_sub(cds_sequence, 1, 5)),
+    context  = if (MUT == "noderer_window_shift")
+                 paste0(str_sub(utr5_sequence, start = pmax(1L, utr5_len - 4L)),
+                        str_sub(cds_sequence, 1, 6))      # -5..+6 instead of -6..+5
+               else
+                 paste0(str_sub(utr5_sequence, start = pmax(1L, utr5_len - 5L)),
+                        str_sub(cds_sequence, 1, 5)),
     usable   = nchar(context) == 11L & str_sub(context, 7, 9) == "ATG"
   ) %>%
   left_join(noderer %>% dplyr::select(context, noderer_tis_efficiency = efficiency),
@@ -391,7 +417,11 @@ cat("Kept", sum(!cds$cds_has_start & cds$cds_has_stop),
 # nascent chain slows the peptide exit tunnel; consecutive lysine codons make an mRNA poly(A)
 # stretch the ribosome slides on. Built on s_int (initiator and terminal stop removed), so
 # they inherit the codon features' frame guarantee and the same truncation mask.
-pep_ss <- DNAStringSet(codon_tbl$s_int)
+pep_ss <- if (MUT == "peptide_frame_shift") {
+  DNAStringSet(str_sub(codon_tbl$s_int, 2L, nchar(codon_tbl$s_int) - 2L))   # +1 frame
+} else {
+  DNAStringSet(codon_tbl$s_int)
+}
 # translate() is masked here by another attached package, so it is qualified.
 pep_aa <- Biostrings::translate(pep_ss, if.fuzzy.codon = "solve")
 pep_len <- nchar(pep_aa)
@@ -464,6 +494,8 @@ cat("3'UTR sequences available:", nrow(utr3_tbl), "of", nrow(features), "\n")
 
 cridge <- read_tsv(file.path(ref_dir, "cridge2018_termination_contexts.tsv"),
                    show_col_types = FALSE)
+if (MUT == "cridge_permute")            # break the context -> readthrough correspondence
+  cridge$readthrough_measure <- sample(cridge$readthrough_measure)
 cridge_med <- median(cridge$readthrough_measure)
 stopifnot(
   "Cridge table is not 192 contexts"    = nrow(cridge) == 192L,
@@ -516,6 +548,11 @@ term_cols <- c("term_stop_TAA", "term_stop_TAG", "term_stop_TGA",
                "term_plus4_A", "term_plus4_C", "term_plus4_G", "term_plus4_T",
                "term_window_gc", "term_interval_codons",
                "term_readthrough_cridge", "term_log1p_readthrough")
+if (MUT == "term_stop_shuffle") {       # stop identity no longer matches the transcript
+  i <- sample(nrow(term))
+  term[, c("term_stop_TAA", "term_stop_TAG", "term_stop_TGA")] <-
+    term[i, c("term_stop_TAA", "term_stop_TAG", "term_stop_TGA")]
+}
 term <- term %>% dplyr::select(transcript_id_clean, all_of(term_cols))
 ## --- G4mer rG4 propensity ------------------------------------------------------------
 # Inference is already done - g4mer/02_run_g4mer.py scored every region and wrote
@@ -546,6 +583,8 @@ cat("G4mer summaries loaded:",
     paste(sprintf("%s %d", names(table(g4_raw$region)), table(g4_raw$region)),
           collapse = "; "), "\n")
 
+if (MUT == "g4_region_swap")            # 5'UTR scores land on the 3'UTR and vice versa
+  g4_raw$region <- dplyr::recode(g4_raw$region, utr5 = "utr3", utr3 = "utr5")
 g4_wide <- g4_raw %>%
   dplyr::select(transcript_id_clean, region, g4mer_max, g4mer_mean,
                 g4mer_frac_above, region_length) %>%
@@ -773,6 +812,33 @@ print(as.data.frame(g4_spot))
 stopifnot("motif-containing regions do not outscore motif-free ones" =
             all(g4_spot$med_motif > g4_spot$med_no_motif))
 cat("G4 motif spot-check passed in all three regions\n")
+
+# The ordering check above is NOT sufficient, and the mutation test proved it: exchanging the
+# 5'UTR and 3'UTR summaries passes it, because G-richness is correlated across regions of the
+# same transcript, so a swapped score still ranks motif-containing above motif-free. Region
+# assignment has to be checked DISCRIMINATIVELY - each region's score must track its OWN
+# motif better than another region's. Without this, the CDS/5'UTR-vs-3'UTR result rests on an
+# unverified join.
+g4_disc <- g4_raw %>%
+  dplyr::select(transcript_id_clean, region, g4mer_max) %>%
+  inner_join(g4_motif %>% dplyr::select(transcript_id_clean, region, has_g4),
+             by = "transcript_id_clean", relationship = "many-to-many") %>%
+  dplyr::rename(score_region = region.x, motif_region = region.y) %>%
+  group_by(score_region, motif_region) %>%
+  summarise(auc_like = mean(has_g4 * g4mer_max) / mean(g4mer_max),
+            gap = median(g4mer_max[has_g4]) - median(g4mer_max[!has_g4]),
+            .groups = "drop")
+
+own <- g4_disc %>% filter(score_region == motif_region) %>%
+  dplyr::select(region = score_region, own_gap = gap)
+best_other <- g4_disc %>% filter(score_region != motif_region) %>%
+  group_by(region = score_region) %>% summarise(other_gap = max(gap), .groups = "drop")
+disc <- inner_join(own, best_other, by = "region")
+print(as.data.frame(disc %>% mutate(across(where(is.numeric), ~ round(., 4)))))
+
+stopifnot("a region's G4 score tracks another region's motif better than its own - check the join" =
+            all(disc$own_gap > disc$other_gap))
+cat("G4 region-assignment check passed: each region tracks its own motif best\n")
 ```
 
 ```{r validate_peptide, eval = !params$pass_through}
@@ -1058,6 +1124,18 @@ definitions <- tribble(
   "max_net_charge_30aa", "max (K+R) - (D+E) over any 30-aa window; whole chain if shorter",
   "max_consecutive_aaa", "longest in-frame run of AAA lysine codons",
   "max_consecutive_aag", "longest in-frame run of AAG lysine codons",
+  "term_stop_TAA",        "1 if the annotated stop codon is TAA, else 0",
+  "term_stop_TAG",        "1 if the annotated stop codon is TAG, else 0",
+  "term_stop_TGA",        "1 if the annotated stop codon is TGA, else 0",
+  "term_plus4_A",         "1 if the base immediately 3' of the stop (+4) is A, else 0",
+  "term_plus4_C",         "1 if the base immediately 3' of the stop (+4) is C, else 0",
+  "term_plus4_G",         "1 if the base immediately 3' of the stop (+4) is G, else 0",
+  "term_plus4_T",         "1 if the base immediately 3' of the stop (+4) is T, else 0",
+  "term_window_gc",       "percent GC of the 9 nt stop + 6 nt window (+1..+9)",
+  "term_interval_codons", "codons from the annotated stop to the next in-frame stop in the 3'UTR",
+  "term_readthrough_cridge",
+    "Cridge 2018 Table S1 percent readthrough for this +1..+6 context (192-context lookup)",
+  "term_log1p_readthrough", "log1p(term_readthrough_cridge)",
   "g4mer_max_resid_utr5", "G4mer max, residual on log2 5'UTR length + utr5_gc (stride 10)",
   "g4mer_max_resid_cds",  "G4mer max, residual on log2 CDS length + cds_gc (stride 20)",
   "g4mer_max_resid_utr3", "G4mer max, residual on log2 3'UTR length + utr3_gc (stride 20)",
@@ -1186,7 +1264,7 @@ cat("\nGATE PASSED: the annotation reproduces the baseline 51 features exactly\n
 
 # 5. Write
 
-```{r write_outputs}
+```{r write_outputs, eval = params$mutate_input == ""}
 matrix_out <- features
 cat(if (isTRUE(params$pass_through))
       "pass_through = TRUE: baseline copied unchanged\n"

@@ -177,15 +177,34 @@ here writes to `output/predictive_modeling/`. Outputs go to
 | `01_build_feature_matrix.Rmd` | single builder -> `feature_matrix_tco.rds` + **`feature_annotation.csv`** |
 | `02_rf_model.Rmd` | fork of 07, driven by `include_blocks` instead of eight `feature_set` branches |
 | `01b_feature_dictionary.R` | regenerates **`FEATURES.md`**, the committed feature dictionary |
+| `01c_mutation_test_checks.R` | renders `01_` once per deliberate corruption and asserts the matching check FIRES |
+| `03_shap.Rmd` | SHAP decomposition; family attribution is the reason it exists |
 | `02_sweep_presets.R` | the sweep arms, shared by `02b_` and `02c_` so a reported result stays re-runnable |
 | `02b_neg_subsample_sweep.R` | `Rscript 02b_... <preset>`; 20 `neg_seed` x N arms (~5 min for 3 arms). No argument lists the presets |
 | `02c_sweep_stability.Rmd` | reports any preset (`params$preset`); **the null band any claim must clear** |
+
+**`fidelity_tol = 0.02` from `07c_` does not transfer, and `max_abs` is the wrong statistic.**
+`03_shap.Rmd` derives its own bound instead of inheriting one, and measuring it shows why: on
+this 72-feature model, `max |deviation|` ranks deliberately misconfigured surrogates as
+*better* than the correct one (`min.node.size = 25` scores 0.069 vs the correct 0.111), because
+it is a single worst-case point. Worse, **`min.node.size` is not detectable by fidelity here at
+all** - every value from 1 to 25 lands within a few percent of the correct RMSE, where on the
+56-feature `external_stability` set `min.node.size = 1` gave a 12x separation. Only `mtry`
+moves fidelity. So Check B asserts on RMSE and **only against the misconfigurations it can
+discriminate**, and `min.node.size` is guarded by Check A's structural equality instead.
+
+**`02_` saves the imputed split** (`rf_model_data_{suffix}.rds`, gated on `save_model_data`,
+off during sweeps) so `03_` explains *that* model's data rather than re-deriving it from
+params as `07c_` must. That removes a whole class of drift rather than asserting its way back.
 
 **`FEATURES.md` is the committed feature dictionary** - one row per column with variant,
 origin, coverage and definition, plus which `validate_*` chunk exercises it. Regenerate with
 `01b_feature_dictionary.R` after any change to `01_`; never edit it by hand. It exists because
 `feature_annotation.csv` lives in `output/`, which is gitignored, so the matrix's contents are
-otherwise invisible to anyone reading the repo. Its **verification-coverage table is the point**:
+otherwise invisible to anyone reading the repo. Definitions are written **only where `01_` states one deliberately** - 61 of 171 columns. A
+blank is not an oversight: the column is inherited, and paraphrasing the notebook that built it
+would be inventing documentation. Those rows instead carry a derived **assigned in** column
+listing every notebook that assigns that name. Its **verification-coverage table is the point**:
 32 of 106 modelled features are checked in this fork, and the other 74 are inherited, checked
 only in their original `code/predictive_modeling/` notebook. The reproduction gates would not
 notice if one of those had always been wrong - which is exactly how the `01h_` Kozak and `01g_`
@@ -258,6 +277,16 @@ of *one arbitrary draw*. On this model the draw alone moves test AUC by **0.069*
 pinned at 9 - so the sweep is **paired**: within a seed both variant sets see identical genes,
 and the paired-difference sd (0.0029) is ~6x smaller than the draw-to-draw sd (0.0166). Effects
 invisible in a distribution comparison are readable when paired.
+
+**A check that has never been shown to FAIL is uninformative.** `01c_mutation_test_checks.R`
+renders `01_` once per named corruption (`mutate_input`) and asserts the matching check fires;
+a mutation run never writes the matrix. Currently **6 of 6 caught**. The suite earned its place
+immediately: `g4_region_swap` (exchange the 5'UTR and 3'UTR G4mer summaries) originally passed
+**every** check, because the motif spot-check only asserted an *ordering* within each region
+and G-richness is correlated across regions of the same transcript. The CDS/5'UTR-vs-3'UTR
+result rested on an unverified join. The fix is a **discriminative** check - each region's
+score must track its *own* motif better than any other region's - and re-running the mutation
+confirms it now fires. Add a mutation whenever you add a check.
 
 **Run every new family against its own shuffled null, not against zero.** `02_`'s
 `shuffle_families` permutes a family's values across transcripts, destroying its link to the

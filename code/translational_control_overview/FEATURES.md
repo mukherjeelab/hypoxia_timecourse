@@ -15,6 +15,8 @@ Of these, **106 are modelled** by default (blocks `intrinsic` + `external`, excl
 - **variant** - `single`, or one member of a variant pair (`current` / `corrected`). `02_rf_model.Rmd` takes one member per pair via `variant_set`; both in one forest would split credit between near-duplicates.
 - **added_in** - `baseline` means inherited unchanged from `feature_matrix_dhx29_kd_feature.rds`; `tco` means built or corrected in this fork.
 - **cov%** - percent of transcripts with a non-NA value. `02_` drops any feature below 50% as sparse, because median imputation manufactures a split between real and imputed values.
+- **definition** - written only where `01_build_feature_matrix.Rmd` states one deliberately. Blank is not an oversight: the column is inherited, and paraphrasing the notebook that built it would be inventing documentation. Use **assigned in** instead.
+- **assigned in** - every notebook containing an assignment to this column name, found by search. Listed in full rather than picking one, because a column is often created in one notebook and re-derived or coerced in another. `tco_struct_*` is searched under its pre-rename `struct_*` name as well. **Blank means no literal assignment to that name exists in any notebook**, which happens when the name is built programmatically - the `g4mer_*` columns come out of a `pivot_wider` over regions, and the four `clip_*_bound` columns are assembled from a condition vector. Blank is a fact about how the name is constructed, not a missing source.
 - **checks** - which `validate_*` chunk of `01_build_feature_matrix.Rmd` exercises this feature. **Blank means no check in this fork**: for `added_in = baseline` features the checks live in their original `code/predictive_modeling/` notebook, and are not re-run here.
 
 > **What the checks do and do not establish.** Range checks pass on a scrambled join, and a
@@ -30,133 +32,133 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 
 ### `codon_optimality` (13)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `cai` | current | baseline | 99.4 |  |  |
-| `cai_internal` | corrected | tco | 98.8 | Sharp & Li CAI, RPL/RPS reference; internal codons only | corrected |
-| `csc` | current | baseline | 99.4 | iCodon::predict_stability('human'), whole stop-free CDS |  |
-| `csc_first75` | single | baseline | 97.0 |  |  |
-| `csc_internal` | corrected | tco | 98.8 | iCodon::predict_stability('human') on the internal-codon CDS |  |
-| `csc_q1` | single | baseline | 99.4 |  |  |
-| `csc_q2` | single | baseline | 99.4 |  |  |
-| `csc_q3` | single | baseline | 99.4 |  |  |
-| `csc_q4` | single | baseline | 99.4 |  |  |
-| `fop` | current | baseline | 99.4 |  |  |
-| `fop_internal` | corrected | tco | 98.8 | FOP, top-10%-TE reference; internal codons only | corrected |
-| `tai` | current | baseline | 99.4 | coRdon tAI; collaborator variant to be adopted, see 00_ |  |
-| `tai_gtrnadb` | corrected | tco | 98.8 | dos Reis-style tAI; GtRNAdb hg38 copy number + collaborator wobble v1 | corrected |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `cai` | current | baseline | 99.4 |  | 01g_feature_extraction_codon_optimality, 17_frame_control_codon_scores, 27_txn_reporter_codon_usage, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `cai_internal` | corrected | tco | 98.8 | Sharp & Li CAI, RPL/RPS reference; internal codons only | 01_build_feature_matrix | corrected |
+| `csc` | current | baseline | 99.4 | iCodon::predict_stability('human'), whole stop-free CDS | 01g_feature_extraction_codon_optimality, 01j_feature_extraction_csc_positional, 12_codon_optimality_density_plots, 17_frame_control_codon_scores, 20_csc_mrna_stability, 21_csc_vs_gc3_correlation, 26_eif3d_reporter_candidates, 27_txn_reporter_codon_usage, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
+| `csc_first75` | single | baseline | 97.0 |  | 01j_feature_extraction_csc_positional, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `csc_internal` | corrected | tco | 98.8 | iCodon::predict_stability('human') on the internal-codon CDS | 01_build_feature_matrix |  |
+| `csc_q1` | single | baseline | 99.4 |  | 01j_feature_extraction_csc_positional, FEATURE_DECISION_LOG |  |
+| `csc_q2` | single | baseline | 99.4 |  | 01j_feature_extraction_csc_positional, FEATURE_DECISION_LOG |  |
+| `csc_q3` | single | baseline | 99.4 |  | 01j_feature_extraction_csc_positional, FEATURE_DECISION_LOG |  |
+| `csc_q4` | single | baseline | 99.4 |  | 01j_feature_extraction_csc_positional, FEATURE_DECISION_LOG |  |
+| `fop` | current | baseline | 99.4 |  | 01g_feature_extraction_codon_optimality, 12_codon_optimality_density_plots, 17_frame_control_codon_scores, 18_fop_reference_comparison, 27_txn_reporter_codon_usage, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `fop_internal` | corrected | tco | 98.8 | FOP, top-10%-TE reference; internal codons only | 01_build_feature_matrix | corrected |
+| `tai` | current | baseline | 99.4 | coRdon tAI; collaborator variant to be adopted, see 00_ | 01g_feature_extraction_codon_optimality, 17_frame_control_codon_scores, 27_txn_reporter_codon_usage, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `tai_gtrnadb` | corrected | tco | 98.8 | dos Reis-style tAI; GtRNAdb hg38 copy number + collaborator wobble v1 | 01_build_feature_matrix | corrected |
 
 ### `structure_utr5` (12)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `tco_struct_accessibility_aug_context` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_cap_proximal` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_cds_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_cds_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_cds_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_utr3_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_utr3_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_utr3_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_utr5_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_utr5_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_utr5_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_num_structured_regions` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `tco_struct_accessibility_aug_context` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cap_proximal` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cds_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cds_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_cds_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr3_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr3_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr3_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr5_mean` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr5_min` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_utr5_sd` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
 
 ### `termination` (11)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `term_interval_codons` | single | tco | 95.5 |  | termination |
-| `term_log1p_readthrough` | single | tco | 98.7 |  | termination |
-| `term_plus4_A` | single | tco | 98.7 |  | termination |
-| `term_plus4_C` | single | tco | 98.7 |  | termination |
-| `term_plus4_G` | single | tco | 98.7 |  | termination |
-| `term_plus4_T` | single | tco | 98.7 |  | termination |
-| `term_readthrough_cridge` | single | tco | 98.7 |  | termination |
-| `term_stop_TAA` | single | tco | 98.7 |  | termination |
-| `term_stop_TAG` | single | tco | 98.7 |  | termination |
-| `term_stop_TGA` | single | tco | 98.7 |  | termination |
-| `term_window_gc` | single | tco | 98.6 |  | termination |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `term_interval_codons` | single | tco | 95.5 | codons from the annotated stop to the next in-frame stop in the 3'UTR | 01_build_feature_matrix | termination |
+| `term_log1p_readthrough` | single | tco | 98.7 | log1p(term_readthrough_cridge) | 01_build_feature_matrix | termination |
+| `term_plus4_A` | single | tco | 98.7 | 1 if the base immediately 3' of the stop (+4) is A, else 0 | 01_build_feature_matrix | termination |
+| `term_plus4_C` | single | tco | 98.7 | 1 if the base immediately 3' of the stop (+4) is C, else 0 | 01_build_feature_matrix | termination |
+| `term_plus4_G` | single | tco | 98.7 | 1 if the base immediately 3' of the stop (+4) is G, else 0 | 01_build_feature_matrix | termination |
+| `term_plus4_T` | single | tco | 98.7 | 1 if the base immediately 3' of the stop (+4) is T, else 0 | 01_build_feature_matrix | termination |
+| `term_readthrough_cridge` | single | tco | 98.7 | Cridge 2018 Table S1 percent readthrough for this +1..+6 context (192-context lookup) | 01_build_feature_matrix | termination |
+| `term_stop_TAA` | single | tco | 98.7 | 1 if the annotated stop codon is TAA, else 0 | 01_build_feature_matrix | termination |
+| `term_stop_TAG` | single | tco | 98.7 | 1 if the annotated stop codon is TAG, else 0 | 01_build_feature_matrix | termination |
+| `term_stop_TGA` | single | tco | 98.7 | 1 if the annotated stop codon is TGA, else 0 | 01_build_feature_matrix | termination |
+| `term_window_gc` | single | tco | 98.6 | percent GC of the 9 nt stop + 6 nt window (+1..+9) | 01_build_feature_matrix | termination |
 
 ### `g4` (9)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `g4mer_frac_above_cds` | single | tco | 84.3 | fraction of CDS windows above the rG4 threshold | g4mer |
-| `g4mer_frac_above_utr3` | single | tco | 83.3 | fraction of 3'UTR windows above the rG4 threshold | g4mer |
-| `g4mer_frac_above_utr5` | single | tco | 83.4 | fraction of 5'UTR windows above the rG4 threshold | g4mer |
-| `g4mer_max_resid_cds` | single | tco | 84.3 | G4mer max, residual on log2 CDS length + cds_gc (stride 20) | g4mer |
-| `g4mer_max_resid_utr3` | single | tco | 83.3 | G4mer max, residual on log2 3'UTR length + utr3_gc (stride 20) | g4mer |
-| `g4mer_max_resid_utr5` | single | tco | 83.4 | G4mer max, residual on log2 5'UTR length + utr5_gc (stride 10) | g4mer |
-| `g4mer_mean_cds` | single | tco | 84.3 | mean G4mer window score, CDS; no length bias | g4mer |
-| `g4mer_mean_utr3` | single | tco | 83.3 | mean G4mer window score, 3'UTR; no length bias | g4mer |
-| `g4mer_mean_utr5` | single | tco | 83.4 | mean G4mer window score, 5'UTR; no length bias | g4mer |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `g4mer_frac_above_cds` | single | tco | 84.3 | fraction of CDS windows above the rG4 threshold |  | g4mer |
+| `g4mer_frac_above_utr3` | single | tco | 83.3 | fraction of 3'UTR windows above the rG4 threshold |  | g4mer |
+| `g4mer_frac_above_utr5` | single | tco | 83.4 | fraction of 5'UTR windows above the rG4 threshold |  | g4mer |
+| `g4mer_max_resid_cds` | single | tco | 84.3 | G4mer max, residual on log2 CDS length + cds_gc (stride 20) |  | g4mer |
+| `g4mer_max_resid_utr3` | single | tco | 83.3 | G4mer max, residual on log2 3'UTR length + utr3_gc (stride 20) |  | g4mer |
+| `g4mer_max_resid_utr5` | single | tco | 83.4 | G4mer max, residual on log2 5'UTR length + utr5_gc (stride 10) |  | g4mer |
+| `g4mer_mean_cds` | single | tco | 84.3 | mean G4mer window score, CDS; no length bias |  | g4mer |
+| `g4mer_mean_utr3` | single | tco | 83.3 | mean G4mer window score, 3'UTR; no length bias |  | g4mer |
+| `g4mer_mean_utr5` | single | tco | 83.4 | mean G4mer window score, 5'UTR; no length bias |  | g4mer |
 
 ### `length` (8)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `cds_length` | single | baseline | 100.0 |  |  |
-| `log2_cds_length` | single | baseline | 100.0 | log2(x + 1); +1 applied uniformly across all three regions |  |
-| `log2_total_length` | single | baseline | 98.7 |  |  |
-| `log2_utr3_length` | single | baseline | 98.7 | log2(x + 1) |  |
-| `log2_utr5_length` | single | baseline | 100.0 | log2(x + 1) |  |
-| `total_length` | single | baseline | 98.7 |  |  |
-| `utr3_length` | single | baseline | 98.7 |  |  |
-| `utr5_length` | single | baseline | 100.0 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `cds_length` | single | baseline | 100.0 |  | 01_feature_extraction, 01c_feature_extraction_combined, 20_csc_mrna_stability, 28_csc_full_vs_75codon, 41_rscu_mcf7six1_hypoxia, 43_feature_extraction_mcf7six1_codon, 62_cds_length_gc_hypoxia_promotes, 63_cds_length_gc_negative_controls, 64_nanoluc_codon_adaptation, 68_cds_length_gc_red_beetle_luciferase, 85_subunit_seq_3d_bound_features, 92_region_lengths_4e_resistant_vs_sensitive, FEATURE_DECISION_LOG |  |
+| `log2_cds_length` | single | baseline | 100.0 | log2(x + 1); +1 applied uniformly across all three regions | 01_feature_extraction, 33_utr_cds_length_gc, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, 88_lm_gc3_4e_resistance, FEATURE_DECISION_LOG |  |
+| `log2_total_length` | single | baseline | 98.7 |  | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `log2_utr3_length` | single | baseline | 98.7 | log2(x + 1) | 01_feature_extraction, 33_utr_cds_length_gc, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `log2_utr5_length` | single | baseline | 100.0 | log2(x + 1) | 01_feature_extraction, 33_utr_cds_length_gc, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `total_length` | single | baseline | 98.7 |  | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
+| `utr3_length` | single | baseline | 98.7 |  | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, 92_region_lengths_4e_resistant_vs_sensitive, FEATURE_DECISION_LOG |  |
+| `utr5_length` | single | baseline | 100.0 |  | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 63_cds_length_gc_negative_controls, 65_benchling_construct_design, 85_subunit_seq_3d_bound_features, 92_region_lengths_4e_resistant_vs_sensitive, FEATURE_DECISION_LOG |  |
 
 ### `gc` (6)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `cds_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases |  |
-| `gc3` | current | baseline | 100.0 | percent (0-100); INCLUDES the stop codon - to be fixed, see 00_ |  |
-| `gc3_internal` | corrected | tco | 98.8 | percent (0-100); internal codons: initiator and stop removed | corrected |
-| `transcript_gc` | single | baseline | 98.7 | percent (0-100); length-weighted mean of the three regional GCs |  |
-| `utr3_gc` | single | baseline | 98.7 | percent (0-100); denominator includes ambiguous bases |  |
-| `utr5_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `cds_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 01v_feature_extraction_positional_gc, 43_feature_extraction_mcf7six1_codon, 80_teleman_rna_ribo_separately, 85_subunit_seq_3d_bound_features, 88_lm_gc3_4e_resistance, 89_gc_position_density_by_geneset, FEATURE_DECISION_LOG |  |
+| `gc3` | current | baseline | 100.0 | percent (0-100); INCLUDES the stop codon - to be fixed, see 00_ | 01_feature_extraction, 01c_feature_extraction_combined, 21_csc_vs_gc3_correlation, 23_dhx29_riboseq_slamseq, 38_rscu_hypoxia_1hr, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, 80_teleman_rna_ribo_separately, 85_subunit_seq_3d_bound_features, 88_lm_gc3_4e_resistance, 89_gc_position_density_by_geneset, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG |  |
+| `gc3_internal` | corrected | tco | 98.8 | percent (0-100); internal codons: initiator and stop removed | 01_build_feature_matrix | corrected |
+| `transcript_gc` | single | baseline | 98.7 | percent (0-100); length-weighted mean of the three regional GCs | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
+| `utr3_gc` | single | baseline | 98.7 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
+| `utr5_gc` | single | baseline | 100.0 | percent (0-100); denominator includes ambiguous bases | 01_feature_extraction, 01c_feature_extraction_combined, 43_feature_extraction_mcf7six1_codon, 85_subunit_seq_3d_bound_features, FEATURE_DECISION_LOG |  |
 
 ### `initiation` (5)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `kozak_optimal` | single | baseline | 99.7 |  |  |
-| `kozak_pwm_score` | current | baseline | 99.7 | Kozak 1987 log-odds; PWM is WRONG at -6 and -3 - to be fixed, see 00_ |  |
-| `kozak_pwm_score_v2` | corrected | tco | 99.4 | Kozak 1987 Table 1 log-odds (imported file); NA unless AUG-anchored | corrected, noderer |
-| `kozak_score` | single | baseline | 99.7 |  | noderer |
-| `noderer_tis_efficiency` | single | tco | 99.4 | Noderer 2014 FACS-seq TIS efficiency (12-150), -6..+5 lookup; NA unless AUG-anchored | noderer |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `kozak_optimal` | single | baseline | 99.7 |  | 01h_feature_extraction_kozak, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `kozak_pwm_score` | current | baseline | 99.7 | Kozak 1987 log-odds; PWM is WRONG at -6 and -3 - to be fixed, see 00_ | 01h_feature_extraction_kozak, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `kozak_pwm_score_v2` | corrected | tco | 99.4 | Kozak 1987 Table 1 log-odds (imported file); NA unless AUG-anchored | 01_build_feature_matrix | corrected, noderer |
+| `kozak_score` | single | baseline | 99.7 |  | 01h_feature_extraction_kozak, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG | noderer |
+| `noderer_tis_efficiency` | single | tco | 99.4 | Noderer 2014 FACS-seq TIS efficiency (12-150), -6..+5 lookup; NA unless AUG-anchored | 01_build_feature_matrix | noderer |
 
 ### `nascent_peptide` (3)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `max_net_charge_30aa` | single | tco | 98.8 | max (K+R) - (D+E) over any 30-aa window; whole chain if shorter | peptide |
-| `ppp_motif_density` | single | tco | 98.8 | PPP occurrences per 100 residues; overlapping matches counted | peptide |
-| `proline_fraction` | single | tco | 98.8 | fraction (0-1) of internal-codon residues that are proline | peptide |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `max_net_charge_30aa` | single | tco | 98.8 | max (K+R) - (D+E) over any 30-aa window; whole chain if shorter | 01_build_feature_matrix | peptide |
+| `ppp_motif_density` | single | tco | 98.8 | PPP occurrences per 100 residues; overlapping matches counted | 01_build_feature_matrix | peptide |
+| `proline_fraction` | single | tco | 98.8 | fraction (0-1) of internal-codon residues that are proline | 01_build_feature_matrix | peptide |
 
 ### `structure_cds` (3)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `tco_struct_accessibility_start_proximal_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_stop_proximal_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_num_structured_regions_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `tco_struct_accessibility_start_proximal_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_stop_proximal_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 
 ### `structure_utr3` (3)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `tco_struct_accessibility_distal_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_accessibility_stop_proximal_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
-| `tco_struct_num_structured_regions_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `tco_struct_accessibility_distal_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_accessibility_stop_proximal_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100, region folded in ISOLATION (see 00_ section 6) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 
 ### `polya_track` (2)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `max_consecutive_aaa` | single | tco | 98.8 | longest in-frame run of AAA lysine codons | peptide |
-| `max_consecutive_aag` | single | tco | 98.8 | longest in-frame run of AAG lysine codons | peptide |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `max_consecutive_aaa` | single | tco | 98.8 | longest in-frame run of AAA lysine codons | 01_build_feature_matrix | peptide |
+| `max_consecutive_aag` | single | tco | 98.8 | longest in-frame run of AAG lysine codons | 01_build_feature_matrix | peptide |
 
 ## Block: `external` (36)
 
@@ -164,54 +166,54 @@ Measured in some other experiment. Will not exist for most new datasets.
 
 ### `clip` (23)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `clip_cap_binding_count` | single | baseline | 91.4 |  |  |
-| `clip_cate_diff_npcs_3utr` | single | baseline | 100.0 |  |  |
-| `clip_cate_diff_npcs_5utr` | single | baseline | 100.0 |  |  |
-| `clip_cate_diff_npcs_bound` | single | baseline | 100.0 |  |  |
-| `clip_cate_diff_npcs_cds` | single | baseline | 100.0 |  |  |
-| `clip_cate_undiff_npcs_3utr` | single | baseline | 100.0 |  |  |
-| `clip_cate_undiff_npcs_5utr` | single | baseline | 100.0 |  |  |
-| `clip_cate_undiff_npcs_bound` | single | baseline | 100.0 |  |  |
-| `clip_cate_undiff_npcs_cds` | single | baseline | 100.0 |  |  |
-| `clip_eif3_count` | single | baseline | 91.4 |  |  |
-| `clip_lee_complete_media_bound` | single | baseline | 100.0 |  |  |
-| `clip_lee_complete_media_lfc` | single | baseline | 9.0 |  |  |
-| `clip_lee_glu_dep_bound` | single | baseline | 100.0 |  |  |
-| `clip_lee_glu_dep_lfc` | single | baseline | 9.0 |  |  |
-| `clip_lee_glu_vs_cm_enrichment` | single | baseline | 9.0 |  |  |
-| `clip_lee_int_stress_bound` | single | baseline | 100.0 |  |  |
-| `clip_lee_int_stress_lfc` | single | baseline | 4.6 |  |  |
-| `clip_lee_parclip_a_b_d_g_5utr` | single | baseline | 100.0 |  |  |
-| `clip_lee_parclip_a_b_d_g_bound` | single | baseline | 100.0 |  |  |
-| `clip_lee_parclip_a_b_d_g_cds` | single | baseline | 100.0 |  |  |
-| `clip_lee_parclip_d_only_5utr` | single | baseline | 100.0 |  |  |
-| `clip_lee_parclip_d_only_bound` | single | baseline | 100.0 |  |  |
-| `clip_lee_parclip_d_only_cds` | single | baseline | 100.0 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `clip_cap_binding_count` | single | baseline | 91.4 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_cate_diff_npcs_3utr` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_diff_npcs_5utr` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_diff_npcs_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_diff_npcs_cds` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_undiff_npcs_3utr` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_undiff_npcs_5utr` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_undiff_npcs_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_cate_undiff_npcs_cds` | single | baseline | 100.0 |  |  |  |
+| `clip_eif3_count` | single | baseline | 91.4 |  | 01e_feature_extraction_clip_split, 14_ecdf_clip_eif3_count, 26_eif3d_reporter_candidates, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_lee_complete_media_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_complete_media_lfc` | single | baseline | 9.0 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_lee_glu_dep_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_glu_dep_lfc` | single | baseline | 9.0 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_lee_glu_vs_cm_enrichment` | single | baseline | 9.0 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_lee_int_stress_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_int_stress_lfc` | single | baseline | 4.6 |  | 01e_feature_extraction_clip_split, 32_cap_binding_density, FEATURE_DECISION_LOG |  |
+| `clip_lee_parclip_a_b_d_g_5utr` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_parclip_a_b_d_g_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_parclip_a_b_d_g_cds` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_parclip_d_only_5utr` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_parclip_d_only_bound` | single | baseline | 100.0 |  |  |  |
+| `clip_lee_parclip_d_only_cds` | single | baseline | 100.0 |  |  |  |
 
 ### `stability_external` (9)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `cnot3_ribo_enrichment` | single | baseline | 92.6 |  |  |
-| `cnot3_weighted_codon_score` | single | baseline | 93.8 |  |  |
-| `hia2026_ctrl_halflife` | single | baseline | 43.3 |  |  |
-| `hia2026_dhx29_halflife_logfc` | single | baseline | 43.3 |  |  |
-| `hia2026_dhx29_kd_rna_lfc` | single | baseline | 89.0 |  |  |
-| `hia2026_dhx29_occupancy` | single | baseline | 93.8 |  |  |
-| `karner2026_mda231_log2_ct` | single | baseline | 68.2 |  |  |
-| `zhu2024_cnot3ko_halflife_logfc` | single | baseline | 83.2 |  |  |
-| `zhu2024_ctrl_halflife` | single | baseline | 88.5 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `cnot3_ribo_enrichment` | single | baseline | 92.6 |  | 22_cnot3_riboseq_slamseq, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `cnot3_weighted_codon_score` | single | baseline | 93.8 |  | 22_cnot3_riboseq_slamseq, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `hia2026_ctrl_halflife` | single | baseline | 43.3 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `hia2026_dhx29_halflife_logfc` | single | baseline | 43.3 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `hia2026_dhx29_kd_rna_lfc` | single | baseline | 89.0 |  | 87_dhx29_rnaseq_gc3_sensitivity |  |
+| `hia2026_dhx29_occupancy` | single | baseline | 93.8 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `karner2026_mda231_log2_ct` | single | baseline | 68.2 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `zhu2024_cnot3ko_halflife_logfc` | single | baseline | 83.2 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `zhu2024_ctrl_halflife` | single | baseline | 88.5 |  | 01i_feature_extraction_external_stability, 43_feature_extraction_mcf7six1_codon, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
 
 ### `dap5` (4)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `dap5_polysome_lfc` | single | baseline | 94.6 |  |  |
-| `dap5_weber_lfc` | single | baseline | 2.5 |  |  |
-| `is_dap5_promoted` | single | baseline | 100.0 |  |  |
-| `is_dap5_repressed` | single | baseline | 100.0 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `dap5_polysome_lfc` | single | baseline | 94.6 |  | 01b_feature_extraction_targeted, FEATURE_DECISION_LOG |  |
+| `dap5_weber_lfc` | single | baseline | 2.5 |  | 01b_feature_extraction_targeted, FEATURE_DECISION_LOG |  |
+| `is_dap5_promoted` | single | baseline | 100.0 |  | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `is_dap5_repressed` | single | baseline | 100.0 |  | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
 
 ## Block: `eif4e` (6)
 
@@ -219,14 +221,14 @@ eIF4E-derived, and circular for a 4E model, so kept separable.
 
 ### `eif4e` (6)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `eif4e_ip_inhib_vs_vehicle_lfc` | single | baseline | 85.1 |  |  |
-| `eif4e_ip_inhibitor_only_lfc` | single | baseline | 85.1 |  |  |
-| `eif4e_ip_vehicle_lfc` | single | baseline | 85.1 |  |  |
-| `is_4e_resistant` | single | baseline | 100.0 |  |  |
-| `is_4e_sensitive` | single | baseline | 100.0 |  |  |
-| `te_4e_resistance_lfc` | single | baseline | 86.7 |  | annotation |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `eif4e_ip_inhib_vs_vehicle_lfc` | single | baseline | 85.1 |  | 01b_feature_extraction_targeted, 01c_feature_extraction_combined, FEATURE_DECISION_LOG |  |
+| `eif4e_ip_inhibitor_only_lfc` | single | baseline | 85.1 |  | 01b_feature_extraction_targeted, 01c_feature_extraction_combined, FEATURE_DECISION_LOG |  |
+| `eif4e_ip_vehicle_lfc` | single | baseline | 85.1 |  | 01b_feature_extraction_targeted, 01c_feature_extraction_combined, FEATURE_DECISION_LOG |  |
+| `is_4e_resistant` | single | baseline | 100.0 |  | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `is_4e_sensitive` | single | baseline | 100.0 |  | 01_feature_extraction, 43_feature_extraction_mcf7six1_codon, FEATURE_DECISION_LOG |  |
+| `te_4e_resistance_lfc` | single | baseline | 86.7 |  | 01b_feature_extraction_targeted, FEATURE_DECISION_LOG | annotation |
 
 ## Block: `label` (45)
 
@@ -234,58 +236,58 @@ The target and anything derived from it. Never a feature.
 
 ### `outcome_derived` (42)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `delta_te_24hr` | single | baseline | 100.0 |  |  |
-| `delta_te_4hr` | single | baseline | 100.0 |  |  |
-| `indiv_te_hypoxia_1hr` | single | baseline | 100.0 |  |  |
-| `indiv_te_hypoxia_24hr` | single | baseline | 100.0 |  |  |
-| `indiv_te_hypoxia_4hr` | single | baseline | 100.0 |  |  |
-| `indiv_te_normoxia_1hr` | single | baseline | 100.0 |  |  |
-| `indiv_te_normoxia_24hr` | single | baseline | 100.0 |  |  |
-| `indiv_te_normoxia_4hr` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3d_inhibits_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3d_inhibits_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3d_inhibits_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3d_promotes_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3d_promotes_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3d_promotes_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3e_inhibits_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3e_inhibits_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3e_inhibits_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3e_promotes_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3e_promotes_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_3e_promotes_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_1hr_inhibited_by_3d_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_1hr_inhibited_by_3e_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_24hr_inhibited_by_3d_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_24hr_inhibited_by_3e_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_4hr_inhibited_by_3d_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_4hr_inhibited_by_3e_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_decreases_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_1hr_inhibited_by_3d_kd_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_1hr_inhibited_by_3e_kd_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_24hr_inhibited_by_3d_kd_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_24hr_inhibited_by_3e_kd_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_4hr_inhibited_by_3d_kd_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_4hr_inhibited_by_3e_kd_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_hypoxia_response_increases_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_normoxia_3d_inhibits_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_normoxia_3d_promotes_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_normoxia_3e_inhibits_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |
-| `sig_normoxia_3e_promotes_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `delta_te_24hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `delta_te_4hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `indiv_te_hypoxia_1hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `indiv_te_hypoxia_24hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `indiv_te_hypoxia_4hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `indiv_te_normoxia_1hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `indiv_te_normoxia_24hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `indiv_te_normoxia_4hr` | single | baseline | 100.0 |  | FEATURE_DECISION_LOG |  |
+| `sig_hypoxia_3d_inhibits_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3d_inhibits_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3d_inhibits_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3d_promotes_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3d_promotes_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3d_promotes_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3e_inhibits_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3e_inhibits_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3e_inhibits_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3e_promotes_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3e_promotes_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_3e_promotes_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_1hr_inhibited_by_3d_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_1hr_inhibited_by_3e_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_24hr_inhibited_by_3d_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_24hr_inhibited_by_3e_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_4hr_inhibited_by_3d_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_4hr_inhibited_by_3e_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_decreases_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_1hr_inhibited_by_3d_kd_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_1hr_inhibited_by_3e_kd_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_1hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_24hr_inhibited_by_3d_kd_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_24hr_inhibited_by_3e_kd_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_24hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_4hr_inhibited_by_3d_kd_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_4hr_inhibited_by_3e_kd_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_hypoxia_response_increases_TE_4hr_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_normoxia_3d_inhibits_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_normoxia_3d_promotes_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_normoxia_3e_inhibits_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |  |
+| `sig_normoxia_3e_promotes_TE_combined_lfc0.5` | single | baseline | 100.0 |  |  |  |
 
 ### `outcome` (3)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `te_lfc` | single | baseline | 100.0 |  |  |
-| `te_lfc_bin` | single | baseline | 100.0 |  |  |
-| `te_padj` | single | baseline | 99.9 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `te_lfc` | single | baseline | 100.0 |  | 01u_feature_extraction_g4mer, 10_rf_classification_eif3d_vs_eif4e, 24_thesis_committee_2026, 26_eif3d_reporter_candidates, 29_eif3e_elongation_eif3d_model, 41_rscu_mcf7six1_hypoxia, 42_prepare_mcf7six1_genesets, 50_rscu_cross_cellline_correlation, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 56_candidate_mrna_gc3_analysis, 70_rna_genesets_si3d, 77_teleman_eif4e_ip_corrected, 80_teleman_rna_ribo_separately, 81_4e_ip_enrichment_resistant_vs_sensitive, 86_te_change_barplots_with_normoxia_regressed, FEATURE_DECISION_LOG |  |
+| `te_lfc_bin` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, FEATURE_DECISION_LOG |  |
+| `te_padj` | single | baseline | 99.9 |  | 10_rf_classification_eif3d_vs_eif4e, 26_eif3d_reporter_candidates, 42_prepare_mcf7six1_genesets, 80_teleman_rna_ribo_separately, FEATURE_DECISION_LOG |  |
 
 ## Block: `qc` (4)
 
@@ -293,12 +295,12 @@ Quality flags about whether another feature is meaningful. Not modelled.
 
 ### `cds_eligibility` (4)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `cds_complete` | single | tco | 100.0 |  |  |
-| `cds_frame_ok` | single | tco | 100.0 |  |  |
-| `cds_has_start` | single | tco | 100.0 |  |  |
-| `cds_has_stop` | single | tco | 100.0 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `cds_complete` | single | tco | 100.0 |  | 01_build_feature_matrix |  |
+| `cds_frame_ok` | single | tco | 100.0 |  | 01_build_feature_matrix |  |
+| `cds_has_start` | single | tco | 100.0 |  | 01_build_feature_matrix |  |
+| `cds_has_stop` | single | tco | 100.0 |  | 01_build_feature_matrix |  |
 
 ## Block: `id` (5)
 
@@ -306,13 +308,13 @@ Identifiers.
 
 ### `id` (5)
 
-| feature | variant | added_in | cov% | definition | checks |
-|---|---|---|---|---|---|
-| `gene_id` | single | baseline | 100.0 |  |  |
-| `gene_id_clean` | single | baseline | 100.0 |  |  |
-| `symbol` | single | baseline | 100.0 |  |  |
-| `transcript_id` | single | baseline | 100.0 |  |  |
-| `transcript_id_clean` | single | baseline | 100.0 |  |  |
+| feature | variant | added_in | cov% | definition | assigned in | checks |
+|---|---|---|---|---|---|---|
+| `gene_id` | single | baseline | 100.0 |  | 01_feature_extraction, 01c_feature_extraction_combined, 02_negative_control_set, 02_random_forest_model, 02b_negative_control_set_si3e, 03_rf_classification_eif3d_targets, 04_rf_classification_eif3d_targets_hypoxia, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07c_rf_shap_eif3d_targets, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 10_rf_hypoxia_specific_vs_normoxia_specific, 20_csc_mrna_stability, 27_txn_reporter_codon_usage, 31_rf_regression_te_lfc, 65_benchling_construct_design, 70_rna_genesets_si3d, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 80_teleman_rna_ribo_separately, 82_manual_gc3_check, 96_eif4e_rip_enrichment_and_te_volcano, 97_absolute_te_by_4e_class, FEATURE_DECISION_LOG |  |
+| `gene_id_clean` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, 01c_kmer_motif_precompute, 01e_feature_extraction_clip_split, 01f_feature_extraction_te_lfc, 01g_feature_extraction_codon_optimality, 01j_feature_extraction_csc_positional, 01l_feature_extraction_codon_features, 01u_feature_extraction_g4mer, 02c_expressed_background_pool_si3e, 03_rf_classification_eif3d_targets, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07b_rf_permutation_importance_eif3d_targets, 07c_rf_shap_eif3d_targets, 08_feature_directionality_analysis, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 14_ecdf_clip_eif3_count, 16_rf_no_te_features_normoxia_hypoxia, 17_frame_control_codon_scores, 18_fop_reference_comparison, 23_dhx29_riboseq_slamseq, 24_thesis_committee_2026, 26_eif3d_reporter_candidates, 31_rf_regression_te_lfc, 32_cap_binding_density, 33_utr_cds_length_gc, 35_rf_regression_residuals, 36_eif4e_vehicle_by_condition, 37_rf_regression_residuals_lfc0, 39_ssmart_input_transcript_hypoxia_1hr, 40_ssmart_input_utr5_hypoxia_1hr, 41_rscu_mcf7six1_hypoxia, 42_prepare_mcf7six1_genesets, 43_feature_extraction_mcf7six1_codon, 48_te_quartile_sequence_features, 49_te_quartile_sequence_features_mcf7six1, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 56_candidate_mrna_gc3_analysis, 60_ribowaltz_epa_codon_occupancy_pos_neg_sets, 62_cds_length_gc_hypoxia_promotes, 63_cds_length_gc_negative_controls, 64_nanoluc_codon_adaptation, 65_benchling_construct_design, 66_rna_changes_si3d_si3e, 67_rna_vs_ribo_si3d_genesets, 68_cds_length_gc_red_beetle_luciferase, 69_eif3d_promoted_genes_all_conditions, 71_gc_content_vs_rna_changes_transcriptome, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 78_feature_matrix_teleman_4e, 80_teleman_rna_ribo_separately, 83_gc_csc_3d_promoted_hypoxia_1hr, 85_subunit_seq_3d_bound_features, 87_dhx29_rnaseq_gc3_sensitivity, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG, 02_rf_model |  |
+| `symbol` | single | baseline | 100.0 |  | 01_feature_extraction, 01b_feature_extraction_targeted, 01c_feature_extraction_combined, 02_random_forest_model, 03_rf_classification_eif3d_targets, 04_rf_classification_eif3d_targets_hypoxia, 05_rf_classification_eif3d_targets_hypoxia, 06_rf_classification_eif3d_targets_parameterized, 07_rf_classification_eif3d_targets_no_boruta, 07c_rf_shap_eif3d_targets, 09_rf_classification_eif4e_targets, 10_rf_classification_eif3d_vs_eif4e, 10_rf_hypoxia_specific_vs_normoxia_specific, 20_csc_mrna_stability, 22_cnot3_riboseq_slamseq, 23_dhx29_riboseq_slamseq, 24_thesis_committee_2026, 25_goodarzi_231_decay_rates, 31_rf_regression_te_lfc, 35_rf_regression_residuals, 37_rf_regression_residuals_lfc0, 43_feature_extraction_mcf7six1_codon, 56_candidate_mrna_gc3_analysis, 65_benchling_construct_design, 76_teleman_4e_riboseq_te_validation, 77_teleman_eif4e_ip_corrected, 78_feature_matrix_teleman_4e, FEATURE_DECISION_LOG |  |
+| `transcript_id` | single | baseline | 100.0 |  | 02_random_forest_model, 65_benchling_construct_design, 76_teleman_4e_riboseq_te_validation, 82_manual_gc3_check, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG |  |
+| `transcript_id_clean` | single | baseline | 100.0 |  | 01_feature_extraction, 01c_feature_extraction_combined, 01c_kmer_motif_precompute, 01d_feature_extraction_structure, 01g_feature_extraction_codon_optimality, 01h_feature_extraction_kozak, 01j_feature_extraction_csc_positional, 01k_feature_extraction_cds_utr3_structure, 01u_feature_extraction_g4mer, 01v_feature_extraction_positional_gc, 17_frame_control_codon_scores, 18_fop_reference_comparison, 19_nucleotide_composition, 20_csc_mrna_stability, 22_cnot3_riboseq_slamseq, 23_dhx29_riboseq_slamseq, 28_csc_full_vs_75codon, 30_condition_specific_codon_usage, 38_rscu_hypoxia_1hr, 39_ssmart_input_transcript_hypoxia_1hr, 40_ssmart_input_utr5_hypoxia_1hr, 41_rscu_mcf7six1_hypoxia, 43_feature_extraction_mcf7six1_codon, 44_rscu_normoxia_1and4hr, 46_rscu_mcf7six1_normoxia_1hr, 51_rscu_231_promoted_hyp_vs_nor, 52_rscu_mcf7six1_promoted_hyp_vs_nor, 54_rscu_pooled_231_hyp_vs_nor, 55_rscu_pooled_mcf7six1_hyp_vs_nor, 62_cds_length_gc_hypoxia_promotes, 63_cds_length_gc_negative_controls, 64_nanoluc_codon_adaptation, 65_benchling_construct_design, 68_cds_length_gc_red_beetle_luciferase, 78_feature_matrix_teleman_4e, 85_subunit_seq_3d_bound_features, 93_rscu_frame_control_dhx29_codons, 95_expressed_isoforms_sictrl_hypoxia_1hr, FEATURE_DECISION_LOG, 01_build_feature_matrix |  |
 
 ## Verification coverage
 

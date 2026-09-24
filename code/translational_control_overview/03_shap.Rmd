@@ -1,0 +1,291 @@
+---
+title: "SHAP decomposition of the TCO model"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_set_label: "tco"
+  variant_set: "corrected"
+  initiation_score: "both"
+  clip_mode: "aggregate"
+  neg_seed: 9
+  explain_n: 200
+  explain_sizes: "50,100,200,400"
+  run_interactions: FALSE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Why SHAP here, and what it is not
+
+Impurity importance cannot resolve **credit-splitting across correlated columns**. This matrix
+is full of them: `cds_gc` / `gc3_internal` / `csc_internal`, the three G4 regions, the length
+family. SHAP is **additive**, so summing within a family is exact rather than approximate, and
+family-level attribution is the thing SHAP buys that `02_`'s Gini ranking structurally cannot.
+
+Three things this notebook does **not** claim:
+
+1. **SHAP is not tuned.** TreeSHAP is exact given a tree ensemble; there is no bandwidth or
+   sample-size knob. What varies is *which model is explained*, *which genes are explained*,
+   and *which summary is read* - so those are what get checked below.
+2. **`mean_signed_shap` is not direction.** It averages to ~0 for every feature; its residual
+   offset only reflects the gap between explain-set mean prediction and the training baseline.
+   The directional quantity is `shap_value_cor` - the correlation of a feature's value with
+   its own SHAP value.
+3. **One run is one negative draw.** These rankings inherit the draw-to-draw instability that
+   `02c_` quantifies for impurity. `neg_seed` is exposed so the same paired sweep can be run
+   over SHAP.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(treeshap)
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+set.seed(9)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+
+# Suffix is built by the SAME helper 02b_/02c_ use, so this cannot drift from 02_'s naming.
+suffix <- sweep_suffix(list(feature_set_label = params$feature_set_label,
+                            variant_set       = params$variant_set,
+                            initiation_score  = params$initiation_score,
+                            clip_mode         = params$clip_mode),
+                       params$neg_seed)
+
+model_path <- file.path(out_dir, paste0("rf_classifier_", suffix, ".rds"))
+data_path  <- file.path(out_dir, paste0("rf_model_data_", suffix, ".rds"))
+stopifnot(
+  "notebook 02 model not found - knit 02_rf_model.Rmd with these params first" =
+    file.exists(model_path),
+  "notebook 02 model data not found - re-knit 02_ with save_model_data = TRUE" =
+    file.exists(data_path)
+)
+
+rf_prob <- readRDS(model_path)
+md      <- readRDS(data_path)
+stopifnot("saved data does not belong to this model" = identical(md$suffix, suffix))
+
+feature_cols <- md$feature_cols
+train_data   <- md$train
+test_data    <- md$test
+ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+
+cat("Model:", suffix, "\n")
+cat("  treetype:", rf_prob$treetype, "| num.trees:", rf_prob$num.trees,
+    "| mtry:", rf_prob$mtry, "| min.node.size:", rf_prob$min.node.size, "\n")
+cat("  train:", nrow(train_data), " test:", nrow(test_data),
+    " features:", length(feature_cols), "\n")
+```
+
+# 1. The surrogate, and Check A
+
+`treeshap` does not support ranger **probability** forests, so what gets explained is a
+surrogate *regression* forest on the same 0/1 target and the same rows. Its hyperparameters are
+**read off the saved model, never assumed** - ranger's defaults differ by tree type
+(`min.node.size` is 10 for probability but 1 for classification and 5 for regression; `mtry` is
+`floor(sqrt(p))` for probability but `floor(p/3)` for regression). Assuming them would explain
+a different model and every number below would be confidently wrong.
+
+```{r surrogate}
+y_train <- as.integer(train_data$eif3d_target == md$pos_label)
+
+fit_surrogate <- function(mtry, min.node.size) {
+  set.seed(9)
+  ranger(x = train_data[, feature_cols], y = y_train,
+         num.trees = rf_prob$num.trees, mtry = mtry, min.node.size = min.node.size,
+         importance = "none")
+}
+rf_shap <- fit_surrogate(rf_prob$mtry, rf_prob$min.node.size)
+
+stopifnot(
+  "surrogate is not a regression forest"          = rf_shap$treetype == "Regression",
+  "surrogate mtry does not match 02"              = rf_shap$mtry == rf_prob$mtry,
+  "surrogate min.node.size does not match 02"     = rf_shap$min.node.size == rf_prob$min.node.size,
+  "surrogate num.trees does not match 02"         = rf_shap$num.trees == rf_prob$num.trees
+)
+cat("Check A passed: surrogate config matches the 02 model structurally\n")
+```
+
+# 2. Check B: fidelity, calibrated here rather than inherited
+
+`07c_` in the frozen pipeline uses `fidelity_tol = 0.02` on `max |deviation|`, calibrated on a
+**56-feature** set. CLAUDE.md is explicit that this is "a sanity bound, not a tuned one, on
+other feature sets". Measuring it here rather than inheriting it shows the design does **not**
+transfer, in two ways worth recording.
+
+```{r fidelity}
+pred_prob <- predict(rf_prob, data = test_data[, feature_cols])$predictions
+pred_prob <- if (is.matrix(pred_prob)) pred_prob[, md$pos_label] else pred_prob
+
+deviation_of <- function(model) {
+  pr <- predict(model, data = test_data[, feature_cols])$predictions
+  c(max_abs = max(abs(pr - pred_prob)), rmse = sqrt(mean((pr - pred_prob)^2)))
+}
+
+p <- length(feature_cols)
+configs <- tribble(
+  ~label,                ~kind,            ~mtry,        ~min.node.size,
+  "matched (correct)",   "correct",        rf_prob$mtry, rf_prob$min.node.size,
+  "min.node.size = 1",   "min.node.size",  rf_prob$mtry, 1,
+  "min.node.size = 5",   "min.node.size",  rf_prob$mtry, 5,
+  "min.node.size = 25",  "min.node.size",  rf_prob$mtry, 25,
+  "mtry = floor(p/3)",   "mtry",           floor(p / 3), rf_prob$min.node.size,
+  "mtry = 2",            "mtry",           2,            rf_prob$min.node.size
+)
+devs <- map2_dfr(configs$mtry, configs$min.node.size,
+                 ~ as_tibble_row(deviation_of(fit_surrogate(.x, .y))))
+configs <- bind_cols(configs, devs)
+print(as.data.frame(configs %>% mutate(across(c(max_abs, rmse), ~ round(., 4)))))
+```
+
+**Finding 1: `max_abs` is the wrong statistic.** It is one worst-case point and is dominated by
+noise, so it ranks deliberately misconfigured surrogates as *better* than the correct one
+(`min.node.size = 25` scores 0.069 against the correct 0.111). A tolerance on `max_abs` would
+pass a wrong surrogate and fail a right one. RMSE is used below.
+
+**Finding 2: `min.node.size` is not detectable by fidelity on this matrix.** On the 56-feature
+set, `min.node.size = 1` deviated 0.0798 against 0.0068 for the correct config - a 12x
+separation. Here every value from 1 to 25 lands within a few percent of the correct RMSE. Only
+`mtry` moves fidelity materially. So Check B is asserted **only against the misconfigurations
+it can actually discriminate**, and `min.node.size` is guarded by Check A's structural equality
+instead. Claiming otherwise would be the same unexamined transfer this fork exists to catch.
+
+```{r fidelity_assert}
+rmse_of <- function(lbl) configs$rmse[configs$label == lbl]
+dev_correct <- rmse_of("matched (correct)")
+dev_mtry    <- min(configs$rmse[configs$kind == "mtry"])
+dev_mns     <- min(configs$rmse[configs$kind == "min.node.size"])
+
+cat(sprintf("correct RMSE            %.4f\n", dev_correct))
+cat(sprintf("nearest mtry error      %.4f  (%.2fx correct)  <- what Check B can detect\n",
+            dev_mtry, dev_mtry / dev_correct))
+cat(sprintf("nearest min.node.size   %.4f  (%.2fx correct)  <- NOT detectable here\n",
+            dev_mns, dev_mns / dev_correct))
+
+stopifnot(
+  "surrogate does not track 02's held-out predictions" =
+    cor(predict(rf_shap, data = test_data[, feature_cols])$predictions, pred_prob) > 0.95,
+  "an mtry misconfiguration is indistinguishable from the correct surrogate" =
+    dev_mtry > 1.5 * dev_correct
+)
+cat("\nCheck B passed: the correct surrogate tracks 02 closely and is clearly separated\n")
+cat("from mtry misconfigurations. min.node.size is covered by Check A, not by fidelity.\n")
+```
+
+# 3. SHAP
+
+```{r shap}
+explain_n  <- min(params$explain_n, nrow(test_data))
+set.seed(9)
+explain_idx <- sample(nrow(test_data), explain_n)
+explain_set <- as.data.frame(test_data[explain_idx, feature_cols])
+
+unified   <- ranger.unify(rf_shap, as.data.frame(train_data[, feature_cols]))
+shap_out  <- treeshap(unified, explain_set, interactions = params$run_interactions,
+                      verbose = FALSE)
+shap_vals <- as.data.frame(shap_out$shaps)
+stopifnot("SHAP matrix does not match the explain set" =
+            nrow(shap_vals) == explain_n && ncol(shap_vals) == length(feature_cols))
+cat("SHAP computed on", explain_n, "held-out genes x", length(feature_cols), "features\n")
+```
+
+```{r shap_table}
+# shap_value_cor is the DIRECTIONAL summary: a feature's value against its own SHAP value.
+shap_value_cor <- map_dbl(feature_cols, function(f) {
+  v <- explain_set[[f]]; s <- shap_vals[[f]]
+  if (sd(v, na.rm = TRUE) == 0 || sd(s, na.rm = TRUE) == 0) return(NA_real_)
+  cor(v, s, use = "complete.obs", method = "spearman")
+})
+
+shap_tbl <- tibble(
+  feature          = feature_cols,
+  mean_abs_shap    = colMeans(abs(shap_vals)),
+  mean_signed_shap = colMeans(shap_vals),      # NOT direction - see the header
+  shap_value_cor   = shap_value_cor
+) %>%
+  left_join(ann %>% dplyr::select(feature, family, block), by = "feature") %>%
+  arrange(desc(mean_abs_shap)) %>%
+  mutate(rank_shap = row_number())
+
+print(as.data.frame(shap_tbl %>% slice_head(n = 20) %>%
+        mutate(across(where(is.numeric), ~ round(., 4)))))
+```
+
+# 4. Family attribution - the reason to use SHAP at all
+
+SHAP is additive, so a family's contribution is the **exact** sum of its members'. Impurity
+importance cannot do this: correlated columns split credit unpredictably between themselves.
+
+```{r family}
+fam_tbl <- shap_tbl %>%
+  group_by(family) %>%
+  summarise(n = n(), family_shap = sum(mean_abs_shap),
+            top_feature = feature[which.max(mean_abs_shap)], .groups = "drop") %>%
+  mutate(share_pct = round(100 * family_shap / sum(family_shap), 2)) %>%
+  arrange(desc(family_shap))
+print(as.data.frame(fam_tbl %>% mutate(family_shap = round(family_shap, 4))))
+```
+
+```{r vs_impurity}
+imp <- read_csv(file.path(out_dir, paste0("rf_importance_", suffix, ".csv")),
+                show_col_types = FALSE)
+cmp <- shap_tbl %>%
+  dplyr::select(feature, family, mean_abs_shap) %>%
+  inner_join(imp %>% dplyr::select(feature, impurity = importance), by = "feature")
+cat("SHAP vs impurity, feature level: Spearman",
+    round(cor(cmp$mean_abs_shap, cmp$impurity, method = "spearman"), 3),
+    ", n =", nrow(cmp), "\n")
+
+fam_cmp <- cmp %>% group_by(family) %>%
+  summarise(shap = sum(mean_abs_shap), impurity = sum(impurity), .groups = "drop") %>%
+  mutate(shap_share = 100 * shap / sum(shap), imp_share = 100 * impurity / sum(impurity),
+         delta = shap_share - imp_share) %>% arrange(desc(abs(delta)))
+cat("\nFamily share, SHAP vs impurity (delta = where the two disagree):\n")
+print(as.data.frame(fam_cmp %>% mutate(across(where(is.numeric), ~ round(., 2))) %>%
+                      dplyr::select(family, shap_share, imp_share, delta)))
+```
+
+# 5. Is the explain set big enough?
+
+`explain_n` is a free choice, and nothing elsewhere justifies it. If the family ranking is not
+stable across sizes, the number is doing work it should not be.
+
+```{r explain_stability}
+sizes <- as.integer(str_trim(str_split(params$explain_sizes, ",")[[1]]))
+sizes <- sizes[sizes <= nrow(test_data)]
+
+fam_at <- function(n) {
+  set.seed(9)
+  idx <- sample(nrow(test_data), n)
+  sv  <- as.data.frame(treeshap(unified, as.data.frame(test_data[idx, feature_cols]),
+                                interactions = FALSE, verbose = FALSE)$shaps)
+  tibble(feature = feature_cols, mas = colMeans(abs(sv))) %>%
+    left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+    group_by(family) %>% summarise(share = sum(mas), .groups = "drop") %>%
+    mutate(share = 100 * share / sum(share), n = n)
+}
+stab <- map_dfr(sizes, fam_at)
+
+stab %>% pivot_wider(names_from = n, values_from = share, names_prefix = "n") %>%
+  arrange(desc(.data[[paste0("n", max(sizes))]])) %>%
+  mutate(across(where(is.numeric), ~ round(., 2))) %>% as.data.frame() %>% print()
+
+rank_cor <- stab %>% group_by(n) %>% mutate(rk = rank(-share)) %>%
+  dplyr::select(family, n, rk) %>% pivot_wider(names_from = n, values_from = rk)
+cat("\nSpearman of family ranking, smallest vs largest explain set:",
+    round(cor(rank_cor[[2]], rank_cor[[ncol(rank_cor)]], method = "spearman"), 3), "\n")
+```
+
+```{r export}
+write_csv(shap_tbl, file.path(out_dir, paste0("shap_feature_", suffix, ".csv")))
+write_csv(fam_tbl,  file.path(out_dir, paste0("shap_family_", suffix, ".csv")))
+write_csv(stab,     file.path(out_dir, paste0("shap_explain_stability_", suffix, ".csv")))
+cat("Wrote 3 SHAP files with suffix:", suffix, "\n")
+```
