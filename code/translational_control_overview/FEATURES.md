@@ -8,7 +8,7 @@ Rscript code/translational_control_overview/01b_feature_dictionary.R
 ```
 
 Matrix: **10172 transcripts x 173 columns**, keyed on `transcript_id_clean`.
-Of these, **101 are modelled** by default (blocks `intrinsic` + `external`, excluding deprecated); the rest are identifiers, labels or QC flags.
+Of these, **104 are modelled** by default (blocks `intrinsic` + `external`, excluding deprecated); the rest are identifiers, labels or QC flags.
 
 ## How to read the columns
 
@@ -111,7 +111,7 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `tco_struct_accessibility_cds_sd` | single | baseline | 84.3 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 | `tco_struct_accessibility_start_proximal_cds` | single | baseline | 84.3 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 | `tco_struct_accessibility_stop_proximal_cds` | single | baseline | 84.3 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_num_structured_regions_cds` | single | baseline | 84.3 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions_cds` | single | baseline | 100.0 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 
 ### `structure_utr3` (6)
 
@@ -122,7 +122,7 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `tco_struct_accessibility_utr3_mean` | single | baseline | 83.4 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 | `tco_struct_accessibility_utr3_min` | single | baseline | 83.4 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 | `tco_struct_accessibility_utr3_sd` | single | baseline | 83.4 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_num_structured_regions_utr3` | single | baseline | 83.4 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions_utr3` | single | baseline | 100.0 | RNAplfold -W 150 -L 100 -u 30, region folded in ISOLATION; NOT comparable to the 5'UTR columns (different window) | 01k_feature_extraction_cds_utr3_structure, FEATURE_DECISION_LOG |  |
 
 ### `structure_utr5` (6)
 
@@ -133,7 +133,7 @@ Computable from the transcript sequence alone. These are what transfer to a new 
 | `tco_struct_accessibility_utr5_mean` | single | baseline | 83.4 | RNAplfold -W 80 -L 40 -u 30, region folded in ISOLATION; NOT comparable to the CDS/3'UTR columns (different window) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
 | `tco_struct_accessibility_utr5_min` | single | baseline | 83.4 | RNAplfold -W 80 -L 40 -u 30, region folded in ISOLATION; NOT comparable to the CDS/3'UTR columns (different window) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
 | `tco_struct_accessibility_utr5_sd` | single | baseline | 83.4 | RNAplfold -W 80 -L 40 -u 30, region folded in ISOLATION; NOT comparable to the CDS/3'UTR columns (different window) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
-| `tco_struct_num_structured_regions` | single | baseline | 83.4 | RNAplfold -W 80 -L 40 -u 30, region folded in ISOLATION; NOT comparable to the CDS/3'UTR columns (different window) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
+| `tco_struct_num_structured_regions` | single | baseline | 100.0 | RNAplfold -W 80 -L 40 -u 30, region folded in ISOLATION; NOT comparable to the CDS/3'UTR columns (different window) | 01d_feature_extraction_structure, FEATURE_DECISION_LOG |  |
 
 ### `initiation` (5)
 
@@ -323,9 +323,9 @@ Identifiers.
 | | modelled features |
 |---|---|
 | exercised by a `validate_*` chunk here | 32 |
-| no check in this fork | 69 |
+| no check in this fork | 72 |
 
-Unchecked here, by family: `clip` (23), `stability_external` (10), `length` (8), `codon_optimality` (5), `gc` (5), `dap5` (4), `structure_cds` (4), `structure_utr3` (4), `structure_utr5` (4), `initiation` (2).
+Unchecked here, by family: `clip` (23), `stability_external` (10), `length` (8), `codon_optimality` (5), `gc` (5), `structure_cds` (5), `structure_utr3` (5), `structure_utr5` (5), `dap5` (4), `initiation` (2).
 
 These are inherited features whose checks live in `code/predictive_modeling/`. They are not
 unverified, but they are not verified *here*, and the reproduction gate would not notice if

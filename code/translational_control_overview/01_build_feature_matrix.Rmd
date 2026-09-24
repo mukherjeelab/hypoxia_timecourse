@@ -7,6 +7,7 @@ params:
   pass_through: FALSE
   mutate_input: ""
   apply_audit_repairs: TRUE
+  check_golden: TRUE
 editor_options:
   chunk_output_type: console
 ---
@@ -720,6 +721,34 @@ stopifnot("tco_struct_ rename did not apply" =
 baseline_cols <- sub("^struct_", "tco_struct_", baseline_cols)
 cat("Renamed", length(struct_old), "struct_* columns to tco_struct_*\n")
 
+## --- corrected structure values (the phantom-zero defect) ---------------------------
+# 01d_/01k_ mis-detect the _lunp header (the second line starts with a SPACE before '#'), so
+# the column-header line is parsed as data, becomes an all-NA row, and is then zero-filled -
+# a phantom position at the 5' end with accessibility 0, meaning "maximally structured".
+# 01f_recompute_structure.R re-derives all 15 accessibility features from the same stored
+# _lunp files with correct header detection, and proves the defect is characterised by
+# reproducing the buggy values bit-for-bit first (deviation 0 in all three regions).
+#
+# The aggregate means barely move (CDS +0.0004); the POSITIONAL features move ~0.012-0.017,
+# because the phantom is 1 of 30 positions in that window whatever the transcript length.
+recomputed_f <- file.path(out_dir, "structure_recomputed.rds")
+if (file.exists(recomputed_f) && isTRUE(params$apply_audit_repairs)) {
+  rec <- readRDS(recomputed_f)
+  rec_cols <- setdiff(colnames(rec), "transcript_id_clean")
+  stopifnot("recomputed structure columns are not in the matrix" =
+              all(rec_cols %in% colnames(features)))
+  before <- sum(!is.na(features$tco_struct_accessibility_cds_mean))
+  features <- features %>%
+    dplyr::select(-all_of(rec_cols)) %>%
+    left_join(rec, by = "transcript_id_clean")
+  cat("Replaced", length(rec_cols), "structure columns with correctly-parsed values;",
+      "coverage", before, "->", sum(!is.na(features$tco_struct_accessibility_cds_mean)),
+      "transcripts\n")
+} else if (!file.exists(recomputed_f)) {
+  cat("NOTE: structure_recomputed.rds absent - run 01f_recompute_structure.R;",
+      "the stored structure columns carry the phantom-zero defect\n")
+}
+
 ## --- structure repairs (audit findings F1, F2, F5) -----------------------------------
 # F1. 01d_/01k_ apply replace_na(., 0) to the RNAplfold columns, so transcripts the cluster
 # run never scored arrive as ZERO rather than NA. Zero means "maximally structured" to the
@@ -761,7 +790,12 @@ if (MUT == "struct_zero_fill") {     # F1 class: NA back to the 0 sentinel
   for (cc in sc) features[[cc]][is.na(features[[cc]])] <- 0
 }
 
-broken_structure <- grep("^tco_struct_(accessibility_.*_min|num_structured_regions)",
+# accessibility_*_min is NO LONGER deprecated: it was constant only because the phantom zero
+# was always the minimum. With correct parsing it is a real minimum accessibility.
+# num_structured_regions stays deprecated on its own merit - the phantom was its +1, but a
+# 30-mer has ~1e-9 probability of being unpaired, so the "< 0.2" threshold still passes
+# essentially every position and the count remains a length proxy.
+broken_structure <- grep("^tco_struct_num_structured_regions",
                          colnames(features), value = TRUE)
 cat("Deprecating", length(broken_structure), "structure columns (constant, or length proxies):",
     paste(broken_structure, collapse = ", "), "\n")
@@ -1475,6 +1509,12 @@ Regenerate **on purpose** with `01d_golden_transcripts.R` when a feature is legi
 corrected - the commit diff then shows exactly which transcripts and columns moved. A silent
 change fails here instead.
 
+When a feature is corrected on purpose, the snapshot must be regenerated on purpose too, and
+the build has to be able to produce a matrix for `01d_` to snapshot. Knit once with
+`check_golden = FALSE`, run `01d_golden_transcripts.R`, then knit again with the default so
+the new snapshot is verified. The commit diff shows exactly which transcripts and columns
+moved.
+
 ```{r golden_transcripts, eval = !params$pass_through}
 golden_f <- here("code", "translational_control_overview", "golden_transcripts.csv")
 if (!file.exists(golden_f)) {
@@ -1499,13 +1539,18 @@ if (!file.exists(golden_f)) {
   if (nrow(moved))
     print(moved %>% arrange(desc(abs(value - value_now))) %>% head(10) %>% as.data.frame())
 
-  stopifnot(
-    "a golden feature is missing from the matrix" =
-      all(unique(golden$feature) %in% colnames(features)),
-    "golden transcript values changed - if this was intended, re-run 01d_golden_transcripts.R" =
-      nrow(moved) == 0 && nrow(missing_col) == 0 && nrow(na_flip) == 0
-  )
-  cat("  golden snapshot matches\n")
+  if (!isTRUE(params$check_golden)) {
+    cat("  check_golden = FALSE: differences reported, not asserted.",
+        "Re-run 01d_golden_transcripts.R to re-snapshot.\n")
+  } else {
+    stopifnot(
+      "a golden feature is missing from the matrix" =
+        all(unique(golden$feature) %in% colnames(features)),
+      "golden transcript values changed - if intended, re-run 01d_golden_transcripts.R" =
+        nrow(moved) == 0 && nrow(missing_col) == 0 && nrow(na_flip) == 0
+    )
+    cat("  golden snapshot matches\n")
+  }
 }
 ```
 

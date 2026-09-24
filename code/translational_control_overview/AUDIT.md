@@ -129,16 +129,50 @@ a gate run for the same reason. Both gates are green on that path.
   window size and must not be read as biology. The annotation now records the parameters and
   the non-comparability per column.
 
-- **RESOLVED — the reported `_lunp` off-by-one is NOT confirmed.** A cut-off audit claimed
-  one without evidence. The primary accessibility column is `df[[2]]`, the `l=1` column, and
-  for a 1-mer "ending at position i" *is* position i, so that parse is correct. What is real
-  is a different defect in the `l=30` column: it is NA for rows 1-29 (a 30-mer cannot end
-  before position 30) and the parser zero-fills those, which reads as "maximally structured".
+- **F8 (CONFIRMED, and it was the off-by-one after all) — a phantom zero contaminates every
+  `struct_*` column.** `01d_`/`01k_` find the `_lunp` header with `str_starts(lines, "#")`,
+  but the second line begins with a **space** before `#`. The test misses it, the
+  column-header line is parsed as data, becomes an all-NA row, and
+  `acc_vals[is.na(acc_vals)] <- 0` turns it into **0** — "maximally structured". Every
+  transcript carried a phantom position at the 5' end.
 
-- **Root cause of F2 established.** The "structured region" count thresholds the 30-nt window
-  at `< 0.2`, but the probability of a full 30-mer being unpaired is around **1e-9**, so
-  **100% of positions pass**. The feature never counted structure; it counted positions, which
-  is why it equalled region length. Already deprecated.
+  I initially reported this off-by-one as *not confirmed*, having checked the column indexing
+  (`l=1` → position *i*, which is correct) and not the **row** indexing. The cut-off audit was
+  right; I looked in the wrong dimension.
+
+  One bug, three symptoms — it is the root cause of both F2 and F5:
+
+  | symptom | why |
+  |---|---|
+  | F5: `*_min` identically 0 | the phantom zero is always the minimum |
+  | F2: region count = length **+ 1** | the phantom row is the +1 (7,653 of 8,572 CDS) |
+  | all accessibility means diluted, sds inflated | one extra zero in the vector |
+
+  **Fix:** `01f_recompute_structure.R` re-derives all 15 accessibility features from the same
+  stored `_lunp` files with correct header detection. It computes the buggy value too and
+  **asserts it reproduces the stored column bit-for-bit before writing** — deviation **0 in
+  all three regions, all five features** — because reproducing a defect is the proof it is
+  characterised.
+
+  | region | mean shift | positional shift |
+  |---|---|---|
+  | 5'UTR | +0.00383 | **+0.01637** |
+  | CDS | +0.00036 | **+0.01238** |
+  | 3'UTR | +0.00056 | **+0.01650** |
+
+  **The aggregates were nearly fine; the positional features were materially wrong.** A
+  phantom is 1 of *n* in a mean but always 1 of 30 in `cap_proximal` /
+  `start_proximal_cds` / `stop_proximal_utr3` — a 3.3% contamination independent of length,
+  in exactly the features one would use to argue for structure at the cap, start or stop.
+
+  `*_min` is **un-deprecated**: it was constant only because of the phantom. 
+  `num_structured_regions*` stays deprecated on its own merit — with the phantom gone the
+  count becomes length rather than length+1, but a 30-mer has ~1e-9 probability of being
+  unpaired, so `< 0.2` still passes essentially every position.
+
+  **`code/predictive_modeling/` is deliberately NOT fixed**, per the freeze. Every `struct_*`
+  value there carries the phantom, as does anything downstream that consumed it. Recorded in
+  CLAUDE.md under "Findings that affect the EXISTING pipeline".
 - **Not re-derived at all:** `kozak_score` / `kozak_optimal` tiers, `cnot3_weighted_codon_score`,
   positional CSC, and `clip_lee_glu_vs_cm_enrichment` — which is *not*
   `glu_dep_lfc − complete_media_lfc` despite the name (max dev 21.8) and whose definition is

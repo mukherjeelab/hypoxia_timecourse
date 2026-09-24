@@ -424,6 +424,35 @@ because tiers are set mostly by +4 and by `[CT]`-vs-`[AG]`, so a within-tier err
 the tier means. Any PWM/tier feature needs a **within-tier** check. Practical impact on the
 si3d hypoxia 1hr model: none, because the feature ranks 31 of 51.
 
+**A phantom zero contaminates every `struct_*` column (`01d_`, `01k_`).** Both notebooks find
+the `_lunp` header with `str_starts(lines, "#")`, but the second line of an RNAplfold `_lunp`
+file is `" #i$\tl=1\t..."` - it begins with a **space**. The test misses it, the column-header
+line is passed to `read.table` as data, it parses to an all-NA row, and
+`acc_vals[is.na(acc_vals)] <- 0` turns that into **0**, which means *maximally structured*. So
+every transcript carries a phantom position at the 5' end with accessibility zero.
+
+One bug, three symptoms:
+
+| symptom | why |
+|---|---|
+| `struct_accessibility_*_min` is identically 0 for every transcript | the phantom zero is always the minimum |
+| `struct_num_structured_regions*` equals region length **+ 1** | the phantom row is the +1 (confirmed for 7,653 of 8,572 CDS) |
+| every accessibility mean is diluted and every sd inflated | one extra zero in the vector |
+
+The positional features are the worst affected: `cap_proximal`, `start_proximal_cds` and
+`stop_proximal_utr3` average exactly 30 positions, so the phantom is **3.3% of the window
+regardless of transcript length**. Measured on the 5'UTR, correcting it moves
+`accessibility_cap_proximal` by **+0.0164** and `accessibility_utr5_mean` by **+0.0038**
+(medians) - the feature you would interrogate for 5'-end biology was distorted four times as
+much as the aggregate.
+
+**`code/predictive_modeling/` is deliberately NOT fixed**, per the freeze: every `struct_*`
+value there, and anything downstream that consumed them, carries the phantom. The fork
+recomputes them correctly from the same stored `_lunp` files
+(`01f_recompute_structure.R`), which reproduces the buggy values bit-for-bit first as proof
+the defect is characterised. Treat any published `struct_*` number from the frozen pipeline
+with this in mind.
+
 **`csc` partly encodes stop-codon identity (`01g_`).** iCodon is given the stop-containing CDS.
 Removing the stop gives r = 0.939 and shifts the median 0.116 -> -0.015. Impact is **real and
 verified over 20 draws**: `csc` falls from median rank 3.5 to 10.0 with **non-overlapping**
