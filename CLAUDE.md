@@ -281,12 +281,31 @@ both arms see the same matrix.
 Results so far on si3d / hypoxia / 1hr, **all of which are per-dataset and must be re-run on a
 new mRNA set rather than inherited**:
 
+All three sweeps below were re-run end to end on the **same 72-feature matrix**, so the shares
+are comparable to each other.
+
 | family | real vs shuffled share | verdict |
 |---|---|---|
-| `termination` (11) | 6.29 vs 6.10 pp (+0.17, p = 0.003) | at the floor; best feature ranks 31 vs 32 shuffled |
-| `nascent_peptide` (3) | 3.70 vs 3.00 pp (+0.76, 20/20, p < 1e-4) | **real, but carried entirely by `proline_fraction`** (rank 16 vs 27 shuffled) |
-| `polya_track` (2) | 0.674 vs 0.610 pp (+0.05) | at the floor |
+| `termination` (11) | 5.05 vs 4.91 pp (+0.14, 16/20, p = 0.005) | at the floor; every per-feature gain within +/-5 ranks |
+| `nascent_peptide` (3) | 3.27 vs 2.63 pp (+0.69, 20/20, p < 1e-4) | **real, but carried entirely by `proline_fraction`** (gain +12.5 ranks) |
+| `polya_track` (2) | 0.567 vs 0.534 pp (+0.02, 13/20, p = 0.058) | at the floor |
 | `g4` (9) | 10.24 vs 8.72 pp (+1.52, 20/20, p < 1e-4) | **clears the floor**, and is the only family to beat its shuffled arm on AUC (+0.0023, p = 0.036) |
+
+**The per-feature `gain` (shuffled rank - real rank) is the readable summary**, and `02c_`
+section 4 prints it. Positive means the real values earn the place; zero or negative means the
+column is indistinguishable from noise.
+
+| earns its place | gain | indistinguishable from noise | gain |
+|---|---|---|---|
+| `g4mer_mean_cds` | +15.5 | `max_net_charge_30aa`, `ppp_motif_density`, `max_consecutive_aaa`/`aag` | **0.0** each |
+| `proline_fraction` | +12.5 | every `term_*` column | -5 to +3.5 |
+| `g4mer_mean_utr5` | +9.0 | `g4mer_max_resid_utr3` | **-7.5** |
+| `g4mer_max_resid_cds` | +8.5 | `g4mer_mean_utr3` | **-12.0** |
+| `g4mer_max_resid_utr5` | +6.0 | | |
+
+Four of the five nascent-peptide/poly(A) columns have a gain of **exactly 0.0** - identical
+median rank to their own permuted copies. Both 3'UTR G4 columns score *worse* than their
+shuffled versions.
 
 `max_net_charge_30aa`, `ppp_motif_density`, `max_consecutive_aag` and `max_consecutive_aaa`
 are **rank-identical to their shuffled copies** (44/46/48/49 of 63). No family beats the
