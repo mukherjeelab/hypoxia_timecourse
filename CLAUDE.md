@@ -348,10 +348,57 @@ are comparable to each other.
 
 | family | real vs shuffled share | verdict |
 |---|---|---|
-| `termination` (11) | 5.05 vs 4.91 pp (+0.14, 16/20, p = 0.005) | at the floor; every per-feature gain within +/-5 ranks |
-| `nascent_peptide` (3) | 3.27 vs 2.63 pp (+0.69, 20/20, p < 1e-4) | **real, but carried entirely by `proline_fraction`** (gain +12.5 ranks) |
-| `polya_track` (2) | 0.567 vs 0.534 pp (+0.02, 13/20, p = 0.058) | at the floor |
-| `g4` (9) | 10.24 vs 8.72 pp (+1.52, 20/20, p < 1e-4) | **clears the floor**, and is the only family to beat its shuffled arm on AUC (+0.0023, p = 0.036) |
+| `termination` (11) | 4.53 vs 4.41 pp (+0.08, 16/20, p = 0.005) | at the floor; every per-feature gain within +/-4 ranks |
+| `nascent_peptide` (3) | 3.03 vs 2.34 pp (+0.67, 20/20, p < 1e-4) | **real, but carried entirely by `proline_fraction`** (gain **+24** ranks) |
+| `polya_track` (2) | 0.497 vs 0.483 pp (+0.03, 12/20, **p = 0.37**) | **null.** Across three matrix versions this went p = 0.003 -> 0.058 -> 0.37 |
+| `g4` (9) | 10.24 vs 8.07 pp (**+2.16**, 20/20, p < 1e-4) | **clears the floor by the widest margin**; `g4mer_mean_cds` gains **+26.5** ranks, `g4mer_max_resid_cds` +20.5 |
+
+Re-run after the F8 phantom-zero fix, the effects got **larger**, not smaller: `g4` +1.52 -> +2.16 pp
+and `proline_fraction` +12.5 -> +24 ranks. Cleaning the contaminated structure columns stopped
+them absorbing credit the real features had earned.
+
+## SHAP noise floor (`03d_shap_seed_sweep.R`)
+
+**One run per experiment is defensible only against a measured floor.** Twenty draws with
+*nothing biological varying* - same 1,436 positives every time, a different size-matched
+negative draw each time (52% overlap), forest and CV pinned at 9 - give the spread a family's
+share shows for free.
+
+| family | median share | sd | 5-95% | min detectable difference |
+|---|---|---|---|---|
+| `length` | 19.85 | 1.15 | 18.3-21.5 | **3.21** |
+| `gc` | 17.28 | 0.82 | 16.3-18.8 | 2.28 |
+| `stability_external` | 13.95 | 0.98 | 12.2-15.3 | 2.73 |
+| `structure_cds` | 8.36 | 0.74 | 7.2-9.5 | 2.08 |
+| `g4` | 7.90 | 0.62 | 7.4-9.0 | 1.73 |
+| `codon_optimality` | 7.76 | 0.87 | 6.5-9.1 | 2.45 |
+| `clip` | 6.85 | 0.95 | 5.4-8.6 | 2.65 |
+| `structure_utr5` | 4.30 | 0.28 | 3.8-4.7 | 0.79 |
+| `termination` | 2.46 | 0.30 | 2.2-3.0 | 0.84 |
+| `nascent_peptide` | 2.28 | 0.36 | 2.1-3.1 | 1.00 |
+| `polya_track` | 0.33 | 0.06 | 0.2-0.4 | 0.17 |
+
+The threshold is **per family, not one number**: `length` needs a 3.2-point difference to mean
+anything, `structure_utr5` only 0.8. Two single-run experiments each carry their own draw
+noise, so the relevant scale is ~sqrt(2) x sd; the last column is 2.8 x sd. Shares are bounded
+at 0 and skewed for the small families, so prefer the empirical 5-95% interval over a
+normal-theory one.
+
+**SHAP is more rank-stable than impurity.** 14 of 20 features are top-20 in *every* draw
+(impurity: 7 of 20) and the top-20 Jaccard is 0.818 (impurity: 0.67).
+
+**But 14 of 69 features have a `shap_value_cor` sign that FLIPS across draws** - including
+`tco_struct_accessibility_stop_proximal_utr3` at exactly 50/50, the three 3'UTR G4 columns and
+`term_interval_codons`. Direction is uninterpretable for those, and they are the same features
+the shuffled-null calls noise.
+
+**The floor does NOT transfer between experiments** (`03e_experiment_pool_ratios.R`). It is
+driven by the pool ratio - negative pool size over positive set size - and across 51 gene sets
+that ratio spans **0.96 to 46.5**. The reference experiment sits at 1.94, predicting 51% draw
+overlap against 52% measured, so the ratio forecasts the floor without fitting anything. Seven
+experiments have a pool *no larger than* their positive set: every seed draws the same genes, a
+sweep returns N copies of one model, and it looks reassuringly stable while measuring nothing.
+Most of those are si3e sets scored against the si3d pool and need their own comparator.
 
 **The per-feature `gain` (shuffled rank - real rank) is the readable summary**, and `02c_`
 section 4 prints it. Positive means the real values earn the place; zero or negative means the
