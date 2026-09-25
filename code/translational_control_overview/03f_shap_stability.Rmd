@@ -1,0 +1,152 @@
+---
+title: "SHAP noise floor: what a family's share does when nothing changes"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  feature_set_label: "tco"
+  variant_set: "corrected"
+  initiation_score: "both"
+  clip_mode: "aggregate"
+  seeds: 20
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Why this exists
+
+The plan is **one model run per experiment**, then compare SHAP importances across
+experiments. That is only defensible against a measured floor: how much does a family's share
+move when *nothing biological changes*?
+
+`03d_shap_seed_sweep.R` answers it. Across these runs the **positive set is identical** - all
+1,436 genes, every time - and only the size-matched negative draw differs, at about 52%
+overlap between any two draws. The train/test split, the forest and the CV stay pinned at 9.
+So the spread below is attributable to negative-class composition and nothing else.
+
+**This is a lower bound on uncertainty, not the whole of it.** It holds the positives fixed,
+and successive draws share half their negatives because the pool is only ~1.9x the positive
+set. A cross-experiment comparison also varies the positives, which adds more on top. A
+difference smaller than this floor is definitely noise; a difference larger than it is not
+automatically biology.
+
+**And it does not transfer between experiments** - see `03e_experiment_pool_ratios.R`. The
+floor is driven by the pool ratio, which spans 0.96 to 46.5 across the 51 gene sets.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+sfx <- function(s) sweep_suffix(list(feature_set_label = params$feature_set_label,
+                                     variant_set = params$variant_set,
+                                     initiation_score = params$initiation_score,
+                                     clip_mode = params$clip_mode), s)
+dat <- map_dfr(seq_len(params$seeds), function(s) {
+  f <- file.path(out_dir, paste0("shap_feature_", sfx(s), ".csv"))
+  if (!file.exists(f)) return(tibble())
+  read_csv(f, show_col_types = FALSE) %>% mutate(seed = s)
+})
+stopifnot("no SHAP sweep output - run 03d_shap_seed_sweep.R first" = nrow(dat) > 0)
+cat("Seeds loaded:", n_distinct(dat$seed), "of", params$seeds, "\n")
+
+# Share, not raw mean|SHAP|: the raw scale depends on each run's prediction spread and is not
+# comparable between runs.
+dat <- dat %>% group_by(seed) %>%
+  mutate(share = 100 * mean_abs_shap / sum(mean_abs_shap)) %>% ungroup()
+```
+
+# 1. The floor
+
+```{r floor}
+fam_seed <- dat %>% group_by(seed, family) %>%
+  summarise(share = sum(share), .groups = "drop")
+
+floor_tbl <- fam_seed %>% group_by(family) %>%
+  summarise(median = median(share), sd = sd(share),
+            lo = quantile(share, 0.05), hi = quantile(share, 0.95), .groups = "drop") %>%
+  mutate(cv_pct = 100 * sd / median,
+         min_detectable_diff = 2.8 * sd) %>%
+  arrange(desc(median))
+print(as.data.frame(floor_tbl %>% mutate(across(where(is.numeric), ~ round(., 2)))))
+```
+
+**`min_detectable_diff` is the column to use.** Two single-run experiments each carry their own
+draw noise, so the difference between them has spread about `sqrt(2)` x sd; 2.8 x sd is roughly
+a 95% bound. The threshold is **per family** - `length` needs a 3.2-point difference to mean
+anything, `structure_utr5` only 0.8.
+
+Shares are bounded at 0 and skewed for the small families, so prefer the empirical 5-95%
+interval over anything normal-theory.
+
+```{r fig_floor, fig.width = 7, fig.height = 5}
+OBS <- "#E69F00"
+p1 <- fam_seed %>%
+  mutate(family = factor(family, levels = rev(floor_tbl$family))) %>%
+  ggplot(aes(x = share, y = family)) +
+  geom_boxplot(outlier.size = 0.8, fill = "grey90", colour = "grey30", linewidth = 0.4) +
+  geom_point(data = floor_tbl %>%
+               mutate(family = factor(family, levels = rev(floor_tbl$family))),
+             aes(x = median, y = family), colour = OBS, size = 2) +
+  labs(x = "share of total SHAP attribution (%)", y = NULL,
+       title = "How far a family's share moves on the draw alone",
+       subtitle = sprintf("%d negative draws; positives identical in every run, n = 1,436",
+                          n_distinct(dat$seed))) +
+  theme_classic(base_size = 12)
+print(p1)
+if (params$save_plots)
+  ggsave(here("plots", "03f_shap_family_floor.pdf"), p1, width = 7, height = 5)
+```
+
+# 2. Rank stability, against the impurity benchmark
+
+```{r ranks}
+rk <- dat %>% group_by(seed) %>% mutate(rk = rank(-mean_abs_shap)) %>% ungroup()
+top20 <- rk %>% filter(rk <= 20) %>% group_by(seed) %>%
+  summarise(f = list(feature), .groups = "drop")
+always <- Reduce(intersect, top20$f)
+
+j <- combn(nrow(top20), 2, function(k)
+  length(intersect(top20$f[[k[1]]], top20$f[[k[2]]])) /
+    length(union(top20$f[[k[1]]], top20$f[[k[2]]])))
+
+cat("Features top-20 in EVERY draw:", length(always), "of 20\n")
+cat(paste(" ", paste(always, collapse = ", ")), "\n")
+cat("\nTop-20 Jaccard across seed pairs: median", round(median(j), 3),
+    "range", paste(round(range(j), 3), collapse = " - "), "\n")
+cat("\nFor comparison, the frozen pipeline's IMPURITY benchmark (notebook 91_):",
+    "7 of 20 features, Jaccard 0.67.\n")
+cat("SHAP is the more rank-stable of the two, which is part of what justifies its cost.\n")
+```
+
+# 3. Direction is not always interpretable
+
+`shap_value_cor` is the directional summary. A feature whose **sign flips** between draws has
+no stable direction to report, whatever its magnitude.
+
+```{r direction}
+sgn <- dat %>% group_by(feature, family) %>%
+  summarise(n = n(), frac_pos = mean(shap_value_cor > 0, na.rm = TRUE),
+            median_cor = median(shap_value_cor, na.rm = TRUE), .groups = "drop")
+flips <- sgn %>% filter(frac_pos > 0.05, frac_pos < 0.95) %>%
+  arrange(abs(frac_pos - 0.5))
+
+cat("Features whose direction flips across draws:", nrow(flips), "of", nrow(sgn), "\n\n")
+print(as.data.frame(flips %>% mutate(across(where(is.numeric), ~ round(., 3)))))
+cat("\nThese overlap heavily with the features the shuffled-family null calls noise.\n")
+cat("Do not interpret direction for any of them.\n")
+```
+
+```{r export}
+write_csv(floor_tbl, file.path(out_dir, "shap_noise_floor.csv"))
+write_csv(sgn,       file.path(out_dir, "shap_direction_stability.csv"))
+cat("Wrote shap_noise_floor.csv and shap_direction_stability.csv\n")
+```
