@@ -21,6 +21,8 @@ params:
   explain_n: 200
   explain_sizes: "50,100,200,400"
   run_interactions: FALSE
+  save_shap_plots: TRUE
+  corr_group_threshold: 0.8
   cluster_k_max: 6
   cluster_n_null: 50
   # Sweep mode skips the two sections that are one-time checks rather than per-run
@@ -334,6 +336,53 @@ print(as.data.frame(lab %>% arrange(desc(shift)) %>%
                   imp_share = round(imp_share, 2), shap_share = round(shap_share, 2))))
 ```
 
+```{r fig_feature_slope, fig.width = 11, fig.height = 7, eval = !params$sweep_mode}
+# The family slope chart at FEATURE resolution, in two cuts.
+#   (a) the 20 features SHAP ranks highest - what the model actually leans on
+#   (b) the 20 that MOVE most between the two methods - where impurity was borrowing or
+#       lending credit. Point size is SHAP share throughout, because a feature can move a
+#       long way and still be negligible; without size, (b) would flatter trivial features.
+feat_slope <- function(d, ttl, sub) {
+  long <- d %>%
+    dplyr::select(feature, family, impurity = imp_share, SHAP = shap_share) %>%
+    pivot_longer(c(impurity, SHAP), names_to = "method", values_to = "share") %>%
+    mutate(method = factor(method, levels = c("impurity", "SHAP")))
+  ggplot(long, aes(method, share, group = feature)) +
+    geom_line(aes(colour = family), linewidth = 0.7, alpha = 0.85, show.legend = FALSE) +
+    geom_point(aes(colour = family, size = share), alpha = 0.9, show.legend = FALSE) +
+    ggrepel::geom_text_repel(
+      data = long %>% filter(method == "SHAP"),
+      aes(label = feature, colour = family), hjust = 0, nudge_x = 0.06, direction = "y",
+      size = 2.9, show.legend = FALSE, segment.size = 0.2, max.overlaps = 30) +
+    scale_size_continuous(range = c(1.5, 5)) +
+    scale_x_discrete(expand = expansion(mult = c(0.10, 0.75))) +
+    labs(x = NULL, y = "share of total attribution (%)", title = ttl, subtitle = sub) +
+    theme_classic(base_size = 11)
+}
+
+top_shap <- cmp_p %>% slice_max(shap_share, n = 20)
+movers   <- cmp_p %>% mutate(delta = shap_share - imp_share) %>%
+  slice_max(abs(delta), n = 20)
+
+pa <- feat_slope(top_shap, "(a) Top 20 features by SHAP",
+                 sprintf("point size = SHAP share. n = %d features in the model",
+                         nrow(cmp_p)))
+pb <- feat_slope(movers, "(b) Top 20 movers between the two methods",
+                 sprintf("point size = SHAP share, so a large move on a small feature stays small. n = %d",
+                         nrow(cmp_p)))
+print(cowplot::plot_grid(pa, pb, nrow = 1))
+if (params$save_shap_plots)
+  ggsave(here("plots", paste0("03_feature_slope_impurity_vs_shap_", suffix, ".pdf")),
+         cowplot::plot_grid(pa, pb, nrow = 1), width = 11, height = 7)
+
+cat("\nThe movers, with their actual importance:\n")
+print(as.data.frame(movers %>% arrange(desc(shap_share - imp_share)) %>%
+        transmute(feature, family,
+                  imp_share = round(imp_share, 2), shap_share = round(shap_share, 2),
+                  delta_pp = round(shap_share - imp_share, 2),
+                  rank_imp, rank_shap, in_top20_shap = rank_shap <= 20)))
+```
+
 ```{r fig_family_slope, fig.width = 6.5, fig.height = 5, eval = !params$sweep_mode}
 slope <- fam_cmp %>%
   dplyr::select(family, impurity = imp_share, SHAP = shap_share) %>%
@@ -356,6 +405,190 @@ print(p_fam)
 ggsave(here("plots", paste0("03_family_impurity_vs_shap_", suffix, ".pdf")), p_fam,
        width = 6.5, height = 5)
 ```
+
+# 4a. One signed column per feature
+
+A single column of every feature needs a fill that is **signed, additive and interpretable**.
+Only one candidate is all three.
+
+| | signed | additive | comparable across runs |
+|---|---|---|---|
+| mean \|SHAP\| share (%) | no | yes (sums to 100) | **yes** |
+| mean signed SHAP, **all** genes | yes | yes | **useless - cancels to ~0** |
+| **mean signed SHAP, positive class only** | **yes** | **yes** | no (raw scale) |
+| mean \|SHAP\| x sign(cor) | yes | **no** | yes |
+
+Averaging the signed values over *all* explained genes is the trap: positives and negatives
+pull opposite ways and cancel, which is why `mean_signed_shap` averages to ~0 for every feature
+and is exported for completeness only. Restricting to the **positive class** removes the
+cancellation and keeps additivity exactly - the column sums to the mean lift in predicted
+probability above baseline for a target gene, which is asserted below.
+
+Multiplying a magnitude by a sign is the other trap: it looks like the answer, sums to nothing
+meaningful, and is simply wrong for any feature whose effect is non-monotonic - and 14 of 69
+features here have a direction that flips between negative draws.
+
+`shap_value_cor` is not additive at all. It is a bounded correlation answering "which way",
+never "how much".
+
+```{r fig_signed_column, fig.width = 6.5, fig.height = 11, eval = !params$sweep_mode}
+pos_rows <- test_data$eif3d_target[explain_idx] == md$pos_label
+signed <- tibble(feature = feature_cols,
+                 signed_shap = colMeans(shap_vals[pos_rows, , drop = FALSE])) %>%
+  left_join(shap_tbl %>% dplyr::select(feature, family, mean_abs_shap), by = "feature") %>%
+  mutate(abs_share = 100 * mean_abs_shap / sum(mean_abs_shap),
+         # For comparing ACROSS experiments: divide by a common scale, never z-score.
+         # See the note below - scaling preserves additivity, centring destroys it.
+         signed_share = 100 * signed_shap / sum(abs(signed_shap)))
+
+# Additivity is the claim, so it is asserted rather than assumed: the column must sum to the
+# mean of the per-gene row sums, which for TreeSHAP is (prediction - baseline).
+row_sums <- rowSums(shap_vals[pos_rows, , drop = FALSE])
+stopifnot("the signed column is not additive - do not read it as a decomposition" =
+            isTRUE(all.equal(sum(signed$signed_shap), mean(row_sums))))
+cat(sprintf("Additive: column sums to %.5f = mean lift above baseline for a target gene (n = %d positives)\n",
+            sum(signed$signed_shap), sum(pos_rows)))
+
+lim <- max(abs(signed$signed_shap))
+p_sign <- signed %>%
+  mutate(feature = fct_reorder(feature, signed_shap)) %>%
+  ggplot(aes(x = 1, y = feature, fill = signed_shap)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%+.4f", signed_shap)), size = 2.4) +
+  scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0,
+                       limits = c(-lim, lim), name = "mean signed\nSHAP (positives)") +
+  scale_x_continuous(breaks = NULL) +
+  labs(x = NULL, y = NULL,
+       title = "Signed contribution to a typical eIF3d target",
+       subtitle = sprintf("vermillion pushes toward target, blue away; additive, sums to %.4f. n = %d positives",
+                          sum(signed$signed_shap), sum(pos_rows))) +
+  theme_classic(base_size = 9) +
+  theme(axis.line.x = element_blank(), axis.ticks.x = element_blank())
+print(p_sign)
+if (params$save_shap_plots)
+  ggsave(here("plots", paste0("03_signed_column_", suffix, ".pdf")), p_sign,
+         width = 6.5, height = 11)
+
+write_csv(signed, file.path(out_dir, paste0("shap_signed_positive_", suffix, ".csv")))
+```
+
+## Comparing this across experiments: scale, do not z-score
+
+The signed column above is on each run's own probability scale, so it is not directly
+comparable between experiments. The fix is to normalise per experiment - but **which**
+normalisation matters, and the obvious one is wrong.
+
+**Z-scoring destroys the additivity that made this column worth plotting.** Subtracting a mean
+means a group of *k* features loses *k* x mean, so the distortion scales with how many features
+a group contains. Measured on this run:
+
+| family | raw signed | `signed_share` | z-score | n |
+|---|---|---|---|---|
+| `length` | +0.0283 | 25.27 | +7.82 | 4 |
+| `termination` | **+0.0004** | 0.37 | **-5.84** | **11** |
+| `initiation` | +0.00006 | 0.06 | -2.16 | 4 |
+
+`termination` carries essentially no signed signal yet gets the largest-magnitude z-sum of any
+family, purely for having 11 features. Empirically `signed_share / raw` is a **constant across
+every family**, while `zscore / raw` ranges from +276 to -34,530.
+
+**Dividing by a common scale keeps everything:** `signed_share = 100 * signed_shap /
+sum(|signed_shap|)` is signed, comparable across experiments, and still additive, because
+dividing every element by the *same* constant leaves group totals exactly proportional.
+Centring is the step that breaks it. Two further conditions for the cross-experiment matrix:
+fix the feature universe (a feature dropped in one experiment must not read as "unimportant"),
+and carry each run's AUC, since a ranking from a weak model does not mean what a strong one's
+does.
+
+A second reason to avoid z-scores here: most features sit near zero and a few are large, so the
+sd is set by the tail. On this run 29 of 69 features have |z| < 0.5 - crushed together - while
+the maximum is 4.0.
+
+# 4b. Correlated features: grouping by measured redundancy, not by hand
+
+Family sums fix credit-splitting only where the families were drawn correctly in the first
+place. `cds_gc` and `gc3_internal` correlate at 0.93 and sit in the same family, so that split
+is absorbed - but a hand-drawn boundary cannot catch redundancy it did not anticipate.
+
+The data-driven alternative: cluster features on `1 - |r|`, cut at a threshold, and sum SHAP
+within each cluster. **Additivity makes any grouping exact**, so this costs nothing in rigour
+and does not require knowing in advance what is redundant. The threshold is a choice, so it is
+reported and varied.
+
+```{r corr_groups, eval = !params$sweep_mode}
+X <- as.matrix(rbind(train_data[, feature_cols], test_data[, feature_cols]))
+Cm <- cor(X, use = "pairwise.complete.obs")
+hc <- hclust(as.dist(1 - abs(Cm)), method = "average")
+
+cat("Sensitivity of the grouping to the threshold:\n")
+for (thr in c(0.7, 0.8, 0.9)) {
+  cl <- cutree(hc, h = 1 - thr)
+  cat(sprintf("  |r| >= %.1f : %2d groups from %d features (%d singletons)\n",
+              thr, max(cl), length(cl), sum(table(cl) == 1)))
+}
+
+cl <- cutree(hc, h = 1 - params$corr_group_threshold)
+grp <- tibble(feature = names(cl), grp = cl) %>%
+  left_join(shap_tbl %>% dplyr::select(feature, family, mean_abs_shap), by = "feature") %>%
+  mutate(share = 100 * mean_abs_shap / sum(mean_abs_shap))
+
+grp_tbl <- grp %>% group_by(grp) %>%
+  summarise(n = n(), group_share = sum(share),
+            families = paste(sort(unique(family)), collapse = " + "),
+            spans_families = n_distinct(family) > 1,
+            label = feature[which.max(share)],          # name a group by its strongest member
+            members = paste(feature, collapse = ", "), .groups = "drop") %>%
+  arrange(desc(group_share))
+
+cat("\n=== multi-feature groups at |r| >=", params$corr_group_threshold, "===\n")
+print(as.data.frame(grp_tbl %>% filter(n > 1) %>%
+        dplyr::select(n, group_share, families, spans_families, members) %>%
+        mutate(group_share = round(group_share, 2))), right = FALSE)
+
+# A group that crosses a family boundary is the case hand-defined families CANNOT catch: the
+# family totals understate a shared axis and split it across two rows of the family table.
+cross <- grp_tbl %>% filter(n > 1, spans_families)
+cat("\nGroups spanning more than one family:", nrow(cross), "\n")
+if (nrow(cross)) {
+  cat("These are where the family view is misleading - the family totals divide one\n")
+  cat("empirical axis between two rows:\n")
+  print(as.data.frame(cross %>% dplyr::select(group_share, families, members) %>%
+                        mutate(group_share = round(group_share, 2))), right = FALSE)
+}
+```
+
+```{r fig_corr_groups, fig.width = 8, fig.height = 5.5, eval = !params$sweep_mode}
+top_grp <- grp_tbl %>% slice_max(group_share, n = 20) %>%
+  mutate(lab = if_else(n > 1, sprintf("%s (+%d)", label, n - 1L), label),
+         lab = fct_reorder(lab, group_share))
+
+p_grp <- ggplot(top_grp, aes(lab, group_share)) +
+  geom_segment(aes(xend = lab, y = 0, yend = group_share), colour = "grey60",
+               linewidth = 0.6) +
+  geom_point(aes(colour = spans_families, size = n)) +
+  coord_flip() +
+  scale_colour_manual(values = c(`FALSE` = "#0072B2", `TRUE` = "#D55E00"),
+                      name = "spans >1 family") +
+  scale_size_continuous(range = c(2.5, 5.5), name = "features") +
+  labs(x = NULL, y = "summed SHAP share (%)",
+       title = sprintf("SHAP summed over correlated groups (|r| >= %.1f)",
+                       params$corr_group_threshold),
+       subtitle = sprintf("groups named by their strongest member; vermillion = crosses a family boundary. n = %d features in %d groups",
+                          nrow(grp), max(cl))) +
+  theme_classic(base_size = 11)
+print(p_grp)
+if (params$save_shap_plots)
+  ggsave(here("plots", paste0("03_shap_corr_groups_", suffix, ".pdf")), p_grp,
+         width = 8, height = 5.5)
+
+write_csv(grp_tbl, file.path(out_dir, paste0("shap_corr_groups_", suffix, ".csv")))
+```
+
+**Reading it.** Where the correlation grouping and the family grouping agree, the family view is
+fine. Where a group crosses a family boundary, the correlation grouping is the honest number:
+the family totals are dividing one empirical axis between two rows. For the cross-experiment
+comparison, correlated-group totals are also the more robust unit, since individual features
+can split credit differently between experiments while their group total stays put.
 
 # 5. Is the explain set big enough?
 
@@ -412,13 +645,16 @@ pos_x    <- as.data.frame(test_data[pos_test, feature_cols])
 shap_pos <- as.data.frame(treeshap(unified, pos_x, interactions = FALSE,
                                    verbose = FALSE)$shaps)
 
+sym_all <- test_data$symbol[pos_test]
 fam_of <- ann$family[match(feature_cols, ann$feature)]
 fam_mat <- t(rowsum(t(as.matrix(shap_pos)), group = fam_of))   # exact family sums per gene
 
 # Normalise within gene: the profile is the share of that gene's attribution, signed.
-denom   <- rowSums(abs(fam_mat)); denom[denom == 0] <- NA
-profile <- fam_mat / denom
-profile <- profile[stats::complete.cases(profile), , drop = FALSE]
+denom     <- rowSums(abs(fam_mat)); denom[denom == 0] <- NA
+profile   <- fam_mat / denom
+keep_rows <- stats::complete.cases(profile)      # index, so every later matrix aligns
+profile   <- profile[keep_rows, , drop = FALSE]
+sym_keep  <- sym_all[keep_rows]
 cat("Profiles:", nrow(profile), "genes x", ncol(profile), "families\n")
 ```
 
@@ -448,6 +684,112 @@ if (nullres$p_overall > 0.05) {
 }
 ```
 
+```{r fig_subgroup_heatmap, fig.width = 8, fig.height = 6, eval = !params$sweep_mode}
+# Genes x families, each row a gene's normalised SHAP profile. Rows ordered by cluster, so
+# whether the clusters correspond to visible blocks is a question you can answer by looking.
+library(pheatmap)
+
+set.seed(9)
+km_hm <- kmeans(profile, centers = nullres$best_k_sil, nstart = 25)
+ord   <- order(km_hm$cluster)
+
+hm_mat <- profile[ord, , drop = FALSE]                 # a copy, so profile keeps its indexing
+rownames(hm_mat) <- make.unique(sym_keep)[ord]
+ann_row <- data.frame(cluster = factor(km_hm$cluster[ord]))
+rownames(ann_row) <- rownames(hm_mat)
+
+lim <- max(abs(profile))
+pheatmap(hm_mat,
+         cluster_rows = FALSE, cluster_cols = TRUE,
+         show_rownames = FALSE, annotation_row = ann_row,
+         # CLAUDE.md diverging convention: Okabe-Ito dark blue to white to vermillion
+         color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+         breaks = seq(-lim, lim, length.out = 102),
+         main = sprintf("Per-gene SHAP profile by family (n = %d positive-class genes)",
+                        nrow(profile)),
+         filename = if (params$save_shap_plots)
+           here("plots", paste0("03_subgroup_heatmap_", suffix, ".pdf")) else NA,
+         width = 8, height = 6)
+```
+
+```{r subgroup_resolution, eval = !params$sweep_mode}
+# Does the answer depend on RESOLUTION? Family-level profiles are exact sums and denoise
+# credit-splitting; per-FEATURE profiles are higher resolution but let correlated columns
+# (cds_gc vs gc3_internal) divide a gene's credit arbitrarily between themselves. If
+# per-feature clustering finds MORE structure, suspect that split rather than biology.
+prof_feat <- as.matrix(shap_pos)[keep_rows, , drop = FALSE]   # same genes as `profile`
+den_f <- rowSums(abs(prof_feat)); den_f[den_f == 0] <- 1
+prof_feat <- prof_feat / den_f
+
+null_feat <- subgroup_null(prof_feat, ks = 2:params$cluster_k_max,
+                           n_perm = params$cluster_n_null)
+cat("family-level (", ncol(profile), " dims): z = ", round(nullres$z_obs, 2),
+    ", p = ", signif(nullres$p_overall, 3), "\n", sep = "")
+cat("per-feature  (", ncol(prof_feat), " dims): z = ", round(null_feat$z_obs, 2),
+    ", p = ", signif(null_feat$p_overall, 3), "\n", sep = "")
+
+# Do the two resolutions agree on WHICH genes group together?
+set.seed(9); k_f <- kmeans(prof_feat, centers = nullres$best_k_sil, nstart = 25)$cluster
+set.seed(9); k_m <- kmeans(profile,     centers = nullres$best_k_sil, nstart = 25)$cluster
+tab <- table(family_level = k_m, per_feature = k_f)
+print(tab)
+agree <- sum(apply(tab, 1, max)) / sum(tab)
+cat(sprintf("\nbest-matching agreement between the two resolutions: %.1f%% of genes\n",
+            100 * agree))
+```
+
+Per-feature reports a far larger z than family-level, and that is a **warning, not a win**:
+69 dimensions give correlated columns room to divide a gene's credit between themselves, and
+clustering will organise genes by that split. The agreement below is what shows the extra
+resolution is not buying a different answer.
+
+```{r fig_resolution_agreement, fig.width = 10, fig.height = 4.5, eval = !params$sweep_mode}
+# Each cluster label is arbitrary, so the two partitions are first matched by their best
+# overlap - otherwise "agreement" would depend on which cluster kmeans happened to call 1.
+best_match <- apply(tab, 1, which.max)
+flow <- as.data.frame(tab) %>%
+  mutate(family_level = as.integer(as.character(family_level)),
+         per_feature  = as.integer(as.character(per_feature)),
+         agrees = per_feature == best_match[family_level],
+         pct = 100 * Freq / sum(Freq))
+
+AGREE_COL <- "#009E73"; DISAGREE_COL <- "grey70"
+
+# (a) the contingency table itself
+p_tile <- ggplot(flow, aes(factor(per_feature), factor(family_level))) +
+  geom_tile(aes(fill = agrees), colour = "white", linewidth = 1.2, show.legend = FALSE) +
+  geom_text(aes(label = ifelse(Freq > 0, sprintf("%d\n%.1f%%", Freq, pct), "")),
+            size = 3.6, lineheight = 0.95) +
+  scale_fill_manual(values = c(`TRUE` = alpha(AGREE_COL, 0.45),
+                               `FALSE` = alpha(DISAGREE_COL, 0.35))) +
+  labs(x = "per-feature cluster (69 dims)", y = "family-level cluster (14 dims)",
+       title = "(a) Same genes, two resolutions",
+       subtitle = sprintf("green = matched clusters. n = %d genes", sum(tab))) +
+  theme_classic(base_size = 12)
+
+# (b) the same thing as flows, where the eye reads agreement as straight-through ribbons
+p_flow <- ggplot(flow %>% filter(Freq > 0)) +
+  geom_segment(aes(x = 1, xend = 2, y = family_level, yend = per_feature,
+                   linewidth = Freq, colour = agrees), alpha = 0.7, show.legend = FALSE) +
+  geom_point(aes(x = 1, y = family_level), size = 4, colour = "grey30") +
+  geom_point(aes(x = 2, y = per_feature),  size = 4, colour = "grey30") +
+  scale_linewidth_continuous(range = c(0.5, 9)) +
+  scale_colour_manual(values = c(`TRUE` = AGREE_COL, `FALSE` = DISAGREE_COL)) +
+  scale_x_continuous(breaks = c(1, 2), labels = c("family-level", "per-feature"),
+                     limits = c(0.85, 2.15)) +
+  scale_y_reverse(breaks = sort(unique(c(flow$family_level, flow$per_feature)))) +
+  labs(x = NULL, y = "cluster",
+       title = "(b) Where the genes go",
+       subtitle = sprintf("ribbon width = genes; %.1f%% stay in the matched cluster",
+                          100 * agree)) +
+  theme_classic(base_size = 12)
+
+print(cowplot::plot_grid(p_tile, p_flow, nrow = 1, rel_widths = c(1, 1)))
+if (params$save_shap_plots)
+  ggsave(here("plots", paste0("03_resolution_agreement_", suffix, ".pdf")),
+         cowplot::plot_grid(p_tile, p_flow, nrow = 1), width = 10, height = 4.5)
+```
+
 ```{r subgroup_characterise, eval = !params$sweep_mode}
 set.seed(9)
 km  <- kmeans(profile, centers = best_k, nstart = 25)
@@ -475,6 +817,13 @@ subgroups <- tibble(gene_id_clean = gid, symbol = sym, cluster = km$cluster) %>%
 
 ```{r export}
 write_csv(shap_tbl, file.path(out_dir, paste0("shap_feature_", suffix, ".csv")))
+
+# The full per-gene x per-feature matrix. Everything else in this notebook is this object
+# collapsed by averaging down the columns; exporting it lets a gene be interrogated directly.
+if (!params$sweep_mode)
+  write_csv(bind_cols(tibble(gene_id_clean = test_data$gene_id_clean[explain_idx],
+                             symbol = test_data$symbol[explain_idx]), shap_vals),
+            file.path(out_dir, paste0("shap_per_gene_", suffix, ".csv")))
 write_csv(fam_tbl,  file.path(out_dir, paste0("shap_family_", suffix, ".csv")))
 if (!params$sweep_mode) {
   write_csv(stab,      file.path(out_dir, paste0("shap_explain_stability_", suffix, ".csv")))
