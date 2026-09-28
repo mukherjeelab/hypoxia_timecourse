@@ -1,0 +1,500 @@
+---
+title: "SHAP heatmap: features by experiment"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  experiments: "si3d hypoxia 1hr=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  floor_preset: "transform"
+  floor_arm: "raw"
+  corr_threshold: 0.8
+  reduced_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_reduced_corrected_both_clipaggregate_yraw"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "15_shap_heatmap.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It builds the SHAP heatmap this whole fork exists to produce: **features as rows, experiments as
+columns**, from the random-forest regression's SHAP values.
+
+Right now it has **one column**. Everything is written so that adding an experiment is one entry
+in the `experiments` param and nothing else changes.
+
+**Decisions**
+
+- The cell value is **`share_pct`**, each feature's percentage of that experiment's total
+  \|SHAP\|. This is the only quantity comparable across experiments without adjustment: raw SHAP
+  is in log2 TE units, and the outcome's spread varies about 7-fold across contrasts, so raw
+  magnitudes are not on one scale. `10d_target_scale_analysis.Rmd` measures this.
+- Both views are produced, because they answer different questions. **Individual features** show
+  what the model actually used. **Grouped** rows fix the fact that correlated features split a
+  single signal between them; summing SHAP within a group is exact, since SHAP is additive.
+- Two groupings are shown, not one: by **family** (the prior grouping, which the annotation table
+  defines) and by **correlated cluster** (read off the data by `14_feature_correlation.Rmd`).
+  They disagree in the one place that matters, and that disagreement is the point.
+- Rows are ordered by magnitude while there is one column. With more than one, columns get
+  clustered and rows ordered by their mean.
+- A feature whose share sits below its own measured noise floor is marked, so a visible cell is
+  not mistaken for a real one.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(pheatmap)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+
+# The experiment list. One "label=suffix" pair per experiment, semicolon-separated. Adding a
+# second experiment means adding one pair here; no other line in this notebook changes.
+parse_experiments <- function(s) {
+  parts <- str_trim(str_split(s, ";")[[1]])
+  parts <- parts[nzchar(parts)]
+  tibble(label  = str_trim(str_replace(parts, "=.*$", "")),
+         suffix = str_trim(str_replace(parts, "^[^=]*=", "")))
+}
+exps <- parse_experiments(params$experiments)
+cat("experiments:", nrow(exps), "\n")
+print(as.data.frame(exps), row.names = FALSE)
+
+read_one <- function(label, suffix) {
+  f <- file.path(out_dir, paste0("shapreg_feature_", suffix, ".csv"))
+  if (!file.exists(f)) { warning("missing: ", f); return(NULL) }
+  read_csv(f, show_col_types = FALSE) %>%
+    transmute(experiment = label, feature, family,
+              share = share_pct, direction = shap_value_cor)
+}
+long <- pmap_dfr(list(exps$label, exps$suffix), read_one)
+stopifnot("no SHAP outputs found for any experiment" = nrow(long) > 0)
+
+# Every experiment must describe the same features, or a row means different things in different
+# columns. With one experiment this is trivially true; it is asserted now so that it fails loudly
+# the first time a second experiment with a different feature set is added.
+per_exp <- long %>% count(experiment, name = "n_features")
+print(as.data.frame(per_exp), row.names = FALSE)
+if (nrow(exps) > 1) {
+  sets <- split(long$feature, long$experiment)
+  stopifnot("experiments do not share a feature set - rows would not be comparable" =
+              length(unique(map(sets, sort))) == 1)
+}
+stopifnot("shares do not sum to 100 within an experiment" =
+            all(abs(tapply(long$share, long$experiment, sum) - 100) < 1e-6))
+# Each column's own performance, so the heatmap says how good the model behind it was. A column
+# from a model that barely ranks its own genes should not be read like one that ranks them well.
+read_perf <- function(label, suffix) {
+  f <- file.path(out_dir, paste0("rfreg_performance_", suffix, ".csv"))
+  if (!file.exists(f)) return(tibble(experiment = label, auc = NA_real_, spearman = NA_real_))
+  d <- read_csv(f, show_col_types = FALSE)
+  g <- function(k) { v <- d$value[d$metric == k]; if (length(v)) v[1] else NA_real_ }
+  tibble(experiment = label, auc = g("bridge_auc_geneset"), spearman = g("spearman_raw_y"))
+}
+perf <- pmap_dfr(list(exps$label, exps$suffix), read_perf)
+print(as.data.frame(perf %>% mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+
+# Column annotation: the AUC bridge, and the held-out Spearman beside it.
+anno_col <- perf %>%
+  transmute(experiment, `bridge AUC` = auc, `Spearman` = spearman) %>%
+  column_to_rownames("experiment")
+
+ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
+```
+
+```{r annotations}
+# Which features cannot be read directionally: their shap_value_cor sign flips across the 20
+# split seeds, so the signed view must not be trusted for them.
+dir_path <- file.path(out_dir, paste0("shapreg_direction_stability_",
+                                      params$floor_preset, "_", params$floor_arm, ".csv"))
+unstable <- if (file.exists(dir_path)) {
+  d <- read_csv(dir_path, show_col_types = FALSE)
+  d$feature[d$frac_pos > 0.05 & d$frac_pos < 0.95]
+} else character(0)
+cat("features with an unstable SHAP direction:", length(unstable), "\n")
+if (length(unstable)) cat("  ", paste(unstable, collapse = ", "), "\n")
+
+# The measured per-family floor: how much a family's share moves when nothing biological changes.
+floor_path <- file.path(out_dir, paste0("shapreg_noise_floor_",
+                                        params$floor_preset, "_", params$floor_arm, ".csv"))
+fam_floor <- if (file.exists(floor_path))
+  read_csv(floor_path, show_col_types = FALSE) %>%
+    dplyr::select(family, floor_sd = sd, floor_mdd = min_detectable_diff) else NULL
+cat("family noise floor available:", !is.null(fam_floor), "\n")
+
+# The data-driven grouping from 14_. Features not in a multi-feature cluster are their own group.
+clus_path <- file.path(out_dir, paste0("featcorr_clusters_", exps$suffix[1], ".csv"))
+corr_group <- if (file.exists(clus_path)) {
+  cl <- read_csv(clus_path, show_col_types = FALSE) %>%
+    filter(abs(threshold - params$corr_threshold) < 1e-9)
+  cl %>% group_by(cluster) %>%
+    summarise(group = paste0(first(leader), " +", n() - 1), features = list(feature),
+              .groups = "drop") %>%
+    unnest(features) %>% dplyr::select(feature = features, group)
+} else NULL
+cat("correlated-cluster grouping available:", !is.null(corr_group), "\n")
+```
+
+# 1. Individual features
+
+```{r fig_features, fig.width = 7, fig.height = 13}
+mat_of <- function(d, row, val = "share") {
+  d %>% dplyr::select(all_of(c(row, "experiment", val))) %>%
+    pivot_wider(names_from = experiment, values_from = all_of(val)) %>%
+    column_to_rownames(row) %>% as.matrix()
+}
+ord_rows <- function(m) m[order(rowMeans(m, na.rm = TRUE), decreasing = TRUE), , drop = FALSE]
+
+M <- ord_rows(mat_of(long, "feature"))
+fam_of <- long %>% distinct(feature, family) %>% deframe()
+
+# "reproducible" means the feature's direction came out with the same sign in all 20 split-seed
+# runs. "flips" means it did not, so the colour in the direction panel is not reproducible for
+# that row and should be read as magnitude only. 17 of 69 features flip, carrying 6.3% of the
+# total SHAP between them - every large feature is consistent.
+anno_row <- data.frame(
+  family              = fam_of[rownames(M)],
+  `direction repeats` = ifelse(rownames(M) %in% unstable, "flips", "reproducible"),
+  row.names = rownames(M), check.names = FALSE)
+fam_cols <- setNames(
+  colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                     "#0072B2", "#D55E00", "#CC79A7", "grey50"))(n_distinct(anno_row$family)),
+  sort(unique(anno_row$family)))
+
+pheat <- function(m, main, annor, annoc = NULL, signed = FALSE, fname = NULL, ...) {
+  if (signed) {
+    lim <- max(abs(m), na.rm = TRUE)
+    col <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(101)
+    brk <- seq(-lim, lim, length.out = 102)
+  } else {
+    col <- colorRampPalette(c("white", "#FDD9A0", "#E69F00", "#D55E00"))(101)
+    brk <- seq(0, max(m, na.rm = TRUE), length.out = 102)
+  }
+  args <- list(mat = m, color = col, breaks = brk,
+               cluster_rows = FALSE, cluster_cols = ncol(m) > 2,
+               annotation_row = annor, annotation_col = anno_col, annotation_colors = annoc,
+               display_numbers = ncol(m) <= 3, number_format = "%.1f", fontsize_number = 7,
+               fontsize_row = 8, fontsize_col = 9, cellwidth = 42, main = main, ...)
+  do.call(pheatmap, args)
+  if (!is.null(fname) && isTRUE(params$save_plots)) {
+    pdf(file.path(here("plots"), fname), width = 7, height = max(4, 0.17 * nrow(m) + 2))
+    do.call(pheatmap, args); dev.off()
+  }
+}
+
+pheat(M, sprintf("SHAP share (%%) per feature, %d experiment%s",
+                 ncol(M), if (ncol(M) == 1) "" else "s"),
+      anno_row, list(family = fam_cols,
+                     `direction repeats` = c(reproducible = "grey85", flips = "#CC79A7")),
+      fname = "15_heatmap_features_magnitude.pdf")
+cat(sprintf("\n%d features | top: %s (%.2f%%) | bottom: %s (%.2f%%)\n",
+            nrow(M), rownames(M)[1], M[1, 1], rownames(M)[nrow(M)], M[nrow(M), 1]))
+cat(sprintf("the top 10 features carry %.1f%% of the total\n", sum(M[1:10, 1])))
+```
+
+```{r fig_features_direction, fig.width = 7, fig.height = 13}
+# Direction, coloured by shap_value_cor itself rather than by a signed share.
+#
+# shap_value_cor is the Spearman correlation between a feature's value and its own SHAP value, so
+# it is bounded at -1 and +1 and says which way the feature pushes, independent of how much. Most
+# features here sit near +/-0.95, so the panel reads as effectively binary - but a feature whose
+# direction is genuinely ambiguous stays pale instead of being forced to a side, which a hard
+# two-colour scheme would hide.
+#
+# Vermillion = a higher feature value pushes the predicted TE change UP (more eIF3d-promoted).
+# Dark blue = pushes it DOWN. White = 0. The scale is symmetric about 0 and spans the full
+# [-1, 1] range, so colour is comparable between panels and between experiments.
+Md <- mat_of(long, "feature", "direction")[rownames(M), , drop = FALSE]
+
+dir_args <- list(
+  mat = Md,
+  color  = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  breaks = seq(-1, 1, length.out = 102),
+  cluster_rows = FALSE, cluster_cols = ncol(Md) > 2,
+  annotation_row = anno_row, annotation_col = anno_col,
+  annotation_colors = list(family = fam_cols,
+                           `direction repeats` = c(reproducible = "grey85", flips = "#CC79A7")),
+  display_numbers = ncol(Md) <= 3, number_format = "%.2f", fontsize_number = 7,
+  fontsize_row = 8, fontsize_col = 9, cellwidth = 42,
+  main = "Direction: correlation of each feature with its own SHAP\nvermillion = pushes TE change up, blue = down, white = 0")
+do.call(pheatmap, dir_args)
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", "15_heatmap_features_direction.pdf"),
+      width = 7, height = max(4, 0.17 * nrow(Md) + 2))
+  do.call(pheatmap, dir_args); dev.off()
+}
+
+cat(sprintf("\ndirection: %d features push UP, %d push DOWN\n",
+            sum(Md[, 1] > 0), sum(Md[, 1] < 0)))
+cat(sprintf("strongly directional (|cor| > 0.8): %d of %d\n",
+            sum(abs(Md[, 1]) > 0.8), nrow(Md)))
+cat(sprintf("ambiguous (|cor| < 0.5, shown pale): %d\n", sum(abs(Md[, 1]) < 0.5)))
+if (length(unstable))
+  cat(sprintf("sign flips across split seeds (annotated, do not read direction): %d\n",
+              sum(rownames(Md) %in% unstable)))
+amb <- tibble(feature = rownames(Md), cor = Md[, 1],
+              share = M[rownames(Md), 1]) %>% filter(abs(cor) < 0.5) %>% arrange(desc(share))
+if (nrow(amb)) {
+  cat("\nfeatures whose direction is weak, with the share they nonetheless carry:\n")
+  print(as.data.frame(amb %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+}
+```
+
+# 2. Grouped by family
+
+```{r fig_family, fig.width = 6.5, fig.height = 5}
+# Exact: SHAP is additive, so a family's share is the sum of its members' shares.
+fam_long <- long %>% group_by(experiment, family) %>%
+  summarise(share = sum(share), n = n(), .groups = "drop")
+Mf <- ord_rows(mat_of(fam_long, "family"))
+annof <- if (!is.null(fam_floor)) {
+  d <- fam_floor %>% filter(family %in% rownames(Mf)) %>%
+    mutate(`noise floor` = floor_mdd) %>% dplyr::select(family, `noise floor`) %>%
+    column_to_rownames("family")
+  d[rownames(Mf), , drop = FALSE]
+} else NULL
+pheat(Mf, sprintf("SHAP share (%%) per family, %d experiment%s",
+                  ncol(Mf), if (ncol(Mf) == 1) "" else "s"),
+      annof, NULL, fname = "15_heatmap_family_magnitude.pdf")
+# A family's direction is the share-weighted mean of its members' correlations. When members
+# disagree this moves toward 0 and the cell goes white, which is the honest reading: the family
+# has no single direction.
+fam_dir <- long %>% group_by(experiment, family) %>%
+  summarise(direction = weighted.mean(direction, share), .groups = "drop")
+Mfd <- mat_of(fam_dir, "family", "direction")[rownames(Mf), , drop = FALSE]
+fd_args <- list(mat = Mfd,
+  color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  breaks = seq(-1, 1, length.out = 102),
+  cluster_rows = FALSE, cluster_cols = ncol(Mfd) > 2, annotation_col = anno_col,
+  display_numbers = ncol(Mfd) <= 3, number_format = "%.2f", fontsize_number = 8,
+  fontsize_row = 9, fontsize_col = 9, cellwidth = 42,
+  main = "Family direction (share-weighted)\nwhite = members disagree")
+do.call(pheatmap, fd_args)
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", "15_heatmap_family_direction.pdf"), width = 6.5, height = 5)
+  do.call(pheatmap, fd_args); dev.off()
+}
+mixed <- tibble(family = rownames(Mfd), dir = Mfd[, 1]) %>% filter(abs(dir) < 0.5)
+if (nrow(mixed)) {
+  cat("\nfamilies with no single direction (members disagree):\n")
+  print(as.data.frame(mixed %>% mutate(dir = round(dir, 3))), row.names = FALSE)
+}
+
+tab <- fam_long %>% arrange(desc(share))
+if (!is.null(fam_floor)) tab <- tab %>% left_join(fam_floor, by = "family")
+print(as.data.frame(tab %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+```
+
+# 3. Grouped by correlated cluster
+
+```{r fig_cluster, fig.width = 6.5, fig.height = 12, eval = !is.null(corr_group)}
+# The grouping read off the data rather than assigned in advance. Where a family splits a signal
+# across correlated members, or where correlated members sit in DIFFERENT families, this recovers
+# the total that either view alone understates.
+cg_long <- long %>%
+  left_join(corr_group, by = "feature") %>%
+  mutate(group = coalesce(group, feature)) %>%
+  group_by(experiment, group) %>%
+  summarise(share = sum(share), n = n(),
+            families = paste(sort(unique(family)), collapse = "+"), .groups = "drop")
+Mc <- ord_rows(mat_of(cg_long, "group"))
+anno_c <- cg_long %>% distinct(group, n, families) %>%
+  transmute(group, size = ifelse(n > 1, "grouped", "single")) %>%
+  column_to_rownames("group")
+anno_c <- anno_c[rownames(Mc), , drop = FALSE]
+pheat(Mc, sprintf("SHAP share (%%) per correlated cluster (|rho| >= %.1f)", params$corr_threshold),
+      anno_c, list(size = c(grouped = "#D55E00", single = "grey85")),
+      fname = "15_heatmap_cluster_magnitude.pdf")
+
+cat("\nmulti-feature clusters, and what each recovers:\n")
+print(as.data.frame(cg_long %>% filter(n > 1) %>% arrange(desc(share)) %>%
+  mutate(share = round(share, 2))), row.names = FALSE)
+```
+
+# 4. Where the two groupings disagree
+
+```{r disagreement, eval = !is.null(corr_group)}
+# The reason for showing both. A correlated cluster that stays inside one family is already
+# handled by the family view. A cluster that crosses families is not: in the family view its
+# signal is split across two or more rows, and no amount of summing within families recovers it.
+cross <- cg_long %>% filter(n > 1, str_detect(families, fixed("+")))
+if (!nrow(cross)) {
+  cat("Every correlated cluster sits within a single family, so the two groupings agree.\n")
+} else {
+  cat(sprintf("%d correlated cluster%s cross family lines:\n\n", nrow(cross),
+              if (nrow(cross) == 1) "" else "s"))
+  for (i in seq_len(nrow(cross))) {
+    g <- cross$group[i]
+    members <- long %>% filter(experiment == cross$experiment[i]) %>%
+      left_join(corr_group, by = "feature") %>% filter(group == g) %>%
+      arrange(desc(share))
+    cat(sprintf("  %s  -> combined %.2f%% across families: %s\n",
+                g, cross$share[i], cross$families[i]))
+    for (j in seq_len(nrow(members)))
+      cat(sprintf("       %-34s %5.2f%%   %s\n",
+                  members$feature[j], members$share[j], members$family[j]))
+    cat(sprintf("     in the family view this is split across %d rows, the largest being %.2f%%\n\n",
+                n_distinct(members$family), max(members$share)))
+  }
+  cat("Reading the family heatmap alone understates these by that split.\n")
+}
+```
+
+# 5. Reduced: one representative per correlated cluster
+
+A third view, which does not replace either of the first two. Here the model is **refit** with
+only one feature kept from each correlated cluster, so the retained feature absorbs the signal
+its near-duplicates were splitting with it.
+
+This has to be a refit rather than a filtered heatmap. Deleting rows after the fact would leave
+the survivors holding their old, split-down SHAP values, which understates them by exactly the
+amount the exercise is meant to recover.
+
+**Decisions**
+
+- Keep **exactly one** feature per cluster, never zero. `reduce_to_representatives()` in
+  `10_regression_presets.R` derives the list from `14_`'s cluster table and asserts that
+  invariant, because a feature that looks like noise in this experiment may carry signal in
+  another - and if its row is missing here while present there, the columns stop lining up.
+- Choose the representative by SHAP share first, then centrality within the cluster, then
+  completeness. For a two-member cluster centrality is always tied, so SHAP decides.
+- Do not compare shares between this view and the others as absolute numbers. The denominator
+  changed: 60 features' shares sum to 100 just as 69 did. Read ordering, and read the gain.
+
+```{r reduced, eval = nzchar(params$reduced_suffix)}
+red_path <- file.path(out_dir, paste0("shapreg_feature_", params$reduced_suffix, ".csv"))
+have_red <- file.exists(red_path)
+if (!have_red) {
+  cat("The reduced run is not on disk yet. To build it:\n\n")
+  cat("  drop <- reduce_to_representatives(<featcorr_clusters csv>, <shapreg_feature csv>, 0.8)$drop\n")
+  cat("  rmarkdown::render('10_rf_regression.Rmd', params = list(\n")
+  cat("      exclude_features = paste(drop, collapse = ','),\n")
+  cat("      feature_set_label = 'tcoreg_reduced'))\n")
+  cat("  then the same params for 11_shap_regression.Rmd\n")
+} else {
+  red <- read_csv(red_path, show_col_types = FALSE) %>%
+    transmute(feature, family, share_red = share_pct, dir_red = shap_value_cor)
+  full <- long %>% filter(experiment == exps$label[1]) %>%
+    dplyr::select(feature, family, share_full = share, dir_full = direction)
+  cat(sprintf("full model: %d features | reduced model: %d features | removed: %d\n",
+              nrow(full), nrow(red), nrow(full) - nrow(red)))
+
+  # What each retained feature gained once its near-duplicates were removed.
+  cmp <- red %>% inner_join(full %>% dplyr::select(feature, share_full, dir_full), by = "feature") %>%
+    mutate(gain = share_red - share_full) %>% arrange(desc(share_red))
+  cat("\ntop of the reduced model, with what each feature gained:\n")
+  print(as.data.frame(cmp %>% head(15) %>%
+    mutate(across(where(is.numeric), ~ round(., 2)))), row.names = FALSE)
+
+  # The question this variant exists to answer, per cluster.
+  if (!is.null(corr_group)) {
+    grp <- corr_group %>% inner_join(full, by = "feature") %>%
+      group_by(group) %>%
+      summarise(members = n(),
+                combined_full = sum(share_full),
+                kept = paste(intersect(feature, red$feature), collapse = ", "),
+                kept_full = sum(share_full[feature %in% red$feature]), .groups = "drop") %>%
+      mutate(kept_red = red$share_red[match(kept, red$feature)],
+             recovered = 100 * (kept_red - kept_full) / (combined_full - kept_full)) %>%
+      arrange(desc(combined_full))
+    cat("\nper cluster: did the survivor absorb what the dropped members were carrying?\n")
+    print(as.data.frame(grp %>% dplyr::select(kept, members, combined_full, kept_full,
+                                              kept_red, recovered) %>%
+      mutate(across(where(is.numeric), ~ round(., 2)))), row.names = FALSE)
+    cat("\n  combined_full = the cluster's total share in the full model\n")
+    cat("  kept_full     = the survivor's share there, before the others were removed\n")
+    cat("  kept_red      = its share after the refit\n")
+    cat("  recovered     = what fraction of the dropped members' share it picked up (%)\n")
+    cat("\nNear 100 means the cluster really was one signal. Well under 100 means the dropped\n")
+    cat("features were carrying something of their own that is now simply gone.\n")
+  }
+}
+```
+
+```{r fig_reduced, eval = nzchar(params$reduced_suffix) && exists("have_red") && have_red, fig.width = 7, fig.height = 12}
+Mr <- red %>% transmute(feature, !!exps$label[1] := share_red) %>%
+  column_to_rownames("feature") %>% as.matrix()
+Mr <- Mr[order(Mr[, 1], decreasing = TRUE), , drop = FALSE]
+anno_r <- data.frame(family = red$family[match(rownames(Mr), red$feature)],
+                     row.names = rownames(Mr))
+r_args <- list(mat = Mr,
+  color = colorRampPalette(c("white", "#FDD9A0", "#E69F00", "#D55E00"))(101),
+  breaks = seq(0, max(Mr), length.out = 102),
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  annotation_row = anno_r, annotation_col = anno_col,
+  annotation_colors = list(family = fam_cols),
+  display_numbers = TRUE, number_format = "%.1f", fontsize_number = 7,
+  fontsize_row = 8, fontsize_col = 9, cellwidth = 42,
+  main = sprintf("Reduced model: %d features, one per correlated cluster", nrow(Mr)))
+do.call(pheatmap, r_args)
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", "15_heatmap_reduced_magnitude.pdf"), width = 7,
+      height = max(4, 0.17 * nrow(Mr) + 2))
+  do.call(pheatmap, r_args); dev.off()
+}
+
+Mrd <- red %>% transmute(feature, !!exps$label[1] := dir_red) %>%
+  column_to_rownames("feature") %>% as.matrix()
+Mrd <- Mrd[rownames(Mr), , drop = FALSE]
+rd_args <- modifyList(r_args, list(mat = Mrd,
+  color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  breaks = seq(-1, 1, length.out = 102), number_format = "%.2f",
+  main = "Reduced model: direction"))
+do.call(pheatmap, rd_args)
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", "15_heatmap_reduced_direction.pdf"), width = 7,
+      height = max(4, 0.17 * nrow(Mrd) + 2))
+  do.call(pheatmap, rd_args); dev.off()
+}
+```
+
+# 6. Adding the next experiment
+
+```{r next_steps}
+cat("This heatmap currently has", ncol(M), "column(s).\n\n")
+cat("To add an experiment, run 10_ and 11_ for it, then add one pair to the experiments param:\n\n")
+cat('  params = list(experiments = paste(\n')
+cat('    "si3d hypoxia 1hr=', exps$suffix[1], '",\n', sep = "")
+cat('    "si3d normoxia 1hr=<that run\'s suffix>",\n')
+cat('    sep = ";"))\n\n')
+cat("Nothing else in this notebook changes: rows become the shared feature set, columns get\n")
+cat("clustered once there are more than two, and the assert above fails loudly if a new\n")
+cat("experiment does not describe the same features.\n\n")
+cat("Two things that must hold for a new column to be comparable:\n")
+cat("  * the same 69 features, asserted above\n")
+cat("  * its own noise floor, measured by 11d_/11f_ for that experiment. The floor is driven by\n")
+cat("    gene count and outcome spread, so it does not transfer between experiments.\n")
+```
+
+```{r export}
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+if (exists("cmp")) reg_write_csv(cmp, file.path(out_dir, "shapreg_heatmap_reduced_vs_full.csv"))
+if (exists("grp")) reg_write_csv(grp, file.path(out_dir, "shapreg_heatmap_cluster_recovery.csv"))
+reg_write_csv(long %>% mutate(signed = share * sign(direction)),
+              file.path(out_dir, "shapreg_heatmap_long.csv"))
+reg_write_csv(as_tibble(M, rownames = "feature"),
+              file.path(out_dir, "shapreg_heatmap_features.csv"))
+reg_write_csv(as_tibble(Mf, rownames = "family"),
+              file.path(out_dir, "shapreg_heatmap_family.csv"))
+if (!is.null(corr_group))
+  reg_write_csv(as_tibble(Mc, rownames = "group"),
+                file.path(out_dir, "shapreg_heatmap_cluster.csv"))
+cat("Wrote the heatmap matrices in long and wide form.\n")
+```

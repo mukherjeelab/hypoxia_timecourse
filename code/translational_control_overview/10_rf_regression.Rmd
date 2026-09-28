@@ -23,6 +23,7 @@ params:
   initiation_score: "both"
   include_deprecated: FALSE
   exclude_families: ""
+  exclude_features: ""
   shuffle_families: ""
   outcome_csv: ""
   outcome_col: "te_lfc"
@@ -598,6 +599,26 @@ n_init <- sum(sel$feature %in% c("kozak_pwm_score", "kozak_pwm_score_v2",
 stopifnot("an exclusive initiation_score let two start-context scores through" =
             params$initiation_score == "both" || n_init <= 1L)
 
+# Drop named individual features. Used to keep one representative per correlated cluster, so a
+# signal split across near-duplicates is carried by a single row instead. This CHANGES the model:
+# the retained feature absorbs the dropped ones' role, which is the whole point and is also why
+# this cannot be done by deleting rows from a heatmap after the fact.
+#
+# A distinct feature_set_label is required, because exclude_features is not part of the output
+# suffix - without it a reduced run would silently overwrite the full run's model, importance and
+# SHAP. Same hazard neg_tag guards against in 02_.
+if (nzchar(params$exclude_features)) {
+  drop_feats <- str_trim(str_split(params$exclude_features, ",")[[1]])
+  unknown <- setdiff(drop_feats, annotation$feature)
+  stopifnot("exclude_features names a column that is not in the annotation" = !length(unknown),
+            "exclude_features needs a distinct feature_set_label or it overwrites the full run" =
+              params$feature_set_label != "tcoreg")
+  n_before_ef <- nrow(sel)
+  sel <- sel %>% filter(!feature %in% drop_feats)
+  cat("Excluded", n_before_ef - nrow(sel), "named features:",
+      paste(drop_feats, collapse = ", "), "\n")
+}
+
 if (nzchar(params$exclude_families)) {
   drop_fams <- str_trim(str_split(params$exclude_families, ",")[[1]])
   stopifnot("exclude_families names an unknown family" = all(drop_fams %in% annotation$family))
@@ -680,7 +701,15 @@ stopifnot("a feature is near-collinear with the outcome - a renamed leak" =
 
 # Parity with the classifier's feature set. This replaces gate_against_baseline: it has content
 # (it can fail) and it is the precondition that makes 12_'s comparison about model type.
-if (isTRUE(params$gate_feature_parity)) {
+# Parity cannot hold when features have been deliberately removed, so the gate skips itself
+# rather than requiring every caller to remember to switch it off. Its purpose is to guarantee
+# that 12_'s classifier comparison is about model type; a reduced-feature run is not for that
+# comparison, and saying so here is better than failing on a condition that is false by design.
+if (isTRUE(params$gate_feature_parity) && nzchar(params$exclude_features)) {
+  cat("Feature-parity gate SKIPPED: exclude_features removed features on purpose, so parity\n",
+      "  with the classifier's set cannot hold. This run is not comparable to 02_ in 12_.\n")
+}
+if (isTRUE(params$gate_feature_parity) && !nzchar(params$exclude_features)) {
   clf_imp_path <- file.path(out_dir, paste0("rf_importance_", clf_suffix, ".csv"))
   if (file.exists(clf_imp_path)) {
     clf_features <- read_csv(clf_imp_path, show_col_types = FALSE)$feature

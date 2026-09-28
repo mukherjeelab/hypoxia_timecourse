@@ -158,3 +158,46 @@ PRESET_FAMILIES_REG <- list(
   g4          = "g4",
   peptide     = c("nascent_peptide", "polya_track")
 )
+
+# --- one representative per correlated cluster -------------------------------------------
+# Builds the exclude_features list from 14_feature_correlation.Rmd's cluster table instead of
+# having it typed by hand, and guarantees the rule that matters for a cross-experiment heatmap:
+# EVERY cluster keeps exactly one survivor, never zero.
+#
+# Why never zero: a feature that looks like noise in one experiment may carry signal in another,
+# and if it is absent here its row is missing from this column while present in that one, so the
+# rows stop lining up. That is the whole thing the heatmap depends on. Dropping a whole cluster
+# also discards the concept, not just the redundancy.
+#
+# Representative choice, in order: largest SHAP share, then most central within the cluster
+# (highest mean |rho| to the other members), then fewest missing values. SHAP leads because it is
+# what the model actually used; centrality breaks ties, which for a 2-member cluster is always a
+# tie since both members share the single correlation.
+reduce_to_representatives <- function(clusters_csv, shap_csv, threshold = 0.8,
+                                      centrality = NULL) {
+  stopifnot("cluster table not found - run 14_feature_correlation.Rmd first" =
+              file.exists(clusters_csv),
+            "SHAP table not found - run 11_shap_regression.Rmd first" = file.exists(shap_csv))
+  cl <- readr::read_csv(clusters_csv, show_col_types = FALSE)
+  cl <- cl[abs(cl$threshold - threshold) < 1e-9, , drop = FALSE]
+  stopifnot("no clusters at that threshold" = nrow(cl) > 0)
+  sh <- readr::read_csv(shap_csv, show_col_types = FALSE)
+  cl$share <- sh$share_pct[match(cl$feature, sh$feature)]
+  if (!is.null(centrality)) cl$centrality <- centrality[cl$feature] else cl$centrality <- 0
+
+  keep <- vapply(split(cl, cl$cluster), function(d) {
+    o <- order(-d$share, -d$centrality, d$feature)
+    d$feature[o[1]]
+  }, character(1))
+  drop <- setdiff(cl$feature, keep)
+
+  # The invariant, asserted rather than trusted.
+  per_cluster_kept <- vapply(split(cl, cl$cluster),
+                             function(d) sum(!d$feature %in% drop), integer(1))
+  stopifnot(
+    "a cluster would lose every member - never drop a whole cluster" = all(per_cluster_kept == 1L),
+    "a kept feature is also in the drop list" = !any(keep %in% drop)
+  )
+  list(keep = unname(keep), drop = drop,
+       n_clusters = length(keep), n_dropped = length(drop))
+}
