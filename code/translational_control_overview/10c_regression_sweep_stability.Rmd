@@ -1,0 +1,283 @@
+---
+title: "`r paste0('Regression split-seed sweep: ', params$preset)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    # Code is folded by default with an "unfold" control on every block, and a "Code" menu at the
+    # top right to expand everything at once. The commentary in these chunks is long on purpose,
+    # so the default view should be the prose, the tables and the figures.
+    code_folding: hide
+params:
+  preset: "transform"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10c_regression_sweep_stability.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It reports one sweep from `10b_regression_split_sweep.R`: the same model refit across 20 different
+train/test splits, for each arm of a preset. The point is to show how much a single run's number
+moves when nothing about the model or the data changes, only which genes were held out.
+
+**Decisions**
+
+- Vary `split_seed` only. In `02_`'s classifier the equivalent axis was `neg_seed`, which changed
+  which negatives were drawn; there is no draw here, so the axis is the split.
+- Keep the forest seed fixed, so within a split every arm sees identical rows and arms can be
+  compared pairwise.
+- Judge arms on paired differences, whose spread is much smaller than the split-to-split spread.
+  An effect too small to see in a distribution comparison can be clear when paired.
+- Do not reuse the classifier's floor for regression quantities. Two 80/20 splits share about 81%
+  of their training rows, where a negative draw shared about 52% of genes, so this floor should be
+  tighter and is measured separately.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+```
+
+```{r load}
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+out_dir <- here("output", "translational_control_overview")
+
+stopifnot("unknown preset" = params$preset %in% names(REG_PRESETS))
+arms <- REG_PRESETS[[params$preset]]
+cat("Preset:", params$preset, "| arms:", paste(names(arms), collapse = ", "),
+    "| seeds:", length(REG_SPLIT_SEEDS), "\n")
+
+read_perf <- function(arm, seed) {
+  f <- file.path(out_dir, paste0("rfreg_performance_", reg_suffix(arm, seed), ".csv"))
+  if (!file.exists(f)) return(NULL)
+  d <- read_csv(f, show_col_types = FALSE)
+  tibble(split_seed = seed,
+         spearman  = d$value[d$metric == "spearman_raw_y"],
+         pearson   = d$value[d$metric == "pearson_raw_y"],
+         r2        = d$value[d$metric == "r2_pearson_sq_raw_y"],
+         oob_r2    = d$value[d$metric == "oob_r2"],
+         bridge    = d$value[d$metric == "bridge_auc_geneset"],
+         n_feat    = d$value[d$metric == "n_features"])
+}
+sw <- imap_dfr(arms, function(a, nm)
+  map_dfr(REG_SPLIT_SEEDS, ~ read_perf(a, .x)) %>% mutate(arm = nm))
+stopifnot("no sweep outputs found - run 10b_regression_split_sweep.R first" = nrow(sw) > 0)
+sw$arm <- factor(sw$arm, levels = names(arms))
+
+present <- sw %>% count(arm, name = "n_seeds")
+print(as.data.frame(present), row.names = FALSE)
+if (any(present$n_seeds < length(REG_SPLIT_SEEDS)))
+  cat("WARNING: incomplete arms. Paired statistics use only seeds present in Every arm.\n")
+# Pair on the intersection, so a missing render cannot turn a paired test into an unpaired one.
+complete_seeds <- sw %>% count(split_seed) %>% filter(n == length(arms)) %>% pull(split_seed)
+cat("Seeds complete across all arms:", length(complete_seeds), "\n")
+```
+
+# 1. How much one run's number moves
+
+Reports each arm's spread across the 20 splits.
+
+**Decisions**
+
+- Report the full range alongside the standard deviation, since the range is what a single
+  unlucky or lucky run could have reported.
+- Assert the feature count is identical across the seeds within each arm, so an arm's runs differ
+  only by the split. Between arms it may legitimately differ, because an `exclude_families` arm
+  drops the family under test.
+
+
+```{r spread}
+spread <- sw %>% group_by(arm) %>%
+  summarise(n = n(),
+            across(c(spearman, bridge, oob_r2),
+                   list(median = median, sd = sd,
+                        p05 = ~ quantile(.x, 0.05), p95 = ~ quantile(.x, 0.95))),
+            .groups = "drop")
+print(as.data.frame(spread %>% mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+
+cat("\nThe number a SINGLE run would have reported, per arm:\n")
+for (a in levels(sw$arm)) {
+  s <- sw %>% filter(arm == a)
+  cat(sprintf("  %-8s Spearman range %.4f to %.4f (spread %.4f = %.1fx its own sd)\n",
+              a, min(s$spearman), max(s$spearman), diff(range(s$spearman)),
+              diff(range(s$spearman)) / sd(s$spearman)))
+}
+# The feature set must not move across the SEEDS WITHIN an arm: if it does, that arm's runs differ
+# by more than the split and its paired differences are confounded.
+#
+# Between arms a difference is expected, not a fault. family_arms_reg()'s `none` arm passes
+# exclude_families, so it deliberately drops the family under test - 9 columns for the g4 preset,
+# 5 for peptide - while `real` and `shuf` keep all of them (shuffling permutes values, never drops
+# a column). Asserting one global feature count therefore made this report unproducible for 2 of
+# the 5 presets, which is the opposite of what the header promises.
+feat_by_arm <- sw %>% group_by(arm) %>%
+  summarise(n_runs = n(), n_feat = paste(sort(unique(n_feat)), collapse = ", "),
+            n_distinct_feat = n_distinct(n_feat), .groups = "drop")
+print(as.data.frame(feat_by_arm), row.names = FALSE)
+stopifnot("the feature count varies across seeds within an arm - those runs differ by more than the split" =
+            all(feat_by_arm$n_distinct_feat == 1))
+if (nrow(feat_by_arm) > 1 && n_distinct(feat_by_arm$n_feat) > 1)
+  cat("\nFeature counts differ BETWEEN arms, which is expected when an arm excludes a family.\n")
+cat("\nFeature count constant within every arm.\n")
+```
+
+# 2. Paired differences
+
+Compares each arm against the preset's first arm, pairing within split seed.
+
+**Decisions**
+
+- Pair on the intersection of seeds present in every arm, so a failed render cannot quietly turn a
+  paired test into an unpaired one.
+- Report the ratio of the paired spread to the unpaired spread, which is what shows why pairing
+  was necessary.
+
+
+```{r paired}
+# Everything is compared against the first arm, which is the preset's reference by construction.
+ref <- levels(sw$arm)[1]
+wide <- sw %>% filter(split_seed %in% complete_seeds) %>%
+  dplyr::select(arm, split_seed, spearman) %>%
+  pivot_wider(names_from = arm, values_from = spearman)
+
+pair_tbl <- map_dfr(setdiff(levels(sw$arm), ref), function(a) {
+  d <- wide[[a]] - wide[[ref]]
+  tibble(comparison = paste(a, "-", ref), n = length(d),
+         mean_delta = mean(d), sd_delta = sd(d),
+         n_positive = sum(d > 0),
+         p_wilcox = tryCatch(wilcox.test(d)$p.value, error = function(e) NA_real_),
+         # The honest scale: a paired difference is readable only against ITS OWN sd, not
+         # against the much larger seed-to-seed sd.
+         ratio_to_unpaired_sd = sd(d) / sd(sw$spearman[sw$arm == ref]))
+})
+print(as.data.frame(pair_tbl %>% mutate(across(where(is.numeric), ~ signif(., 4)))),
+      row.names = FALSE)
+cat(sprintf("\nseed-to-seed sd of the reference arm: %.4f\n", sd(sw$spearman[sw$arm == ref])))
+cat("A paired difference far below that sd can still be real; an UNPAIRED comparison at this\n")
+cat("sample size could not resolve it. That is the whole reason the sweep is paired.\n")
+```
+
+```{r fig_sweep, fig.width = 11, fig.height = 4.6}
+p_pair <- ggplot(sw, aes(arm, spearman)) +
+  geom_line(data = sw %>% filter(split_seed %in% complete_seeds),
+            aes(group = split_seed), colour = "grey78", linewidth = 0.4) +
+  geom_point(aes(colour = arm), size = 2, alpha = 0.85) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.45, linewidth = 0.4, colour = "black") +
+  scale_colour_viridis_d(guide = "none", end = 0.85) +
+  labs(x = NULL, y = "Spearman vs raw held-out y",
+       title = "(a) Every arm on one yardstick",
+       subtitle = sprintf("grey lines join the same split_seed | %d seeds x %d arms",
+                          length(complete_seeds), length(arms))) +
+  theme_classic(base_size = 12)
+
+pd <- map_dfr(setdiff(levels(sw$arm), ref), function(a)
+  tibble(comparison = paste(a, "-", ref), delta = wide[[a]] - wide[[ref]]))
+p_delta <- ggplot(pd, aes(comparison, delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_boxplot(width = 0.4, outlier.shape = NA, fill = "grey92") +
+  geom_jitter(width = 0.08, size = 1.8, alpha = 0.8, colour = "#E69F00") +
+  geom_text(data = pair_tbl, aes(comparison, Inf,
+            label = sprintf("mean %+.4f\nsd %.4f\n%d/%d > 0\np = %.3g",
+                            mean_delta, sd_delta, n_positive, n, p_wilcox)),
+            vjust = 1.2, size = 2.9) +
+  labs(x = NULL, y = paste("paired difference in Spearman vs", ref),
+       title = "(b) Paired differences against their own sd",
+       subtitle = "zero is the null; the box is what the draw alone produces") +
+  theme_classic(base_size = 12)
+
+p_bridge <- ggplot(sw, aes(arm, bridge)) +
+  geom_line(data = sw %>% filter(split_seed %in% complete_seeds),
+            aes(group = split_seed), colour = "grey78", linewidth = 0.4) +
+  geom_point(aes(colour = arm), size = 2, alpha = 0.85) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.45, linewidth = 0.4, colour = "black") +
+  scale_colour_viridis_d(guide = "none", end = 0.85) +
+  labs(x = NULL, y = "bridge AUC vs the classifier's gene sets",
+       title = "(c) The AUC bridge, swept",
+       subtitle = "02_'s single reported test AUC was 0.8306") +
+  geom_hline(yintercept = 0.8306, linetype = "dotted", colour = "#0072B2") +
+  theme_classic(base_size = 12)
+
+pg <- plot_grid(p_pair, p_delta, p_bridge, nrow = 1, rel_widths = c(1, 1, 1))
+print(pg)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("10c_sweep_", params$preset, ".pdf")), pg, width = 11, height = 4.6)
+```
+
+# 3. Family shares across the sweep
+
+If SHAP was run for these arms, reports how much each family's share moves across splits.
+
+**Decisions**
+
+- Use `2.8 * sd` as the minimum detectable difference, matching how the classifier's floor was
+  built so the two can be combined later.
+- Skip cleanly and print the command to run when SHAP outputs are absent.
+
+
+```{r family_shares}
+# Only present if 11d_ was run for these arms. Family share is the cross-experiment quantity, so
+# its spread over the sweep IS the floor a reported share difference has to clear.
+fam <- imap_dfr(arms, function(a, nm)
+  map_dfr(REG_SPLIT_SEEDS, function(s) {
+    f <- file.path(out_dir, paste0("shapreg_family_", reg_suffix(a, s), ".csv"))
+    if (!file.exists(f)) return(NULL)
+    read_csv(f, show_col_types = FALSE) %>%
+      dplyr::select(family, share_pct) %>% mutate(arm = nm, split_seed = s)
+  }))
+have_shap <- nrow(fam) > 0
+if (!have_shap) {
+  cat("No shapreg_family_* files for this preset.\n")
+  cat("Run: Rscript code/translational_control_overview/11d_shap_regression_seed_sweep.R", params$preset, "\n")
+} else {
+  floor_tbl <- fam %>% group_by(arm, family) %>%
+    summarise(n = n(), median = median(share_pct), sd = sd(share_pct),
+              p05 = quantile(share_pct, 0.05), p95 = quantile(share_pct, 0.95),
+              # 2.8 sd, matching shap_noise_floor.csv's construction so the two are comparable.
+              min_detectable_diff = 2.8 * sd, .groups = "drop") %>%
+    arrange(arm, desc(median))
+  print(as.data.frame(floor_tbl %>% mutate(across(where(is.numeric), ~ round(., 3)))),
+        row.names = FALSE)
+}
+```
+
+```{r fig_family, eval = have_shap, fig.width = 9, fig.height = 5}
+p_fam <- fam %>%
+  mutate(family = fct_reorder(family, share_pct, .fun = median)) %>%
+  ggplot(aes(share_pct, family, colour = arm)) +
+  geom_point(position = position_dodge(width = 0.5), size = 1.5, alpha = 0.6) +
+  scale_colour_viridis_d(end = 0.85, name = NULL) +
+  labs(x = "family share of total |SHAP| (%)", y = NULL,
+       title = "Family shares across split seeds",
+       subtitle = sprintf("one point per seed. The SPREAD is the floor, not the median. n = %d seeds",
+                          n_distinct(fam$split_seed))) +
+  theme_classic(base_size = 12)
+print(p_fam)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("10c_family_shares_", params$preset, ".pdf")), p_fam,
+         width = 9, height = 5)
+```
+
+```{r export}
+reg_write_csv(sw, file.path(out_dir, paste0("rfreg_sweep_", params$preset, ".csv")))
+reg_write_csv(pair_tbl, file.path(out_dir, paste0("rfreg_sweep_paired_", params$preset, ".csv")))
+if (have_shap)
+  reg_write_csv(floor_tbl, file.path(out_dir, paste0("shapreg_noise_floor_", params$preset, ".csv")))
+cat("Wrote sweep report for preset:", params$preset, "\n")
+```

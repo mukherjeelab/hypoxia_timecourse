@@ -1,0 +1,208 @@
+---
+title: "`r paste0('Regression SHAP stability: ', params$preset, ' / ', params$arm)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    # Code is folded by default with an "unfold" control on every block, and a "Code" menu at the
+    # top right to expand everything at once. The commentary in these chunks is long on purpose,
+    # so the default view should be the prose, the tables and the figures.
+    code_folding: hide
+params:
+  preset: "transform"
+  arm: "raw"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "11f_shap_regression_stability.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It reads the SHAP outputs that `11d_shap_regression_seed_sweep.R` produced across 20 splits and
+reports how much a family share and a feature rank move when nothing biological changes - the same
+10,172 genes every run, a different 80% used for training, the forest seed fixed.
+
+That spread is the threshold a single run's number has to clear before it means anything.
+
+**Decisions**
+
+- Measure this separately from the classifier's floor rather than reusing it. The two come from
+  different sources: the classifier's from which negatives were drawn (about 52% gene overlap),
+  this one from which rows train (about 81% overlap). This one is expected to be tighter, and the
+  ratio is reported rather than assumed.
+- Express the threshold as `2.8 * sd`, matching how the classifier's floor was built so `12_` can
+  combine them.
+- Report the threshold per family, not as one number.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r load}
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+out_dir <- here("output", "translational_control_overview")
+
+stopifnot("unknown preset" = params$preset %in% names(REG_PRESETS))
+arm <- REG_PRESETS[[params$preset]][[params$arm]]
+stopifnot("unknown arm for this preset" = !is.null(arm))
+
+feat <- map_dfr(REG_SPLIT_SEEDS, function(s) {
+  f <- file.path(out_dir, paste0("shapreg_feature_", reg_suffix(arm, s), ".csv"))
+  if (!file.exists(f)) return(NULL)
+  read_csv(f, show_col_types = FALSE) %>% mutate(split_seed = s)
+})
+stopifnot("no shapreg_feature_* files found - run 11d_shap_regression_seed_sweep.R first" =
+            nrow(feat) > 0)
+n_seeds <- n_distinct(feat$split_seed)
+cat("Seeds:", n_seeds, "| features per run:", n_distinct(feat$feature), "\n")
+stopifnot("the feature set changed across the sweep" =
+            n_distinct(table(feat$split_seed)) == 1)
+```
+
+# 1. Family share floor
+
+Reports each family's share across the 20 splits, and compares the spread to the classifier's.
+
+**Decisions**
+
+- Prefer the empirical 5th-to-95th percentile interval over a normal-theory one, since shares are
+  bounded below at zero and skewed for the small families.
+
+
+```{r family_floor}
+fam <- feat %>% group_by(split_seed, family) %>%
+  summarise(share = sum(mean_abs_shap), .groups = "drop_last") %>%
+  group_by(split_seed) %>% mutate(share = 100 * share / sum(share)) %>% ungroup()
+
+floor_tbl <- fam %>% group_by(family) %>%
+  summarise(n = n(), median = median(share), sd = sd(share),
+            lo = quantile(share, 0.05), hi = quantile(share, 0.95),
+            cv_pct = 100 * sd / median,
+            # 2.8 * sd, matching shap_noise_floor.csv's construction exactly so the two floors
+            # can be combined in 12_. Two single-run experiments each carry their own draw
+            # noise, so the relevant scale is ~sqrt(2) x sd; 2.8 is that, rounded up.
+            min_detectable_diff = 2.8 * sd, .groups = "drop") %>%
+  arrange(desc(median))
+print(as.data.frame(floor_tbl %>% mutate(across(where(is.numeric), ~ round(., 3)))),
+      row.names = FALSE)
+cat("\nThe threshold is PER FAMILY, not one number: ",
+    sprintf("%s needs %.2f pp, %s only %.2f pp.\n",
+            floor_tbl$family[which.max(floor_tbl$min_detectable_diff)],
+            max(floor_tbl$min_detectable_diff),
+            floor_tbl$family[which.min(floor_tbl$min_detectable_diff)],
+            min(floor_tbl$min_detectable_diff)))
+
+# Compare against the classification floor, if present. The expectation is that this one is
+# tighter, because the split reuses ~81% of rows where the draw reused ~52% of genes.
+clf_f <- file.path(out_dir, "shap_noise_floor.csv")
+if (file.exists(clf_f)) {
+  cmp <- read_csv(clf_f, show_col_types = FALSE) %>%
+    dplyr::select(family, sd_clf = sd, mdd_clf = min_detectable_diff) %>%
+    inner_join(floor_tbl %>% dplyr::select(family, sd_reg = sd, mdd_reg = min_detectable_diff),
+               by = "family") %>%
+    mutate(ratio = sd_reg / sd_clf) %>% arrange(ratio)
+  print(as.data.frame(cmp %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+  cat(sprintf("\nregression sd / classifier sd: median %.2f over %d families (< 1 means tighter)\n",
+              median(cmp$ratio), nrow(cmp)))
+}
+```
+
+```{r fig_floor, fig.width = 9, fig.height = 5}
+p <- fam %>% mutate(family = fct_reorder(family, share, .fun = median)) %>%
+  ggplot(aes(share, family)) +
+  geom_point(size = 1.6, alpha = 0.55, colour = "#E69F00",
+             position = position_jitter(height = 0.12, seed = 9)) +
+  stat_summary(fun = median, geom = "point", size = 2.6, colour = "black") +
+  labs(x = "family share of total |SHAP| (%)", y = NULL,
+       title = "What a family share is worth with nothing biological varying",
+       subtitle = sprintf("one point per split seed, n = %d seeds | black = median", n_seeds)) +
+  theme_classic(base_size = 12)
+print(p)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("11f_family_floor_", params$preset, "_", params$arm, ".pdf")),
+         p, width = 9, height = 5)
+```
+
+# 2. Rank stability and direction
+
+Reports how stable the feature ranking is across splits, and which features' directions can be
+read at all.
+
+**Decisions**
+
+- Compute the within-model top-20 overlap, which `12_` needs in order to interpret its cross-model
+  number.
+- Name the features that are top-20 in every split, since those are the ones that can be ranked
+  off a single run.
+- Flag features whose direction flips sign across splits. Those have no interpretable direction and
+  should be grouped rather than dropped wherever the decomposition has to keep adding up.
+
+
+```{r rank_stability}
+# 12_ needs this number: a CROSS-model top-20 Jaccard means little until you know how well each
+# model agrees with itself across its own replication axis.
+tops <- feat %>% group_by(split_seed) %>% slice_min(rank_shap, n = 20) %>%
+  summarise(f = list(feature), .groups = "drop")
+pairs <- combn(nrow(tops), 2)
+jac <- apply(pairs, 2, function(ij) {
+  a <- tops$f[[ij[1]]]; b <- tops$f[[ij[2]]]
+  length(intersect(a, b)) / length(union(a, b))
+})
+always <- feat %>% filter(rank_shap <= 20) %>% count(feature) %>% filter(n == n_seeds)
+cat(sprintf("top-20 Jaccard across seed pairs: median %.3f (range %.3f-%.3f, %d pairs)\n",
+            median(jac), min(jac), max(jac), length(jac)))
+cat(sprintf("features top-20 in EVERY seed: %d of 20\n", nrow(always)))
+cat("  ", paste(always$feature, collapse = ", "), "\n")
+cat("\nRank a feature off a single run only if it clears that bar.\n")
+```
+
+```{r direction_stability}
+# A feature whose shap_value_cor sign flips across seeds has no interpretable direction. 03f_
+# found 14 of 69 such features for the classifier; the same test here says which regression
+# features can be read directionally at all.
+dir_tbl <- feat %>% group_by(feature, family) %>%
+  summarise(n = n(), frac_pos = mean(shap_value_cor > 0, na.rm = TRUE),
+            median_cor = median(shap_value_cor, na.rm = TRUE), .groups = "drop") %>%
+  arrange(abs(frac_pos - 0.5))
+unstable <- dir_tbl %>% filter(frac_pos > 0.05, frac_pos < 0.95)
+cat(sprintf("sign-unstable features (0.05 < frac_pos < 0.95): %d of %d\n",
+            nrow(unstable), nrow(dir_tbl)))
+if (nrow(unstable))
+  print(as.data.frame(unstable %>% mutate(across(where(is.numeric), ~ round(., 3)))),
+        row.names = FALSE)
+cat("\nDirection is uninterpretable for these. They must be lumped, not deleted, wherever\n")
+cat("additivity has to survive.\n")
+```
+
+```{r export}
+reg_write_csv(floor_tbl, file.path(out_dir,
+  paste0("shapreg_noise_floor_", params$preset, "_", params$arm, ".csv")))
+reg_write_csv(dir_tbl, file.path(out_dir,
+  paste0("shapreg_direction_stability_", params$preset, "_", params$arm, ".csv")))
+reg_write_csv(tibble(arm = params$arm, preset = params$preset,
+                     median_jaccard = median(jac), min_jaccard = min(jac),
+                     max_jaccard = max(jac), n_pairs = length(jac),
+                     always_top20 = nrow(always)),
+  file.path(out_dir, paste0("shapreg_top20_jaccard_", params$preset, ".csv")))
+# Also write the arm-agnostic name 10c_/12_ look for by default.
+reg_write_csv(floor_tbl %>% mutate(arm = params$arm),
+  file.path(out_dir, paste0("shapreg_noise_floor_", params$preset, ".csv")))
+cat("Wrote the regression SHAP floor for", params$preset, "/", params$arm, "\n")
+```

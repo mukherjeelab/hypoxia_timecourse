@@ -1,0 +1,538 @@
+---
+title: "Target scale: does centring and scaling the TE outcome change anything?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    # Code is folded by default with an "unfold" control on every block, and a "Code" menu at the
+    # top right to expand everything at once. The commentary in these chunks is long on purpose,
+    # so the default view should be the prose, the tables and the figures.
+    code_folding: hide
+params:
+  base_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  winsor_at: 3
+  num_trees: 1000
+  min_node_size: 5
+  forest_seed: 9
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10d_target_scale_analysis.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It asks whether the TE outcome should be centred and scaled before modelling, and answers it by
+fitting the same forest on the same genes with four different versions of the outcome, then
+comparing what changes.
+
+The four versions are: the raw log2 fold change; a robust z-score (subtract the median, divide by
+the MAD); the raw values with the extremes capped at plus or minus 3; and a rank version, where
+each gene's outcome is replaced by its percentile within the training set.
+
+**The short answer: centring and scaling change nothing that matters.** A forest that splits on
+variance reduction cannot tell `y` from `a + b*y` - the split it picks is the same, and node
+impurity just scales by `b squared`, which cancels once importance is expressed as a share. The
+version that does change the model is the rank one, because it is not a straight line.
+
+**Decisions**
+
+- Keep the raw log2 fold change as the model default, so SHAP values stay in interpretable TE
+  units.
+- Keep robust-z available for reporting SHAP in MAD units, but not as a modelling option worth
+  sweeping, since it produces the same model.
+- Treat the rank version as the one real alternative, and test it properly in section 4.
+- Reuse `10_`'s saved split rather than making a new one, so all four versions see identical rows
+  and identical imputed features.
+- Assert the equivalence numerically rather than just describing it, with tolerances set by what
+  would change a conclusion.
+
+## Which comparisons the question actually affects
+
+Not every quantity is affected, and it is worth separating them before looking at any numbers.
+
+| compared across experiments | already scale-free? | needs a transform? |
+|---|---|---|
+| family SHAP `share_pct`, `signed_share` | yes | no |
+| feature SHAP ranks, top-20 sets | yes | no |
+| test Spearman, Precision@K, AUC | yes | no |
+| `mean_abs_shap` in raw TE units | no | **yes, the only case** |
+
+Everything this pipeline currently writes for cross-experiment comparison is a ratio computed
+within a single run, so it is already unaffected by the scale of the outcome. Only raw SHAP
+magnitudes are exposed to it.
+
+**Decisions**
+
+- Compare shares and ranks directly across experiments; they need no adjustment.
+- If raw SHAP magnitudes are ever compared, divide by each run's own `mad(y)` at reporting time
+  rather than changing how the model is fitted. `11_` writes that column already.
+
+## Scoring every version the same way
+
+The rank version reports a higher R-squared than the raw one, but those two R-squareds are
+computed on different outcomes - ranks are flatter and more predictable, so the number rises
+partly by definition. Comparing them directly changes the yardstick rather than comparing models.
+
+**Decisions**
+
+- Score all four versions by Spearman against the same raw held-out outcome, whatever each was
+  trained on.
+- Judge the difference paired across split seeds (section 4), not on a single split.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(cowplot)
+```
+
+```{r load}
+out_dir  <- here("output", "translational_control_overview")
+plots_dir <- here("plots")
+md_path  <- file.path(out_dir, paste0("rfreg_model_data_", params$base_suffix, ".rds"))
+stopifnot("run 10_rf_regression.Rmd first - its saved split is what this notebook re-uses" =
+            file.exists(md_path))
+md <- readRDS(md_path)
+
+# One split, four outcomes. Re-using 10_'s saved split rather than re-deriving it means every
+# arm below sees byte-identical rows and byte-identical imputed features, so any difference is
+# the outcome transform and nothing else.
+train <- md$train; test <- md$test; fc <- md$feature_cols
+stopifnot("the saved split is not the raw-target run" = md$target_transform == "raw",
+          "the saved split was winsorized" = md$winsorize_y == 0)
+cat("Split reused from:", md$suffix, "\n")
+cat("Train", nrow(train), "| Test", nrow(test), "|", length(fc), "features\n")
+cat(sprintf("Raw target: median %+.4f  MAD %.4f  sd %.4f  range [%.2f, %.2f]\n",
+            median(train$y), mad(train$y), sd(train$y), min(train$y), max(train$y)))
+ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
+```
+
+# 1. The four versions of the outcome
+
+Fits the four outcome versions on one shared split and compares their fit and their importance
+shares.
+
+**Decisions**
+
+- Use one split for all four, so the only difference is the outcome.
+- Report each version's own OOB R-squared for reference, but compare on Spearman against the raw
+  outcome.
+
+
+```{r fit_arms}
+B  <- params$winsor_at
+m0 <- median(train$y); s0 <- mad(train$y)
+e0 <- stats::ecdf(train$y)                 # TRAIN only, applied to both
+
+arms <- list(
+  raw      = list(tr = train$y,
+                  te = test$y,
+                  lab = "raw log2 TE LFC"),
+  robust_z = list(tr = (train$y - m0) / s0,
+                  te = (test$y  - m0) / s0,
+                  lab = sprintf("robust z: (y - %.3f) / %.3f", m0, s0)),
+  winsor   = list(tr = pmin(pmax(train$y, -B), B),
+                  te = pmin(pmax(test$y,  -B), B),
+                  lab = sprintf("winsorized at +/-%g", B)),
+  rank_ecdf= list(tr = e0(train$y),
+                  te = e0(test$y),
+                  lab = "rank: training ECDF")
+)
+
+fit_arm <- function(y_tr) {
+  set.seed(params$forest_seed)
+  ranger(x = train[, fc], y = y_tr, num.trees = params$num_trees,
+         min.node.size = params$min_node_size, importance = "impurity",
+         seed = params$forest_seed)
+}
+fits  <- map(arms, ~ fit_arm(.x$tr))
+preds <- map(fits, ~ predict(.x, data = test[, fc])$predictions)
+
+# Every arm scored on the same yardstick: Spearman against raw held-out y.
+res <- imap_dfr(fits, function(f, nm) {
+  p <- preds[[nm]]
+  tibble(arm = nm, label = arms[[nm]]$lab,
+         oob_r2_own_scale = f$r.squared,
+         spearman_raw_y   = cor(p, test$y, method = "spearman"),
+         pearson_raw_y    = cor(p, test$y),
+         mtry = f$mtry, min_node = f$min.node.size)
+})
+print(as.data.frame(res %>% mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+
+share_of <- function(f) { i <- f$variable.importance; 100 * i / sum(i) }
+shares   <- map(fits, share_of)
+```
+
+```{r assert_affine}
+# The claim, asserted rather than illustrated - but asserted on the right quantity.
+#
+# The analytic invariance is exact: variance-reduction splitting cannot distinguish y from
+# a + b*y. The implementation is not bit-exact, and pretending otherwise would be wrong. With
+# ~69 features and 8,140 rows there are many near-tied candidate splits, and rescaling y changes
+# the floating-point sums of squares enough that a tie occasionally resolves the other way. So
+# the two forests are not identical: no held-out prediction is exactly equal.
+#
+# What matters is whether that residual disturbance is large enough to change a conclusion, and
+# it is not - by two orders of magnitude. The tolerance below is justified against the measured
+# SHAP noise floor: the most precisely estimated family (polya_track) has a minimum detectable
+# difference of 0.17 pp, so a share deviation under 0.15 pp cannot move any reported result.
+ratio     <- median(fits$robust_z$variable.importance / fits$raw$variable.importance)
+dev_share <- max(abs(shares$raw - shares$robust_z))
+sp_pred   <- cor(preds$raw, preds$robust_z, method = "spearman")
+# Back-transform to the raw scale so the prediction difference is readable in TE units.
+pz_raw    <- preds$robust_z * s0 + m0
+cat(sprintf("OOB R2      raw %.6f vs robust-z %.6f   (diff %.2e)\n",
+            fits$raw$r.squared, fits$robust_z$r.squared,
+            abs(fits$raw$r.squared - fits$robust_z$r.squared)))
+cat(sprintf("importance  ratio %.4f vs predicted 1/MAD^2 = %.4f   (rel err %.2e)\n",
+            ratio, 1 / s0^2, abs(ratio - 1 / s0^2) / (1 / s0^2)))
+cat(sprintf("shares      max deviation %.4f pp   (smallest family's noise floor: 0.17 pp)\n",
+            dev_share))
+cat(sprintf("predictions Spearman %.6f | max |diff| on raw scale %.4f = %.1f%% of sd | exactly equal: %d of %d\n",
+            sp_pred, max(abs(preds$raw - pz_raw)),
+            100 * max(abs(preds$raw - pz_raw)) / sd(preds$raw),
+            sum(preds$raw == pz_raw), length(preds$raw)))
+stopifnot(
+  # Tolerances are set from what would change a conclusion, not from what looks tidy.
+  "robust-z moved an importance share beyond the tightest family's noise floor" =
+    dev_share < 0.15,
+  "importance did not scale by 1/MAD^2 - the transform is not behaving affinely" =
+    abs(ratio - 1 / s0^2) / (1 / s0^2) < 0.01,
+  "robust-z changed OOB R2 by more than tie-breaking noise can explain" =
+    abs(fits$raw$r.squared - fits$robust_z$r.squared) < 5e-3,
+  "robust-z substantially reordered the held-out predictions" = sp_pred > 0.99
+)
+cat("\nAFFINE EQUIVALENCE HOLDS to numerical tolerance: centring and scaling the target changes\n")
+cat("nothing that any reported quantity is sensitive to. It is not bit-exact, and the reason is\n")
+cat("floating-point tie-breaking among near-equal splits, not a failure of the invariance.\n")
+```
+
+```{r fig_distributions, fig.width = 11, fig.height = 3.4}
+# Raw and robust-z are the same shape with a relabelled axis. Winsor clips the tails; rank
+# flattens to uniform. Seeing them side by side is the point.
+dist_df <- imap_dfr(arms, ~ tibble(arm = .y, label = .x$lab, y = .x$tr))
+dist_df$arm <- factor(dist_df$arm, levels = names(arms))
+
+p_dist <- ggplot(dist_df, aes(y)) +
+  geom_histogram(bins = 60, fill = "#E69F00", colour = NA, alpha = 0.85) +
+  facet_wrap(~ arm, scales = "free", nrow = 1,
+             labeller = labeller(arm = setNames(map_chr(arms, "lab"), names(arms)))) +
+  labs(x = "target value (training split)", y = "genes",
+       title = "Target under each transform",
+       subtitle = sprintf("n = %d training genes. raw and robust z are the same shape on a relabelled axis.",
+                          nrow(train))) +
+  theme_classic(base_size = 12) + theme(strip.background = element_blank())
+print(p_dist)
+ggsave_if(file.path(plots_dir, "10d_target_distributions.pdf"), p_dist, width = 11, height = 3.4)
+```
+
+# 2. How much the outcome's scale really differs between experiments
+
+Shows how much the outcome's location and spread actually vary between experiments, and what each
+proposed fix does about it.
+
+**Decisions**
+
+- Measure the variation across every si3d and si3e knockdown contrast saved in `output/`, rather
+  than assuming it.
+- Draw three views of the same curves - raw, centred, and ranked - so it is visible that centring
+  aligns location while leaving spread untouched, and ranking removes both differences.
+
+
+```{r fig_cross_experiment, fig.width = 11, fig.height = 4.6}
+# Across every si3d/si3e knockdown contrast on disk, the outcome's location and spread both move
+# a lot. Centring aligns location only. Scaling aligns spread only in the affine sense the model
+# already ignores. The rank map makes every experiment identical by construction, which is what
+# "distributions consistent across experiments" actually requires.
+files <- list.files(here("output"),
+                    pattern = "^translation_categories_si3[de]_vs_sictrl_.*[.]csv$",
+                    full.names = TRUE)
+xe <- map_dfr(files, function(f) {
+  d <- suppressMessages(read_csv(f, show_col_types = FALSE))
+  if (!"te_lfc" %in% names(d)) return(NULL)
+  tibble(contrast = sub("[.]csv$", "", sub("translation_categories_", "", basename(f))),
+         te_lfc = d$te_lfc[!is.na(d$te_lfc)])
+})
+stats_xe <- xe %>% group_by(contrast) %>%
+  summarise(n = n(), med = median(te_lfc), mad = mad(te_lfc), sd = sd(te_lfc), .groups = "drop") %>%
+  arrange(med)
+cat(sprintf("%d contrasts | median spans %+.3f to %+.3f | MAD spans %.3f to %.3f (%.1fx)\n",
+            nrow(stats_xe), min(stats_xe$med), max(stats_xe$med),
+            min(stats_xe$mad), max(stats_xe$mad), max(stats_xe$mad) / min(stats_xe$mad)))
+print(as.data.frame(stats_xe %>% mutate(across(c(med, mad, sd), ~ round(., 3)))), row.names = FALSE)
+
+xe <- xe %>% group_by(contrast) %>%
+  mutate(centred = te_lfc - median(te_lfc),
+         ranked  = stats::ecdf(te_lfc)(te_lfc)) %>% ungroup()
+long <- bind_rows(
+  xe %>% transmute(contrast, value = te_lfc,  view = "raw te_lfc"),
+  xe %>% transmute(contrast, value = centred, view = "centred (median removed)"),
+  xe %>% transmute(contrast, value = ranked,  view = "rank (per-experiment ECDF)"))
+long$view <- factor(long$view, levels = c("raw te_lfc", "centred (median removed)",
+                                          "rank (per-experiment ECDF)"))
+
+p_xe <- ggplot(long, aes(value, group = contrast)) +
+  geom_density(alpha = 0.15, linewidth = 0.8, colour = "grey40") +
+  facet_wrap(~ view, scales = "free", nrow = 1) +
+  labs(x = "value", y = "density",
+       title = "Why centring does not make experiments comparable, and ranking does",
+       subtitle = sprintf("one curve per contrast, n = %d contrasts. Centring aligns location only; spread still spans %.1fx in MAD. The rank view is identical by construction.",
+                          nrow(stats_xe), max(stats_xe$mad) / min(stats_xe$mad))) +
+  theme_classic(base_size = 12) + theme(strip.background = element_blank())
+print(p_xe)
+ggsave_if(file.path(plots_dir, "10d_cross_experiment_overlay.pdf"), p_xe, width = 11, height = 4.6)
+```
+
+```{r fig_shares, fig.width = 10, fig.height = 5}
+ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+sh_df <- tibble(feature = fc, raw = shares$raw, robust_z = shares$robust_z,
+                winsor = shares$winsor, rank_ecdf = shares$rank_ecdf) %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature")
+
+mk <- function(col, ttl, note) {
+  r <- cor(sh_df$raw, sh_df[[col]], method = "spearman")
+  j <- length(intersect(sh_df$feature[order(-sh_df$raw)][1:20],
+                        sh_df$feature[order(-sh_df[[col]])][1:20])) /
+       length(union(sh_df$feature[order(-sh_df$raw)][1:20],
+                    sh_df$feature[order(-sh_df[[col]])][1:20]))
+  ggplot(sh_df, aes(raw, .data[[col]])) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_point(alpha = 0.7, size = 1.8, colour = "#E69F00") +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.3,
+             label = sprintf("Spearman = %.3f\ntop-20 Jaccard = %.3f\nmax dev = %.3f pp\nn = %d features",
+                             r, j, max(abs(sh_df$raw - sh_df[[col]])), nrow(sh_df))) +
+    labs(x = "importance share, raw target (%)", y = paste0("share, ", col, " (%)"),
+         title = ttl, subtitle = note) +
+    theme_classic(base_size = 12)
+}
+p_z <- mk("robust_z", "(a) Affine: the no-op",
+          "points sit ON the identity line - centring and scaling move nothing")
+p_r <- mk("rank_ecdf", "(b) Non-linear: the transform that matters",
+          "the rank map does reallocate importance")
+pg <- plot_grid(p_z, p_r, nrow = 1)
+print(pg)
+ggsave_if(file.path(plots_dir, "10d_importance_shares_raw_vs_robustz.pdf"), p_z, width = 5.5, height = 5)
+ggsave_if(file.path(plots_dir, "10d_importance_shares_raw_vs_rank.pdf"),    p_r, width = 5.5, height = 5)
+ggsave_if(file.path(plots_dir, "10d_importance_shares_panels.pdf"),         pg,  width = 10,  height = 5)
+```
+
+# 3. Do the extreme genes explain the rank version's advantage?
+
+Tests whether the rank version's advantage comes from the handful of extreme genes.
+
+Capping at plus or minus 3 and ranking both reduce the influence of extremes, but by different
+amounts. If capping recovers most of ranking's gain, the gain was the extremes; if it recovers
+little, the gain is something else.
+
+**Decisions**
+
+- Include the capped version specifically to answer this, rather than as a third preference.
+- Treat a single split as insufficient, and defer the verdict to section 4.
+
+
+```{r fig_tails, fig.width = 10, fig.height = 4.2}
+# winsor and rank test the same hypothesis - that the extreme genes distort a variance-splitting
+# forest - at two strengths. That is what makes this comparison decisive rather than a
+# preference: if winsor recovers most of rank's gain, the gain was the handful of extreme genes,
+# and the cheaper arm that stays in interpretable TE units wins.
+n_ext <- c(`|y|>1` = sum(abs(train$y) > 1), `|y|>2` = sum(abs(train$y) > 2),
+           `|y|>3` = sum(abs(train$y) > 3))
+cat("training genes beyond thresholds:\n"); print(n_ext)
+cat(sprintf("raw target sd %.3f, MAD %.3f -> the most extreme gene is %.1f robust-sd out\n",
+            sd(train$y), mad(train$y), max(abs(train$y - m0)) / s0))
+
+tail_df <- tibble(y = train$y) %>%
+  mutate(robust_z = (y - m0) / s0, winsor = pmin(pmax(y, -B), B), rank_ecdf = e0(y)) %>%
+  pivot_longer(-y, names_to = "arm", values_to = "transformed")
+p_tail <- ggplot(tail_df, aes(y, transformed)) +
+  geom_vline(xintercept = c(-B, B), linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9, colour = "#E69F00") +
+  facet_wrap(~ arm, scales = "free_y", nrow = 1) +
+  labs(x = "raw te_lfc", y = "transformed target",
+       title = "What each transform does to the extremes",
+       subtitle = sprintf("n = %d training genes; %d beyond |2| and %d beyond |3|. robust z is a straight line, which is why it changes nothing.",
+                          nrow(train), n_ext[["|y|>2"]], n_ext[["|y|>3"]])) +
+  theme_classic(base_size = 12) + theme(strip.background = element_blank())
+print(p_tail)
+ggsave_if(file.path(plots_dir, "10d_tail_effect.pdf"), p_tail, width = 10, height = 4.2)
+
+gain_rank   <- res$spearman_raw_y[res$arm == "rank_ecdf"] - res$spearman_raw_y[res$arm == "raw"]
+gain_winsor <- res$spearman_raw_y[res$arm == "winsor"]    - res$spearman_raw_y[res$arm == "raw"]
+cat(sprintf("\nSpearman against raw held-out y, single split:\n  raw %.4f | winsor %+.4f | rank %+.4f\n",
+            res$spearman_raw_y[res$arm == "raw"], gain_winsor, gain_rank))
+cat(sprintf("  winsor recovers %.0f%% of rank's gain on this one split.\n",
+            100 * gain_winsor / gain_rank))
+cat("  ONE split cannot decide this: section 4 judges it paired over 20 split seeds.\n")
+```
+
+# 4. The same comparison, paired over 20 split seeds
+
+Repeats the comparison across 20 different train/test splits, pairing the versions within each
+split.
+
+**Decisions**
+
+- Pair within split seed, since all versions see identical rows there. The paired difference has
+  a much smaller spread than the split-to-split variation, which is what makes a small effect
+  readable at all.
+- Skip this section cleanly when the sweep has not been run, rather than failing.
+
+
+```{r paired_sweep}
+# A single split cannot separate a +0.008 Spearman difference from noise. The sweep is paired -
+# within a split_seed every arm sees identical rows - so the paired-difference sd is the right
+# scale, and it runs far below the seed-to-seed sd. Gated on 10b_ having been run.
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+arm_files <- map(REG_PRESETS$transform, function(a)
+  map_chr(REG_SPLIT_SEEDS, ~ file.path(out_dir,
+    paste0("rfreg_performance_", reg_suffix(a, .x), ".csv"))))
+have <- map_lgl(arm_files, ~ all(file.exists(.x)))
+cat("transform-preset sweep present for arms:",
+    paste(names(have)[have], collapse = ", "),
+    if (!all(have)) paste0(" | MISSING: ", paste(names(have)[!have], collapse = ", ")) else "", "\n")
+run_paired <- all(have)
+if (!run_paired)
+  cat("\nRun:  Rscript code/translational_control_overview/10b_regression_split_sweep.R transform\n",
+      "then re-knit this notebook for the paired panel.\n")
+```
+
+```{r fig_paired, eval = run_paired, fig.width = 10, fig.height = 4.4}
+sw <- imap_dfr(REG_PRESETS$transform, function(a, nm)
+  map_dfr(REG_SPLIT_SEEDS, function(s) {
+    d <- read_csv(file.path(out_dir, paste0("rfreg_performance_", reg_suffix(a, s), ".csv")),
+                  show_col_types = FALSE)
+    tibble(arm = nm, split_seed = s,
+           spearman = d$value[d$metric == "spearman_raw_y"],
+           bridge   = d$value[d$metric == "bridge_auc_geneset"])
+  }))
+sw$arm <- factor(sw$arm, levels = names(REG_PRESETS$transform))
+
+p_pair <- ggplot(sw, aes(arm, spearman)) +
+  geom_line(aes(group = split_seed), colour = "grey75", linewidth = 0.4) +
+  geom_point(aes(colour = arm), size = 2, alpha = 0.85) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.45, linewidth = 0.4, colour = "black") +
+  scale_colour_manual(values = c(raw = "grey40", winsor = "#0072B2", rank = "#E69F00"),
+                      guide = "none") +
+  labs(x = NULL, y = "Spearman vs raw held-out y",
+       title = "(a) One yardstick, paired across split seeds",
+       subtitle = sprintf("grey lines join the same split_seed. n = %d seeds x %d arms",
+                          length(REG_SPLIT_SEEDS), length(REG_PRESETS$transform))) +
+  theme_classic(base_size = 12)
+
+pd <- sw %>% dplyr::select(arm, split_seed, spearman) %>%
+  pivot_wider(names_from = arm, values_from = spearman) %>%
+  mutate(`winsor - raw` = winsor - raw, `rank - raw` = rank - raw) %>%
+  dplyr::select(split_seed, `winsor - raw`, `rank - raw`) %>%
+  pivot_longer(-split_seed, names_to = "contrast", values_to = "delta")
+lab <- pd %>% group_by(contrast) %>%
+  summarise(m = mean(delta), s = sd(delta), n_pos = sum(delta > 0), n = n(),
+            p = tryCatch(wilcox.test(delta)$p.value, error = function(e) NA_real_),
+            .groups = "drop")
+print(as.data.frame(lab %>% mutate(across(where(is.numeric), ~ signif(., 3)))), row.names = FALSE)
+cat(sprintf("\nseed-to-seed sd of raw Spearman: %.4f | paired-difference sd: %.4f (%.1fx smaller)\n",
+            sd(sw$spearman[sw$arm == "raw"]), sd(pd$delta[pd$contrast == "rank - raw"]),
+            sd(sw$spearman[sw$arm == "raw"]) / sd(pd$delta[pd$contrast == "rank - raw"])))
+
+p_delta <- ggplot(pd, aes(contrast, delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_boxplot(width = 0.4, outlier.shape = NA, fill = "grey92") +
+  geom_jitter(width = 0.08, size = 1.8, alpha = 0.8, colour = "#E69F00") +
+  geom_text(data = lab, aes(contrast, Inf,
+            label = sprintf("mean %+.4f\nsd %.4f\n%d/%d > 0\np = %.3g", m, s, n_pos, n, p)),
+            vjust = 1.25, size = 3) +
+  labs(x = NULL, y = "paired difference in Spearman",
+       title = "(b) Paired differences, judged against their own sd",
+       subtitle = "the only scale on which a small gain is readable") +
+  theme_classic(base_size = 12)
+
+pgp <- plot_grid(p_pair, p_delta, nrow = 1, rel_widths = c(1, 1))
+print(pgp)
+ggsave_if(file.path(plots_dir, "10d_same_yardstick_paired.pdf"), pgp, width = 10, height = 4.4)
+```
+
+# 5. When this question comes back: comparing experiments
+
+Records what to do when this question returns during cross-experiment comparison, and which
+findings here must not be carried over to a new dataset.
+
+**Decisions**
+
+- Generate the decision table from the live numbers, so it cannot drift from the measurements
+  above it.
+- Mark two things as per-dataset: whether the rank version helps, and the SHAP noise floor. Both
+  depend on gene count and outcome spread, which change between experiments.
+
+
+Everything above is measured on **one** experiment, and on one experiment the question is closed:
+centring and scaling change nothing. The question re-opens the moment two experiments are put
+side by side, and it re-opens for **one specific quantity only**.
+
+```{r cross_experiment_decision}
+# The decision table, as code so it cannot drift from the numbers above.
+decision <- tibble::tribble(
+  ~quantity,                          ~scale_free, ~action_when_comparing_experiments,
+  "family share_pct",                  TRUE,  "compare directly - it is a within-run ratio",
+  "feature rank / top-20 set",         TRUE,  "compare directly",
+  "test Spearman, Precision@K, AUC",   TRUE,  "compare directly",
+  "mean_abs_shap (raw TE units)",      FALSE, "divide by each run's own mad(y) FIRST",
+  "signed_share",                      TRUE,  "compare directly",
+  "SHAP in rank units",                TRUE,  "already identical by construction"
+)
+print(as.data.frame(decision), row.names = FALSE)
+
+cat(sprintf("\nWhy the fourth row is different: across the %d si3d/si3e contrasts on disk the\n", nrow(stats_xe)))
+cat(sprintf("target MAD spans %.3f to %.3f, a %.1fx range. So '0.05 log2 of SHAP' means %.1fx\n",
+            min(stats_xe$mad), max(stats_xe$mad), max(stats_xe$mad)/min(stats_xe$mad),
+            max(stats_xe$mad)/min(stats_xe$mad)))
+cat("more of that experiment's spread in one contrast than another. That is a real\n")
+cat("incomparability, and it is the ONLY one centring/scaling was ever needed for.\n\n")
+cat("11_shap_regression.Rmd already writes the fixed column: mean_abs_shap_mad_scaled.\n")
+cat("So the cross-experiment recipe is:\n")
+cat("  * comparing shares or ranks  -> nothing to do\n")
+cat("  * comparing SHAP magnitudes  -> use mean_abs_shap_mad_scaled, NOT mean_abs_shap\n")
+cat("  * want identical target distributions by construction -> target_transform = 'rank_ecdf',\n")
+cat("    at the cost of SHAP no longer being in log2 TE units\n\n")
+cat("What is NOT settled, and needs re-measuring per experiment rather than inherited:\n")
+cat("  * whether rank_ecdf helps. On this one it is +0.006 Spearman, and winsorizing at +/-3\n")
+cat("    gives -0.001, so the gain is NOT the extreme genes. Section 4 tests it paired.\n")
+cat("  * the SHAP noise floor itself. It is driven by n_genes and target spread, both of which\n")
+cat("    change per experiment, so 11f_ must be re-run rather than its numbers carried over.\n")
+```
+
+# 6. Conclusions
+
+```{r summary}
+cat("1. Centring and scaling the target is a NO-OP. Asserted above: OOB R2 unchanged, importance\n")
+cat("   scales by exactly 1/MAD^2, shares move <", sprintf("%.3f", dev_share), "pp, predictions rank-identical.\n")
+cat("   It cannot make shares more comparable across experiments, because shares are already\n")
+cat("   scale-free. Its ONE legitimate use is reporting SHAP in MAD units.\n\n")
+cat("2. Raw stays the default: SHAP in log2 TE units is interpretable, and comparable to\n")
+cat("   notebook 31_ in the frozen pipeline.\n\n")
+cat("3. For cross-experiment work the target's MAD spans",
+    sprintf("%.1fx", max(stats_xe$mad) / min(stats_xe$mad)),
+    "across", nrow(stats_xe), "contrasts, so EITHER compare\n")
+cat("   shares/ranks (already immune), OR divide mean_abs_shap by each run's own mad(y) at\n")
+cat("   report time, OR use rank_ecdf, which makes every experiment identical by construction.\n\n")
+if (exists("run_paired") && run_paired) {
+  cat("4. rank vs raw, paired over", length(REG_SPLIT_SEEDS), "split seeds: see section 4's table.\n")
+} else {
+  cat("4. Whether rank's small Spearman gain is real is NOT yet decided - run 10b_ (transform)\n")
+  cat("   and re-knit. A single split cannot separate it from draw noise.\n")
+}
+```

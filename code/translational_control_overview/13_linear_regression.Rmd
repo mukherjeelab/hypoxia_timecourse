@@ -1,0 +1,476 @@
+---
+title: "`r paste0('Linear regression on TE LFC, and how it compares to the forest (eIF', params$gene, ', ', params$condition, ', ', params$timepoint, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  rf_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  gene: "3d"
+  condition: "hypoxia"
+  timepoint: "1hr"
+  lfc: "0.5"
+  direction: "promotes"
+  readout: "TE"
+  drop_for_rank: "term_stop_TAA"
+  n_spline_features: 8
+  spline_df: 4
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "13_linear_regression.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It fits a linear model to the same outcome, on the same genes, with the same features as the
+random forest in `10_rf_regression.Rmd`, and asks whether the forest is earning its complexity.
+
+Three arms:
+
+- **OLS** - one coefficient per feature, with standard errors, p-values and VIF. This is the
+  readable model.
+- **Lasso** - the same features with an L1 penalty, which answers how few of them are actually
+  needed.
+- **OLS plus splines** - natural splines on the strongest continuous features, which answers
+  whether the outcome is non-linear in them.
+
+**Decisions**
+
+- Load `10_`'s saved split rather than rebuilding it, so both models see byte-identical training
+  rows, held-out rows and imputed feature values. Any difference in performance is the model.
+- Drop one column, ``r params$drop_for_rank``, to make the design full rank (see below). Keep
+  every other feature, including the correlated ones, so the comparison with the forest stays a
+  comparison of models rather than of feature sets.
+- Report coefficients both raw and standardized. Raw reads in natural units; standardized (per SD
+  of the feature) is the only version whose magnitudes are comparable between features.
+- Print VIF next to every coefficient, so features whose individual estimate is imprecise are
+  visible rather than silently over-read.
+- Score both models by Spearman against the raw held-out outcome, the same yardstick `10_` uses.
+
+## Why one column has to go
+
+Two feature groups encode related things: `term_plus4_A/C/G/T` (the base after the stop codon)
+and `term_stop_TAA/TAG/TGA` (which stop codon). For most genes exactly one dummy in each group is
+1, but for the genes whose CDS has no annotated stop **all seven are 0**. Both groups therefore sum
+to the same indicator - "has an annotated stop" - which makes one column an exact linear
+combination of the others:
+
+```
+plus4_T = (stop_TAA + stop_TAG + stop_TGA) - plus4_A - plus4_C - plus4_G
+```
+
+A forest is unaffected: a redundant column simply never improves a split, so it is ignored. Linear
+regression is not, because it solves for one coefficient per column, and when one column is an
+exact combination of the rest there are infinitely many coefficient sets with identical
+predictions. The coefficients are not identifiable, and `lm()` silently drops a column and reports
+`NA` for it.
+
+Dropping one column removes the dependency and loses nothing, since that column's information is
+fully present in the others. `r params$drop_for_rank` is the reference here, so the remaining
+dummies in its group read as effects *relative to* it.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(glmnet)
+library(splines)
+library(cowplot)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+md_path <- file.path(out_dir, paste0("rfreg_model_data_", params$rf_suffix, ".rds"))
+stopifnot("run 10_rf_regression.Rmd first - its saved split is what this notebook re-uses" =
+            file.exists(md_path))
+md <- readRDS(md_path)
+train <- md$train; test <- md$test
+ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+
+# One column dropped, everything else kept.
+stopifnot("drop_for_rank is not in the feature set" =
+            params$drop_for_rank %in% md$feature_cols)
+fc <- setdiff(md$feature_cols, params$drop_for_rank)
+
+Xtr <- as.matrix(train[, fc]); ytr <- train$y
+Xte <- as.matrix(test[, fc]);  yte <- test$y
+
+# The design must now be full rank, or the coefficients are still not identifiable. Asserted
+# rather than hoped for, because lm() would otherwise proceed and return NA coefficients.
+qr_rank <- qr(cbind(1, Xtr))$rank
+cat(sprintf("design: %d columns (incl. intercept), rank %d\n", ncol(Xtr) + 1, qr_rank))
+stopifnot("the design is still rank-deficient after the drop - find the remaining dependency" =
+            qr_rank == ncol(Xtr) + 1)
+cat(sprintf("train %d genes | test %d genes | %d features (dropped %s)\n",
+            nrow(Xtr), nrow(Xte), ncol(Xtr), params$drop_for_rank))
+ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
+```
+
+# 1. OLS
+
+```{r ols}
+ols <- lm(ytr ~ ., data = as.data.frame(Xtr))
+stopifnot("OLS still dropped a column - the design is not full rank" =
+            !any(is.na(coef(ols))))
+pred_ols <- as.numeric(predict(ols, newdata = as.data.frame(Xte)))
+
+# VIF without depending on car: 1 / (1 - R^2) from regressing each feature on the others.
+vif_of <- function(X) {
+  vapply(seq_len(ncol(X)), function(j) {
+    r2 <- summary(lm(X[, j] ~ X[, -j]))$r.squared
+    1 / (1 - r2)
+  }, numeric(1))
+}
+vifs <- vif_of(Xtr); names(vifs) <- colnames(Xtr)
+
+# Standardized coefficients: beta * sd(x) / sd(y). This is the only scale on which two features
+# with different units can be compared, and it is what lines up with a SHAP share.
+sd_x <- apply(Xtr, 2, sd); sd_y <- sd(ytr)
+co <- summary(ols)$coefficients
+coef_tbl <- tibble(
+  feature  = rownames(co),
+  beta_raw = co[, 1], se = co[, 2], t = co[, 3], p = co[, 4]
+) %>%
+  filter(feature != "(Intercept)") %>%
+  mutate(beta_std = beta_raw * sd_x[feature] / sd_y,
+         vif      = vifs[feature],
+         p_adj    = p.adjust(p, method = "BH")) %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+  arrange(desc(abs(beta_std)))
+
+cat(sprintf("adjusted R2 (train) %.4f | residual df %d\n",
+            summary(ols)$adj.r.squared, ols$df.residual))
+cat(sprintf("features with BH-adjusted p < 0.05: %d of %d\n",
+            sum(coef_tbl$p_adj < 0.05), nrow(coef_tbl)))
+cat(sprintf("features with VIF > 10 (coefficient imprecise, prediction unaffected): %d\n\n",
+            sum(coef_tbl$vif > 10)))
+print(as.data.frame(coef_tbl %>% head(20) %>%
+  mutate(across(c(beta_raw, se, beta_std), ~ signif(., 3)),
+         across(c(t, vif), ~ round(., 2)),
+         across(c(p, p_adj), ~ signif(., 2)))), row.names = FALSE)
+```
+
+# 2. Lasso: how few features are needed?
+
+```{r lasso}
+# Standardized internally by glmnet (standardize = TRUE), so the penalty treats features with
+# different units comparably. Same seed convention as everywhere else in this project.
+set.seed(9)
+cvfit <- cv.glmnet(Xtr, ytr, alpha = 1, nfolds = 10, standardize = TRUE)
+pred_lasso_min <- as.numeric(predict(cvfit, newx = Xte, s = "lambda.min"))
+pred_lasso_1se <- as.numeric(predict(cvfit, newx = Xte, s = "lambda.1se"))
+
+nz <- function(s) {
+  b <- as.matrix(coef(cvfit, s = s))
+  rownames(b)[b[, 1] != 0 & rownames(b) != "(Intercept)"]
+}
+nz_min <- nz("lambda.min"); nz_1se <- nz("lambda.1se")
+cat(sprintf("lambda.min %.5f -> %d of %d features retained\n",
+            cvfit$lambda.min, length(nz_min), ncol(Xtr)))
+cat(sprintf("lambda.1se %.5f -> %d of %d features retained\n",
+            cvfit$lambda.1se, length(nz_1se), ncol(Xtr)))
+cat("\nthe sparse model (lambda.1se) keeps:\n  ",
+    paste(nz_1se, collapse = ", "), "\n")
+
+lasso_tbl <- as.matrix(coef(cvfit, s = "lambda.1se")) %>% as.data.frame() %>%
+  rownames_to_column("feature") %>% rename(beta_lasso = 2) %>%
+  filter(feature != "(Intercept)", beta_lasso != 0) %>%
+  mutate(beta_lasso_std = beta_lasso * sd_x[feature] / sd_y) %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+  arrange(desc(abs(beta_lasso_std)))
+print(as.data.frame(lasso_tbl %>%
+  mutate(across(where(is.numeric), ~ signif(., 3)))), row.names = FALSE)
+```
+
+# 3. Is the relationship linear? A spline check
+
+```{r splines}
+# If the forest beats OLS it must be exploiting non-linearity or interactions. Replacing the
+# strongest continuous features with natural splines tests the non-linearity half directly: if
+# splines do not beat OLS, the relationship is linear in those features and the forest's extra
+# flexibility has nothing to use.
+#
+# Binary and dummy columns are excluded - a spline on a 0/1 column is the column.
+n_unique <- apply(Xtr, 2, function(v) length(unique(v)))
+continuous <- names(n_unique)[n_unique > 10]
+spline_feats <- coef_tbl %>% filter(feature %in% continuous) %>%
+  head(params$n_spline_features) %>% pull(feature)
+cat("splined:", paste(spline_feats, collapse = ", "), "\n")
+cat(sprintf("(top %d continuous features by |standardized coefficient|, df = %d each)\n\n",
+            length(spline_feats), params$spline_df))
+
+mk_formula <- function(feats, sp, df) {
+  terms <- vapply(feats, function(f)
+    if (f %in% sp) sprintf("ns(`%s`, df = %d)", f, df) else sprintf("`%s`", f), character(1))
+  as.formula(paste("ytr ~", paste(terms, collapse = " + ")))
+}
+dtr <- as.data.frame(Xtr); dte <- as.data.frame(Xte)
+fit_sp <- lm(mk_formula(colnames(Xtr), spline_feats, params$spline_df), data = dtr)
+pred_sp <- as.numeric(predict(fit_sp, newdata = dte))
+
+# Nested models, so an F test is the direct question: do the extra spline terms explain more than
+# chance? It is reported next to the held-out Spearman, which is what actually matters.
+an <- anova(ols, fit_sp)
+cat(sprintf("extra parameters: %d | F = %.2f | p = %.3g\n",
+            abs(diff(an$Df[1:2])), an$F[2], an$`Pr(>F)`[2]))
+cat(sprintf("train adj R2: OLS %.4f -> splines %.4f\n",
+            summary(ols)$adj.r.squared, summary(fit_sp)$adj.r.squared))
+```
+
+# 4. All models on one yardstick
+
+```{r compare}
+rf_pred <- read_csv(file.path(out_dir, paste0("rfreg_predictions_", params$rf_suffix, ".csv")),
+                    show_col_types = FALSE) %>% filter(split == "test")
+stopifnot("the saved RF predictions do not line up with this split" =
+            identical(rf_pred$gene_id_clean, test$gene_id_clean))
+
+r2_of <- function(p) 1 - sum((yte - p)^2) / sum((yte - mean(ytr))^2)
+models <- tibble::tribble(
+  ~model,             ~pred,
+  "OLS",               pred_ols,
+  "lasso (1se)",       pred_lasso_1se,
+  "lasso (min)",       pred_lasso_min,
+  "OLS + splines",     pred_sp,
+  "random forest",     rf_pred$pred
+) %>%
+  mutate(spearman = map_dbl(pred, ~ cor(.x, yte, method = "spearman")),
+         pearson  = map_dbl(pred, ~ cor(.x, yte)),
+         r2       = map_dbl(pred, r2_of),
+         rmse     = map_dbl(pred, ~ sqrt(mean((yte - .x)^2))),
+         n_param  = c(ncol(Xtr), length(nz_1se), length(nz_min),
+                      length(coef(fit_sp)) - 1, NA_integer_))
+print(as.data.frame(models %>% dplyr::select(-pred) %>%
+  mutate(across(where(is.double), ~ round(., 4)))), row.names = FALSE)
+
+# The differences above are small, so they need the scale that 10c_ measured: the split-to-split
+# sd of the forest's own Spearman. A gap smaller than that is not a result.
+sw_path <- file.path(out_dir, "rfreg_sweep_transform.csv")
+if (file.exists(sw_path)) {
+  sd_split <- read_csv(sw_path, show_col_types = FALSE) %>%
+    filter(arm == "raw") %>% pull(spearman) %>% sd()
+  gap <- max(models$spearman) - models$spearman[models$model == "random forest"]
+  cat(sprintf("\nbest linear arm minus forest: %+.4f Spearman\n", gap))
+  cat(sprintf("split-to-split sd of the forest's Spearman: %.4f (from 10c_'s sweep)\n", sd_split))
+  cat(sprintf("=> the gap is %.1f%% of one standard deviation of the split noise.\n",
+              100 * abs(gap) / sd_split))
+  if (abs(gap) < sd_split)
+    cat("   On this evidence the two model families perform the same, and the simpler one wins\n",
+        "   on parsimony. A sweep over split seeds would be needed to claim a real difference.\n")
+} else {
+  cat("\n(run 10b_ to get the split-to-split sd that these differences must be judged against)\n")
+}
+
+# The same AUC bridge 10_ reports, so the two model families are compared on that too.
+pos_genes <- read_csv(here("output", "genesets",
+  paste0(params$condition, "_", params$gene, "_", params$direction, "_",
+         params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")),
+  show_col_types = FALSE)$ensembl_gene
+neg_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+  show_col_types = FALSE) %>% mutate(g = sub("[.].*", "", gene_id)) %>% pull(g)
+neg_genes <- setdiff(neg_genes, pos_genes)
+lab <- case_when(test$gene_id_clean %in% pos_genes ~ 1L,
+                 test$gene_id_clean %in% neg_genes ~ 0L, TRUE ~ NA_integer_)
+auc_of <- function(p) {
+  k <- !is.na(lab)
+  as.numeric(pROC::auc(pROC::roc(lab[k], p[k], direction = "<", quiet = TRUE)))
+}
+models$bridge_auc <- map_dbl(models$pred, auc_of)
+cat(sprintf("\nAUC bridge (n = %d pos / %d neg):\n", sum(lab == 1, na.rm = TRUE),
+            sum(lab == 0, na.rm = TRUE)))
+print(as.data.frame(models %>% dplyr::select(model, spearman, bridge_auc) %>%
+  mutate(across(where(is.double), ~ round(., 4)))), row.names = FALSE)
+```
+
+```{r fig_performance, fig.width = 11, fig.height = 4.4}
+p_perf <- models %>%
+  mutate(model = fct_reorder(model, spearman),
+         family = if_else(model == "random forest", "forest", "linear")) %>%
+  ggplot(aes(spearman, model, fill = family)) +
+  geom_col(alpha = 0.9, width = 0.65) +
+  geom_text(aes(label = sprintf("%.4f", spearman)), hjust = -0.12, size = 3.2) +
+  scale_fill_manual(values = c(linear = "#0072B2", forest = "#E69F00"), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.16))) +
+  labs(x = "Spearman vs raw held-out outcome", y = NULL,
+       title = "(a) Held-out ranking performance",
+       subtitle = sprintf("n = %d held-out genes, identical split for every model", nrow(Xte))) +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+
+p_sc <- tibble(ols = pred_ols, rf = rf_pred$pred, obs = yte) %>%
+  ggplot(aes(rf, ols)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.2, size = 0.7, colour = "#0072B2") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.3,
+           label = sprintf("Spearman = %.3f\nn = %d genes",
+                           cor(pred_ols, rf_pred$pred, method = "spearman"), nrow(Xte))) +
+  labs(x = "forest prediction", y = "OLS prediction",
+       title = "(b) Do the two models rank genes the same way?",
+       subtitle = "held-out genes") +
+  theme_classic(base_size = 11)
+
+pg <- plot_grid(p_perf, p_sc, nrow = 1, rel_widths = c(1.15, 1))
+print(pg)
+ggsave_if(here("plots", paste0("13_performance_", params$rf_suffix, ".pdf")), pg,
+          width = 11, height = 4.4)
+```
+
+# 5. Coefficients, and whether they agree with the forest
+
+```{r fig_coefficients, fig.width = 11, fig.height = 6}
+top_c <- coef_tbl %>% head(25) %>%
+  mutate(feature = fct_reorder(feature, beta_std),
+         sig = p_adj < 0.05,
+         lo = (beta_raw - 1.96 * se) * sd_x[as.character(feature)] / sd_y,
+         hi = (beta_raw + 1.96 * se) * sd_x[as.character(feature)] / sd_y)
+p_coef <- ggplot(top_c, aes(beta_std, feature)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, colour = "grey65") +
+  geom_point(aes(colour = sig, size = pmin(vif, 20))) +
+  scale_colour_manual(values = c(`TRUE` = "#0072B2", `FALSE` = "grey65"),
+                      labels = c(`TRUE` = "BH p < 0.05", `FALSE` = "not significant"),
+                      name = NULL) +
+  scale_size_continuous(range = c(1.5, 4.5), name = "VIF (capped at 20)") +
+  labs(x = "standardized coefficient (per SD of the feature, in SD of the outcome)", y = NULL,
+       title = "(a) OLS coefficients, top 25 by magnitude",
+       subtitle = "bars are 95% CI; larger points have more collinearity and a less trustworthy individual estimate") +
+  theme_classic(base_size = 11)
+print(p_coef)
+ggsave_if(here("plots", paste0("13_coefficients_", params$rf_suffix, ".pdf")), p_coef,
+          width = 8, height = 6)
+```
+
+```{r fig_vs_shap, fig.width = 11, fig.height = 4.8}
+# A standardized coefficient and a SHAP share measure different things - one is signed and
+# conditional on the other features, the other is an unsigned average contribution - so the
+# comparison is between |beta_std| and the SHAP share, on ranks.
+shap_path <- file.path(out_dir, paste0("shapreg_feature_", params$rf_suffix, ".csv"))
+imp_path  <- file.path(out_dir, paste0("rfreg_importance_", params$rf_suffix, ".csv"))
+if (!file.exists(imp_path)) {
+  cat("Forest importance not found; run 10_rf_regression.Rmd.\n")
+} else {
+  imp <- read_csv(imp_path, show_col_types = FALSE) %>%
+    dplyr::select(feature, rf_share = share_pct)
+  j <- coef_tbl %>% dplyr::select(feature, family, beta_std, p_adj) %>%
+    mutate(abs_beta = abs(beta_std)) %>% inner_join(imp, by = "feature")
+  p_imp <- ggplot(j, aes(rf_share, abs_beta)) +
+    geom_point(aes(colour = family), size = 2, alpha = 0.85) +
+    scale_colour_viridis_d(guide = "none", end = 0.9) +
+    ggrepel::geom_text_repel(
+      data = j %>% filter(rf_share > 2.5 | abs_beta > quantile(abs_beta, 0.92)),
+      aes(label = feature), size = 2.5, max.overlaps = 18, seed = 9) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+             label = sprintf("Spearman = %.3f\nn = %d features",
+                             cor(j$rf_share, j$abs_beta, method = "spearman"), nrow(j))) +
+    labs(x = "forest impurity share (%)", y = "|standardized OLS coefficient|",
+         title = "(a) Coefficient magnitude vs forest importance",
+         subtitle = "ranks compared: the two quantities are not on a common scale") +
+    theme_classic(base_size = 11)
+
+  if (file.exists(shap_path)) {
+    sh <- read_csv(shap_path, show_col_types = FALSE) %>%
+      mutate(shap_share = 100 * mean_abs_shap / sum(mean_abs_shap)) %>%
+      dplyr::select(feature, shap_share, shap_value_cor)
+    j2 <- j %>% inner_join(sh, by = "feature")
+    # A coefficient's sign and SHAP's directional summary should agree where both are defined.
+    agree <- mean(sign(j2$beta_std) == sign(j2$shap_value_cor), na.rm = TRUE)
+    p_shap <- ggplot(j2, aes(shap_share, abs_beta)) +
+      geom_point(aes(colour = sign(beta_std) == sign(shap_value_cor)), size = 2, alpha = 0.85) +
+      scale_colour_manual(values = c(`TRUE` = "grey40", `FALSE` = "#D55E00"),
+                          labels = c(`TRUE` = "sign agrees", `FALSE` = "sign differs"),
+                          name = NULL) +
+      ggrepel::geom_text_repel(
+        data = j2 %>% filter(shap_share > 3 | abs_beta > quantile(abs_beta, 0.92)),
+        aes(label = feature), size = 2.5, max.overlaps = 18, seed = 9) +
+      annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+               label = sprintf("Spearman = %.3f\nsign agreement %.0f%%\nn = %d",
+                               cor(j2$shap_share, j2$abs_beta, method = "spearman"),
+                               100 * agree, nrow(j2))) +
+      labs(x = "forest SHAP share (%)", y = "|standardized OLS coefficient|",
+           title = "(b) Coefficient vs SHAP",
+           subtitle = "colour: does the coefficient's sign match SHAP's direction?") +
+      theme_classic(base_size = 11) + theme(legend.position = "bottom")
+    pg2 <- plot_grid(p_imp, p_shap, nrow = 1)
+  } else {
+    cat("SHAP not found; run 11_shap_regression.Rmd to fill in panel (b).\n")
+    pg2 <- p_imp
+  }
+  print(pg2)
+  ggsave_if(here("plots", paste0("13_coef_vs_forest_", params$rf_suffix, ".pdf")), pg2,
+            width = 11, height = 4.8)
+}
+```
+
+```{r fig_splines, fig.width = 11, fig.height = 6}
+# What the spline arm actually fitted: the partial effect of each splined feature, with the
+# straight-line OLS fit over it. If the two are close, the relationship is linear and the extra
+# parameters bought nothing.
+grid_one <- function(f) {
+  g <- as.data.frame(matrix(rep(colMeans(Xtr), each = 100), nrow = 100,
+                            dimnames = list(NULL, colnames(Xtr))))
+  g[[f]] <- seq(quantile(Xtr[, f], 0.01), quantile(Xtr[, f], 0.99), length.out = 100)
+  tibble(feature = f, x = g[[f]],
+         spline = as.numeric(predict(fit_sp, newdata = g)),
+         linear = as.numeric(predict(ols,    newdata = g)))
+}
+pe <- map_dfr(spline_feats, grid_one) %>%
+  pivot_longer(c(spline, linear), names_to = "fit", values_to = "pred")
+p_pe <- ggplot(pe, aes(x, pred, colour = fit)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ feature, scales = "free_x", ncol = 4) +
+  scale_colour_manual(values = c(linear = "#0072B2", spline = "#E69F00"), name = NULL) +
+  labs(x = "feature value (1st to 99th percentile)", y = "predicted TE LFC",
+       title = "Partial effects: straight line vs natural spline",
+       subtitle = "other features held at their means. Close curves mean the relationship is linear") +
+  theme_classic(base_size = 11) + theme(strip.background = element_blank(),
+                                        legend.position = "bottom")
+print(p_pe)
+ggsave_if(here("plots", paste0("13_partial_effects_", params$rf_suffix, ".pdf")), p_pe,
+          width = 11, height = 6)
+```
+
+# 6. Conclusions
+
+```{r summary}
+best_lin <- models %>% filter(model != "random forest") %>% slice_max(spearman, n = 1)
+rf_row   <- models %>% filter(model == "random forest")
+cat(sprintf("best linear arm: %s, Spearman %.4f (%d parameters)\n",
+            best_lin$model, best_lin$spearman, best_lin$n_param))
+cat(sprintf("random forest:   Spearman %.4f\n", rf_row$spearman))
+cat(sprintf("difference:      %+.4f\n\n", best_lin$spearman - rf_row$spearman))
+cat(sprintf("the sparse lasso keeps %d of %d features and reaches Spearman %.4f\n",
+            length(nz_1se), ncol(Xtr), models$spearman[models$model == "lasso (1se)"]))
+cat(sprintf("splines add %d parameters for a Spearman change of %+.4f\n\n",
+            length(coef(fit_sp)) - 1 - ncol(Xtr),
+            models$spearman[models$model == "OLS + splines"] - models$spearman[models$model == "OLS"]))
+cat("Read these against the split-to-split noise printed in section 4, not against zero.\n")
+cat("A single split cannot separate differences of this size; 10b_/10c_ is the machinery for\n")
+cat("that, and the same sweep would need to be run for the linear arms to make a firm claim.\n")
+```
+
+```{r export}
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+reg_write_csv(coef_tbl,  file.path(out_dir, paste0("linreg_coefficients_", params$rf_suffix, ".csv")))
+reg_write_csv(lasso_tbl, file.path(out_dir, paste0("linreg_lasso_", params$rf_suffix, ".csv")))
+reg_write_csv(models %>% dplyr::select(-pred),
+              file.path(out_dir, paste0("linreg_performance_", params$rf_suffix, ".csv")))
+reg_write_csv(tibble(gene_id_clean = test$gene_id_clean, symbol = test$symbol, y = yte,
+                     pred_ols = pred_ols, pred_lasso_1se = pred_lasso_1se,
+                     pred_splines = pred_sp, pred_rf = rf_pred$pred),
+              file.path(out_dir, paste0("linreg_predictions_", params$rf_suffix, ".csv")))
+cat("Wrote linreg_* outputs.\n")
+```

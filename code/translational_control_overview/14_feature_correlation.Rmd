@@ -1,0 +1,367 @@
+---
+title: "Feature correlation structure: what is actually independent?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  rf_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  thresholds: "0.7,0.8,0.9"
+  main_threshold: 0.8
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "14_feature_correlation.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It measures how correlated the 69 modelled features are with each other, across every expressed
+transcript, and shows where that correlation is large enough to split a SHAP value between
+features that are really measuring one thing.
+
+This is a **diagnosis only**. Nothing here is written for another notebook to consume, no feature
+is dropped, and no model is refitted.
+
+**Decisions**
+
+- Use all **10,172** transcripts in the feature matrix, not just the training split. Correlation
+  between features is a property of the transcripts, not of any particular model fit or split.
+- Use **Spearman**, not Pearson. Several of these features are monotone transforms of each other -
+  `term_log1p_readthrough` is literally `log1p()` of `term_readthrough_cridge` - and Spearman
+  reports those as the perfect redundancy they are, where Pearson would understate it.
+- Report at several thresholds rather than one. Where a cluster appears is as informative as the
+  cluster itself.
+- Annotate every cluster with the SHAP share its members hold, so the cost of the splitting is
+  quantified rather than implied.
+
+## Why this matters for the heatmap
+
+When two features carry the same underlying signal, the forest uses whichever is convenient at
+each split. One gene's prediction gets attributed to `cds_gc`, another's to `gc3_internal`.
+Neither attribution is wrong, but read one row at a time, the *concept* looks half as important as
+it is.
+
+Summing SHAP within a correlated group fixes this exactly, because SHAP is additive: the sum of
+two features' SHAP values is precisely their joint contribution to each gene's prediction, with
+nothing estimated and no refit. Dropping one instead changes the model, and the survivor absorbs
+the dropped feature's role by an unknown amount.
+
+The reason to look before deciding is that at these correlations the features are **not
+interchangeable**. A pair at rho 0.9 still has about 19% of its variance unshared. Section 5
+quantifies exactly how much would be lost by dropping each member.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(pheatmap)
+library(cowplot)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+md <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", params$rf_suffix, ".rds")))
+m   <- readRDS(file.path(out_dir, params$matrix_rds))
+ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+
+fc <- md$feature_cols
+stopifnot("the saved model data and the matrix disagree about the features" =
+            all(fc %in% colnames(m)))
+
+X <- m[, fc]
+for (f in fc) if (is.list(X[[f]])) X[[f]] <- as.numeric(unlist(X[[f]]))
+X <- as.matrix(X)
+cat(sprintf("%d transcripts x %d features\n", nrow(X), ncol(X)))
+cat(sprintf("missing values: %d (%.3f%%)\n", sum(is.na(X)), 100 * mean(is.na(X))))
+
+C <- suppressWarnings(cor(X, use = "pairwise.complete.obs", method = "spearman"))
+stopifnot("correlation matrix has missing entries - a feature may be constant" = !anyNA(C))
+D <- as.dist(1 - abs(C))
+hc <- hclust(D, method = "average")
+fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+thresholds <- as.numeric(str_trim(str_split(params$thresholds, ",")[[1]]))
+
+shap_path <- file.path(out_dir, paste0("shapreg_feature_", params$rf_suffix, ".csv"))
+have_shap <- file.exists(shap_path)
+shap <- if (have_shap) read_csv(shap_path, show_col_types = FALSE) %>%
+  dplyr::select(feature, share_pct) else NULL
+cat("SHAP shares available:", have_shap, "\n")
+ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
+```
+
+# 1. The correlation heatmap
+
+```{r fig_heatmap, fig.width = 13, fig.height = 12}
+Cd <- C; diag(Cd) <- 0
+np <- ncol(C) * (ncol(C) - 1) / 2
+cat("pairs above each threshold:\n")
+for (th in c(0.5, 0.6, 0.7, 0.8, 0.9, 0.95))
+  cat(sprintf("  |rho| > %.2f : %5d of %d pairs (%.2f%%)\n",
+              th, sum(abs(Cd) > th) / 2, np, 100 * (sum(abs(Cd) > th) / 2) / np))
+
+fam_cols <- setNames(
+  colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+                     "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)),
+  sort(unique(fam)))
+anno <- data.frame(family = fam[fc], row.names = fc)
+
+pheatmap(C,
+  color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  breaks = seq(-1, 1, length.out = 102),
+  clustering_distance_rows = D, clustering_distance_cols = D,
+  clustering_method = "average",
+  annotation_row = anno, annotation_col = anno,
+  annotation_colors = list(family = fam_cols),
+  fontsize_row = 6, fontsize_col = 6, treeheight_col = 40, treeheight_row = 40,
+  main = sprintf("Spearman correlation, %d features across %d transcripts", ncol(C), nrow(X)))
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", paste0("14_correlation_heatmap_", params$rf_suffix, ".pdf")),
+      width = 13, height = 12)
+  pheatmap(C, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+    breaks = seq(-1, 1, length.out = 102),
+    clustering_distance_rows = D, clustering_distance_cols = D,
+    clustering_method = "average", annotation_row = anno, annotation_col = anno,
+    annotation_colors = list(family = fam_cols), fontsize_row = 6, fontsize_col = 6,
+    main = "Spearman correlation between modelled features")
+  dev.off()
+}
+```
+
+# 2. Clusters at each threshold
+
+```{r clusters}
+cluster_at <- function(th) {
+  g <- cutree(hc, h = 1 - th)
+  tibble(feature = names(g), cluster = as.integer(g)) %>%
+    left_join(tibble(feature = fc, family = fam[fc]), by = "feature") %>%
+    { if (have_shap) left_join(., shap, by = "feature") else mutate(., share_pct = NA_real_) } %>%
+    group_by(cluster) %>% filter(n() > 1) %>%
+    arrange(desc(share_pct), .by_group = TRUE) %>%
+    mutate(leader = first(feature),
+           rho_to_leader = map2_dbl(leader, feature, ~ C[.x, .y])) %>%
+    ungroup() %>% mutate(threshold = th)
+}
+clus <- map_dfr(thresholds, cluster_at)
+
+for (th in thresholds) {
+  d <- clus %>% filter(threshold == th)
+  cat(sprintf("\n===== |rho| >= %.2f : %d multi-feature clusters covering %d features =====\n",
+              th, n_distinct(d$cluster), nrow(d)))
+  for (k in unique(d$cluster)) {
+    x <- d %>% filter(cluster == k)
+    cat(sprintf("\n  cluster %d | %d features | combined SHAP %.2f%% | families: %s\n",
+                k, nrow(x), sum(x$share_pct, na.rm = TRUE),
+                paste(sort(unique(x$family)), collapse = ", ")))
+    for (i in seq_len(nrow(x)))
+      cat(sprintf("     %-36s %6.2f%%  %-19s rho=%+.3f\n",
+                  x$feature[i], x$share_pct[i], x$family[i], x$rho_to_leader[i]))
+  }
+}
+```
+
+```{r fig_cluster_shap, fig.width = 10, fig.height = 5}
+# How much SHAP sits inside a correlated cluster is the size of the problem. A cluster spanning
+# more than one family is the case that family-level sums do NOT already solve.
+csum <- clus %>% group_by(threshold, cluster) %>%
+  summarise(n = n(), shap = sum(share_pct, na.rm = TRUE),
+            n_fam = n_distinct(family), leader = first(leader),
+            fams = paste(sort(unique(family)), collapse = "+"), .groups = "drop") %>%
+  mutate(spans_families = n_fam > 1)
+p_cs <- csum %>%
+  mutate(lab = paste0(leader, " (+", n - 1, ")")) %>%
+  ggplot(aes(shap, reorder(lab, shap), fill = spans_families)) +
+  geom_col(alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f%%", shap)), hjust = -0.12, size = 3) +
+  facet_wrap(~ paste0("|rho| >= ", threshold), scales = "free_y") +
+  scale_fill_manual(values = c(`TRUE` = "#D55E00", `FALSE` = "grey60"),
+                    labels = c(`TRUE` = "spans families", `FALSE` = "within one family"),
+                    name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(x = "combined SHAP share of the cluster (%)", y = NULL,
+       title = "How much attribution sits inside a correlated cluster",
+       subtitle = "orange clusters cross family lines, so family-level sums do not resolve them") +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom",
+                                        strip.background = element_blank())
+print(p_cs)
+ggsave_if(here("plots", paste0("14_cluster_shap_", params$rf_suffix, ".pdf")), p_cs,
+          width = 10, height = 5)
+```
+
+# 3. How many independent axes are there really?
+
+```{r fig_pca, fig.width = 11, fig.height = 4.6}
+# PCA on the correlation matrix. If the 69 features were independent, 69 components would each
+# explain about 1.4% and the curve would be a straight line. The gap between that and the real
+# curve is the redundancy.
+pca <- prcomp(X[complete.cases(X), ], center = TRUE, scale. = TRUE)
+ve  <- pca$sdev^2 / sum(pca$sdev^2)
+cum <- cumsum(ve)
+n_for <- function(p) which(cum >= p)[1]
+cat(sprintf("components needed for 50%%: %d | 80%%: %d | 90%%: %d | 95%%: %d  (of %d features)\n",
+            n_for(0.5), n_for(0.8), n_for(0.9), n_for(0.95), ncol(X)))
+cat(sprintf("PC1 alone explains %.1f%%; the first 5 explain %.1f%%\n", 100*ve[1], 100*cum[5]))
+
+p_scree <- tibble(pc = seq_along(ve), ve = ve, cum = cum) %>% head(40) %>%
+  ggplot(aes(pc)) +
+  geom_col(aes(y = 100 * ve), fill = "#E69F00", alpha = 0.9) +
+  geom_line(aes(y = 100 * cum), colour = "#0072B2", linewidth = 0.9) +
+  geom_point(aes(y = 100 * cum), colour = "#0072B2", size = 1.2) +
+  geom_hline(yintercept = 100 / ncol(X), linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 30, y = 100/ncol(X) + 4, size = 3, colour = "grey40",
+           label = sprintf("%.1f%% = what one PC would explain if\nall %d features were independent",
+                           100/ncol(X), ncol(X))) +
+  labs(x = "principal component", y = "variance explained (%)",
+       title = "(a) Scree: bars are per-component, line is cumulative",
+       subtitle = sprintf("%d components carry 90%% of the variance in %d features",
+                          n_for(0.9), ncol(X))) +
+  theme_classic(base_size = 11)
+
+# Features in the space of the first two components, coloured by family: which families occupy
+# the same direction, and which are their own axis.
+ld <- as_tibble(pca$rotation[, 1:2], rownames = "feature") %>%
+  mutate(family = fam[feature])
+p_load <- ggplot(ld, aes(PC1, PC2, colour = family)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_point(size = 2, alpha = 0.9) +
+  scale_colour_manual(values = fam_cols, name = NULL) +
+  ggrepel::geom_text_repel(
+    data = ld %>% filter(sqrt(PC1^2 + PC2^2) > quantile(sqrt(ld$PC1^2 + ld$PC2^2), 0.75)),
+    aes(label = feature), size = 2.4, max.overlaps = 22, seed = 9, show.legend = FALSE) +
+  labs(x = sprintf("PC1 (%.1f%%)", 100*ve[1]), y = sprintf("PC2 (%.1f%%)", 100*ve[2]),
+       title = "(b) Feature loadings",
+       subtitle = "features pointing the same way are measuring the same axis") +
+  theme_classic(base_size = 11) + theme(legend.position = "right",
+                                        legend.text = element_text(size = 7))
+pg <- plot_grid(p_scree, p_load, nrow = 1, rel_widths = c(1, 1.25))
+print(pg)
+ggsave_if(here("plots", paste0("14_pca_", params$rf_suffix, ".pdf")), pg, width = 11, height = 4.6)
+```
+
+# 4. Is every feature in the right family?
+
+```{r family_audit}
+# A systematic version of a spot-check: for every feature, compare its mean |rho| to the other
+# members of its own family against its mean |rho| to each other family. A feature that tracks a
+# different family more closely than its own is either mislabelled or measuring something other
+# than its name suggests.
+#
+# This was prompted by hia2026_dhx29_occupancy_tx, which is labelled stability_external but is
+# built in 23_dhx29_riboseq_slamseq.Rmd as a per-codon enrichment table averaged over the CDS -
+# structurally the same construction as csc / cai / fop. Its comment there reads: "Per-gene DHX29
+# occupancy = weighted mean of CES values, weighted by codon frequency". The CES table is AU3-
+# biased, which is why the score tracks GC so strongly.
+fam_of <- fam[fc]
+audit <- map_dfr(fc, function(f) {
+  own <- setdiff(fc[fam_of == fam_of[[f]]], f)
+  by_fam <- map_dbl(sort(unique(fam_of)), function(g) {
+    others <- setdiff(fc[fam_of == g], f)
+    if (!length(others)) return(NA_real_)
+    mean(abs(C[f, others]))
+  })
+  names(by_fam) <- sort(unique(fam_of))
+  best <- names(which.max(by_fam))
+  tibble(feature = f, family = fam_of[[f]],
+         own_family = if (length(own)) mean(abs(C[f, own])) else NA_real_,
+         closest_family = best, closest_value = by_fam[[best]])
+}) %>%
+  mutate(misplaced = !is.na(own_family) & closest_family != family &
+                     closest_value > own_family + 0.1) %>%
+  arrange(desc(closest_value - own_family))
+
+cat(sprintf("features whose nearest family is not their own (by > 0.1 mean |rho|): %d of %d\n\n",
+            sum(audit$misplaced), nrow(audit)))
+print(as.data.frame(audit %>% filter(misplaced) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+
+cat("\nThis is a flag, not a verdict: a feature can legitimately correlate with another family\n")
+cat("without belonging to it. Check how each one is actually computed before relabelling.\n")
+```
+
+# 5. What would dropping a feature actually cost?
+
+```{r unique_variance}
+# For each member of a cluster, how much of its variance is NOT explained by the cluster leader.
+# This is what would be lost by keeping only the leader. At rho 0.9 that is still about 19%, so
+# these features are not interchangeable even when they look redundant.
+uv <- clus %>% filter(threshold == params$main_threshold) %>%
+  mutate(shared_with_leader = rho_to_leader^2,
+         unique_variance    = 1 - rho_to_leader^2) %>%
+  dplyr::select(cluster, feature, family, share_pct, rho_to_leader,
+                shared_with_leader, unique_variance)
+print(as.data.frame(uv %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+
+p_uv <- uv %>% filter(unique_variance > 0) %>%
+  mutate(feature = reorder(feature, unique_variance)) %>%
+  ggplot(aes(100 * unique_variance, feature, fill = family)) +
+  geom_col(alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.0f%%", 100 * unique_variance)), hjust = -0.15, size = 3) +
+  scale_fill_manual(values = fam_cols, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(x = "variance NOT shared with the cluster leader (%)", y = NULL,
+       title = sprintf("What each feature still carries on its own (clusters at |rho| >= %.1f)",
+                       params$main_threshold),
+       subtitle = "this is what would be discarded by keeping only the leader of each cluster") +
+  theme_classic(base_size = 11)
+print(p_uv)
+ggsave_if(here("plots", paste0("14_unique_variance_", params$rf_suffix, ".pdf")), p_uv,
+          width = 9, height = 5)
+```
+
+# 6. The decision table
+
+```{r decision_table}
+# One row per cluster at the main threshold, with everything needed to make a keep/drop/group
+# call, and a blank column for the biological judgement. This notebook deliberately does not make
+# that call or write a grouping for anything downstream to consume.
+dec <- clus %>% filter(threshold == params$main_threshold) %>%
+  group_by(cluster) %>%
+  summarise(n_features        = n(),
+            members           = paste(feature, collapse = " | "),
+            families          = paste(sort(unique(family)), collapse = " + "),
+            spans_families    = n_distinct(family) > 1,
+            combined_shap_pct = round(sum(share_pct, na.rm = TRUE), 2),
+            top_feature       = first(leader),
+            top_feature_shap  = round(first(share_pct), 2),
+            min_rho           = round(min(abs(rho_to_leader)), 3),
+            max_unique_var    = round(max(1 - rho_to_leader^2), 3),
+            .groups = "drop") %>%
+  arrange(desc(combined_shap_pct)) %>%
+  mutate(biological_call = "")
+print(as.data.frame(dec %>% dplyr::select(-members)), row.names = FALSE)
+cat("\nmembers of each cluster:\n")
+for (i in seq_len(nrow(dec)))
+  cat(sprintf("  cluster %d: %s\n", dec$cluster[i], dec$members[i]))
+
+cat(sprintf("\nTotal SHAP inside a multi-feature cluster at |rho| >= %.1f: %.1f%%\n",
+            params$main_threshold, sum(dec$combined_shap_pct)))
+cat(sprintf("Of that, in clusters spanning more than one family: %.1f%%\n",
+            sum(dec$combined_shap_pct[dec$spans_families])))
+cat("The second number is the part that family-level SHAP sums do not already resolve.\n")
+```
+
+```{r export}
+# Diagnostic tables only. Nothing here is read by 11_ or 12_, and no grouping is defined.
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+reg_write_csv(clus,  file.path(out_dir, paste0("featcorr_clusters_", params$rf_suffix, ".csv")))
+reg_write_csv(audit, file.path(out_dir, paste0("featcorr_family_audit_", params$rf_suffix, ".csv")))
+reg_write_csv(dec,   file.path(out_dir, paste0("featcorr_decision_table_", params$rf_suffix, ".csv")))
+reg_write_csv(as_tibble(C, rownames = "feature"),
+              file.path(out_dir, paste0("featcorr_matrix_", params$rf_suffix, ".csv")))
+cat("Wrote featcorr_* diagnostics. No grouping file written; nothing downstream changes.\n")
+```

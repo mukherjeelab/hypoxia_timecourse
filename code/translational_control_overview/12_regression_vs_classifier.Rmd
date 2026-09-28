@@ -1,0 +1,505 @@
+---
+title: "Regression versus classifier: are the SHAP values consistent?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    # Code is folded by default with an "unfold" control on every block, and a "Code" menu at the
+    # top right to expand everything at once. The commentary in these chunks is long on purpose,
+    # so the default view should be the prose, the tables and the figures.
+    code_folding: hide
+params:
+  clf_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tco_corrected_both_clipaggregate"
+  reg_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  reg_sweep_preset: "transform"
+  reg_sweep_arm: "raw"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "12_regression_vs_classifier.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+It compares the feature importance the regression produced against the feature importance the
+classifier produced, to see whether the two models point at the same features.
+
+It reads saved CSVs from both and fits nothing.
+
+**Decisions**
+
+- Compare shares and ranks only, never raw SHAP magnitudes. The classifier's SHAP is in units of
+  probability and the regression's is in log2 TE fold change, so the raw numbers are not
+  commensurable. The raw column is not joined at all.
+- Require both models to have used the same features, and stop if they did not. Otherwise a
+  difference could be a difference in feature sets rather than in models.
+- Judge every difference against a measured noise floor rather than against zero.
+
+## What counts as a real difference
+
+Each model's share carries its own run-to-run variation, and the two sources are different: the
+classifier's comes from which negatives were drawn (about 52% gene overlap between draws), the
+regression's from which genes were held out (about 81% row overlap). So a difference has to clear
+both.
+
+**Decisions**
+
+- Combine the two as `2.8 * sqrt(sd_clf^2 + sd_reg^2)`, per family. The saved floor files store
+  `2.8 * sd`, so that factor is divided back out before combining.
+- If only one floor is available, fall back to it and label the threshold as understating, so a
+  verdict based on it is visibly provisional.
+
+## Three things differ between the two models at once
+
+| | classifier | regression |
+|---|---|---|
+| what SHAP explains | a substitute regression forest on 0/1 labels | the model itself |
+| outcome | binary, thresholded | continuous |
+| genes | 2,872 balanced (1,436 + 1,436) | 10,172 |
+
+Because all three differ together, agreement could mean the model type does not matter, or it
+could mean two separate effects cancelled.
+
+**Decisions**
+
+- Include a third arm that separates them: the regression refit on exactly the classifier's 2,872
+  genes. Comparing it to the full regression isolates the change in gene population; comparing it
+  to the classifier isolates the change in outcome type.
+- Report section 4 as open rather than concluded when that arm has not been run.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(cowplot)
+```
+
+```{r load}
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+out_dir <- here("output", "translational_control_overview")
+
+need <- c(clf_fam  = file.path(out_dir, paste0("shap_family_",     params$clf_suffix, ".csv")),
+          clf_feat = file.path(out_dir, paste0("shap_feature_",    params$clf_suffix, ".csv")),
+          reg_fam  = file.path(out_dir, paste0("shapreg_family_",  params$reg_suffix, ".csv")),
+          reg_feat = file.path(out_dir, paste0("shapreg_feature_", params$reg_suffix, ".csv")))
+missing <- need[!file.exists(need)]
+if (length(missing)) {
+  cat("MISSING inputs:\n"); for (m in missing) cat("  ", m, "\n")
+  cat("\nRun 03_shap.Rmd (classifier) and 11_shap_regression.Rmd (regression) first.\n")
+}
+stopifnot("required SHAP outputs are missing - see the list above" = length(missing) == 0)
+
+clf_fam  <- read_csv(need[["clf_fam"]],  show_col_types = FALSE)
+clf_feat <- read_csv(need[["clf_feat"]], show_col_types = FALSE)
+reg_fam  <- read_csv(need[["reg_fam"]],  show_col_types = FALSE)
+reg_feat <- read_csv(need[["reg_feat"]], show_col_types = FALSE)
+
+# The precondition that makes this a comparison of model type rather than of feature sets.
+stopifnot(
+  "the two models do not share a feature set - this comparison would not be about model type" =
+    setequal(clf_feat$feature, reg_feat$feature),
+  "the two models' family sets differ" = setequal(clf_fam$family, reg_fam$family))
+cat("Both models:", nrow(clf_feat), "features |", nrow(clf_fam), "families\n")
+cat("Classifier SHAP units: probability | Regression SHAP units: log2 TE LFC\n")
+cat("=> only shares and ranks are joined below; the raw mean_abs_shap column is not.\n")
+```
+
+```{r floors}
+# Classification floor: measured over 20 neg_seed draws by 03f_.
+clf_floor_path <- file.path(out_dir, "shap_noise_floor.csv")
+# Regression floor: measured over 20 split_seeds by 10c_ (needs 11d_ to have been run).
+reg_floor_path <- file.path(out_dir,
+  paste0("shapreg_noise_floor_", params$reg_sweep_preset, ".csv"))
+
+clf_floor <- if (file.exists(clf_floor_path))
+  read_csv(clf_floor_path, show_col_types = FALSE) %>%
+    dplyr::select(family, sd_clf = sd) else NULL
+reg_floor <- if (file.exists(reg_floor_path))
+  read_csv(reg_floor_path, show_col_types = FALSE) %>%
+    filter(arm == params$reg_sweep_arm) %>% dplyr::select(family, sd_reg = sd) else NULL
+
+cat("classification floor:", if (is.null(clf_floor)) "MISSING" else "present", "\n")
+cat("regression floor:    ", if (is.null(reg_floor)) "MISSING (run 11d_ then 10c_)" else "present", "\n")
+if (is.null(reg_floor))
+  cat("\nWithout the regression floor, deltas are judged against the CLASSIFIER's noise alone,\n",
+      "which UNDERSTATES the threshold. Any 'MOVED' verdict below is provisional until 11d_ runs.\n")
+```
+
+# 1. Family shares
+
+Compares the two models' family-level shares, with each difference judged against its own floor.
+
+**Decisions**
+
+- Report Spearman and Pearson agreement across families, plus a per-family verdict.
+- Draw the floor on both figures as error bars, rather than quoting it in text only.
+
+
+```{r family_compare}
+fam <- clf_fam %>% dplyr::select(family, share_clf = share_pct) %>%
+  inner_join(reg_fam %>% dplyr::select(family, share_reg = share_pct), by = "family") %>%
+  mutate(delta = share_reg - share_clf)
+if (!is.null(clf_floor)) fam <- fam %>% left_join(clf_floor, by = "family")
+if (!is.null(reg_floor)) fam <- fam %>% left_join(reg_floor, by = "family")
+if (!"sd_clf" %in% names(fam)) fam$sd_clf <- NA_real_
+if (!"sd_reg" %in% names(fam)) fam$sd_reg <- NA_real_
+
+fam <- fam %>%
+  mutate(
+    # Combined floor. With only one side measured, fall back to that side and say so.
+    mdd = case_when(
+      !is.na(sd_clf) & !is.na(sd_reg) ~ 2.8 * sqrt(sd_clf^2 + sd_reg^2),
+      !is.na(sd_clf)                  ~ 2.8 * sd_clf,
+      TRUE                            ~ NA_real_),
+    floor_basis = case_when(
+      !is.na(sd_clf) & !is.na(sd_reg) ~ "combined",
+      !is.na(sd_clf)                  ~ "classifier only (understates)",
+      TRUE                            ~ "none"),
+    verdict = case_when(is.na(mdd)         ~ "no floor",
+                        abs(delta) > mdd   ~ "MOVED",
+                        TRUE               ~ "within the floor")) %>%
+  arrange(desc(share_clf))
+print(as.data.frame(fam %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+
+rho <- cor(fam$share_clf, fam$share_reg, method = "spearman")
+pea <- cor(fam$share_clf, fam$share_reg)
+cat(sprintf("\nfamily share agreement: Spearman %.4f | Pearson %.4f | n = %d families\n",
+            rho, pea, nrow(fam)))
+cat("families beyond their floor:", sum(fam$verdict == "MOVED"), "of",
+    sum(fam$verdict != "no floor"), "\n")
+if (any(fam$verdict == "MOVED"))
+  cat("  ", paste(sprintf("%s %+.2f pp", fam$family[fam$verdict == "MOVED"],
+                          fam$delta[fam$verdict == "MOVED"]), collapse = " | "), "\n")
+```
+
+```{r fig_family, fig.width = 11, fig.height = 5}
+p_sc <- ggplot(fam, aes(share_clf, share_reg)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_errorbar(aes(ymin = share_reg - mdd, ymax = share_reg + mdd),
+                width = 0, colour = "grey70", na.rm = TRUE) +
+  geom_point(aes(colour = verdict), size = 3) +
+  ggrepel::geom_text_repel(aes(label = family), size = 3, max.overlaps = 20, seed = 9) +
+  scale_colour_manual(values = c("MOVED" = "#D55E00", "within the floor" = "grey45",
+                                 "no floor" = "#0072B2"), name = NULL) +
+  labs(x = "classifier SHAP share (%)", y = "regression SHAP share (%)",
+       title = "(a) Family shares, with the floor drawn",
+       subtitle = sprintf("Spearman %.3f | error bars = combined min detectable difference | n = %d families",
+                          rho, nrow(fam))) +
+  theme_classic(base_size = 12)
+
+# The slope view: which families gained and which lost, against their own floor.
+p_sl <- fam %>% mutate(family = fct_reorder(family, delta)) %>%
+  ggplot(aes(delta, family)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = -mdd, xmax = mdd), height = 0.35, colour = "grey80",
+                 linewidth = 3, alpha = 0.5, na.rm = TRUE) +
+  geom_point(aes(colour = verdict), size = 3) +
+  scale_colour_manual(values = c("MOVED" = "#D55E00", "within the floor" = "grey45",
+                                 "no floor" = "#0072B2"), guide = "none") +
+  labs(x = "regression share minus classifier share (pp)", y = NULL,
+       title = "(b) Change, against each family's own floor",
+       subtitle = "grey band is the noise floor; a point inside it has not moved") +
+  theme_classic(base_size = 12)
+
+pg <- plot_grid(p_sc, p_sl, nrow = 1, rel_widths = c(1.05, 1))
+print(pg)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("12_family_shares_", params$reg_suffix, ".pdf")),
+         pg, width = 11, height = 5)
+```
+
+# 2. Feature level: ranks and direction
+
+Repeats the comparison one feature at a time, and checks whether the two models agree on the
+direction of each feature's effect.
+
+**Decisions**
+
+- Read the cross-model top-20 overlap against how well each model agrees with itself across its
+  own repeat runs. A cross-model number alone has nothing to be compared to.
+- Test direction agreement twice: over all features, and over only those whose direction is stable
+  across repeat runs. Features whose sign flips between runs have no direction to agree about, and
+  including them manufactures disagreement.
+
+
+```{r feature_compare}
+ft <- clf_feat %>%
+  mutate(share_clf = 100 * mean_abs_shap / sum(mean_abs_shap)) %>%
+  dplyr::select(feature, family, share_clf, rank_clf = rank_shap, cor_clf = shap_value_cor) %>%
+  inner_join(reg_feat %>%
+               mutate(share_reg = 100 * mean_abs_shap / sum(mean_abs_shap)) %>%
+               dplyr::select(feature, share_reg, rank_reg = rank_shap, cor_reg = shap_value_cor),
+             by = "feature")
+cat(sprintf("feature rank Spearman %.4f | share Pearson %.4f | n = %d\n",
+            cor(ft$rank_clf, ft$rank_reg, method = "spearman"),
+            cor(ft$share_clf, ft$share_reg), nrow(ft)))
+
+jac <- function(a, b, k = 20)
+  length(intersect(head(a, k), head(b, k))) / length(union(head(a, k), head(b, k)))
+cross_j <- jac(ft$feature[order(ft$rank_clf)], ft$feature[order(ft$rank_reg)])
+
+# The framing that answers the question. A cross-model Jaccard means little alone: it has to be
+# read against how well each model agrees with itself across its own replication axis. If
+# cross-model agreement is comparable to within-model agreement, the two models agree as well as
+# either agrees with itself, which is the strongest form "consistent" can take.
+within_clf <- NA_real_; within_reg <- NA_real_
+f_clf <- file.path(out_dir, "shap_noise_floor.csv")   # 03f_ reports 0.818 for the classifier
+if (file.exists(f_clf)) within_clf <- 0.818            # from 03f_'s top-20 Jaccard
+reg_stab <- file.path(out_dir, paste0("shapreg_top20_jaccard_", params$reg_sweep_preset, ".csv"))
+if (file.exists(reg_stab))
+  within_reg <- read_csv(reg_stab, show_col_types = FALSE) %>%
+    filter(arm == params$reg_sweep_arm) %>% pull(median_jaccard) %>% first()
+
+cat(sprintf("\ntop-20 Jaccard:  cross-model %.3f | within-classifier %s | within-regression %s\n",
+            cross_j,
+            if (is.na(within_clf)) "n/a" else sprintf("%.3f", within_clf),
+            if (is.na(within_reg)) "n/a (run 11d_)" else sprintf("%.3f", within_reg)))
+if (!is.na(within_clf) && cross_j >= within_clf * 0.9)
+  cat("=> cross-model agreement is comparable to the classifier's agreement with itself.\n")
+```
+
+```{r direction_compare}
+# Direction is uninterpretable for features whose shap_value_cor sign flips across replicates.
+# 03f_ found 14 of 69 such features for the classifier. Including them manufactures
+# disagreement, so the sign test is reported over all features and over the stable subset.
+stab_path <- file.path(out_dir, "shap_direction_stability.csv")
+sign_all <- mean(sign(ft$cor_clf) == sign(ft$cor_reg), na.rm = TRUE)
+cat(sprintf("shap_value_cor sign agreement, ALL features: %.3f (%d of %d)\n",
+            sign_all, sum(sign(ft$cor_clf) == sign(ft$cor_reg), na.rm = TRUE), nrow(ft)))
+if (file.exists(stab_path)) {
+  ds <- read_csv(stab_path, show_col_types = FALSE)
+  unstable <- ds$feature[ds$frac_pos > 0.05 & ds$frac_pos < 0.95]
+  cat("sign-unstable in the classifier (03f_):", length(unstable), "features\n")
+  fs <- ft %>% filter(!feature %in% unstable)
+  agree <- sum(sign(fs$cor_clf) == sign(fs$cor_reg), na.rm = TRUE)
+  bt <- binom.test(agree, nrow(fs), p = 0.5)
+  cat(sprintf("sign agreement on the STABLE subset: %.3f (%d of %d), binomial p = %.3g\n",
+              agree / nrow(fs), agree, nrow(fs), bt$p.value))
+  disagree <- fs %>% filter(sign(cor_clf) != sign(cor_reg)) %>%
+    dplyr::select(feature, family, cor_clf, cor_reg, rank_clf, rank_reg)
+  if (nrow(disagree)) {
+    cat("\nstable features whose DIRECTION disagrees between the two models:\n")
+    print(as.data.frame(disagree %>% mutate(across(where(is.numeric), ~ round(., 3)))),
+          row.names = FALSE)
+  }
+} else cat("shap_direction_stability.csv not found - stable-subset test skipped\n")
+```
+
+```{r fig_feature, fig.width = 11, fig.height = 5}
+p_rk <- ggplot(ft, aes(rank_clf, rank_reg)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(aes(colour = family), size = 2, alpha = 0.85) +
+  scale_colour_viridis_d(guide = "none", end = 0.9) +
+  ggrepel::geom_text_repel(
+    data = ft %>% filter(abs(rank_clf - rank_reg) > 15 | pmin(rank_clf, rank_reg) <= 5),
+    aes(label = feature), size = 2.6, max.overlaps = 25, seed = 9) +
+  labs(x = "classifier SHAP rank", y = "regression SHAP rank",
+       title = "(a) Feature ranks",
+       subtitle = sprintf("Spearman %.3f | labelled: top 5 or moved >15 ranks | n = %d",
+                          cor(ft$rank_clf, ft$rank_reg, method = "spearman"), nrow(ft))) +
+  theme_classic(base_size = 12)
+
+p_dir <- ggplot(ft, aes(cor_clf, cor_reg)) +
+  geom_hline(yintercept = 0, colour = "grey70") + geom_vline(xintercept = 0, colour = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(aes(colour = sign(cor_clf) == sign(cor_reg)), size = 2, alpha = 0.85) +
+  scale_colour_manual(values = c("TRUE" = "grey40", "FALSE" = "#D55E00"),
+                      labels = c("TRUE" = "same sign", "FALSE" = "opposite"), name = NULL) +
+  labs(x = "classifier shap_value_cor", y = "regression shap_value_cor",
+       title = "(b) Direction, the interpretable quantity",
+       subtitle = sprintf("sign agreement %.1f%% over all %d features", 100 * sign_all, nrow(ft))) +
+  theme_classic(base_size = 12)
+
+pg2 <- plot_grid(p_rk, p_dir, nrow = 1)
+print(pg2)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("12_feature_compare_", params$reg_suffix, ".pdf")),
+         pg2, width = 11, height = 5)
+```
+
+# 3. The AUC comparison, as distributions
+
+Compares the two models' AUCs as distributions over their repeat runs rather than as two numbers.
+
+Only about 112 genes were held out by both models, where the confidence interval is roughly plus
+or minus 0.08 - too wide to separate 0.83 from 0.78. Both models do have 20 replicates saved, so
+the comparison is made there instead.
+
+**Decisions**
+
+- Compare distributions, not point estimates.
+- Leave them unpaired. The two axes are different randomisations, so there is no meaningful
+  pairing between a negative draw and a split.
+- State plainly that the two AUCs measure related but not identical things: the classifier's is its
+  own task, the regression's is against labels it never saw.
+
+
+```{r auc_distributions}
+# A point-vs-point AUC comparison is not answerable at this sample size: only ~112 genes are held
+# out by both models, where the 95% CI half-width is ~0.08. Both models do however have a
+# 20-replicate distribution on disk, so the comparison is distribution-vs-distribution.
+# Unpaired, deliberately: the two axes are different randomisations (negative draw vs split), so
+# there is no meaningful pairing between a neg_seed and a split_seed.
+clf_perf <- map_dfr(c(9L, 1:20), function(s) {
+  suf <- sweep_suffix(list(feature_set_label = "tco"), s)
+  f <- file.path(out_dir, paste0("rf_performance_", suf, ".csv"))
+  if (!file.exists(f)) return(NULL)
+  d <- read_csv(f, show_col_types = FALSE)
+  tibble(model = "classifier (neg_seed)", seed = s, auc = d$value[d$metric == "test_auc"])
+}) %>% distinct(seed, .keep_all = TRUE)
+
+reg_sweep_path <- file.path(out_dir, paste0("rfreg_sweep_", params$reg_sweep_preset, ".csv"))
+reg_perf <- if (file.exists(reg_sweep_path))
+  read_csv(reg_sweep_path, show_col_types = FALSE) %>%
+    filter(arm == params$reg_sweep_arm) %>%
+    transmute(model = "regression (split_seed)", seed = split_seed, auc = bridge) else NULL
+
+if (is.null(reg_perf) || nrow(clf_perf) == 0) {
+  cat("Need both sweeps. classifier runs found:", nrow(clf_perf),
+      "| regression sweep:", !is.null(reg_perf), "\n")
+} else {
+  auc_df <- bind_rows(clf_perf, reg_perf)
+  print(as.data.frame(auc_df %>% group_by(model) %>%
+    summarise(n = n(), median = median(auc), sd = sd(auc),
+              p05 = quantile(auc, .05), p95 = quantile(auc, .95), .groups = "drop") %>%
+    mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+  wt <- wilcox.test(auc ~ model, data = auc_df)
+  cat(sprintf("\nunpaired Wilcoxon p = %.4g\n", wt$p.value))
+  cat("NOTE: the classifier's AUC is its own task (separating its two classes); the regression's\n")
+  cat("is the bridge AUC on labels it never saw. Comparable in scale, not identical in meaning.\n")
+}
+```
+
+```{r fig_auc, eval = exists("auc_df"), fig.width = 7, fig.height = 4.4}
+p_auc <- ggplot(auc_df, aes(auc, model, colour = model)) +
+  geom_point(position = position_jitter(height = 0.12, seed = 9), size = 2, alpha = 0.75) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.4, linewidth = 0.4, colour = "black") +
+  scale_colour_manual(values = c("classifier (neg_seed)" = "#0072B2",
+                                 "regression (split_seed)" = "#E69F00"), guide = "none") +
+  labs(x = "AUC", y = NULL, title = "Two replication axes, two distributions",
+       subtitle = sprintf("n = %d classifier draws, %d regression splits. Unpaired: the axes are different randomisations.",
+                          sum(auc_df$model == "classifier (neg_seed)"),
+                          sum(auc_df$model == "regression (split_seed)"))) +
+  theme_classic(base_size = 12)
+print(p_auc)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("12_auc_distributions_", params$reg_suffix, ".pdf")),
+         p_auc, width = 7, height = 4.4)
+```
+
+# 4. Separating gene population from model type
+
+Uses the restricted-gene arm to attribute the family share differences to their causes.
+
+**Decisions**
+
+- Split each difference into a population part and a model part, and report them next to the total.
+- Print the commands to build the arm when it is missing, rather than failing.
+
+
+```{r population_arm}
+# The regression refit on exactly the classifier's 2,872 genes. Comparing it to the 10,172-gene
+# regression isolates gene population; comparing it to the classifier isolates outcome type plus
+# the surrogate. Without this arm, "the two agree" cannot be told from "two effects cancelled".
+clfgene_suffix <- reg_suffix(REG_PRESETS$population$clfgene, 9L)
+clfgene_path   <- file.path(out_dir, paste0("shapreg_family_", clfgene_suffix, ".csv"))
+if (!file.exists(clfgene_path)) {
+  cat("The clfgenes arm has not been run. To build it:\n")
+  cat("  rmarkdown::render('10_rf_regression.Rmd', params=list(\n")
+  cat("      restrict_to_classifier_genes=TRUE, feature_set_label='tcoreg_pop'))\n")
+  cat("  rmarkdown::render('11_shap_regression.Rmd', params=list(\n")
+  cat("      restrict_to_classifier_genes=TRUE, feature_set_label='tcoreg_pop'))\n")
+} else {
+  cg_fam <- read_csv(clfgene_path, show_col_types = FALSE) %>%
+    dplyr::select(family, share_clfgene = share_pct)
+  three <- fam %>% dplyr::select(family, share_clf, share_reg, mdd) %>%
+    left_join(cg_fam, by = "family") %>%
+    # Oriented the same way as section 1's delta = share_reg - share_clf, so a family that gained
+    # share in the regression is positive in BOTH tables. It previously ran the other way
+    # (share_clf - share_reg) while the caption claimed to repeat section 1's number, which made
+    # total the NEGATION of the quantity it was presented as. This repo has a documented history
+    # of contrast signs that disagree with their own labels, so the definition is what moved.
+    #
+    # Algebraically, reading classifier -> regression:
+    #   model_effect = share_clfgene - share_clf   swap the classifier for the regression on the
+    #                                              classifier's 2,872 genes (gene set held fixed)
+    #   pop_effect   = share_reg     - share_clfgene   then widen from 2,872 to all 10,172 genes
+    #   sum          = share_reg     - share_clf   = total = section 1's delta, exactly.
+    mutate(model_effect = share_clfgene - share_clf,   # classifier vs regression, same genes
+           pop_effect   = share_reg     - share_clfgene, # 2,872 -> 10,172 genes
+           total        = share_reg     - share_clf) %>%
+    arrange(desc(abs(total)))
+  print(as.data.frame(three %>% mutate(across(where(is.numeric), ~ round(., 2)))), row.names = FALSE)
+  # The decomposition is exact by construction, but assert it rather than trusting the arithmetic:
+  # a future edit to one component is exactly the kind of change that leaves the caption true and
+  # the table wrong.
+  stopifnot("the population/model decomposition does not sum to the total" =
+              all(abs(three$pop_effect + three$model_effect - three$total) < 1e-8, na.rm = TRUE))
+  cat("\nmodel_effect = swapping the classifier for the regression ON THE CLASSIFIER'S GENES\n")
+  cat("pop_effect   = then widening from the classifier's genes to all of them\n")
+  cat("total        = the raw difference reported in section 1, share_reg - share_clf\n")
+  cat("               (model + pop, exactly - asserted above, not merely up to rounding)\n")
+  cat(sprintf("\nlargest population effect: %s %+.2f pp | largest model effect: %s %+.2f pp\n",
+              three$family[which.max(abs(three$pop_effect))],
+              three$pop_effect[which.max(abs(three$pop_effect))],
+              three$family[which.max(abs(three$model_effect))],
+              three$model_effect[which.max(abs(three$model_effect))]))
+}
+```
+
+# 5. Summary
+
+States which families moved beyond their floor and which did not.
+
+**Decisions**
+
+- Repeat the caveat about a missing regression floor here, so a provisional verdict is not read as
+  settled.
+
+
+```{r summary}
+cat(sprintf("Family shares agree at Spearman %.3f (Pearson %.3f) over %d families.\n",
+            rho, pea, nrow(fam)))
+cat(sprintf("Feature ranks agree at Spearman %.3f over %d features; top-20 Jaccard %.3f.\n",
+            cor(ft$rank_clf, ft$rank_reg, method = "spearman"), nrow(ft), cross_j))
+moved <- fam %>% filter(verdict == "MOVED")
+if (nrow(moved)) {
+  cat(sprintf("\n%d famil%s moved beyond %s floor:\n", nrow(moved),
+              if (nrow(moved) == 1) "y" else "ies",
+              if (all(moved$floor_basis == "combined")) "the combined" else "its"))
+  for (i in seq_len(nrow(moved)))
+    cat(sprintf("  %-20s %+6.2f pp  (floor %.2f, basis: %s)\n",
+                moved$family[i], moved$delta[i], moved$mdd[i], moved$floor_basis[i]))
+  cat("\nThese are NOT noise. Section 4 attributes them to gene population vs model type when\n")
+  cat("the clfgenes arm is present; otherwise the attribution is open.\n")
+} else {
+  cat("\nNo family moved beyond its floor: the two models agree within replication noise.\n")
+}
+if (any(fam$floor_basis == "classifier only (understates)"))
+  cat("\nCAVEAT: the regression floor is missing, so every threshold above is too LENIENT.\n",
+      "Run 11d_ then 10c_ before treating any 'MOVED' verdict as settled.\n")
+```
+
+```{r export}
+reg_write_csv(fam, file.path(out_dir, paste0("regvsclf_family_", params$reg_suffix, ".csv")))
+reg_write_csv(ft,  file.path(out_dir, paste0("regvsclf_feature_", params$reg_suffix, ".csv")))
+if (exists("auc_df"))
+  reg_write_csv(auc_df, file.path(out_dir, paste0("regvsclf_auc_", params$reg_suffix, ".csv")))
+if (exists("three"))
+  reg_write_csv(three, file.path(out_dir, paste0("regvsclf_population_", params$reg_suffix, ".csv")))
+cat("Wrote comparison outputs.\n")
+```

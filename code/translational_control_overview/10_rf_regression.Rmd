@@ -1,0 +1,1504 @@
+---
+title: "`r paste0('RF regression: ', params$outcome_col, ' ~ features (eIF', params$gene, ', ', params$condition, ', ', params$timepoint, ', y=', params$target_transform, ')')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    # Code is folded by default with an "unfold" control on every block, and a "Code" menu at the
+    # top right to expand everything at once. The commentary in these chunks is long on purpose,
+    # so the default view should be the prose, the tables and the figures.
+    code_folding: hide
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  readout: "TE"
+  timepoint: "1hr"
+  lfc: "0.5"
+  include_blocks: "intrinsic,external"
+  clip_mode: "aggregate"
+  matrix_rds: "feature_matrix_tco.rds"
+  feature_set_label: "tcoreg"
+  variant_set: "corrected"
+  initiation_score: "both"
+  include_deprecated: FALSE
+  exclude_families: ""
+  shuffle_families: ""
+  outcome_csv: ""
+  outcome_col: "te_lfc"
+  outcome_padj_col: "te_padj"
+  negate_outcome: FALSE
+  target_transform: "raw"
+  winsorize_y: 0
+  split_seed: 9
+  forest_seed: 9
+  num_trees: 1000
+  mtry: 0
+  min_node_size: 5
+  splitrule: "variance"
+  sample_fraction: 0
+  weight_mode: "none"
+  restrict_to_classifier_genes: FALSE
+  gate_feature_parity: TRUE
+  clf_suffix_override: ""
+  precision_at_k: "50,100,200,500"
+  auc_bridge: TRUE
+  run_cv: TRUE
+  save_plots: TRUE
+  save_model_data: TRUE
+  mutate_target: ""
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+# `params` is a base function outside knitr, so it must be cleared before being defined as a
+# list. The defaults below are not re-typed: notebook 07 in the frozen pipeline carries a
+# second, disagreeing interactive param set, so knitting it gives a 56-feature model while
+# running it chunk-by-chunk gives a 51-feature one. Reading this file's own YAML back is the
+# only interactive path that cannot drift from the knit path.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10_rf_regression.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r direction_facts, include=FALSE}
+# The direction of this contrast is DERIVED here, before any prose, so that the sentences in the
+# overview cannot state it wrongly. An earlier draft of this notebook claimed the classifier's
+# positive set was "genes whose TE went up on knockdown", which is backwards: te_lfc is
+# log2(sictrl / si3d), so a positive value means the control is higher and the knockdown LOWER.
+# Every directional phrase below is interpolated from these values, and the assertion at the end
+# ties them to the `direction` param, so prose and data cannot disagree.
+suppressMessages({ library(dplyr); library(readr); library(here) })
+.dir_outcome <- if (nzchar(params$outcome_csv)) params$outcome_csv else
+  paste0("translation_categories_si", params$gene, "_vs_sictrl_",
+         params$condition, "_", params$timepoint, ".csv")
+.dir_te  <- read_csv(here("output", .dir_outcome), show_col_types = FALSE) %>%
+  mutate(g = sub("[.].*", "", gene_id))
+.dir_pos <- read_csv(here("output", "genesets",
+  paste0(params$condition, "_", params$gene, "_", params$direction, "_",
+         params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")),
+  show_col_types = FALSE)$ensembl_gene
+.dir_p       <- .dir_te %>% filter(g %in% .dir_pos)
+.dir_median  <- median(.dir_p[[params$outcome_col]], na.rm = TRUE)
+.dir_n       <- nrow(.dir_p)
+# Positive outcome = control above knockdown = the knockdown LOWERS it.
+.dir_verb    <- if (.dir_median > 0) "falls" else "rises"      # singular: "TE falls"
+.dir_verb_pl <- if (.dir_median > 0) "fall"  else "rise"       # plural:  "those genes fall"
+.dir_effect  <- if (.dir_median > 0) "promotes" else "inhibits"
+.dir_ratio   <- paste0("log2(sictrl / si", params$gene, ")")
+.dir_gene    <- paste0("eIF", params$gene)                     # "3d" -> "eIF3d", not "eIF33d"
+# The count that belongs in the prose is the number the CLASSIFIER actually modelled, which is the
+# gene set intersected with the feature matrix, not the size of the gene set CSV. Read it from 02_'s
+# saved metrics when available rather than restating a number from a different denominator.
+.dir_clf_suffix <- if (nzchar(params$clf_suffix_override)) params$clf_suffix_override else {
+  source(here("code", "translational_control_overview", "02_sweep_presets.R"), local = TRUE)
+  sweep_suffix(list(gene = params$gene, direction = params$direction, readout = params$readout,
+                    condition = params$condition, timepoint = params$timepoint,
+                    lfc = params$lfc, feature_set_label = "tco"), 9L)
+}
+.dir_clf_perf <- file.path(here("output", "translational_control_overview"),
+                           paste0("rf_performance_", .dir_clf_suffix, ".csv"))
+.dir_n_clf <- if (file.exists(.dir_clf_perf))
+  read_csv(.dir_clf_perf, show_col_types = FALSE) %>% filter(metric == "n_pos") %>% pull(value) else
+  NA_real_
+.dir_n_phrase <- if (is.na(.dir_n_clf)) paste0("the ", .dir_n, " genes in that set") else
+  paste0("the ", format(.dir_n_clf, big.mark = ","), " genes")
+stopifnot(
+  "the positive set's median outcome sign disagrees with the `direction` param" =
+    (params$direction == "promotes" && .dir_median > 0) ||
+    (params$direction == "inhibits" && .dir_median < 0)
+)
+```
+
+# Overview
+
+This notebook predicts each gene's continuous TE log2 fold change from its mRNA sequence and
+structure features, using a random forest regression.
+
+It is the regression counterpart to `02_rf_model.Rmd`, which answers a related but different
+question. That notebook is a classifier: it takes `r .dir_n_phrase` whose TE **`r .dir_verb`**
+when `r .dir_gene` is knocked down - the genes `r .dir_gene` `r .dir_effect` - draws an equal
+number from a pool selected for showing no effect, and learns to tell the two apart. This notebook
+drops the classes and the pool, and models the TE change itself across every gene in the feature
+matrix.
+
+On the sign: the outcome is ``r params$outcome_col``, which is `r .dir_ratio`, so a positive value
+means TE was higher in the control than after knockdown. The gene set behind that classifier is
+defined by ``r params$outcome_col` > `r params$lfc``, with median
+`r sprintf("%+.3f", .dir_median)` across its `r format(.dir_n, big.mark = ",")` genes, so those genes `r .dir_verb_pl` on
+knockdown. Positive therefore means `r .dir_gene` `r .dir_effect` translation throughout this
+notebook.
+
+Every directional phrase in that paragraph is computed from the outcome file at knit time, not
+typed, and a check ties the sign to the `direction` parameter. An earlier draft of this notebook
+had the direction backwards in prose while every number in it was correct, which is the failure
+this arrangement removes.
+
+**Decisions**
+
+- Model every gene with a measured TE value (10,172) rather than a balanced pair of tails
+  (2,872).
+- Use the continuous TE log2 fold change as the outcome, not a thresholded label.
+- Replace `neg_seed` with `split_seed` as the replication axis. There is no negative draw left
+  to seed, so the thing that varies between repeat runs is now which genes are held out. The
+  sweep in `10b_`/`10c_` uses that.
+- Keep the feature selection identical to `02_`'s, so that when `12_` compares the two models'
+  SHAP values the comparison is about the model rather than about the feature sets.
+- Write only `rfreg_*` filenames, never `rf_*` or `shap_*`. `assert_no_collision()` in
+  `10_regression_presets.R` enforces this so a run here cannot overwrite the frozen
+  classification results.
+
+One thing to note when reading the results: because there is no negative pool, no number here
+is a property of that pool. That is worth stating because the pool is not a neutral sample of
+the transcriptome. Its genes are GC-richer than the rest of the matrix by 2.45 percentage points
+(Wilcoxon p = 2.7e-17), so any GC difference measured against it is partly a property of how the
+pool was selected.
+
+## Which TE column is the outcome
+
+Three columns in this project have similar names and different meanings, so it is worth being
+explicit about which one is being modelled.
+
+| column | where it lives | role here |
+|---|---|---|
+| `te_lfc` | the outcome CSV for this contrast | **the outcome.** What the forest predicts. |
+| `rna_lfc` | the same CSV | checks the file's sign convention. Not modelled. |
+| `te_lfc` | the feature matrix | a different contrast. Not used. |
+
+**The outcome** is `te_lfc` from `translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv`.
+
+**`rna_lfc` is used once, to confirm the sign convention.** The filenames read
+`si3d_vs_sictrl`, but the DESeq2 coefficient is `Condition_sictrl_vs_si3d`, so the columns are
+log2(sictrl / si3d) and positive means eIF3d promotes translation. Since the filename and the
+coefficient disagree, the orientation is checked against the data instead: the siRNA destroys
+EIF3D's own mRNA, so EIF3D's `rna_lfc` must be strongly positive, and it is (+2.90, about 87%
+knockdown).
+
+That check cannot be done on `te_lfc`, because EIF3D's own `te_lfc` is negative (-1.26). EIF3D is
+TE-buffered in this contrast: its ribosome footprints rise (+1.45) along with its mRNA (+2.90),
+so the ratio moves down. Requiring EIF3D's `te_lfc` to be positive would therefore fail on
+correct data.
+
+**The feature matrix's `te_lfc` is a different contrast** and is not the outcome. Audit finding
+F7 established that it is the siCTRL hypoxia-versus-normoxia comparison, not a knockdown
+comparison: it separates the eIF3d target set by a median of only -0.013 and correlates 0.002
+with the outcome used here. `indiv_te_hypoxia_1hr` is also not a fold change, but an absolute TE
+level (it correlates 0.933 with the normoxia equivalent).
+
+**Decisions**
+
+- Drop `te_lfc`, `te_padj` and `te_lfc_bin` from the feature matrix before joining the outcome,
+  so there is never a second column of that name next to the outcome.
+- Check the sign convention on `rna_lfc`, not on `te_lfc`.
+- Check the outcome by value against both matrix columns, not by name. Joining either of them
+  as the outcome would model the wrong quantity while passing every range and finiteness check,
+  so a name-based check would not catch it. The `target_provenance` chunk does this.
+- Exclude `rna_lfc`, `ribo_lfc` and `category` from the features along with the outcome columns.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(pROC)
+```
+
+```{r derived_values}
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))   # sweep_suffix()
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+
+SPLIT_SEED  <- as.integer(params$split_seed)
+FOREST_SEED <- as.integer(params$forest_seed)
+
+stopifnot(
+  "target_transform must be raw, rank_ecdf or robust_z" =
+    params$target_transform %in% c("raw", "rank_ecdf", "robust_z"),
+  "splitrule must be variance, extratrees or maxstat" =
+    params$splitrule %in% c("variance", "extratrees", "maxstat"),
+  "winsorize_y must be >= 0" = params$winsorize_y >= 0,
+  # padj is a monotone function of |lfc|/lfcSE, so weighting by it upweights large |y|. That is
+  # weighting by the outcome - a soft target leak that inflates R2, Spearman and every AUC.
+  # Blocked rather than documented, because it is the tempting option: padj is the precision
+  # column that actually exists in the file, and lfcSE is not saved for this contrast.
+  "weight_mode='padj' weights by a function of |y| - that is target leakage" =
+    params$weight_mode %in% c("none", "basemean")
+)
+
+include_blocks <- str_trim(str_split(params$include_blocks, ",")[[1]])
+stopifnot("include_blocks must name real blocks" =
+            all(include_blocks %in% c("intrinsic", "external", "eif4e", "technical")))
+
+# Built from the same params as 02_'s, so a regression suffix is string-alignable with the
+# classifier suffix it will be compared against in 12_.
+suffix <- reg_suffix(list(
+  gene = params$gene, direction = params$direction, readout = params$readout,
+  condition = params$condition, timepoint = params$timepoint, lfc = params$lfc,
+  feature_set_label = params$feature_set_label, variant_set = params$variant_set,
+  initiation_score = params$initiation_score, clip_mode = params$clip_mode,
+  target_transform = params$target_transform, winsorize_y = params$winsorize_y,
+  min_node_size = params$min_node_size, mtry = params$mtry, num_trees = params$num_trees,
+  splitrule = params$splitrule, sample_fraction = params$sample_fraction,
+  weight_mode = params$weight_mode,
+  restrict_to_classifier_genes = params$restrict_to_classifier_genes,
+  forest_seed = FOREST_SEED), SPLIT_SEED)
+
+clf_suffix <- if (nzchar(params$clf_suffix_override)) params$clf_suffix_override else
+  sweep_suffix(list(gene = params$gene, direction = params$direction, readout = params$readout,
+                    condition = params$condition, timepoint = params$timepoint,
+                    lfc = params$lfc, feature_set_label = "tco"), 9L)
+
+# "" builds the knockdown contrast filename from params. si3e normoxia 1and4hr is the one
+# contrast saved under a different stem, so it needs an explicit outcome_csv.
+outcome_file <- if (nzchar(params$outcome_csv)) params$outcome_csv else
+  paste0("translation_categories_si", params$gene, "_vs_sictrl_",
+         params$condition, "_", params$timepoint, ".csv")
+
+out_dir <- here("output", "translational_control_overview")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+MUTATING <- nzchar(params$mutate_target)
+ggsave_if <- function(...) if (isTRUE(params$save_plots) && !MUTATING) ggsave(...)
+
+cat("Suffix:        ", suffix, "\n")
+cat("Classifier ref:", clf_suffix, "\n")
+cat("Outcome file:  ", outcome_file, "  column:", params$outcome_col, "\n")
+cat("Transform:     ", params$target_transform,
+    if (params$winsorize_y > 0) paste0(" (winsorized at +/-", params$winsorize_y, ")") else "", "\n")
+cat("Seeds:          split", SPLIT_SEED, "| forest", FOREST_SEED, "\n")
+if (MUTATING) cat("*** MUTATION RUN:", params$mutate_target, "- nothing will be written ***\n")
+```
+
+# Load
+
+Reads the feature matrix, its annotation table, and the outcome file for this contrast.
+
+**Decisions**
+
+- Take features from `feature_matrix_tco.rds` and outcomes from a separate
+  `translation_categories_*` file, rather than expecting the outcome to already be in the matrix.
+- Require the annotation table to describe exactly the columns the matrix has, so feature
+  selection cannot silently reference a column that is not there.
+
+
+```{r load_data}
+features_raw <- readRDS(file.path(out_dir, params$matrix_rds))
+annotation   <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+stopifnot("annotation does not match the matrix" =
+            setequal(annotation$feature, colnames(features_raw)))
+cat("Matrix:", nrow(features_raw), "x", ncol(features_raw), "\n")
+
+# Drop the label columns before the join. Leaving them would put a second column named te_lfc
+# next to the outcome and force dplyr to rename one of them, which is how the wrong column
+# could end up being modelled without anyone noticing.
+features <- features_raw %>% dplyr::select(-any_of(c("te_lfc", "te_padj", "te_lfc_bin")))
+
+outcome_raw <- read_csv(here("output", outcome_file), show_col_types = FALSE)
+stopifnot(
+  "outcome CSV lacks the named outcome column" = params$outcome_col %in% names(outcome_raw),
+  "outcome CSV lacks the named padj column"    = params$outcome_padj_col %in% names(outcome_raw),
+  "outcome CSV has no gene_id column"          = "gene_id" %in% names(outcome_raw)
+)
+cat("Outcome file:", nrow(outcome_raw), "genes |",
+    sum(!is.na(outcome_raw[[params$outcome_col]])), "with a non-NA outcome\n")
+```
+
+# Target
+
+Joins the outcome onto the feature matrix, then checks that the joined values are the intended
+quantity and the intended direction.
+
+**Decisions**
+
+- Join on `gene_id_clean`. The matrix holds one transcript per gene, so this is one-to-one, and
+  the code asserts that rather than assuming it.
+- Keep every gene with a non-missing outcome. No filtering on significance: `te_padj` is used
+  only for reporting and for the Precision@K labels.
+- Do not re-centre the outcome even though its median is 0.304 rather than zero. Centring is an
+  affine transform, and a variance-splitting forest is unchanged by it.
+  `10d_target_scale_analysis.Rmd` measures and plots this.
+- Verify the join reproduces the source file exactly rather than trusting `inner_join`.
+
+
+```{r create_target}
+# sub() on an already-unversioned id is a no-op, so this handles both conventions.
+outcome <- outcome_raw %>%
+  mutate(gene_id_clean = sub("[.].*", "", gene_id)) %>%
+  dplyr::select(gene_id_clean,
+                y      = all_of(params$outcome_col),
+                y_padj = all_of(params$outcome_padj_col))
+
+# MDA-MB-231 is log2(sictrl/si3d) so positive already means "eIF3d promotes". MCF7-SIX1 runs the
+# other way and must be negated to match. Untested on MCF7-SIX1 - the direction check below is
+# what would catch a mistake.
+if (isTRUE(params$negate_outcome)) {
+  outcome$y <- -outcome$y
+  cat("NOTE: outcome negated (negate_outcome = TRUE)\n")
+}
+
+# --- mutation hooks. Deliberate corruptions, each of which must trip a named check below. ---
+if (MUTATING) {
+  mt <- params$mutate_target
+  if (mt == "target_is_matrix_te_lfc") {
+    outcome <- features_raw %>% dplyr::select(gene_id_clean, y = te_lfc, y_padj = te_padj)
+  } else if (mt == "target_is_indiv_te") {
+    outcome <- features_raw %>% dplyr::select(gene_id_clean, y = indiv_te_hypoxia_1hr) %>%
+      mutate(y_padj = 0.5)
+  } else if (mt %in% c("flip_target_sign", "permute_target")) {
+    # Both of these corrupt the outcome for every gene EXCEPT the knockdown gene itself.
+    #
+    # Without that exception they trip the contrast anchor, because the anchor compares the
+    # knockdown gene's own value against the params-implied file and a negated or permuted value
+    # no longer matches. Three of the nine mutations were landing on the anchor for that reason,
+    # which meant the geneset-separation spot-check was never demonstrated to fire at all - the
+    # "a check never shown to FAIL is uninformative" problem, one level up. Holding the knockdown
+    # gene fixed lets these two slip past the anchor so that separation is the only check left
+    # that can catch them, which is what proves it works.
+    .kd <- paste0("EIF", toupper(params$gene))
+    .kd_ids <- if ("symbol" %in% names(outcome_raw))
+      sub("[.].*", "", outcome_raw$gene_id[outcome_raw$symbol == .kd]) else character(0)
+    .spare <- outcome$gene_id_clean %in% .kd_ids
+    .keep  <- outcome$y[.spare]
+    if (mt == "flip_target_sign") {
+      outcome$y <- -outcome$y
+    } else {
+      set.seed(9); outcome$y <- sample(outcome$y)
+    }
+    outcome$y[.spare] <- .keep
+    cat(sprintf("  (held %s fixed so the contrast anchor still passes)\n", .kd))
+  }
+  cat("applied mutation:", mt, "\n")
+}
+
+model_genes <- features %>%
+  inner_join(outcome, by = "gene_id_clean") %>%
+  filter(!is.na(y))
+
+# Optional: restrict to the genes the classifier modelled. This is the arm that separates
+# "different model type" from "different gene population" when 12_ compares SHAP - without it,
+# agreement between the two models cannot be told apart from two effects cancelling.
+if (isTRUE(params$restrict_to_classifier_genes)) {
+  clf_genes_path <- file.path(out_dir, paste0("rf_model_gene_sets_", clf_suffix, ".csv"))
+  stopifnot("restrict_to_classifier_genes needs 02_'s gene sets - knit 02_rf_model.Rmd first" =
+              file.exists(clf_genes_path))
+  clf_genes <- read_csv(clf_genes_path, show_col_types = FALSE)$gene_id_clean
+  n_before  <- nrow(model_genes)
+  model_genes <- model_genes %>% filter(gene_id_clean %in% clf_genes)
+  cat("Restricted to the classifier's genes:", n_before, "->", nrow(model_genes), "\n")
+}
+
+cat("Model genes:", nrow(model_genes), "\n")
+```
+
+```{r target_provenance}
+# Confirm the outcome is the quantity intended.
+#
+# The matrix's own te_lfc is the siCTRL hypoxia-versus-normoxia contrast (audit finding F7,
+# pinned bit-for-bit by 01_'s verify_te_lfc_provenance), and indiv_te_hypoxia_1hr is an absolute
+# TE level. Joining either as the outcome would model the wrong quantity while passing every
+# range, finiteness and monotonicity check here, so the outcome is compared against both by
+# value rather than by name.
+prov <- features_raw %>%
+  dplyr::select(gene_id_clean, m_te = te_lfc, m_ind = indiv_te_hypoxia_1hr) %>%
+  inner_join(model_genes %>% dplyr::select(gene_id_clean, y), by = "gene_id_clean")
+k_te  <- complete.cases(prov$y, prov$m_te)
+k_ind <- complete.cases(prov$y, prov$m_ind)
+dev_te  <- max(abs(prov$y[k_te] - prov$m_te[k_te]))
+r_te    <- cor(prov$y[k_te],  prov$m_te[k_te],  method = "spearman")
+r_ind   <- cor(prov$y[k_ind], prov$m_ind[k_ind], method = "spearman")
+cat(sprintf("vs matrix te_lfc (hypoxia response): max|dev| %.3f, Spearman %+.3f (n=%d)\n",
+            dev_te, r_te, sum(k_te)))
+cat(sprintf("vs indiv_te_hypoxia_1hr (abs TE level): Spearman %+.3f\n", r_ind))
+stopifnot(
+  "the joined outcome equals the matrix's own te_lfc, so the wrong contrast was loaded" = dev_te > 0.5,
+  "the target tracks the matrix hypoxia-response te_lfc too closely" = abs(r_te)  < 0.5,
+  "the target tracks an absolute TE level too closely"               = abs(r_ind) < 0.5
+)
+
+# Never transcribe a reference value: re-parse the source and assert the join reproduced it
+# exactly, rather than trusting that inner_join did what was intended.
+recheck <- model_genes %>% dplyr::select(gene_id_clean, y) %>%
+  inner_join(outcome %>% dplyr::select(gene_id_clean, src = y), by = "gene_id_clean")
+stopifnot(
+  "the target is not bit-identical to its named source file" =
+    nrow(recheck) == nrow(model_genes) && max(abs(recheck$y - recheck$src)) == 0,
+  # The matrix is one transcript per gene, so a gene-keyed join must not fan out.
+  "the target join was not 1:1 - the matrix is no longer one transcript per gene" =
+    !any(duplicated(model_genes$gene_id_clean)),
+  "non-finite target" = all(is.finite(model_genes$y)),
+  "the join added more than the two expected columns" =
+    setequal(setdiff(colnames(model_genes), colnames(features)), c("y", "y_padj"))
+)
+
+# A param typo must not silently load normoxia, or 4hr, while every other check passes.
+if (!nzchar(params$outcome_csv))
+  stopifnot("outcome_csv does not name this contrast" =
+    all(vapply(c(paste0("si", params$gene), "sictrl", params$condition, params$timepoint),
+               function(t) grepl(t, outcome_file, fixed = TRUE), logical(1))))
+
+cat(sprintf("\nTARGET: n=%d  median %+.3f  mean %+.3f  sd %.3f  MAD %.3f  range [%.2f, %.2f]\n",
+            nrow(model_genes), median(model_genes$y), mean(model_genes$y), sd(model_genes$y),
+            mad(model_genes$y), min(model_genes$y), max(model_genes$y)))
+cat(sprintf("        |y|>1: %d   |y|>2: %d   |y|>3: %d\n",
+            sum(abs(model_genes$y) > 1), sum(abs(model_genes$y) > 2),
+            sum(abs(model_genes$y) > 3)))
+# The median is not zero (0.304 on si3d hypoxia 1hr). Do not "recentre to fix it": centring is
+# an affine transform and a variance-splitting forest is invariant to it, so it changes nothing
+# the model does and nothing about importance shares. 10d_target_scale_analysis.Rmd measures and
+# plots that, and asserts the equivalence.
+```
+
+```{r direction_check}
+# Confirm the sign convention. This is the only use of rna_lfc in this notebook: it is not
+# modelled, not predicted, and is excluded from the features.
+#
+# te_lfc cannot serve here. EIF3D's own te_lfc is -1.26, because EIF3D is TE-buffered in this
+# contrast (its ribo_lfc of +1.45 tracks its rna_lfc of +2.90), so requiring it to be positive
+# would fail on correct data. The siRNA destroys EIF3D's mRNA, so rna_lfc gives an unambiguous
+# reading: this file is oriented log2(sictrl/si3d), and positive means eIF3d promotes.
+kd_symbol <- paste0("EIF", toupper(params$gene))            # 3d -> EIF3D, 3e -> EIF3E
+if ("symbol" %in% names(outcome_raw) && "rna_lfc" %in% names(outcome_raw) &&
+    !isTRUE(params$negate_outcome)) {
+  e <- outcome_raw %>% filter(symbol == kd_symbol)
+  stopifnot("the knockdown target gene is not in the outcome file" = nrow(e) == 1)
+  cat(sprintf("%s rna_lfc %+.2f (the ruler: must be strongly positive) | te_lfc %+.2f (%s)\n",
+              kd_symbol, e$rna_lfc, e[[params$outcome_col]], e$category))
+  stopifnot(
+    "the knockdown gene's rna_lfc is not strongly positive - the contrast direction has flipped" =
+      e$rna_lfc > 2
+  )
+  # Contrast anchor. The rna_lfc ruler above confirms the DIRECTION but not WHICH contrast was
+  # loaded: every si3d file has the knockdown gene strongly up, so a normoxia file, or 4hr,
+  # sails through it. This pins the specific contrast.
+  #
+  # No value is transcribed here. An earlier version of this check carried a hand-typed expected
+  # value, and the value was simply wrong (0.104 against a true +0.9240 for normoxia 1hr) -
+  # exactly the failure mode CLAUDE.md's "never transcribe reference values" rule exists for.
+  # Instead the reference is parsed from the file that PARAMS imply, independently of
+  # outcome_csv. When outcome_csv overrides to a different contrast the two disagree and this
+  # fires; that override path is what this check guards, and 10z_'s wrong_condition_file
+  # mutation is what proves it fires.
+  implied_file <- paste0("translation_categories_si", params$gene, "_vs_sictrl_",
+                         params$condition, "_", params$timepoint, ".csv")
+  if (file.exists(here("output", implied_file))) {
+    ref <- read_csv(here("output", implied_file), show_col_types = FALSE) %>%
+      filter(symbol == kd_symbol)
+    exp_y <- if (isTRUE(params$negate_outcome)) -ref[[params$outcome_col]]
+             else ref[[params$outcome_col]]
+    obs_y <- model_genes$y[model_genes$symbol == kd_symbol]
+    # The anchor needs the knockdown gene to still be in the modelled set, and under
+    # restrict_to_classifier_genes it cannot be: the classifier's genes are its positive set
+    # (te_lfc > 0.5) plus its negative controls (|te_lfc| < 0.5), and EIF3D's own te_lfc of -1.26
+    # satisfies neither, so it is absent from 02_'s gene sets by construction. Skipping with a
+    # named reason is the honest response - asserting would make that arm unrunnable, and
+    # relaxing the assert to length(obs_y) <= 1 would silently retire it for every run. The
+    # rna_lfc ruler above still fires, so the DIRECTION is checked either way; only the
+    # which-contrast-was-loaded anchor is unavailable.
+    if (length(obs_y) != 1) {
+      cat(sprintf(paste0("contrast anchor SKIPPED: %s is not among the %d modelled genes",
+                         if (isTRUE(params$restrict_to_classifier_genes))
+                           " (filtered out by restrict_to_classifier_genes - it is in neither of 02_'s gene sets)"
+                         else " (absent from the feature matrix or its target is NA)",
+                         ". The anchor cannot be evaluated; the rna_lfc direction ruler above still applies.\n"),
+                  kd_symbol, nrow(model_genes)))
+    } else {
+      cat(sprintf("contrast anchor (%s): %s %s = %+.4f expected, %+.4f observed\n",
+                  implied_file, kd_symbol, params$outcome_col, exp_y, obs_y))
+      stopifnot(
+        "the knockdown gene's own target does not match the contrast params imply - outcome_csv points at the wrong file" =
+          length(obs_y) == 1 && length(exp_y) == 1 && abs(obs_y - exp_y) < 1e-6
+      )
+    }
+  } else {
+    cat("no file matches the params-implied contrast", implied_file, "- anchor not asserted\n")
+  }
+} else {
+  cat("NOTE: direction check skipped (no symbol/rna_lfc column, or outcome was negated)\n")
+}
+
+# Biological spot-check on the outcome: it must separate the classifier's positive set from its
+# negative controls. A sign flip or a scrambled join passes every range check above but fails
+# this one.
+pos_genes <- read_csv(here("output", "genesets",
+  paste0(params$condition, "_", params$gene, "_", params$direction, "_",
+         params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")),
+  show_col_types = FALSE)$ensembl_gene
+neg_csv   <- if (params$gene == "3e") "negative_control_genes_si3e.csv" else
+                                      "negative_control_genes.csv"
+neg_genes <- read_csv(here("output", "predictive_modeling", neg_csv), show_col_types = FALSE) %>%
+  mutate(g = sub("[.].*", "", gene_id)) %>% pull(g)
+neg_genes <- setdiff(neg_genes, pos_genes)     # the same guard 02_ applies before sampling
+
+yp <- model_genes$y[model_genes$gene_id_clean %in% pos_genes]
+yn <- model_genes$y[model_genes$gene_id_clean %in% neg_genes]
+cat(sprintf("target: %s-promoted median %+.3f (n=%d) vs negative controls %+.3f (n=%d), wilcox p=%.2e\n",
+            kd_symbol, median(yp), length(yp), median(yn), length(yn),
+            wilcox.test(yp, yn)$p.value))
+stopifnot(
+  "the target does not separate the promoted gene set from the negative controls" =
+    median(yp) - median(yn) > 0.3
+)
+```
+
+# Select features
+
+Chooses which columns the forest sees, by joining against the annotation table.
+
+**Decisions**
+
+- Reuse `02_rf_model.Rmd`'s selection unchanged, which yields the same 69 features. This is what
+  makes the SHAP comparison in `12_` a comparison of model type.
+- Keep one member of each corrected/superseded feature pair, never both, so they cannot split
+  credit between themselves.
+- Preserve the matrix's column order, because ranger's feature sampling depends on it and
+  reordering would change the forest even with identical seeds.
+- Drop features that are more than half missing, and any that are constant.
+- Guard against leakage two ways: by name, and by checking no feature correlates above 0.9 with
+  the outcome. The second catches a leak that has been renamed, which a name pattern cannot see.
+- Assert the feature set matches the classifier's, replacing `02_`'s baseline reproduction gate,
+  which has no meaning here.
+
+
+```{r select_features}
+# Ported verbatim from 02_rf_model.Rmd, minus the gate branches: there is no frozen regression
+# baseline to reproduce, so gate_against_baseline is replaced by gate_feature_parity below,
+# which asserts the same 69 features the classifier uses. Keeping the selection identical is
+# what makes the SHAP comparison in 12_ a comparison of model type rather than of feature sets.
+aggregate_clip <- c("clip_evidence_count", "clip_eif3_count", "clip_cap_binding_count",
+                    "clip_cap_binding_count_v2",
+                    "clip_lee_int_stress_lfc", "clip_lee_complete_media_lfc",
+                    "clip_lee_glu_dep_lfc", "clip_lee_glu_vs_cm_enrichment")
+
+stopifnot("variant_set must be 'current' or 'corrected'" =
+            params$variant_set %in% c("current", "corrected"))
+sel <- annotation %>%
+  filter(block %in% include_blocks, variant %in% c("single", params$variant_set))
+
+stopifnot("initiation_score must be 'both', 'pwm' or 'noderer'" =
+            params$initiation_score %in% c("both", "pwm", "noderer"))
+drop_init <- switch(params$initiation_score,
+  both    = character(0),
+  pwm     = "noderer_tis_efficiency",
+  noderer = c("kozak_pwm_score", "kozak_pwm_score_v2"))
+if (MUTATING && params$mutate_target == "drop_variant_pair_guard")
+  drop_init <- character(0)                              # let both PWM variants through
+sel <- sel %>% filter(!feature %in% drop_init)
+if (MUTATING && params$mutate_target == "drop_variant_pair_guard")
+  sel <- annotation %>% filter(block %in% include_blocks)   # both members of every pair
+n_init <- sum(sel$feature %in% c("kozak_pwm_score", "kozak_pwm_score_v2",
+                                 "noderer_tis_efficiency"))
+stopifnot("an exclusive initiation_score let two start-context scores through" =
+            params$initiation_score == "both" || n_init <= 1L)
+
+if (nzchar(params$exclude_families)) {
+  drop_fams <- str_trim(str_split(params$exclude_families, ",")[[1]])
+  stopifnot("exclude_families names an unknown family" = all(drop_fams %in% annotation$family))
+  n_drop <- sum(sel$family %in% drop_fams)
+  sel <- sel %>% filter(!family %in% drop_fams)
+  cat("Excluded", n_drop, "features from families:", paste(drop_fams, collapse = ", "), "\n")
+}
+
+if (!isTRUE(params$include_deprecated)) {
+  n_dep <- sum(sel$deprecated)
+  sel <- sel %>% filter(!deprecated)
+  if (n_dep > 0) cat("Excluded", n_dep, "deprecated features\n")
+}
+
+if (params$clip_mode == "aggregate") {
+  sel <- sel %>% filter(!(family == "clip" & !feature %in% aggregate_clip))
+} else if (params$clip_mode == "individual") {
+  sel <- sel %>% filter(!(family == "clip" & feature %in% aggregate_clip))
+}
+
+sel <- sel %>% filter(!str_detect(feature, "^(utr5|utr3|cds|total)_length$"))
+
+# Preserve feature-matrix column order: ranger's mtry sampling depends on it, so reordering
+# would change the forest even with identical seeds.
+feature_cols <- colnames(features)[colnames(features) %in% sel$feature]
+
+non_na <- map_dbl(feature_cols, ~ mean(!is.na(unlist(model_genes[[.x]]))))
+sparse <- feature_cols[non_na < 0.5]
+feature_cols <- setdiff(feature_cols, sparse)
+if (length(sparse)) cat("Dropped", length(sparse), "sparse features (<50% non-NA)\n")
+
+const <- feature_cols[map_lgl(feature_cols, function(f) {
+  v <- unlist(model_genes[[f]]); v <- v[!is.na(v)]
+  length(v) == 0 || stats::sd(v) == 0
+})]
+if (length(const)) {
+  feature_cols <- setdiff(feature_cols, const)
+  cat("Dropped", length(const), "zero-variance features:", paste(const, collapse = ", "), "\n")
+}
+
+list_cols <- feature_cols[map_lgl(feature_cols, ~ is.list(model_genes[[.x]]))]
+for (col in list_cols) model_genes[[col]] <- as.numeric(unlist(model_genes[[col]]))
+
+# Deliberate leak, for the mutation suite: a renamed copy of the outcome, which the name-based
+# regex below cannot see and the value-based check must catch.
+if (MUTATING && params$mutate_target == "leak_target_as_feature") {
+  # Overwrite an EXISTING feature in place rather than appending a new one. Appending changes
+  # the column set, which trips the column-order assert first and leaves the value-based
+  # collinearity guard untested - the check would then have passed a mutation test without ever
+  # having been shown to fire. This version leaves names, order and count untouched, so the
+  # collinearity guard is the only thing that can catch it.
+  leak_into <- feature_cols[length(feature_cols)]
+  model_genes[[leak_into]] <- model_genes$y
+  cat("leaked the target into the existing column:", leak_into, "\n")
+}
+
+cat("Features:", length(feature_cols), "\n")
+
+stopifnot(
+  # Name-based guard, inherited from 02_.
+  "an outcome-derived column reached the feature set" =
+    !any(str_detect(feature_cols,
+      paste0("^te_lfc$|^te_padj$|^te_lfc_bin$|^sig_|^indiv_te_|^delta_te_|",
+             "^y$|^y_padj$|^category$|^rna_lfc$|^ribo_lfc$|^rna_padj$|^ribo_padj$"))),
+  "feature_cols is not in matrix column order" =
+    identical(feature_cols, colnames(features)[colnames(features) %in% feature_cols])
+)
+
+# Value-based guard. 02_'s leakage check is purely name-based, so it would pass on a leak that
+# had simply been renamed - the same blind spot g4_region_swap exposed in 01_, where a check
+# that asserted only a convention passed on a scrambled join. A near-collinear feature is the
+# signature a name regex structurally cannot see.
+leak_cor <- map_dbl(feature_cols, ~ suppressWarnings(
+  cor(as.numeric(model_genes[[.x]]), model_genes$y, use = "complete.obs", method = "spearman")))
+names(leak_cor) <- feature_cols
+worst <- leak_cor[which.max(abs(leak_cor))]
+cat(sprintf("strongest feature-target Spearman: %s %+.3f\n", names(worst), worst))
+stopifnot("a feature is near-collinear with the outcome - a renamed leak" =
+            max(abs(leak_cor), na.rm = TRUE) < 0.9)
+
+# Parity with the classifier's feature set. This replaces gate_against_baseline: it has content
+# (it can fail) and it is the precondition that makes 12_'s comparison about model type.
+if (isTRUE(params$gate_feature_parity)) {
+  clf_imp_path <- file.path(out_dir, paste0("rf_importance_", clf_suffix, ".csv"))
+  if (file.exists(clf_imp_path)) {
+    clf_features <- read_csv(clf_imp_path, show_col_types = FALSE)$feature
+    if (!setequal(clf_features, feature_cols)) {
+      cat("PARITY DIFFERS - only in regression:",
+          paste(setdiff(feature_cols, clf_features), collapse = ", "), "\n")
+      cat("               only in classifier:",
+          paste(setdiff(clf_features, feature_cols), collapse = ", "), "\n")
+    }
+    stopifnot("feature set differs from the classifier's - 12_'s comparison would not be about model type" =
+                setequal(clf_features, feature_cols))
+    cat("Feature parity with", clf_suffix, "OK (", length(feature_cols), "features )\n")
+  } else {
+    cat("NOTE: parity gate skipped -", basename(clf_imp_path), "not found\n")
+  }
+}
+```
+
+# Split, transform, impute
+
+Splits genes into training and held-out sets, optionally transforms the outcome, and fills
+missing feature values.
+
+**Decisions**
+
+- Split 80/20 with `createDataPartition`, which bins a numeric outcome into quantiles so the two
+  halves have matched distributions.
+- Let `split_seed` seed only the split. The forest and the cross-validation use `forest_seed`, so
+  across a sweep any difference is attributable to which genes were held out.
+- Fit every transform on the training split alone and apply it to the held-out set, so no
+  held-out information reaches the map.
+- Impute missing features with training-set medians. The code asserts those medians actually
+  differ from full-data medians, so the constraint is doing work rather than being vacuous.
+- Allow the rank transform to produce ties at the extremes. `ecdf` is a step function, so
+  held-out genes beyond the training range all map to 0 or 1. That is lost resolution at the
+  tails, and it is reported rather than treated as an error.
+
+
+```{r train_test_split}
+model_data <- model_genes %>%
+  dplyr::select(gene_id_clean, symbol, y, y_padj, all_of(feature_cols))
+
+# Shuffled-family null, unchanged from 02_: permuting a family's values across genes destroys
+# its link to the outcome while preserving every marginal, the NA pattern and the within-family
+# correlation structure. Impurity importance is non-negative, so an uninformative family never
+# scores zero - whatever the permuted copy absorbs is the floor the real one must clear.
+if (nzchar(params$shuffle_families)) {
+  shuf <- str_trim(str_split(params$shuffle_families, ",")[[1]])
+  stopifnot("shuffle_families names an unknown family" = all(shuf %in% annotation$family))
+  shuf_cols <- intersect(feature_cols, annotation$feature[annotation$family %in% shuf])
+  set.seed(SPLIT_SEED)                    # tied to the split, so the sweep stays paired
+  perm <- sample(nrow(model_data))
+  for (cc in shuf_cols) model_data[[cc]] <- model_data[[cc]][perm]
+  cat("SHUFFLED", length(shuf_cols), "features in:", paste(shuf, collapse = ", "), "\n")
+}
+
+# split_seed is the only RNG consumer here, and the only thing it seeds. The forest and the CV
+# use forest_seed, so across a sweep every difference is attributable to which genes were held
+# out. createDataPartition bins a numeric y into quantiles, so the two splits stay
+# distributionally matched rather than merely random.
+set.seed(SPLIT_SEED)
+train_idx  <- createDataPartition(model_data$y, p = 0.8, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+cat(sprintf("Train %d (median y %+.4f, MAD %.4f) | Test %d (median y %+.4f, MAD %.4f)\n",
+            nrow(train_data), median(train_data$y), mad(train_data$y),
+            nrow(test_data),  median(test_data$y),  mad(test_data$y)))
+```
+
+```{r target_transform}
+# Winsorizing first, with bounds from the training split only, then the transform. Both are fitted on the
+# training split and applied to test, so no test information reaches either map.
+win_bounds <- NULL
+if (params$winsorize_y > 0) {
+  # The bounds are a FIXED CONSTANT from params, not estimated from the data, so winsorizing
+  # has no train/test leakage channel by construction - there is nothing here for a
+  # "bounds from all rows" mutation to corrupt. If bounds are ever made quantile-based, they
+  # must be computed on train only and that change needs its own mutation.
+  b <- params$winsorize_y
+  win_bounds <- c(-b, b)
+  n_cap_tr <- sum(train_data$y < win_bounds[1] | train_data$y > win_bounds[2])
+  train_data$y_win <- pmin(pmax(train_data$y, win_bounds[1]), win_bounds[2])
+  test_data$y_win  <- pmin(pmax(test_data$y,  win_bounds[1]), win_bounds[2])
+  cat("Winsorized at", win_bounds, "-", n_cap_tr, "training genes capped\n")
+} else {
+  train_data$y_win <- train_data$y
+  test_data$y_win  <- test_data$y
+}
+
+apply_transform <- function(y_tr, y_te, mode) switch(mode,
+  raw = list(tr = y_tr, te = y_te, inv_scale = 1, ecdf = NULL),
+  # AFFINE, and therefore a NO-OP for a variance-splitting forest: the argmax split is unchanged
+  # and node impurity scales by 1/MAD^2, so trees, predictions and importance shares are
+  # identical. Kept only so the equivalence stays assertable and so 10d_ can plot it. It exists
+  # to report SHAP in MAD units, not to change the model.
+  robust_z = { m <- median(y_tr); s <- mad(y_tr)
+               stopifnot("MAD of the training target is zero" = s > 0)
+               list(tr = (y_tr - m) / s, te = (y_te - m) / s, inv_scale = s, ecdf = NULL) },
+  # NON-LINEAR, and the only transform that changes the fit. ONE map, built on training rows and
+  # applied to both, so train and test share a scale by construction rather than by assertion.
+  # (31_ in the frozen pipeline uses rank()/n for train and ecdf for test; those disagree on
+  # ties. Using one map removes the class of bug.)
+  rank_ecdf = { e <- stats::ecdf(y_tr); list(tr = e(y_tr), te = e(y_te), inv_scale = NA_real_, ecdf = e) },
+  stop("unknown target_transform"))
+
+if (MUTATING && params$mutate_target == "ecdf_on_all_rows" &&
+    params$target_transform == "rank_ecdf") {
+  e_bad <- stats::ecdf(model_data$y)                       # built on train AND test
+  tf <- list(tr = e_bad(train_data$y_win), te = e_bad(test_data$y_win),
+             inv_scale = NA_real_, ecdf = e_bad)
+} else {
+  tf <- apply_transform(train_data$y_win, test_data$y_win, params$target_transform)
+}
+train_data$y_t <- tf$tr
+test_data$y_t  <- tf$te
+
+# Every transform here is monotone non-decreasing, which is what lets 10d_ score every arm on one
+# yardstick (Spearman against raw held-out y). It is not always strictly increasing: ecdf() is a
+# step function, so test genes below the smallest training value all map to 0 and those above the
+# largest all map to 1. Those ties are real lost resolution at the tails, not a bug - so they are
+# asserted as weak monotonicity and then reported, rather than being allowed to fail a strict
+# check or be silently waved through.
+is_nondecreasing <- function(x, y) {
+  o <- order(x, y); all(diff(y[o]) >= -1e-12)
+}
+stopifnot(
+  "the transform is not monotone non-decreasing in raw y (train)" =
+    is_nondecreasing(train_data$y_win, train_data$y_t),
+  "the transform is not monotone non-decreasing in raw y (test)"  =
+    is_nondecreasing(test_data$y_win,  test_data$y_t)
+)
+if (params$target_transform %in% c("raw", "robust_z")) {
+  # These two are strictly increasing, so they must preserve the ranking exactly.
+  stopifnot(
+    "an affine transform did not preserve the ranking exactly" =
+      isTRUE(all.equal(cor(test_data$y_win, test_data$y_t, method = "spearman"), 1))
+  )
+} else {
+  n_below <- sum(test_data$y_win < min(train_data$y_win))
+  n_above <- sum(test_data$y_win > max(train_data$y_win))
+  cat(sprintf("rank map: %d test genes clipped to 0 (below train min), %d to 1 (above max); Spearman vs raw y %.6f\n",
+              n_below, n_above, cor(test_data$y_win, test_data$y_t, method = "spearman")))
+}
+if (params$target_transform == "rank_ecdf") {
+  stopifnot(
+    "the ecdf was built on more rows than the training split" =
+      length(environment(tf$ecdf)$x) == nrow(train_data),
+    "test ranks escaped [0,1]" = all(test_data$y_t >= 0 & test_data$y_t <= 1),
+    # Discriminative: an ecdf built on ALL rows must give DIFFERENT test ranks, or the
+    # train-only constraint is doing no work and this check is uninformative.
+    # model_data has no y_win column - winsorize_y is asserted to be 0 under rank_ecdf just
+    # below, so y is the winsorized target here by definition.
+    "train-only and all-rows ecdf agree - the no-leakage constraint is vacuous" =
+      max(abs(stats::ecdf(model_data$y)(test_data$y) - test_data$y_t)) > 1e-4,
+    # Winsorizing is provably a no-op under a monotone rank map: it only creates ties at the
+    # bounds. Combining them would look like an extra arm while testing nothing.
+    "winsorize_y has no effect under rank_ecdf - set one or the other" = params$winsorize_y == 0
+  )
+}
+cat(sprintf("Transformed target: train [%.3f, %.3f] median %.3f | test [%.3f, %.3f]\n",
+            min(train_data$y_t), max(train_data$y_t), median(train_data$y_t),
+            min(test_data$y_t),  max(test_data$y_t)))
+```
+
+```{r impute}
+# Medians from the training split only, then applied to both.
+train_medians <- train_data %>% dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~ median(., na.rm = TRUE)))
+all_medians <- model_data %>% dplyr::select(all_of(feature_cols)) %>%
+  summarise(across(everything(), ~ median(., na.rm = TRUE)))
+if (MUTATING && params$mutate_target == "impute_from_all_rows")
+  train_medians <- all_medians                            # the corruption
+
+impute_with_medians <- function(df, medians) {
+  for (col in feature_cols) df[[col]] <- ifelse(is.na(df[[col]]), medians[[col]], df[[col]])
+  df
+}
+train_data <- impute_with_medians(train_data, train_medians)
+test_data  <- impute_with_medians(test_data,  train_medians)
+
+# The no-leakage constraint is only meaningful if train-only medians actually differ from
+# full-data medians. If they were identical, the constraint would be vacuous and the check
+# uninformative - so assert the difference exists, not just that imputation ran.
+stopifnot(
+  "train-only and full-data medians are identical - the no-leakage constraint is vacuous" =
+    any(abs(unlist(train_medians) - unlist(all_medians)) > 0),
+  "NAs survived imputation" =
+    sum(is.na(train_data[, feature_cols])) + sum(is.na(test_data[, feature_cols])) == 0
+)
+cat("Imputed; median-difference columns (train vs all):",
+    sum(abs(unlist(train_medians) - unlist(all_medians)) > 0), "of", length(feature_cols), "\n")
+```
+
+# Train
+
+Fits the regression forest.
+
+**Decisions**
+
+- Set `min.node.size` explicitly rather than relying on the default, which differs between
+  regression and probability forests (5 versus 10). `mtry` is the same for both here, 8.
+- Use 1000 trees rather than `02_`'s 500, because this forest is grown on 8,140 rows rather than
+  2,298.
+- Build the argument list so unset parameters are genuinely absent, rather than passed as a value
+  that happens to match the current default.
+- Do not weight observations. Weighting by `padj` would weight by a function of the outcome's
+  own magnitude, which leaks; that option is blocked rather than merely discouraged. `baseMean`
+  is available as a proxy, and a properly weighted model would need the standard errors for this
+  contrast, which are not saved anywhere.
+
+
+```{r train_rf}
+# Optional precision weighting. baseMean is the only safe proxy available: it is a precision
+# proxy that is not a function of |y|. Real lfcSE for this contrast is not saved anywhere (the
+# saved CSV has padj but no lfcSE, and condition_level_te.csv's lfcSE belongs to the absolute
+# per-condition TE, a different estimate), so a genuinely weighted model needs a small notebook
+# that re-runs deFunction("TE", ...) first. Weighting changes the loss, so a weighted arm is not
+# comparable to the classifier.
+case_wts <- NULL
+if (params$weight_mode == "basemean") {
+  bm <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("[.].*", "", gene_id)) %>%
+    group_by(gene_id_clean) %>% summarise(bm = mean(baseMean, na.rm = TRUE), .groups = "drop")
+  w <- train_data %>% dplyr::select(gene_id_clean) %>% left_join(bm, by = "gene_id_clean") %>%
+    mutate(w = log10(1 + coalesce(bm, median(bm, na.rm = TRUE)))) %>% pull(w)
+  case_wts <- w / mean(w)
+  cat("Weighted by log10(1+baseMean); range", round(range(case_wts), 3), "\n")
+}
+
+# Built as an arg list so an unset param is genuinely absent rather than passed as a value that
+# happens to match today's default. sample.fraction in particular defaults to 1 with replacement
+# but 0.632 without, so hardcoding 1 would silently change meaning if replace were ever set.
+rf_args <- list(
+  x             = train_data[, feature_cols],
+  y             = train_data$y_t,
+  num.trees     = params$num_trees,
+  min.node.size = params$min_node_size,
+  splitrule     = params$splitrule,
+  # maxstat gives unbiased variable SELECTION but its impurity semantics differ, so that arm
+  # reports permutation importance instead and is compared on SHAP, which is engine-agnostic.
+  importance    = if (params$splitrule == "maxstat") "permutation" else "impurity",
+  seed          = FOREST_SEED
+)
+if (params$mtry > 0)            rf_args$mtry            <- params$mtry
+if (params$sample_fraction > 0) rf_args$sample.fraction <- params$sample_fraction
+if (!is.null(case_wts))         rf_args$case.weights    <- case_wts
+
+set.seed(FOREST_SEED)
+rf_model <- do.call(ranger, rf_args)
+
+# do.call() records the entire deparsed ranger function in $call - about 35,000 characters
+# against 53 for a direct call - so print(rf_model) would dump the whole function body into the
+# report. Replace it with a readable record of what was actually run. The data arguments are
+# deliberately left out; x and y would be deparsed in full for the same reason.
+rf_model$call <- as.call(c(
+  quote(ranger),
+  list(x = quote(train_data[, feature_cols]), y = quote(y_train)),
+  rf_args[setdiff(names(rf_args), c("x", "y"))]
+))
+
+# A compact summary, rather than ranger's default print.
+cat(sprintf("%-16s %s\n", "type:", rf_model$treetype))
+cat(sprintf("%-16s %d trees, mtry %d, min.node.size %d, splitrule %s\n", "forest:",
+            rf_model$num.trees, rf_model$mtry, rf_model$min.node.size, params$splitrule))
+cat(sprintf("%-16s %d genes x %d features\n", "trained on:",
+            rf_model$num.samples, rf_model$num.independent.variables))
+cat(sprintf("%-16s %.4f  (MSE %.5f)\n", "OOB R2:",
+            rf_model$r.squared, rf_model$prediction.error))
+cat(sprintf("%-16s %s\n", "call:", paste(deparse(rf_model$call), collapse = " ")))
+
+stopifnot("this is not a regression forest" = rf_model$treetype == "Regression")
+# ranger's default mtry is floor(sqrt(p)) for both probability and regression forests; only
+# min.node.size differs by tree type (10 vs 5). The floor(p/3) regression default belongs to
+# randomForest, not ranger - 03_shap.Rmd's comment says otherwise and is wrong. Measured here so
+# 12_ can state that the SHAP comparison is not confounded by mtry.
+if (params$mtry == 0)
+  stopifnot("ranger's default mtry is not floor(sqrt(p)) - re-measure before comparing to 02_" =
+              rf_model$mtry == floor(sqrt(length(feature_cols))))
+cat("mtry", rf_model$mtry, "| min.node.size", rf_model$min.node.size,
+    "| num.trees", rf_model$num.trees, "| splitrule", params$splitrule,
+    "| OOB R2", round(rf_model$r.squared, 4), "\n")
+
+# The only structural guard against a leak that slipped through both the name and the
+# collinearity check - e.g. a linear combination of features reconstructing the outcome.
+stopifnot("OOB R2 implausibly high - suspect leakage" = rf_model$r.squared < 0.8)
+```
+
+# Evaluate
+
+Scores the model on the held-out genes.
+
+**Decisions**
+
+- Score every variant against the raw held-out outcome, whatever it was trained on. Scoring a
+  rank-trained model on ranks and a raw-trained model on raw values compares two different
+  yardsticks.
+- Report Spearman as the headline. R-squared is reported too but is sensitive to the extreme
+  genes, whose values reach about 19 robust standard deviations.
+- Re-impute and re-transform inside each cross-validation fold, so the no-leakage rule holds per
+  fold as well as on the main split.
+
+
+```{r evaluate}
+# Every arm is scored against raw held-out y, whatever it was trained on. Scoring a rank model
+# by R2 on ranks and a raw model by R2 on raw y compares two different yardsticks and makes the
+# rank model look better partly by definition (ranks are flatter and more predictable). Spearman
+# against raw y is the headline for that reason; R2 is reported too but is tail-sensitive on a
+# target whose extremes reach 19 robust-sd.
+pred_t    <- predict(rf_model, data = test_data[, feature_cols])$predictions
+pred_tr   <- predict(rf_model, data = train_data[, feature_cols])$predictions
+spearman_raw <- cor(pred_t, test_data$y, method = "spearman")
+pearson_raw  <- cor(pred_t, test_data$y)
+
+# On the trained scale, so R2 is a like-for-like fit statistic there.
+ss_res <- sum((test_data$y_t - pred_t)^2)
+ss_tot <- sum((test_data$y_t - mean(train_data$y_t))^2)
+r2_var <- 1 - ss_res / ss_tot
+rmse_t <- sqrt(mean((test_data$y_t - pred_t)^2))
+
+metrics <- tibble(
+  metric = c("spearman_raw_y", "pearson_raw_y", "r2_pearson_sq_raw_y",
+             "r2_var_explained_trained_scale", "rmse_trained_scale", "oob_r2",
+             "spearman_train", "n_genes", "n_train", "n_test", "n_features",
+             "mtry", "min_node_size", "num_trees",
+             "target_median", "target_mad", "target_sd"),
+  value  = c(spearman_raw, pearson_raw, pearson_raw^2, r2_var, rmse_t, rf_model$r.squared,
+             cor(pred_tr, train_data$y, method = "spearman"),
+             nrow(model_data), nrow(train_data), nrow(test_data), length(feature_cols),
+             rf_model$mtry, rf_model$min.node.size, rf_model$num.trees,
+             median(model_data$y), mad(model_data$y), sd(model_data$y)))
+print(as.data.frame(metrics %>% mutate(value = round(value, 5))), row.names = FALSE)
+
+# Predictions must separate the two gene sets on held-out genes, not just in-sample.
+stopifnot(
+  "predictions do not separate the promoted set from the negative controls on held-out genes" =
+    median(pred_t[test_data$gene_id_clean %in% pos_genes]) >
+    median(pred_t[test_data$gene_id_clean %in% neg_genes])
+)
+```
+
+```{r cross_validation, eval = isTRUE(params$run_cv)}
+# 5-fold CV over all of model_data, re-imputing and re-transforming within each fold so the
+# no-leakage discipline holds per fold as well as on the main split.
+set.seed(FOREST_SEED)
+folds <- createFolds(model_data$y, k = 5)
+cv <- map_dfr(seq_along(folds), function(i) {
+  idx <- folds[[i]]
+  tr <- model_data[-idx, ]; te <- model_data[idx, ]
+  b <- params$winsorize_y
+  tr$y_win <- if (b > 0) pmin(pmax(tr$y, -b), b) else tr$y
+  te$y_win <- if (b > 0) pmin(pmax(te$y, -b), b) else te$y
+  tfi <- apply_transform(tr$y_win, te$y_win, params$target_transform)
+  med <- tr %>% dplyr::select(all_of(feature_cols)) %>%
+    summarise(across(everything(), ~ median(., na.rm = TRUE)))
+  tr <- impute_with_medians(tr, med); te <- impute_with_medians(te, med)
+  set.seed(FOREST_SEED)
+  fit <- ranger(x = tr[, feature_cols], y = tfi$tr, num.trees = params$num_trees,
+                mtry = if (params$mtry > 0) params$mtry else NULL,
+                min.node.size = params$min_node_size, splitrule = params$splitrule,
+                seed = FOREST_SEED)
+  p <- predict(fit, data = te[, feature_cols])$predictions
+  tibble(fold = i,
+         spearman = cor(p, te$y, method = "spearman"),
+         pearson  = cor(p, te$y),
+         rmse     = sqrt(mean((tfi$te - p)^2)))
+})
+cat(sprintf("5-fold CV: Spearman %.4f +/- %.4f | Pearson %.4f +/- %.4f | RMSE %.4f +/- %.4f\n",
+            mean(cv$spearman), sd(cv$spearman), mean(cv$pearson), sd(cv$pearson),
+            mean(cv$rmse), sd(cv$rmse)))
+```
+
+# AUC bridge
+
+Computes an AUC so this model can be put next to the classifier's reported number.
+
+A regression has no threshold, so an AUC only exists against labels supplied from outside. Here
+the labels are the classifier's own gene sets, which this model never saw.
+
+**Decisions**
+
+- Treat this as a comparison aid, not a primary metric. Spearman and Precision@K are the primary
+  metrics.
+- Report the ceiling next to the AUC. For a label that is itself a cut on the outcome, the
+  ceiling is 1.0 by construction, so the AUC alone would be misleading.
+- Report how much the two models' held-out sets overlap, and the AUC restricted to the genes both
+  models held out, with its confidence interval. That subset is around 112 genes, where the
+  interval is roughly plus or minus 0.08, so it cannot separate 0.83 from 0.78.
+- Leave the real comparison to `12_`, which compares the two models' distributions over their
+  respective 20 replicates instead of two single numbers.
+
+
+```{r auc_bridge, eval = isTRUE(params$auc_bridge)}
+# A regression has no threshold, so an AUC exists only against an externally supplied label.
+# This is a comparison aid to 02_'s reported test AUC, not a primary metric, and three
+# caveats travel with it as columns rather than prose:
+#
+#  (1) the two models have different test splits, and this regression trained on ~80% of the
+#      classifier's test genes, so the two AUCs are not measured on the same genes;
+#  (2) the "threshold" label is a cut on the regressed quantity, so its ceiling is ~1.0 by
+#      construction - report auc / ceiling, never auc alone;
+#  (3) the only fair subset is the genes held out by both models (~115), where the 95% CI
+#      half-width is ~0.08 and 0.83 cannot be separated from 0.78. The honest comparison is
+#      therefore distribution-vs-distribution over the two sweeps, which 12_ does.
+stopifnot("bridge label sets overlap" = length(intersect(pos_genes, neg_genes)) == 0)
+
+br <- test_data %>%
+  mutate(pred = pred_t,
+         lab_geneset = case_when(gene_id_clean %in% pos_genes ~ 1L,
+                                 gene_id_clean %in% neg_genes ~ 0L, TRUE ~ NA_integer_),
+         lab_thresh  = as.integer(!is.na(y_padj) & y > as.numeric(params$lfc) & y_padj < 0.05))
+
+auc_of <- function(lab, score) {
+  k <- !is.na(lab) & !is.na(score)
+  if (length(unique(lab[k])) < 2) return(NA_real_)
+  as.numeric(auc(roc(lab[k], score[k], direction = "<", quiet = TRUE)))
+}
+bridge <- tibble(
+  label   = c("geneset", "threshold"),
+  n_pos   = c(sum(br$lab_geneset == 1, na.rm = TRUE), sum(br$lab_thresh == 1)),
+  n_neg   = c(sum(br$lab_geneset == 0, na.rm = TRUE), sum(br$lab_thresh == 0)),
+  auc     = c(auc_of(br$lab_geneset, br$pred), auc_of(br$lab_thresh, br$pred)),
+  # The ceiling: the same AUC scored with the TRUE outcome as the predictor.
+  ceiling = c(auc_of(br$lab_geneset, br$y),    auc_of(br$lab_thresh, br$y))
+) %>% mutate(auc_frac_of_ceiling = auc / ceiling)
+print(as.data.frame(bridge %>% mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+
+# Precision@K against the random baseline, which is the prevalence.
+ks <- as.integer(str_trim(str_split(params$precision_at_k, ",")[[1]]))
+prec <- map_dfr(ks, function(k) {
+  k <- min(k, nrow(br))
+  top <- br %>% arrange(desc(pred)) %>% head(k)
+  tibble(K = k, precision = mean(top$lab_thresh == 1),
+         baseline = mean(br$lab_thresh == 1)) %>% mutate(enrichment = precision / baseline)
+})
+print(as.data.frame(prec %>% mutate(across(where(is.double), ~ round(., 4)))), row.names = FALSE)
+
+# Overlap with the classifier's split, and the matched-gene comparison with its CI.
+clf_md_path <- file.path(out_dir, paste0("rf_model_data_", clf_suffix, ".rds"))
+matched_auc <- NA_real_; n_matched <- NA_integer_
+if (file.exists(clf_md_path)) {
+  clf_md  <- readRDS(clf_md_path)
+  matched <- intersect(clf_md$test$gene_id_clean, test_data$gene_id_clean)
+  n_matched <- length(matched)
+  trained_on <- sum(clf_md$test$gene_id_clean %in% train_data$gene_id_clean)
+  cat(sprintf("\nOverlap with 02_'s split: this regression trained on %d of the classifier's %d test genes (%.0f%%)\n",
+              trained_on, nrow(clf_md$test), 100 * trained_on / nrow(clf_md$test)))
+  mb <- br %>% filter(gene_id_clean %in% matched, !is.na(lab_geneset))
+  if (nrow(mb) > 10 && length(unique(mb$lab_geneset)) == 2) {
+    r <- roc(mb$lab_geneset, mb$pred, direction = "<", quiet = TRUE)
+    ci <- as.numeric(ci.auc(r))
+    matched_auc <- as.numeric(auc(r))
+    cat(sprintf("Matched-gene AUC (held out by both models): %.4f [95%% CI %.3f-%.3f], n = %d - underpowered by design\n",
+                matched_auc, ci[1], ci[3], nrow(mb)))
+  }
+} else {
+  cat("\nNOTE: 02_'s rf_model_data not found; overlap and matched-gene AUC skipped\n")
+}
+```
+
+# Importance
+
+Reports which features the forest relied on, and plots the fit.
+
+**Decisions**
+
+- Report impurity importance here, and treat family-level sums as descriptive only. Impurity is
+  not additive, so summing it within a family is not exact. `11_shap_regression.Rmd` gives the
+  exact split using SHAP.
+
+
+```{r importance}
+importance_df <- tibble(
+  feature    = names(rf_model$variable.importance),
+  importance = as.numeric(rf_model$variable.importance)
+) %>%
+  left_join(annotation %>% dplyr::select(feature, family, block), by = "feature") %>%
+  arrange(desc(importance)) %>%
+  mutate(share_pct = 100 * importance / sum(importance), rank = row_number())
+print(as.data.frame(head(importance_df, 20)), row.names = FALSE)
+
+cat("\nFamily shares (impurity is NOT additive - descriptive only; 11_ gives the exact SHAP split):\n")
+print(as.data.frame(importance_df %>% group_by(family) %>%
+  summarise(n = n(), share_pct = round(sum(share_pct), 2), .groups = "drop") %>%
+  arrange(desc(share_pct))), row.names = FALSE)
+```
+
+```{r fig_fit, fig.width = 10, fig.height = 4.6, eval = isTRUE(params$auc_bridge)}
+# Predicted vs observed on held-out genes, and the same separation the AUC bridge summarises.
+# Gated on `auc_bridge` because panel (b) reads `br` and `bridge`, which exist only if the
+# auc_bridge chunk above ran. Without the gate a run with auc_bridge = FALSE dies here with
+# "object 'br' not found" - an infrastructure crash that a mutation test would misread as a
+# check having fired.
+p_fit <- tibble(obs = test_data$y, pred = pred_t) %>%
+  ggplot(aes(obs, pred)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.18, size = 0.7, colour = "#E69F00") +
+  geom_smooth(method = "lm", se = FALSE, colour = "#0072B2", linewidth = 0.8) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+           label = sprintf("Spearman = %.3f\nPearson = %.3f\nn = %d",
+                           spearman_raw, pearson_raw, nrow(test_data))) +
+  labs(x = "observed TE LFC, log2(sictrl / si3d)", y = "predicted",
+       title = "(a) Held-out fit",
+       subtitle = sprintf("%d features | transform: %s", length(feature_cols),
+                          params$target_transform)) +
+  theme_classic(base_size = 11)
+
+p_sep <- br %>% filter(!is.na(lab_geneset)) %>%
+  mutate(cls = if_else(lab_geneset == 1, "eIF3d hypoxia promotes", "Negative control")) %>%
+  ggplot(aes(pred, fill = cls, colour = cls)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  scale_fill_manual(values = c("eIF3d hypoxia promotes" = "#E69F00",
+                              "Negative control" = "black"), name = NULL) +
+  scale_colour_manual(values = c("eIF3d hypoxia promotes" = "#E69F00",
+                                 "Negative control" = "black"), name = NULL) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = sprintf("bridge AUC = %.3f\nceiling = %.3f\nn = %d / %d",
+                           bridge$auc[1], bridge$ceiling[1], bridge$n_pos[1], bridge$n_neg[1])) +
+  labs(x = "predicted TE LFC", y = "density", title = "(b) AUC bridge",
+       subtitle = "the regression never saw these labels") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = c(0.5, 0.96))
+
+pg <- cowplot::plot_grid(p_fit, p_sep, nrow = 1, rel_widths = c(1, 1.15))
+print(pg)
+ggsave_if(here("plots", paste0("10_fit_", suffix, ".pdf")), pg, width = 10, height = 4.6)
+```
+
+# Comparison with the classifier
+
+Four views of how this regression relates to `02_rf_model.Rmd`'s classifier. Everything here
+reads saved artifacts and refits nothing, and each part skips cleanly if its inputs are absent.
+
+This is the summary view. `12_regression_vs_classifier.Rmd` carries the full treatment, including
+the measured noise floor that decides which differences are real.
+
+**Decisions**
+
+- Compare the classifier's predictions only on genes it never trained on. It modelled 2,872 of
+  the 10,172, so most of this notebook's held-out set is genuinely unseen by it.
+- Compare importance and SHAP as shares, never as raw values. The two models' SHAP is in
+  different units.
+- Plot the shrinkage explicitly, since it is the main thing that makes the held-out fit above
+  look worse than the ranking actually is.
+
+```{r fig_roc_and_calibration, fig.width = 11, fig.height = 4.6, eval = isTRUE(params$auc_bridge)}
+# Gated on `auc_bridge` for the same reason as fig_fit: panel (a) is built from `br`, which the
+# auc_bridge chunk creates. Panel (b) needs only `pred_t`, but the two panels share one
+# cowplot grid, so the chunk is gated as a unit.
+#
+# (a) The bridge as an ROC curve rather than two densities, with the ceiling curve drawn. The
+# ceiling uses the true outcome as the predictor: for a label that is a threshold on that
+# outcome it is perfect by construction, which is why the AUC is never reported on its own.
+roc_geneset <- roc(br$lab_geneset[!is.na(br$lab_geneset)],
+                   br$pred[!is.na(br$lab_geneset)], direction = "<", quiet = TRUE)
+roc_ceiling <- roc(br$lab_geneset[!is.na(br$lab_geneset)],
+                   br$y[!is.na(br$lab_geneset)], direction = "<", quiet = TRUE)
+roc_thresh  <- roc(br$lab_thresh, br$pred, direction = "<", quiet = TRUE)
+
+roc_df <- bind_rows(
+  tibble(fpr = 1 - roc_geneset$specificities, tpr = roc_geneset$sensitivities,
+         curve = sprintf("predicted TE vs classifier gene sets (AUC %.3f)",
+                         as.numeric(auc(roc_geneset)))),
+  tibble(fpr = 1 - roc_thresh$specificities, tpr = roc_thresh$sensitivities,
+         curve = sprintf("predicted TE vs a threshold on the outcome (AUC %.3f)",
+                         as.numeric(auc(roc_thresh)))),
+  tibble(fpr = 1 - roc_ceiling$specificities, tpr = roc_ceiling$sensitivities,
+         curve = sprintf("ceiling: TRUE outcome as the predictor (AUC %.3f)",
+                         as.numeric(auc(roc_ceiling)))))
+
+p_roc <- ggplot(roc_df, aes(fpr, tpr, colour = curve)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_path(linewidth = 0.9) + coord_equal() +
+  scale_colour_manual(values = c("#E69F00", "#0072B2", "grey45"), name = NULL) +
+  labs(x = "false positive rate", y = "true positive rate", title = "(a) The AUC bridge as a ROC",
+       subtitle = sprintf("held-out genes only | n = %d positives, %d negatives",
+                          sum(br$lab_geneset == 1, na.rm = TRUE),
+                          sum(br$lab_geneset == 0, na.rm = TRUE))) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = c(0.98, 0.02), legend.justification = c(1, 0),
+        legend.text = element_text(size = 7.5))
+
+# (b) Why the held-out fit looks flat. A forest prediction is an average over leaf values, so
+# predictions shrink toward the training mean. Binning the held-out genes by predicted value and
+# plotting the mean observed value in each bin shows the ranking is monotone even though the
+# magnitudes are compressed.
+calib <- tibble(pred = pred_t, obs = test_data$y) %>%
+  mutate(bin = ntile(pred, 10)) %>% group_by(bin) %>%
+  summarise(pred_mid = mean(pred), obs_mean = mean(obs), obs_se = sd(obs) / sqrt(n()),
+            n = n(), .groups = "drop")
+sd_ratio <- sd(pred_t) / sd(test_data$y)
+p_cal <- ggplot(calib, aes(pred_mid, obs_mean)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_errorbar(aes(ymin = obs_mean - obs_se, ymax = obs_mean + obs_se),
+                width = 0, colour = "grey60") +
+  geom_point(size = 2.6, colour = "#E69F00") +
+  geom_line(colour = "#E69F00", linewidth = 0.6) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.3,
+           label = sprintf("prediction sd / outcome sd = %.3f\n(predictions compressed %.1fx)\nn = %d in 10 bins",
+                           sd_ratio, 1 / sd_ratio, nrow(test_data))) +
+  labs(x = "mean predicted TE LFC in bin", y = "mean observed TE LFC in bin",
+       title = "(b) Ranking is monotone; magnitudes are shrunk",
+       subtitle = "decile bins of held-out genes. Dashed line is y = x") +
+  theme_classic(base_size = 11)
+
+pg_roc <- cowplot::plot_grid(p_roc, p_cal, nrow = 1, rel_widths = c(1.1, 1))
+print(pg_roc)
+ggsave_if(here("plots", paste0("10_roc_calibration_", suffix, ".pdf")), pg_roc,
+          width = 11, height = 4.6)
+```
+
+```{r fig_vs_classifier, fig.width = 11, fig.height = 4.8}
+clf_model_path <- file.path(out_dir, paste0("rf_classifier_", clf_suffix, ".rds"))
+clf_md_path2   <- file.path(out_dir, paste0("rf_model_data_", clf_suffix, ".rds"))
+clf_imp_path2  <- file.path(out_dir, paste0("rf_importance_", clf_suffix, ".csv"))
+have_clf <- all(file.exists(c(clf_model_path, clf_md_path2, clf_imp_path2)))
+
+if (!have_clf) {
+  cat("Classifier artifacts not found; this comparison needs 02_rf_model.Rmd to have been knit.\n")
+} else {
+  clf      <- readRDS(clf_model_path)
+  clf_md2  <- readRDS(clf_md_path2)
+  # The classifier can only score these genes if it was fitted on the same columns in the same
+  # order, so that is checked - but a mismatch is a MISSING INPUT for this comparison, not a
+  # corrupt run, and the section header promises each part skips cleanly when its inputs are
+  # absent. It was a stopifnot, which aborted the whole render: that made every arm that
+  # deliberately changes the feature set unrunnable, including family_arms_reg()'s `none` arm
+  # (exclude_families drops 9 columns for g4, 5 for peptide) and so both family presets.
+  # Reported rather than silently dropped, because an UNintended mismatch looks the same.
+  same_features <- identical(clf_md2$feature_cols, feature_cols)
+}
+if (have_clf && !same_features) {
+  cat(sprintf(paste0("Panels (c) and (d) SKIPPED: the classifier was fitted on %d features and ",
+                     "this run uses %d, so it cannot score these genes.\n"),
+              length(clf_md2$feature_cols), length(feature_cols)))
+  only_clf <- setdiff(clf_md2$feature_cols, feature_cols)
+  only_reg <- setdiff(feature_cols, clf_md2$feature_cols)
+  if (length(only_clf)) cat("  only the classifier has:", paste(only_clf, collapse = ", "), "\n")
+  if (length(only_reg)) cat("  only this run has:      ", paste(only_reg, collapse = ", "), "\n")
+  if (!length(only_clf) && !length(only_reg))
+    cat("  the same columns in a DIFFERENT ORDER, which is a different forest\n")
+  cat("  Expected when the arm excludes a family; investigate if it was not meant to.\n")
+}
+if (have_clf && same_features) {
+  # Only genes the classifier never trained on. It modelled 2,872 of 10,172, so most of this
+  # notebook's held-out set is unseen by it and the comparison is out-of-sample on both sides.
+  unseen <- !(test_data$gene_id_clean %in% clf_md2$train$gene_id_clean)
+  clf_p  <- predict(clf, test_data[unseen, feature_cols])$predictions[, clf_md2$pos_label]
+  cmp_df <- tibble(reg_pred = pred_t[unseen], clf_prob = clf_p,
+                   obs = test_data$y[unseen],
+                   in_pos = test_data$gene_id_clean[unseen] %in% pos_genes)
+  rho_pred <- cor(cmp_df$reg_pred, cmp_df$clf_prob, method = "spearman")
+
+  p_pp <- ggplot(cmp_df, aes(clf_prob, reg_pred)) +
+    geom_point(aes(colour = in_pos), size = 0.8, alpha = 0.35) +
+    geom_smooth(method = "lm", se = FALSE, colour = "#0072B2", linewidth = 0.8) +
+    scale_colour_manual(values = c(`TRUE` = "#E69F00", `FALSE` = "grey55"),
+                        labels = c(`TRUE` = "in the positive set", `FALSE` = "not"), name = NULL) +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.3,
+             label = sprintf("Spearman = %.3f\nn = %d genes\nneither model trained on these",
+                             rho_pred, nrow(cmp_df))) +
+    labs(x = "classifier predicted probability", y = "regression predicted TE LFC",
+         title = "(c) Do the two models order genes the same way?",
+         subtitle = "genes held out by this model and never seen by the classifier") +
+    theme_classic(base_size = 11) + theme(legend.position = "bottom")
+
+  # (d) Impurity importance as shares. Shares rather than raw values, because the two forests
+  # split on different quantities and their raw impurity is not on one scale.
+  clf_imp2 <- read_csv(clf_imp_path2, show_col_types = FALSE) %>%
+    mutate(clf_share = 100 * importance / sum(importance)) %>%
+    dplyr::select(feature, family, clf_share)
+  imp_cmp <- importance_df %>% dplyr::select(feature, reg_share = share_pct) %>%
+    inner_join(clf_imp2, by = "feature")
+  rho_imp <- cor(imp_cmp$clf_share, imp_cmp$reg_share, method = "spearman")
+
+  p_imp <- ggplot(imp_cmp, aes(clf_share, reg_share)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_point(aes(colour = family), size = 2, alpha = 0.85) +
+    scale_colour_viridis_d(guide = "none", end = 0.9) +
+    ggrepel::geom_text_repel(
+      data = imp_cmp %>% filter(pmax(clf_share, reg_share) > 2.5 |
+                                abs(clf_share - reg_share) > 1.5),
+      aes(label = feature), size = 2.5, max.overlaps = 18, seed = 9) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+             label = sprintf("Spearman = %.3f\nn = %d features", rho_imp, nrow(imp_cmp))) +
+    labs(x = "classifier impurity share (%)", y = "regression impurity share (%)",
+         title = "(d) Feature importance, both models",
+         subtitle = "shares, since raw impurity is not on a common scale") +
+    theme_classic(base_size = 11)
+
+  pg_clf <- cowplot::plot_grid(p_pp, p_imp, nrow = 1, rel_widths = c(1, 1.05))
+  print(pg_clf)
+  ggsave_if(here("plots", paste0("10_vs_classifier_", suffix, ".pdf")), pg_clf,
+            width = 11, height = 4.8)
+}
+```
+
+```{r fig_shap_compare, fig.width = 11, fig.height = 4.8}
+# SHAP is computed in 11_shap_regression.Rmd, not here, so this reads its output if present. That
+# keeps this notebook cheap: TreeSHAP on this forest takes far longer than fitting it.
+shap_reg_path <- file.path(out_dir, paste0("shapreg_family_", suffix, ".csv"))
+shap_clf_path <- file.path(out_dir, paste0("shap_family_", clf_suffix, ".csv"))
+feat_reg_path <- file.path(out_dir, paste0("shapreg_feature_", suffix, ".csv"))
+feat_clf_path <- file.path(out_dir, paste0("shap_feature_", clf_suffix, ".csv"))
+have_shap <- all(file.exists(c(shap_reg_path, shap_clf_path, feat_reg_path, feat_clf_path)))
+
+if (!have_shap) {
+  cat("SHAP outputs not found. Run 11_shap_regression.Rmd (and 03_shap.Rmd for the classifier),\n")
+  cat("then re-knit this notebook to fill in these panels.\n")
+} else {
+  fam_r <- read_csv(shap_reg_path, show_col_types = FALSE) %>%
+    dplyr::select(family, reg = share_pct)
+  fam_c <- read_csv(shap_clf_path, show_col_types = FALSE) %>%
+    dplyr::select(family, clf = share_pct)
+  fam_j <- inner_join(fam_c, fam_r, by = "family") %>% mutate(delta = reg - clf)
+
+  p_fam <- fam_j %>%
+    pivot_longer(c(clf, reg), names_to = "model", values_to = "share") %>%
+    mutate(model = recode(model, clf = "classifier", reg = "regression"),
+           family = fct_reorder(family, share, .fun = max)) %>%
+    ggplot(aes(share, family, fill = model)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.65, alpha = 0.9) +
+    scale_fill_manual(values = c(classifier = "#0072B2", regression = "#E69F00"), name = NULL) +
+    labs(x = "share of total |SHAP| (%)", y = NULL,
+         title = "(e) Family SHAP shares, both models",
+         subtitle = sprintf("Spearman %.3f over %d families",
+                            cor(fam_j$clf, fam_j$reg, method = "spearman"), nrow(fam_j))) +
+    theme_classic(base_size = 11) + theme(legend.position = "bottom")
+
+  ft_r <- read_csv(feat_reg_path, show_col_types = FALSE) %>%
+    mutate(reg = 100 * mean_abs_shap / sum(mean_abs_shap)) %>%
+    dplyr::select(feature, family, reg, reg_cor = shap_value_cor)
+  ft_c <- read_csv(feat_clf_path, show_col_types = FALSE) %>%
+    mutate(clf = 100 * mean_abs_shap / sum(mean_abs_shap)) %>%
+    dplyr::select(feature, clf, clf_cor = shap_value_cor)
+  ft_j <- inner_join(ft_c, ft_r, by = "feature")
+
+  p_ft <- ggplot(ft_j, aes(clf, reg)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_point(aes(colour = family), size = 2, alpha = 0.85) +
+    scale_colour_viridis_d(guide = "none", end = 0.9) +
+    ggrepel::geom_text_repel(
+      data = ft_j %>% filter(pmax(clf, reg) > 3 | abs(clf - reg) > 1.5),
+      aes(label = feature), size = 2.5, max.overlaps = 18, seed = 9) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+             label = sprintf("Spearman = %.3f\nn = %d features",
+                             cor(ft_j$clf, ft_j$reg, method = "spearman"), nrow(ft_j))) +
+    labs(x = "classifier SHAP share (%)", y = "regression SHAP share (%)",
+         title = "(f) Feature SHAP shares",
+         subtitle = "shares only: the two models' SHAP is in different units") +
+    theme_classic(base_size = 11)
+
+  pg_shap <- cowplot::plot_grid(p_fam, p_ft, nrow = 1, rel_widths = c(1, 1.05))
+  print(pg_shap)
+  ggsave_if(here("plots", paste0("10_shap_vs_classifier_", suffix, ".pdf")), pg_shap,
+            width = 11, height = 4.8)
+
+  cat("\nFamilies where the two models differ most:\n")
+  print(as.data.frame(fam_j %>% arrange(desc(abs(delta))) %>% head(6) %>%
+    mutate(across(where(is.numeric), ~ round(., 2)))), row.names = FALSE)
+  cat("\nWhether any of these clears replication noise is decided in 12_, not here.\n")
+}
+```
+
+# Export
+
+Writes the model, its importance, its metrics, its predictions, and the split itself.
+
+**Decisions**
+
+- Write nothing during a mutation run, so a deliberately corrupted run cannot be mistaken for a
+  real result.
+- Route every path through `assert_no_collision()`.
+- Save the imputed and transformed split alongside the model, so `11_` explains this model's
+  actual data instead of rebuilding it from parameters. The equivalent notebook in the frozen
+  pipeline rebuilds it and then has to assert its way back to agreement.
+
+
+```{r export, eval = !nzchar(params$mutate_target)}
+# A mutation run never writes, so a corrupted matrix cannot be mistaken for a real result.
+# Every path goes through assert_no_collision(), so no regression output can land on a
+# classification filename and destroy a frozen baseline.
+reg_save_rds(rf_model, file.path(out_dir, paste0("rfreg_model_", suffix, ".rds")))
+reg_write_csv(importance_df, file.path(out_dir, paste0("rfreg_importance_", suffix, ".csv")))
+
+perf <- bind_rows(
+  metrics,
+  if (isTRUE(params$run_cv)) tibble(
+    metric = c("cv_spearman_mean", "cv_spearman_sd", "cv_pearson_mean", "cv_rmse_mean"),
+    value  = c(mean(cv$spearman), sd(cv$spearman), mean(cv$pearson), mean(cv$rmse))) else NULL,
+  if (isTRUE(params$auc_bridge)) tibble(
+    metric = c("bridge_auc_geneset", "bridge_ceiling_geneset", "bridge_auc_threshold",
+               "bridge_ceiling_threshold", "bridge_n_pos", "bridge_n_neg",
+               "matched_gene_auc", "n_matched_genes"),
+    value  = c(bridge$auc[1], bridge$ceiling[1], bridge$auc[2], bridge$ceiling[2],
+               bridge$n_pos[1], bridge$n_neg[1], matched_auc, n_matched)) else NULL,
+  tibble(metric = "split_seed", value = SPLIT_SEED),
+  tibble(metric = "forest_seed", value = FOREST_SEED)
+)
+reg_write_csv(perf, file.path(out_dir, paste0("rfreg_performance_", suffix, ".csv")))
+
+reg_write_csv(
+  bind_rows(
+    train_data %>% dplyr::select(gene_id_clean, symbol, y, y_padj) %>%
+      mutate(pred = pred_tr, split = "train"),
+    test_data %>% dplyr::select(gene_id_clean, symbol, y, y_padj) %>%
+      mutate(pred = pred_t,  split = "test")),
+  file.path(out_dir, paste0("rfreg_predictions_", suffix, ".csv")))
+
+# The imputed, transformed split itself, so 11_shap_regression.Rmd explains this model's data
+# rather than re-deriving it from params. 07c_ in the frozen pipeline re-derives and has to
+# assert its way back to agreement; saving removes that whole class of drift.
+if (isTRUE(params$save_model_data)) {
+  reg_save_rds(list(train = train_data, test = test_data, feature_cols = feature_cols,
+                    suffix = suffix, clf_suffix = clf_suffix,
+                    target_transform = params$target_transform,
+                    winsorize_y = params$winsorize_y, inv_scale = tf$inv_scale,
+                    split_seed = SPLIT_SEED, forest_seed = FOREST_SEED),
+               file.path(out_dir, paste0("rfreg_model_data_", suffix, ".rds")))
+}
+cat("Wrote outputs with suffix:", suffix, "\n")
+```

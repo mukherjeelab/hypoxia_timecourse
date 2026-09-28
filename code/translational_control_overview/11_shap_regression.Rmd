@@ -1,0 +1,560 @@
+---
+title: "`r paste0('SHAP (regression): eIF', params$gene, ' ', params$condition, ' ', params$timepoint, ', y=', params$target_transform)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    # Code is folded by default with an "unfold" control on every block, and a "Code" menu at the
+    # top right to expand everything at once. The commentary in these chunks is long on purpose,
+    # so the default view should be the prose, the tables and the figures.
+    code_folding: hide
+params:
+  condition: "hypoxia"
+  gene: "3d"
+  direction: "promotes"
+  readout: "TE"
+  timepoint: "1hr"
+  lfc: "0.5"
+  feature_set_label: "tcoreg"
+  variant_set: "corrected"
+  initiation_score: "both"
+  clip_mode: "aggregate"
+  target_transform: "raw"
+  winsorize_y: 0
+  min_node_size: 5
+  mtry: 0
+  num_trees: 1000
+  splitrule: "variance"
+  weight_mode: "none"
+  restrict_to_classifier_genes: FALSE
+  split_seed: 9
+  explain_n: 200
+  explain_sizes: "50,100,200,400"
+  top_frac: 0.10
+  corr_group_threshold: 0.8
+  cluster_k_max: 6
+  cluster_n_null: 50
+  save_shap_plots: TRUE
+  sweep_mode: FALSE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "11_shap_regression.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This notebook breaks the regression's predictions down per gene and per feature, using SHAP, so
+that each prediction can be expressed as a baseline plus one signed contribution from every
+feature.
+
+Its main practical advantage over `03_shap.Rmd` is that it explains the model directly.
+
+**Decisions**
+
+- Explain `10_`'s forest itself, with no intermediate model.
+- Load the split `10_` saved, rather than rebuilding it from parameters.
+- Verify the decomposition by checking that it adds up (below), which is the property that
+  matters for any additive explanation.
+- Report family-level sums as exact, because SHAP is additive and summing within a family is a
+  valid operation.
+
+## Why no second model is needed here
+
+`03_shap.Rmd` cannot explain `02_`'s classifier directly, because `treeshap` does not support
+ranger probability forests. It works around that by fitting a substitute regression forest on the
+0/1 labels, copying `mtry`, `min.node.size` and `num.trees` off the saved classifier, and then
+running two checks to confirm the substitute behaves like the original: one comparing their
+configuration, one comparing their held-out predictions.
+
+A regression forest needs none of that, because `treeshap` handles it as-is. Both of those checks
+existed to police the substitute, so they are removed rather than carried over. What remains is
+the check that actually matters for an additive decomposition: the contributions must sum to the
+prediction, with the leftover constant across genes and equal to the forest's mean training
+prediction.
+
+**Decisions**
+
+- Remove the substitute model and its two checks.
+- Replace them with one check that the decomposition closes to within 1e-8.
+- Keep the engine indirection, so Kernel SHAP stays available as a cross-check. With no substitute
+  on either side, that comparison is now cleaner than it was.
+
+## Two summaries that had to be redefined
+
+Two things in `03_` were defined in terms of the positive class, which does not exist here.
+
+- The **signed** column averaged SHAP over the positive class. It now averages over the top
+  fraction of genes by predicted outcome. The reason for restricting to a subset is unchanged: a
+  signed average over all genes cancels to about zero for every feature, which is why
+  `mean_signed_shap` is not a measure of direction.
+- The **subgroup clustering** clustered held-out positives. It now clusters that same top
+  fraction, which keeps the group size comparable to the classifier's 287 genes.
+
+**Decisions**
+
+- Use the top 10% by predicted outcome wherever `03_` used the positive class.
+- Keep `shap_value_cor` as the directional summary; it needs no change.
+- Keep exporting `mean_signed_shap` for completeness while stating that it is not a direction.
+
+## Cost
+
+SHAP is considerably slower here than on the classifier, because of the model rather than the
+method: this forest is grown on 8,140 rows instead of 2,298, so its trees are much deeper, and it
+uses 1000 trees instead of 500.
+
+**Decisions**
+
+- Under `sweep_mode = TRUE`, compute one SHAP matrix instead of three by skipping the signed
+  column, the correlated groups, the explain-set size check and the subgroups. That is what makes
+  the 20-run floor sweep in `11d_` affordable.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(ranger)
+library(treeshap)
+library(cowplot)
+```
+
+```{r load}
+source(here("code", "translational_control_overview", "02_sweep_presets.R"))
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+
+suffix <- reg_suffix(list(
+  gene = params$gene, direction = params$direction, readout = params$readout,
+  condition = params$condition, timepoint = params$timepoint, lfc = params$lfc,
+  feature_set_label = params$feature_set_label, variant_set = params$variant_set,
+  initiation_score = params$initiation_score, clip_mode = params$clip_mode,
+  target_transform = params$target_transform, winsorize_y = params$winsorize_y,
+  min_node_size = params$min_node_size, mtry = params$mtry, num_trees = params$num_trees,
+  splitrule = params$splitrule, weight_mode = params$weight_mode,
+  restrict_to_classifier_genes = params$restrict_to_classifier_genes),
+  as.integer(params$split_seed))
+
+out_dir <- here("output", "translational_control_overview")
+model_path <- file.path(out_dir, paste0("rfreg_model_", suffix, ".rds"))
+md_path    <- file.path(out_dir, paste0("rfreg_model_data_", suffix, ".rds"))
+stopifnot(
+  "regression model RDS not found - knit 10_rf_regression.Rmd with these params first" =
+    file.exists(model_path),
+  "regression model data not found - knit 10_ with save_model_data = TRUE" =
+    file.exists(md_path))
+
+rf <- readRDS(model_path)
+md <- readRDS(md_path)
+# The saved split belongs to this model. 07c_ in the frozen pipeline re-derives the split from
+# params and has to assert its way back to agreement; 10_ saves it, which removes the drift
+# rather than detecting it.
+stopifnot("the saved data does not belong to this model" = identical(md$suffix, suffix))
+
+train_data <- md$train; test_data <- md$test; feature_cols <- md$feature_cols
+ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+stopifnot("annotation does not cover every modelled feature" =
+            all(feature_cols %in% ann$feature))
+
+y_units <- if (params$target_transform == "rank_ecdf") "percentile of training y" else
+           if (params$target_transform == "robust_z")  "MAD of training y" else "log2 TE LFC"
+cat("Suffix:", suffix, "\n")
+cat("Model:", rf$treetype, "| mtry", rf$mtry, "| min.node.size", rf$min.node.size,
+    "| num.trees", rf$num.trees, "| OOB R2", round(rf$r.squared, 4), "\n")
+cat("Train", nrow(train_data), "| Test", nrow(test_data), "|", length(feature_cols), "features\n")
+cat("SHAP will be in units of:", y_units, "\n")
+```
+
+# 1. Computing SHAP
+
+Computes SHAP values for a sample of held-out genes and checks the decomposition adds up.
+
+**Decisions**
+
+- Explain a random sample of `explain_n` held-out genes rather than all of them, for cost.
+- Re-impose the feature order on every call, because `treeshap` returns columns in its own order
+  and a silent reorder would attribute values to the wrong features.
+- Require the leftover after subtracting all contributions to be constant to within 1e-8, and to
+  equal the forest's mean training prediction.
+
+
+```{r shap_setup}
+# No substitute model: what treeshap is handed is notebook 10's forest itself.
+stopifnot("this is not a regression forest - treeshap cannot explain a probability forest" =
+            rf$treetype == "Regression")
+
+unified <- ranger.unify(rf, as.data.frame(train_data[, feature_cols]))
+# Column order is re-imposed on every call: treeshap returns $shaps in its own order, and a
+# silent reorder would misattribute every value to the wrong feature.
+shap_of    <- function(X) as.data.frame(
+  treeshap(unified, as.data.frame(X)[, feature_cols], interactions = FALSE,
+           verbose = FALSE)$shaps[, feature_cols])
+predict_of <- function(X) predict(rf, data = as.data.frame(X))$predictions
+
+explain_n   <- min(params$explain_n, nrow(test_data))
+set.seed(9)
+explain_idx <- sample(nrow(test_data), explain_n)
+explain_set <- as.data.frame(test_data[explain_idx, feature_cols])
+shap_vals   <- shap_of(explain_set)
+stopifnot("SHAP matrix does not match the explain set" =
+            nrow(shap_vals) == explain_n && ncol(shap_vals) == length(feature_cols))
+```
+
+```{r additivity}
+# The check that replaces 03_'s two. A decomposition that closes on the predictions, with a
+# constant leftover, is by definition a decomposition of this model, so there is no substitute
+# model whose fidelity needs arguing.
+pred    <- predict_of(explain_set)
+implied <- pred - rowSums(shap_vals)
+mean_train_pred <- mean(predict_of(train_data[, feature_cols]))
+cat(sprintf("baseline %.6f (sd %.2e over %d genes) | mean training prediction %.6f | diff %.2e\n",
+            mean(implied), sd(implied), length(implied), mean_train_pred,
+            abs(mean(implied) - mean_train_pred)))
+stopifnot(
+  "SHAP does not close on these predictions - the baseline is not constant" =
+    sd(implied) < 1e-8,
+  "the recovered baseline is not the forest's mean training prediction" =
+    abs(mean(implied) - mean_train_pred) < 1e-6
+)
+baseline <- mean(implied)
+```
+
+```{r shap_table}
+shap_value_cor <- map_dbl(feature_cols, function(f) {
+  v <- explain_set[[f]]; s <- shap_vals[[f]]
+  if (sd(v, na.rm = TRUE) == 0 || sd(s, na.rm = TRUE) == 0) return(NA_real_)
+  cor(v, s, use = "complete.obs", method = "spearman")
+})
+
+shap_tbl <- tibble(
+  feature          = feature_cols,
+  mean_abs_shap    = colMeans(abs(shap_vals)),
+  mean_signed_shap = colMeans(shap_vals),     # not direction - cancels to ~0. See the header.
+  shap_value_cor   = shap_value_cor
+) %>%
+  left_join(ann %>% dplyr::select(feature, family, block), by = "feature") %>%
+  arrange(desc(mean_abs_shap)) %>%
+  mutate(share_pct = 100 * mean_abs_shap / sum(mean_abs_shap), rank_shap = row_number())
+print(as.data.frame(head(shap_tbl %>%
+  mutate(across(where(is.numeric), ~ signif(., 4))), 20)), row.names = FALSE)
+
+# Cross-experiment note: mean_abs_shap is in TE units and so is NOT comparable across
+# experiments whose outcome spread differs (MAD spans 7.3x across the 17 si3d/si3e contrasts).
+# share_pct is a within-run ratio and is comparable. mad_scaled is the third option: TE units
+# divided by this run's own outcome spread. See 10d_target_scale_analysis.Rmd.
+shap_tbl$mean_abs_shap_mad_scaled <- shap_tbl$mean_abs_shap / mad(md$train$y)
+```
+
+```{r family_table}
+# Exact, because SHAP is additive: summing within a family is a legitimate operation, which is
+# the reason this decomposition exists at all. Impurity importance structurally cannot do it.
+fam_tbl <- shap_tbl %>% group_by(family) %>%
+  summarise(n = n(), family_shap = sum(mean_abs_shap),
+            top_feature = feature[which.max(mean_abs_shap)], .groups = "drop") %>%
+  mutate(share_pct = 100 * family_shap / sum(family_shap)) %>%
+  arrange(desc(family_shap))
+print(as.data.frame(fam_tbl %>% mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+stopifnot("family shares do not sum to 100" =
+            abs(sum(fam_tbl$share_pct) - 100) < 1e-8)
+```
+
+# 2. SHAP versus impurity importance
+
+Compares the SHAP ranking against the impurity ranking from `10_`.
+
+**Decisions**
+
+- Treat disagreement as expected rather than as an error. Impurity favours continuous and
+  high-cardinality features, which is the reason for computing SHAP at all.
+- Report the comparison at both feature and family level.
+
+
+```{r impurity_vs_shap}
+imp <- read_csv(file.path(out_dir, paste0("rfreg_importance_", suffix, ".csv")),
+                show_col_types = FALSE) %>%
+  dplyr::select(feature, importance, family) %>%
+  mutate(imp_share = 100 * importance / sum(importance),
+         rank_imp  = rank(-importance))
+cmp <- shap_tbl %>% dplyr::select(feature, family, share_pct, rank_shap) %>%
+  inner_join(imp %>% dplyr::select(feature, imp_share, rank_imp), by = "feature")
+cat("feature-level Spearman, SHAP share vs impurity share:",
+    round(cor(cmp$share_pct, cmp$imp_share, method = "spearman"), 4), "\n")
+
+fam_cmp <- cmp %>% group_by(family) %>%
+  summarise(shap = sum(share_pct), imp = sum(imp_share), .groups = "drop") %>%
+  mutate(delta = shap - imp) %>% arrange(desc(abs(delta)))
+print(as.data.frame(fam_cmp %>% mutate(across(where(is.numeric), ~ round(., 2)))), row.names = FALSE)
+```
+
+```{r fig_shap, fig.width = 11, fig.height = 9, eval = !isTRUE(params$sweep_mode)}
+top20 <- shap_tbl %>% head(20) %>% mutate(feature = fct_reorder(feature, mean_abs_shap))
+p_lol <- ggplot(top20, aes(mean_abs_shap, feature)) +
+  geom_segment(aes(x = 0, xend = mean_abs_shap, yend = feature), colour = "grey70") +
+  geom_point(aes(colour = shap_value_cor), size = 3) +
+  scale_colour_gradient2(low = "#0072B2", mid = "grey85", high = "#D55E00", midpoint = 0,
+                         name = "value vs\nown SHAP") +
+  labs(x = paste0("mean |SHAP| (", y_units, ")"), y = NULL,
+       title = "(a) Top 20 features",
+       subtitle = sprintf("n = %d explained genes | colour is the DIRECTIONAL quantity", explain_n)) +
+  theme_classic(base_size = 11)
+
+p_fam <- fam_tbl %>% mutate(family = fct_reorder(family, share_pct)) %>%
+  ggplot(aes(share_pct, family)) +
+  geom_col(fill = "#E69F00", alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f%% (%d)", share_pct, n)), hjust = -0.1, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = "share of total |SHAP| (%)", y = NULL, title = "(b) Family shares",
+       subtitle = "exact: SHAP is additive, so summing within a family is valid") +
+  theme_classic(base_size = 11)
+
+p_cmp <- ggplot(cmp, aes(imp_share, share_pct)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.75, size = 1.8, colour = "#E69F00") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.3,
+           label = sprintf("Spearman = %.3f\nn = %d features",
+                           cor(cmp$share_pct, cmp$imp_share, method = "spearman"), nrow(cmp))) +
+  labs(x = "impurity share (%)", y = "SHAP share (%)", title = "(c) SHAP vs impurity",
+       subtitle = "impurity is biased toward continuous/high-cardinality features") +
+  theme_classic(base_size = 11)
+
+# Beeswarm: the per-gene spread a mean |SHAP| hides.
+bees <- shap_vals %>% dplyr::select(all_of(head(shap_tbl$feature, 15))) %>%
+  mutate(.row = row_number()) %>%
+  pivot_longer(-.row, names_to = "feature", values_to = "shap") %>%
+  left_join(explain_set %>% mutate(.row = row_number()) %>%
+              pivot_longer(-.row, names_to = "feature", values_to = "value"),
+            by = c(".row", "feature")) %>%
+  group_by(feature) %>% mutate(v_scaled = if (sd(value, na.rm = TRUE) > 0)
+    (value - min(value, na.rm = TRUE)) /
+      (max(value, na.rm = TRUE) - min(value, na.rm = TRUE)) else 0.5) %>% ungroup() %>%
+  mutate(feature = factor(feature, levels = rev(head(shap_tbl$feature, 15))))
+p_bee <- ggplot(bees, aes(shap, feature, colour = v_scaled)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_jitter(height = 0.22, size = 0.7, alpha = 0.55) +
+  scale_colour_gradient(low = "#0072B2", high = "#D55E00", name = "feature\nvalue",
+                        breaks = c(0, 1), labels = c("low", "high")) +
+  labs(x = paste0("SHAP (", y_units, ")"), y = NULL, title = "(d) Per-gene contributions",
+       subtitle = "what the mean in (a) averages over") +
+  theme_classic(base_size = 11)
+
+pg <- plot_grid(p_lol, p_fam, p_cmp, p_bee, nrow = 2, rel_heights = c(1.15, 1))
+print(pg)
+if (isTRUE(params$save_shap_plots))
+  ggsave(here("plots", paste0("11_shap_", suffix, ".pdf")), pg, width = 11, height = 9)
+```
+
+# 3. Signed contributions for the strongly-predicted genes
+
+Reports which features push predictions up or down for the genes the model scores highest.
+
+**Decisions**
+
+- Restrict to the top 10% by predicted outcome, since a signed average over all genes cancels.
+- Check the signed values sum to that subset's mean distance above the baseline, so the column is
+  a genuine decomposition rather than a set of unrelated averages.
+
+
+```{r signed, eval = !isTRUE(params$sweep_mode)}
+# A signed mean over all genes cancels to ~0 for every feature, which is exactly why
+# mean_signed_shap is not a measure of direction. 03_ avoided that by averaging over the
+# positive class; there is no class here, so the comparable subset is the top fraction by
+# predicted y - the genes the model says are most strongly eIF3d-promoted.
+n_top    <- max(20L, floor(params$top_frac * nrow(test_data)))
+top_idx  <- order(-predict_of(test_data[, feature_cols]))[seq_len(n_top)]
+top_x    <- as.data.frame(test_data[top_idx, feature_cols])
+shap_top <- shap_of(top_x)
+cat(sprintf("top %.0f%% by predicted y: %d genes (median observed y %+.3f vs %+.3f overall)\n",
+            100 * params$top_frac, n_top, median(test_data$y[top_idx]), median(test_data$y)))
+
+signed <- tibble(feature = feature_cols, signed_shap = colMeans(shap_top)) %>%
+  left_join(shap_tbl %>% dplyr::select(feature, family, mean_abs_shap), by = "feature") %>%
+  mutate(abs_share    = 100 * mean_abs_shap / sum(mean_abs_shap),
+         signed_share = 100 * signed_shap / sum(abs(signed_shap))) %>%
+  arrange(desc(abs(signed_shap)))
+
+# Additive by construction: the signed means must sum to this subset's mean lift above the
+# baseline. If they do not, the column is not a decomposition and must not be read as one.
+row_sums <- rowSums(shap_top)
+stopifnot("the signed column is not additive - do not read it as a decomposition" =
+            isTRUE(all.equal(sum(signed$signed_shap), mean(row_sums))))
+cat(sprintf("sum of signed means %.6f = mean total lift %.6f above baseline %.6f\n",
+            sum(signed$signed_shap), mean(row_sums), baseline))
+print(as.data.frame(head(signed %>% mutate(across(where(is.numeric), ~ signif(., 4))), 15)),
+      row.names = FALSE)
+```
+
+# 4. Correlated groups
+
+Groups features by how correlated they are with each other, and sums SHAP within those groups.
+
+Families are a grouping decided in advance; this is one read off the data. Where several
+near-duplicate features split credit between them, the group recovers the total.
+
+**Decisions**
+
+- Cluster on absolute correlation with average linkage, cutting at `corr_group_threshold`.
+- Report the same summary at thresholds 0.7, 0.8 and 0.9, so the grouping is not taken as exact.
+- Flag groups that span more than one family, since those are where the prior grouping and the
+  data disagree.
+
+
+```{r corr_groups, eval = !isTRUE(params$sweep_mode)}
+# Families are a prior grouping; this is the data-driven one. Where a family splits credit
+# across near-duplicate members, the correlated group recovers the total.
+Xall <- bind_rows(train_data[, feature_cols], test_data[, feature_cols])
+Cm   <- suppressWarnings(cor(Xall, use = "pairwise.complete.obs"))
+Cm[is.na(Cm)] <- 0
+hc   <- hclust(as.dist(1 - abs(Cm)), method = "average")
+grp  <- cutree(hc, h = 1 - params$corr_group_threshold)
+
+cg <- shap_tbl %>% mutate(group = grp[match(feature, names(grp))]) %>%
+  group_by(group) %>%
+  summarise(n = n(), share = sum(share_pct),
+            lead = feature[which.max(mean_abs_shap)],
+            families = paste(sort(unique(family)), collapse = "+"),
+            spans_families = n_distinct(family) > 1, .groups = "drop") %>%
+  arrange(desc(share))
+cat("Groups at |r| >=", params$corr_group_threshold, ":", nrow(cg),
+    "| multi-feature:", sum(cg$n > 1), "| spanning >1 family:", sum(cg$spans_families), "\n")
+print(as.data.frame(head(cg %>% mutate(share = round(share, 2)), 15)), row.names = FALSE)
+
+for (th in c(0.7, 0.8, 0.9)) {
+  g2 <- cutree(hc, h = 1 - th)
+  cat(sprintf("  threshold %.1f -> %d groups, largest share %.2f%%\n", th, max(g2),
+              max(tapply(shap_tbl$share_pct[match(names(g2), shap_tbl$feature)], g2, sum))))
+}
+```
+
+# 5. Explain-set size, and gene subgroups
+
+Checks whether the family ranking depends on how many genes were explained, then looks for
+subgroups of genes driven by different features.
+
+**Decisions**
+
+- Re-run the explain-set size check rather than inheriting `03_`'s conclusion, since the held-out
+  set here is about 2,032 genes rather than 574.
+- Cluster on family-level profiles normalised within each gene, so groups reflect which families
+  drove a gene rather than how strongly it was predicted.
+- Test against a null that permutes each family independently across genes, standardising within
+  each k before maximising over k.
+- Keep two different best-k: one for testing, one for describing. They need not agree.
+
+
+```{r explain_stability, eval = !isTRUE(params$sweep_mode)}
+# 03_'s conclusion was reached on a 574-row test set; this one has ~2,032, so the question is
+# re-opened rather than inherited.
+sizes <- as.integer(str_trim(str_split(params$explain_sizes, ",")[[1]]))
+sizes <- sizes[sizes <= nrow(test_data)]
+stab <- map_dfr(sizes, function(n) {
+  set.seed(9); idx <- sample(nrow(test_data), n)
+  sv <- shap_of(as.data.frame(test_data[idx, feature_cols]))
+  tibble(feature = feature_cols, mean_abs = colMeans(abs(sv))) %>%
+    left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+    group_by(family) %>% summarise(share = 100 * sum(mean_abs), .groups = "drop") %>%
+    mutate(share = 100 * share / sum(share), n = n)
+})
+wide <- stab %>% pivot_wider(names_from = n, values_from = share, names_prefix = "n") %>%
+  arrange(desc(.data[[paste0("n", max(sizes))]]))
+print(as.data.frame(wide %>% mutate(across(where(is.numeric), ~ round(., 2)))), row.names = FALSE)
+rk <- stab %>% group_by(n) %>% mutate(rk = rank(-share)) %>%
+  dplyr::select(family, n, rk) %>% pivot_wider(names_from = n, values_from = rk)
+cat("\nSpearman of family ranking, smallest vs largest explain set:",
+    round(cor(rk[[2]], rk[[ncol(rk)]], method = "spearman"), 3), "\n")
+```
+
+```{r subgroups, eval = !isTRUE(params$sweep_mode) && exists("shap_top")}
+# Clustered on the same top fraction as section 3, so group size stays comparable to the
+# classifier's 287 positive-class genes. Normalised within gene, so clusters reflect which
+# families drove a gene rather than how strongly it was predicted.
+source(here("code", "translational_control_overview", "03_subgroup_null.R"))
+fam_of  <- ann$family[match(feature_cols, ann$feature)]
+fam_mat <- t(rowsum(t(as.matrix(shap_top)), group = fam_of))   # exact: SHAP is additive
+denom   <- rowSums(abs(fam_mat)); denom[denom == 0] <- NA
+profile <- fam_mat / denom
+keep    <- stats::complete.cases(profile)
+profile <- profile[keep, , drop = FALSE]
+sym_keep <- test_data$symbol[top_idx][keep]
+cat("Profiles:", nrow(profile), "genes x", ncol(profile), "families\n")
+
+# The null permutes each family independently across genes: co-occurrence destroyed, marginals
+# preserved. Mean silhouette falls monotonically with k, so a raw best-over-k comparison pits the
+# null's k=2 against an observed k=3 and returns the answer backwards. subgroup_null()
+# standardises within k first. Two best_k are kept apart deliberately: best_k_z for testing,
+# best_k_sil for describing.
+nullres <- subgroup_null(profile, ks = 2:params$cluster_k_max, n_perm = params$cluster_n_null)
+print(as.data.frame(nullres$per_k %>% mutate(across(where(is.numeric), ~ round(., 4)))),
+      row.names = FALSE)
+cat(sprintf("\ntest statistic peaks at k = %d: observed z = %.2f | null median %.2f | null max %.2f | p = %.4g\n",
+            nullres$best_k_z, nullres$z_obs, median(nullres$z_null), max(nullres$z_null),
+            nullres$p_overall))
+best_k <- nullres$best_k_sil
+set.seed(9)
+km <- kmeans(profile, centers = best_k, nstart = 25)
+subgroups <- tibble(symbol = sym_keep, cluster = km$cluster) %>% bind_cols(as_tibble(profile))
+cat("Described at k =", best_k, "(the raw silhouette peak). Sizes:",
+    paste(table(km$cluster), collapse = ", "), "\n")
+lead <- apply(km$centers, 1, function(r) paste(names(sort(r, decreasing = TRUE))[1:2], collapse = ", "))
+for (i in seq_len(best_k))
+  cat(sprintf("  cluster %d (n=%3d): led by %s\n", i, sum(km$cluster == i), lead[i]))
+```
+
+```{r fig_null_band, eval = !isTRUE(params$sweep_mode), fig.width = 6.5, fig.height = 4.4}
+# Plot the null band per k. In 03_ a single summary number hid that the observed value sat above
+# the null at every k of 3 or more; the band is what made that visible.
+band <- nullres$per_k
+p_band <- ggplot(band, aes(k)) +
+  geom_ribbon(aes(ymin = null_min, ymax = null_max), fill = "grey85") +
+  geom_line(aes(y = null_median), colour = "grey40", linetype = "dashed", linewidth = 0.7) +
+  geom_line(aes(y = observed), colour = "#E69F00", linewidth = 1) +
+  geom_point(aes(y = observed), colour = "#E69F00", size = 2.4) +
+  labs(x = "k", y = "mean silhouette",
+       title = "Observed vs the per-k null band",
+       subtitle = sprintf("grey = null min-max over %d permutations, dashed = null median, orange = observed (n = %d genes)",
+                          params$cluster_n_null, nrow(profile))) +
+  theme_classic(base_size = 12)
+print(p_band)
+if (isTRUE(params$save_shap_plots))
+  ggsave(here("plots", paste0("11_subgroup_null_band_", suffix, ".pdf")), p_band,
+         width = 6.5, height = 4.4)
+```
+
+# Export
+
+Writes the feature and family tables, and the per-gene values.
+
+**Decisions**
+
+- Always write the feature and family tables, since those are what the floor sweep reads.
+- Write the rest only outside sweep mode.
+
+
+```{r export}
+reg_write_csv(shap_tbl, file.path(out_dir, paste0("shapreg_feature_", suffix, ".csv")))
+reg_write_csv(fam_tbl,  file.path(out_dir, paste0("shapreg_family_",  suffix, ".csv")))
+
+if (!isTRUE(params$sweep_mode)) {
+  reg_write_csv(fam_cmp, file.path(out_dir, paste0("shapreg_vs_impurity_", suffix, ".csv")))
+  reg_write_csv(
+    bind_cols(tibble(gene_id_clean = test_data$gene_id_clean[explain_idx],
+                     symbol = test_data$symbol[explain_idx],
+                     y = test_data$y[explain_idx], pred = pred), shap_vals),
+    file.path(out_dir, paste0("shapreg_per_gene_", suffix, ".csv")))
+  if (exists("signed"))    reg_write_csv(signed, file.path(out_dir, paste0("shapreg_signed_top_", suffix, ".csv")))
+  if (exists("cg"))        reg_write_csv(cg, file.path(out_dir, paste0("shapreg_corr_groups_", suffix, ".csv")))
+  if (exists("wide"))      reg_write_csv(wide, file.path(out_dir, paste0("shapreg_explain_stability_", suffix, ".csv")))
+  if (exists("subgroups")) reg_write_csv(subgroups, file.path(out_dir, paste0("shapreg_subgroups_", suffix, ".csv")))
+  if (exists("band"))      reg_write_csv(band, file.path(out_dir, paste0("shapreg_subgroup_null_band_", suffix, ".csv")))
+}
+cat("Wrote SHAP outputs with suffix:", suffix, "\n")
+```
