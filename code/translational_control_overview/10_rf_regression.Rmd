@@ -28,6 +28,7 @@ params:
   outcome_csv: ""
   outcome_col: "te_lfc"
   outcome_padj_col: "te_padj"
+  direction_check_csv: ""
   negate_outcome: FALSE
   target_transform: "raw"
   winsorize_y: 0
@@ -44,6 +45,8 @@ params:
   clf_suffix_override: ""
   precision_at_k: "50,100,200,500"
   auc_bridge: TRUE
+  min_test_pos: 20
+  permutation_check: TRUE
   run_cv: TRUE
   save_plots: TRUE
   save_model_data: TRUE
@@ -85,10 +88,37 @@ suppressMessages({ library(dplyr); library(readr); library(here) })
          params$condition, "_", params$timepoint, ".csv")
 .dir_te  <- read_csv(here("output", .dir_outcome), show_col_types = FALSE) %>%
   mutate(g = sub("[.].*", "", gene_id))
-.dir_pos <- read_csv(here("output", "genesets",
-  paste0(params$condition, "_", params$gene, "_", params$direction, "_",
-         params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")),
-  show_col_types = FALSE)$ensembl_gene
+# The positive gene set is needed twice - here to derive the directional wording, and later for
+# the biological spot-check and the AUC bridge - so it is defined ONCE as a function and called
+# in both places. It was duplicated, and the duplicate is what broke the regressed timepoints:
+# this chunk runs before the prose, so it failed on a missing CSV ahead of the branch that
+# handles it.
+#
+# For most timepoints the set is a saved CSV. For the regressed timepoints (1and4hr,
+# alltimepoints) no TE-readout CSV exists, so the set is defined inline from the outcome file by
+# the same rule those CSVs were built with, mirroring notebook 07's use_full_de_table branch
+# rather than inventing a second definition.
+positive_set <- function() {
+  if (params$readout == "TE" && params$timepoint %in% c("1and4hr", "alltimepoints")) {
+    g <- .dir_te %>%
+      filter(.data[[params$outcome_col]] > as.numeric(params$lfc),
+             .data[[params$outcome_padj_col]] < 0.05) %>% pull(g)
+    stopifnot("the inline positive set is empty or implausibly small - check the filter" =
+                length(g) >= 50)
+    attr(g, "source") <- paste0(.dir_outcome, " (inline: ", params$outcome_col, " > ",
+                                params$lfc, " & padj < 0.05)")
+    g
+  } else {
+    csv <- paste0(params$condition, "_", params$gene, "_", params$direction, "_",
+                  params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")
+    pth <- here("output", "genesets", csv)
+    stopifnot("positive geneset CSV not found" = file.exists(pth))
+    g <- read_csv(pth, show_col_types = FALSE)$ensembl_gene
+    attr(g, "source") <- csv
+    g
+  }
+}
+.dir_pos <- positive_set()
 .dir_p       <- .dir_te %>% filter(g %in% .dir_pos)
 .dir_median  <- median(.dir_p[[params$outcome_col]], na.rm = TRUE)
 .dir_n       <- nrow(.dir_p)
@@ -466,12 +496,24 @@ cat(sprintf("        |y|>1: %d   |y|>2: %d   |y|>3: %d\n",
 # would fail on correct data. The siRNA destroys EIF3D's mRNA, so rna_lfc gives an unambiguous
 # reading: this file is oriented log2(sictrl/si3d), and positive means eIF3d promotes.
 kd_symbol <- paste0("EIF", toupper(params$gene))            # 3d -> EIF3D, 3e -> EIF3E
-if ("symbol" %in% names(outcome_raw) && "rna_lfc" %in% names(outcome_raw) &&
+
+# Some contrasts are saved as TE-only tables with no rna_lfc column - te_si3e_vs_sictrl_
+# normoxia_1and4hr.csv is one - which would leave the direction unverifiable for that run.
+# direction_check_csv points the ruler at the companion RNA file so the check still happens
+# rather than being skipped, which is the difference between a verified column and an assumed one.
+dir_src <- if (nzchar(params$direction_check_csv)) {
+  cat("direction ruler read from the companion file:", params$direction_check_csv, "\n")
+  read_csv(here("output", params$direction_check_csv), show_col_types = FALSE)
+} else outcome_raw
+
+if ("symbol" %in% names(dir_src) && "rna_lfc" %in% names(dir_src) &&
     !isTRUE(params$negate_outcome)) {
-  e <- outcome_raw %>% filter(symbol == kd_symbol)
+  e <- dir_src %>% filter(symbol == kd_symbol)
   stopifnot("the knockdown target gene is not in the outcome file" = nrow(e) == 1)
-  cat(sprintf("%s rna_lfc %+.2f (the ruler: must be strongly positive) | te_lfc %+.2f (%s)\n",
-              kd_symbol, e$rna_lfc, e[[params$outcome_col]], e$category))
+  cat(sprintf("%s rna_lfc %+.2f (the ruler: must be strongly positive)%s\n",
+              kd_symbol, e$rna_lfc,
+              if (params$outcome_col %in% names(e))
+                sprintf(" | %s %+.2f", params$outcome_col, e[[params$outcome_col]]) else ""))
   stopifnot(
     "the knockdown gene's rna_lfc is not strongly positive - the contrast direction has flipped" =
       e$rna_lfc > 2
@@ -528,10 +570,9 @@ if ("symbol" %in% names(outcome_raw) && "rna_lfc" %in% names(outcome_raw) &&
 # Biological spot-check on the outcome: it must separate the classifier's positive set from its
 # negative controls. A sign flip or a scrambled join passes every range check above but fails
 # this one.
-pos_genes <- read_csv(here("output", "genesets",
-  paste0(params$condition, "_", params$gene, "_", params$direction, "_",
-         params$readout, "_", params$timepoint, "_lfc", params$lfc, ".csv")),
-  show_col_types = FALSE)$ensembl_gene
+# Reuses the single definition from the direction_facts chunk, so the two cannot diverge.
+pos_genes <- .dir_pos
+cat(sprintf("positive set: %d genes from %s\n", length(pos_genes), attr(pos_genes, "source")))
 neg_csv   <- if (params$gene == "3e") "negative_control_genes_si3e.csv" else
                                       "negative_control_genes.csv"
 neg_genes <- read_csv(here("output", "predictive_modeling", neg_csv), show_col_types = FALSE) %>%
@@ -1043,11 +1084,70 @@ metrics <- tibble(
 print(as.data.frame(metrics %>% mutate(value = round(value, 5))), row.names = FALSE)
 
 # Predictions must separate the two gene sets on held-out genes, not just in-sample.
+# The held-out separation check needs enough positives for a median to mean anything. At the
+# late timepoints there are almost none - si3d hypoxia 24hr puts a single positive gene in the
+# 20% test split, si3e 24hr five - so the check would be comparing one gene's prediction against
+# 573 negatives and passing or failing on noise. It is therefore gated on having at least
+# min_test_pos held-out positives, and says loudly when it skips.
+#
+# Worth noting the converse: a run with only a handful of positives that PASSES has not been
+# meaningfully checked either. The gate applies in both directions.
+n_test_pos <- sum(test_data$gene_id_clean %in% pos_genes)
+n_test_neg <- sum(test_data$gene_id_clean %in% neg_genes)
+if (n_test_pos >= params$min_test_pos) {
+  stopifnot(
+    "predictions do not separate the promoted set from the negative controls on held-out genes" =
+      median(pred_t[test_data$gene_id_clean %in% pos_genes]) >
+      median(pred_t[test_data$gene_id_clean %in% neg_genes])
+  )
+  cat(sprintf("held-out separation check PASSED on %d positives vs %d negatives\n",
+              n_test_pos, n_test_neg))
+} else {
+  cat(sprintf("\n*** held-out separation check SKIPPED: only %d positives in the test split\n",
+              n_test_pos))
+  cat(sprintf("    (need %d). The positive set has %d genes in the whole matrix, so this\n",
+              params$min_test_pos, sum(model_data$gene_id_clean %in% pos_genes)))
+  cat("    contrast has too few affected transcripts for the check to have any power. ***\n\n")
+}
+```
+
+```{r permutation_null, eval = isTRUE(params$permutation_check)}
+# A validity check that depends on nothing outside this run: refit on a PERMUTED outcome and
+# confirm the signal disappears.
+#
+# The alternative checks all lean on an external gene set defined by a threshold on the same
+# quantity being modelled, which is circular and, at the late timepoints, has almost no members.
+# This one asks the only question that matters for a column in the heatmap: is the Spearman we
+# just measured attributable to the features, or would any forest on this many genes produce it?
+#
+# Permuting the outcome while leaving the features untouched destroys the feature-outcome link
+# and preserves everything else - the marginal distribution, the sample size, the correlation
+# structure among features. Whatever Spearman survives is what this setup yields for free.
+set.seed(FOREST_SEED)
+y_perm <- sample(train_data$y_t)
+perm_args <- rf_args; perm_args$y <- y_perm; perm_args$importance <- "none"
+set.seed(FOREST_SEED)
+rf_perm  <- do.call(ranger, perm_args)
+pred_perm <- predict(rf_perm, data = test_data[, feature_cols])$predictions
+sp_perm   <- cor(pred_perm, test_data$y, method = "spearman")
+
+cat(sprintf("real model      : test Spearman %+.4f | OOB R2 %+.4f\n", spearman_raw, rf_model$r.squared))
+cat(sprintf("permuted outcome: test Spearman %+.4f | OOB R2 %+.4f\n", sp_perm, rf_perm$r.squared))
+cat(sprintf("difference      : %+.4f\n", spearman_raw - sp_perm))
 stopifnot(
-  "predictions do not separate the promoted set from the negative controls on held-out genes" =
-    median(pred_t[test_data$gene_id_clean %in% pos_genes]) >
-    median(pred_t[test_data$gene_id_clean %in% neg_genes])
+  # The permuted model must not rank held-out genes. If it does, something links the features to
+  # the outcome other than biology - a leak, or a split that is not independent.
+  "the PERMUTED model still ranks held-out genes - suspect leakage" = abs(sp_perm) < 0.1,
+  # And the real model must beat it. This is the floor every column has to clear to be read.
+  "the real model does not beat its own permuted null" = spearman_raw > sp_perm
 )
+if (spearman_raw - sp_perm < 0.1)
+  cat("\n*** the real model barely beats its permuted null: this column carries little signal ***\n")
+# Exported, so the heatmap can show every column's null rather than each render's log holding it.
+perm_metrics <- tibble(
+  metric = c("perm_spearman", "perm_oob_r2", "perm_margin"),
+  value  = c(sp_perm, rf_perm$r.squared, spearman_raw - sp_perm))
+rm(rf_perm, perm_args)
 ```
 
 ```{r cross_validation, eval = isTRUE(params$run_cv)}
@@ -1210,20 +1310,28 @@ p_fit <- tibble(obs = test_data$y, pred = pred_t) %>%
   annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
            label = sprintf("Spearman = %.3f\nPearson = %.3f\nn = %d",
                            spearman_raw, pearson_raw, nrow(test_data))) +
-  labs(x = "observed TE LFC, log2(sictrl / si3d)", y = "predicted",
+  # Derived, not typed. .dir_ratio is built from params in the direction_facts chunk; hardcoding
+  # "si3d" here put the wrong knockdown on every si3e figure, and the sibling legend below put
+  # the wrong CONDITION on the normoxia figure. Same failure as the directional prose: a label
+  # that does not come from the data will eventually disagree with it.
+  labs(x = paste0("observed TE LFC, ", .dir_ratio), y = "predicted",
        title = "(a) Held-out fit",
        subtitle = sprintf("%d features | transform: %s", length(feature_cols),
                           params$target_transform)) +
   theme_classic(base_size = 11)
 
+# The legend name for the positive class, built from params rather than written out. CLAUDE.md's
+# group_colors block uses the literal "eIF3d hypoxia promotes"; copying that string verbatim is
+# what put "hypoxia" on the normoxia figure.
+pos_label_txt <- sprintf("%s %s %s", .dir_gene, params$condition, params$direction)
 p_sep <- br %>% filter(!is.na(lab_geneset)) %>%
-  mutate(cls = if_else(lab_geneset == 1, "eIF3d hypoxia promotes", "Negative control")) %>%
+  mutate(cls = if_else(lab_geneset == 1, pos_label_txt, "Negative control")) %>%
   ggplot(aes(pred, fill = cls, colour = cls)) +
   geom_density(alpha = 0.15, linewidth = 0.8) +
-  scale_fill_manual(values = c("eIF3d hypoxia promotes" = "#E69F00",
-                              "Negative control" = "black"), name = NULL) +
-  scale_colour_manual(values = c("eIF3d hypoxia promotes" = "#E69F00",
-                                 "Negative control" = "black"), name = NULL) +
+  scale_fill_manual(values = setNames(c("#E69F00", "black"),
+                                      c(pos_label_txt, "Negative control")), name = NULL) +
+  scale_colour_manual(values = setNames(c("#E69F00", "black"),
+                                        c(pos_label_txt, "Negative control")), name = NULL) +
   annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
            label = sprintf("bridge AUC = %.3f\nceiling = %.3f\nn = %d / %d",
                            bridge$auc[1], bridge$ceiling[1], bridge$n_pos[1], bridge$n_neg[1])) +
@@ -1505,6 +1613,7 @@ perf <- bind_rows(
                "matched_gene_auc", "n_matched_genes"),
     value  = c(bridge$auc[1], bridge$ceiling[1], bridge$auc[2], bridge$ceiling[2],
                bridge$n_pos[1], bridge$n_neg[1], matched_auc, n_matched)) else NULL,
+  if (exists("perm_metrics")) perm_metrics else NULL,
   tibble(metric = "split_seed", value = SPLIT_SEED),
   tibble(metric = "forest_seed", value = FOREST_SEED)
 )

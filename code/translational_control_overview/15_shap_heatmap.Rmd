@@ -6,12 +6,13 @@ output:
   html_document:
     code_folding: hide
 params:
-  experiments: "si3d hypoxia 1hr=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  experiments: "MDA-MB-231 si3d hypoxia 1hr=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3d hypoxia 4hr=eif33d_promotes_hypoxia_4hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3d hypoxia 24hr=eif33d_promotes_hypoxia_24hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3d normoxia 1+4hr=eif33d_promotes_normoxia_1and4hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3e hypoxia 1hr=eif33e_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3e hypoxia 4hr=eif33e_promotes_hypoxia_4hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3e hypoxia 24hr=eif33e_promotes_hypoxia_24hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw;MDA-MB-231 si3e normoxia 1+4hr=eif33e_promotes_normoxia_1and4hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
   floor_preset: "transform"
   floor_arm: "raw"
   corr_threshold: 0.8
   reduced_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_reduced_corrected_both_clipaggregate_yraw"
   save_plots: TRUE
+  out_tag: ""
 editor_options:
   chunk_output_type: console
 ---
@@ -35,6 +36,9 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 It builds the SHAP heatmap this whole fork exists to produce: **features as rows, experiments as
 columns**, from the random-forest regression's SHAP values.
+
+Every column here is **MDA-MB-231** cells, eIF3d knockdown (si3d) against siCTRL. The contrast is
+log2(sictrl / si3d), so a positive outcome means eIF3d promotes that transcript's translation.
 
 Right now it has **one column**. Everything is written so that adding an experiment is one entry
 in the `experiments` param and nothing else changes.
@@ -60,6 +64,7 @@ in the `experiments` param and nothing else changes.
 library(tidyverse)
 library(here)
 library(pheatmap)
+library(grid)      # grid.newpage / grid.draw, for drawing a captured pheatmap gtable
 ```
 
 ```{r load}
@@ -93,9 +98,50 @@ stopifnot("no SHAP outputs found for any experiment" = nrow(long) > 0)
 per_exp <- long %>% count(experiment, name = "n_features")
 print(as.data.frame(per_exp), row.names = FALSE)
 if (nrow(exps) > 1) {
+  # Identical feature SETS, not merely identical counts. Two experiments could each have 69
+  # features and not the same 69, in which case a row would mean different things in different
+  # columns and the whole comparison would be silently wrong.
   sets <- split(long$feature, long$experiment)
   stopifnot("experiments do not share a feature set - rows would not be comparable" =
               length(unique(map(sets, sort))) == 1)
+  # The same applies to the genes behind each column: the shares are computed over whatever
+  # transcripts that contrast could score, so a column built on a different gene population is
+  # not comparable even with identical features.
+  gene_counts <- map_dbl(exps$suffix, function(sf) {
+    f <- file.path(out_dir, paste0("rfreg_performance_", sf, ".csv"))
+    if (!file.exists(f)) return(NA_real_)
+    d <- read_csv(f, show_col_types = FALSE); d$value[d$metric == "n_genes"][1]
+  })
+  names(gene_counts) <- exps$label
+  print(gene_counts)
+  stopifnot("columns were built on different numbers of genes - shares are not comparable" =
+              length(unique(na.omit(gene_counts))) == 1)
+  # Every suffix must be distinct, or two columns are the same run under two labels.
+  stopifnot("two experiments resolve to the same suffix" = !any(duplicated(exps$suffix)))
+
+  # Identical GENE sets, not just identical counts. Two contrasts could each score 10,172
+  # transcripts and not the same 10,172, in which case the shares are computed over different
+  # populations and the columns are not comparable even with identical features.
+  gene_sets <- map(exps$suffix, function(sf) {
+    f <- file.path(out_dir, paste0("rfreg_predictions_", sf, ".csv"))
+    if (!file.exists(f)) return(NULL)
+    sort(read_csv(f, show_col_types = FALSE)$gene_id_clean)
+  })
+  names(gene_sets) <- exps$label
+  gene_sets <- compact(gene_sets)
+  if (length(gene_sets) > 1) {
+    same <- length(unique(gene_sets)) == 1
+    if (!same) {
+      base <- gene_sets[[1]]
+      for (nm in names(gene_sets)[-1])
+        cat(sprintf("  %s differs from %s by %d genes\n", nm, names(gene_sets)[1],
+                    length(setdiff(union(base, gene_sets[[nm]]),
+                                   intersect(base, gene_sets[[nm]])))))
+    }
+    stopifnot("columns were built on different GENE SETS - shares are not comparable" = same)
+    cat(sprintf("gene-set identity: all %d columns share the same %d genes\n",
+                length(gene_sets), length(gene_sets[[1]])))
+  }
 }
 stopifnot("shares do not sum to 100 within an experiment" =
             all(abs(tapply(long$share, long$experiment, sum) - 100) < 1e-6))
@@ -106,10 +152,33 @@ read_perf <- function(label, suffix) {
   if (!file.exists(f)) return(tibble(experiment = label, auc = NA_real_, spearman = NA_real_))
   d <- read_csv(f, show_col_types = FALSE)
   g <- function(k) { v <- d$value[d$metric == k]; if (length(v)) v[1] else NA_real_ }
-  tibble(experiment = label, auc = g("bridge_auc_geneset"), spearman = g("spearman_raw_y"))
+  # An AUC computed against a handful of held-out positives is not a measurement. si3d hypoxia
+  # 24hr puts ONE positive gene in its test split. Record it, but do not display it as though it
+  # were comparable to a column with 294.
+  np <- g("bridge_n_pos")
+  tibble(experiment = label, auc = g("bridge_auc_geneset"), spearman = g("spearman_raw_y"),
+         bridge_n_pos = np,
+         auc_usable = !is.na(np) && np >= 20)
 }
 perf <- pmap_dfr(list(exps$label, exps$suffix), read_perf)
+# The outcome's own spread per column. Shares are ratios within a run and so are unaffected by
+# it, but raw SHAP is in log2 TE units and is NOT comparable when these differ - which they do,
+# by several fold across these contrasts. This table is why the heatmap plots share_pct.
+spread <- pmap_dfr(list(exps$label, exps$suffix), function(l, sf) {
+  f <- file.path(out_dir, paste0("rfreg_performance_", sf, ".csv"))
+  if (!file.exists(f)) return(tibble(experiment = l))
+  d <- read_csv(f, show_col_types = FALSE)
+  g <- function(k) { v <- d$value[d$metric == k]; if (length(v)) v[1] else NA_real_ }
+  tibble(experiment = l, n_genes = g("n_genes"), n_features = g("n_features"),
+         outcome_median = g("target_median"), outcome_mad = g("target_mad"))
+})
+perf <- perf %>% left_join(spread, by = "experiment")
 print(as.data.frame(perf %>% mutate(across(where(is.numeric), ~ round(., 4)))), row.names = FALSE)
+if (sum(!is.na(perf$outcome_mad)) > 1)
+  cat(sprintf("\noutcome MAD ranges %.3f to %.3f across columns, a %.1f-fold difference.\n",
+              min(perf$outcome_mad, na.rm = TRUE), max(perf$outcome_mad, na.rm = TRUE),
+              max(perf$outcome_mad, na.rm = TRUE) / min(perf$outcome_mad, na.rm = TRUE)),
+      "Shares are comparable because they are within-run ratios; raw SHAP would not be.\n")
 
 # Column annotation: the AUC bridge, and the held-out Spearman beside it. The colour bars give
 # the at-a-glance comparison once there are several columns.
@@ -120,10 +189,66 @@ anno_col <- perf %>%
 # pheatmap cannot print text inside an annotation bar, so the numbers go into the column label
 # instead. That puts them immediately above their own colour bars, which is where they are
 # wanted: the colour says how this column compares, the number says what it actually was.
+# AUC only where the classifier bridge was run (si3d). Spearman is the regression's own metric
+# and is shown for every column.
+perf$auc[!perf$auc_usable %in% TRUE] <- NA_real_   # underpowered AUCs are not shown
 col_labels <- setNames(
-  sprintf("%s\nAUC %.3f\nrho %.3f", perf$experiment, perf$auc, perf$spearman),
+  ifelse(is.na(perf$auc),
+         sprintf("%s\nrho %.3f", perf$experiment, perf$spearman),
+         sprintf("%s\nAUC %.3f   rho %.3f", perf$experiment, perf$auc, perf$spearman)),
   perf$experiment)
 lab_for <- function(m) unname(col_labels[colnames(m)])
+
+# Did every column's SHAP decomposition actually close? 11_ asserts it per run, but a heatmap
+# that puts eight runs side by side should confirm it for all of them at the point of comparison.
+qc <- map_dfr(seq_len(nrow(exps)), function(i) {
+  f <- file.path(out_dir, paste0("shapreg_qc_", exps$suffix[i], ".csv"))
+  if (!file.exists(f)) return(tibble(experiment = exps$label[i], closure_sd = NA_real_))
+  read_csv(f, show_col_types = FALSE) %>% mutate(experiment = exps$label[i])
+})
+if (any(!is.na(qc$closure_sd))) {
+  cat("\nSHAP closure per column (must be ~0; 11_ asserts < 1e-8):\n")
+  print(as.data.frame(qc %>% dplyr::select(experiment, n_features, explain_n,
+                                           baseline, closure_sd, units) %>%
+    mutate(across(c(baseline), ~ round(., 5)))), row.names = FALSE)
+  stopifnot("a column's SHAP decomposition did not close" =
+              all(qc$closure_sd[!is.na(qc$closure_sd)] < 1e-8))
+  # Units must match, or the shares were computed from differently-scaled SHAP.
+  stopifnot("columns were built with different target transforms" =
+              length(unique(na.omit(qc$target_transform))) <= 1)
+}
+
+# Two diagnostics that decide whether a column should be read at all.
+diag_tbl <- perf %>%
+  mutate(weak_model = spearman < 0.2,
+         auc_meaningful = !is.na(auc))
+if (any(diag_tbl$weak_model, na.rm = TRUE)) {
+  cat("\n*** WEAK COLUMNS: test Spearman < 0.2, so the model found little to learn. Their SHAP\n")
+  cat("    is attribution of near-noise and must not be read like an informative column: ***\n")
+  for (l in diag_tbl$experiment[which(diag_tbl$weak_model)])
+    cat(sprintf("      %s (Spearman %.3f)\n", l, diag_tbl$spearman[diag_tbl$experiment == l]))
+}
+under <- perf %>% filter(!is.na(bridge_n_pos), bridge_n_pos < 20)
+if (nrow(under)) {
+  cat("\nAUC suppressed as underpowered (fewer than 20 held-out positives):\n")
+  for (i in seq_len(nrow(under)))
+    cat(sprintf("      %s (%d positives)\n", under$experiment[i], under$bridge_n_pos[i]))
+}
+if (any(!diag_tbl$auc_meaningful)) {
+  cat("\nColumns with no AUC: the bridge compares against notebook 02's classifier gene sets,\n")
+  cat("which exist only for si3d. For si3e no classifier comparison is wanted, and a fixed LFC\n")
+  cat("cut would be degenerate there anyway - si3e normoxia 1+4hr has median te_lfc +0.619, so\n")
+  cat("te_lfc > 0.5 selects about half the transcriptome. That is the case the regression exists\n")
+  cat("to handle: the continuous outcome needs no threshold. Spearman is the metric for those.\n")
+  for (l in diag_tbl$experiment[!diag_tbl$auc_meaningful]) cat(sprintf("      %s\n", l))
+}
+
+# Output paths carry out_tag, so rendering a second feature set (e.g. the intrinsic-only model)
+# writes alongside the first instead of overwriting it. Without this the 57-feature run would
+# silently replace the 69-feature figures.
+TAG <- if (nzchar(params$out_tag)) paste0("_", params$out_tag) else ""
+tagf <- function(stem, ext) paste0(stem, TAG, ".", ext)
+cat("output tag:", ifelse(nzchar(TAG), TAG, "(none, default feature set)"), "\n")
 
 ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
 ```
@@ -161,9 +286,78 @@ corr_group <- if (file.exists(clus_path)) {
 cat("correlated-cluster grouping available:", !is.null(corr_group), "\n")
 ```
 
+# 0. What is in these models, and what was excluded
+
+```{r exclusion_criteria}
+# Stated explicitly and derived from the data, so a reader of the figure knows what the columns
+# were built from without having to reconstruct it from a param string.
+ann_all <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+modelled <- sort(unique(long$feature))
+candidate <- ann_all %>% filter(block %in% c("intrinsic", "external"), !deprecated,
+                                variant %in% c("single", "corrected"))
+excluded <- candidate %>% filter(!feature %in% modelled) %>%
+  dplyr::select(feature, family, block)
+
+cat(sprintf("features modelled in every column: %d\n", length(modelled)))
+cat(sprintf("blocks represented: %s\n",
+            paste(sort(unique(ann_all$block[match(modelled, ann_all$feature)])), collapse = ", ")))
+
+if (nrow(excluded)) {
+  cat(sprintf("\nEXCLUDED from these models: %d features\n\n", nrow(excluded)))
+  ex_ext <- excluded %>% filter(block == "external")
+  if (nrow(ex_ext)) {
+    cat("  External measurements - data from other experiments, not computable from the\n")
+    cat("  transcript sequence. Excluded so the model rests on intrinsic information only:\n")
+    for (fam in sort(unique(ex_ext$family))) {
+      fs <- ex_ext$feature[ex_ext$family == fam]
+      cat(sprintf("    %-20s %s\n", fam, paste(fs, collapse = ", ")))
+    }
+  }
+  ex_int <- excluded %>% filter(block != "external")
+  if (nrow(ex_int)) {
+    cat("\n  Other exclusions:\n")
+    for (i in seq_len(nrow(ex_int)))
+      cat(sprintf("    %-34s (%s, %s)\n", ex_int$feature[i], ex_int$family[i], ex_int$block[i]))
+  }
+  cat("\n  Note on what was KEPT: several retained features are computed from the sequence but\n")
+  cat("  use weight tables estimated elsewhere - csc_internal (mRNA half-lives), cai/fop\n")
+  cat("  (reference gene sets), tai_gtrnadb (tRNA gene copy number), g4mer_* (a model trained\n")
+  cat("  on rG4-seq), noderer_tis_efficiency (FACS-seq), term_readthrough_cridge (a published\n")
+  cat("  192-context lookup). These are sequence features with external weights, not external\n")
+  cat("  measurements of these transcripts, which is the line drawn here.\n")
+} else {
+  cat("\nNo features excluded: these columns use the full candidate set.\n")
+}
+
+# Known gap, so it is visible in the report rather than only in a note.
+if (!any(grepl("minus9|context_m9", modelled)))
+  cat("\n  KNOWN GAP: termination_context_minus9, the one collaborator feature never built,\n",
+      " is absent from the matrix entirely. It is pure sequence and belongs in an\n",
+      " intrinsic-only model; building it requires returning to 01_ and the genome.\n")
+```
+
 # 1. Individual features
 
 ```{r fig_features, fig.width = 7, fig.height = 13}
+# pheatmap has two failure modes when you want the figure BOTH inline and on disk, and this
+# hits both. Re-drawing inside pdf() after an on-screen draw writes a blank page (163 bytes on a
+# minimal example), because the second grid draw does not get a fresh page. And pheatmap's own
+# filename= closes the active device - measured, device 2 becomes 3 - which clobbers knitr's and
+# silently kills every inline figure after it.
+#
+# Capturing the gtable ONCE with silent = TRUE and drawing it twice avoids both: the device
+# survives, the inline figure is captured, and the file is a real figure.
+draw_and_save <- function(args, fname = NULL, width = 7, height = NULL) {
+  ph <- do.call(pheatmap, c(args, list(silent = TRUE)))
+  grid.newpage(); grid.draw(ph$gtable)
+  if (!is.null(fname) && isTRUE(params$save_plots)) {
+    if (is.null(height)) height <- max(4, 0.17 * nrow(args$mat) + 2)
+    pdf(file.path(here("plots"), fname), width = width, height = height)
+    grid.newpage(); grid.draw(ph$gtable); dev.off()
+  }
+  invisible(ph)
+}
+
 mat_of <- function(d, row, val = "share") {
   d %>% dplyr::select(all_of(c(row, "experiment", val))) %>%
     pivot_wider(names_from = experiment, values_from = all_of(val)) %>%
@@ -202,18 +396,14 @@ pheat <- function(m, main, annor, annoc = NULL, signed = FALSE, fname = NULL, ..
                display_numbers = ncol(m) <= 3, number_format = "%.1f", fontsize_number = 7,
                labels_col = lab_for(m),
                fontsize_row = 8, fontsize_col = 9, cellwidth = 42, main = main, ...)
-  do.call(pheatmap, args)
-  if (!is.null(fname) && isTRUE(params$save_plots)) {
-    pdf(file.path(here("plots"), fname), width = 7, height = max(4, 0.17 * nrow(m) + 2))
-    do.call(pheatmap, args); dev.off()
-  }
+  draw_and_save(args, fname)
 }
 
 pheat(M, sprintf("SHAP share (%%) per feature, %d experiment%s",
                  ncol(M), if (ncol(M) == 1) "" else "s"),
       anno_row, list(family = fam_cols,
                      `direction repeats` = c(reproducible = "grey85", flips = "#CC79A7")),
-      fname = "15_heatmap_features_magnitude.pdf")
+      fname = tagf("15_heatmap_features_magnitude", "pdf"))
 cat(sprintf("\n%d features | top: %s (%.2f%%) | bottom: %s (%.2f%%)\n",
             nrow(M), rownames(M)[1], M[1, 1], rownames(M)[nrow(M)], M[nrow(M), 1]))
 cat(sprintf("the top 10 features carry %.1f%% of the total\n", sum(M[1:10, 1])))
@@ -249,7 +439,8 @@ comb_args <- list(
   annotation_colors = list(family = fam_cols,
                            `direction repeats` = c(reproducible = "grey85", flips = "#CC79A7")),
   # The printed number is the SHARE, not the value being coloured.
-  display_numbers = round(M[rownames(Md), , drop = FALSE], 1),
+  # Printed shares stop being legible past about four columns.
+  display_numbers = if (ncol(Md) <= 4) round(M[rownames(Md), , drop = FALSE], 1) else FALSE,
   fontsize_number = 7, number_color = "black",
   labels_col = lab_for(Md),
   # A feature whose SHAP values are effectively constant has no defined direction - the
@@ -258,12 +449,7 @@ comb_args <- list(
   na_col = "grey88",
   fontsize_row = 8, fontsize_col = 9, cellwidth = 46,
   main = "Colour = direction (vermillion up, blue down, grey undefined)\nNumber = SHAP share (%), rows ordered by it")
-do.call(pheatmap, comb_args)
-if (isTRUE(params$save_plots)) {
-  pdf(here("plots", "15_heatmap_features_combined.pdf"),
-      width = 7.5, height = max(4, 0.17 * nrow(Md) + 2))
-  do.call(pheatmap, comb_args); dev.off()
-}
+draw_and_save(comb_args, tagf("15_heatmap_features_combined", "pdf"), width = 7.5)
 
 n_na <- sum(is.na(Md[, 1]))
 cat(sprintf("\ndirection: %d push UP, %d push DOWN, %d undefined\n",
@@ -287,8 +473,10 @@ if (nrow(disc)) {
   cat("\nabove-median share but weak direction - the model uses these without a consistent sign:\n")
   print(as.data.frame(disc %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
 }
-cat("\nWith many columns the printed numbers get cramped; the magnitude-only panel above\n")
-cat("remains the one to read at that point.\n")
+if (ncol(Md) > 4) {
+  cat("\nNOTE: with", ncol(Md), "columns the per-cell numbers are suppressed and this panel is\n")
+  cat("direction only. The magnitude-only panel above is the one to read for size.\n")
+}
 ```
 
 # 2. Grouped by family
@@ -306,12 +494,25 @@ annof <- if (!is.null(fam_floor)) {
 } else NULL
 pheat(Mf, sprintf("SHAP share (%%) per family, %d experiment%s",
                   ncol(Mf), if (ncol(Mf) == 1) "" else "s"),
-      annof, NULL, fname = "15_heatmap_family_magnitude.pdf")
+      annof, NULL, fname = tagf("15_heatmap_family_magnitude", "pdf"))
 # A family's direction is the share-weighted mean of its members' correlations. When members
 # disagree this moves toward 0 and the cell goes white, which is the honest reading: the family
 # has no single direction.
+# na.rm is required, not optional. is_dap5_repressed has an UNDEFINED shap_value_cor - its SHAP
+# is effectively constant (mean |SHAP| 3e-06), so the correlation has no value rather than a
+# value of zero - and without na.rm that single member made the whole dap5 family NA, rendering
+# it grey in every column. Dropping the undefined members and reporting how many were dropped is
+# the honest handling: the family still has a direction, computed from the members that have one.
 fam_dir <- long %>% group_by(experiment, family) %>%
-  summarise(direction = weighted.mean(direction, share), .groups = "drop")
+  summarise(direction = if (all(is.na(direction))) NA_real_ else
+                        weighted.mean(direction, share, na.rm = TRUE),
+            n_undefined = sum(is.na(direction)), .groups = "drop")
+nd <- fam_dir %>% filter(n_undefined > 0) %>% distinct(family, n_undefined)
+if (nrow(nd)) {
+  cat("\nfamilies containing a feature with no defined direction (excluded from the weighted mean):\n")
+  for (i in seq_len(nrow(nd)))
+    cat(sprintf("   %-20s %d of its members\n", nd$family[i], nd$n_undefined[i]))
+}
 Mfd <- mat_of(fam_dir, "family", "direction")[rownames(Mf), , drop = FALSE]
 fd_args <- list(mat = Mfd,
   color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
@@ -321,11 +522,7 @@ fd_args <- list(mat = Mfd,
   labels_col = lab_for(Mfd),
   fontsize_row = 9, fontsize_col = 9, cellwidth = 42,
   main = "Family direction (share-weighted)\nwhite = members disagree")
-do.call(pheatmap, fd_args)
-if (isTRUE(params$save_plots)) {
-  pdf(here("plots", "15_heatmap_family_direction.pdf"), width = 6.5, height = 5)
-  do.call(pheatmap, fd_args); dev.off()
-}
+draw_and_save(fd_args, tagf("15_heatmap_family_direction", "pdf"), width = 6.5, height = 5)
 mixed <- tibble(family = rownames(Mfd), dir = Mfd[, 1]) %>% filter(abs(dir) < 0.5)
 if (nrow(mixed)) {
   cat("\nfamilies with no single direction (members disagree):\n")
@@ -356,7 +553,7 @@ anno_c <- cg_long %>% distinct(group, n, families) %>%
 anno_c <- anno_c[rownames(Mc), , drop = FALSE]
 pheat(Mc, sprintf("SHAP share (%%) per correlated cluster (|rho| >= %.1f)", params$corr_threshold),
       anno_c, list(size = c(grouped = "#D55E00", single = "grey85")),
-      fname = "15_heatmap_cluster_magnitude.pdf")
+      fname = tagf("15_heatmap_cluster_magnitude", "pdf"))
 
 cat("\nmulti-feature clusters, and what each recovers:\n")
 print(as.data.frame(cg_long %>% filter(n > 1) %>% arrange(desc(share)) %>%
@@ -479,12 +676,7 @@ r_args <- list(mat = Mr,
   labels_col = lab_for(Mr),
   fontsize_row = 8, fontsize_col = 9, cellwidth = 42,
   main = sprintf("Reduced model: %d features, one per correlated cluster", nrow(Mr)))
-do.call(pheatmap, r_args)
-if (isTRUE(params$save_plots)) {
-  pdf(here("plots", "15_heatmap_reduced_magnitude.pdf"), width = 7,
-      height = max(4, 0.17 * nrow(Mr) + 2))
-  do.call(pheatmap, r_args); dev.off()
-}
+draw_and_save(r_args, tagf("15_heatmap_reduced_magnitude", "pdf"), width = 7)
 
 Mrd <- red %>% transmute(feature, !!exps$label[1] := dir_red) %>%
   column_to_rownames("feature") %>% as.matrix()
@@ -493,12 +685,7 @@ rd_args <- modifyList(r_args, list(mat = Mrd,
   color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
   breaks = seq(-1, 1, length.out = 102), number_format = "%.2f",
   main = "Reduced model: direction"))
-do.call(pheatmap, rd_args)
-if (isTRUE(params$save_plots)) {
-  pdf(here("plots", "15_heatmap_reduced_direction.pdf"), width = 7,
-      height = max(4, 0.17 * nrow(Mrd) + 2))
-  do.call(pheatmap, rd_args); dev.off()
-}
+draw_and_save(rd_args, tagf("15_heatmap_reduced_direction", "pdf"), width = 7)
 ```
 
 # 6. Adding the next experiment
@@ -521,16 +708,16 @@ cat("    gene count and outcome spread, so it does not transfer between experime
 
 ```{r export}
 source(here("code", "translational_control_overview", "10_regression_presets.R"))
-if (exists("cmp")) reg_write_csv(cmp, file.path(out_dir, "shapreg_heatmap_reduced_vs_full.csv"))
-if (exists("grp")) reg_write_csv(grp, file.path(out_dir, "shapreg_heatmap_cluster_recovery.csv"))
+if (exists("cmp")) reg_write_csv(cmp, file.path(out_dir, tagf("shapreg_heatmap_reduced_vs_full", "csv")))
+if (exists("grp")) reg_write_csv(grp, file.path(out_dir, tagf("shapreg_heatmap_cluster_recovery", "csv")))
 reg_write_csv(long %>% mutate(signed = share * sign(direction)),
-              file.path(out_dir, "shapreg_heatmap_long.csv"))
+              file.path(out_dir, tagf("shapreg_heatmap_long", "csv")))
 reg_write_csv(as_tibble(M, rownames = "feature"),
-              file.path(out_dir, "shapreg_heatmap_features.csv"))
+              file.path(out_dir, tagf("shapreg_heatmap_features", "csv")))
 reg_write_csv(as_tibble(Mf, rownames = "family"),
-              file.path(out_dir, "shapreg_heatmap_family.csv"))
+              file.path(out_dir, tagf("shapreg_heatmap_family", "csv")))
 if (!is.null(corr_group))
   reg_write_csv(as_tibble(Mc, rownames = "group"),
-                file.path(out_dir, "shapreg_heatmap_cluster.csv"))
+                file.path(out_dir, tagf("shapreg_heatmap_cluster", "csv")))
 cat("Wrote the heatmap matrices in long and wide form.\n")
 ```
