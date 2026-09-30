@@ -1,0 +1,299 @@
+---
+title: "Herrmannova HeLa outcome prep: eIF3d / eIF3e TE, oriented control over knockdown"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  xlsx: "accessories/herrmannova elife riboseq/elife-95846-supp1-v1.xlsx"
+  matrix_rds: "feature_matrix_tco.rds"
+  lfc: "0.5"
+  neg_lfc: "0.5"
+  neg_padj: "0.3"
+  min_xcell_rho: 0.05
+  min_xcell_sep: 0.03
+  write_outputs: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10h_herrmannova_outcome_prep.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Turns Herrmannova et al. (*eLife* 2024, 95846) ribosome profiling of eIF3d and eIF3e knockdowns in
+**HeLa** into outcome files that `10_rf_regression.Rmd` can model exactly like an MDA-MB-231 or
+MCF7-SIX1 contrast, so the two knockdowns can become columns in the SHAP heatmap.
+
+The paper reports log2(knockdown / non-targeting). Every value is **negated once, here**, so the
+written `te_lfc` / `rna_lfc` are log2(control / knockdown) - the orientation of our own
+MDA-MB-231 files - and positive means the factor **promotes**. eIF3h is in the source but not
+carried forward.
+
+**Decisions**
+
+- Verify the table against the paper before using it: the published DTEG counts, split by
+  direction, and the paper's own padj < 0.05 sheets must be reproduced exactly.
+- Keep only genes DESeq2 actually tested (non-NA padj). Genes removed by independent filtering
+  have an unshrunk, low-count fold change that is mostly noise.
+- Pin the sign three independent ways: each factor's own mRNA, the paper's down/up split, and a
+  rank correlation with the matched MDA-MB-231 normoxia contrast. The last is the only one built
+  on data outside this file, and it is shown to fail on the un-negated values.
+- Gene-level only. The paper reports no transcripts, so the model will use MDA-MB-231's dominant
+  isoform for each gene; HeLa's isoforms are unknown.
+- Name the outputs by the project's convention (`translation_categories_si{g}_vs_sictrl_*`),
+  including its known wart: the filename states the ratio backwards, the contents are
+  control over knockdown. `condition = hela_normoxia`, `timepoint = steadystate` (a knockdown
+  at steady state, not a hypoxia time course).
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+```
+
+```{r paths}
+XLSX <- here(params$xlsx)
+OUT  <- here("output")
+stopifnot("Herrmannova supplement not found" = file.exists(XLSX))
+KD <- c(d = "3d", e = "3e")                       # sheet letter -> project gene code
+lfc_cut <- as.numeric(params$lfc)
+```
+
+# 1. Load
+
+The `all data` sheet carries four legend rows above the header; the `TE_*` sheets carry one.
+
+```{r load}
+all_data <- suppressWarnings(read_excel(XLSX, sheet = "all data", skip = 4))
+num_cols <- grep("log2FoldChange$|padj$", names(all_data), value = TRUE)
+all_data <- all_data %>% mutate(across(all_of(num_cols), ~ suppressWarnings(as.numeric(.x))))
+stopifnot(
+  "all data is not 17,520 genes - check the skip" = nrow(all_data) == 17520,
+  "all data is not 22 columns"                    = ncol(all_data) == 22,
+  "gene_id is not unique"                         = !any(duplicated(all_data$gene_id)),
+  "gene_id is versioned - expected bare ENSG"     = !any(grepl("\\.", all_data$gene_id))
+)
+col <- function(kind, k, what = "log2FoldChange") paste0(kind, "_", k, "_vs_nt.", what)
+cat("all data:", nrow(all_data), "genes\n")
+```
+
+# 2. Reproduce the paper
+
+## 2a. TE is footprints minus mRNA
+
+If this fails, the TE column being read is not TE.
+
+```{r te_identity}
+te_id <- map_dfr(names(KD), function(k) {
+  te <- all_data[[col("TE", k)]]; fp <- all_data[[col("FP", k)]]; mr <- all_data[[col("mRNA", k)]]
+  ok <- is.finite(te) & is.finite(fp) & is.finite(mr)
+  tibble(knockdown = paste0("eIF", KD[[k]]), n = sum(ok), max_abs_diff = max(abs(te - (fp - mr))[ok]))
+})
+knitr::kable(te_id)
+stopifnot("TE column is not FP - mRNA: wrong column" = all(te_id$max_abs_diff < 1e-6))
+```
+
+## 2b. The published DTEG counts, split by direction
+
+Herrmannova et al. report the number of differentially translated genes (TE padj < 0.05) per
+knockdown, and how many go down vs up. These are the paper's numbers, typed as the expected
+values of a replication check; the data are read from the file.
+
+```{r dteg_counts}
+PAPER_DTEG <- tribble(
+  ~k,  ~paper_total, ~paper_down, ~paper_up,
+  "d",        1971L,       1040L,      931L,
+  "e",        1180L,        622L,      558L
+)
+obs <- map_dfr(names(KD), function(k) {
+  lf <- all_data[[col("TE", k)]]; pa <- all_data[[col("TE", k, "padj")]]
+  sig <- !is.na(pa) & pa < 0.05 & !is.na(lf)
+  tibble(k = k, obs_total = sum(sig), obs_down = sum(sig & lf < 0), obs_up = sum(sig & lf > 0))
+})
+dteg <- left_join(PAPER_DTEG, obs, by = "k") %>% mutate(knockdown = paste0("eIF", KD[k]), .before = 1)
+knitr::kable(dteg %>% dplyr::select(-k))
+stopifnot("DTEG totals do not match the paper" = all(dteg$paper_total == dteg$obs_total),
+          "DTEG down counts do not match the paper" = all(dteg$paper_down == dteg$obs_down),
+          "DTEG up counts do not match the paper" = all(dteg$paper_up == dteg$obs_up))
+```
+
+## 2c. The paper's own filtered sheets are reproducible from `all data`
+
+```{r sheets}
+for (k in names(KD)) {
+  sh <- suppressWarnings(read_excel(XLSX, sheet = paste0("TE_", k, " padj 0.05"), skip = 1))
+  mine <- all_data$gene_id[!is.na(all_data[[col("TE", k, "padj")]]) &
+                             all_data[[col("TE", k, "padj")]] < 0.05]
+  stopifnot(setNames(list(setequal(mine, sh$gene_id)),
+                     paste0("TE_", k, " sheet is not reproducible from 'all data'"))[[1]])
+}
+cat("TE_d and TE_e padj < 0.05 sheets reproduced exactly from 'all data'\n")
+```
+
+# 3. Direction
+
+## 3a. Ruler one: each factor's own mRNA
+
+The siRNA destroys its own target, so in the source orientation (knockdown / control) EIF3D must
+be strongly negative in the eIF3d knockdown and flat in the eIF3e knockdown, and vice versa.
+
+```{r ruler_own}
+own <- map_dfr(names(KD), function(k) {
+  other <- setdiff(names(KD), k)
+  r <- all_data %>% filter(hgnc_symbol == paste0("EIF", toupper(KD[[k]])))
+  stopifnot("knockdown target missing or duplicated" = nrow(r) == 1)
+  tibble(target = r$hgnc_symbol, own_kd_mRNA = r[[col("mRNA", k)]],
+         other_kd_mRNA = r[[col("mRNA", other)]])
+})
+knitr::kable(own, digits = 2)
+stopifnot("a target is not depleted in its own knockdown" = all(own$own_kd_mRNA < -2),
+          "a target moves in the knockdown that does not target it" = all(abs(own$other_kd_mRNA) < 1))
+```
+
+## 3b. Negate, and keep the tested genes
+
+```{r negate}
+neg <- map(setNames(names(KD), KD), function(k) {
+  all_data %>%
+    transmute(gene_id, gene_id_clean = gene_id, symbol = hgnc_symbol,
+              # THE NEGATION. One place. Source is log2(KD / NT); written is log2(NT / KD).
+              te_lfc   = -.data[[col("TE", k)]],   te_padj   = .data[[col("TE", k, "padj")]],
+              rna_lfc  = -.data[[col("mRNA", k)]], rna_padj  = .data[[col("mRNA", k, "padj")]],
+              ribo_lfc = -.data[[col("FP", k)]],   ribo_padj = .data[[col("FP", k, "padj")]],
+              source_te_log2FoldChange = .data[[col("TE", k)]])
+})
+tested <- map(neg, ~ .x %>% filter(!is.na(te_lfc), !is.na(te_padj)))
+
+tco <- readRDS(here("output", "translational_control_overview", params$matrix_rds))
+desc <- imap_dfr(tested, function(d, g) tibble(
+  knockdown = paste0("eIF", g), tested = nrow(d),
+  untested_dropped = sum(!is.na(neg[[g]]$te_lfc)) - nrow(d),
+  in_matrix = sum(d$gene_id_clean %in% tco$gene_id_clean),
+  median = median(d$te_lfc), MAD = mad(d$te_lfc),
+  promotes = sum(d$te_lfc > lfc_cut & d$te_padj < 0.05)))
+knitr::kable(desc, digits = 3)
+
+# After negation the paper's "down" genes are exactly the positive significant ones.
+down_now <- map_int(names(KD), function(k) {
+  d <- tested[[KD[[k]]]]; sum(d$te_padj < 0.05 & d$te_lfc > 0)
+})
+stopifnot("after negation, the positive significant genes are not the paper's down genes" =
+            all(down_now == PAPER_DTEG$paper_down))
+own_after <- map_dbl(KD, function(g) tested[[g]] %>% filter(symbol == paste0("EIF", toupper(g))) %>% pull(rna_lfc))
+cat(sprintf("own-target rna_lfc after negation: %s (MDA-MB-231 EIF3D is about +2.9)\n",
+            paste(sprintf("EIF%s %+.2f", toupper(KD), own_after), collapse = ", ")))
+stopifnot("negated own-target rna_lfc must be strongly positive, as in our files" = all(own_after > 2))
+```
+
+## 3c. Ruler two: the matched MDA-MB-231 contrast
+
+eIF3d and eIF3e targets overlap between cell lines, so the negated HeLa TE must correlate
+**positively** with the same knockdown in MDA-MB-231 normoxia, and 231-defined targets must score
+above 231-defined negative controls on HeLa values. Both are also computed for the un-negated
+values, which must fail, so the check is shown to discriminate.
+
+```{r ruler_xcell}
+ref231 <- c(`3d` = "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv",
+            `3e` = "translation_categories_si3e_vs_sictrl_normoxia_1hr.csv")
+pos_of <- function(g) read_csv(here("output", "genesets",
+    paste0("hypoxia_", g, "_promotes_TE_1hr_lfc0.5.csv")), show_col_types = FALSE)$ensembl_gene
+neg_of <- function(g) read_csv(here("output", "predictive_modeling",
+    if (g == "3e") "negative_control_genes_si3e.csv" else "negative_control_genes.csv"),
+    show_col_types = FALSE) %>% mutate(gg = sub("[.].*", "", gene_id)) %>% pull(gg)
+
+xc <- map_dfr(KD, function(g) {
+  m <- tested[[g]] %>% filter(gene_id_clean %in% tco$gene_id_clean)
+  r <- read_csv(file.path(OUT, ref231[[g]]), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("[.].*", "", gene_id)) %>% dplyr::select(gene_id_clean, ref = te_lfc)
+  j <- inner_join(m, r, by = "gene_id_clean") %>% filter(is.finite(ref))
+  p <- pos_of(g); n <- setdiff(neg_of(g), p)
+  yp <- m$te_lfc[m$gene_id_clean %in% p]; yn <- m$te_lfc[m$gene_id_clean %in% n]
+  tibble(knockdown = paste0("eIF", g), ref = ref231[[g]], n_paired = nrow(j),
+         rho_negated = cor(j$te_lfc, j$ref, method = "spearman"),
+         rho_if_raw = -cor(j$te_lfc, j$ref, method = "spearman"),
+         n_pos = length(yp), n_neg = length(yn),
+         sep_negated = median(yp) - median(yn), sep_if_raw = -(median(yp) - median(yn)))
+})
+knitr::kable(xc, digits = 4)
+stopifnot(
+  "negated HeLa TE does not correlate positively with the matched 231 contrast - sign is wrong" =
+    all(xc$rho_negated > params$min_xcell_rho),
+  "231-defined targets do not score above 231 negative controls on HeLa values" =
+    all(xc$sep_negated > params$min_xcell_sep),
+  "the un-negated orientation would also have passed - the ruler does not discriminate" =
+    all(xc$rho_if_raw < 0) && all(xc$sep_if_raw < 0)
+)
+```
+
+# 4. Write
+
+```{r write_outcomes, eval = isTRUE(params$write_outputs)}
+dest <- function(g) paste0("translation_categories_si", g, "_vs_sictrl_hela_normoxia_steadystate.csv")
+for (g in KD) write_csv(tested[[g]] %>% dplyr::select(-gene_id_clean), file.path(OUT, dest(g)))
+
+# Read back and assert the file on disk is the negation of the source, gene for gene.
+chk <- map_dfr(names(KD), function(k) {
+  a <- read_csv(file.path(OUT, dest(KD[[k]])), show_col_types = FALSE)
+  j <- inner_join(a %>% dplyr::select(gene_id, te_lfc, rna_lfc),
+                  all_data %>% dplyr::select(gene_id, s_te = all_of(col("TE", k)),
+                                             s_rna = all_of(col("mRNA", k))), by = "gene_id")
+  tibble(file = dest(KD[[k]]), n = nrow(j), expected_n = nrow(tested[[KD[[k]]]]),
+         max_dev_te = max(abs(j$te_lfc + j$s_te)), max_dev_rna = max(abs(j$rna_lfc + j$s_rna), na.rm = TRUE),
+         signs_inverted = all(sign(j$te_lfc) == -sign(j$s_te)))
+})
+knitr::kable(chk)
+stopifnot("a written file lost or gained genes" = all(chk$n == chk$expected_n),
+          "a written file is not the negation of its source" =
+            all(chk$max_dev_te < 1e-12) && all(chk$max_dev_rna < 1e-12),
+          "a written file does not have every sign inverted" = all(chk$signs_inverted))
+```
+
+# 5. Gene sets for `10_`'s spot-check and AUC bridge
+
+Same rule as the MDA-MB-231 and MCF7-SIX1 sets: positives `te_lfc > 0.5 & padj < 0.05`,
+negative controls `|te_lfc| < 0.5 & padj > 0.3`.
+
+```{r write_genesets, eval = isTRUE(params$write_outputs)}
+gs <- map_dfr(KD, function(g) {
+  d <- tested[[g]]
+  nm <- paste0("hela_normoxia_", g, "_promotes_TE_steadystate_lfc", params$lfc)
+  p <- d %>% filter(te_lfc > lfc_cut, te_padj < 0.05) %>%
+    transmute(db_gene_symbol = symbol, ensembl_gene = gene_id_clean, te_lfc, te_padj,
+              gs_name = nm,
+              gs_description = paste0("genes whose translation eIF", g, " promotes in HeLa ",
+                "(Herrmannova 2024), te_lfc > ", params$lfc, " & padj < 0.05; te_lfc is ",
+                "log2(control / knockdown), negated from the paper's log2(KD / NT)"),
+              gs_source_species = "homo sapiens")
+  write_csv(p, here("output", "genesets", paste0(nm, ".csv")))
+  n <- d %>% filter(abs(te_lfc) < as.numeric(params$neg_lfc), te_padj > as.numeric(params$neg_padj)) %>%
+    transmute(gene_id, symbol, te_lfc, te_padj)
+  nn <- paste0("hela_normoxia_", g, "_negative_controls_lfc", params$neg_lfc, ".csv")
+  write_csv(n, here("output", "genesets", nn))
+  tibble(knockdown = paste0("eIF", g), positives = nrow(p), negatives = nrow(n),
+         pos_in_matrix = sum(p$ensembl_gene %in% tco$gene_id_clean))
+})
+knitr::kable(gs)
+stopifnot("a positive gene set is implausibly small" = all(gs$positives >= 50),
+          "a negative control set is smaller than its positive set" = all(gs$negatives > gs$positives))
+```
+
+```{r session}
+sessionInfo()
+```

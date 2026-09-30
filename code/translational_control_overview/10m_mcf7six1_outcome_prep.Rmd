@@ -1,0 +1,511 @@
+---
+title: "MCF7-SIX1 outcome prep: establishing the contrast direction once"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  mcf7_repo: "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+  matrix_rds: "feature_matrix_tco.rds"
+  lfc: "0.5"
+  neg_lfc: "0.5"
+  neg_padj: "0.3"
+  min_xcell_rho: 0.05
+  min_xcell_sep: 0.03
+  write_outputs: TRUE
+  flip_demo: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10m_mcf7six1_outcome_prep.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+MCF7-SIX1 translation-efficiency results live in a different repository and are computed in the
+**opposite orientation** from the MDA-MB-231 results this fork models. This notebook is the one
+place where that is corrected: it reads the four MCF7-SIX1 contrasts, proves their orientation
+three independent ways, negates them, and writes them out in the same shape and the same
+orientation as the 231 files.
+
+Everything downstream then reads a promotes-positive table and needs no flag. That is the point:
+a per-run `negate_outcome` switch has to be set correctly in every one of eight run
+configurations, and a single omission produces a column whose features are read backwards while
+every range check still passes. Here the negation happens once, next to the evidence for it.
+
+**Terms used below**
+
+- **promotes-positive** - the sign convention this project uses everywhere: a positive outcome
+  means the knockdown *lowered* the quantity, so the factor *promotes* it. The 231 files are
+  already promotes-positive; the MCF7-SIX1 files are not.
+- **the ruler** - an independent quantity used to check a sign, rather than the quantity being
+  checked. Three different rulers are used here, and they do not share a failure mode.
+- **cross-cell-line ruler** - the matched 231 contrast. Genuinely independent data, so it cannot
+  be fooled by an error made consistently inside the MCF7-SIX1 files.
+
+**Decisions**
+
+- Negate once, here, and write promotes-positive tables. No downstream notebook negates anything.
+- Write them under the same `translation_categories_si{gene}_vs_sictrl_{condition}_{timepoint}`
+  stem the 231 files use, with `condition = "mcf7six1_{hypoxia|normoxia}"`, so notebook `10_`
+  resolves them from params with no new code path and its contrast anchor still applies.
+- Keep the same filename wart the 231 files have: the name reads `si3d_vs_sictrl` and the column
+  is log2(sictrl / si3d). Matching the existing convention is worth more than fixing the name in
+  one corner of the project.
+- Verify orientation from the producing source code, not from the filename and not from a value
+  typed into this notebook.
+- Refuse to write anything if any orientation check fails.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+# 1. The four source contrasts
+
+```{r registry}
+MCF7 <- file.path(params$mcf7_repo, "counts")
+OUT  <- here("output")
+
+# gene / condition -> (source file, the notebook chunk that produced it, the matched 231 ruler)
+registry <- tribble(
+  ~gene, ~condition,  ~src,                     ~producer,              ~ref231,
+  "3d",  "hypoxia",   "hypoxia_si_ctrl_3d.csv", "5_hypoxicresponse.Rmd",
+     "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "3d",  "normoxia",  "normoxia_sictrl_3d.csv", "3_normoxia.Rmd",
+     "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv",
+  "3e",  "hypoxia",   "hypoxia_si_ctrl_3e.csv", "5_hypoxicresponse.Rmd",
+     "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv",
+  "3e",  "normoxia",  "normoxia_sictrl_3e.csv", "3_normoxia.Rmd",
+     "translation_categories_si3e_vs_sictrl_normoxia_1hr.csv"
+) %>%
+  mutate(kd_symbol = paste0("EIF", toupper(gene)),
+         other_kd  = paste0("EIF", toupper(if_else(gene == "3d", "3e", "3d"))),
+         dest      = paste0("translation_categories_si", gene, "_vs_sictrl_mcf7six1_",
+                            condition, "_1hr.csv"),
+         label     = paste0("si", gene, " ", condition))
+
+stopifnot("a source file is missing" = all(file.exists(file.path(MCF7, registry$src))),
+          "a producing notebook is missing" =
+            all(file.exists(file.path(params$mcf7_repo, "code", registry$producer))),
+          "a matched 231 ruler is missing" = all(file.exists(file.path(OUT, registry$ref231))))
+knitr::kable(registry %>% dplyr::select(label, src, producer, dest))
+```
+
+# 2. Ruler one: orientation parsed from the producing code
+
+The orientation is a property of how DESeq2 was called, so it is read out of the call rather than
+inferred from the output. For each contrast this finds the chunk that writes the file and checks
+four things: `treatment` is releveled so **siCTRL is the reference**, `library` is releveled so
+**RNA is the reference**, the design is the interaction model, and the coefficient extracted is
+the interaction term.
+
+With siCTRL and RNA as the references, that coefficient is
+log2 TE(knockdown) - log2 TE(siCTRL) = **log2(KD / siCTRL)** - the opposite of the 231
+convention. That is what makes negation necessary, and it is the only reason.
+
+**Decisions**
+
+- Parse the four facts rather than transcribing the conclusion. If the upstream analysis is ever
+  re-run with different reference levels, this check fires instead of silently inverting
+  every result in the heatmap.
+- Require all four. Any one of them alone is compatible with more than one orientation.
+
+```{r parse_orientation}
+parse_orientation <- function(producer, src) {
+  lines <- readLines(file.path(params$mcf7_repo, "code", producer), warn = FALSE)
+  w <- grep(paste0("write_csv\\(.*", src, "\"\\)"), lines, fixed = FALSE)
+  stopifnot("could not find the write_csv call that produces this file" = length(w) >= 1)
+  w <- w[length(w)]
+  h <- grep("^## ", lines[seq_len(w)])                 # nearest preceding section heading
+  stopifnot("could not find the enclosing section" = length(h) >= 1)
+  blk <- lines[h[length(h)]:w]
+
+  trt  <- grep("treatment\\s*<-\\s*relevel", blk, value = TRUE)
+  lib  <- grep("library\\s*<-\\s*relevel",   blk, value = TRUE)
+  des  <- grep("design\\s*=\\s*~",           blk, value = TRUE)
+  coef <- grep("results\\(.*resultsNames\\(.*\\)\\[[0-9]+\\]", blk, value = TRUE)
+
+  ref_of <- function(x) str_match(x[1], 'ref\\s*=\\s*"([^"]+)"')[, 2]
+  list(
+    trt_ref   = ref_of(trt),
+    lib_ref   = ref_of(lib),
+    design    = str_squish(str_replace(des[1], ".*design\\s*=\\s*", "")),
+    coef_idx  = as.integer(str_match(coef[1], "\\[([0-9]+)\\]")[, 2]),
+    shrunk    = any(grepl("lfcShrink", blk))
+  )
+}
+
+ori <- pmap_dfr(list(registry$producer, registry$src, registry$label), function(p, s, l) {
+  o <- parse_orientation(p, s)
+  tibble(label = l, treatment_ref = o$trt_ref, library_ref = o$lib_ref,
+         design = o$design, coef_index = o$coef_idx, lfcShrink = o$shrunk)
+})
+knitr::kable(ori)
+
+stopifnot(
+  "treatment is not releveled to siCTRL - the orientation assumed here no longer holds" =
+    all(ori$treatment_ref == "sictrl"),
+  "library is not releveled to RNA - the interaction term is not a TE contrast" =
+    all(ori$library_ref == "rna"),
+  "the design is not the treatment-by-library interaction model" =
+    all(str_detect(ori$design, "treatment\\s*\\+\\s*library\\s*\\+\\s*treatment:library")),
+  "the extracted coefficient is not the 4th, which is the interaction term" =
+    all(ori$coef_index == 4L)
+)
+cat("\nRULER 1 PASSED. With treatment ref = sictrl and library ref = rna, coefficient 4 of\n",
+    "~treatment + library + treatment:library is log2 TE(KD) - log2 TE(sictrl) = log2(KD/sictrl).\n",
+    "The 231 files are log2(sictrl/KD). Therefore: NEGATE.\n", sep = "")
+```
+
+# 3. Load, negate, and describe
+
+```{r load_negate}
+raw <- map(seq_len(nrow(registry)), function(i) {
+  read_csv(file.path(MCF7, registry$src[i]), show_col_types = FALSE)
+})
+names(raw) <- registry$label
+
+stopifnot("a source file lacks an expected column" =
+            all(map_lgl(raw, ~ all(c("gene_id", "symbol", "log2FoldChange", "padj",
+                                     "baseMean", "lfcSE") %in% names(.x)))),
+          "a source file has duplicated gene ids" =
+            all(map_lgl(raw, ~ !any(duplicated(sub("[.].*", "", .x$gene_id))))))
+
+# THE NEGATION. One line, one place.
+neg <- imap(raw, function(d, l) {
+  d %>% mutate(gene_id_clean = sub("[.].*", "", gene_id),
+               te_lfc  = -log2FoldChange,      # promotes-positive, matching 231
+               te_padj = padj)
+})
+
+desc <- imap_dfr(neg, function(d, l) tibble(
+  contrast = l, n = nrow(d),
+  median = median(d$te_lfc, na.rm = TRUE), MAD = mad(d$te_lfc, na.rm = TRUE),
+  min = min(d$te_lfc, na.rm = TRUE), max = max(d$te_lfc, na.rm = TRUE),
+  sig = sum(d$te_padj < 0.05, na.rm = TRUE)))
+knitr::kable(desc, digits = 4)
+
+cat("\nThe medians sit at zero, unlike the 231 contrasts (+0.11 to +0.52). The 231 libraries are\n",
+    "spike-in normalised and the knockdown lowers total mRNA per cell, which shifts their TE\n",
+    "median up; these are not spike-in normalised. It is a location difference, and a\n",
+    "variance-splitting forest is invariant to location and scale, so it does not affect SHAP\n",
+    "shares or ranks (measured in 10d_target_scale_analysis.Rmd). It does mean the raw MAD\n",
+    "differs between cell lines, so raw SHAP magnitudes are not comparable across them - shares\n",
+    "are, and shares are what the heatmap shows.\n", sep = "")
+```
+
+# 4. Ruler two: the depleted factor's own TE, with specificity
+
+Each file should show its *own* target moving, and the other factor moving less. This is a weak
+ruler on its own - it says the right experiment was loaded rather than which way it points - but
+it is the one that would catch two files having been swapped.
+
+**Decisions**
+
+- Check specificity, not just magnitude. "EIF3D is significant" is true in most of these files;
+  "EIF3D moves more than EIF3E in the si3d file" is the statement with content.
+- Read this ruler in the *raw* orientation, before negation, so it describes the source file.
+
+```{r ruler_kd}
+kd <- pmap_dfr(list(seq_len(nrow(registry))), function(i) {
+  d <- raw[[registry$label[i]]]
+  own_row <- d %>% filter(symbol == registry$kd_symbol[i])
+  oth_row <- d %>% filter(symbol == registry$other_kd[i])
+  stopifnot("a knockdown target gene is absent from its own file" = nrow(own_row) == 1,
+            "the other factor is absent from the file" = nrow(oth_row) >= 1)
+  # The row objects are named own_row/oth_row rather than own/other because tibble() evaluates
+  # its arguments with data masking, so a column named `other` shadows a variable of that name
+  # for every argument after it.
+  tibble(contrast = registry$label[i], depleted = registry$kd_symbol[i],
+         raw_lfc = own_row$log2FoldChange, padj = own_row$padj,
+         other = registry$other_kd[i], other_raw_lfc = oth_row$log2FoldChange[1],
+         margin = own_row$log2FoldChange - oth_row$log2FoldChange[1])
+})
+knitr::kable(kd, digits = 4)
+
+stopifnot(
+  "the depleted factor's own raw TE is not clearly positive - the file may be oriented the 231 way" =
+    all(kd$raw_lfc > 0.5),
+  "the depleted factor's own change is not significant" = all(kd$padj < 0.05),
+  "the depleted factor does not move more than the other factor - the files may be swapped" =
+    all(kd$margin > 0)
+)
+cat("\nRULER 2 PASSED. In raw orientation the depleted factor is up in all four files, by more\n",
+    "than the other factor in each. Negated, it is down - matching 231, where EIF3D's own\n",
+    "te_lfc is -1.26 because it is TE-buffered: the residual mRNA is better translated.\n",
+    "Note this ruler is about WHICH experiment, not which direction, which is why ruler 3 exists.\n",
+    sep = "")
+```
+
+# 5. Ruler three: the matched 231 contrast
+
+This is the only ruler built on independent data, so it is the one that cannot be fooled by a
+mistake made consistently throughout the MCF7-SIX1 files. eIF3d and eIF3e targets overlap between
+the two cell lines, so the negated MCF7-SIX1 outcome must correlate **positively** with the
+matched 231 contrast. If the sign were wrong, it would correlate negatively.
+
+Two forms of it are reported: a transcriptome-wide rank correlation, and the separation of
+**231-defined** eIF3d/eIF3e target genes from **231-defined** negative controls, scored on
+MCF7-SIX1 values. The second matters because it is the same shape as the spot-check notebook
+`10_` runs, so the threshold used there is calibrated here rather than guessed.
+
+**Decisions**
+
+- Report both orientations of the correlation side by side. A check that only ever prints the
+  passing number does not show its own discriminating power.
+- Restrict to the genes the model will actually see, so the numbers here are the numbers
+  `10_` will reproduce.
+
+```{r ruler_xcell}
+tco <- readRDS(file.path(here("output", "translational_control_overview"), params$matrix_rds))
+pos_of <- function(g) read_csv(here("output", "genesets",
+    paste0("hypoxia_", g, "_promotes_TE_1hr_lfc0.5.csv")), show_col_types = FALSE)$ensembl_gene
+neg_of <- function(g) read_csv(here("output", "predictive_modeling",
+    if (g == "3e") "negative_control_genes_si3e.csv" else "negative_control_genes.csv"),
+    show_col_types = FALSE) %>% mutate(gg = sub("[.].*", "", gene_id)) %>% pull(gg)
+
+xc <- pmap_dfr(list(seq_len(nrow(registry))), function(i) {
+  g <- registry$gene[i]
+  d <- neg[[registry$label[i]]]
+  m <- tco %>% dplyr::select(gene_id_clean) %>%
+    inner_join(d %>% dplyr::select(gene_id_clean, te_lfc), by = "gene_id_clean") %>%
+    filter(!is.na(te_lfc))
+  r <- read_csv(file.path(OUT, registry$ref231[i]), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("[.].*", "", gene_id)) %>%
+    dplyr::select(gene_id_clean, ref = te_lfc)
+  j <- inner_join(m, r, by = "gene_id_clean") %>% filter(is.finite(ref))
+  p <- pos_of(g); n <- setdiff(neg_of(g), p)
+  yp <- m$te_lfc[m$gene_id_clean %in% p]; yn <- m$te_lfc[m$gene_id_clean %in% n]
+  tibble(contrast = registry$label[i], n_modelled = nrow(m), n_paired = nrow(j),
+         rho_negated = cor(j$te_lfc, j$ref, method = "spearman"),
+         rho_if_raw  = -cor(j$te_lfc, j$ref, method = "spearman"),
+         n_pos = length(yp), n_neg = length(yn),
+         sep_negated = median(yp) - median(yn),
+         sep_if_raw  = -(median(yp) - median(yn)))
+})
+knitr::kable(xc, digits = 4)
+
+stopifnot(
+  "the negated outcome does not correlate positively with the matched 231 contrast - the sign is wrong" =
+    all(xc$rho_negated > params$min_xcell_rho),
+  "231-defined targets do not score above 231-defined negative controls on MCF7-SIX1 values" =
+    all(xc$sep_negated > params$min_xcell_sep),
+  "the raw orientation would have passed too - this ruler has no discriminating power" =
+    all(xc$rho_if_raw < 0) && all(xc$sep_if_raw < 0),
+  "the four contrasts do not agree on a single gene count" = n_distinct(xc$n_modelled) == 1
+)
+cat(sprintf(paste0("\nRULER 3 PASSED on all four contrasts. Negated rho spans %+.3f to %+.3f;\n",
+                   "the raw orientation would have spanned %+.3f to %+.3f, so the check\n",
+                   "distinguishes the two rather than passing either way.\n",
+                   "All four score %d of the matrix's %d genes.\n"),
+            min(xc$rho_negated), max(xc$rho_negated),
+            max(xc$rho_if_raw), min(xc$rho_if_raw),
+            xc$n_modelled[1], nrow(tco)))
+```
+
+## What a flipped sign would look like
+
+The rulers above pass. A check that has only ever been seen to pass is uninformative, so this
+re-runs ruler three on a deliberately un-negated outcome and confirms it fails.
+
+```{r flip_demo, eval = isTRUE(params$flip_demo)}
+flip_ok <- map_lgl(seq_len(nrow(registry)), function(i) {
+  d <- raw[[registry$label[i]]] %>%                       # NOT negated - the mistake
+    mutate(gene_id_clean = sub("[.].*", "", gene_id), te_lfc = log2FoldChange)
+  m <- tco %>% dplyr::select(gene_id_clean) %>%
+    inner_join(d %>% dplyr::select(gene_id_clean, te_lfc), by = "gene_id_clean") %>%
+    filter(!is.na(te_lfc))
+  r <- read_csv(file.path(OUT, registry$ref231[i]), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("[.].*", "", gene_id)) %>% dplyr::select(gene_id_clean, ref = te_lfc)
+  j <- inner_join(m, r, by = "gene_id_clean") %>% filter(is.finite(ref))
+  cor(j$te_lfc, j$ref, method = "spearman") > params$min_xcell_rho     # would the check pass?
+})
+cat("un-negated outcome passes ruler 3 for", sum(flip_ok), "of", nrow(registry), "contrasts\n")
+stopifnot("an un-negated outcome would have passed ruler 3 - the check is not discriminative" =
+            !any(flip_ok))
+cat("CONFIRMED: forgetting the negation fails ruler 3 in every contrast.\n")
+```
+
+# 6. Write the promotes-positive outcome tables
+
+```{r write_outcomes, eval = isTRUE(params$write_outputs)}
+written <- pmap_chr(list(seq_len(nrow(registry))), function(i) {
+  out <- neg[[registry$label[i]]] %>%
+    transmute(gene_id, symbol, baseMean, te_lfc, te_padj, lfcSE,
+              source_log2FoldChange = log2FoldChange)
+  p <- file.path(OUT, registry$dest[i])
+  write_csv(out, p)
+  p
+})
+cat(paste0("wrote ", basename(written), collapse = "\n"), "\n")
+
+# Read back and assert the file on disk is the negation of the file on the other side of the
+# repo boundary. Writing and then trusting the write is how a half-written file gets modelled.
+chk <- pmap_dfr(list(seq_len(nrow(registry))), function(i) {
+  a <- read_csv(file.path(OUT, registry$dest[i]), show_col_types = FALSE)
+  b <- raw[[registry$label[i]]]
+  j <- inner_join(a %>% dplyr::select(gene_id, te_lfc),
+                  b %>% dplyr::select(gene_id, log2FoldChange), by = "gene_id")
+  tibble(contrast = registry$label[i], n = nrow(j),
+         max_dev = max(abs(j$te_lfc + j$log2FoldChange), na.rm = TRUE),
+         # Exact, and round-trip-proof: every gene's sign must be inverted.
+         signs_inverted = all(sign(j$te_lfc) == -sign(j$log2FoldChange), na.rm = TRUE),
+         na_pattern_same = identical(is.na(j$te_lfc), is.na(j$log2FoldChange)))
+})
+knitr::kable(chk)
+# The tolerance is not slack: a CSV round-trip through readr keeps about 15 significant digits,
+# so the written value is not bit-identical to the in-memory one. Measured, the worst deviation
+# is 7e-18. Asserting == 0 here would be asserting a property of the file format, not of the
+# negation, so the exact statement is made on the signs instead and the magnitude gets a bound
+# far below anything that could matter.
+stopifnot("a written file is not the negation of its source" = all(chk$max_dev < 1e-12),
+          "a written file does not have every sign inverted" = all(chk$signs_inverted),
+          "a written file's missing-value pattern differs from its source" =
+            all(chk$na_pattern_same),
+          "a written file lost genes" = all(chk$n == map_int(raw, nrow)))
+```
+
+# 7. Gene sets and the common-gene list
+
+Two further artifacts. The gene sets let notebook `10_` run its own same-cell-line spot-check;
+they are built from these files, so they cannot catch an error shared with this notebook, which
+is exactly why ruler three above exists and is the asserted one.
+
+The common-gene list is the 9,335 genes MCF7-SIX1 can score. Putting MCF7-SIX1 and 231 columns in
+one heatmap requires every column to be built on the same genes, because a SHAP share is computed
+over whatever genes the model explained. The list is written here so the 231 runs can be
+restricted to it rather than each run deciding for itself.
+
+**Decisions**
+
+- Build gene sets for all four contrasts, including si3e, which had none. Otherwise the si3e
+  columns would silently lose a check the si3d columns have.
+- Define them by the same rule notebook `42_prepare_mcf7six1_genesets.Rmd` used for si3d, so the
+  si3d files this notebook writes reproduce the existing ones rather than competing with them.
+
+```{r write_genesets, eval = isTRUE(params$write_outputs)}
+lfc_cut <- as.numeric(params$lfc)
+gs <- pmap_dfr(list(seq_len(nrow(registry))), function(i) {
+  d   <- neg[[registry$label[i]]]
+  cnd <- paste0("mcf7six1_", registry$condition[i]); g <- registry$gene[i]
+  nm  <- paste0(cnd, "_", g, "_promotes_TE_1hr_lfc", params$lfc, ".csv")
+  p <- d %>% filter(te_lfc > lfc_cut, !is.na(te_padj), te_padj < 0.05) %>%
+    transmute(db_gene_symbol = symbol, ensembl_gene = gene_id_clean, te_lfc, te_padj,
+              gs_name = paste0(cnd, "_", g, "_promotes_TE_1hr_lfc", params$lfc),
+              gs_description = paste0("genes whose translation is promoted by eIF", g,
+                " in ", registry$condition[i], " at 1hr in MCF7-SIX1 cells, te_lfc > ",
+                params$lfc, " (te_lfc is promotes-positive: negated from log2(si", g,
+                "/sictrl))"),
+              gs_source_species = "homo sapiens")
+  write_csv(p, here("output", "genesets", nm))
+  n <- d %>% filter(abs(te_lfc) < as.numeric(params$neg_lfc),
+                    !is.na(te_padj), te_padj > as.numeric(params$neg_padj)) %>%
+    transmute(gene_id, symbol, te_lfc, te_padj)
+  nn <- paste0("mcf7six1_", registry$condition[i], "_", g, "_negative_controls_lfc",
+               params$neg_lfc, ".csv")
+  write_csv(n, here("output", "genesets", nn))
+  tibble(contrast = registry$label[i], positives = nrow(p), negatives = nrow(n),
+         pos_file = nm, neg_file = nn)
+})
+knitr::kable(gs %>% dplyr::select(contrast, positives, negatives))
+stopifnot("a positive gene set is implausibly small" = all(gs$positives >= 50),
+          "a negative control set is smaller than its positive set" = all(gs$negatives > gs$positives))
+
+# Reproduce nb42's existing si3d sets rather than quietly disagreeing with them. nb42 wrote its
+# hypoxia/normoxia sets under a name without the cell-line prefix on the condition, so the two
+# are compared by content.
+for (i in which(registry$gene == "3d")) {
+  old <- here("output", "genesets",
+              paste0("mcf7six1_", registry$condition[i], "_3d_promotes_TE_1hr_lfc",
+                     params$lfc, ".csv"))
+  if (file.exists(old)) {
+    a <- read_csv(old, show_col_types = FALSE)$ensembl_gene
+    b <- read_csv(here("output", "genesets", gs$pos_file[which(registry$gene == "3d" &
+           registry$condition == registry$condition[i])]), show_col_types = FALSE)$ensembl_gene
+    cat(sprintf("nb42 %s: %d genes; here: %d; identical: %s\n",
+                registry$condition[i], length(a), length(b), setequal(a, b)))
+  }
+}
+```
+
+```{r write_common_genes, eval = isTRUE(params$write_outputs)}
+common <- tco %>% dplyr::select(gene_id_clean) %>%
+  filter(gene_id_clean %in% Reduce(intersect, map(neg, ~ .x$gene_id_clean[!is.na(.x$te_lfc)])))
+stopifnot("the common-gene list is not a subset of the feature matrix" =
+            all(common$gene_id_clean %in% tco$gene_id_clean),
+          "the common-gene list has duplicates" = !any(duplicated(common$gene_id_clean)),
+          "the common-gene list is implausibly small" = nrow(common) > 8000)
+write_csv(common, file.path(here("output", "translational_control_overview"),
+                            "mcf7six1_common_genes.csv"))
+cat(sprintf("common genes scorable in every MCF7-SIX1 contrast and present in the matrix: %d of %d (%.1f%%)\n",
+            nrow(common), nrow(tco), 100 * nrow(common) / nrow(tco)))
+```
+
+# 8. The isoform caveat, measured
+
+A MCF7-SIX1-specific feature matrix is not available, and cannot be built without new compute:
+the precomputed G4 scores cover only about 5% of the transcripts MCF7-SIX1 would select that 231
+does not. So the MCF7-SIX1 columns are modelled on the **231-selected** transcript per gene.
+
+That is not free, and this section measures the exposure rather than asserting it is small. The
+number to know is how often the two cell lines would pick a different dominant transcript for the
+same gene; for those genes the feature values describe an isoform that is not the one MCF7-SIX1
+mainly expresses, which adds noise to the features and would *understate* the families whose
+features are isoform-sensitive.
+
+**Decisions**
+
+- Report the discordance rather than correcting for it. Correcting is not possible without the
+  missing features.
+- Write the concordant-gene list, so the MCF7-SIX1 model can be re-run on genes where the two
+  cell lines agree. Comparing that arm against the full one turns this caveat into a measurement.
+
+```{r isoform_caveat, eval = isTRUE(params$write_outputs)}
+m6_path <- here("output", "predictive_modeling", "feature_matrix_mcf7six1_external_stability.rds")
+if (file.exists(m6_path)) {
+  m6 <- readRDS(m6_path) %>% distinct(gene_id_clean, .keep_all = TRUE)
+  cmp <- tco %>% dplyr::select(gene_id_clean, tx_231 = transcript_id_clean) %>%
+    inner_join(m6 %>% dplyr::select(gene_id_clean, tx_mcf = transcript_id_clean),
+               by = "gene_id_clean") %>%
+    filter(gene_id_clean %in% common$gene_id_clean)
+  cat(sprintf("genes with a transcript choice in both cell lines: %d\n", nrow(cmp)))
+  cat(sprintf("  same dominant transcript:      %5d (%.1f%%)\n",
+              sum(cmp$tx_231 == cmp$tx_mcf), 100 * mean(cmp$tx_231 == cmp$tx_mcf)))
+  cat(sprintf("  different dominant transcript: %5d (%.1f%%)  <- features describe 231's isoform\n",
+              sum(cmp$tx_231 != cmp$tx_mcf), 100 * mean(cmp$tx_231 != cmp$tx_mcf)))
+  conc <- cmp %>% filter(tx_231 == tx_mcf) %>% dplyr::select(gene_id_clean)
+  write_csv(conc, file.path(here("output", "translational_control_overview"),
+                            "mcf7six1_isoform_concordant_genes.csv"))
+  cat(sprintf("wrote mcf7six1_isoform_concordant_genes.csv (%d genes)\n", nrow(conc)))
+} else {
+  cat("NOTE: no MCF7-SIX1 feature matrix on disk, so the discordance cannot be measured here.\n")
+}
+```
+
+# Summary
+
+```{r summary}
+cat("Direction: all three rulers agree that the MCF7-SIX1 files are log2(KD/sictrl) and must be\n")
+cat("negated. The un-negated orientation fails ruler 3 in all four contrasts.\n\n")
+cat("Written, promotes-positive, ready for notebook 10_ to resolve from params:\n")
+cat(paste0("  ", registry$dest, collapse = "\n"), "\n")
+cat("\nUse condition = \"mcf7six1_hypoxia\" / \"mcf7six1_normoxia\", timepoint = \"1hr\",\n")
+cat("negate_outcome = FALSE (the negation is already in the file).\n")
+```

@@ -8,6 +8,19 @@ params:
   mutate_input: ""
   apply_audit_repairs: TRUE
   check_golden: TRUE
+  # --- cell line and its inputs -------------------------------------------------------------
+  # Every default is the MDA-MB-231 value, so a default knit is byte-for-byte the run the two
+  # gates were written against. A second cell line overrides these rather than getting a second
+  # copy of this notebook: the families below are DEFINED here, and a parallel implementation is
+  # how two cell lines end up measuring subtly different quantities under the same column names.
+  cell_line: "MDA-MB-231"
+  baseline_rds: "feature_matrix_dhx29_kd_feature.rds"
+  kozak_seqs_rds: "precomputed_kozak_sequences.rds"
+  dhx29_occ_rds: "dhx29_riboseq_occupancy.rds"
+  g4mer_tag: ""
+  codon_weights_rds: ""
+  cache_tag: ""
+  out_rds: "feature_matrix_tco.rds"
 editor_options:
   chunk_output_type: console
 ---
@@ -52,8 +65,21 @@ library(here)
 ```
 
 ```{r load_baseline}
-baseline_rds <- "feature_matrix_dhx29_kd_feature.rds"
+baseline_rds <- params$baseline_rds
 features <- readRDS(here("output", "predictive_modeling", baseline_rds))
+CACHE <- params$cache_tag        # "" for MDA-MB-231; suffixes the per-transcript-set caches
+stopifnot(
+  # A non-default cell line MUST redirect its outputs and caches, or it overwrites the
+  # MDA-MB-231 matrix and the gates lose the file they reproduce.
+  "a non-MDA-MB-231 build must set out_rds" =
+    params$cell_line == "MDA-MB-231" || params$out_rds != "feature_matrix_tco.rds",
+  "a non-MDA-MB-231 build must set cache_tag, or it reuses the 231 transcript caches" =
+    params$cell_line == "MDA-MB-231" || nzchar(CACHE),
+  "a non-MDA-MB-231 build must not read the 231 baseline matrix" =
+    params$cell_line == "MDA-MB-231" ||
+    params$baseline_rds != "feature_matrix_dhx29_kd_feature.rds"
+)
+cat("Cell line:", params$cell_line, "\n")
 
 out_dir <- here("output", "translational_control_overview")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
@@ -94,7 +120,7 @@ enter the same forest, where they would split credit and hide the effect being m
 
 ```{r corrected_features, eval = !params$pass_through}
 ref_dir <- here("accessories", "collaborator_reference")
-seqs <- readRDS(here("output", "predictive_modeling", "precomputed_kozak_sequences.rds"))
+seqs <- readRDS(here("output", "predictive_modeling", params$kozak_seqs_rds))
 
 utr5 <- seqs$utr5_seq %>% filter(transcript_id_clean %in% features$transcript_id_clean)
 cds  <- seqs$cds_seq  %>% filter(transcript_id_clean %in% features$transcript_id_clean)
@@ -297,35 +323,86 @@ fop_of <- function(cm, opt) {
 full_ss <- DNAStringSet(codon_tbl$sq_upper); names(full_ss) <- codon_tbl$transcript_id_clean
 cm_full <- counts_of(full_ss)
 
-ribo_tx  <- features %>% filter(str_detect(symbol, "^RPL|^RPS")) %>% pull(transcript_id_clean)
-ribo_idx <- rownames(cm_full) %in% ribo_tx
-w_full   <- build_w(cm_full, ribo_idx)
+# THE CODON WEIGHT TABLE IS PART OF THE FEATURE DEFINITION, SO IT IS SHARED, NOT REDERIVED.
+#
+# CAI weights come from the codon usage of a reference set (ribosomal proteins), and the FOP
+# optimal codon per amino acid from the top TE decile. Derived from `features`, those reference
+# sets are the ones in whichever matrix is being built - so a second cell line would get its own
+# weights, and `cai_internal` would then measure "adaptation to THAT cell line's highly-expressed
+# codon usage". Two such columns are different quantities and must not sit in one heatmap row.
+#
+# So: the MDA-MB-231 build derives the weights, verifies them against 01g_'s stored values, and
+# SAVES them. Any other build loads that file and recomputes cai/fop with it. codon_weights_rds
+# defaults to "" so the 231 path is unchanged and still byte-identical.
+cw_path <- file.path(out_dir, "codon_weights_mdamb231.rds")
 
-te_rank <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE) %>%
-  filter(condition == "normoxia", treatment == "sictrl") %>%
-  group_by(gene_id) %>% summarise(mte = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
-  filter(!is.na(mte)) %>% arrange(desc(mte))
-top10  <- sub("\\..*", "", te_rank$gene_id[seq_len(ceiling(nrow(te_rank) * 0.10))])
-ref_tx <- features$transcript_id_clean[sub("\\..*", "", features$gene_id) %in% top10]
-ref_tx <- ref_tx[ref_tx %in% rownames(cm_full)]
-opt_full <- unname(sapply(aa_to_codons, function(c_)
-  c_[which.max(colSums(cm_full[ref_tx, , drop = FALSE])[c_])]))
+if (!nzchar(params$codon_weights_rds)) {
+  ribo_tx  <- features %>% filter(str_detect(symbol, "^RPL|^RPS")) %>% pull(transcript_id_clean)
+  ribo_idx <- rownames(cm_full) %in% ribo_tx
+  w_full   <- build_w(cm_full, ribo_idx)
 
-# VERIFY before trusting: recomputing on the FULL CDS must reproduce 01g_'s stored values
-# exactly. If it does not, the reference sets or the weights have been rebuilt wrongly and
-# nothing downstream is safe.
-verify <- tibble(transcript_id_clean = rownames(cm_full),
-                 cai_rep = cai_of(cm_full, w_full),
-                 fop_rep = fop_of(cm_full, opt_full)) %>%
-  inner_join(features %>% dplyr::select(transcript_id_clean, cai, fop),
-             by = "transcript_id_clean")
-cai_dev <- max(abs(verify$cai_rep - verify$cai), na.rm = TRUE)
-fop_dev <- max(abs(verify$fop_rep - verify$fop), na.rm = TRUE)
-cat("Reproduction of 01g_ on the full CDS: CAI max|dev| =", signif(cai_dev, 3),
-    ", FOP max|dev| =", signif(fop_dev, 3), ", n =", sum(complete.cases(verify)), "\n")
-stopifnot("recomputation does not reproduce 01g_'s CAI" = cai_dev < 1e-9,
-          "recomputation does not reproduce 01g_'s FOP" = fop_dev < 1e-9)
-cat("Verified: the codon pipeline here matches 01g_ exactly\n")
+  te_rank <- read_csv(here("output", "condition_level_te.csv"), show_col_types = FALSE) %>%
+    filter(condition == "normoxia", treatment == "sictrl") %>%
+    group_by(gene_id) %>% summarise(mte = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+    filter(!is.na(mte)) %>% arrange(desc(mte))
+  top10  <- sub("\\..*", "", te_rank$gene_id[seq_len(ceiling(nrow(te_rank) * 0.10))])
+  ref_tx <- features$transcript_id_clean[sub("\\..*", "", features$gene_id) %in% top10]
+  ref_tx <- ref_tx[ref_tx %in% rownames(cm_full)]
+  opt_full <- unname(sapply(aa_to_codons, function(c_)
+    c_[which.max(colSums(cm_full[ref_tx, , drop = FALSE])[c_])]))
+
+  # VERIFY before trusting: recomputing on the FULL CDS must reproduce 01g_'s stored values
+  # exactly. If it does not, the reference sets or the weights have been rebuilt wrongly and
+  # nothing downstream is safe.
+  verify <- tibble(transcript_id_clean = rownames(cm_full),
+                   cai_rep = cai_of(cm_full, w_full),
+                   fop_rep = fop_of(cm_full, opt_full)) %>%
+    inner_join(features %>% dplyr::select(transcript_id_clean, cai, fop),
+               by = "transcript_id_clean")
+  cai_dev <- max(abs(verify$cai_rep - verify$cai), na.rm = TRUE)
+  fop_dev <- max(abs(verify$fop_rep - verify$fop), na.rm = TRUE)
+  cat("Reproduction of 01g_ on the full CDS: CAI max|dev| =", signif(cai_dev, 3),
+      ", FOP max|dev| =", signif(fop_dev, 3), ", n =", sum(complete.cases(verify)), "\n")
+  stopifnot("recomputation does not reproduce 01g_'s CAI" = cai_dev < 1e-9,
+            "recomputation does not reproduce 01g_'s FOP" = fop_dev < 1e-9)
+  cat("Verified: the codon pipeline here matches 01g_ exactly\n")
+  # MUT is a character param, so it is tested with nzchar() as everywhere else in this notebook;
+  # `!MUT` would error on a string. A mutation run must not overwrite the verified weights.
+  # The weights are saved further down, once the INTERNAL-codon versions exist too: those are
+  # derived the same way and are what cai_internal/fop_internal actually use, so saving only the
+  # full-CDS pair would leave the modelled features to be rederived per cell line.
+} else {
+  cwp <- file.path(out_dir, params$codon_weights_rds)
+  stopifnot("codon_weights_rds not found - knit the MDA-MB-231 build first to create it" =
+              file.exists(cwp))
+  cw <- readRDS(cwp)
+  stopifnot("the codon weights file is not the verified object" =
+              all(c("w_full", "opt_full", "cai_dev", "fop_dev") %in% names(cw)),
+            "the loaded codon weights were not verified against 01g_" =
+              cw$cai_dev < 1e-9 && cw$fop_dev < 1e-9,
+            "the loaded weights do not cover the genetic code" =
+              setequal(names(cw$w_full), names(gen_code)),
+            "the loaded optimal-codon set is not one codon per amino acid" =
+              length(cw$opt_full) == length(aa_to_codons))
+  w_full <- cw$w_full; opt_full <- cw$opt_full
+  cat(sprintf("codon weights LOADED from %s (verified: CAI dev %.1e, FOP dev %.1e)\n",
+              basename(cwp), cw$cai_dev, cw$fop_dev))
+
+  # cai/fop are REPLACED with the shared-weight recomputation. The values inherited from the
+  # baseline were built with that cell line's own reference sets, so leaving them would put two
+  # different quantities in one column name - the very thing the shared weights prevent. The
+  # 01g_ reproduction check cannot apply here and is deliberately not faked: what is asserted
+  # instead is that the weights came from the verified 231 run.
+  rep_cai <- cai_of(cm_full, w_full); rep_fop <- fop_of(cm_full, opt_full)
+  old_cai <- features$cai[match(rownames(cm_full), features$transcript_id_clean)]
+  cat(sprintf("replacing inherited cai/fop with shared-weight values: median |change| %.4f (n=%d)\n",
+              median(abs(rep_cai - old_cai), na.rm = TRUE), sum(!is.na(old_cai))))
+  idx <- match(rownames(cm_full), features$transcript_id_clean)
+  features$cai[idx] <- rep_cai
+  features$fop[idx] <- rep_fop
+  stopifnot("CAI outside [0,1]" = all(features$cai >= 0 & features$cai <= 1, na.rm = TRUE),
+            "FOP outside [0,1]" = all(features$fop >= 0 & features$fop <= 1, na.rm = TRUE))
+}
 
 # Now the internal-codon versions.
 trim_internal <- function(x) {
@@ -339,9 +416,26 @@ stopifnot("internal sequences lost frame" = all(nchar(codon_tbl$s_int) %% 3 == 0
 
 int_ss <- DNAStringSet(codon_tbl$s_int); names(int_ss) <- codon_tbl$transcript_id_clean
 cm_int  <- counts_of(int_ss)
-w_int   <- build_w(cm_int, ribo_idx)
-opt_int <- unname(sapply(aa_to_codons, function(c_)
-  c_[which.max(colSums(cm_int[ref_tx, , drop = FALSE])[c_])]))
+# cai_internal and fop_internal are the MODELLED features, so their weights matter most. They
+# are shared across cell lines for the same reason the full-CDS ones are.
+if (!nzchar(params$codon_weights_rds)) {
+  w_int   <- build_w(cm_int, ribo_idx)
+  opt_int <- unname(sapply(aa_to_codons, function(c_)
+    c_[which.max(colSums(cm_int[ref_tx, , drop = FALSE])[c_])]))
+  if (params$cell_line == "MDA-MB-231" && !nzchar(MUT)) {
+    saveRDS(list(w_full = w_full, opt_full = opt_full, w_int = w_int, opt_int = opt_int,
+                 n_ribo_tx = sum(ribo_idx), n_ref_tx = length(ref_tx),
+                 cai_dev = cai_dev, fop_dev = fop_dev,
+                 verified_against = "01g_ stored cai/fop on the full CDS",
+                 built_on = format(Sys.Date())), cw_path)
+    cat("saved the verified codon weights (full + internal) to", basename(cw_path), "\n")
+  }
+} else {
+  stopifnot("the codon weights file predates the internal-codon weights - re-knit the MDA-MB-231 build" =
+              all(c("w_int", "opt_int") %in% names(cw)))
+  w_int <- cw$w_int; opt_int <- cw$opt_int
+  cat("internal-codon weights LOADED from the shared file\n")
+}
 cat("Optimal codons changed by trimming:", sum(opt_int != opt_full), "of 20\n")
 
 predict_human <- predict_stability("human")
@@ -482,7 +576,7 @@ cat("nascent peptide + poly(A): scored", sum(!is.na(pep$proline_fraction)), "of"
 # the terminal stop was removed from the iCodon input, csc lost 1.35 pp of importance share
 # (20/20 seeds), which means it had been carrying stop-codon identity. That signal belongs
 # here, under its own name, rather than smuggled into a codon-optimality score.
-utr3_cache <- file.path(out_dir, "precomputed_utr3_seqs.rds")
+utr3_cache <- file.path(out_dir, paste0("precomputed_utr3_seqs", CACHE, ".rds"))
 if (file.exists(utr3_cache)) {
   utr3_tbl <- readRDS(utr3_cache)
 } else {
@@ -574,7 +668,8 @@ term <- term %>% dplyr::select(transcript_id_clean, all_of(term_cols))
 g4_dir     <- here("output", "g4mer")
 g4_regions <- c("utr5", "cds", "utr3")
 g4_raw <- map_dfr(g4_regions, function(rg)
-  read_tsv(file.path(g4_dir, paste0("g4mer_summary_", rg, ".tsv")), show_col_types = FALSE))
+  read_tsv(file.path(g4_dir, paste0("g4mer_summary_", rg, params$g4mer_tag, ".tsv")),
+           show_col_types = FALSE))
 
 stopifnot(
   "g4mer scores outside [0, 1]" =
@@ -606,13 +701,44 @@ g4_join <- features %>%
   dplyr::select(transcript_id_clean, utr5_gc, cds_gc, utr3_gc) %>%
   left_join(g4_wide, by = "transcript_id_clean")
 
+# THE RESIDUALISATION COEFFICIENTS ARE SHARED, for the same reason the codon weights are.
+# Refitting per matrix makes g4mer_max_resid_* a within-population quantity: the same transcript
+# gets a different residual in a different cell line's matrix (measured: up to 0.041), because
+# the regression it is residualised against was fitted on different rows. Fitting on MDA-MB-231
+# and APPLYING those coefficients elsewhere keeps one definition. The 231 build is unchanged by
+# this - it is still fitted on its own rows, which is where the coefficients come from.
+g4_fit_path <- file.path(out_dir, "g4_resid_coefs_mdamb231.rds")
+g4_use_saved <- nzchar(params$codon_weights_rds)      # same switch: this is a non-231 build
+g4_coefs <- if (g4_use_saved) {
+  stopifnot("g4_resid_coefs_mdamb231.rds not found - knit the MDA-MB-231 build first" =
+              file.exists(g4_fit_path))
+  readRDS(g4_fit_path)
+} else list()
+
 for (rg in g4_regions) {
   mx <- paste0("g4mer_max_", rg); ln <- paste0("region_length_", rg)
   gcc <- paste0(rg, "_gc")
-  fit <- lm(g4_join[[mx]] ~ log2(g4_join[[ln]] + 1) + g4_join[[gcc]], na.action = na.exclude)
-  g4_join[[paste0("g4mer_max_resid_", rg)]] <- as.numeric(residuals(fit))
-  cat(sprintf("  g4mer_max_%-4s ~ log2(length) + GC: R2 = %.3f, n = %d\n",
-              rg, summary(fit)$r.squared, sum(!is.na(residuals(fit)))))
+  dfr <- data.frame(y = g4_join[[mx]], l2 = log2(g4_join[[ln]] + 1), gc = g4_join[[gcc]])
+  if (g4_use_saved) {
+    cf <- g4_coefs[[rg]]
+    stopifnot("no saved g4 residual coefficients for this region" = !is.null(cf))
+    pred <- cf[1] + cf[2] * dfr$l2 + cf[3] * dfr$gc
+    resid <- dfr$y - pred
+    resid[!is.finite(dfr$y) | !is.finite(dfr$l2) | !is.finite(dfr$gc)] <- NA_real_
+    g4_join[[paste0("g4mer_max_resid_", rg)]] <- resid
+    cat(sprintf("  g4mer_max_%-4s residual from SAVED 231 coefficients, n = %d\n",
+                rg, sum(!is.na(resid))))
+  } else {
+    fit <- lm(y ~ l2 + gc, data = dfr, na.action = na.exclude)
+    g4_join[[paste0("g4mer_max_resid_", rg)]] <- as.numeric(residuals(fit))
+    g4_coefs[[rg]] <- as.numeric(coef(fit))
+    cat(sprintf("  g4mer_max_%-4s ~ log2(length) + GC: R2 = %.3f, n = %d\n",
+                rg, summary(fit)$r.squared, sum(!is.na(residuals(fit)))))
+  }
+}
+if (!g4_use_saved && params$cell_line == "MDA-MB-231" && !nzchar(MUT)) {
+  saveRDS(g4_coefs, g4_fit_path)
+  cat("  saved the g4 residual coefficients to", basename(g4_fit_path), "\n")
 }
 
 g4_cols <- c(paste0("g4mer_max_resid_", g4_regions),
@@ -627,7 +753,7 @@ g4 <- g4_join %>% dplyr::select(transcript_id_clean, all_of(g4_cols))
 # F3. hia2026_dhx29_occupancy was joined at GENE level from a transcript-keyed source, so
 # ~1,013 transcripts carry a different isoform's occupancy. Ribosome occupancy is
 # isoform-specific, so that is a value/key mix-up rather than a rounding issue.
-dhx29_occ <- readRDS(here("output", "predictive_modeling", "dhx29_riboseq_occupancy.rds"))
+dhx29_occ <- readRDS(here("output", "predictive_modeling", params$dhx29_occ_rds))
 stopifnot("dhx29 occupancy source is not transcript-keyed" =
             "transcript_id_clean" %in% colnames(dhx29_occ),
           "dhx29 occupancy source has duplicate transcripts" =
@@ -731,7 +857,7 @@ cat("Renamed", length(struct_old), "struct_* columns to tco_struct_*\n")
 #
 # The aggregate means barely move (CDS +0.0004); the POSITIONAL features move ~0.012-0.017,
 # because the phantom is 1 of 30 positions in that window whatever the transcript length.
-recomputed_f <- file.path(out_dir, "structure_recomputed.rds")
+recomputed_f <- file.path(out_dir, paste0("structure_recomputed", CACHE, ".rds"))
 if (file.exists(recomputed_f) && isTRUE(params$apply_audit_repairs)) {
   rec <- readRDS(recomputed_f)
   rec_cols <- setdiff(colnames(rec), "transcript_id_clean")
@@ -753,7 +879,7 @@ if (file.exists(recomputed_f) && isTRUE(params$apply_audit_repairs)) {
 # with the REGION-CORRECT parameters and validated by reproducing already-scored transcripts
 # at deviation 0. These fill NA rather than overwriting anything.
 for (rg in c("utr5", "cds", "utr3")) {
-  rf <- file.path(out_dir, paste0("structure_rescued_", rg, ".rds"))
+  rf <- file.path(out_dir, paste0("structure_rescued_", rg, CACHE, ".rds"))
   if (!file.exists(rf) || !isTRUE(params$apply_audit_repairs)) next
   resc <- readRDS(rf)
   rcols <- setdiff(colnames(resc), "transcript_id_clean")
@@ -1536,9 +1662,18 @@ the new snapshot is verified. The commit diff shows exactly which transcripts an
 moved.
 
 ```{r golden_transcripts, eval = !params$pass_through}
-golden_f <- here("code", "translational_control_overview", "golden_transcripts.csv")
+# Per cell line. The snapshot is a regression guard: specific transcripts' values must not move
+# between runs of the SAME build. Comparing a second cell line against the MDA-MB-231 snapshot
+# asks a different question and answers it wrongly - the golden set is 231's dominant transcripts,
+# many of which MCF7-SIX1 does not select at all (474 of 1,632 cells were simply absent), and it
+# covers 102 columns including ones no model uses. Cross-cell-line agreement is established
+# instead by comparing the MODELLED features by value on the transcripts dominant in both, which
+# is a stronger statement: 69 of 69 bit-identical over 6,084 transcripts.
+golden_f <- here("code", "translational_control_overview",
+                 paste0("golden_transcripts", CACHE, ".csv"))
 if (!file.exists(golden_f)) {
-  cat("No golden file yet - create it with 01d_golden_transcripts.R\n")
+  cat("No golden file for this build yet (", basename(golden_f),
+      ") - create it with 01d_golden_transcripts.R\n", sep = "")
 } else {
   golden <- read_csv(golden_f, show_col_types = FALSE)
   now <- features %>%
@@ -1674,16 +1809,46 @@ cat(if (isTRUE(params$pass_through))
     else
       "pass_through = FALSE: corrected variants added alongside the originals\n")
 
-saveRDS(matrix_out, file.path(out_dir, "feature_matrix_tco.rds"))
-write_csv(annotation, file.path(out_dir, "feature_annotation.csv"))
+out_matrix_path <- file.path(out_dir, params$out_rds)
+# The annotation table is the feature-parity contract: 02_/10_ select features by joining
+# against it, so two cell lines sharing one heatmap axis must agree on it exactly. A second
+# cell line therefore writes its own copy AND is required to match the 231 one, rather than
+# overwriting it and making the disagreement unobservable.
+ann_path <- file.path(out_dir, paste0("feature_annotation", CACHE, ".csv"))
+
+saveRDS(matrix_out, out_matrix_path)
+write_csv(annotation, ann_path)
 
 stopifnot("written matrix lost rows" = nrow(matrix_out) == nrow(features))
 
+if (nzchar(CACHE)) {
+  ref_ann_path <- file.path(out_dir, "feature_annotation.csv")
+  if (file.exists(ref_ann_path)) {
+    ref_ann <- read_csv(ref_ann_path, show_col_types = FALSE)
+    key <- c("feature", "block", "family", "variant", "deprecated")
+    key <- intersect(key, intersect(colnames(ref_ann), colnames(annotation)))
+    a <- annotation %>% dplyr::select(all_of(key)) %>% arrange(feature)
+    b <- ref_ann    %>% dplyr::select(all_of(key)) %>% arrange(feature)
+    only_here <- setdiff(annotation$feature, ref_ann$feature)
+    only_ref  <- setdiff(ref_ann$feature, annotation$feature)
+    if (length(only_here)) cat("annotation: only in this build:", paste(only_here, collapse = ", "), "\n")
+    if (length(only_ref))  cat("annotation: only in MDA-MB-231:", paste(only_ref, collapse = ", "), "\n")
+    stopifnot(
+      "this build's feature set differs from MDA-MB-231's - the two cannot share a heatmap axis" =
+        setequal(annotation$feature, ref_ann$feature),
+      "a feature's block/family/variant differs from MDA-MB-231's - SHAP families would not line up" =
+        isTRUE(all.equal(as.data.frame(a), as.data.frame(b)))
+    )
+    cat(sprintf("annotation parity with MDA-MB-231: OK (%d features, identical block/family/variant)\n",
+                nrow(annotation)))
+  } else {
+    cat("NOTE: no MDA-MB-231 feature_annotation.csv to check parity against\n")
+  }
+}
+
 cat("\nWrote:\n")
-cat(" ", file.path(out_dir, "feature_matrix_tco.rds"), "-",
-    nrow(matrix_out), "x", ncol(matrix_out), "\n")
-cat(" ", file.path(out_dir, "feature_annotation.csv"), "-",
-    nrow(annotation), "rows\n")
+cat(" ", out_matrix_path, "-", nrow(matrix_out), "x", ncol(matrix_out), "\n")
+cat(" ", ann_path, "-", nrow(annotation), "rows\n")
 
 annotation %>% count(block, name = "columns") %>% arrange(desc(columns)) %>% print()
 ```

@@ -30,6 +30,15 @@ params:
   outcome_padj_col: "te_padj"
   direction_check_csv: ""
   negate_outcome: FALSE
+  cell_line: "MDA-MB-231"
+  outcome_kind: "te"
+  min_spot_sep: 0.3
+  heldout_sep_check: TRUE
+  perm_n: 1
+  xcell_ref_csv: ""
+  neg_lfc: "0.5"
+  restrict_to_genes_csv: ""
+  parity_ref_suffix: ""
   target_transform: "raw"
   winsorize_y: 0
   split_seed: 9
@@ -126,7 +135,15 @@ positive_set <- function() {
 .dir_verb    <- if (.dir_median > 0) "falls" else "rises"      # singular: "TE falls"
 .dir_verb_pl <- if (.dir_median > 0) "fall"  else "rise"       # plural:  "those genes fall"
 .dir_effect  <- if (.dir_median > 0) "promotes" else "inhibits"
-.dir_ratio   <- paste0("log2(sictrl / si", params$gene, ")")
+# MDA-MB-231 files are written as log2(sictrl / siX) already. MCF7-SIX1 results are computed the
+# other way round and are negated into this orientation once, by 10m_mcf7six1_outcome_prep.Rmd,
+# so the stored column is promotes-positive in both cell lines but its provenance differs.
+# Calling an MCF7-SIX1 outcome "log2(sictrl / si3d)" would name a contrast nobody computed.
+.dir_ratio   <- if (params$outcome_kind == "binding")
+  "log2(IP / input) eIF3d subunit-seq cap-binding enrichment, from deposited RPKM" else
+  if (params$cell_line == "MDA-MB-231")
+  paste0("log2(sictrl / si", params$gene, ")") else
+  paste0("log2(si", params$gene, " / sictrl) negated, which is the same orientation")
 .dir_gene    <- paste0("eIF", params$gene)                     # "3d" -> "eIF3d", not "eIF33d"
 # The count that belongs in the prose is the number the CLASSIFIER actually modelled, which is the
 # gene set intersected with the feature matrix, not the size of the gene set CSV. Read it from 02_'s
@@ -144,14 +161,28 @@ positive_set <- function() {
   NA_real_
 .dir_n_phrase <- if (is.na(.dir_n_clf)) paste0("the ", .dir_n, " genes in that set") else
   paste0("the ", format(.dir_n_clf, big.mark = ","), " genes")
+# Binding outcomes have no knockdown direction; a stress-ratio hit set can sit near zero (the
+# thapsigargin hits barely rise over DMSO), which is a finding, not a sign error.
 stopifnot(
   "the positive set's median outcome sign disagrees with the `direction` param" =
+    params$outcome_kind == "binding" ||
     (params$direction == "promotes" && .dir_median > 0) ||
     (params$direction == "inhibits" && .dir_median < 0)
 )
 ```
 
 # Overview
+
+```{r binding_banner, echo = FALSE, results = "asis", eval = params$outcome_kind == "binding"}
+cat(paste0(
+  "> **This run models eIF3d CAP BINDING, not TE.** The outcome is ", .dir_ratio,
+  " (`", params$outcome_csv, "`, ", params$cell_line, "), built by ",
+  "`10s_subunit_seq_outcome_prep.Rmd`. Wherever the text below says TE, knockdown or ",
+  "\"promotes\", read cap-binding enrichment; the knockdown direction rulers are skipped and the ",
+  "positive set is the published subunit-seq hit list. **Provisional:** computed from RPKM, not ",
+  "DESeq2 on counts, and must be rerun from the raw reads. Raw enrichment is length-confounded ",
+  "and no background IP exists. See `CAP_BINDING_DATA.md`.\n\n"))
+```
 
 This notebook predicts each gene's continuous TE log2 fold change from its mRNA sequence and
 structure features, using a random forest regression.
@@ -269,6 +300,39 @@ include_blocks <- str_trim(str_split(params$include_blocks, ",")[[1]])
 stopifnot("include_blocks must name real blocks" =
             all(include_blocks %in% c("intrinsic", "external", "eif4e", "technical")))
 
+# Cell line. The only thing that can go badly wrong with a second cell line is the sign, and the
+# way it goes wrong is quietly: the MDA-MB-231 outcome files carry rna_lfc and check their own
+# direction against it, while the MCF7-SIX1 tables have no RNA column at all, so that check would
+# simply print "skipped" and the run would proceed unverified. A non-231 run is therefore
+# REQUIRED to name an independent ruler instead of being allowed to skip.
+# HeLa = Herrmannova et al. 2024 (eLife), prepared by 10h_herrmannova_outcome_prep.Rmd.
+# HEK293T = subunit-seq cap binding (outcome_kind = "binding"), prepared by
+# 10s_subunit_seq_outcome_prep.Rmd. There is no knockdown, so no direction ruler applies; the
+# prep notebook's replication checks against both papers take its place.
+stopifnot("outcome_kind must be te or binding" = params$outcome_kind %in% c("te", "binding"),
+          "cell_line must be MDA-MB-231, MCF7-SIX1, HeLa or HEK293T" =
+            params$cell_line %in% c("MDA-MB-231", "MCF7-SIX1", "HeLa", "HEK293T"),
+          "HEK293T is the binding cell line and binding is HEK293T only" =
+            (params$cell_line == "HEK293T") == (params$outcome_kind == "binding"),
+          "a binding run needs an explicit outcome_csv" =
+            params$outcome_kind == "te" || nzchar(params$outcome_csv),
+          "a non-MDA-MB-231 TE run must name xcell_ref_csv - the matched 231 contrast that serves as its direction ruler" =
+            params$cell_line == "MDA-MB-231" || params$outcome_kind == "binding" ||
+            nzchar(params$xcell_ref_csv))
+
+# Where this run's negative controls live. Derived from the params rather than passed in, so one
+# cell line cannot be scored against the other's controls by forgetting an argument.
+neg_csv_path <- if (params$cell_line == "MDA-MB-231") {
+  here("output", "predictive_modeling",
+       if (params$gene == "3e") "negative_control_genes_si3e.csv" else
+                                "negative_control_genes.csv")
+} else {
+  here("output", "genesets",
+       paste0(params$condition, "_", params$gene, "_negative_controls_lfc", params$neg_lfc, ".csv"))
+}
+stopifnot("the negative control CSV for this cell line and knockdown was not found" =
+            file.exists(neg_csv_path))
+
 # Built from the same params as 02_'s, so a regression suffix is string-alignable with the
 # classifier suffix it will be compared against in 12_.
 suffix <- reg_suffix(list(
@@ -299,9 +363,13 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 MUTATING <- nzchar(params$mutate_target)
 ggsave_if <- function(...) if (isTRUE(params$save_plots) && !MUTATING) ggsave(...)
 
+cat("Cell line:     ", params$cell_line, "\n")
 cat("Suffix:        ", suffix, "\n")
 cat("Classifier ref:", clf_suffix, "\n")
 cat("Outcome file:  ", outcome_file, "  column:", params$outcome_col, "\n")
+cat("Neg controls:  ", basename(neg_csv_path), "\n")
+if (params$cell_line != "MDA-MB-231")
+  cat("Direction ruler:", params$xcell_ref_csv, "\n")
 cat("Transform:     ", params$target_transform,
     if (params$winsorize_y > 0) paste0(" (winsorized at +/-", params$winsorize_y, ")") else "", "\n")
 cat("Seeds:          split", SPLIT_SEED, "| forest", FOREST_SEED, "\n")
@@ -426,6 +494,28 @@ if (isTRUE(params$restrict_to_classifier_genes)) {
   cat("Restricted to the classifier's genes:", n_before, "->", nrow(model_genes), "\n")
 }
 
+# Restrict to a supplied gene list. This exists to put two cell lines on one heatmap axis: a SHAP
+# share is computed over whichever genes the model explained, so columns built on different gene
+# populations are not comparable, and 15_ asserts exactly that. MCF7-SIX1 can score 9,335 of the
+# matrix's 10,172 genes, so a combined figure needs the 231 runs restricted to the same 9,335.
+if (nzchar(params$restrict_to_genes_csv)) {
+  rp <- file.path(out_dir, params$restrict_to_genes_csv)
+  stopifnot("restrict_to_genes_csv not found" = file.exists(rp))
+  keep_g <- read_csv(rp, show_col_types = FALSE)$gene_id_clean
+  stopifnot("restrict_to_genes_csv has no gene_id_clean column" = !is.null(keep_g),
+            # Same hazard exclude_features guards: the restriction is not part of the output
+            # suffix, so without a distinct label a restricted run silently overwrites the
+            # full run's model, importance and SHAP.
+            "a restricted run needs a distinct feature_set_label or it overwrites the full run" =
+              params$feature_set_label != "tcoreg")
+  n_before_r <- nrow(model_genes)
+  model_genes <- model_genes %>% filter(gene_id_clean %in% keep_g)
+  cat(sprintf("Restricted to %s: %d -> %d genes\n", params$restrict_to_genes_csv,
+              n_before_r, nrow(model_genes)))
+  stopifnot("the gene restriction removed nearly everything - wrong list?" =
+              nrow(model_genes) > 5000)
+}
+
 cat("Model genes:", nrow(model_genes), "\n")
 ```
 
@@ -501,6 +591,43 @@ kd_symbol <- paste0("EIF", toupper(params$gene))            # 3d -> EIF3D, 3e ->
 # normoxia_1and4hr.csv is one - which would leave the direction unverifiable for that run.
 # direction_check_csv points the ruler at the companion RNA file so the check still happens
 # rather than being skipped, which is the difference between a verified column and an assumed one.
+# Cross-cell-line direction ruler, for any cell line whose outcome file has no RNA column.
+#
+# This is the check that replaces `rna_lfc > 2`. It is built on independent data - the matched
+# MDA-MB-231 contrast - which matters, because a same-cell-line gene set is derived from the very
+# file whose sign is in question and so cannot catch an error made consistently upstream. eIF3d
+# and eIF3e targets overlap between the two cell lines, so a correctly oriented outcome must
+# correlate POSITIVELY with the 231 contrast; an inverted one correlates negatively by the same
+# amount.
+#
+# 10m_mcf7six1_outcome_prep.Rmd runs this same check before it writes the outcome file. Repeating
+# it here is deliberate rather than redundant: the prep notebook certifies the file, this
+# certifies that THIS RUN loaded that file and not another one.
+if (params$cell_line != "MDA-MB-231" && params$outcome_kind == "te") {
+  xref <- read_csv(here("output", params$xcell_ref_csv), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("[.].*", "", gene_id)) %>%
+    dplyr::select(gene_id_clean, ref = all_of(params$outcome_col))
+  xj <- model_genes %>% dplyr::select(gene_id_clean, y) %>%
+    inner_join(xref, by = "gene_id_clean") %>% filter(is.finite(ref), is.finite(y))
+  x_rho <- cor(xj$y, xj$ref, method = "spearman")
+  cat(sprintf("cross-cell-line ruler vs %s: Spearman %+.4f (n=%d). An inverted sign would read %+.4f.\n",
+              params$xcell_ref_csv, x_rho, nrow(xj), -x_rho))
+  stopifnot(
+    "the ruler contrast shares too few genes with this run to be informative" = nrow(xj) > 3000,
+    "this contrast correlates NEGATIVELY with the matched MDA-MB-231 contrast - the sign is inverted and every direction in this run would be backwards" =
+      x_rho > 0.05,
+    # The ruler has to point at the SAME experiment. eIF3d and eIF3e targets overlap, so a si3d
+    # outcome checked against a si3e reference still correlates positively: the sign would pass
+    # while the run was anchored to the wrong contrast.
+    "xcell_ref_csv names a different knockdown than this run" =
+      grepl(paste0("si", params$gene), params$xcell_ref_csv, fixed = TRUE),
+    "xcell_ref_csv names a different oxygen condition than this run" =
+      grepl(sub("^[a-z0-9]+_", "", params$condition), params$xcell_ref_csv, fixed = TRUE),
+    "xcell_ref_csv must be an MDA-MB-231 contrast - another cell line cannot serve as its own independent ruler" =
+      !grepl("mcf7", params$xcell_ref_csv, fixed = TRUE)
+  )
+}
+
 dir_src <- if (nzchar(params$direction_check_csv)) {
   cat("direction ruler read from the companion file:", params$direction_check_csv, "\n")
   read_csv(here("output", params$direction_check_csv), show_col_types = FALSE)
@@ -563,6 +690,12 @@ if ("symbol" %in% names(dir_src) && "rna_lfc" %in% names(dir_src) &&
   } else {
     cat("no file matches the params-implied contrast", implied_file, "- anchor not asserted\n")
   }
+} else if (params$outcome_kind == "binding") {
+  cat("Direction rulers not applicable: a cap-binding outcome has no knockdown. The prep notebook\n",
+      "  reproduced both papers' tables; the spot-check below tests published hits vs the rest.\n", sep = "")
+} else if (params$cell_line != "MDA-MB-231") {
+  cat("rna_lfc ruler not applicable: this cell line's tables carry no RNA column.\n",
+      "  The direction was checked above against the matched MDA-MB-231 contrast instead.\n", sep = "")
 } else {
   cat("NOTE: direction check skipped (no symbol/rna_lfc column, or outcome was negated)\n")
 }
@@ -573,9 +706,10 @@ if ("symbol" %in% names(dir_src) && "rna_lfc" %in% names(dir_src) &&
 # Reuses the single definition from the direction_facts chunk, so the two cannot diverge.
 pos_genes <- .dir_pos
 cat(sprintf("positive set: %d genes from %s\n", length(pos_genes), attr(pos_genes, "source")))
-neg_csv   <- if (params$gene == "3e") "negative_control_genes_si3e.csv" else
-                                      "negative_control_genes.csv"
-neg_genes <- read_csv(here("output", "predictive_modeling", neg_csv), show_col_types = FALSE) %>%
+# neg_csv_path is resolved in derived_values from the cell line and knockdown, so an MCF7-SIX1
+# run cannot be scored against MDA-MB-231's controls.
+cat("negative controls:", basename(neg_csv_path), "\n")
+neg_genes <- read_csv(neg_csv_path, show_col_types = FALSE) %>%
   mutate(g = sub("[.].*", "", gene_id)) %>% pull(g)
 neg_genes <- setdiff(neg_genes, pos_genes)     # the same guard 02_ applies before sampling
 
@@ -586,7 +720,7 @@ cat(sprintf("target: %s-promoted median %+.3f (n=%d) vs negative controls %+.3f 
             wilcox.test(yp, yn)$p.value))
 stopifnot(
   "the target does not separate the promoted gene set from the negative controls" =
-    median(yp) - median(yn) > 0.3
+    median(yp) - median(yn) > as.numeric(params$min_spot_sep)
 )
 ```
 
@@ -766,6 +900,28 @@ if (isTRUE(params$gate_feature_parity) && !nzchar(params$exclude_features)) {
   } else {
     cat("NOTE: parity gate skipped -", basename(clf_imp_path), "not found\n")
   }
+}
+
+# Cross-run feature parity. The gate above compares against 02_'s classifier, which exists only
+# for the MDA-MB-231 contrasts; for any other cell line it prints "not found" and the run goes
+# ahead with no parity check at all - which is precisely the guarantee a multi-cell-line heatmap
+# depends on. parity_ref_suffix names a REGRESSION run instead, so every column that will share
+# an axis can be tied explicitly to one feature set.
+if (nzchar(params$parity_ref_suffix)) {
+  ref_imp <- file.path(out_dir, paste0("rfreg_importance_", params$parity_ref_suffix, ".csv"))
+  stopifnot("parity_ref_suffix names a run with no saved importance - knit that run first" =
+              file.exists(ref_imp))
+  ref_feats <- read_csv(ref_imp, show_col_types = FALSE)$feature
+  if (!setequal(ref_feats, feature_cols)) {
+    cat("PARITY DIFFERS - only in this run:",
+        paste(setdiff(feature_cols, ref_feats), collapse = ", "), "\n")
+    cat("               only in the reference:",
+        paste(setdiff(ref_feats, feature_cols), collapse = ", "), "\n")
+  }
+  stopifnot("feature set differs from parity_ref_suffix - these two runs cannot share a heatmap axis" =
+              setequal(ref_feats, feature_cols))
+  cat("Cross-run feature parity with", params$parity_ref_suffix, "OK (",
+      length(feature_cols), "features )\n")
 }
 ```
 
@@ -1094,7 +1250,14 @@ print(as.data.frame(metrics %>% mutate(value = round(value, 5))), row.names = FA
 # meaningfully checked either. The gate applies in both directions.
 n_test_pos <- sum(test_data$gene_id_clean %in% pos_genes)
 n_test_neg <- sum(test_data$gene_id_clean %in% neg_genes)
-if (n_test_pos >= params$min_test_pos) {
+sep_pos <- median(pred_t[test_data$gene_id_clean %in% pos_genes])
+sep_neg <- median(pred_t[test_data$gene_id_clean %in% neg_genes])
+if (!isTRUE(params$heldout_sep_check)) {
+  # Off only for cap-binding stress RATIOS, where the positive set is the hit list from one
+  # condition and does not define the outcome. There the direction is a result, not a check.
+  cat(sprintf("held-out separation REPORTED, not asserted: predicted median %+.3f for %d positives vs %+.3f for %d negatives\n",
+              sep_pos, n_test_pos, sep_neg, n_test_neg))
+} else if (n_test_pos >= params$min_test_pos) {
   stopifnot(
     "predictions do not separate the promoted set from the negative controls on held-out genes" =
       median(pred_t[test_data$gene_id_clean %in% pos_genes]) >
@@ -1131,10 +1294,30 @@ rf_perm  <- do.call(ranger, perm_args)
 pred_perm <- predict(rf_perm, data = test_data[, feature_cols])$predictions
 sp_perm   <- cor(pred_perm, test_data$y, method = "spearman")
 
+# perm_n > 1 (cap-binding runs): one shuffle is not a null distribution. On small test sets with
+# a strongly feature-determined outcome, shuffled forests scatter +/-0.2 around zero (measured on
+# the subunit-seq columns), so a fixed |shuffle| < 0.1 bound fails by chance. There the real model
+# must instead beat the MAXIMUM of perm_n shuffled forests. perm_n = 1 keeps the original check.
+if (as.integer(params$perm_n) > 1) {
+  sp_perm_all <- vapply(seq_len(as.integer(params$perm_n)), function(i) {
+    set.seed(FOREST_SEED + i)
+    pa <- rf_args; pa$y <- sample(train_data$y_t); pa$importance <- "none"; pa$seed <- FOREST_SEED + i
+    f <- do.call(ranger, pa)
+    cor(predict(f, data = test_data[, feature_cols])$predictions, test_data$y, method = "spearman")
+  }, numeric(1))
+  cat(sprintf("%d shuffled forests: Spearman mean %+.3f, sd %.3f, range [%+.3f, %+.3f]\n",
+              length(sp_perm_all), mean(sp_perm_all), sd(sp_perm_all),
+              min(sp_perm_all), max(sp_perm_all)))
+}
+
 cat(sprintf("real model      : test Spearman %+.4f | OOB R2 %+.4f\n", spearman_raw, rf_model$r.squared))
 cat(sprintf("permuted outcome: test Spearman %+.4f | OOB R2 %+.4f\n", sp_perm, rf_perm$r.squared))
 cat(sprintf("difference      : %+.4f\n", spearman_raw - sp_perm))
-stopifnot(
+if (as.integer(params$perm_n) > 1) {
+  stopifnot(
+    "shuffled forests are centred away from zero - suspect leakage" = abs(mean(sp_perm_all)) < 0.1,
+    "the real model does not beat the best of its shuffled forests" = spearman_raw > max(sp_perm_all))
+} else stopifnot(
   # The permuted model must not rank held-out genes. If it does, something links the features to
   # the outcome other than biology - a leak, or a split that is not independent.
   "the PERMUTED model still ranks held-out genes - suspect leakage" = abs(sp_perm) < 0.1,
@@ -1226,8 +1409,16 @@ auc_of <- function(lab, score) {
   if (length(unique(lab[k])) < 2) return(NA_real_)
   as.numeric(auc(roc(lab[k], score[k], direction = "<", quiet = TRUE)))
 }
+# The self-contained AUC. Positives are a threshold on this contrast's own outcome and negatives
+# are every other held-out gene, so it needs no external gene set and is comparable across
+# knockdowns and timepoints. This is the AUC reported.
+#
+# The screened-comparator version is kept below for continuity with notebook 02, but it is NOT
+# the headline: its negatives are genes selected for having no effect, a pool measured to be
+# GC-enriched by +2.45 (Wilcoxon p = 2.7e-17), which inflates it (0.806 against 0.721 here).
 bridge <- tibble(
-  label   = c("geneset", "threshold"),
+  # row 1 = against the screened negative controls; row 2 = against every other held-out gene.
+  label   = c("vs_screened_controls", "vs_all_other_genes"),
   n_pos   = c(sum(br$lab_geneset == 1, na.rm = TRUE), sum(br$lab_thresh == 1)),
   n_neg   = c(sum(br$lab_geneset == 0, na.rm = TRUE), sum(br$lab_thresh == 0)),
   auc     = c(auc_of(br$lab_geneset, br$pred), auc_of(br$lab_thresh, br$pred)),
@@ -1607,12 +1798,34 @@ perf <- bind_rows(
   if (isTRUE(params$run_cv)) tibble(
     metric = c("cv_spearman_mean", "cv_spearman_sd", "cv_pearson_mean", "cv_rmse_mean"),
     value  = c(mean(cv$spearman), sd(cv$spearman), mean(cv$pearson), mean(cv$rmse))) else NULL,
-  if (isTRUE(params$auc_bridge)) tibble(
-    metric = c("bridge_auc_geneset", "bridge_ceiling_geneset", "bridge_auc_threshold",
-               "bridge_ceiling_threshold", "bridge_n_pos", "bridge_n_neg",
-               "matched_gene_auc", "n_matched_genes"),
-    value  = c(bridge$auc[1], bridge$ceiling[1], bridge$auc[2], bridge$ceiling[2],
-               bridge$n_pos[1], bridge$n_neg[1], matched_auc, n_matched)) else NULL,
+  # Written as a tribble so each metric NAME is bound to its value on the same row. The previous
+  # two-parallel-vector form silently desynced - 10 names against 12 values - and the run failed
+  # with "Tibble columns must have compatible sizes" rather than writing a wrong number, which
+  # was lucky. A tribble cannot desync.
+  #
+  # Two AUCs, named for their comparator, because that is the whole difference between them.
+  # Both define positives identically: outcome > the lfc cut AND padj < 0.05, on held-out genes.
+  #   auc                     positives vs every OTHER held-out gene. Self-contained: needs no
+  #                           external gene set, so it is comparable across knockdowns and
+  #                           timepoints. This is the one reported.
+  #   auc_vs_screened_ctrl    positives vs notebook 02's screened negative controls - genes
+  #                           selected for having NO effect. That pool is not a neutral sample:
+  #                           it is GC-enriched by +2.45 (Wilcoxon p = 2.7e-17), which inflates
+  #                           the number (0.806 against 0.721 at si3d hypoxia 1hr). Kept only
+  #                           for continuity with 02_; do not compare it across contrasts.
+  if (isTRUE(params$auc_bridge)) tibble::tribble(
+    ~metric,                    ~value,
+    "auc",                       bridge$auc[2],
+    "auc_ceiling",               bridge$ceiling[2],
+    "auc_n_pos",                 bridge$n_pos[2],
+    "auc_n_neg",                 bridge$n_neg[2],
+    "auc_vs_screened_ctrl",      bridge$auc[1],
+    "auc_vs_screened_ceiling",   bridge$ceiling[1],
+    "auc_vs_screened_n_pos",     bridge$n_pos[1],
+    "auc_vs_screened_n_neg",     bridge$n_neg[1],
+    "matched_gene_auc",          matched_auc,
+    "n_matched_genes",           as.numeric(n_matched)
+  ) else NULL,
   if (exists("perm_metrics")) perm_metrics else NULL,
   tibble(metric = "split_seed", value = SPLIT_SEED),
   tibble(metric = "forest_seed", value = FOREST_SEED)

@@ -21,6 +21,20 @@ params:
   explain_n: 200
   explain_sizes: "50,100,200,400"
   run_interactions: FALSE
+  # Which estimator turns the fitted model into per-feature contributions.
+  #   "treeshap"   - exact Shapley values of a SURROGATE regression forest (Checks A and B).
+  #   "kernelshap" - approximate Shapley values of the ACTUAL probability forest. No surrogate,
+  #                  so no fidelity apparatus; the discretionary choice moves to kernel_bg_n.
+  # Outputs are suffixed with the engine unless it is treeshap, so the two never overwrite.
+  shap_engine: "treeshap"
+  kernel_bg_n: 100
+  # A full kernelshap knit explains ~1,200 genes and takes ~30 min. Caching keyed on the exact
+  # gene set makes a re-knit for a plot change free. TreeSHAP is seconds and is never cached,
+  # so its path stays byte-for-byte what it was.
+  use_shap_cache: TRUE
+  # Section 7b single-gene panel. Empty = the positive whose total lift is closest to the
+  # median, so the "representative" gene is chosen by rule rather than picked.
+  force_gene: ""
   save_shap_plots: TRUE
   corr_group_threshold: 0.8
   cluster_k_max: 6
@@ -102,8 +116,17 @@ feature_cols <- md$feature_cols
 train_data   <- md$train
 test_data    <- md$test
 ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+# Engine-independent, so it lives here rather than in the surrogate chunk - which is gated off
+# under kernelshap, and took section 7 down with it when this was defined there.
+y_train <- as.integer(train_data$eif3d_target == md$pos_label)
 
-cat("Model:", suffix, "\n")
+# suffix identifies the MODEL, so it is what locates 02_'s saved files and must not carry the
+# engine. out_suffix identifies this notebook's OUTPUTS and does, so a kernelshap run cannot
+# silently overwrite the treeshap run's CSVs and plots - the same failure neg_tag guards.
+out_suffix <- paste0(suffix, if (params$shap_engine != "treeshap")
+                               paste0("_", params$shap_engine) else "")
+stopifnot("unknown shap_engine" = params$shap_engine %in% c("treeshap", "kernelshap"))
+cat("Model:", suffix, "| engine:", params$shap_engine, "\n")
 cat("  treetype:", rf_prob$treetype, "| num.trees:", rf_prob$num.trees,
     "| mtry:", rf_prob$mtry, "| min.node.size:", rf_prob$min.node.size, "\n")
 cat("  train:", nrow(train_data), " test:", nrow(test_data),
@@ -119,9 +142,7 @@ surrogate *regression* forest on the same 0/1 target and the same rows. Its hype
 `floor(sqrt(p))` for probability but `floor(p/3)` for regression). Assuming them would explain
 a different model and every number below would be confidently wrong.
 
-```{r surrogate}
-y_train <- as.integer(train_data$eif3d_target == md$pos_label)
-
+```{r surrogate, eval = params$shap_engine == "treeshap"}
 fit_surrogate <- function(mtry, min.node.size) {
   set.seed(9)
   ranger(x = train_data[, feature_cols], y = y_train,
@@ -146,7 +167,7 @@ cat("Check A passed: surrogate config matches the 02 model structurally\n")
 other feature sets". Measuring it here rather than inheriting it shows the design does **not**
 transfer, in two ways worth recording.
 
-```{r fidelity}
+```{r fidelity, eval = params$shap_engine == "treeshap"}
 pred_prob <- predict(rf_prob, data = test_data[, feature_cols])$predictions
 pred_prob <- if (is.matrix(pred_prob)) pred_prob[, md$pos_label] else pred_prob
 
@@ -183,7 +204,7 @@ separation. Here every value from 1 to 25 lands within a few percent of the corr
 it can actually discriminate**, and `min.node.size` is guarded by Check A's structural equality
 instead. Claiming otherwise would be the same unexamined transfer this fork exists to catch.
 
-```{r fidelity_assert}
+```{r fidelity_assert, eval = params$shap_engine == "treeshap"}
 rmse_of <- function(lbl) configs$rmse[configs$label == lbl]
 dev_correct <- rmse_of("matched (correct)")
 dev_mtry    <- min(configs$rmse[configs$kind == "mtry"])
@@ -223,6 +244,67 @@ stopifnot(
 cat("Check B passed on the absolute requirement.\n")
 ```
 
+# 2b. One entry point per engine
+
+Everything below calls `shap_of()` and `predict_of()` and never touches an engine directly, so
+the rest of the notebook - tables, families, beeswarm, force plots, subgroups - is identical
+either way. Adding an engine means adding a branch here and changing nothing else.
+
+Kernel SHAP's discretionary choice is the **background set**: the reference genes whose values
+stand in for a feature being "absent". It replaces the surrogate as the thing that has to be
+justified, and it also sets the baseline every force plot is drawn from, so it is seeded and
+its size is recorded rather than left implicit.
+
+Cost is the other asymmetry. TreeSHAP is seconds; kernel SHAP is ~4.8 min per 200 genes on this
+model, and this notebook explains three sets (the explain set, all held-out positives, and four
+nested sizes for the stability check), so a full kernel run is roughly half an hour. Kernel SHAP
+also has no interaction values, which is asserted rather than silently ignored.
+
+```{r engine}
+if (params$shap_engine == "treeshap") {
+  unified    <- ranger.unify(rf_shap, as.data.frame(train_data[, feature_cols]))
+  shap_of    <- function(X, interactions = FALSE)
+    list(shaps = treeshap(unified, as.data.frame(X)[, feature_cols],
+                          interactions = interactions, verbose = FALSE)$shaps[, feature_cols])
+  predict_of <- function(X) predict(rf_shap, data = as.data.frame(X))$predictions
+  cat("engine: TreeSHAP on the surrogate regression forest\n")
+} else {
+  library(kernelshap)
+  pred_fun <- function(m, newdata) predict(m, data = newdata)$predictions[, md$pos_label]
+  set.seed(9)
+  bg_X <- as.data.frame(train_data[sample(nrow(train_data),
+                                          min(params$kernel_bg_n, nrow(train_data))),
+                                   feature_cols])
+  # Keyed on the gene set AND the background, so changing either invalidates the entry rather
+  # than silently returning values computed for a different question.
+  cache_file <- file.path(out_dir, paste0("shap_engine_cache_", out_suffix, ".rds"))
+  shap_cache <- if (params$use_shap_cache && file.exists(cache_file))
+                  readRDS(cache_file) else list()
+  shap_of <- function(X, interactions = FALSE) {
+    if (interactions)
+      stop("kernelshap produces no SHAP interaction values - set run_interactions = FALSE")
+    Xd  <- as.data.frame(X)[, feature_cols]
+    key <- rlang::hash(list(Xd, bg_X))
+    if (!is.null(shap_cache[[key]])) {
+      cat("  kernelshap: reusing cached values for", nrow(Xd), "genes\n")
+      return(list(shaps = shap_cache[[key]]))
+    }
+    t0 <- Sys.time()
+    ks <- kernelshap(rf_prob, X = Xd, bg_X = bg_X, pred_fun = pred_fun, verbose = FALSE)
+    stopifnot("kernelshap did not converge for every gene" = all(ks$converged))
+    S <- as.data.frame(as.matrix(ks$S)[, feature_cols, drop = FALSE])
+    cat(sprintf("  kernelshap: %d genes in %.1f min\n", nrow(Xd),
+                as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+    shap_cache[[key]] <<- S
+    if (params$use_shap_cache) saveRDS(shap_cache, cache_file)
+    list(shaps = S)
+  }
+  predict_of <- function(X) pred_fun(rf_prob, as.data.frame(X)[, feature_cols])
+  cat("engine: Kernel SHAP on the probability forest |",
+      nrow(bg_X), "background genes (seed 9)\n")
+}
+```
+
 # 3. SHAP
 
 ```{r shap}
@@ -231,9 +313,7 @@ set.seed(9)
 explain_idx <- sample(nrow(test_data), explain_n)
 explain_set <- as.data.frame(test_data[explain_idx, feature_cols])
 
-unified   <- ranger.unify(rf_shap, as.data.frame(train_data[, feature_cols]))
-shap_out  <- treeshap(unified, explain_set, interactions = params$run_interactions,
-                      verbose = FALSE)
+shap_out  <- shap_of(explain_set, interactions = params$run_interactions)
 shap_vals <- as.data.frame(shap_out$shaps)
 stopifnot("SHAP matrix does not match the explain set" =
             nrow(shap_vals) == explain_n && ncol(shap_vals) == length(feature_cols))
@@ -327,7 +407,7 @@ p_fs <- ggplot(cmp_p, aes(imp_share, shap_share, colour = family)) +
        subtitle = "dashed line = perfect agreement; labelled points are the 8 largest rank shifts") +
   theme_classic(base_size = 12)
 print(p_fs)
-ggsave(here("plots", paste0("03_impurity_vs_shap_", suffix, ".pdf")), p_fs,
+ggsave(here("plots", paste0("03_impurity_vs_shap_", out_suffix, ".pdf")), p_fs,
        width = 7.5, height = 5.5)
 
 cat("\nLargest rank shifts (positive = impurity ranks it LOWER than SHAP does):\n")
@@ -372,7 +452,7 @@ pb <- feat_slope(movers, "(b) Top 20 movers between the two methods",
                          nrow(cmp_p)))
 print(cowplot::plot_grid(pa, pb, nrow = 1))
 if (params$save_shap_plots)
-  ggsave(here("plots", paste0("03_feature_slope_impurity_vs_shap_", suffix, ".pdf")),
+  ggsave(here("plots", paste0("03_feature_slope_impurity_vs_shap_", out_suffix, ".pdf")),
          cowplot::plot_grid(pa, pb, nrow = 1), width = 11, height = 7)
 
 cat("\nThe movers, with their actual importance:\n")
@@ -402,7 +482,7 @@ p_fam <- ggplot(slope, aes(method, share, group = family)) +
                           nrow(cmp_p))) +
   theme_classic(base_size = 12)
 print(p_fam)
-ggsave(here("plots", paste0("03_family_impurity_vs_shap_", suffix, ".pdf")), p_fam,
+ggsave(here("plots", paste0("03_family_impurity_vs_shap_", out_suffix, ".pdf")), p_fam,
        width = 6.5, height = 5)
 ```
 
@@ -426,7 +506,7 @@ p_bee <- sv_importance(sv, kind = "beeswarm", max_display = 25) +
   theme_classic(base_size = 10)
 print(p_bee)
 if (params$save_shap_plots)
-  ggsave(here("plots", paste0("03_beeswarm_", suffix, ".pdf")), p_bee, width = 8, height = 9)
+  ggsave(here("plots", paste0("03_beeswarm_", out_suffix, ".pdf")), p_bee, width = 8, height = 9)
 ```
 
 ```{r fig_dependence, fig.width = 10, fig.height = 6.5, eval = !params$sweep_mode}
@@ -437,7 +517,7 @@ deps <- lapply(top6, function(f)
   sv_dependence(sv, v = f, color_var = NULL) + theme_classic(base_size = 9))
 print(cowplot::plot_grid(plotlist = deps, nrow = 2))
 if (params$save_shap_plots)
-  ggsave(here("plots", paste0("03_dependence_", suffix, ".pdf")),
+  ggsave(here("plots", paste0("03_dependence_", out_suffix, ".pdf")),
          cowplot::plot_grid(plotlist = deps, nrow = 2), width = 10, height = 6.5)
 ```
 
@@ -514,10 +594,10 @@ p_sign <- signed %>%
         plot.caption.position = "plot")
 print(p_sign)
 if (params$save_shap_plots)
-  ggsave(here("plots", paste0("03_signed_column_", suffix, ".pdf")), p_sign,
+  ggsave(here("plots", paste0("03_signed_column_", out_suffix, ".pdf")), p_sign,
          width = 7.5, height = 12)
 
-write_csv(signed, file.path(out_dir, paste0("shap_signed_positive_", suffix, ".csv")))
+write_csv(signed, file.path(out_dir, paste0("shap_signed_positive_", out_suffix, ".csv")))
 ```
 
 ## Comparing this across experiments: scale, do not z-score
@@ -626,10 +706,10 @@ p_grp <- ggplot(top_grp, aes(lab, group_share)) +
   theme_classic(base_size = 11)
 print(p_grp)
 if (params$save_shap_plots)
-  ggsave(here("plots", paste0("03_shap_corr_groups_", suffix, ".pdf")), p_grp,
+  ggsave(here("plots", paste0("03_shap_corr_groups_", out_suffix, ".pdf")), p_grp,
          width = 8, height = 5.5)
 
-write_csv(grp_tbl, file.path(out_dir, paste0("shap_corr_groups_", suffix, ".csv")))
+write_csv(grp_tbl, file.path(out_dir, paste0("shap_corr_groups_", out_suffix, ".csv")))
 ```
 
 **Reading it.** Where the correlation grouping and the family grouping agree, the family view is
@@ -650,8 +730,7 @@ sizes <- sizes[sizes <= nrow(test_data)]
 fam_at <- function(n) {
   set.seed(9)
   idx <- sample(nrow(test_data), n)
-  sv  <- as.data.frame(treeshap(unified, as.data.frame(test_data[idx, feature_cols]),
-                                interactions = FALSE, verbose = FALSE)$shaps)
+  sv  <- as.data.frame(shap_of(as.data.frame(test_data[idx, feature_cols]))$shaps)
   tibble(feature = feature_cols, mas = colMeans(abs(sv))) %>%
     left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
     group_by(family) %>% summarise(share = sum(mas), .groups = "drop") %>%
@@ -690,8 +769,7 @@ pos_test <- which(test_data$eif3d_target == md$pos_label)
 cat("Positive-class genes in the held-out set:", length(pos_test), "\n")
 
 pos_x    <- as.data.frame(test_data[pos_test, feature_cols])
-shap_pos <- as.data.frame(treeshap(unified, pos_x, interactions = FALSE,
-                                   verbose = FALSE)$shaps)
+shap_pos <- as.data.frame(shap_of(pos_x)$shaps)
 
 sym_all <- test_data$symbol[pos_test]
 fam_of <- ann$family[match(feature_cols, ann$feature)]
@@ -756,7 +834,7 @@ pheatmap(hm_mat,
          main = sprintf("Per-gene SHAP profile by family (n = %d positive-class genes)",
                         nrow(profile)),
          filename = if (params$save_shap_plots)
-           here("plots", paste0("03_subgroup_heatmap_", suffix, ".pdf")) else NA,
+           here("plots", paste0("03_subgroup_heatmap_", out_suffix, ".pdf")) else NA,
          width = 8, height = 6)
 ```
 
@@ -834,7 +912,7 @@ p_flow <- ggplot(flow %>% filter(Freq > 0)) +
 
 print(cowplot::plot_grid(p_tile, p_flow, nrow = 1, rel_widths = c(1, 1)))
 if (params$save_shap_plots)
-  ggsave(here("plots", paste0("03_resolution_agreement_", suffix, ".pdf")),
+  ggsave(here("plots", paste0("03_resolution_agreement_", out_suffix, ".pdf")),
          cowplot::plot_grid(p_tile, p_flow, nrow = 1), width = 10, height = 4.5)
 ```
 
@@ -863,21 +941,284 @@ subgroups <- tibble(gene_id_clean = gid, symbol = sym, cluster = km$cluster) %>%
   bind_cols(as_tibble(profile))
 ```
 
+# 7. Force plots
+
+A force plot is the **per-instance** view: a bar running from the model's baseline to a
+prediction, with each contribution pushing it right (toward target, vermillion) or left (away,
+blue). The two colours meet exactly at the prediction, which is the decomposition closing in
+front of you - and the only figure here that puts the probability units on screen.
+
+Two things these are not. They are not the cross-experiment summary (that is `signed_share` in
+4a, which is scale-normalised on purpose). And a force plot averaged over genes is no longer
+one instance - both figures below are **means over gene sets**, labelled as such, except the
+single-gene panel in 7b.
+
+Both use the section-6 explain set - **all** held-out positives - rather than the 200-gene
+mixed sample sections 1-5 use, so they describe exactly the genes the subgroups were built
+from. That makes them differ slightly from 4a's column, which is the positives *inside* the
+200 (lift 0.1064 there vs 0.1007 here).
+
+## The baseline is recovered, not assumed
+
+Neither engine returns the intercept its contributions are added to, and **the two engines do
+not share one**. Under TreeSHAP the origin is the surrogate's mean *training* prediction -
+here **0.49940**, so assuming `mean(y_train) = 0.5` would shift every bar below. Under Kernel
+SHAP it is the mean prediction over the background genes, which moves if the background does.
+
+Rather than hardcode either, the baseline is read back out of the decomposition:
+`prediction - sum(SHAP)` must be the same constant for every gene, and that constancy is
+asserted. If it fails, the SHAP values do not belong to these predictions and no force plot
+below means anything. The recovered value is then checked against whichever origin the active
+engine is supposed to have, so a force plot drawn from the wrong one cannot pass quietly.
+
+```{r force_setup, eval = !params$sweep_mode}
+library(ggrepel)
+
+# Standard force-plot geometry. Vermillion fills [f - sum(pos), f] with the largest
+# contribution adjacent to f; blue fills [f, f + |sum(neg)|] likewise. The two therefore meet
+# at f by construction, so the figure cannot show a decomposition that does not close.
+force_layout <- function(values, baseline) {
+  f   <- baseline + sum(values)
+  pos <- sort(values[values > 0], decreasing = TRUE)
+  neg <- sort(values[values < 0])
+  xr  <- f - c(0, cumsum(pos))
+  xb  <- f + c(0, cumsum(abs(neg)))
+  bind_rows(
+    tibble(label = names(pos), value = as.numeric(pos),
+           xmin = xr[-1], xmax = xr[-length(xr)], push = "toward target"),
+    tibble(label = names(neg), value = as.numeric(neg),
+           xmin = xb[-length(xb)], xmax = xb[-1], push = "away from target")
+  ) %>% mutate(fx = f, base = baseline, wid = xmax - xmin)
+}
+push_cols <- c("toward target" = "#D55E00", "away from target" = "#0072B2")
+
+# Baseline, recovered from the decomposition rather than assumed.
+pos_pred <- predict_of(pos_x)
+implied  <- pos_pred - rowSums(shap_pos)
+stopifnot("SHAP values do not close on these predictions - the baseline is not constant" =
+            sd(implied) < 1e-8)
+baseline <- mean(implied)
+cat(sprintf("baseline recovered from the decomposition: %.5f (sd %.1e over %d genes)\n",
+            baseline, sd(implied), length(implied)))
+# What the baseline SHOULD equal differs by engine, so each is checked against its own
+# expectation rather than against a single hardcoded idea of where the origin sits.
+if (params$shap_engine == "treeshap") {
+  cat(sprintf("  the surrogate's mean training prediction. mean(y_train) = %.5f - close, but NOT\n  the intercept; substituting it would shift every force plot below.\n",
+              mean(y_train)))
+} else {
+  bg_mean <- mean(predict_of(bg_X))
+  cat(sprintf("  kernelshap's baseline is the mean prediction over the %d background genes = %.5f\n",
+              nrow(bg_X), bg_mean))
+  stopifnot("kernelshap baseline is not the background mean prediction - the background changed under it" =
+              abs(baseline - bg_mean) < 1e-6)
+}
+
+# Rows aligned to the clustering: section 6 dropped incomplete profiles, so everything here
+# must use the same keep_rows index or cluster labels attach to the wrong genes.
+fam_raw   <- fam_mat[keep_rows, , drop = FALSE]
+shap_keep <- shap_pos[keep_rows, , drop = FALSE]
+real_prob <- predict(rf_prob, test_data[pos_test, feature_cols])$predictions[, md$pos_label][keep_rows]
+stopifnot("force-plot rows are not aligned to the clustering" =
+            nrow(fam_raw) == length(km$cluster) && nrow(shap_keep) == length(km$cluster))
+```
+
+## 7a. Cluster means, at family resolution
+
+Family sums are **exact** (SHAP is additive), which is the same reason section 6 clusters on
+them. Nothing is excluded here: every one of the `r ncol(fam_raw)` families is in the bar, so
+each cluster's bar closes on that cluster's mean prediction.
+
+**This figure changes the reading of section 6.** The profiles clustered there are normalised
+within gene, which removes *magnitude* but not the *sign balance* - and the clusters turn out
+to differ mostly in whether the model believes them at all:
+
+```{r force_cluster_prep, eval = !params$sweep_mode}
+cluster_force <- lapply(sort(unique(km$cluster)), function(k) {
+  force_layout(colMeans(fam_raw[km$cluster == k, , drop = FALSE]), baseline) %>%
+    mutate(cluster = k, n = sum(km$cluster == k),
+           mean_prob = mean(real_prob[km$cluster == k]),
+           frac_called = mean(real_prob[km$cluster == k] > 0.5))
+}) %>% bind_rows()
+
+# Each bar must close on the surrogate's own cluster mean, so additivity is asserted per
+# cluster rather than assumed from the global check.
+for (k in sort(unique(km$cluster)))
+  stopifnot("a cluster bar does not close on its mean prediction" =
+              isTRUE(all.equal(unique(cluster_force$fx[cluster_force$cluster == k]),
+                               mean(pos_pred[keep_rows][km$cluster == k]))))
+
+print(as.data.frame(cluster_force %>% distinct(cluster, n, fx, mean_prob, frac_called) %>%
+        mutate(lift = fx - baseline, across(where(is.numeric), ~ round(., 3)))))
+cat("\nPositives the model calls target overall:",
+    round(mean(real_prob > 0.5), 3), "\n")
+```
+
+```{r fig_force_cluster, fig.width = 9.5, fig.height = 7.5, eval = !params$sweep_mode}
+cf <- cluster_force %>%
+  mutate(panel = fct_reorder(sprintf("cluster %d  (n = %d, mean predicted p = %.2f, %.0f%% called target)",
+                                     cluster, n, mean_prob, 100 * frac_called), cluster))
+thr_a <- 0.04 * max(cf$wid)
+
+p_fc <- ggplot(cf) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = 1, fill = push),
+            colour = "white", linewidth = 0.3) +
+  geom_vline(aes(xintercept = base), linetype = "dashed", colour = "grey40") +
+  geom_segment(aes(x = fx, xend = fx, y = -0.1, yend = 1.1), linewidth = 0.8) +
+  geom_text(data = . %>% distinct(panel, fx),
+            aes(x = fx, y = -0.45, label = sprintf("f = %.3f", fx)),
+            size = 2.8, fontface = "bold") +
+  geom_text_repel(data = . %>% filter(wid >= thr_a),
+                  aes(x = (xmin + xmax) / 2, y = 1, label = sprintf("%s %+.3f", label, value)),
+                  size = 2.4, direction = "y", ylim = c(1.15, 2.7), segment.size = 0.2,
+                  segment.colour = "grey60", min.segment.length = 0, max.overlaps = Inf) +
+  facet_wrap(~ panel, ncol = 1) +
+  ylim(-0.6, 2.8) +
+  scale_fill_manual(values = push_cols, name = NULL) +
+  labs(x = "predicted probability of being an eIF3d target", y = NULL,
+       title = "Mean force plot per SHAP subgroup, family resolution",
+       subtitle = sprintf("Dashed line = model baseline (%.3f). Bars close on each cluster's mean prediction; all %d families included.",
+                          baseline, ncol(fam_raw)),
+       caption = paste(
+         "Read the bars' POSITION, not only their composition. The section-6 profiles are normalised within gene,",
+         "which removes magnitude but not sign balance, so the clusters separate largely by whether the model",
+         "believes the gene at all - cluster 1 sits BELOW baseline and is 45 positives the classifier misses.",
+         "Treat these as a confidence gradient with differing drivers, not three independent mechanisms.",
+         sep = "\n")) +
+  theme_classic(base_size = 10) +
+  theme(axis.line.y = element_blank(), axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(), strip.background = element_blank(),
+        strip.text = element_text(hjust = 0, face = "bold"),
+        plot.caption = element_text(hjust = 0, size = 6.5, colour = "grey30"),
+        plot.caption.position = "plot")
+print(p_fc)
+if (params$save_shap_plots)
+  ggsave(here("plots", paste0("03_force_cluster_", out_suffix, ".pdf")), p_fc,
+         width = 9.5, height = 7.5)
+
+write_csv(cluster_force, file.path(out_dir, paste0("shap_force_cluster_", out_suffix, ".csv")))
+```
+
+## 7b. Feature resolution, sign-unstable features set aside
+
+`03f_` measures, over 20 negative draws, how often each feature's `shap_value_cor` is positive;
+anything strictly between 0.05 and 0.95 has no direction worth reading. Those features are
+**lumped into one grey-free block** rather than deleted, because deleting them would silently
+break additivity and the bar would stop closing on the prediction. The block's net and gross
+are both reported, so a small block is distinguishable from a block that merely cancels.
+
+The list is read from `shap_direction_stability.csv`, which is produced by a 20-seed sweep of
+the **reference experiment**. On a new dataset it must be regenerated (`03d_` then `03f_`) -
+the feature-set match is checked below but a stale *list* on a matching feature set cannot be
+detected, so this is the one place where running a different experiment requires a deliberate
+step rather than a re-knit.
+
+```{r force_features_prep, eval = !params$sweep_mode}
+dir_path <- file.path(out_dir, "shap_direction_stability.csv")
+have_dir <- file.exists(dir_path)
+if (!have_dir)
+  cat("shap_direction_stability.csv not found - run 03d_ then 03f_ first. Section 7b skipped.\n")
+```
+
+```{r force_features, fig.width = 11, fig.height = 8, eval = !params$sweep_mode && file.exists(file.path(out_dir, "shap_direction_stability.csv"))}
+dir_tbl <- read_csv(dir_path, show_col_types = FALSE)
+stopifnot("the direction-stability sweep covers a different feature set than this model - regenerate it with 03d_ and 03f_" =
+            setequal(dir_tbl$feature, feature_cols))
+
+flip   <- dir_tbl %>% filter(frac_pos > 0.05, frac_pos < 0.95) %>% pull(feature)
+stable <- setdiff(feature_cols, flip)
+lump   <- sprintf("%d sign-unstable (lumped)", length(flip))
+cat(sprintf("sign-unstable: %d of %d features\n", length(flip), length(feature_cols)))
+
+# Per family, how much of the attribution sits in features with no readable direction.
+fam_burden <- tibble(feature = feature_cols, family = ann$family[match(feature_cols, ann$feature)],
+                     ma = colMeans(abs(shap_keep)), is_flip = feature_cols %in% flip) %>%
+  group_by(family) %>%
+  summarise(frac_unstable = sum(ma[is_flip]) / sum(ma), .groups = "drop") %>%
+  filter(frac_unstable > 0) %>% arrange(desc(frac_unstable))
+cat("\nShare of each family's |SHAP| carried by sign-unstable features:\n")
+print(as.data.frame(fam_burden %>% mutate(frac_unstable = round(frac_unstable, 3))))
+cat("\nDo not give a family a directional reading where this is large;",
+    "polya_track is 100% and has no readable direction at all.\n")
+
+with_lump <- function(v) force_layout(c(v[stable], setNames(sum(v[flip]), lump)), baseline)
+
+mean_signed_pos <- colMeans(shap_keep)
+lift <- rowSums(shap_keep)
+gi   <- if (nzchar(params$force_gene)) which(sym_keep == params$force_gene)[1] else
+          which.min(abs(lift - median(lift)))
+stopifnot("force_gene not found among the held-out positives" = !is.na(gi))
+cat(sprintf("\nSingle-gene panel: %s (lift %+.4f; median positive lift %+.4f)\n",
+            sym_keep[gi], lift[gi], median(lift)))
+cat(sprintf("lumped block: net %+.5f, gross %.5f of a %.5f total lift\n",
+            sum(mean_signed_pos[flip]), sum(abs(mean_signed_pos[flip])), sum(mean_signed_pos)))
+
+lvl <- c(sprintf("mean over all %d held-out positives", nrow(shap_keep)),
+         sprintf("%s  (one gene, predicted p = %.2f)", sym_keep[gi], real_prob[gi]))
+feat_force <- bind_rows(with_lump(mean_signed_pos)          %>% mutate(panel = lvl[1]),
+                        with_lump(unlist(shap_keep[gi, ]))  %>% mutate(panel = lvl[2])) %>%
+  mutate(panel = factor(panel, levels = lvl)) %>%
+  group_by(panel) %>% mutate(thr = 0.028 * sum(wid)) %>% ungroup()
+
+stopifnot("the lumped bar does not close on the prediction" =
+            isTRUE(all.equal(feat_force$fx[feat_force$panel == lvl[1]][1],
+                             baseline + sum(mean_signed_pos))))
+
+p_ff <- ggplot(feat_force) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = 1, fill = push),
+            colour = "white", linewidth = 0.25) +
+  geom_vline(aes(xintercept = base), linetype = "dashed", colour = "grey40") +
+  geom_segment(aes(x = fx, xend = fx, y = -0.1, yend = 1.1), linewidth = 0.8) +
+  geom_text(data = . %>% distinct(panel, fx),
+            aes(x = fx, y = -0.5, label = sprintf("f = %.3f", fx)),
+            size = 2.8, fontface = "bold") +
+  geom_text_repel(data = . %>% filter(wid >= thr),
+                  aes(x = (xmin + xmax) / 2, y = 1, label = sprintf("%s %+.4f", label, value)),
+                  size = 2.1, direction = "y", ylim = c(1.15, 3.4), segment.size = 0.2,
+                  segment.colour = "grey60", min.segment.length = 0, max.overlaps = Inf) +
+  facet_wrap(~ panel, ncol = 1, scales = "free_x") +
+  ylim(-0.7, 3.5) +
+  scale_fill_manual(values = push_cols, name = NULL) +
+  labs(x = "predicted probability of being an eIF3d target", y = NULL,
+       title = sprintf("Force plot over %d direction-stable features", length(stable)),
+       subtitle = sprintf("The %d features whose SHAP direction flips between negative draws are lumped into a single block, not dropped,\nso each bar still closes on its prediction. Segments under 2.8%% of the bar are unlabelled; all values are in the exported CSV.",
+                          length(flip)),
+       caption = paste(
+         "The two panels answer different questions. Averaged over positives (top) nearly every stable feature pushes",
+         "the SAME way and no single one exceeds +0.013 in probability: the model is a broad accumulator, not a",
+         "detector of one or two decisive signals. For an individual gene (bottom) the mix is real - cds_gc pushes",
+         "this gene AWAY from target while its mean over positives pushes toward it. A mean force plot is therefore",
+         "a summary of the model, and a single-gene force plot is the only one that is literally a force plot.",
+         sep = "\n")) +
+  theme_classic(base_size = 10) +
+  theme(axis.line.y = element_blank(), axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(), strip.background = element_blank(),
+        strip.text = element_text(hjust = 0, face = "bold"),
+        plot.caption = element_text(hjust = 0, size = 6.5, colour = "grey30"),
+        plot.caption.position = "plot")
+print(p_ff)
+if (params$save_shap_plots)
+  ggsave(here("plots", paste0("03_force_features_", out_suffix, ".pdf")), p_ff,
+         width = 11, height = 8)
+
+write_csv(feat_force, file.path(out_dir, paste0("shap_force_features_", out_suffix, ".csv")))
+write_csv(fam_burden, file.path(out_dir, paste0("shap_family_unstable_share_", out_suffix, ".csv")))
+```
+
 ```{r export}
-write_csv(shap_tbl, file.path(out_dir, paste0("shap_feature_", suffix, ".csv")))
+write_csv(shap_tbl, file.path(out_dir, paste0("shap_feature_", out_suffix, ".csv")))
 
 # The full per-gene x per-feature matrix. Everything else in this notebook is this object
 # collapsed by averaging down the columns; exporting it lets a gene be interrogated directly.
 if (!params$sweep_mode)
   write_csv(bind_cols(tibble(gene_id_clean = test_data$gene_id_clean[explain_idx],
                              symbol = test_data$symbol[explain_idx]), shap_vals),
-            file.path(out_dir, paste0("shap_per_gene_", suffix, ".csv")))
-write_csv(fam_tbl,  file.path(out_dir, paste0("shap_family_", suffix, ".csv")))
+            file.path(out_dir, paste0("shap_per_gene_", out_suffix, ".csv")))
+write_csv(fam_tbl,  file.path(out_dir, paste0("shap_family_", out_suffix, ".csv")))
 if (!params$sweep_mode) {
-  write_csv(stab,      file.path(out_dir, paste0("shap_explain_stability_", suffix, ".csv")))
-  write_csv(subgroups, file.path(out_dir, paste0("shap_subgroups_", suffix, ".csv")))
-  cat("Wrote 4 SHAP files with suffix:", suffix, "\n")
+  write_csv(stab,      file.path(out_dir, paste0("shap_explain_stability_", out_suffix, ".csv")))
+  write_csv(subgroups, file.path(out_dir, paste0("shap_subgroups_", out_suffix, ".csv")))
+  cat("Wrote 4 SHAP files with suffix:", out_suffix, "\n")
 } else {
-  cat("Wrote 2 SHAP files (sweep_mode) with suffix:", suffix, "\n")
+  cat("Wrote 2 SHAP files (sweep_mode) with suffix:", out_suffix, "\n")
 }
 ```

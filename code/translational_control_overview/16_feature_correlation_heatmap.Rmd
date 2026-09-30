@@ -1,0 +1,259 @@
+---
+title: "Feature-LFC correlation heatmap: features by experiment, no model"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  experiments: "MDA-MB-231 3d hypoxia 1hr=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3d hypoxia 4hr=eif33d_promotes_hypoxia_4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3d hypoxia 24hr=eif33d_promotes_hypoxia_24hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3d normoxia 1+4hr=eif33d_promotes_normoxia_1and4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e hypoxia 1hr=eif33e_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e hypoxia 4hr=eif33e_promotes_hypoxia_4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e hypoxia 24hr=eif33e_promotes_hypoxia_24hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e normoxia 1+4hr=eif33e_promotes_normoxia_1and4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3d hypoxia 1hr=eif33d_promotes_mcf7six1_hypoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3d normoxia 1hr=eif33d_promotes_mcf7six1_normoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3e hypoxia 1hr=eif33e_promotes_mcf7six1_hypoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3e normoxia 1hr=eif33e_promotes_mcf7six1_normoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;HeLa 3d no stress (Herrmannova)=eif33d_promotes_hela_normoxia_steadystate_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;HeLa 3e no stress (Herrmannova)=eif33e_promotes_hela_normoxia_steadystate_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;HEK293T DHX29 IP enrichment (Hia)=eifdhx29_promotes_hek293t_dhx29ip_ribo_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  # Which feature matrix each column's model used, matched on a suffix substring (first match
+  # wins, "" = default). The regression model data does not record the matrix, so this must be
+  # stated; the gene-set and feature-set checks below catch a wrong entry.
+  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;=feature_matrix_tco.rds"
+  fdr: 0.05
+  save_plots: TRUE
+  out_tag: ""
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "16_feature_correlation_heatmap.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+The model-free counterpart to `15_shap_heatmap.Rmd`: **features as rows, experiments as
+columns**, and each cell is the **Spearman rho between that feature and that experiment's LFC**
+across genes. No random forest and no SHAP.
+
+The two heatmaps answer different questions, which is why this one exists:
+
+- **SHAP** credits a feature *in the presence of every other feature*. When two features carry the
+  same signal, the model splits it between them or gives it to one.
+- **rho** is *marginal*: what the feature tracks on its own. A feature can correlate strongly with
+  the LFC and still receive little SHAP credit because a correlated feature carries it in the model.
+  Where the two heatmaps disagree is the informative part.
+
+**Decisions**
+
+- **Same columns, genes and transcripts as the SHAP heatmap.** The `experiments` param has the
+  same format. Each column's genes are read from that regression's saved model data, so a
+  correlation is computed on exactly the genes behind that column's SHAP values, and its feature
+  values come from the same matrix that model used.
+- **Raw feature values, not the model's imputed ones.** Each correlation uses the genes where the
+  feature is measured; n is reported per cell.
+- **Sign convention matches everything else:** the LFC is oriented so positive = the factor
+  promotes (log2 control / knockdown). Positive rho = higher feature value, more promoted - read it
+  like the SHAP direction colour.
+- **Colour is rho itself** (diverging, -1 to +1), never the p-value. A cell whose correlation is
+  **not significant** (Benjamini-Hochberg over the whole grid) is **left uncoloured** (white, no
+  number). At n ~ 10,000 even |rho| ~ 0.03 clears the bar, so among coloured cells the colour
+  intensity is what carries effect size.
+- **Intrinsic features only; individual features, grouped by family.** Correlations cannot be
+  summed within a family the way SHAP shares can, so there is no family-level panel.
+- **The column annotation is the gene count n**, not a model rho. The SHAP heatmap's grey "rho"
+  track is model performance and has no counterpart here.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(pheatmap)
+library(grid)
+```
+
+# Load
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+parse_pairs <- function(s) {
+  parts <- str_trim(str_split(s, ";")[[1]]); parts <- parts[nzchar(parts)]
+  tibble(key = str_trim(str_replace(parts, "=.*$", "")),
+         val = str_trim(str_replace(parts, "^[^=]*=", "")))
+}
+exps <- parse_pairs(params$experiments) %>% dplyr::rename(label = key, suffix = val)
+mmap <- parse_pairs(params$matrix_map)
+matrix_for <- function(suffix) {
+  hit <- mmap %>% filter(key == "" | str_detect(suffix, fixed(key)))
+  hit$val[1]
+}
+exps <- exps %>% mutate(matrix_rds = map_chr(suffix, matrix_for))
+stopifnot("an experiment label is duplicated" = !any(duplicated(exps$label)),
+          "a column has no matrix" = !any(is.na(exps$matrix_rds)))
+print(as.data.frame(exps %>% dplyr::select(label, matrix_rds)), row.names = FALSE)
+
+annotation <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+matrices <- set_names(unique(exps$matrix_rds)) %>% map(~ readRDS(file.path(out_dir, .x)))
+walk(matrices, ~ stopifnot("a feature matrix is not one transcript per gene" =
+                              !any(duplicated(.x$gene_id_clean))))
+```
+
+# Correlate
+
+For each column: the modelled genes and their LFC (`y`, before any target transform) from the
+regression's saved model data, joined to raw feature values from that column's matrix.
+
+```{r correlate}
+one_column <- function(label, suffix, matrix_rds) {
+  md <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", suffix, ".rds")))
+  genes <- bind_rows(md$train %>% dplyr::select(gene_id_clean, y),
+                     md$test  %>% dplyr::select(gene_id_clean, y))
+  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(genes$gene_id_clean)),
+            "model-data y is not finite" = all(is.finite(genes$y)))
+  fm <- matrices[[matrix_rds]]
+  stopifnot("a modelled feature is missing from the matrix this column is mapped to" =
+              all(md$feature_cols %in% names(fm)),
+            "a modelled gene is missing from the matrix this column is mapped to" =
+              all(genes$gene_id_clean %in% fm$gene_id_clean))
+  x <- fm[match(genes$gene_id_clean, fm$gene_id_clean), md$feature_cols, drop = FALSE]
+  map_dfr(md$feature_cols, function(f) {
+    v <- as.numeric(unlist(x[[f]])); k <- is.finite(v)
+    ct <- suppressWarnings(cor.test(v[k], genes$y[k], method = "spearman", exact = FALSE))
+    tibble(experiment = label, feature = f, rho = unname(ct$estimate), p = ct$p.value, n = sum(k))
+  }) %>% mutate(n_genes = nrow(genes))
+}
+long <- pmap_dfr(list(exps$label, exps$suffix, exps$matrix_rds), one_column)
+
+# Same feature SET in every column, or a row means different things in different columns.
+sets <- split(long$feature, long$experiment)
+stopifnot("columns do not share one feature set" =
+            all(map_lgl(sets, ~ setequal(.x, sets[[1]]))))
+long <- long %>% mutate(fdr = p.adjust(p, method = "BH"), sig = fdr < params$fdr) %>%
+  left_join(annotation %>% dplyr::select(feature, family), by = "feature")
+stopifnot("a feature has no family" = !any(is.na(long$family)),
+          "a correlation is not finite" = all(is.finite(long$rho)))
+
+long %>% group_by(experiment) %>%
+  summarise(n_genes = first(n_genes), min_n = min(n), features = n(),
+            significant = sum(sig), max_abs_rho = max(abs(rho)), .groups = "drop") %>%
+  arrange(match(experiment, exps$label)) %>% as.data.frame() %>% print(row.names = FALSE)
+```
+
+# Heatmap
+
+Rows are grouped by family (families ordered by their largest |rho| anywhere) and, within a
+family, by mean |rho|. Columns are clustered on their full rho profiles, so masking does not change
+the column order. Colour and the printed number are rho; **white, unnumbered cells are not
+significant** at the chosen FDR.
+
+```{r heatmap, fig.width = 13, fig.height = 13}
+M  <- long %>% dplyr::select(feature, experiment, rho) %>%
+  pivot_wider(names_from = experiment, values_from = rho) %>% column_to_rownames("feature") %>%
+  as.matrix()
+M  <- M[, exps$label, drop = FALSE]
+S  <- long %>% dplyr::select(feature, experiment, sig) %>%
+  pivot_wider(names_from = experiment, values_from = sig) %>% column_to_rownames("feature") %>%
+  as.matrix()
+S  <- S[rownames(M), colnames(M), drop = FALSE]
+
+fam <- long %>% distinct(feature, family)
+fam_order <- long %>% group_by(family) %>% summarise(m = max(abs(rho)), .groups = "drop") %>%
+  arrange(desc(m)) %>% pull(family)
+row_order <- long %>% group_by(feature) %>% summarise(m = mean(abs(rho)), .groups = "drop") %>%
+  left_join(fam, by = "feature") %>%
+  arrange(match(family, fam_order), desc(m)) %>% pull(feature)
+M <- M[row_order, , drop = FALSE]; S <- S[row_order, , drop = FALSE]
+gaps <- which(diff(match(fam$family[match(row_order, fam$feature)], fam_order)) != 0)
+
+lab <- matrix(sprintf("%.2f", M), nrow(M), dimnames = dimnames(M))
+lab[!S] <- ""                           # not significant: no number
+Mp <- M; Mp[!S] <- NA                   # ...and no colour (na_col)
+col_hc <- if (ncol(M) > 2) hclust(dist(t(M))) else FALSE   # clustered on UNMASKED rho
+cat(sprintf("coloured (significant) cells: %d of %d\n", sum(S), length(S)))
+
+meta <- exps %>% transmute(
+  experiment = label,
+  `cell line` = case_when(str_detect(suffix, "_hek293t_") ~ "HEK293T",
+                          str_detect(suffix, "_hela_")    ~ "HeLa",
+                          str_detect(suffix, "mcf7six1")  ~ "MCF7-SIX1",
+                          TRUE                            ~ "MDA-MB-231"),
+  `initiation factor` = case_when(str_detect(suffix, "^eifdhx29_") ~ "DHX29",
+                                  str_detect(suffix, "^eif33e_")   ~ "eIF3e", TRUE ~ "eIF3d"),
+  condition = case_when(str_detect(suffix, "_hela_|_dhx29ip_") ~ "no stress",
+                        str_detect(suffix, "_hypoxia_")  ~ "hypoxia",
+                        str_detect(suffix, "_normoxia_") ~ "normoxia",
+                        TRUE                             ~ "other")) %>%
+  left_join(long %>% distinct(experiment, n_genes), by = "experiment") %>%
+  column_to_rownames("experiment")
+anno_colors <- list(
+  `cell line` = c(`MDA-MB-231` = "#F0E442", `MCF7-SIX1` = "#661100", HeLa = "#999933",
+                  HEK293T = "#44AA99")[unique(meta$`cell line`)],
+  `initiation factor` = c(eIF3d = "#E69F00", eIF3e = "#56B4E9",
+                          DHX29 = "#882255")[unique(meta$`initiation factor`)],
+  condition = c(hypoxia = "#CC79A7", normoxia = "#009E73", `no stress` = "#009E73",
+                other = "grey60")[unique(meta$condition)],
+  n_genes = colorRampPalette(c("grey93", "grey20"))(100))
+row_anno <- data.frame(family = fam$family[match(rownames(M), fam$feature)], row.names = rownames(M))
+
+lim <- max(abs(M)); brk <- seq(-lim, lim, length.out = 101)
+hm <- pheatmap(Mp, na_col = "white", color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(100), breaks = brk,
+               cluster_rows = FALSE, cluster_cols = col_hc, gaps_row = gaps,
+               display_numbers = lab, number_color = "grey15", fontsize_number = 6,
+               annotation_col = meta, annotation_row = row_anno, annotation_colors = anno_colors,
+               main = paste0("Spearman rho, feature vs LFC (intrinsic features; white = not significant, BH FDR >= ",
+                             params$fdr, ")"),
+               fontsize_row = 7, fontsize_col = 8, angle_col = 90, silent = TRUE)
+grid.newpage(); grid.draw(hm$gtable)
+tag <- if (nzchar(params$out_tag)) paste0("_", params$out_tag) else ""
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("16_feature_lfc_correlation_heatmap", tag, ".pdf")), hm$gtable,
+         width = 13, height = 13)
+```
+
+# How often does the model agree with the marginal correlation?
+
+For each column: across its features, the correlation between rho and the SHAP direction
+(`shap_value_cor`, the correlation of a feature's value with its own SHAP value), and the number of
+features whose signs agree among the ten with the largest SHAP share. A feature can disagree for a
+good reason - the model may use it conditionally on a correlated feature - so this is a
+description, not a check.
+
+```{r agreement, fig.width = 11, fig.height = 5}
+shap <- pmap_dfr(list(exps$label, exps$suffix), function(label, suffix) {
+  f <- file.path(out_dir, paste0("shapreg_feature_", suffix, ".csv"))
+  if (!file.exists(f)) return(NULL)
+  read_csv(f, show_col_types = FALSE) %>%
+    transmute(experiment = label, feature, share = share_pct, direction = shap_value_cor)
+})
+both <- long %>% inner_join(shap, by = c("experiment", "feature"))
+agree <- both %>% group_by(experiment) %>%
+  summarise(n_features = n(),
+            r_rho_vs_direction = cor(rho, direction, use = "complete.obs"),
+            top10_same_sign = sum(sign(rho[order(-share)][1:10]) == sign(direction[order(-share)][1:10])),
+            .groups = "drop") %>% arrange(match(experiment, exps$label))
+print(as.data.frame(agree %>% mutate(r_rho_vs_direction = round(r_rho_vs_direction, 2))), row.names = FALSE)
+
+p <- ggplot(both, aes(abs(rho), share, colour = family)) +
+  geom_point(size = 1.4, alpha = 0.8) +
+  facet_wrap(~ experiment, ncol = 7) +
+  labs(x = "|Spearman rho|, feature vs LFC", y = "SHAP share (%)",
+       title = "Marginal correlation vs model credit",
+       subtitle = paste0("Upper-left: model credit without a marginal signal; lower-right: marginal ",
+                         "signal the model gives to something else. n features = ",
+                         n_distinct(both$feature), " per panel")) +
+  theme_classic(base_size = 9) + theme(legend.position = "bottom")
+print(p)
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("16_rho_vs_shap_share", tag, ".pdf")), p, width = 14, height = 6)
+```
+
+```{r write}
+write_csv(long, file.path(out_dir, paste0("feature_lfc_correlation", tag, ".csv")))
+cat("wrote", paste0("feature_lfc_correlation", tag, ".csv"), "-", nrow(long), "rows\n")
+```
+
+```{r session}
+sessionInfo()
+```

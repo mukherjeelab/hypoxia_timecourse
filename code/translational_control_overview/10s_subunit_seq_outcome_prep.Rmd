@@ -1,0 +1,272 @@
+---
+title: "Subunit-seq outcome prep: eIF3d cap-binding enrichment from deposited RPKM"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  src_dir: "accessories/subunit_seq"
+  matrix_rds: "feature_matrix_tco.rds"
+  min_input_rpkm: 1
+  pseudocount: 0.1
+  min_sep: 0.3
+  write_outputs: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10s_subunit_seq_outcome_prep.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Builds five eIF3d cap-binding outcomes for `10_rf_regression.Rmd`, from the per-sample RPKM the
+two subunit-seq studies deposited on GEO. They feed a **separate** heatmap, never the combined
+TE heatmap. The full background, and every caveat below, is in `CAP_BINDING_DATA.md`.
+
+| outcome | study | quantity |
+|---|---|---|
+| `cm` | Lamper 2020, GSE158249 | log2(IP / input), complete media |
+| `glu` | Lamper 2020 | log2(IP / input), glucose deprivation |
+| `tg` | Mukhopadhyay 2023, GSE236188 | log2(IP / input), thapsigargin |
+| `gluvscm` | Lamper 2020 | glu minus cm: stress-specific binding (their fig. S4F quantity, extended to all genes) |
+| `tgvsdmso` | Mukhopadhyay 2023 | tg minus DMSO |
+
+**Caveats that travel with every result from these outcomes**
+
+- **Provisional: must be rerun from the raw reads.** The papers ran DESeq2 on counts; only RPKM was
+  deposited, and RPKM cannot be turned back into counts. So there is no padj, no standard error
+  and no count-based noise model here, and the expression filter is RPKM-based rather than the
+  papers' read-count filter (>= 50 / >= 60 input reads), which selects a different gene
+  population. Reprocessing SRA (SRP284032; GSE236188) with DESeq2 is the proper version.
+- **Raw enrichment is length-confounded.** log2(IP / input) tracks transcript length at Spearman
+  0.58-0.78, and neither study sequenced a background IP (IgG or untagged) that could separate
+  eIF3d binding from pull-down background. The stress ratios cancel whatever capture bias the two
+  conditions share.
+- **Gene level, HEK293T.** The data carry no transcript IDs; the model uses MDA-MB-231's dominant
+  isoform for each gene.
+- The positive sets used for `10_`'s spot-check are the published hit lists, defined from the same
+  libraries, so that check confirms the join and the sign, not independent biology.
+
+**Decisions**
+
+- Enrichment = mean over the two replicates of log2((IP + 0.1) / (input + 0.1)), RPKM units. The
+  pseudocount was measured to move the length correlation by <= 0.003.
+- A gene enters an outcome only if input RPKM >= 1 in **every** input sample that outcome uses
+  (both replicates; both conditions for a ratio).
+- Ratios subtract per-condition replicate means; replicates are not assumed paired across
+  conditions.
+- Genes whose Ensembl ID appears twice in a Lamper GEO file are dropped, not collapsed (3-4
+  genes, none a published hit). In the Mukhopadhyay files the duplicates are pseudoautosomal
+  X / `_PAR_Y` copies, which are summed.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+```
+
+# 1. Load
+
+```{r load}
+src <- function(f) here(params$src_dir, f)
+stopifnot("a source file is missing" = all(file.exists(src(c(
+  "GSE158249_Complete_RPKM.xlsx", "GSE158249_Glucose_RPKM.xlsx",
+  "GSE236188_SubunitSeqRep1_rpkm.txt.gz", "GSE236188_SubunitSeqRep2_rpkm.txt.gz",
+  "lamper2020_table_s2_cm_hits.xlsx", "lamper2020_table_s3.xlsx",
+  "mukhopadhyay2023_table_s2_tg_hits.xlsx")))))
+
+drop_dups <- function(d, id) {
+  dup <- unique(d[[id]][duplicated(d[[id]])])
+  if (length(dup)) cat("dropping", length(dup), "duplicated ids:", paste(dup, collapse = ", "), "\n")
+  d[!d[[id]] %in% dup, ]
+}
+cm  <- read_excel(src("GSE158249_Complete_RPKM.xlsx")) %>% drop_dups("ensembl_gene_id")
+glu <- read_excel(src("GSE158249_Glucose_RPKM.xlsx"))  %>% drop_dups("ensembl_gene_id")
+# Pseudoautosomal genes appear twice in the Mukhopadhyay files, as the X copy and a `_PAR_Y`
+# copy, with reads split between them (one published hit, ZBED1, is listed under its _PAR_Y id
+# and its X copy is all zeros). The two copies have the same length, so their RPKMs add to the
+# gene's total. isr_raw keeps the exact ids for the replication check; isr is per gene.
+isr_raw <- inner_join(read.delim(gzfile(src("GSE236188_SubunitSeqRep1_rpkm.txt.gz"))),
+                      read.delim(gzfile(src("GSE236188_SubunitSeqRep2_rpkm.txt.gz"))), by = "Gene")
+stopifnot("an ISR gene id is duplicated beyond the X / PAR_Y pair" = !any(duplicated(isr_raw$Gene)))
+isr <- isr_raw %>% mutate(ensembl_gene_id = sub("[.].*", "", Gene)) %>%
+  group_by(ensembl_gene_id) %>% summarise(across(where(is.numeric), sum), .groups = "drop")
+cat("ISR: summed", nrow(isr_raw) - nrow(isr), "PAR_Y copies into their X-copy gene\n")
+s3 <- read_excel(src("lamper2020_table_s3.xlsx")) %>%
+  mutate(across(c(log2FoldChange_CM, padj_CM, log2FoldChange_Glu, padj_Glu),
+                ~ suppressWarnings(as.numeric(.x))))
+s2_cm <- read_excel(src("lamper2020_table_s2_cm_hits.xlsx"))
+s2_tg <- read_excel(src("mukhopadhyay2023_table_s2_tg_hits.xlsx"))
+
+stopifnot("GEO Lamper files are not ~58k genes" = nrow(cm) > 55000 && nrow(glu) > 55000,
+          "GEO Mukhopadhyay files are not ~58k genes" = nrow(isr) > 55000,
+          "unexpected GEO columns" =
+            all(c("CM_In_Rep1", "CM_In_Rep2", "CM_IP_Rep1", "CM_IP_Rep2") %in% names(cm)) &&
+            all(c("Glu_In_Rep1", "Glu_In_Rep2", "Glu_IP_Rep1", "Glu_IP_Rep2") %in% names(glu)) &&
+            all(c("Input_Rep1", "IP_Rep1", "Input_TG_Rep1", "IP_TG_Rep1",
+                  "Input_Rep2", "IP_Rep2", "Input_TG_Rep2", "IP_TG_Rep2") %in% names(isr)))
+cat("GEO genes: CM", nrow(cm), "| GLU", nrow(glu), "| ISR", nrow(isr), "\n")
+```
+
+# 2. Reproduce the papers
+
+```{r replicate_lamper}
+x <- s3 %>% inner_join(cm %>% dplyr::select(-hgnc_symbol), by = "ensembl_gene_id") %>%
+  inner_join(glu %>% dplyr::select(-hgnc_symbol), by = "ensembl_gene_id")
+rel <- function(pub, rec) max(abs(pub - rec) / abs(pub), na.rm = TRUE)
+lam <- tibble(
+  column = c("RPKM_CM_rep1", "RPKM_CM_rep2", "RPKM_GLU_rep1", "RPKM_GLU_rep2"),
+  max_rel_dev = c(rel(x$RPKM_CM_rep1,  x$CM_IP_Rep1  / x$CM_In_Rep1),
+                  rel(x$RPKM_CM_rep2,  x$CM_IP_Rep2  / x$CM_In_Rep2),
+                  rel(x$RPKM_GLU_rep1, x$Glu_IP_Rep1 / x$Glu_In_Rep1),
+                  rel(x$RPKM_GLU_rep2, x$Glu_IP_Rep2 / x$Glu_In_Rep2)))
+knitr::kable(lam, digits = 17)
+hits_glu <- s3$ensembl_gene_id[which(s3$log2FoldChange_Glu > 2 & s3$padj_Glu < 0.005)]
+hits_cm  <- s3$ensembl_gene_id[which(s3$log2FoldChange_CM  > 2 & s3$padj_CM  < 0.005)]
+cat("Lamper hits at padj < 0.005 & log2FC > 2: GLU", length(hits_glu), "| CM", length(hits_cm),
+    "| overlap", length(intersect(hits_glu, hits_cm)), "\n")
+stopifnot(
+  "Table S3 not all found in GEO" = nrow(x) == nrow(s3),
+  "Table S3 IP/input ratios are not reproduced from GEO RPKM" = all(lam$max_rel_dev < 1e-9),
+  # Paper text: "eIF3d binds the 5' cap of 668 transcripts in glucose-deprived HEK293T cells".
+  "GLU hit count is not the paper's 668" = length(hits_glu) == 668,
+  "CM hits are not exactly Table S2" = setequal(hits_cm, s2_cm$ensembl_gene_id),
+  # Table S2's own column flags which CM targets are also GLU targets.
+  "CM/GLU overlap disagrees with Table S2's own flag" =
+    length(intersect(hits_glu, hits_cm)) ==
+      sum(s2_cm$eIF3d_subunit_seq_Glu_deprivation == "eIF3d_glucose_dep_target")
+)
+```
+
+```{r replicate_mukhopadhyay}
+y <- s2_tg %>% inner_join(isr_raw, by = c("ensembl_gene_id" = "Gene"))
+r_tg <- log2((y$IP_TG_Rep1 + y$IP_TG_Rep2) / (y$Input_TG_Rep1 + y$Input_TG_Rep2))
+r_dm <- log2((y$IP_Rep1 + y$IP_Rep2 + 0.01) / (y$Input_Rep1 + y$Input_Rep2 + 0.01))
+cat(sprintf("Table S2 (%d genes) log2FC vs GEO log2(IP_Tg / Input_Tg): r = %.3f; vs DMSO IP/input: r = %.3f\n",
+            nrow(y), cor(y$log2FoldChange, r_tg), cor(y$log2FoldChange, r_dm)))
+stopifnot(
+  "Table S2 genes not all found in GEO by versioned id" = nrow(y) == nrow(s2_tg),
+  "Table S2 is not the thapsigargin IP-over-input contrast" = cor(y$log2FoldChange, r_tg) > 0.9,
+  "Table S2 tracks DMSO as well as Tg - wrong contrast identified" =
+    cor(y$log2FoldChange, r_tg) > cor(y$log2FoldChange, r_dm) + 0.1,
+  # The paper's headline target (Fig. 2C-G).
+  "ALKBH5 is not in Table S2" = "ALKBH5" %in% s2_tg$hgnc_symbol
+)
+hits_tg <- unique(sub("[.].*", "", s2_tg$ensembl_gene_id))   # strips _PAR_Y too
+```
+
+# 3. Build the outcomes
+
+```{r build}
+pc <- params$pseudocount; mn <- params$min_input_rpkm
+enrich <- function(id, i1, i2, p1, p2)
+  tibble(ensembl_gene_id = id, in1 = i1, in2 = i2,
+         y = (log2((p1 + pc) / (i1 + pc)) + log2((p2 + pc) / (i2 + pc))) / 2)
+e_cm  <- enrich(cm$ensembl_gene_id,  cm$CM_In_Rep1,  cm$CM_In_Rep2,  cm$CM_IP_Rep1,  cm$CM_IP_Rep2)
+e_glu <- enrich(glu$ensembl_gene_id, glu$Glu_In_Rep1, glu$Glu_In_Rep2, glu$Glu_IP_Rep1, glu$Glu_IP_Rep2)
+e_tg  <- enrich(isr$ensembl_gene_id, isr$Input_TG_Rep1, isr$Input_TG_Rep2, isr$IP_TG_Rep1, isr$IP_TG_Rep2)
+e_dm  <- enrich(isr$ensembl_gene_id, isr$Input_Rep1, isr$Input_Rep2, isr$IP_Rep1, isr$IP_Rep2)
+
+keep <- function(d) d %>% filter(in1 >= mn, in2 >= mn)
+single <- function(d) keep(d) %>% transmute(ensembl_gene_id, enrich_lfc = y,
+                                            input_rpkm_min = pmin(in1, in2))
+ratio <- function(s, b) inner_join(keep(s), keep(b), by = "ensembl_gene_id", suffix = c("_s", "_b")) %>%
+  transmute(ensembl_gene_id, enrich_lfc = y_s - y_b,
+            input_rpkm_min = pmin(in1_s, in2_s, in1_b, in2_b))
+
+sym <- bind_rows(cm %>% dplyr::select(ensembl_gene_id, symbol = hgnc_symbol),
+                 glu %>% dplyr::select(ensembl_gene_id, symbol = hgnc_symbol)) %>%
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+
+outcomes <- list(cm = single(e_cm), glu = single(e_glu), tg = single(e_tg),
+                 gluvscm = ratio(e_glu, e_cm), tgvsdmso = ratio(e_tg, e_dm)) %>%
+  map(~ .x %>% left_join(sym, by = "ensembl_gene_id") %>%
+        transmute(gene_id = ensembl_gene_id, symbol, enrich_lfc,
+                  enrich_padj = NA_real_,     # no padj exists: RPKM only, see caveats
+                  input_rpkm_min))
+pos <- list(cm = hits_cm, glu = hits_glu, tg = hits_tg, gluvscm = hits_glu, tgvsdmso = hits_tg)
+# Negatives for the spot-check: expressed genes that are not a published hit of that study in
+# any condition, so a CM-only hit cannot sit among the GLU negatives.
+study_hits <- list(cm = union(hits_cm, hits_glu), glu = union(hits_cm, hits_glu), tg = hits_tg,
+                   gluvscm = union(hits_cm, hits_glu), tgvsdmso = hits_tg)
+
+tco <- readRDS(here("output", "translational_control_overview", params$matrix_rds))
+summ <- imap_dfr(outcomes, function(d, k) {
+  m <- d %>% filter(gene_id %in% tco$gene_id_clean)
+  yp <- m$enrich_lfc[m$gene_id %in% pos[[k]]]
+  yn <- m$enrich_lfc[!m$gene_id %in% study_hits[[k]]]
+  tibble(outcome = k, genes = nrow(d), in_matrix = nrow(m),
+         pos_published = length(pos[[k]]), pos_in_model = length(yp),
+         median = median(m$enrich_lfc), MAD = mad(m$enrich_lfc),
+         sep_pos_minus_neg = median(yp) - median(yn),
+         rho_length = cor(m$enrich_lfc,
+                          log2(as.numeric(tco$total_length[match(m$gene_id, tco$gene_id_clean)])),
+                          method = "spearman", use = "pairwise.complete.obs"))
+})
+knitr::kable(summ, digits = 3)
+stopifnot("an outcome has a non-finite value" = all(map_lgl(outcomes, ~ all(is.finite(.x$enrich_lfc)))),
+          "an outcome has duplicated genes" = all(map_lgl(outcomes, ~ !any(duplicated(.x$gene_id)))),
+          "an outcome has too few genes in the matrix to model" = all(summ$in_matrix > 2000),
+          # Raw outcomes: hits were called on these same libraries, so a small gap means a
+          # broken join or sign. Ratios: the hits were called in ONE condition, so the only
+          # claim is that they rise under stress (> 0). Measured: tg hits rise by just 0.11 on
+          # tg vs DMSO - most published ISR targets are nearly as enriched in DMSO.
+          "published hits do not score well above non-hits on a raw outcome - join or sign is wrong" =
+            all(summ$sep_pos_minus_neg[summ$outcome %in% c("cm", "glu", "tg")] > params$min_sep),
+          "published hits do not rise under stress on a ratio outcome - sign is wrong" =
+            all(summ$sep_pos_minus_neg[summ$outcome %in% c("gluvscm", "tgvsdmso")] > 0),
+          "too few published hits survive the expression filter for 10_'s spot-check" =
+            all(summ$pos_in_model >= 50))
+alk <- outcomes$tg %>% filter(symbol == "ALKBH5")
+cat(sprintf("ALKBH5 thapsigargin enrichment %+.2f, percentile %.0f of the tg outcome\n",
+            alk$enrich_lfc, 100 * mean(outcomes$tg$enrich_lfc <= alk$enrich_lfc)))
+```
+
+# 4. Write
+
+Named for `10_`'s param-built paths: condition `hek293t_capbind_<outcome>`, timepoint `rpkm`,
+gene `3d`, direction `promotes`. The gene-set filenames carry `_TE_` only because `10_` builds the
+path that way; they are cap-binding hit lists.
+
+```{r write, eval = isTRUE(params$write_outputs)}
+for (k in names(outcomes)) {
+  cond <- paste0("hek293t_capbind_", k)
+  write_csv(outcomes[[k]], here("output", paste0("subunit_seq_", cond, "_rpkm.csv")))
+  d <- outcomes[[k]]
+  write_csv(d %>% filter(gene_id %in% pos[[k]]) %>%
+              transmute(db_gene_symbol = symbol, ensembl_gene = gene_id, enrich_lfc,
+                        gs_name = paste0(cond, "_published_hits"),
+                        gs_description = "published subunit-seq hits (DESeq2 IP vs input); not a TE set"),
+            here("output", "genesets", paste0(cond, "_3d_promotes_TE_rpkm_lfc0.5.csv")))
+  write_csv(d %>% filter(!gene_id %in% study_hits[[k]]) %>% dplyr::select(gene_id, symbol, enrich_lfc),
+            here("output", "genesets", paste0(cond, "_3d_negative_controls_lfc0.5.csv")))
+}
+back <- imap_dfr(outcomes, function(d, k) {
+  a <- read_csv(here("output", paste0("subunit_seq_hek293t_capbind_", k, "_rpkm.csv")),
+                show_col_types = FALSE)
+  tibble(outcome = k, same_n = nrow(a) == nrow(d),
+         max_dev = max(abs(a$enrich_lfc - d$enrich_lfc[match(a$gene_id, d$gene_id)])))
+})
+knitr::kable(back)
+stopifnot("a written outcome does not read back" = all(back$same_n) && all(back$max_dev < 1e-12))
+```
+
+```{r session}
+sessionInfo()
+```

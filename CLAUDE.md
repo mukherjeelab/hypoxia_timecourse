@@ -6,6 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is an R-only bioinformatics project studying translational regulation by eIF3d and eIF3e during hypoxia in MDA-MB-231 and MCF7-SIX1 breast cancer cells. It integrates ribosome profiling + RNA-seq to compute translation efficiency (TE), then builds Random Forest models to predict which genes are translationally regulated by eIF3d/3e and what sequence/structural features drive that regulation.
 
+## How to Report Back
+
+**Lead with a three-sentence summary and the decision you need from me.** Finding, consequence,
+question - in that order, before any evidence. A report that opens with method makes me read to
+the end to learn whether I have to do anything.
+
+**Do not use notebook numbers as nouns.** `07`, `02c`, `01k_` are filenames, not concepts. Say
+"the classifier notebook" or "the expressed-background pool" and give the number only when I
+need to open, knit or find that specific file. The same goes for output filenames and param
+names: name what the thing does, then identify it.
+
+**Define internal terms on first use**, including ones this file introduces - pool ratio,
+screened vs expressed background, sign-unstable, variant pair, the draw, the floor. A term that
+is obvious while the work is fresh is not obvious in a thread I return to in a month.
+
+**Why:** these are one failure, not three - writing from the position of someone who just did
+the work, for a reader who did not. The decision, the plain-language name and the definition are
+what survive that gap.
+
 ## Running Code
 
 All analysis lives in R Markdown notebooks (`.Rmd`). Open `hypoxia_timecourse.Rproj` in RStudio and knit notebooks individually. There is no Makefile or pipeline runner — notebooks are run in the numerical order implied by their filenames.

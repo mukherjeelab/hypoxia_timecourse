@@ -1,0 +1,210 @@
+---
+title: "Top-100 feature means heatmap: features by experiment, no model"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  experiments: "MDA-MB-231 3d hypoxia 1hr=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3d hypoxia 4hr=eif33d_promotes_hypoxia_4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3d hypoxia 24hr=eif33d_promotes_hypoxia_24hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3d normoxia 1+4hr=eif33d_promotes_normoxia_1and4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e hypoxia 1hr=eif33e_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e hypoxia 4hr=eif33e_promotes_hypoxia_4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e hypoxia 24hr=eif33e_promotes_hypoxia_24hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MDA-MB-231 3e normoxia 1+4hr=eif33e_promotes_normoxia_1and4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3d hypoxia 1hr=eif33d_promotes_mcf7six1_hypoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3d normoxia 1hr=eif33d_promotes_mcf7six1_normoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3e hypoxia 1hr=eif33e_promotes_mcf7six1_hypoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;MCF7-SIX1 3e normoxia 1hr=eif33e_promotes_mcf7six1_normoxia_1hr_lfc0.5_tcoreg_mcf7tx_intrinsic_corrected_both_clipaggregate_yraw;HeLa 3d no stress (Herrmannova)=eif33d_promotes_hela_normoxia_steadystate_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;HeLa 3e no stress (Herrmannova)=eif33e_promotes_hela_normoxia_steadystate_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw;HEK293T DHX29 IP enrichment (Hia)=eifdhx29_promotes_hek293t_dhx29ip_ribo_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  # Which feature matrix each column's model used, matched on a suffix substring (first match
+  # wins, "" = default). The regression model data does not record the matrix, so this must be
+  # stated; the gene-set and feature-set checks below catch a wrong entry.
+  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;=feature_matrix_tco.rds"
+  top_n: 100
+  padj_max: 0.05
+  save_plots: TRUE
+  out_tag: ""
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "17_top100_feature_means_heatmap.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+A third, model-free view of the same features and experiments as `15_shap_heatmap.Rmd` (SHAP) and
+`16_feature_correlation_heatmap.Rmd` (Spearman rho). Here each cell is the **mean value of a feature
+across the 100 transcripts each experiment most promotes**: what the most strongly regulated
+mRNAs look like, in the feature's own units.
+
+**Decisions**
+
+- **Same columns, genes and matrices** as the other two heatmaps (same `experiments` param; genes
+  from each regression's saved model data; raw, non-imputed feature values).
+- **Top 100 = highest LFC, significant genes first.** LFC is oriented so positive = the factor
+  promotes. Genes with padj < 0.05 are taken first, by LFC; if a column has fewer than 100 of
+  them, it is filled to exactly 100 with the next-highest-LFC genes regardless of padj. Every
+  column is therefore a mean over 100 genes (a 5-gene mean at 3d hypoxia 24hr otherwise took the
+  extreme colour in about a third of rows). The column annotation `n_significant` shows how many
+  of each column's 100 are significant, so filled columns stay visible.
+- **The printed number is the raw mean; the colour is that mean scaled within the feature
+  across columns** (z-score of the row). Features have different units, so one scale across
+  rows is impossible. Colour therefore answers "in which experiments are the top genes highest
+  or lowest for this feature" - **not** whether they differ from a typical gene. Row scaling also
+  stretches every row to the full colour range, so a row whose raw means barely differ looks as
+  vivid as one that differs a lot; read the printed numbers before the colour.
+- **No significance testing** here.
+- Intrinsic features, individual rows grouped by family, as in the correlation heatmap.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(pheatmap)
+library(grid)
+```
+
+# Load
+
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+parse_pairs <- function(s) {
+  parts <- str_trim(str_split(s, ";")[[1]]); parts <- parts[nzchar(parts)]
+  tibble(key = str_trim(str_replace(parts, "=.*$", "")),
+         val = str_trim(str_replace(parts, "^[^=]*=", "")))
+}
+exps <- parse_pairs(params$experiments) %>% dplyr::rename(label = key, suffix = val)
+mmap <- parse_pairs(params$matrix_map)
+matrix_for <- function(suffix) {
+  hit <- mmap %>% filter(key == "" | str_detect(suffix, fixed(key)))
+  hit$val[1]
+}
+exps <- exps %>% mutate(matrix_rds = map_chr(suffix, matrix_for))
+stopifnot("an experiment label is duplicated" = !any(duplicated(exps$label)),
+          "a column has no matrix" = !any(is.na(exps$matrix_rds)))
+print(as.data.frame(exps %>% dplyr::select(label, matrix_rds)), row.names = FALSE)
+
+annotation <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+matrices <- set_names(unique(exps$matrix_rds)) %>% map(~ readRDS(file.path(out_dir, .x)))
+walk(matrices, ~ stopifnot("a feature matrix is not one transcript per gene" =
+                              !any(duplicated(.x$gene_id_clean))))
+```
+
+# Top-N means
+
+```{r top_means}
+one_column <- function(label, suffix, matrix_rds) {
+  md <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", suffix, ".rds")))
+  genes <- bind_rows(md$train %>% dplyr::select(gene_id_clean, y, y_padj),
+                     md$test  %>% dplyr::select(gene_id_clean, y, y_padj))
+  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(genes$gene_id_clean)),
+            "this column has no padj to rank within" = any(!is.na(genes$y_padj)))
+  N <- as.integer(params$top_n)
+  sig  <- genes %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > 0) %>% arrange(desc(y))
+  top  <- sig %>% slice_head(n = N)
+  if (nrow(top) < N)
+    top <- bind_rows(top, genes %>% filter(!gene_id_clean %in% top$gene_id_clean) %>%
+                       arrange(desc(y)) %>% slice_head(n = N - nrow(top)))
+  n_sig <- min(nrow(sig), N)
+  stopifnot("could not fill the top set to N genes" = nrow(top) == N)
+  fm <- matrices[[matrix_rds]]
+  stopifnot("a modelled feature is missing from this column's matrix" = all(md$feature_cols %in% names(fm)),
+            "a top gene is missing from this column's matrix" = all(top$gene_id_clean %in% fm$gene_id_clean))
+  x <- fm[match(top$gene_id_clean, fm$gene_id_clean), md$feature_cols, drop = FALSE]
+  map_dfr(md$feature_cols, function(f) {
+    v <- as.numeric(unlist(x[[f]]))
+    tibble(experiment = label, feature = f, mean = mean(v, na.rm = TRUE), n = sum(is.finite(v)))
+  }) %>% mutate(n_top = nrow(top), n_significant = n_sig, lfc_min_in_top = min(top$y),
+                n_genes = nrow(genes))
+}
+long <- pmap_dfr(list(exps$label, exps$suffix, exps$matrix_rds), one_column)
+sets <- split(long$feature, long$experiment)
+stopifnot("columns do not share one feature set" = all(map_lgl(sets, ~ setequal(.x, sets[[1]]))))
+long <- long %>% left_join(annotation %>% dplyr::select(feature, family), by = "feature")
+stopifnot("a feature has no family" = !any(is.na(long$family)),
+          "a mean is not finite" = all(is.finite(long$mean)))
+
+long %>% distinct(experiment, n_genes, n_top, n_significant, lfc_min_in_top) %>%
+  arrange(match(experiment, exps$label)) %>% as.data.frame() %>% print(row.names = FALSE)
+short <- long %>% distinct(experiment, n_significant) %>% filter(n_significant < params$top_n)
+if (nrow(short))
+  cat("FILLED beyond padj <", params$padj_max, ":", paste0(short$experiment, " (", short$n_significant,
+      " significant)", collapse = "; "), "\n")
+```
+
+# Heatmap
+
+Rows grouped by family (same family order as the correlation heatmap uses: by largest spread
+here), columns clustered on the row-scaled profile. Printed numbers are raw top-100 means.
+
+```{r heatmap, fig.width = 13, fig.height = 13}
+M <- long %>% dplyr::select(feature, experiment, mean) %>%
+  pivot_wider(names_from = experiment, values_from = mean) %>% column_to_rownames("feature") %>%
+  as.matrix()
+M <- M[, exps$label, drop = FALSE]
+Z <- t(scale(t(M)))                                  # row z-score across columns
+Z[!is.finite(Z)] <- 0                                # a constant row has no spread to show
+
+fam <- long %>% distinct(feature, family)
+spread <- tibble(feature = rownames(Z), s = apply(abs(Z), 1, max))
+fam_order <- fam %>% left_join(spread, by = "feature") %>% group_by(family) %>%
+  summarise(m = max(s), .groups = "drop") %>% arrange(desc(m)) %>% pull(family)
+row_order <- fam %>% arrange(match(family, fam_order), feature) %>% pull(feature)
+Z <- Z[row_order, , drop = FALSE]; M <- M[row_order, , drop = FALSE]
+gaps <- which(diff(match(fam$family[match(row_order, fam$feature)], fam_order)) != 0)
+
+# Print with precision matched to each feature's scale, so 0-1 fractions and log2 lengths both read.
+fmt_row <- function(v) { d <- max(0, 2 - floor(log10(max(abs(v), 1e-9)))); formatC(v, format = "f", digits = min(d, 3)) }
+lab <- t(apply(M, 1, fmt_row)); dimnames(lab) <- dimnames(M)
+
+meta <- exps %>% transmute(
+  experiment = label,
+  `cell line` = case_when(str_detect(suffix, "_hek293t_") ~ "HEK293T",
+                          str_detect(suffix, "_hela_")    ~ "HeLa",
+                          str_detect(suffix, "mcf7six1")  ~ "MCF7-SIX1",
+                          TRUE                            ~ "MDA-MB-231"),
+  `initiation factor` = case_when(str_detect(suffix, "^eifdhx29_") ~ "DHX29",
+                                  str_detect(suffix, "^eif33e_")   ~ "eIF3e", TRUE ~ "eIF3d"),
+  condition = case_when(str_detect(suffix, "_hela_|_dhx29ip_") ~ "no stress",
+                        str_detect(suffix, "_hypoxia_")  ~ "hypoxia",
+                        str_detect(suffix, "_normoxia_") ~ "normoxia",
+                        TRUE                             ~ "other")) %>%
+  left_join(long %>% distinct(experiment, n_significant), by = "experiment") %>%
+  column_to_rownames("experiment")
+anno_colors <- list(
+  `cell line` = c(`MDA-MB-231` = "#F0E442", `MCF7-SIX1` = "#661100", HeLa = "#999933",
+                  HEK293T = "#44AA99")[unique(meta$`cell line`)],
+  `initiation factor` = c(eIF3d = "#E69F00", eIF3e = "#56B4E9",
+                          DHX29 = "#882255")[unique(meta$`initiation factor`)],
+  condition = c(hypoxia = "#CC79A7", normoxia = "#009E73", `no stress` = "#009E73",
+                other = "grey60")[unique(meta$condition)],
+  n_significant = colorRampPalette(c("grey93", "grey20"))(100))
+row_anno <- data.frame(family = fam$family[match(rownames(Z), fam$feature)], row.names = rownames(Z))
+
+lim <- max(abs(Z)); brk <- seq(-lim, lim, length.out = 101)
+hm <- pheatmap(Z, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(100), breaks = brk,
+               cluster_rows = FALSE, cluster_cols = if (ncol(Z) > 2) hclust(dist(t(Z))) else FALSE,
+               gaps_row = gaps, display_numbers = lab, number_color = "grey15", fontsize_number = 5.5,
+               annotation_col = meta, annotation_row = row_anno, annotation_colors = anno_colors,
+               main = paste0("Top ", params$top_n, " promoted transcripts: mean feature value\n",
+                             "number = raw mean; colour = row z-score across experiments"),
+               fontsize_row = 7, fontsize_col = 8, angle_col = 90, silent = TRUE)
+grid.newpage(); grid.draw(hm$gtable)
+tag <- if (nzchar(params$out_tag)) paste0("_", params$out_tag) else ""
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("17_top", params$top_n, "_feature_means_heatmap", tag, ".pdf")),
+         hm$gtable, width = 13, height = 13)
+```
+
+```{r write}
+write_csv(long, file.path(out_dir, paste0("top", params$top_n, "_feature_means", tag, ".csv")))
+cat("wrote", paste0("top", params$top_n, "_feature_means", tag, ".csv"), "-", nrow(long), "rows\n")
+```
+
+```{r session}
+sessionInfo()
+```

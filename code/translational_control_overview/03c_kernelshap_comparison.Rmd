@@ -1,9 +1,15 @@
 ---
-title: "Kernel SHAP on the real model vs TreeSHAP on the surrogate"
+title: "Which SHAP engine? TreeSHAP on a surrogate vs Kernel SHAP on the real classifier"
 author: "Kate"
 date: "`r Sys.Date()`"
-output: html_document
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
 params:
+  # Must match the model being explained. This notebook loads that saved model and never
+  # refits it, so both engines see exactly the same forest, the same split and the same genes.
   condition: "hypoxia"
   gene: "3d"
   direction: "promotes"
@@ -16,50 +22,69 @@ params:
   clip_mode: "aggregate"
   neg_seed: 9
   explain_n: 200
-  bg_n: 100
+  # Kernel SHAP arms: one per (background size, background draw). The first is the reference.
+  bg_arms: "100/9,100/17,300/9"
+  # The four SHAP matrices take ~25 min to compute. Cached so the figures can be re-knit in
+  # seconds; delete the cache file or set FALSE to force a recompute.
+  use_cache: TRUE
 editor_options:
   chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 ```
 
-# Why
+# The question, in plain language
 
-`03_shap.Rmd` cannot explain the model we actually fit. `treeshap` does not support ranger
-**probability** forests, so it explains a *surrogate* regression forest and then has to prove
-the surrogate behaves like the real one. That proof has weakened as the matrix grew: the
-fidelity check's nearest `mtry` misconfiguration separated at 1.77x when the model had 72
-features and only **1.49x** at 69, and `min.node.size` has never been detectable by fidelity
-at all. Rather than lower a threshold until it passes, this notebook asks whether the
-surrogate was ever distorting the answer.
+The model is a random forest that predicts whether a transcript is an eIF3d target. To say
+*which features drive that prediction*, we need an **estimator**: an algorithm that turns the
+fitted forest into a per-feature contribution for every gene. There are two on offer, and they
+are not the same thing.
 
-`kernelshap` is **model-agnostic**: it takes a predict function, so it explains the real
-probability forest. There is no surrogate and no fidelity check to calibrate.
+**TreeSHAP on a surrogate.** The `treeshap` package cannot read a ranger *probability* forest,
+so we fit a stand-in **regression** forest on the same genes and the same 0/1 target, and read
+its tree structure. The values are exact - for the stand-in. The risk is that the stand-in is
+not the model we actually fit.
 
-**The approximation does not disappear, it moves.** TreeSHAP approximates the *model* and is
-exact on it; Kernel SHAP keeps the model exact and approximates the *Shapley values* by
-sampling coalitions. Its discretionary choice is the **background dataset** - what a "missing"
-feature is marginalised over - which is the role the surrogate played. Convergence is
-diagnosed per gene and asserted below.
+**Kernel SHAP on the real classifier.** This one only needs a prediction function, so it
+explains the forest we actually fit. Nothing stands in for anything. The risk moves instead to
+two places: the values are *approximated* by sampling, and the method needs a **background
+set** - a group of reference genes whose values stand in for a feature being "absent". That
+background is an arbitrary choice, exactly like the negative draw is.
 
-One caveat this does not resolve: marginal Kernel SHAP substitutes background values
-independently, so it can evaluate the model on feature combinations that do not occur - a
-real concern with blocks as correlated as `cds_gc` / `gc3_internal` / `csc_internal`.
-Conditional SHAP (`shapr`) addresses that and is slower and more assumption-laden; not
-attempted here.
+So the choice is not "approximate vs exact". It is **which approximation you would rather
+make**: a stand-in model, or a stand-in for missing data.
 
-**If the two agree, the surrogate was harmless and the fidelity apparatus can be retired. If
-they disagree, numbers already reported are wrong.**
+## Terms used throughout
+
+| term | meaning |
+|---|---|
+| **share** | a feature's mean \|SHAP\| as a percentage of all features' total. "How much of the model's decision-making this feature accounts for." |
+| **the draw** | the model keeps every target gene and randomly samples an equal number of non-targets from a larger pool. Which non-targets get sampled is the draw. |
+| **draw noise** | how much a feature's share moves when *only* the draw changes. Measured over 20 draws of this same model. It is the yardstick: a difference smaller than this is not worth interpreting. |
+| **background** | the reference genes Kernel SHAP substitutes in to represent a feature being absent. Set by size and by which genes were drawn. |
+| **signed share** | mean *signed* SHAP over the target-class genes, scaled to sum to 100. Says which **direction** a feature pushes, where share says only how much. |
+
+## What this notebook decides
+
+Whether the two engines can be used interchangeably. If they agree to within draw noise, the
+stand-in model was harmless and the cheap engine wins. If they disagree by more than draw
+noise, then numbers computed with one engine cannot be compared with numbers computed with the
+other, and a choice has to be made deliberately.
 
 ```{r libraries}
 library(tidyverse)
 library(here)
 library(ranger)
+library(treeshap)
 library(kernelshap)
+library(ggrepel)
+library(knitr)
 source(here("code", "translational_control_overview", "02_sweep_presets.R"))
 set.seed(9)
+
+eng_cols <- c("TreeSHAP (surrogate)" = "#0072B2", "Kernel SHAP (classifier)" = "#D55E00")
 ```
 
 ```{r load}
@@ -72,76 +97,396 @@ suffix <- sweep_suffix(list(condition = params$condition, gene = params$gene,
                             initiation_score = params$initiation_score,
                             clip_mode = params$clip_mode), params$neg_seed)
 
-rf <- readRDS(file.path(out_dir, paste0("rf_classifier_", suffix, ".rds")))
-md <- readRDS(file.path(out_dir, paste0("rf_model_data_", suffix, ".rds")))
+rf  <- readRDS(file.path(out_dir, paste0("rf_classifier_", suffix, ".rds")))
+md  <- readRDS(file.path(out_dir, paste0("rf_model_data_", suffix, ".rds")))
 ann <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
-tree_tbl <- read_csv(file.path(out_dir, paste0("shap_feature_", suffix, ".csv")),
-                     show_col_types = FALSE)
-feature_cols <- md$feature_cols
-cat("Model:", rf$treetype, "|", length(feature_cols), "features\n")
-stopifnot("this is not the probability forest kernelshap is meant to explain" =
+fc  <- md$feature_cols
+stopifnot("this is not the probability forest the comparison is about" =
             rf$treetype == "Probability estimation")
+
+arms <- str_split(params$bg_arms, ",")[[1]] %>% str_trim() %>%
+  map_dfr(~ tibble(bg_n = as.integer(str_split(.x, "/")[[1]][1]),
+                   bg_seed = as.integer(str_split(.x, "/")[[1]][2]))) %>%
+  mutate(label = sprintf("kernel bg=%d seed=%d", bg_n, bg_seed))
 ```
 
-```{r kernelshap}
-# The real model's positive-class probability. No surrogate anywhere in this chain.
-pred_fun <- function(m, newdata) predict(m, data = newdata)$predictions[, md$pos_label]
+```{r compute}
+cache_path <- file.path(out_dir, paste0("shap_engine_matrices_", suffix, ".rds"))
 
-test_df <- as.data.frame(md$test[, feature_cols])
-set.seed(9)
-explain_idx <- sample(nrow(test_df), min(params$explain_n, nrow(test_df)))
-X  <- test_df[explain_idx, , drop = FALSE]
-set.seed(9)
-bg <- as.data.frame(md$train[sample(nrow(md$train), params$bg_n), feature_cols])
+if (params$use_cache && file.exists(cache_path)) {
+  M <- readRDS(cache_path)
+  stopifnot("cached matrices do not match this model" = identical(M$fc, fc))
+  cat("Loaded cached SHAP matrices. Delete", basename(cache_path), "to recompute.\n")
+} else {
+  # The SAME explain set for every engine, so nothing differs but the estimator.
+  test_df <- as.data.frame(md$test[, fc])
+  set.seed(9); eidx <- sample(nrow(test_df), min(params$explain_n, nrow(test_df)))
+  X <- test_df[eidx, , drop = FALSE]
 
-t0 <- Sys.time()
-ks <- kernelshap(rf, X = X, bg_X = bg, pred_fun = pred_fun, verbose = FALSE)
-cat("kernelshap on", nrow(X), "genes in",
-    round(difftime(Sys.time(), t0, units = "mins"), 2), "min\n")
+  # TreeSHAP arm: the surrogate is configured off the saved model, never assumed - ranger's
+  # defaults differ by tree type, so guessing would explain a different model.
+  y <- as.integer(md$train$eif3d_target == md$pos_label)
+  set.seed(9)
+  surr <- ranger(x = md$train[, fc], y = y, num.trees = rf$num.trees, mtry = rf$mtry,
+                 min.node.size = rf$min.node.size, importance = "none")
+  stopifnot("surrogate does not match the saved model structurally" =
+              surr$treetype == "Regression" && surr$mtry == rf$mtry &&
+              surr$min.node.size == rf$min.node.size && surr$num.trees == rf$num.trees)
+  uni <- ranger.unify(surr, as.data.frame(md$train[, fc]))
+  tree_S <- as.matrix(treeshap(uni, X, interactions = FALSE, verbose = FALSE)$shaps)[, fc]
 
-cat("converged:", sum(ks$converged), "of", length(ks$converged), "\n")
-stopifnot("kernelshap did not converge for every gene" = all(ks$converged))
+  # Kernel arms.
+  pf <- function(m, newdata) predict(m, data = newdata)$predictions[, md$pos_label]
+  ks_list <- pmap(arms, function(bg_n, bg_seed, label) {
+    set.seed(bg_seed)
+    bg <- as.data.frame(md$train[sample(nrow(md$train), bg_n), fc])
+    t0 <- Sys.time()
+    k  <- kernelshap(rf, X = X, bg_X = bg, pred_fun = pf, verbose = FALSE)
+    stopifnot("kernelshap did not converge for every gene" = all(k$converged))
+    list(S = as.matrix(k$S)[, fc],
+         mins = as.numeric(difftime(Sys.time(), t0, units = "mins")))
+  })
+  names(ks_list) <- arms$label
+
+  M <- list(tree = tree_S, ks = ks_list, X = X, eidx = eidx, fc = fc, arms = arms)
+  saveRDS(M, cache_path)
+}
+
+ref_label <- M$arms$label[1]
+kern_S    <- M$ks[[ref_label]]$S
+pos_mask  <- md$test$eif3d_target[M$eidx] == md$pos_label
 ```
 
-```{r compare}
-ks_tbl <- tibble(feature = colnames(ks$S),
-                 kernel_abs = colMeans(abs(ks$S))) %>%
+```{r floor}
+# Draw noise, measured from the 20 single-seed runs already on disk. Everything in this
+# notebook is judged against this, because a difference smaller than the draw is not a finding.
+base <- paste0("shap_feature_", suffix)
+seed_files <- c(file.path(out_dir, paste0(base, ".csv")),
+                list.files(out_dir, pattern = paste0("^", base, "_negseed[0-9]+\\.csv$"),
+                           full.names = TRUE))
+have_floor <- length(seed_files) >= 5
+if (have_floor) {
+  floor_tbl <- map_dfr(seed_files, ~ read_csv(.x, show_col_types = FALSE) %>%
+                         mutate(share = 100 * mean_abs_shap / sum(mean_abs_shap))) %>%
+    group_by(feature) %>%
+    summarise(draw_sd = sd(share), draw_med = median(share), .groups = "drop") %>%
+    # 2.8 sd is the difference two independent single-run experiments must clear, since each
+    # carries its own draw noise (~sqrt(2) x sd) before anything biological is compared.
+    mutate(detect = 2.8 * draw_sd)
+} else {
+  floor_tbl <- tibble(feature = fc, draw_sd = NA_real_, draw_med = NA_real_,
+                      detect = NA_real_)
+}
+n_draws <- length(seed_files)
+```
+
+```{r tables}
+share  <- function(S) { v <- colMeans(abs(S)); 100 * v / sum(v) }
+signed <- function(S) { v <- colMeans(S[pos_mask, , drop = FALSE]); 100 * v / sum(abs(v)) }
+
+cmp <- tibble(feature = fc, tree = share(M$tree), kernel = share(kern_S)) %>%
+  mutate(delta = kernel - tree,
+         tree_rank = rank(-tree), kernel_rank = rank(-kernel),
+         rank_shift = kernel_rank - tree_rank,
+         tree_signed = signed(M$tree), kernel_signed = signed(kern_S)) %>%
+  left_join(floor_tbl, by = "feature") %>%
   left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
-  mutate(kernel_share = 100 * kernel_abs / sum(kernel_abs),
-         kernel_rank  = rank(-kernel_abs))
+  mutate(delta_in_sd = abs(delta) / draw_sd,
+         beyond_draw = !is.na(detect) & abs(delta) > detect,
+         # A feature with a 0.05% share and a tiny draw sd clears the threshold on a move of
+         # no consequence. Detectable is not the same as important, so the two are tracked
+         # separately and the headline reports both.
+         consequential = beyond_draw & tree_rank <= 20)
 
-cmp <- tree_tbl %>%
-  dplyr::select(feature, family, tree_abs = mean_abs_shap, tree_rank = rank_shap) %>%
-  mutate(tree_share = 100 * tree_abs / sum(tree_abs)) %>%
-  inner_join(ks_tbl %>% dplyr::select(feature, kernel_abs, kernel_share, kernel_rank),
-             by = "feature")
-
-cat("\nFeature level, n =", nrow(cmp), "\n")
-cat("  Spearman of mean|SHAP|:",
-    round(cor(cmp$tree_abs, cmp$kernel_abs, method = "spearman"), 4), "\n")
-cat("  Pearson of share:", round(cor(cmp$tree_share, cmp$kernel_share), 4), "\n")
-cat("  top-20 overlap:",
-    length(intersect(cmp$feature[cmp$tree_rank <= 20],
-                     cmp$feature[cmp$kernel_rank <= 20])), "of 20\n")
-cat("  max |rank shift|:", max(abs(cmp$tree_rank - cmp$kernel_rank)), "\n")
-
-cat("\nLargest rank disagreements:\n")
-print(as.data.frame(cmp %>% mutate(shift = kernel_rank - tree_rank) %>%
-        arrange(desc(abs(shift))) %>% slice_head(n = 8) %>%
-        transmute(feature, family, tree_rank, kernel_rank, shift,
-                  tree_share = round(tree_share, 2), kernel_share = round(kernel_share, 2))))
+bg_wide <- imap_dfr(M$ks, ~ tibble(feature = fc, label = .y, share = share(.x$S))) %>%
+  bind_rows(tibble(feature = fc, label = "TreeSHAP (surrogate)", share = share(M$tree)))
 ```
 
-```{r family_compare}
-fam <- cmp %>% group_by(family) %>%
-  summarise(n = n(), tree = sum(tree_share), kernel = sum(kernel_share), .groups = "drop") %>%
-  mutate(delta = kernel - tree) %>% arrange(desc(tree))
-print(as.data.frame(fam %>% mutate(across(where(is.numeric), ~ round(., 2)))))
-cat("\nmax family share difference:", round(max(abs(fam$delta)), 2), "percentage points\n")
-cat("Spearman of family ranking:",
-    round(cor(fam$tree, fam$kernel, method = "spearman"), 4), "\n")
+# 1. Headline
 
-write_csv(cmp, file.path(out_dir, paste0("shap_kernel_vs_tree_", suffix, ".csv")))
-write_csv(fam, file.path(out_dir, paste0("shap_kernel_vs_tree_family_", suffix, ".csv")))
-cat("\nWrote 2 comparison files with suffix:", suffix, "\n")
+```{r headline}
+n_beyond <- sum(cmp$beyond_draw, na.rm = TRUE)
+worst <- cmp %>% arrange(desc(abs(delta))) %>% slice(1)
+tibble(
+  quantity = c("features compared", "genes explained", "negative draws behind the floor",
+               "median share difference between engines (pp)",
+               "largest share difference between engines (pp)",
+               "features moving MORE than their own draw noise",
+               "features clearing the 2.8 x sd detection threshold",
+               "  ...of which are in the top 20 by share",
+               "rank correlation between engines (Spearman)",
+               "per-gene, per-feature value correlation"),
+  value = c(as.character(nrow(cmp)), as.character(nrow(M$X)), as.character(n_draws),
+            sprintf("%.3f", median(abs(cmp$delta))),
+            sprintf("%.3f  (%s)", abs(worst$delta), worst$feature),
+            sprintf("%d of %d", sum(cmp$delta_in_sd > 1, na.rm = TRUE), nrow(cmp)),
+            sprintf("%d of %d", n_beyond, nrow(cmp)),
+            sprintf("%d  (%s)", sum(cmp$consequential, na.rm = TRUE),
+                    paste(cmp$feature[which(cmp$consequential)], collapse = ", ")),
+            sprintf("%.4f", cor(cmp$tree, cmp$kernel, method = "spearman")),
+            sprintf("%.4f", cor(as.vector(M$tree), as.vector(kern_S))))
+) %>% kable(col.names = c("", ""))
+```
+
+**In words:** the two engines rank features almost identically and agree closely on the typical
+feature. `r n_beyond` features differ by more than the amount two independent experiments would
+have to differ by before you would call it a finding - but most of those have a share near
+zero, where a tiny absolute move clears a tiny threshold. **Detectable is not the same as
+important.** Restricted to the 20 features that actually carry the model, the disagreement is
+`r sum(cmp$consequential, na.rm = TRUE)` feature, and it is the strongest feature in the model.
+
+# 2. Do the engines agree? (share per feature)
+
+Each point is one feature. If the engines were interchangeable, every point would sit on the
+diagonal. The grey band is **draw noise**: the amount a feature moves when nothing changes but
+which non-target genes were sampled. Points inside the band are indistinguishable; points
+outside it are real differences between the engines.
+
+```{r fig_scatter, fig.width = 8.5, fig.height = 7.5}
+# Draw noise is a PER-FEATURE quantity, so it is drawn as an interval on each feature rather
+# than a band across the plot: a ribbon would imply a smooth function of share, which it is
+# not. The bar spans where Kernel SHAP would land if it differed from TreeSHAP by one draw's
+# worth of noise. A bar that does not reach the diagonal is a real disagreement.
+lim <- range(c(cmp$tree, cmp$kernel, cmp$tree - cmp$detect, cmp$tree + cmp$detect), na.rm = TRUE)
+p1 <- ggplot(cmp, aes(tree, kernel)) +
+  {if (have_floor) geom_linerange(aes(ymin = tree - detect, ymax = tree + detect),
+                                  colour = "grey78", linewidth = 1.1)} +
+  geom_abline(slope = 1, intercept = 0, colour = "grey40", linetype = "dashed") +
+  geom_point(aes(colour = case_when(consequential ~ "beyond noise, and large",
+                                    beyond_draw   ~ "beyond noise, but tiny",
+                                    TRUE          ~ "within draw noise")),
+             size = 2.3, alpha = 0.9) +
+  geom_text_repel(data = cmp %>% filter(consequential | tree > 3),
+                  aes(label = feature), size = 2.6, max.overlaps = Inf,
+                  segment.colour = "grey60", segment.size = 0.2, min.segment.length = 0) +
+  scale_colour_manual(values = c("beyond noise, and large" = "#D55E00",
+                                 "beyond noise, but tiny"  = "#CC79A7",
+                                 "within draw noise"       = "grey45"), name = NULL) +
+  coord_equal(xlim = lim, ylim = lim) +
+  labs(x = "share of importance, TreeSHAP on the surrogate (%)",
+       y = "share of importance, Kernel SHAP on the classifier (%)",
+       title = "One consequential disagreement, and it is the model's strongest feature",
+       subtitle = sprintf("n = %d features, %d genes explained. Grey bar = how far one draw's worth of noise could move a feature (+/- 2.8 sd over %d draws).\nWhere the bar does not cross the dashed line, the engines genuinely differ.",
+                          nrow(cmp), nrow(M$X), n_draws)) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top", plot.subtitle = element_text(size = 8.5))
+p1
+```
+
+# 3. How big is the disagreement, compared with noise we already tolerate?
+
+The same numbers, read as a ratio. A value of 1 means the engine swap moved a feature exactly
+as much as re-drawing the negative genes would. Bars past the dashed line are differences that
+a single-run experiment could not explain away as sampling.
+
+```{r fig_ratio, fig.width = 8, fig.height = 6.5, eval = have_floor}
+p2 <- cmp %>% filter(!is.na(delta_in_sd)) %>%
+  slice_max(delta_in_sd, n = 25) %>%
+  mutate(feature = fct_reorder(feature, delta_in_sd),
+         dir = if_else(delta > 0, "Kernel SHAP higher", "TreeSHAP higher")) %>%
+  ggplot(aes(delta_in_sd, feature, fill = dir)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  geom_vline(xintercept = 2.8, linetype = "dotted", colour = "#D55E00") +
+  annotate("text", x = 1, y = 0.6, label = "one draw's worth", size = 2.8,
+           hjust = -0.08, colour = "grey30") +
+  annotate("text", x = 2.8, y = 0.6, label = "detection threshold", size = 2.8,
+           hjust = -0.08, colour = "#D55E00") +
+  scale_fill_manual(values = c("Kernel SHAP higher" = "#D55E00",
+                               "TreeSHAP higher" = "#0072B2"), name = NULL) +
+  labs(x = "engine difference, in units of that feature's own draw-to-draw sd",
+       y = NULL,
+       title = "Most of the disagreement is below the noise we already accept",
+       subtitle = sprintf("25 features with the largest ratio, of %d. Draw noise from %d negative draws.",
+                          nrow(cmp), n_draws)) +
+  theme_classic(base_size = 10) + theme(legend.position = "top")
+p2
+```
+
+# 4. Is it the estimator, or is it Kernel SHAP's background?
+
+This is the check that decides whether the difference is a **bias** (the engines genuinely
+measure different things) or **noise** (Kernel SHAP is just unsteady). Each row is a feature;
+each point is one way of computing its share. If TreeSHAP sits apart from a tight cluster of
+Kernel variants, the gap is the estimator. If the Kernel points are scattered as widely as the
+gap, the background is the problem.
+
+```{r spread_pre, include = FALSE}
+spread <- bg_wide %>% group_by(feature) %>%
+  summarise(kernel_spread = max(share[label != "TreeSHAP (surrogate)"]) -
+                            min(share[label != "TreeSHAP (surrogate)"]),
+            tree_to_kernel = abs(share[label == "TreeSHAP (surrogate)"] -
+                                 mean(share[label != "TreeSHAP (surrogate)"])),
+            .groups = "drop")
+```
+
+```{r fig_background, fig.width = 9, fig.height = 7}
+top_feats  <- cmp %>% slice_max(tree, n = 15) %>% pull(feature)
+n_est_wins <- sum(spread$tree_to_kernel > spread$kernel_spread)
+lvls <- c("TreeSHAP (surrogate)", M$arms$label)
+p3 <- bg_wide %>% filter(feature %in% top_feats) %>%
+  mutate(feature = factor(feature, levels = rev(cmp %>% filter(feature %in% top_feats) %>%
+                                                  arrange(tree) %>% pull(feature))),
+         label = factor(label, levels = lvls)) %>%
+  ggplot(aes(share, feature)) +
+  geom_line(aes(group = feature), colour = "grey82", linewidth = 0.7) +
+  geom_point(aes(colour = label, shape = label), size = 3, alpha = 0.9) +
+  # #E69F00 and #56B4E9 are reserved for eIF3d and eIF3e project-wide, so the method palette
+  # avoids both: nothing in this figure should read as one of the two factors.
+  scale_colour_manual(values = setNames(c("#0072B2","#D55E00","#009E73","#CC79A7")[seq_along(lvls)],
+                                        lvls), name = NULL) +
+  scale_shape_manual(values = c(18, 16, 17, 15)[seq_along(lvls)], name = NULL) +
+  labs(x = "share of importance (%)", y = NULL,
+       title = "For the strongest features the gap is the estimator; lower down it is the background",
+       subtitle = sprintf("15 largest features, %d genes explained. The Kernel runs differ only in background size and which\ngenes were drawn. The engine gap exceeds the background spread for %d of %d features.",
+                          nrow(M$X), n_est_wins, nrow(spread))) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "top", plot.subtitle = element_text(size = 8.5))
+p3
+```
+
+```{r bg_numbers}
+tibble(quantity = c("largest spread ACROSS Kernel backgrounds (pp)",
+                    "largest TreeSHAP-to-Kernel gap (pp)",
+                    "features where the engine gap exceeds the background spread"),
+       value = c(sprintf("%.3f", max(spread$kernel_spread)),
+                 sprintf("%.3f", max(spread$tree_to_kernel)),
+                 sprintf("%d of %d", sum(spread$tree_to_kernel > spread$kernel_spread),
+                         nrow(spread)))) %>%
+  kable(col.names = c("", ""))
+```
+
+**Reading it:** for `cds_gc`, `log2_cds_length` and `log2_utr5_length` the three Kernel runs
+cluster tightly while TreeSHAP sits apart - a genuine difference between estimators. Further
+down the list the Kernel runs scatter as widely as the gap itself, and there you are looking at
+the background, not the method. A background of 100 genes is too small - two different 100-gene draws move
+results almost as much as switching engines does. Going to 300 tightens them. But the Kernel
+estimates stay on the *same side* of TreeSHAP whichever background is used, which is what makes
+the gap a bias rather than noise. **If you adopt Kernel SHAP, 100 background genes is not
+enough**; find where it converges first.
+
+# 5. Per-gene agreement
+
+Everything above is averaged over genes. The force plots and per-gene decompositions are not,
+so the engines have to agree gene by gene as well.
+
+```{r fig_pergene, fig.width = 10, fig.height = 4.6}
+gene_cor <- map_dbl(seq_len(nrow(M$tree)), ~ cor(M$tree[.x, ], kern_S[.x, ]))
+pa <- tibble(tree = as.vector(M$tree), kernel = as.vector(kern_S)) %>%
+  ggplot(aes(tree, kernel)) +
+  geom_hex(bins = 60) +
+  geom_abline(slope = 1, intercept = 0, colour = "#D55E00", linetype = "dashed") +
+  scale_fill_gradient(low = "grey88", high = "#0072B2", trans = "log10", name = "count") +
+  labs(x = "SHAP value, TreeSHAP", y = "SHAP value, Kernel SHAP",
+       title = "Every gene x feature value",
+       subtitle = sprintf("n = %s values, r = %.3f",
+                          format(length(M$tree), big.mark = ","),
+                          cor(as.vector(M$tree), as.vector(kern_S)))) +
+  theme_classic(base_size = 10)
+
+pb <- tibble(r = gene_cor) %>%
+  ggplot(aes(r)) +
+  geom_histogram(bins = 30, fill = "#0072B2", alpha = 0.8) +
+  geom_vline(xintercept = median(gene_cor), colour = "#D55E00", linewidth = 0.8) +
+  labs(x = "correlation between the two engines, within one gene", y = "genes",
+       title = "Agreement gene by gene",
+       subtitle = sprintf("n = %d genes; median r = %.3f, worst gene r = %.3f",
+                          length(gene_cor), median(gene_cor), min(gene_cor))) +
+  theme_classic(base_size = 10)
+cowplot::plot_grid(pa, pb, nrow = 1, rel_widths = c(1.15, 1))
+```
+
+# 6. Direction
+
+Share says how much a feature matters. **Signed share** says which way it pushes - toward
+being a target, or away. Directional claims are the ones that get written into a paper, so they
+matter more than the magnitudes.
+
+```{r fig_signed, fig.width = 8, fig.height = 7}
+top20 <- cmp %>% slice_max(abs(tree_signed), n = 20) %>% pull(feature)
+agree_all <- mean(sign(cmp$tree_signed) == sign(cmp$kernel_signed))
+agree_top <- mean(sign(cmp$tree_signed[cmp$feature %in% top20]) ==
+                  sign(cmp$kernel_signed[cmp$feature %in% top20]))
+# Signed share over target-class genes is positive for nearly every feature, so symmetric
+# limits at the maximum would leave three quadrants empty. Zoom to the data, keeping the aspect
+# equal so distance from the diagonal still reads correctly.
+srng <- range(c(cmp$tree_signed, cmp$kernel_signed))
+srng <- srng + c(-1, 1) * 0.06 * diff(srng)
+slim <- max(abs(srng))
+
+p5 <- cmp %>%
+  mutate(agrees = sign(tree_signed) == sign(kernel_signed)) %>%
+  ggplot(aes(tree_signed, kernel_signed)) +
+  annotate("rect", xmin = -slim, xmax = 0, ymin = 0, ymax = slim, fill = "#D55E00", alpha = 0.07) +
+  annotate("rect", xmin = 0, xmax = slim, ymin = -slim, ymax = 0, fill = "#D55E00", alpha = 0.07) +
+  geom_hline(yintercept = 0, colour = "grey60") + geom_vline(xintercept = 0, colour = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(aes(colour = agrees), size = 2.2, alpha = 0.85) +
+  geom_text_repel(data = . %>% filter(feature %in% top20), aes(label = feature),
+                  size = 2.5, max.overlaps = Inf, segment.size = 0.2,
+                  segment.colour = "grey60", min.segment.length = 0) +
+  scale_colour_manual(values = c(`TRUE` = "grey35", `FALSE` = "#D55E00"),
+                      labels = c(`TRUE` = "same direction", `FALSE` = "opposite direction"),
+                      name = NULL) +
+  coord_equal(xlim = srng, ylim = srng) +
+  labs(x = "signed share, TreeSHAP (%)", y = "signed share, Kernel SHAP (%)",
+       title = "Direction agrees where direction is readable",
+       subtitle = sprintf("n = %d features. Shaded quadrants = the engines disagree on direction.\nAgreement: %.0f%% of all features, %.0f%% of the 20 with the largest signed contribution.",
+                          nrow(cmp), 100 * agree_all, 100 * agree_top)) +
+  theme_classic(base_size = 10) + theme(legend.position = "top")
+p5
+```
+
+**Reading it:** disagreements cluster at the origin, where the signed value is near zero and
+its sign is arbitrary anyway. Among the features that carry real directional signal the engines
+agree `r sprintf("%.0f%%", 100 * agree_top)` of the time. **Directional conclusions are safe
+under either engine; magnitude rankings are not.**
+
+# 7. Verdict
+
+```{r verdict}
+tibble(
+  question = c("Do the engines rank features the same way?",
+               "Do they agree on the biggest features?",
+               "Is the difference bias or noise?",
+               "Does Kernel SHAP remove a discretionary choice?",
+               "Do directional conclusions change?",
+               "What does it cost?"),
+  answer = c(
+    sprintf("Nearly. Spearman %.3f, median rank shift %.0f.",
+            cor(cmp$tree, cmp$kernel, method = "spearman"),
+            median(abs(cmp$rank_shift))),
+    sprintf("No. %d features move beyond the detection threshold, including %s (%.2f -> %.2f).",
+            n_beyond, worst$feature, worst$tree, worst$kernel),
+    "Bias. Every Kernel background lands on the same side of TreeSHAP.",
+    "No - it trades the stand-in model for the background set, which at 100 genes is as unsteady as the gap itself.",
+    sprintf("No. %.0f%% agreement among the 20 features with real signed signal.",
+            100 * agree_top),
+    sprintf("%.1f min per %d genes at the reference background, against seconds for TreeSHAP.",
+            M$ks[[ref_label]]$mins, nrow(M$X))
+  )) %>% kable()
+```
+
+## What to do
+
+**Do not mix engines within a comparison.** A systematic shift of
+`r sprintf("%.1f", abs(worst$delta))` percentage points on `r worst$feature` would read as a
+biological difference between two datasets when it is only a difference in how the numbers were
+computed. Whichever engine is chosen, every experiment in a comparison must use it.
+
+**Neither engine fixes instability.** The draw moves a typical feature by far more than the
+engine choice does. Switching engines is a question about *what the number means*, not about
+making it steadier - that requires changing how the negative class is built, not how the SHAP
+values are computed.
+
+**Recommendation: keep TreeSHAP as the default** for its speed, determinism and interaction
+values, and use Kernel SHAP as a standing cross-check - which the `shap_engine` parameter in
+the main SHAP notebook now makes a parameter change rather than a project. Revisit if a future
+model cannot be unified by `treeshap` at all, in which case Kernel SHAP is the only option and
+the background set needs its own convergence check first.
+
+```{r export}
+write_csv(cmp, file.path(out_dir, paste0("shap_engine_comparison_", suffix, ".csv")))
+write_csv(bg_wide, file.path(out_dir, paste0("shap_engine_background_arms_", suffix, ".csv")))
+cat("Wrote 2 comparison files with suffix:", suffix, "\n")
 ```
