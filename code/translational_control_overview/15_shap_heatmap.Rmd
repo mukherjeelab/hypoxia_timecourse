@@ -10,9 +10,11 @@ params:
   floor_preset: "transform"
   floor_arm: "raw"
   corr_threshold: 0.8
+  clusters_suffix: ""
   reduced_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_reduced_corrected_both_clipaggregate_yraw"
   save_plots: TRUE
   out_tag: ""
+  allow_mixed_genes: FALSE
 editor_options:
   chunk_output_type: console
 ---
@@ -37,8 +39,12 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 It builds the SHAP heatmap this whole fork exists to produce: **features as rows, experiments as
 columns**, from the random-forest regression's SHAP values.
 
-Every column here is **MDA-MB-231** cells, eIF3d knockdown (si3d) against siCTRL. The contrast is
-log2(sictrl / si3d), so a positive outcome means eIF3d promotes that transcript's translation.
+By default every column must be built on the same genes. `allow_mixed_genes = TRUE` relaxes
+that so MDA-MB-231 and MCF7-SIX1 columns can sit in one figure: the feature set is still asserted
+identical, but each column's shares are then computed over its own gene population, so a
+difference between cell lines mixes biology with gene-population differences. The overlap is
+reported below. The contrast is log2(sictrl / si3d) in every column (MCF7-SIX1 negated to match),
+so a positive outcome means the factor promotes that transcript's translation.
 
 Right now it has **one column**. Everything is written so that adding an experiment is one entry
 in the `experiments` param and nothing else changes.
@@ -114,8 +120,9 @@ if (nrow(exps) > 1) {
   })
   names(gene_counts) <- exps$label
   print(gene_counts)
-  stopifnot("columns were built on different numbers of genes - shares are not comparable" =
-              length(unique(na.omit(gene_counts))) == 1)
+  if (!isTRUE(params$allow_mixed_genes))
+    stopifnot("columns were built on different numbers of genes - shares are not comparable" =
+                length(unique(na.omit(gene_counts))) == 1)
   # Every suffix must be distinct, or two columns are the same run under two labels.
   stopifnot("two experiments resolve to the same suffix" = !any(duplicated(exps$suffix)))
 
@@ -138,9 +145,20 @@ if (nrow(exps) > 1) {
                     length(setdiff(union(base, gene_sets[[nm]]),
                                    intersect(base, gene_sets[[nm]])))))
     }
-    stopifnot("columns were built on different GENE SETS - shares are not comparable" = same)
-    cat(sprintf("gene-set identity: all %d columns share the same %d genes\n",
-                length(gene_sets), length(gene_sets[[1]])))
+    if (isTRUE(params$allow_mixed_genes)) {
+      if (!same) {
+        shared <- Reduce(intersect, gene_sets)
+        cat(sprintf("\n*** MIXED GENE POPULATIONS (allow_mixed_genes = TRUE): columns score %d to %d genes;\n",
+                    min(lengths(gene_sets)), max(lengths(gene_sets))))
+        cat(sprintf("    %d genes are common to all %d columns. Shares are within-column ratios over\n",
+                    length(shared), length(gene_sets)))
+        cat("    each column's own genes, so cross-cell-line differences are not purely biological. ***\n")
+      }
+    } else {
+      stopifnot("columns were built on different GENE SETS - shares are not comparable" = same)
+      cat(sprintf("gene-set identity: all %d columns share the same %d genes\n",
+                  length(gene_sets), length(gene_sets[[1]])))
+    }
   }
 }
 stopifnot("shares do not sum to 100 within an experiment" =
@@ -155,8 +173,11 @@ read_perf <- function(label, suffix) {
   # An AUC computed against a handful of held-out positives is not a measurement. si3d hypoxia
   # 24hr puts ONE positive gene in its test split. Record it, but do not display it as though it
   # were comparable to a column with 294.
-  np <- g("bridge_n_pos")
-  tibble(experiment = label, auc = g("bridge_auc_geneset"), spearman = g("spearman_raw_y"),
+  # The self-contained AUC: positives are a threshold on this contrast's own outcome, negatives
+  # are every other held-out gene. No external gene set, so it is comparable across knockdowns.
+  np <- g("auc_n_pos"); if (is.na(np)) np <- g("bridge_n_pos")
+  a  <- g("auc");       if (is.na(a))  a  <- g("bridge_auc_threshold")
+  tibble(experiment = label, auc = a, spearman = g("spearman_raw_y"),
          bridge_n_pos = np,
          auc_usable = !is.na(np) && np >= 20)
 }
@@ -182,9 +203,85 @@ if (sum(!is.na(perf$outcome_mad)) > 1)
 
 # Column annotation: the AUC bridge, and the held-out Spearman beside it. The colour bars give
 # the at-a-glance comparison once there are several columns.
+# Named for what they are. "bridge AUC" was my own shorthand and needed explaining, which is a
+# sign it should not be on a figure: it is the AUC of the regression's predicted TE scored
+# against notebook 02's classifier gene sets, which exist only for si3d. Spearman is the
+# regression's own held-out metric and applies to every column.
+# Condition and initiation factor, parsed from the SUFFIX rather than the label, so the
+# annotation cannot disagree with the run it describes if a label is ever reworded.
+meta <- tibble(experiment = exps$label, suffix = exps$suffix) %>%
+  mutate(factor_kd = case_when(str_detect(suffix, "^eif33d_") ~ "eIF3d",
+                               str_detect(suffix, "^eif33e_") ~ "eIF3e",
+                               TRUE ~ NA_character_),
+         condition = case_when(str_detect(suffix, "_hypoxia_")  ~ "hypoxia",
+                               str_detect(suffix, "_normoxia_") ~ "normoxia",
+                               TRUE ~ NA_character_),
+         # Cell line, ready for the ones still to come. Everything present is MDA-MB-231, so
+         # this track is currently one flat colour - it exists so a second line differentiates
+         # automatically rather than needing the figure reworked. MCF7-SIX1 carries "mcf7six1"
+         # in its condition string by this project's naming convention.
+         cell_line = case_when(str_detect(suffix, "mcf7six1|mcf7_six1") ~ "MCF7-SIX1",
+                               str_detect(suffix, "mcf7")              ~ "MCF7",
+                               TRUE                                     ~ "MDA-MB-231"),
+         # Which cell line's dominant isoforms the feature matrix was built on. MCF7-SIX1 was
+         # fitted twice - on the 231 matrix and on its own (the _mcf7tx runs) - and without this
+         # track those two columns would be indistinguishable in a combined figure.
+         isoforms = ifelse(str_detect(suffix, "_mcf7tx"), "MCF7-SIX1", "MDA-MB-231"))
+stopifnot("could not parse the knockdown or condition from a suffix" =
+            !any(is.na(meta$factor_kd)) && !any(is.na(meta$condition)))
+cat("cell lines present:", paste(sort(unique(meta$cell_line)), collapse = ", "), "\n")
+print(as.data.frame(meta %>% dplyr::select(experiment, factor_kd, condition)), row.names = FALSE)
+
+# Only the two CATEGORICAL tracks are coloured: which factor was knocked down, and which
+# condition. Spearman goes in the column label as a number instead of a colour bar - a
+# continuous annotation next to a continuous heatmap body reads as a second data layer and
+# competes with the values it is meant to contextualise.
+#
+# AUC is not shown at all. Any AUC needs the continuous outcome thresholded, which reintroduces
+# the arbitrary cutoff this regression exists to avoid, and it degenerates exactly where it
+# matters: te_lfc > 0.5 selects about half the transcriptome at si3e normoxia 1+4hr and leaves a
+# single held-out positive at si3d hypoxia 24hr. Spearman needs no threshold, applies to every
+# column identically, and is what the model actually ranks. It is still written to
+# rfreg_performance_* for anyone who wants it.
 anno_col <- perf %>%
-  transmute(experiment, `bridge AUC` = auc, `Spearman` = spearman) %>%
+  left_join(meta %>% dplyr::select(experiment, factor_kd, condition, cell_line, isoforms),
+            by = "experiment") %>%
+  transmute(experiment,
+            `cell line`         = cell_line,
+            isoforms            = isoforms,
+            `initiation factor` = factor_kd,
+            condition           = condition,
+            rho                 = spearman) %>%
   column_to_rownames("experiment")
+# The isoforms track only carries information when some column was fitted on another cell line's
+# isoforms. Otherwise it duplicates the cell-line track exactly, so it is dropped.
+if (all(meta$isoforms == meta$cell_line)) anno_col$isoforms <- NULL
+
+# The two reserved project hues, used here for exactly what they are reserved for: eIF3d is
+# Okabe-Ito orange and eIF3e Okabe-Ito light blue throughout this project. Condition therefore
+# takes two DIFFERENT Okabe-Ito hues, so nothing in the figure can be misread as a knockdown -
+# and neither is #0072B2 or #D55E00, which the diverging body scale already uses.
+# One colour per meaning across the whole figure, all Okabe-Ito:
+#   orange  #E69F00 -> eIF3d      sky     #56B4E9 -> eIF3e   (both reserved project-wide)
+#   purple  #CC79A7 -> hypoxia    green   #009E73 -> normoxia
+#   black           -> a feature whose direction does not reproduce across seeds
+#   #0072B2 and #D55E00 are the diverging body scale, so they are not reused in annotations.
+# Cell-line colours are assigned by NAME, so a line added later keeps its colour wherever it
+# appears rather than depending on what else is in the figure.
+cell_pal <- c(`MDA-MB-231` = "#F0E442",   # the one unused Okabe-Ito hue
+              `MCF7-SIX1`  = "#661100",
+              `MCF7`       = "#AA4499")
+
+anno_col_colors <- list(
+  `cell line`         = cell_pal[intersect(names(cell_pal), unique(meta$cell_line))],
+  isoforms            = c(`MDA-MB-231` = "grey85", `MCF7-SIX1` = "grey35")[unique(meta$isoforms)],
+  `initiation factor` = c(`eIF3d` = "#E69F00", `eIF3e` = "#56B4E9"),
+  condition           = c(hypoxia = "#CC79A7", normoxia = "#009E73"),
+  # rho is the only CONTINUOUS track, so it gets a single-hue sequential ramp rather than a
+  # categorical set. Grey deliberately: the heatmap body is a blue-white-vermillion diverging
+  # scale, and any coloured ramp beside it competes with the values it is meant to contextualise.
+  # Grey reads as "this is a metric about the column", not as another data layer.
+  rho                 = colorRampPalette(c("grey93", "grey20"))(100))
 
 # pheatmap cannot print text inside an annotation bar, so the numbers go into the column label
 # instead. That puts them immediately above their own colour bars, which is where they are
@@ -192,31 +289,67 @@ anno_col <- perf %>%
 # AUC only where the classifier bridge was run (si3d). Spearman is the regression's own metric
 # and is shown for every column.
 perf$auc[!perf$auc_usable %in% TRUE] <- NA_real_   # underpowered AUCs are not shown
-col_labels <- setNames(
-  ifelse(is.na(perf$auc),
-         sprintf("%s\nrho %.3f", perf$experiment, perf$spearman),
-         sprintf("%s\nAUC %.3f   rho %.3f", perf$experiment, perf$auc, perf$spearman)),
-  perf$experiment)
+# ONE line. Column labels are rotated, so a newline stacks the lines sideways and they
+# interleave with the neighbouring column - the labels become unreadable. The metrics go in
+# parentheses on the same line instead, and the annotation bars carry them as colour too.
+# rho only. AUC is deliberately NOT shown, because across these columns it varies with how many
+# genes happen to clear the LFC cut rather than with how well the model ranks: si3d hypoxia 24hr
+# has ONE held-out positive, so its AUC of 0.41 is a single gene's rank, while si3e normoxia
+# 1+4hr has 996 - 49% of the held-out set - so its 0.79 is close to "above median". Putting the
+# two side by side invites a comparison that is about the threshold, not the model. That
+# threshold is what the regression exists to avoid. rho needs none and means the same thing in
+# every column. AUC is still written to rfreg_performance_* for anyone who wants it.
+col_labels <- setNames(sprintf("%s  (rho %.2f)", perf$experiment, perf$spearman),
+                       perf$experiment)
 lab_for <- function(m) unname(col_labels[colnames(m)])
 
 # Did every column's SHAP decomposition actually close? 11_ asserts it per run, but a heatmap
 # that puts eight runs side by side should confirm it for all of them at the point of comparison.
-qc <- map_dfr(seq_len(nrow(exps)), function(i) {
-  f <- file.path(out_dir, paste0("shapreg_qc_", exps$suffix[i], ".csv"))
-  if (!file.exists(f)) return(tibble(experiment = exps$label[i], closure_sd = NA_real_))
-  read_csv(f, show_col_types = FALSE) %>% mutate(experiment = exps$label[i])
-})
-if (any(!is.na(qc$closure_sd))) {
-  cat("\nSHAP closure per column (must be ~0; 11_ asserts < 1e-8):\n")
-  print(as.data.frame(qc %>% dplyr::select(experiment, n_features, explain_n,
-                                           baseline, closure_sd, units) %>%
-    mutate(across(c(baseline), ~ round(., 5)))), row.names = FALSE)
-  stopifnot("a column's SHAP decomposition did not close" =
-              all(qc$closure_sd[!is.na(qc$closure_sd)] < 1e-8))
-  # Units must match, or the shares were computed from differently-scaled SHAP.
-  stopifnot("columns were built with different target transforms" =
-              length(unique(na.omit(qc$target_transform))) <= 1)
+#
+# EVERY column must be checked - a column with no record fails, rather than being skipped. The
+# shapreg_qc_ file was added to 11_ after some runs were made (si3d hypoxia 1hr and 4hr have
+# none), so where it is missing the closure is recomputed from shapreg_per_gene_, which holds each
+# explained gene's prediction and its per-feature SHAP. That recompute reproduces the stored
+# closure_sd and baseline exactly on the columns that have both.
+closure_from_per_gene <- function(sf) {
+  f <- file.path(out_dir, paste0("shapreg_per_gene_", sf, ".csv"))
+  if (!file.exists(f)) return(NULL)
+  d <- read_csv(f, show_col_types = FALSE)
+  fc <- setdiff(names(d), c("gene_id_clean", "symbol", "y", "pred"))
+  implied <- d$pred - rowSums(d[fc])
+  tibble(n_features = length(fc), explain_n = nrow(d), baseline = mean(implied),
+         closure_sd = sd(implied))
 }
+qc <- map_dfr(seq_len(nrow(exps)), function(i) {
+  f  <- file.path(out_dir, paste0("shapreg_qc_", exps$suffix[i], ".csv"))
+  pg <- closure_from_per_gene(exps$suffix[i])
+  if (file.exists(f)) {
+    q <- read_csv(f, show_col_types = FALSE) %>% mutate(source = "shapreg_qc")
+    # Where both exist they must agree, or the per-gene fallback is not a valid substitute.
+    if (!is.null(pg))
+      stopifnot("per-gene SHAP does not reproduce the stored closure record" =
+                  abs(pg$baseline - q$baseline) < 1e-9 && abs(pg$closure_sd - q$closure_sd) < 1e-9)
+  } else if (!is.null(pg)) {
+    q <- pg %>% mutate(units = NA_character_, target_transform = NA_character_,
+                       source = "recomputed from per-gene SHAP")
+  } else {
+    q <- tibble(closure_sd = NA_real_, source = "none")
+  }
+  q %>% mutate(experiment = exps$label[i])
+})
+cat("\nSHAP closure per column (must be ~0; 11_ asserts < 1e-8):\n")
+print(as.data.frame(qc %>% dplyr::select(any_of(c("experiment", "n_features", "explain_n",
+                                                  "baseline", "closure_sd", "source"))) %>%
+  mutate(across(any_of("baseline"), ~ round(., 5)))), row.names = FALSE)
+stopifnot("a column has no SHAP closure record (no shapreg_qc_ or shapreg_per_gene_ file)" =
+            !any(is.na(qc$closure_sd)))
+stopifnot("a column's SHAP decomposition did not close" = all(qc$closure_sd < 1e-8))
+# Units must match, or the shares were computed from differently-scaled SHAP. The transform is
+# also in every suffix (_yraw), which covers the recomputed columns.
+stopifnot("columns were built with different target transforms" =
+            length(unique(na.omit(qc$target_transform))) <= 1,
+          "columns were built with different target transforms (suffix)" =
+            length(unique(str_extract(exps$suffix, "_y[a-z]+"))) == 1)
 
 # Two diagnostics that decide whether a column should be read at all.
 diag_tbl <- perf %>%
@@ -228,12 +361,12 @@ if (any(diag_tbl$weak_model, na.rm = TRUE)) {
   for (l in diag_tbl$experiment[which(diag_tbl$weak_model)])
     cat(sprintf("      %s (Spearman %.3f)\n", l, diag_tbl$spearman[diag_tbl$experiment == l]))
 }
-under <- perf %>% filter(!is.na(bridge_n_pos), bridge_n_pos < 20)
-if (nrow(under)) {
-  cat("\nAUC suppressed as underpowered (fewer than 20 held-out positives):\n")
-  for (i in seq_len(nrow(under)))
-    cat(sprintf("      %s (%d positives)\n", under$experiment[i], under$bridge_n_pos[i]))
-}
+cat("\nColumn labels carry rho only: Spearman of predicted vs observed TE on held-out genes.\n")
+cat("No threshold, identical meaning in every column, and the quantity the forest ranks.\n\n")
+cat("AUC is computed and written to rfreg_performance_* but is NOT shown. Across these columns\n")
+cat("it tracks how many genes clear the LFC cut rather than model quality - one held-out\n")
+cat("positive at si3d hypoxia 24hr against 996 at si3e normoxia 1+4hr - so comparing it between\n")
+cat("columns compares thresholds, not models.\n")
 if (any(!diag_tbl$auc_meaningful)) {
   cat("\nColumns with no AUC: the bridge compares against notebook 02's classifier gene sets,\n")
   cat("which exist only for si3d. For si3e no classifier comparison is wanted, and a fixed LFC\n")
@@ -254,6 +387,23 @@ ggsave_if <- function(...) if (isTRUE(params$save_plots)) ggsave(...)
 ```
 
 ```{r annotations}
+# The direction-stability flags and the family noise floor below were each MEASURED on one
+# experiment: the floor_preset / floor_arm split-seed sweep, which is si3d hypoxia 1hr in
+# MDA-MB-231 on the full feature set. The floor is driven by gene count and outcome spread, so it
+# does not transfer to another contrast, cell line or feature set. They are therefore shown ONLY
+# when every column is that experiment, and dropped from the figure otherwise - a bar that looks
+# like it covers every column but was measured on one of them is worse than no bar.
+source(here("code", "translational_control_overview", "10_regression_presets.R"))
+floor_arm_def <- REG_PRESETS[[params$floor_preset]][[params$floor_arm]]
+stopifnot("floor_preset / floor_arm not found in REG_PRESETS" = !is.null(floor_arm_def))
+# The sweep runs under its own feature_set_label (e.g. tcoreg_tf) only so its outputs do not
+# overwrite the main run; its model is otherwise the main tcoreg configuration.
+floor_measured_on <- reg_suffix(modifyList(floor_arm_def, list(feature_set_label = "tcoreg")))
+floor_applies <- all(exps$suffix == floor_measured_on)
+cat("noise floor and direction stability were measured on:", floor_measured_on, "\n")
+cat(if (floor_applies) "  every column is that experiment - shown\n" else
+      "  not every column is that experiment - both are DROPPED from this figure\n")
+
 # Which features cannot be read directionally: their shap_value_cor sign flips across the 20
 # split seeds, so the signed view must not be trusted for them.
 dir_path <- file.path(out_dir, paste0("shapreg_direction_stability_",
@@ -262,6 +412,7 @@ unstable <- if (file.exists(dir_path)) {
   d <- read_csv(dir_path, show_col_types = FALSE)
   d$feature[d$frac_pos > 0.05 & d$frac_pos < 0.95]
 } else character(0)
+if (!floor_applies) unstable <- character(0)
 cat("features with an unstable SHAP direction:", length(unstable), "\n")
 if (length(unstable)) cat("  ", paste(unstable, collapse = ", "), "\n")
 
@@ -271,10 +422,21 @@ floor_path <- file.path(out_dir, paste0("shapreg_noise_floor_",
 fam_floor <- if (file.exists(floor_path))
   read_csv(floor_path, show_col_types = FALSE) %>%
     dplyr::select(family, floor_sd = sd, floor_mdd = min_detectable_diff) else NULL
+if (!floor_applies) fam_floor <- NULL
 cat("family noise floor available:", !is.null(fam_floor), "\n")
 
 # The data-driven grouping from 14_. Features not in a multi-feature cluster are their own group.
-clus_path <- file.path(out_dir, paste0("featcorr_clusters_", exps$suffix[1], ".csv"))
+# Which run's correlated-feature clustering to use. Feature-feature correlation is a property of
+# the FEATURE MATRIX, not of the outcome, and every column here is built from the same matrix, so
+# one clustering legitimately describes all of them. clusters_suffix makes that reuse explicit:
+# without it the grouping is looked up under the first column's suffix, and a figure whose first
+# column is a cell line that 14_ was never run for silently loses the panel.
+clus_suffix <- if (nzchar(params$clusters_suffix)) params$clusters_suffix else exps$suffix[1]
+clus_path <- file.path(out_dir, paste0("featcorr_clusters_", clus_suffix, ".csv"))
+if (nzchar(params$clusters_suffix))
+  cat("correlated-cluster grouping taken from:", clus_suffix,
+      "\n  (valid for every column here: they share one feature matrix, so feature-feature",
+      "\n   correlation is identical; only the outcome differs between columns)\n")
 corr_group <- if (file.exists(clus_path)) {
   cl <- read_csv(clus_path, show_col_types = FALSE) %>%
     filter(abs(threshold - params$corr_threshold) < 1e-9)
@@ -347,11 +509,37 @@ if (!any(grepl("minus9|context_m9", modelled)))
 #
 # Capturing the gtable ONCE with silent = TRUE and drawing it twice avoids both: the device
 # survives, the inline figure is captured, and the file is a real figure.
-draw_and_save <- function(args, fname = NULL, width = 7, height = NULL) {
+draw_and_save <- function(args, fname = NULL, width = 9, height = NULL,
+                          cellheight = 13) {
+  # Rows get a FIXED height in points and the page grows to fit, rather than a fixed page
+  # squeezing the rows. With 11 families in a 4-inch page the row labels overlapped and the
+  # dendrogram took most of the height; a fixed cellheight makes every row legible whether
+  # there are 11 of them or 69.
+  if (is.null(args$cellheight)) args$cellheight <- cellheight
+  # No title on the figure. What each panel shows is stated in the notebook text beside it, and
+  # the multi-line titles competed with the column dendrogram for space.
+  args$main <- NA
   ph <- do.call(pheatmap, c(args, list(silent = TRUE)))
   grid.newpage(); grid.draw(ph$gtable)
   if (!is.null(fname) && isTRUE(params$save_plots)) {
-    if (is.null(height)) height <- max(4, 0.17 * nrow(args$mat) + 2)
+    # Page height is COMPUTED, not assumed. A flat overhead clipped the title once the column
+    # labels grew: they are rotated, so their height scales with the longest label's character
+    # count rather than being constant.
+    if (is.null(height)) {
+      lab_txt   <- if (!is.null(args$labels_col)) args$labels_col else colnames(args$mat)
+      dendro_in <- if (isTRUE(args$cluster_cols)) 1.2 else 0.2
+      n_tracks  <- (if (!is.null(args$annotation_col)) ncol(args$annotation_col) else 0) +
+                   (if (!is.null(args$annotation_row)) 1 else 0)
+      height <- cellheight * nrow(args$mat) / 72 +   # the matrix itself
+                0.075 * max(nchar(lab_txt)) +        # rotated column labels, ~9pt
+                dendro_in + 0.22 * n_tracks + 0.9    # dendrogram, annotation bars, title
+    }
+    # Width grows with the column count for the same reason. A fixed 9 in page clipped the
+    # leftmost columns once a 16-column cross-cell-line figure was drawn.
+    cw <- if (!is.null(args$cellwidth)) args$cellwidth else 42
+    width <- max(width, cw * ncol(args$mat) / 72 +      # the matrix itself
+                        0.07 * max(nchar(rownames(args$mat))) +   # row labels
+                        (if (!is.null(args$annotation_row)) 0.5 else 0) + 3.2)  # legends
     pdf(file.path(here("plots"), fname), width = width, height = height)
     grid.newpage(); grid.draw(ph$gtable); dev.off()
   }
@@ -376,6 +564,9 @@ anno_row <- data.frame(
   family              = fam_of[rownames(M)],
   `direction repeats` = ifelse(rownames(M) %in% unstable, "flips", "reproducible"),
   row.names = rownames(M), check.names = FALSE)
+# Measured on one experiment only; see the annotations chunk. Without this the bar would read
+# "reproducible" for every row, which is a claim nobody measured.
+if (!floor_applies) anno_row$`direction repeats` <- NULL
 fam_cols <- setNames(
   colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
                      "#0072B2", "#D55E00", "#CC79A7", "grey50"))(n_distinct(anno_row$family)),
@@ -392,7 +583,8 @@ pheat <- function(m, main, annor, annoc = NULL, signed = FALSE, fname = NULL, ..
   }
   args <- list(mat = m, color = col, breaks = brk,
                cluster_rows = FALSE, cluster_cols = ncol(m) > 2,
-               annotation_row = annor, annotation_col = anno_col, annotation_colors = annoc,
+               annotation_row = annor, annotation_col = anno_col,
+               annotation_colors = c(annoc, anno_col_colors),
                display_numbers = ncol(m) <= 3, number_format = "%.1f", fontsize_number = 7,
                labels_col = lab_for(m),
                fontsize_row = 8, fontsize_col = 9, cellwidth = 42, main = main, ...)
@@ -402,7 +594,7 @@ pheat <- function(m, main, annor, annoc = NULL, signed = FALSE, fname = NULL, ..
 pheat(M, sprintf("SHAP share (%%) per feature, %d experiment%s",
                  ncol(M), if (ncol(M) == 1) "" else "s"),
       anno_row, list(family = fam_cols,
-                     `direction repeats` = c(reproducible = "grey85", flips = "#CC79A7")),
+                     `direction repeats` = c(reproducible = "grey85", flips = "black")),
       fname = tagf("15_heatmap_features_magnitude", "pdf"))
 cat(sprintf("\n%d features | top: %s (%.2f%%) | bottom: %s (%.2f%%)\n",
             nrow(M), rownames(M)[1], M[1, 1], rownames(M)[nrow(M)], M[nrow(M), 1]))
@@ -436,8 +628,9 @@ comb_args <- list(
   breaks = seq(-1, 1, length.out = 102),
   cluster_rows = FALSE, cluster_cols = ncol(Md) > 2,
   annotation_row = anno_row, annotation_col = anno_col,
-  annotation_colors = list(family = fam_cols,
-                           `direction repeats` = c(reproducible = "grey85", flips = "#CC79A7")),
+  annotation_colors = c(list(family = fam_cols,
+                             `direction repeats` = c(reproducible = "grey85", flips = "black")),
+                        anno_col_colors),
   # The printed number is the SHARE, not the value being coloured.
   # Printed shares stop being legible past about four columns.
   display_numbers = if (ncol(Md) <= 4) round(M[rownames(Md), , drop = FALSE], 1) else FALSE,
@@ -449,7 +642,7 @@ comb_args <- list(
   na_col = "grey88",
   fontsize_row = 8, fontsize_col = 9, cellwidth = 46,
   main = "Colour = direction (vermillion up, blue down, grey undefined)\nNumber = SHAP share (%), rows ordered by it")
-draw_and_save(comb_args, tagf("15_heatmap_features_combined", "pdf"), width = 7.5)
+draw_and_save(comb_args, tagf("15_heatmap_features_combined", "pdf"), width = 9)
 
 n_na <- sum(is.na(Md[, 1]))
 cat(sprintf("\ndirection: %d push UP, %d push DOWN, %d undefined\n",
@@ -494,7 +687,8 @@ annof <- if (!is.null(fam_floor)) {
 } else NULL
 pheat(Mf, sprintf("SHAP share (%%) per family, %d experiment%s",
                   ncol(Mf), if (ncol(Mf) == 1) "" else "s"),
-      annof, NULL, fname = tagf("15_heatmap_family_magnitude", "pdf"))
+      annof, if (!is.null(annof)) list(`noise floor` = colorRampPalette(c("grey93", "grey20"))(100)),
+      fname = tagf("15_heatmap_family_magnitude", "pdf"))
 # A family's direction is the share-weighted mean of its members' correlations. When members
 # disagree this moves toward 0 and the cell goes white, which is the honest reading: the family
 # has no single direction.
@@ -518,11 +712,12 @@ fd_args <- list(mat = Mfd,
   color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
   breaks = seq(-1, 1, length.out = 102),
   cluster_rows = FALSE, cluster_cols = ncol(Mfd) > 2, annotation_col = anno_col,
+  annotation_colors = anno_col_colors,
   display_numbers = ncol(Mfd) <= 3, number_format = "%.2f", fontsize_number = 8,
   labels_col = lab_for(Mfd),
   fontsize_row = 9, fontsize_col = 9, cellwidth = 42,
   main = "Family direction (share-weighted)\nwhite = members disagree")
-draw_and_save(fd_args, tagf("15_heatmap_family_direction", "pdf"), width = 6.5, height = 5)
+draw_and_save(fd_args, tagf("15_heatmap_family_direction", "pdf"), width = 7.5)
 mixed <- tibble(family = rownames(Mfd), dir = Mfd[, 1]) %>% filter(abs(dir) < 0.5)
 if (nrow(mixed)) {
   cat("\nfamilies with no single direction (members disagree):\n")
@@ -551,9 +746,66 @@ anno_c <- cg_long %>% distinct(group, n, families) %>%
   transmute(group, size = ifelse(n > 1, "grouped", "single")) %>%
   column_to_rownames("group")
 anno_c <- anno_c[rownames(Mc), , drop = FALSE]
+
+# Direction, computed here so the magnitude panel can carry it as a side bar. A cluster's
+# direction in one column is the share-weighted mean of its members' shap_value_cor, undefined
+# members excluded rather than allowed to blank the row.
+cg_dir <- long %>%
+  left_join(corr_group, by = "feature") %>%
+  mutate(group = coalesce(group, feature)) %>%
+  group_by(experiment, group) %>%
+  summarise(direction = if (all(is.na(direction))) NA_real_ else
+                        weighted.mean(direction, share, na.rm = TRUE), .groups = "drop")
+Mcd <- mat_of(cg_dir, "group", "direction")[rownames(Mc), , drop = FALSE]
+
+# Side bar: the row's direction averaged over the columns, each experiment weighted equally.
+# BINNED, not continuous: pheatmap stretches a continuous annotation ramp over the observed
+# min..max, so white would not sit at 0 and a mildly positive row could render blue. Near 0 means
+# either weak everywhere or opposite signs in different experiments - the direction panel below
+# says which.
+dir_levels <- c("down (< -0.5)", "weak down", "mixed / weak", "weak up", "up (> 0.5)")
+dir_cols   <- setNames(c("#0072B2", "#9CC7E4", "grey92", "#F0B48C", "#D55E00"), dir_levels)
+mean_dir <- rowMeans(Mcd, na.rm = TRUE)
+anno_c_mag <- anno_c
+anno_c_mag$`mean direction` <- factor(
+  as.character(cut(mean_dir, c(-Inf, -0.5, -0.2, 0.2, 0.5, Inf), labels = dir_levels)),
+  levels = dir_levels)
+# Grouped is dark grey, not vermillion: vermillion now means "pushes up" in this figure.
+size_cols <- c(grouped = "grey30", single = "grey85")
 pheat(Mc, sprintf("SHAP share (%%) per correlated cluster (|rho| >= %.1f)", params$corr_threshold),
-      anno_c, list(size = c(grouped = "#D55E00", single = "grey85")),
+      anno_c_mag, list(size = size_cols,
+                       `mean direction` = dir_cols[levels(droplevels(anno_c_mag$`mean direction`))]),
       fname = tagf("15_heatmap_cluster_magnitude", "pdf"))
+cat("\nmean direction bar, rows per bin:\n"); print(table(anno_c_mag$`mean direction`))
+
+# Direction for the clusters too, so all three groupings - features, families, correlated
+# clusters - carry both a magnitude and a direction panel. Only the feature and family views had
+# one; that was an omission rather than a choice.
+#
+# A cluster's direction is the share-weighted mean of its members' shap_value_cor, with
+# undefined members excluded rather than allowed to blank the row. Because a correlated cluster
+# can span families, this is the view that shows whether a single correlated axis pushes one way
+# even when its members are filed under different families.
+# (cg_dir / Mcd are computed above, before the magnitude panel.)
+cd_args <- list(mat = Mcd,
+  color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  breaks = seq(-1, 1, length.out = 102),
+  cluster_rows = FALSE, cluster_cols = ncol(Mcd) > 2,
+  annotation_row = anno_c, annotation_col = anno_col,
+  annotation_colors = c(list(size = size_cols), anno_col_colors),
+  na_col = "grey88", labels_col = lab_for(Mcd),
+  display_numbers = ncol(Mcd) <= 3, number_format = "%.2f", fontsize_number = 7,
+  fontsize_row = 8, fontsize_col = 9,
+  main = sprintf("Direction per correlated cluster (|rho| >= %.1f)\nvermillion up, blue down, white = members disagree",
+                 params$corr_threshold))
+draw_and_save(cd_args, tagf("15_heatmap_cluster_direction", "pdf"), width = 9)
+
+mixed_c <- tibble(group = rownames(Mcd), dir = Mcd[, 1]) %>%
+  filter(!is.na(dir), abs(dir) < 0.4)
+if (nrow(mixed_c)) {
+  cat("\nclusters with no single direction (members push opposite ways):\n")
+  print(as.data.frame(mixed_c %>% mutate(dir = round(dir, 3))), row.names = FALSE)
+}
 
 cat("\nmulti-feature clusters, and what each recovers:\n")
 print(as.data.frame(cg_long %>% filter(n > 1) %>% arrange(desc(share)) %>%
@@ -671,12 +923,12 @@ r_args <- list(mat = Mr,
   breaks = seq(0, max(Mr), length.out = 102),
   cluster_rows = FALSE, cluster_cols = FALSE,
   annotation_row = anno_r, annotation_col = anno_col,
-  annotation_colors = list(family = fam_cols),
+  annotation_colors = c(list(family = fam_cols), anno_col_colors),
   display_numbers = TRUE, number_format = "%.1f", fontsize_number = 7,
   labels_col = lab_for(Mr),
   fontsize_row = 8, fontsize_col = 9, cellwidth = 42,
   main = sprintf("Reduced model: %d features, one per correlated cluster", nrow(Mr)))
-draw_and_save(r_args, tagf("15_heatmap_reduced_magnitude", "pdf"), width = 7)
+draw_and_save(r_args, tagf("15_heatmap_reduced_magnitude", "pdf"), width = 9)
 
 Mrd <- red %>% transmute(feature, !!exps$label[1] := dir_red) %>%
   column_to_rownames("feature") %>% as.matrix()
@@ -685,7 +937,7 @@ rd_args <- modifyList(r_args, list(mat = Mrd,
   color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
   breaks = seq(-1, 1, length.out = 102), number_format = "%.2f",
   main = "Reduced model: direction"))
-draw_and_save(rd_args, tagf("15_heatmap_reduced_direction", "pdf"), width = 7)
+draw_and_save(rd_args, tagf("15_heatmap_reduced_direction", "pdf"), width = 9)
 ```
 
 # 6. Adding the next experiment

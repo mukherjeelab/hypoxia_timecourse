@@ -1,0 +1,213 @@
+---
+title: "Does the correlated-feature grouping hold on MCF7-SIX1's own isoforms?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  ref_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  ref_matrix_rds: "feature_matrix_tco.rds"
+  mcf7_suffix: "eif33d_promotes_mcf7six1_hypoxia_1hr_lfc0.5_tcoreg_mcf7tx_corrected_both_clipaggregate_yraw"
+  mcf7_matrix_rds: "feature_matrix_tco_mcf7six1.rds"
+  thresholds: "0.7,0.8,0.9"
+  main_threshold: 0.8
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "14b_feature_correlation_mcf7six1_check.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this checks
+
+The combined heatmap (`15_shap_heatmap.Rmd`) sums SHAP within **correlated clusters**: groups of
+features whose pairwise |Spearman rho| clears 0.8. `14_feature_correlation.Rmd` defines them once,
+on the MDA-MB-231 feature matrix. The MCF7-SIX1 columns are built on a different matrix, whose
+features are computed on MCF7-SIX1's own dominant isoforms. This notebook asks whether the same
+grouping holds there.
+
+It is **read-only**: it writes no outputs and changes nothing upstream.
+
+**Decisions**
+
+- The method is copied from `14_`, not reimplemented: Spearman on every transcript in the
+  matrix, pairwise-complete, average-linkage clustering on 1 - |rho|, cut at 1 - threshold. As
+  a gate, the MDA-MB-231 side must reproduce `14_`'s saved cluster table exactly before any
+  comparison is trusted.
+- Differences are split into two causes. **Isoform**: the same genes, but features computed on
+  a different transcript. **Population**: different genes in each matrix. Restricting both
+  matrices to their shared genes removes the second.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+```
+
+```{r load}
+out_dir <- here("output", "translational_control_overview")
+thresholds <- as.numeric(str_trim(str_split(params$thresholds, ",")[[1]]))
+
+md_ref  <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", params$ref_suffix, ".rds")))
+md_mcf7 <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", params$mcf7_suffix, ".rds")))
+fc <- md_ref$feature_cols
+stopifnot("the two runs do not model the same features" = setequal(fc, md_mcf7$feature_cols))
+
+to_X <- function(m) {
+  X <- m[, fc]
+  for (f in fc) if (is.list(X[[f]])) X[[f]] <- as.numeric(unlist(X[[f]]))
+  X <- as.matrix(X); rownames(X) <- m$gene_id_clean; X
+}
+m_ref  <- readRDS(file.path(out_dir, params$ref_matrix_rds))
+m_mcf7 <- readRDS(file.path(out_dir, params$mcf7_matrix_rds))
+stopifnot(all(fc %in% colnames(m_ref)), all(fc %in% colnames(m_mcf7)))
+X_ref <- to_X(m_ref); X_mcf7 <- to_X(m_mcf7)
+cat(sprintf("MDA-MB-231 matrix: %d transcripts | MCF7-SIX1 matrix: %d transcripts | %d features\n",
+            nrow(X_ref), nrow(X_mcf7), length(fc)))
+
+# Same-gene, different-isoform bookkeeping.
+shared_genes <- intersect(m_ref$gene_id_clean, m_mcf7$gene_id_clean)
+iso <- tibble(gene_id_clean = shared_genes,
+              tx_ref  = m_ref$transcript_id_clean[match(shared_genes, m_ref$gene_id_clean)],
+              tx_mcf7 = m_mcf7$transcript_id_clean[match(shared_genes, m_mcf7$gene_id_clean)])
+cat(sprintf("genes in both matrices: %d, of which %d (%.1f%%) use a different isoform\n",
+            nrow(iso), sum(iso$tx_ref != iso$tx_mcf7), 100 * mean(iso$tx_ref != iso$tx_mcf7)))
+stopifnot("gene_id_clean is not unique in a matrix" =
+            !anyDuplicated(m_ref$gene_id_clean), !anyDuplicated(m_mcf7$gene_id_clean))
+
+spearman <- function(X) {
+  C <- suppressWarnings(cor(X, use = "pairwise.complete.obs", method = "spearman"))
+  stopifnot("correlation matrix has missing entries - a feature may be constant" = !anyNA(C))
+  C
+}
+clusters_of <- function(C, th) {
+  cutree(hclust(as.dist(1 - abs(C)), method = "average"), h = 1 - th)
+}
+C_ref  <- spearman(X_ref)
+C_mcf7 <- spearman(X_mcf7)
+C_ref_sh  <- spearman(X_ref[shared_genes, ])
+C_mcf7_sh <- spearman(X_mcf7[shared_genes, ])
+```
+
+# 1. Gate: the MDA-MB-231 side reproduces 14_
+
+```{r gate}
+saved <- read_csv(file.path(out_dir, paste0("featcorr_clusters_", params$ref_suffix, ".csv")),
+                  show_col_types = FALSE)
+# 14_ saves only multi-feature clusters. Compare them as sets of member sets, since cluster
+# numbering is arbitrary.
+as_sets <- function(g) {
+  s <- split(names(g), g); s <- s[lengths(s) > 1]
+  sort(map_chr(s, ~ paste(sort(.x), collapse = "|")))
+}
+for (th in thresholds) {
+  mine <- as_sets(clusters_of(C_ref, th))
+  theirs <- saved %>% filter(abs(threshold - th) < 1e-9) %>% group_by(cluster) %>%
+    summarise(k = paste(sort(feature), collapse = "|"), .groups = "drop") %>% pull(k) %>% sort()
+  stopifnot("re-derived MDA-MB-231 clusters do not match 14_'s saved table" =
+              identical(unname(mine), theirs))
+  cat(sprintf("|rho| >= %.1f: %d multi-feature clusters, identical to 14_\n", th, length(mine)))
+}
+```
+
+# 2. How much do the pairwise correlations move?
+
+```{r pairwise}
+ut <- upper.tri(C_ref)
+pairs <- tibble(a = rownames(C_ref)[row(C_ref)[ut]], b = colnames(C_ref)[col(C_ref)[ut]],
+                rho_231 = C_ref[ut], rho_mcf7 = C_mcf7[ut],
+                rho_231_shared = C_ref_sh[ut], rho_mcf7_shared = C_mcf7_sh[ut]) %>%
+  mutate(delta = rho_mcf7 - rho_231,
+         delta_isoform    = rho_mcf7_shared - rho_231_shared,   # same genes, different isoform
+         delta_population = rho_231_shared - rho_231)           # same isoform, fewer genes
+cat(sprintf("%d feature pairs\n", nrow(pairs)))
+cat(sprintf("|delta rho|, MCF7-SIX1 matrix vs MDA-MB-231 matrix: median %.3f, 95th pct %.3f, max %.3f\n",
+            median(abs(pairs$delta)), quantile(abs(pairs$delta), 0.95), max(abs(pairs$delta))))
+cat(sprintf("  of which from the isoform change (shared genes only): median %.3f, max %.3f\n",
+            median(abs(pairs$delta_isoform)), max(abs(pairs$delta_isoform))))
+cat(sprintf("  of which from the gene population:                     median %.3f, max %.3f\n",
+            median(abs(pairs$delta_population)), max(abs(pairs$delta_population))))
+cat(sprintf("correlation of the two correlation matrices (all pairs): r = %.4f\n",
+            cor(pairs$rho_231, pairs$rho_mcf7)))
+
+th <- params$main_threshold
+cross <- pairs %>% filter((abs(rho_231) >= th) != (abs(rho_mcf7) >= th)) %>%
+  arrange(desc(abs(delta)))
+cat(sprintf("\npairs that cross |rho| = %.1f between the matrices: %d\n", th, nrow(cross)))
+if (nrow(cross)) print(as.data.frame(cross %>% dplyr::select(a, b, rho_231, rho_mcf7,
+                                                             delta_isoform, delta_population) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+
+cat("\nlargest moves overall:\n")
+print(as.data.frame(pairs %>% arrange(desc(abs(delta))) %>% head(10) %>%
+  dplyr::select(a, b, rho_231, rho_mcf7, delta_isoform, delta_population) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+```
+
+```{r fig_pairs, fig.width = 5.5, fig.height = 5}
+ggplot(pairs, aes(abs(rho_231), abs(rho_mcf7))) +
+  annotate("rect", xmin = th, xmax = 1, ymin = th, ymax = 1, fill = "grey90") +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = th, colour = "grey60", linewidth = 0.3) +
+  geom_vline(xintercept = th, colour = "grey60", linewidth = 0.3) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "|rho|, MDA-MB-231 isoforms", y = "|rho|, MCF7-SIX1 isoforms",
+       title = "Feature-pair correlation on the two matrices",
+       subtitle = sprintf("n = %d feature pairs; shaded = grouped in both at |rho| >= %.1f",
+                          nrow(pairs), th)) +
+  theme_classic(base_size = 12)
+```
+
+# 3. Do the clusters themselves change?
+
+```{r clusters}
+# Adjusted Rand index between two partitions of the same features (1 = identical).
+ari <- function(x, y) {
+  t <- table(x, y); n <- sum(t); c2 <- function(v) sum(choose(v, 2))
+  a <- c2(t); b <- c2(rowSums(t)); c <- c2(colSums(t)); e <- b * c / choose(n, 2)
+  (a - e) / ((b + c) / 2 - e)
+}
+cmp <- map_dfr(thresholds, function(t) {
+  g1 <- clusters_of(C_ref, t); g2 <- clusters_of(C_mcf7, t)[names(g1)]
+  s1 <- as_sets(g1); s2 <- as_sets(g2)
+  tibble(threshold = t, clusters_231 = length(s1), clusters_mcf7 = length(s2),
+         identical_clusters = length(intersect(s1, s2)),
+         only_231 = length(setdiff(s1, s2)), only_mcf7 = length(setdiff(s2, s1)),
+         ARI = ari(g1, g2))
+})
+print(as.data.frame(cmp %>% mutate(ARI = round(ARI, 4))), row.names = FALSE)
+
+g1 <- clusters_of(C_ref, th); g2 <- clusters_of(C_mcf7, th)[names(g1)]
+d1 <- setdiff(as_sets(g1), as_sets(g2)); d2 <- setdiff(as_sets(g2), as_sets(g1))
+cat(sprintf("\nat the heatmap's threshold (|rho| >= %.1f):\n", th))
+if (!length(d1) && !length(d2)) {
+  cat("  every multi-feature cluster is identical on the two matrices.\n")
+} else {
+  cat("  clusters on MDA-MB-231 only:\n");  for (s in d1) cat("    ", gsub("\\|", ", ", s), "\n")
+  cat("  clusters on MCF7-SIX1 only:\n");   for (s in d2) cat("    ", gsub("\\|", ", ", s), "\n")
+}
+```
+
+# 4. What it means for the combined heatmap
+
+```{r verdict}
+same_main <- !length(d1) && !length(d2)
+cat(if (same_main)
+  sprintf("At |rho| >= %.1f the grouping is identical on both matrices, so the cluster rows of the\ncombined heatmap mean the same thing in the MCF7-SIX1 columns as in the MDA-MB-231 ones.\n", th)
+else
+  sprintf("At |rho| >= %.1f the grouping differs (%d cluster(s) only on MDA-MB-231, %d only on\nMCF7-SIX1). The cluster rows of the combined heatmap use the MDA-MB-231 grouping, so for the\nMCF7-SIX1 columns those rows sum features that are not correlated at that level on MCF7-SIX1's\nown transcripts (or split ones that are). The family and single-feature views are unaffected.\n",
+          th, length(d1), length(d2)))
+```
