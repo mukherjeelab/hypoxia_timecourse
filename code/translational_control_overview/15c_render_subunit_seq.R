@@ -16,7 +16,7 @@ e <- c("MDA-MB-231 3d hypoxia 1hr (TE reference)" = "eif33d_promotes_hypoxia_1hr
 exps <- paste(paste0(names(e), "=", e, T), collapse = ";")
 rmarkdown::render(here::here("code/translational_control_overview/15_shap_heatmap.Rmd"),
   params = list(experiments = exps, allow_mixed_genes = TRUE, reduced_suffix = "",
-                clusters_suffix = "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw",
+                clusters_suffix = "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw",
                 out_tag = "subunit_seq_rpkm"),
   output_file = "15_shap_heatmap_subunit_seq_rpkm.html",
   intermediates_dir = tempfile(), quiet = TRUE)

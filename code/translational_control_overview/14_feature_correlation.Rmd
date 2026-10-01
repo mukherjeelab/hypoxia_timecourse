@@ -131,15 +131,19 @@ pheatmap(C,
   fontsize_row = 6, fontsize_col = 6, treeheight_col = 40, treeheight_row = 40,
   main = sprintf("Spearman correlation, %d features across %d transcripts", ncol(C), nrow(X)))
 if (isTRUE(params$save_plots)) {
-  pdf(here("plots", paste0("14_correlation_heatmap_", params$rf_suffix, ".pdf")),
-      width = 13, height = 12)
-  pheatmap(C, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  # Build silently, then draw the stored gtable into the PDF. Calling pheatmap() directly after
+  # pdf() inside a knitr chunk wrote an essentially empty 4 KB file - knitr's own graphics device
+  # captured the drawing. Same pattern as 15_shap_heatmap.Rmd's draw_and_save().
+  hm_pdf <- pheatmap(C, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
     breaks = seq(-1, 1, length.out = 102),
     clustering_distance_rows = D, clustering_distance_cols = D,
     clustering_method = "average", annotation_row = anno, annotation_col = anno,
     annotation_colors = list(family = fam_cols), fontsize_row = 6, fontsize_col = 6,
-    main = "Spearman correlation between modelled features")
-  dev.off()
+    main = "Spearman correlation between modelled features", silent = TRUE)
+  pdf(here("plots", paste0("14_correlation_heatmap_", params$rf_suffix, ".pdf")),
+      width = 13, height = 12)
+  grid::grid.newpage(); grid::grid.draw(hm_pdf$gtable)
+  invisible(dev.off())
 }
 ```
 
@@ -364,4 +368,107 @@ reg_write_csv(dec,   file.path(out_dir, paste0("featcorr_decision_table_", param
 reg_write_csv(as_tibble(C, rownames = "feature"),
               file.path(out_dir, paste0("featcorr_matrix_", params$rf_suffix, ".csv")))
 cat("Wrote featcorr_* diagnostics. No grouping file written; nothing downstream changes.\n")
+```
+
+# 8. Which features are most correlated, and do they cross families?
+
+The full matrix above is mostly near zero, so it does not show the answer at a glance. These two
+figures do: (a) every pair with |rho| > 0.5, ranked, coloured by whether the two features share a
+family; (b) only the features in those pairs, with rho printed. A **cross-family** pair is where
+the predefined families and the data disagree.
+
+```{r top_pairs, fig.width = 10, fig.height = 11}
+pairs_tbl <- as_tibble(as.table(C), .name_repair = ~ c("a", "b", "rho")) %>%
+  mutate(a = as.character(a), b = as.character(b)) %>%
+  filter(a < b, is.finite(rho)) %>%
+  mutate(abs_rho = abs(rho), fam_a = fam[a], fam_b = fam[b],
+         same_family = ifelse(fam_a == fam_b, "same family", "different families"),
+         label = paste0(a, "  x  ", b),
+         families = ifelse(fam_a == fam_b, fam_a, paste(fam_a, "/", fam_b))) %>%
+  arrange(desc(abs_rho))
+top <- pairs_tbl %>% filter(abs_rho > 0.5)
+cat(sprintf("pairs with |rho| > 0.5: %d (same family %d, different families %d)\n", nrow(top),
+            sum(top$same_family == "same family"), sum(top$same_family == "different families")))
+print(as.data.frame(top %>% transmute(a, b, rho = round(rho, 3), families, same_family)), row.names = FALSE)
+
+pair_cols <- c(`same family` = "#009E73", `different families` = "#CC79A7")  # not the eIF3d/e hues
+p_pairs <- ggplot(top, aes(x = abs_rho, y = reorder(label, abs_rho), fill = same_family)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = sprintf("%+.2f", rho)), hjust = -0.1, size = 2.6) +
+  geom_vline(xintercept = c(0.7, 0.8, 0.9), linetype = "dashed", colour = "grey55", linewidth = 0.3) +
+  scale_fill_manual(values = pair_cols, name = NULL) +
+  scale_x_continuous(limits = c(0, 1.08), breaks = seq(0, 1, 0.1), expand = c(0, 0)) +
+  labs(x = "|Spearman rho| (printed: signed rho)", y = NULL,
+       title = "Most correlated feature pairs",
+       subtitle = sprintf("%d features, %d MDA-MB-231 transcripts; %d pairs with |rho| > 0.5; dashed = 0.7 / 0.8 / 0.9",
+                          ncol(C), nrow(X), nrow(top))) +
+  theme_classic(base_size = 9) + theme(legend.position = "top", axis.text.y = element_text(size = 7))
+print(p_pairs)
+ggsave_if(here("plots", paste0("14_top_correlated_pairs_", params$rf_suffix, ".pdf")), p_pairs,
+          width = 10, height = 11)
+```
+
+```{r top_pairs_heatmap, fig.width = 11, fig.height = 10}
+inv <- sort(unique(c(top$a, top$b)))
+Cs <- C[inv, inv]
+hc <- hclust(as.dist(1 - abs(Cs)), method = "average")
+lab <- matrix(sprintf("%.2f", Cs), nrow(Cs), dimnames = dimnames(Cs)); diag(lab) <- ""
+lab[abs(Cs) < 0.5] <- ""                                   # print only the strong values
+fam_pal <- setNames(c("#0072B2", "#009E73", "#CC79A7", "#D55E00", "#F0E442", "#661100", "#999933",
+                      "#44AA99", "#882255", "#332288", "#DDCC77", "#AA4499", "#117733", "grey50")[seq_len(n_distinct(fam))],
+                    sort(unique(fam)))
+an <- data.frame(family = fam[inv], row.names = inv)
+hm_top <- pheatmap(Cs, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+  breaks = seq(-1, 1, length.out = 102), cluster_rows = hc, cluster_cols = hc,
+  display_numbers = lab, number_color = "grey10", fontsize_number = 6.5,
+  annotation_row = an, annotation_col = an,
+  annotation_colors = list(family = fam_pal[unique(an$family)]),
+  fontsize_row = 7.5, fontsize_col = 7.5, treeheight_col = 0,
+  main = sprintf("Features in any pair with |rho| > 0.5 (%d of %d); values shown where |rho| >= 0.5", length(inv), ncol(C)),
+  silent = TRUE)
+grid::grid.newpage(); grid::grid.draw(hm_top$gtable)
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", paste0("14_top_correlated_heatmap_", params$rf_suffix, ".pdf")), width = 11, height = 10)
+  grid::grid.newpage(); grid::grid.draw(hm_top$gtable); invisible(dev.off())
+}
+reg_write_csv(top %>% dplyr::select(a, b, rho, abs_rho, fam_a, fam_b, same_family),
+              file.path(out_dir, paste0("featcorr_top_pairs_", params$rf_suffix, ".csv")))
+```
+
+# 9. Which family members are in each correlated cluster
+
+One block per multi-feature cluster, at each threshold. Bars are the member's SHAP share (si3d
+hypoxia 1hr full model), coloured by its **family**, so a cluster that mixes families shows two or
+more colours. The label is the member's Spearman rho with the cluster leader (its highest-SHAP
+member). Clustering: average linkage on 1 - |rho|, cut at |rho| = threshold (section 2).
+
+```{r cluster_membership, fig.width = 12, fig.height = 9}
+cm <- clus %>%
+  group_by(threshold, cluster) %>%
+  mutate(n_fam = n_distinct(family),
+         block = sprintf("%s (+%d)%s", first(leader), n() - 1, ifelse(n_fam > 1, "  [mixed]", ""))) %>%
+  ungroup() %>%
+  mutate(threshold = factor(sprintf("|rho| >= %.1f", threshold)),
+         feature_lab = paste0(feature, "  (", family, ")"))
+cat("multi-feature clusters per threshold:\n")
+print(as.data.frame(cm %>% distinct(threshold, cluster, n_fam) %>% group_by(threshold) %>%
+  summarise(clusters = n(), mixed_family = sum(n_fam > 1), .groups = "drop")), row.names = FALSE)
+cm_pal <- fam_pal[sort(unique(cm$family))]
+p_cm <- ggplot(cm, aes(x = share_pct, y = reorder(feature_lab, share_pct), fill = family)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = ifelse(feature == leader, "leader", sprintf("rho %+.2f", rho_to_leader))),
+            hjust = -0.08, size = 2.5) +
+  facet_grid(block ~ threshold, scales = "free_y", space = "free_y") +
+  scale_fill_manual(values = cm_pal) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.45))) +
+  labs(x = "SHAP share (%), si3d hypoxia 1hr full model", y = NULL,
+       title = "Correlated feature clusters and their family members",
+       subtitle = sprintf("%d features, %d MDA-MB-231 transcripts; average-linkage clusters on 1 - |rho|; label = rho with the cluster leader",
+                          ncol(C), nrow(X))) +
+  theme_bw(base_size = 8) +
+  theme(strip.text.y = element_text(angle = 0, hjust = 0), legend.position = "bottom",
+        panel.grid.major.y = element_blank())
+print(p_cm)
+ggsave_if(here("plots", paste0("14_cluster_membership_", params$rf_suffix, ".pdf")), p_cm,
+          width = 12, height = 9)
 ```

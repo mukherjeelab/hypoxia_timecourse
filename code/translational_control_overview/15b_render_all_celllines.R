@@ -19,18 +19,22 @@ mk <- function(fs) {
          setNames(fx(m, paste0("_mcf7tx", fs)), paste("MCF7-SIX1", names(m))),
          # HeLa (Herrmannova et al. 2024, eLife): gene-level TE on MDA-MB-231's isoforms, tested
          # genes only. Outcome files and sign checks are in 10h_herrmannova_outcome_prep.Rmd.
-         setNames(fx(h, fs), paste("HeLa", names(h))),
-         # DHX29 selective ribosome IP (Hia et al., HEK293T): intrinsic-only by design, so it
-         # joins only the intrinsic heatmap. Built by 10x_dhx29_ip_outcome_prep.R.
-         if (fs == "_intrinsic") c("HEK293T DHX29 IP enrichment (Hia)" =
-           fx("eifdhx29_promotes_hek293t_dhx29ip_ribo", fs)))
+         setNames(fx(h, fs), paste("HeLa", names(h))))
+  # DHX29 selective ribosome IP (Hia et al., HEK293T; 10x_dhx29_ip_outcome_prep.R) joins the
+  # intrinsic heatmap once it has been run on its own HEK293T-isoform matrix. Its earlier run on
+  # MDA-MB-231 isoforms was stopped deliberately, so there is no SHAP output to show yet:
+  #   if (fs == "_intrinsic") e <- c(e, "HEK293T DHX29 IP enrichment (Hia)" =
+  #     fx("eifdhx29_promotes_hek293t_dhx29ip_ribo", fs))
   paste(paste0(names(e), "=", e), collapse = ";")
 }
 args <- commandArgs(TRUE); fs <- if (args[1] == "intrinsic") "_intrinsic" else ""
 tag <- if (fs == "") "all_celllines" else "all_celllines_intrinsic"
 rmarkdown::render(here::here("code/translational_control_overview/15_shap_heatmap.Rmd"),
   params = list(experiments = mk(fs), allow_mixed_genes = TRUE, reduced_suffix = "",
-                clusters_suffix = "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw",
+                # Correlated-feature clusters computed on THIS model's feature set: the intrinsic
+                # heatmap uses 14_ run on the 57 intrinsic features, so no group counts an
+                # external feature the model never saw (memberships verified identical otherwise).
+                clusters_suffix = paste0("eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg", fs, T),
                 out_tag = tag),
   output_file = paste0("15_shap_heatmap_", tag, ".html"),
   intermediates_dir = tempfile(), quiet = TRUE)
