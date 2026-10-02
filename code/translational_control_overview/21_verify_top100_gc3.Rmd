@@ -1,0 +1,255 @@
+---
+title: "Verify the top-100 heatmap from source: GC3"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  top_n: 100
+  padj_max: 0.05
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "21_verify_top100_gc3.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+An independent check of one row of the top-100 heatmap (`17_top100_feature_means_heatmap.Rmd`,
+rendered by `17b_render_top100_direct.R`): **GC3 of the CDS** (`gc3_internal`), for every
+column. Nothing is read from the feature matrices except **which genes** each column contains
+(its universe); everything else comes from the source:
+
+| quantity | source |
+|---|---|
+| the transcript used for each gene | each dataset's own selection rule, recomputed where possible: MDA-MB-231 from the siCTRL normoxia RNA-seq Salmon files; the other cell sets from their transcript maps; MANE from `mane_select_v49.csv` |
+| CDS sequence | GENCODE v49 TxDb + hg38 genome |
+| GC3 | % G/C at the third position of internal codons (initiator AUG and terminal stop removed), complete CDS only (length divisible by 3 and ending in a stop) |
+| LFC, padj, top 100 | the outcome file, with the heatmap's rule: genes with padj < 0.05 and LFC > 0 ranked by LFC, filled to 100 by LFC if fewer |
+
+Three things are then asserted against the matrices, each of which the heatmap depends on:
+the matrix uses the transcript the source rule picks; its `gc3_internal` equals GC3 recomputed
+from sequence; and the top-100 mean printed on the heatmap equals the mean computed here.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(tximport)
+  library(GenomicFeatures); library(BSgenome.Hsapiens.UCSC.hg38)
+})
+O  <- here("output", "translational_control_overview")
+PD <- here("output", "predictive_modeling")
+kd_cols <- c(eIF3d = "#E69F00", eIF3e = "#56B4E9", eIF4E = "#CC6677", DHX29 = "#882255", DAP5 = "#DDCC77")
+```
+
+# 1. Columns
+
+Same columns, labels and outcome files as the heatmap.
+
+```{r columns}
+tc <- function(g, c_, t) paste0("translation_categories_si", g, "_vs_sictrl_", c_, "_", t, ".csv")
+cols <- tribble(
+  ~label, ~set, ~factor, ~outcome, ~lfc, ~padj,
+  "MDA-MB-231 3d hypoxia 1hr",    "231", "eIF3d", tc("3d", "hypoxia", "1hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3d hypoxia 4hr",    "231", "eIF3d", tc("3d", "hypoxia", "4hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3d hypoxia 24hr",   "231", "eIF3d", tc("3d", "hypoxia", "24hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3d normoxia 1+4hr", "231", "eIF3d", tc("3d", "normoxia", "1and4hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3e hypoxia 1hr",    "231", "eIF3e", tc("3e", "hypoxia", "1hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3e hypoxia 4hr",    "231", "eIF3e", tc("3e", "hypoxia", "4hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3e hypoxia 24hr",   "231", "eIF3e", tc("3e", "hypoxia", "24hr"), "te_lfc", "te_padj",
+  "MDA-MB-231 3e normoxia 1+4hr", "231", "eIF3e", "te_si3e_vs_sictrl_normoxia_1and4hr.csv", "te_lfc", "te_padj",
+  "MCF7-SIX1 3d hypoxia 1hr",     "mcf7", "eIF3d", tc("3d", "mcf7six1_hypoxia", "1hr"), "te_lfc", "te_padj",
+  "MCF7-SIX1 3d normoxia 1hr",    "mcf7", "eIF3d", tc("3d", "mcf7six1_normoxia", "1hr"), "te_lfc", "te_padj",
+  "MCF7-SIX1 3e hypoxia 1hr",     "mcf7", "eIF3e", tc("3e", "mcf7six1_hypoxia", "1hr"), "te_lfc", "te_padj",
+  "MCF7-SIX1 3e normoxia 1hr",    "mcf7", "eIF3e", tc("3e", "mcf7six1_normoxia", "1hr"), "te_lfc", "te_padj",
+  "HeLa 3d no stress (Herrmannova)", "hela", "eIF3d", tc("3d", "hela_normoxia", "steadystate"), "te_lfc", "te_padj",
+  "HeLa 3e no stress (Herrmannova)", "hela", "eIF3e", tc("3e", "hela_normoxia", "steadystate"), "te_lfc", "te_padj",
+  "HeLa 4E TE level, E.V. (Teleman)",   "hela", "eIF4E", "teleman_absolute_te_ev.csv", "te_level", "te_level_padj",
+  "HeLa 4E TE level, 4E-BP1 (Teleman)", "hela", "eIF4E", "teleman_absolute_te_bp.csv", "te_level", "te_level_padj",
+  "HEK293T DHX29 IP enrichment (Hia)",  "dhx29", "DHX29", "dhx29_ip_hek293t_enrichment.csv", "enrich_lfc", "enrich_padj",
+  "HEK293T DAP5 no stress (Weber)*",    "mane", "DAP5", "translation_categories_sidap5_vs_sictrl_hek293t_normoxia_steadystate.csv", "te_lfc", "te_padj")
+matrix_of <- c(`231` = "feature_matrix_tco.rds", mcf7 = "feature_matrix_tco_mcf7six1.rds",
+               hela = "feature_matrix_tco_hela.rds", dhx29 = "feature_matrix_tco_dhx29.rds",
+               mane = "feature_matrix_tco_mane.rds")
+stopifnot("an outcome file is missing" = all(file.exists(here("output", cols$outcome))))
+knitr::kable(cols %>% dplyr::select(label, set, outcome))
+```
+
+# 2. Each cell set's transcript, from its source
+
+MDA-MB-231's most abundant transcript is **recomputed** from the Salmon quantifications exactly
+as `code/predictive_modeling/01_feature_extraction.Rmd` defines it: TPM summed over the siCTRL
+normoxia RNA-seq libraries, highest per gene. The other cell sets read their transcript maps,
+which are the outputs of their own selection steps (MCF7-SIX1 Salmon; HeLa Roiuk/Teleman control
+RNA; HEK293T DHX29 footprints; MANE Select).
+
+```{r source_transcripts}
+meta <- read_csv(here("accessories", "metadata_231_timecourse.csv"), show_col_types = FALSE)
+ids  <- meta %>% filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL", condition == "normoxia") %>% pull(id)
+sf   <- here("2025_MDAcells_riboseq", "salmon", ids, "quant.sf.gz"); names(sf) <- ids
+stopifnot("siCTRL normoxia Salmon files missing" = all(file.exists(sf)))
+txi  <- tximport(sf, type = "salmon", txOut = TRUE)
+t2g  <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                 col_names = c("transcript_id", "gene_id"), show_col_types = FALSE) %>%
+  filter(str_starts(transcript_id, "ENST"))
+src231 <- tibble(transcript_id = rownames(txi$abundance), total = rowSums(txi$abundance)) %>%
+  inner_join(t2g, by = "transcript_id") %>%
+  mutate(gene_id_clean = sub("[.].*", "", gene_id), transcript_id_clean = sub("[.].*", "", transcript_id)) %>%
+  group_by(gene_id_clean) %>% slice_max(total, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  dplyr::select(gene_id_clean, transcript_id_clean)
+cat("MDA-MB-231: Salmon libraries", length(sf), "| genes with a most-abundant transcript", nrow(src231), "\n")
+
+mane <- read_csv(here("accessories", "human", "mane_select_v49.csv"),
+                 col_names = c("gene_id_clean", "transcript_id_clean", "symbol"), show_col_types = FALSE)
+src <- list(`231` = src231,
+            mcf7  = readRDS(file.path(PD, "precomputed_mcf7six1_tx.rds")),
+            hela  = readRDS(file.path(PD, "precomputed_teleman_tx.rds")),
+            dhx29 = readRDS(file.path(PD, "precomputed_dhx29_tx.rds")),
+            mane  = mane) %>%
+  map(~ .x %>% transmute(gene_id_clean = as.character(unlist(gene_id_clean)),
+                         transcript_id_clean = as.character(unlist(transcript_id_clean))))
+```
+
+## The matrices use those transcripts
+
+The matrix is read here for its gene list and its transcript IDs only.
+
+```{r transcript_identity}
+mats <- map(matrix_of, ~ readRDS(file.path(O, .x)))
+ident <- imap_dfr(mats, function(m, s) {
+  j <- m %>% dplyr::select(gene_id_clean, transcript_id_clean) %>%
+    left_join(src[[s]] %>% dplyr::rename(src_tx = transcript_id_clean), by = "gene_id_clean")
+  tibble(cell_set = s, matrix_genes = nrow(j), gene_in_source = sum(!is.na(j$src_tx)),
+         same_transcript = sum(j$src_tx == j$transcript_id_clean, na.rm = TRUE))
+})
+knitr::kable(ident)
+stopifnot("a matrix uses a transcript its source selection does not pick" =
+            all(ident$same_transcript == ident$matrix_genes))
+```
+
+# 3. GC3 from sequence
+
+```{r gc3}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+want <- unique(unlist(map(src, "transcript_id_clean")))
+cdsl <- cdsBy(txdb, by = "tx", use.names = TRUE); names(cdsl) <- sub("[.].*", "", names(cdsl))
+cdsl <- cdsl[names(cdsl) %in% want]
+cds  <- toupper(as.character(extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38, cdsl)))
+gc3_of <- function(s) {
+  n <- nchar(s) %/% 3L
+  if (nchar(s) %% 3L != 0L || n < 2L) return(NA_real_)
+  cod <- substring(s, seq(1, 3 * n, 3), seq(3, 3 * n, 3))
+  if (!tail(cod, 1) %in% c("TAA", "TAG", "TGA")) return(NA_real_)   # truncated CDS: no terminal stop
+  cod <- head(cod, -1); if (cod[1] == "ATG") cod <- cod[-1]
+  if (!length(cod)) return(NA_real_)
+  100 * mean(substr(cod, 3, 3) %in% c("G", "C"))
+}
+gc3 <- tibble(transcript_id_clean = names(cds), gc3_source = vapply(cds, gc3_of, numeric(1)))
+cat("CDS sequences:", nrow(gc3), "| GC3 defined:", sum(!is.na(gc3$gc3_source)), "\n")
+
+# ACTB is a known GC3-rich transcript; a range check for the definition itself.
+actb <- gc3$gc3_source[gc3$transcript_id_clean %in% src$`231`$transcript_id_clean[
+  src$`231`$gene_id_clean == "ENSG00000075624"]]
+cat(sprintf("ACTB GC3 (MDA-MB-231 transcript): %.1f%%\n", actb))
+stopifnot("GC3 outside [0, 100]" = all(between(gc3$gc3_source, 0, 100), na.rm = TRUE),
+          "ACTB GC3 is not in the GC3-rich range" = length(actb) == 1 && actb > 60)
+```
+
+## The matrices' `gc3_internal` equals it, transcript by transcript
+
+```{r gc3_vs_matrix}
+gc3_chk <- imap_dfr(mats, function(m, s) {
+  j <- m %>% dplyr::select(transcript_id_clean, gc3_internal) %>% left_join(gc3, by = "transcript_id_clean")
+  k <- !is.na(j$gc3_internal) & !is.na(j$gc3_source)
+  tibble(cell_set = s, transcripts = nrow(j), both = sum(k),
+         na_only_matrix = sum(is.na(j$gc3_internal) & !is.na(j$gc3_source)),
+         na_only_source = sum(!is.na(j$gc3_internal) & is.na(j$gc3_source)),
+         max_abs_dev = max(abs(j$gc3_internal[k] - j$gc3_source[k])))
+})
+knitr::kable(gc3_chk, digits = 12)
+stopifnot("matrix gc3_internal differs from GC3 recomputed from sequence" =
+            all(gc3_chk$max_abs_dev < 1e-9) && all(gc3_chk$na_only_matrix == 0) && all(gc3_chk$na_only_source == 0))
+```
+
+# 4. Top 100 per column, and its mean
+
+```{r top100}
+per_col <- pmap(cols, function(label, set, factor, outcome, lfc, padj) {
+  oc <- read_csv(here("output", outcome), show_col_types = FALSE) %>%
+    transmute(gene_id_clean = sub("[.].*", "", gene_id), y = .data[[lfc]], y_padj = .data[[padj]])
+  uni <- oc %>% filter(gene_id_clean %in% mats[[set]]$gene_id_clean, !is.na(y)) %>%       # the column's universe
+    left_join(src[[set]], by = "gene_id_clean") %>% left_join(gc3, by = "transcript_id_clean")
+  sig <- uni %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > 0) %>% arrange(desc(y))
+  top <- sig %>% slice_head(n = params$top_n)
+  if (nrow(top) < params$top_n)
+    top <- bind_rows(top, uni %>% filter(!gene_id_clean %in% top$gene_id_clean) %>% arrange(desc(y)) %>%
+                       slice_head(n = params$top_n - nrow(top)))
+  # What the heatmap printed: the same genes' gc3_internal from the matrix.
+  hm <- mats[[set]]$gc3_internal[match(top$gene_id_clean, mats[[set]]$gene_id_clean)]
+  list(all = uni %>% mutate(label = label, factor = factor),
+       summary = tibble(label = label, factor = factor, n_all = sum(!is.na(uni$gc3_source)),
+                        mean_all = mean(uni$gc3_source, na.rm = TRUE),
+                        n_top = sum(!is.na(top$gc3_source)), n_top_significant = min(nrow(sig), params$top_n),
+                        mean_top = mean(top$gc3_source, na.rm = TRUE),
+                        heatmap_value = mean(hm, na.rm = TRUE),
+                        wilcox_p = wilcox.test(top$gc3_source, uni$gc3_source[!uni$gene_id_clean %in% top$gene_id_clean])$p.value),
+       top = top$gene_id_clean)
+})
+summ <- map_dfr(per_col, "summary")
+knitr::kable(summ %>% dplyr::select(-factor), digits = c(0, 0, 2, 0, 0, 2, 2, 4))
+stopifnot("a top-100 mean from source differs from the heatmap's value" =
+            all(abs(summ$mean_top - summ$heatmap_value) < 1e-9))
+cat("Every top-100 GC3 mean computed from source equals the value printed on the heatmap.\n")
+```
+
+# 5. Figure
+
+Black: every transcript in the column's universe. Coloured: its top 100, in the colour of the
+factor the column measures. The label gives both means and both n.
+
+```{r figure, fig.width = 16, fig.height = 11}
+dens <- bind_rows(map(per_col, function(z)
+  bind_rows(z$all %>% mutate(set = "all transcripts"),
+            z$all %>% filter(gene_id_clean %in% z$top) %>% mutate(set = "top")))) %>%
+  filter(!is.na(gc3_source)) %>%
+  mutate(label = factor(label, levels = cols$label))
+lab <- summ %>% mutate(label = factor(label, levels = cols$label),
+  txt = sprintf(paste0("top ", params$top_n, " mean = %.1f%% (n = %d)\nall mean = %.1f%% (n = %s)\nWilcoxon p = %.2g"),
+                mean_top, n_top, mean_all, format(n_all, big.mark = ","), wilcox_p))
+p <- ggplot() +
+  geom_density(data = dens %>% filter(set == "all transcripts"), aes(gc3_source),
+               colour = "black", linewidth = 0.8) +
+  geom_density(data = dens %>% filter(set == "top"), aes(gc3_source, colour = factor, fill = factor),
+               alpha = 0.15, linewidth = 0.8) +
+  geom_vline(data = lab, aes(xintercept = mean_top, colour = factor), linetype = 2, linewidth = 0.5) +
+  geom_text(data = lab, aes(x = -Inf, y = Inf, label = txt), hjust = -0.05, vjust = 1.2, size = 2.7) +
+  scale_colour_manual(values = kd_cols, name = paste("top", params$top_n, "of")) +
+  scale_fill_manual(values = kd_cols, name = paste("top", params$top_n, "of")) +
+  facet_wrap(~ label, ncol = 6, scales = "free_y") +
+  labs(x = "CDS GC3 (%), internal codons, from GENCODE v49 sequence", y = "density",
+       caption = paste("* features computed on the MANE Select transcript; all other columns use",
+                       "each dataset's own most abundant or representative transcript.")) +
+  theme_classic(base_size = 12) + theme(strip.text = element_text(size = 8), legend.position = "bottom")
+p
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("21_gc3_top", params$top_n, "_vs_all_by_experiment.pdf")), p, width = 16, height = 11)
+```
+
+```{r session}
+sessionInfo()
+```

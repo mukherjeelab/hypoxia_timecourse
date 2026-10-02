@@ -10,11 +10,14 @@ params:
   # Which feature matrix each column's model used, matched on a suffix substring (first match
   # wins, "" = default). The regression model data does not record the matrix, so this must be
   # stated; the gene-set and feature-set checks below catch a wrong entry.
-  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;=feature_matrix_tco.rds"
+  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;_helatx_=feature_matrix_tco_hela.rds;_hektx_=feature_matrix_tco_dhx29.rds;_manetx_=feature_matrix_tco_mane.rds;=feature_matrix_tco.rds"
   top_n: 100
   padj_max: 0.05
   save_plots: TRUE
   out_tag: ""
+  footnote: ""
+  outcomes: ""
+  feature_list_csv: "rfreg_importance_eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw.csv"
 editor_options:
   chunk_output_type: console
 ---
@@ -97,19 +100,40 @@ walk(matrices, ~ stopifnot("a feature matrix is not one transcript per gene" =
 # Top-N means
 
 ```{r top_means}
+# Two sources for a column's genes and LFC. Default: the regression run's saved model data.
+# outcomes = "label=file|lfc_col|padj_col;..." reads them DIRECTLY from the outcome file instead,
+# joined to the column's matrix exactly as 10_ does (inner join on gene, LFC not NA), so this
+# model-free figure does not have to wait for any model. The feature list is then the intrinsic
+# reference run's (feature_list_csv).
+direct <- parse_pairs(params$outcomes)
 one_column <- function(label, suffix, matrix_rds) {
+  if (label %in% direct$key) {
+    spec <- str_split(direct$val[direct$key == label], fixed("|"))[[1]]
+    oc <- read_csv(here("output", spec[1]), show_col_types = FALSE)
+    stopifnot("outcome file lacks the named LFC / padj column" = all(spec[2:3] %in% names(oc)))
+    fm0 <- matrices[[matrix_rds]]
+    genes <- oc %>% transmute(gene_id_clean = sub("[.].*", "", gene_id), y = .data[[spec[2]]],
+                              y_padj = .data[[spec[3]]]) %>%
+      filter(gene_id_clean %in% fm0$gene_id_clean, !is.na(y))
+    md <- list(feature_cols = read_csv(file.path(out_dir, params$feature_list_csv),
+                                       show_col_types = FALSE)$feature)
+  } else {
   md <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", suffix, ".rds")))
   genes <- bind_rows(md$train %>% dplyr::select(gene_id_clean, y, y_padj),
                      md$test  %>% dplyr::select(gene_id_clean, y, y_padj))
-  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(genes$gene_id_clean)),
-            "this column has no padj to rank within" = any(!is.na(genes$y_padj)))
+  }
+  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(genes$gene_id_clean)))
+  # A column with no padj at all (the cap-binding RPKM ratios: no statistical test exists) is
+  # ranked by LFC alone; n_significant is then NA, not 0, so it cannot be read as "none passed".
+  no_padj <- all(is.na(genes$y_padj))
+  if (no_padj) cat(label, ": no padj in this outcome - top set ranked by LFC alone\n")
   N <- as.integer(params$top_n)
   sig  <- genes %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > 0) %>% arrange(desc(y))
   top  <- sig %>% slice_head(n = N)
   if (nrow(top) < N)
     top <- bind_rows(top, genes %>% filter(!gene_id_clean %in% top$gene_id_clean) %>%
                        arrange(desc(y)) %>% slice_head(n = N - nrow(top)))
-  n_sig <- min(nrow(sig), N)
+  n_sig <- if (no_padj) NA_integer_ else min(nrow(sig), N)
   stopifnot("could not fill the top set to N genes" = nrow(top) == N)
   fm <- matrices[[matrix_rds]]
   stopifnot("a modelled feature is missing from this column's matrix" = all(md$feature_cols %in% names(fm)),
@@ -167,20 +191,32 @@ meta <- exps %>% transmute(
                           str_detect(suffix, "_hela_")    ~ "HeLa",
                           str_detect(suffix, "mcf7six1")  ~ "MCF7-SIX1",
                           TRUE                            ~ "MDA-MB-231"),
-  `initiation factor` = case_when(str_detect(suffix, "^eifdhx29_") ~ "DHX29",
+  `initiation factor` = case_when(str_detect(suffix, "^eif3dhx29_") ~ "DHX29",   # suffix stem is paste0("eif3", gene)
+                                  str_detect(suffix, "^eif3dap5_")  ~ "DAP5",
+                                  str_detect(suffix, "^eif34e_")   ~ "eIF4E",
                                   str_detect(suffix, "^eif33e_")   ~ "eIF3e", TRUE ~ "eIF3d"),
-  condition = case_when(str_detect(suffix, "_hela_|_dhx29ip_") ~ "no stress",
+  condition = case_when(str_detect(suffix, "_capbind_(glu|tg)vs") ~ "cap binding, stress ratio",
+                        str_detect(suffix, "_capbind_") ~ "cap binding",
+                        str_detect(suffix, "_hela_|_dhx29ip_|_hek293t_normoxia_") ~ "no stress",
                         str_detect(suffix, "_hypoxia_")  ~ "hypoxia",
                         str_detect(suffix, "_normoxia_") ~ "normoxia",
                         TRUE                             ~ "other")) %>%
   left_join(long %>% distinct(experiment, n_significant), by = "experiment") %>%
   column_to_rownames("experiment")
+# The bars are parsed from the suffix; a column label that names a cell line must agree with it.
+# (A placeholder suffix once labelled every column MDA-MB-231 / eIF3d / "other".)
+lab_line <- str_extract(rownames(meta), "^(MDA-MB-231|MCF7-SIX1|HeLa|HEK293T)")
+stopifnot("a column's cell-line bar disagrees with its label" =
+            all(is.na(lab_line) | lab_line == meta$`cell line`),
+          "a column's condition could not be parsed from its suffix" = !any(meta$condition == "other"))
 anno_colors <- list(
   `cell line` = c(`MDA-MB-231` = "#F0E442", `MCF7-SIX1` = "#661100", HeLa = "#999933",
                   HEK293T = "#44AA99")[unique(meta$`cell line`)],
   `initiation factor` = c(eIF3d = "#E69F00", eIF3e = "#56B4E9",
-                          DHX29 = "#882255")[unique(meta$`initiation factor`)],
+                          DHX29 = "#882255", eIF4E = "#CC6677",
+                          DAP5 = "#DDCC77")[unique(meta$`initiation factor`)],
   condition = c(hypoxia = "#CC79A7", normoxia = "#009E73", `no stress` = "#009E73",
+                `cap binding` = "#332288", `cap binding, stress ratio` = "#8C7FC7",
                 other = "grey60")[unique(meta$condition)],
   n_significant = colorRampPalette(c("grey93", "grey20"))(100))
 row_anno <- data.frame(family = fam$family[match(rownames(Z), fam$feature)], row.names = rownames(Z))
@@ -193,11 +229,17 @@ hm <- pheatmap(Z, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(100
                main = paste0("Top ", params$top_n, " promoted transcripts: mean feature value\n",
                              "number = raw mean; colour = row z-score across experiments"),
                fontsize_row = 7, fontsize_col = 8, angle_col = 90, silent = TRUE)
-grid.newpage(); grid.draw(hm$gtable)
+# The footnote (the MANE star) is drawn on the figure so it travels with the PDF.
+stopifnot("a column label carries a star but no footnote explains it" =
+            !any(grepl("*", exps$label, fixed = TRUE)) || nzchar(params$footnote))
+foot <- function() if (nzchar(params$footnote))
+  grid.text(params$footnote, x = unit(0.1, "in"), y = unit(0.08, "in"),
+            just = c("left", "bottom"), gp = gpar(fontsize = 8))
+grid.newpage(); grid.draw(hm$gtable); foot()
 tag <- if (nzchar(params$out_tag)) paste0("_", params$out_tag) else ""
 if (isTRUE(params$save_plots))
-  ggsave(here("plots", paste0("17_top", params$top_n, "_feature_means_heatmap", tag, ".pdf")),
-         hm$gtable, width = 13, height = 13)
+  { pdf(here("plots", paste0("17_top", params$top_n, "_feature_means_heatmap", tag, ".pdf")), width = 13, height = 13)
+    grid.newpage(); grid.draw(hm$gtable); foot(); dev.off() }
 ```
 
 ```{r write}

@@ -39,6 +39,14 @@ if (!is.na(arm_nm)) {
   arms <- arms[arm_nm]
 }
 seeds <- REG_SPLIT_SEEDS[seq_len(min(n_seeds, length(REG_SPLIT_SEEDS)))]
+# Optional 4th argument: rerun only these seeds, e.g. "5,7,14,17" (the others' outputs are kept).
+if (length(args) >= 4) seeds <- intersect(seeds, as.integer(strsplit(args[4], ",")[[1]]))
+# PERM_N (env): shuffles for 10_'s leakage check. One shuffle's Spearman has sd ~0.045 on this
+# model (a forest fitted to shuffled LFCs still learns a random feature pattern that correlates a
+# little with the real LFC), so the single-shuffle |rho| < 0.1 bound fails 4 of 20 seeds by chance
+# (2026-10-02; the 16 passing seeds span -0.099..+0.063, mean ~0, OOB R2 ~-0.01 throughout).
+# PERM_N = 20 judges a run against 20 shuffles instead. It changes the check only, not the model.
+perm_n <- as.integer(Sys.getenv("PERM_N", "1"))
 
 # An arm carries whatever params its question needs, and 10_ declares all of them. 11_ declares a
 # subset - it never selects features itself, so it has no exclude_families or shuffle_families -
@@ -68,7 +76,8 @@ for (arm_name in names(arms)) {
         file.path(src, "10_rf_regression.Rmd"),
         params = utils::modifyList(arm, list(
           split_seed = s, run_cv = FALSE, save_plots = FALSE,
-          save_model_data = TRUE, auc_bridge = TRUE, gate_feature_parity = FALSE)),
+          save_model_data = TRUE, auc_bridge = TRUE, gate_feature_parity = FALSE,
+          perm_n = perm_n)),
         output_file = file.path(tempdir(), paste0("10_", suf, ".html")), quiet = TRUE)
       rmarkdown::render(
         file.path(src, "11_shap_regression.Rmd"),

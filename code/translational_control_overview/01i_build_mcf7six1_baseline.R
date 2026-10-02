@@ -1,4 +1,7 @@
 # 01i_build_mcf7six1_baseline.R
+# SUPERSEDED 2026-10-01 for MCF7-SIX1 by 01l_build_celltx_baseline.R mcf7six1 (via 01m_). This
+# builder assumed 31 columns in every _lunp file (dropping 650 short 5'UTRs) and carried CDS GC /
+# Kozak from 43_, which blanks them for CDS lengths not divisible by 3. Kept for the record.
 # Build the MCF7-SIX1 counterpart of feature_matrix_dhx29_kd_feature.rds, so that
 # 01_build_feature_matrix.Rmd can produce the MCF7-SIX1 matrix from the SAME code that produces
 # the MDA-MB-231 one. The alternative - a second implementation of the feature definitions - is

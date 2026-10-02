@@ -1,0 +1,249 @@
+---
+title: "How eIF3d's feature explanation changes across hypoxia: joint SHAP clustering, MDA-MB-231"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  stem: "eif33d_promotes_%s_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  timepoints: "hypoxia_1hr,hypoxia_4hr,hypoxia_24hr"
+  reference: "normoxia_1and4hr"
+  ks: "2,3,4,5,6,7,8"
+  n_perm: 50
+  sil_n: 2000
+  save_plots: TRUE
+  test_reuse: ""
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "25_shap_timecourse_joint_clustering.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Asks how the features that explain eIF3d-dependent translation change through the hypoxia time
+course in MDA-MB-231 (Kate, 2026-10-02). Each gene gets an out-of-fold SHAP vector from each
+timepoint's intrinsic regression model (`23_shap_gene_clustering.Rmd`, run per timepoint). Genes
+are then clustered **on all three hypoxia timepoints at once**: one combined profile per gene,
+its 1hr, 4hr and 24hr family-level SHAP side by side. A cluster is then a group of genes whose
+explanation changes over time in the same way, e.g. "GC-driven at 1hr, length-driven at 24hr".
+
+- **Profiles:** the 11 family sums (exact, SHAP is additive), normalised within gene **and within
+  timepoint** (divided by that timepoint's total |SHAP| for the gene). Within-timepoint
+  normalisation stops the strongest model (1hr) from dominating the grouping simply because its
+  SHAP values are larger.
+- **Normoxia 1+4hr** is shown as an extra block in the heatmap but is **not used to form the
+  groups**, so the hypoxia-defined groups can be read in normoxia.
+- **k** is chosen against the column-permuted null exactly as in `23_` / `03_subgroup_null.R`
+  (standardise within k, then maximise over k); both the silhouette peak and the best-supported k
+  are drawn.
+- **Caveat carried throughout:** the 4hr and 24hr models are weaker (held-out Spearman about 0.39
+  and 0.30 against 0.47 at 1hr), so their SHAP vectors are noisier. Section 5 reports how much each
+  timepoint drives the grouping.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(cluster); library(pheatmap); library(grid) })
+O <- here("output", "translational_control_overview")
+tps <- strsplit(params$timepoints, ",")[[1]]; ref <- params$reference
+ks <- as.integer(strsplit(params$ks, ",")[[1]])
+SAVE <- isTRUE(params$save_plots) && !nzchar(params$test_reuse)
+tp_lab <- function(x) c(hypoxia_1hr = "hypoxia 1hr", hypoxia_4hr = "hypoxia 4hr", hypoxia_24hr = "hypoxia 24hr",
+                        normoxia_1and4hr = "normoxia 1+4hr")[x]
+```
+
+# 1. Out-of-fold SHAP per timepoint
+
+```{r load}
+load_tp <- function(tp) {
+  f <- file.path(O, paste0("shap_oof_", sprintf(params$stem, if (nzchar(params$test_reuse)) params$test_reuse else tp), ".rds"))
+  stopifnot("out-of-fold SHAP missing - render 23_shap_gene_clustering.Rmd for this timepoint first" = file.exists(f))
+  readRDS(f)
+}
+oof <- map(setNames(c(tps, ref), c(tps, ref)), load_tp)
+if (nzchar(params$test_reuse)) cat("TEST MODE: every timepoint reuses", params$test_reuse, "\n")
+ids <- map(oof, ~ .x$genes$gene_id_clean)
+stopifnot("timepoints do not cover the same genes in the same order" = all(map_lgl(ids, identical, ids[[1]])),
+          "timepoints do not share one feature set" = all(map_lgl(oof, ~ identical(colnames(.x$S), colnames(oof[[1]]$S)))))
+genes <- oof[[1]]$genes %>% dplyr::select(gene_id_clean, symbol)
+for (tp in names(oof)) genes[[paste0("lfc_", tp)]] <- oof[[tp]]$genes$y
+fc <- colnames(oof[[1]]$S)
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+map_dfr(names(oof), ~ tibble(timepoint = tp_lab(.x), genes = nrow(oof[[.x]]$S),
+  oof_spearman = cor(oof[[.x]]$genes$pred_oof, oof[[.x]]$genes$y, method = "spearman"))) %>% knitr::kable(digits = 3)
+```
+
+# 2. The joint profile
+
+```{r profiles}
+fam_norm <- function(S) { F <- sapply(sort(unique(fam)), function(g) rowSums(S[, fam == g, drop = FALSE]))
+  F / pmax(rowSums(abs(F)), 1e-12) }
+blocks <- map(oof, ~ fam_norm(.x$S))
+for (tp in names(blocks)) colnames(blocks[[tp]]) <- paste0(colnames(blocks[[tp]]), " | ", tp_lab(tp))
+J <- do.call(cbind, blocks[tps])                       # the clustering input: hypoxia only
+R <- blocks[[ref]]                                     # shown, not clustered on
+cat(sprintf("joint profile: %d genes x %d columns (%d families x %d timepoints)\n", nrow(J), ncol(J), n_distinct(fam), length(tps)))
+```
+
+# 3. How many groups
+
+```{r null}
+set.seed(9); sil_idx <- sort(sample(nrow(J), min(params$sil_n, nrow(J))))
+sil_of <- function(M, k, seed = 9) { set.seed(seed); km <- kmeans(M, centers = k, nstart = 10, iter.max = 50)
+  if (length(unique(km$cluster[sil_idx])) < 2) return(NA_real_)
+  mean(silhouette(km$cluster[sil_idx], dist(M[sil_idx, ]))[, 3]) }
+obs <- vapply(ks, function(k) sil_of(J, k), numeric(1))
+nm <- t(vapply(seq_len(params$n_perm), function(i) { set.seed(1000 + i); P <- apply(J, 2, sample)
+  vapply(ks, function(k) sil_of(P, k), numeric(1)) }, numeric(length(ks))))
+z <- (obs - colMeans(nm)) / apply(nm, 2, sd)
+z_null <- vapply(seq_len(params$n_perm), function(i) { m2 <- nm[-i, , drop = FALSE]
+  max((nm[i, ] - colMeans(m2)) / apply(m2, 2, sd)) }, numeric(1))
+per_k <- tibble(k = ks, observed = obs, null_median = apply(nm, 2, median), null_min = apply(nm, 2, min),
+                null_max = apply(nm, 2, max), z = z)
+p_overall <- (sum(z_null >= max(z)) + 1) / (params$n_perm + 1)
+k_sil <- ks[which.max(obs)]; k_z <- ks[which.max(z)]
+knitr::kable(per_k, digits = 3)
+cat(sprintf("silhouette peak k = %d | best supported vs null k = %d (z = %.1f, p = %.3f over %d permutations)\n",
+            k_sil, k_z, max(z), p_overall, params$n_perm))
+ggplot(per_k, aes(k)) + geom_ribbon(aes(ymin = null_min, ymax = null_max), fill = "grey85") +
+  geom_line(aes(y = null_median), linetype = 2, colour = "grey50") +
+  geom_line(aes(y = observed), colour = "#E69F00", linewidth = 0.8) + geom_point(aes(y = observed), colour = "#E69F00") +
+  labs(y = "mean silhouette", title = "Joint 1hr + 4hr + 24hr profile against the column-permuted null",
+       subtitle = sprintf("n = %d genes; grey = null min-max over %d permutations", nrow(J), params$n_perm)) +
+  theme_classic(base_size = 12)
+```
+
+# 4. Heatmaps
+
+Genes are columns, ordered by group and within a group by the 1hr LFC. Rows are the 11 families
+in four blocks - hypoxia 1hr, 4hr, 24hr (used for grouping) and normoxia 1+4hr (shown only).
+
+```{r heatmaps, fig.width = 15, fig.height = 11, results = "asis"}
+sets <- list(hypoxia_1hr = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv", hypoxia_4hr = "hypoxia_3d_promotes_TE_4hr_lfc0.5.csv",
+             hypoxia_24hr = "hypoxia_3d_promotes_TE_24hr_lfc0.5.csv")
+for (tp in names(sets)) genes[[paste0("promoted_", tp)]] <- genes$gene_id_clean %in%
+  sub("[.].*", "", read_csv(here("output", "genesets", sets[[tp]]), show_col_types = FALSE)$ensembl_gene)
+rg <- oof[[ref]]$genes; genes[[paste0("promoted_", ref)]] <- rg$y > 0.5 & !is.na(rg$y_padj) & rg$y_padj < 0.05
+assign_k <- list()
+for (k in unique(c(k_sil, k_z))) {
+  set.seed(9); cl <- kmeans(J, centers = k, nstart = 25, iter.max = 50)$cluster
+  cl <- match(cl, as.integer(names(sort(table(cl), decreasing = TRUE))))
+  assign_k[[as.character(k)]] <- cl
+  ord <- order(cl, -genes$lfc_hypoxia_1hr)
+  H <- t(cbind(J, R)[ord, ]); cap <- max(abs(H))
+  acol <- data.frame(group = factor(cl[ord]), check.names = FALSE, row.names = colnames(H))
+  for (tp in c(tps, ref)) acol[[paste("LFC", tp_lab(tp))]] <- genes[[paste0("lfc_", tp)]][ord]
+  for (tp in c(tps, ref)) acol[[paste("promoted", tp_lab(tp))]] <- ifelse(genes[[paste0("promoted_", tp)]][ord], "yes", "no")
+  arow <- data.frame(timepoint = factor(sub(".* \\| ", "", rownames(H)), levels = tp_lab(c(tps, ref))),
+                     family = sub(" \\|.*", "", rownames(H)), row.names = rownames(H))
+  div <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(50)
+  acols <- c(list(group = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_len(k)], seq_len(k)),
+                  timepoint = setNames(c("#F2C6DE", "#CC79A7", "#7A2E5C", "#009E73"), tp_lab(c(tps, ref))),
+                  family = setNames(colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)), sort(unique(fam)))),
+             setNames(rep(list(div), length(c(tps, ref))), paste("LFC", tp_lab(c(tps, ref)))),
+             setNames(rep(list(c(yes = "#E69F00", no = "grey92")), length(c(tps, ref))), paste("promoted", tp_lab(c(tps, ref)))))
+  hm <- pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE, fontsize_row = 7,
+                 color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101), breaks = seq(-cap, cap, length.out = 102),
+                 annotation_col = acol, annotation_row = arow, annotation_colors = acols,
+                 gaps_col = cumsum(table(cl))[-k], gaps_row = cumsum(rep(n_distinct(fam), length(c(tps, ref))))[-length(c(tps, ref))],
+                 labels_row = sub(" \\|.*", "", rownames(H)),
+                 main = sprintf("eIF3d, MDA-MB-231: family SHAP (normalised within gene and timepoint) | k = %d (%s) | n = %d genes\nGroups formed on hypoxia 1hr + 4hr + 24hr; normoxia 1+4hr shown, not used",
+                                k, if (k == k_sil) "silhouette peak" else "best supported vs null", nrow(J)), silent = TRUE)
+  cat("\n\n## k = ", k, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (SAVE) { png(here("plots", paste0("25_shap_timecourse_joint_k", k, ".png")), width = 15, height = 11, units = "in", res = 300)
+    grid.newpage(); grid.draw(hm$gtable); dev.off() }
+}
+```
+
+# 5. What changes over time, per group
+
+The mean normalised SHAP of each family at each timepoint, per group (best-supported k). A line
+that crosses zero is a family whose direction of influence flips for those genes.
+
+```{r trajectories, fig.width = 13, fig.height = 7}
+k_use <- as.character(k_z); cl <- assign_k[[k_use]]
+traj <- map_dfr(c(tps, ref), function(tp) as_tibble(blocks[[tp]]) %>%
+  rename_with(~ sub(" \\|.*", "", .x)) %>% mutate(group = cl) %>% pivot_longer(-group, names_to = "family") %>%
+  group_by(group, family) %>% summarise(mean = mean(value), .groups = "drop") %>% mutate(timepoint = tp_lab(tp)))
+top_fams <- traj %>% group_by(family) %>% summarise(a = max(abs(mean))) %>% slice_max(a, n = 6) %>% pull(family)
+p_traj <- traj %>% filter(family %in% top_fams) %>%
+  mutate(timepoint = factor(timepoint, levels = tp_lab(c(tps, ref))),
+         group = paste0("group ", group, " (n = ", table(cl)[as.character(group)], ")")) %>%
+  ggplot(aes(timepoint, mean, colour = family, group = family)) +
+  geom_hline(yintercept = 0, colour = "grey70") + geom_line(linewidth = 0.8) + geom_point() +
+  facet_wrap(~ group) +
+  labs(y = "mean SHAP share (signed, normalised within gene and timepoint)", x = NULL,
+       title = sprintf("How each group's explanation changes across the time course (k = %s)", k_use),
+       subtitle = "six families with the largest mean |value|; normoxia 1+4hr shown for reference") +
+  theme_classic(base_size = 12) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_traj
+if (SAVE) ggsave(here("plots", "25_shap_timecourse_group_trajectories.pdf"), p_traj, width = 13, height = 7)
+```
+
+## How much each timepoint drives the grouping
+
+Share of the between-group sum of squares that each timepoint's block carries. A timepoint near
+zero is barely used to separate the groups.
+
+```{r tp_contribution}
+bss <- map_dfr(tps, function(tp) { cols <- grepl(paste0("\\| ", tp_lab(tp), "$"), colnames(J)); X <- J[, cols]
+  tibble(timepoint = tp_lab(tp), between_ss = sum(sapply(split(as.data.frame(X), cl), function(d) nrow(d) * sum((colMeans(d) - colMeans(X))^2)))) }) %>%
+  mutate(share_pct = 100 * between_ss / sum(between_ss))
+knitr::kable(bss, digits = 2)
+```
+
+## Group summary
+
+```{r summary}
+fm <- readRDS(file.path(O, "feature_matrix_tco.rds"))
+seqv <- fm %>% transmute(gene_id_clean, cds_gc, gc3 = gc3_internal, cds_nt = 2^log2_cds_length - 1, utr5_nt = 2^log2_utr5_length - 1)
+summ <- genes %>% mutate(group = cl) %>% left_join(seqv, by = "gene_id_clean") %>% group_by(group) %>%
+  summarise(n = n(), across(starts_with("lfc_"), median, .names = "median_{.col}"),
+            across(starts_with("promoted_"), sum), cds_gc = median(cds_gc), gc3 = median(gc3, na.rm = TRUE),
+            cds_nt = median(cds_nt), utr5_nt = median(utr5_nt), .groups = "drop")
+knitr::kable(summ, digits = 2)
+```
+
+# 6. Do genes change group between timepoints?
+
+Each timepoint's own clustering (from `23_`, families normalised, at its best-supported k),
+cross-tabulated: how genes in each 1hr group distribute at 4hr, and 4hr at 24hr.
+
+```{r transitions, fig.width = 11, fig.height = 4.5}
+own <- map(setNames(tps, tps), function(tp) {
+  f <- file.path(O, paste0("shap_gene_clusters_", sprintf(params$stem, if (nzchar(params$test_reuse)) params$test_reuse else tp), ".csv"))
+  a <- read_csv(f, show_col_types = FALSE) %>% filter(profile == "families, normalised")
+  a %>% filter(k == max(k)) %>% dplyr::select(gene_id_clean, cluster) })
+pairs <- list(c(tps[1], tps[2]), c(tps[2], tps[3]))
+tr <- map_dfr(pairs, function(p) inner_join(own[[p[1]]], own[[p[2]]], by = "gene_id_clean", suffix = c("_from", "_to")) %>%
+  dplyr::count(cluster_from, cluster_to) %>% mutate(step = paste(tp_lab(p[1]), "->", tp_lab(p[2]))))
+p_tr <- ggplot(tr, aes(factor(cluster_to), factor(cluster_from), fill = n)) + geom_tile(colour = "white") +
+  geom_text(aes(label = n), size = 3) + scale_fill_gradient(low = "grey95", high = "#CC79A7") +
+  facet_wrap(~ step, scales = "free") +
+  labs(x = "group at the later timepoint", y = "group at the earlier timepoint",
+       title = "Genes moving between each timepoint's own SHAP groups", subtitle = sprintf("n = %d genes", nrow(genes))) +
+  theme_classic(base_size = 12)
+p_tr
+if (SAVE) ggsave(here("plots", "25_shap_timecourse_group_transitions.pdf"), p_tr, width = 11, height = 4.5)
+if (SAVE) write_csv(genes %>% mutate(joint_group = cl, k = as.integer(k_use)),
+                    file.path(O, "shap_timecourse_joint_groups_eif3d_mdamb231.csv"))
+```
+
+```{r session}
+sessionInfo()
+```

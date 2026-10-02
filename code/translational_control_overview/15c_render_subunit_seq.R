@@ -13,10 +13,17 @@ e <- c("MDA-MB-231 3d hypoxia 1hr (TE reference)" = "eif33d_promotes_hypoxia_1hr
        "HEK293T cap binding, thapsigargin"        = "eif33d_promotes_hek293t_capbind_tg_rpkm",
        "HEK293T cap binding, glucose / complete"  = "eif33d_promotes_hek293t_capbind_gluvscm_rpkm",
        "HEK293T cap binding, thapsigargin / DMSO" = "eif33d_promotes_hek293t_capbind_tgvsdmso_rpkm")
-exps <- paste(paste0(names(e), "=", e, T), collapse = ";")
+# Cap-binding columns are fitted on MANE Select (the _manetx runs; Kate, 2026-10-01), so they are
+# starred and the figure carries the footnote. The MDA-MB-231 reference keeps its own matrix.
+cb <- grepl("hek293t", e)
+sfx <- ifelse(cb, sub("_tcoreg_intrinsic", "_tcoreg_manetx_intrinsic", T), T)
+names(e)[cb] <- paste0(names(e)[cb], "*")
+exps <- paste(paste0(names(e), "=", e, sfx), collapse = ";")
+FOOT <- paste("* features computed on the MANE Select transcript; the MDA-MB-231 column uses its",
+              "own most abundant transcript.")
 rmarkdown::render(here::here("code/translational_control_overview/15_shap_heatmap.Rmd"),
   params = list(experiments = exps, allow_mixed_genes = TRUE, reduced_suffix = "",
                 clusters_suffix = "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw",
-                out_tag = "subunit_seq_rpkm"),
+                out_tag = "subunit_seq_rpkm", footnote = FOOT),
   output_file = "15_shap_heatmap_subunit_seq_rpkm.html",
-  intermediates_dir = tempfile(), quiet = TRUE)
+  intermediates_dir = tempfile(), quiet = TRUE, envir = new.env())

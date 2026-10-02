@@ -1,0 +1,277 @@
+---
+title: "Weber DAP5 outcome prep: HEK293T DAP5 knockout TE, refit with deFunction, on MANE transcripts"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  geo_dir: "accessories/weber_dap5"
+  ribodiff_xlsx: "accessories/dap5kd_riboseq_weber2022.xlsx"
+  mane_csv: "accessories/human/mane_select_v49.csv"
+  min_counts: 40
+  min_ribodiff_rho: 0.9
+  lfc: "0.5"
+  neg_lfc: "0.5"
+  neg_padj: "0.3"
+  write_outputs: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "10w_weber_dap5_outcome_prep.Rmd"))
+  params <- lapply(.fm$params,
+                   function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Turns Weber et al. 2022 ribosome profiling of a **DAP5 (EIF4G2) knockout in HEK293T** (GEO
+GSE155854) into an outcome file that `10_rf_regression.Rmd` can model, so DAP5 can become a
+column in the SHAP, correlation and top-100 heatmaps.
+
+**Decisions (Kate, 2026-10-01)**
+
+- **TE is refit from the GEO read counts with `deFunction(mode = "TE")`**, the same wrapper and
+  interaction design (`~ Condition + SeqType + Condition:SeqType`, apeglm shrinkage, no independent
+  filtering) that produced every MDA-MB-231 eIF3 column, rather than taking the paper's RiboDiff
+  values. The RiboDiff table is used only to show the data reproduce the paper.
+- **Orientation: wild type over knockout**, `test_condition = "WT"`, `control_condition = "KO"`, so
+  the coefficient is log2(TE WT / TE KO) and **positive = DAP5 promotes**, as in our files. No
+  negation is needed anywhere.
+- **Features are computed on each gene's MANE Select transcript.** Every other heatmap column uses
+  that dataset's own most abundant or representative transcript; the study reports no transcripts
+  and no HEK293T isoform data exists for it, so this column is the one stated exception and is
+  starred on every heatmap.
+- **Genes are joined to MANE by gene symbol, direct matches only.** The GEO tables carry hg19-era
+  symbols and no Ensembl IDs. No alias rescue is attempted; the genes lost are counted and written
+  out in section 5.
+- **Low-count filter: at least `min_counts` reads summed over the four RNA libraries AND over the
+  four ribosome libraries.** This is the filter used in the earlier verification of this dataset
+  (2026-09-30, r = 0.999 against RiboDiff); it is not a project-wide convention. `deFunction` itself
+  does not filter.
+- Output names follow the project's `translation_categories_si{gene}_vs_sictrl_*` convention so
+  `10_` finds them from params (`gene = dap5`, `condition = hek293t_normoxia`, `timepoint =
+  steadystate`), with the convention's known wart: it says "si" and "sictrl" for what is a CRISPR
+  knockout against wild type.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(DESeq2)
+source(here("code", "functions.R"))
+```
+
+# 1. Load
+
+```{r load}
+rd_counts <- function(f) read.delim(gzfile(here(params$geo_dir, f)), check.names = FALSE) %>%
+  dplyr::select(gene, WT_1, WT_2, DAP5_1, DAP5_2)
+rna  <- rd_counts("GSE155854_readcounts_RNA.txt.gz")
+ribo <- rd_counts("GSE155854_readcounts_Ribo.txt.gz")
+geo_te <- read.delim(gzfile(here(params$geo_dir, "GSE155854_TE_DAP5_vs_wt.txt.gz")),
+                     check.names = FALSE) %>%
+  dplyr::select(geneIDs, padj, TEcontrol, TEDAP5KO, te = `log2FC_TE(DAP5KO vs control)`)
+xl <- suppressMessages(read_excel(here(params$ribodiff_xlsx))) %>%
+  dplyr::select(geneIDs, te = `log2FC_TE(DAP5KO vs control)`, padj = `padj TE`)
+stopifnot("RNA count genes not unique"  = !any(duplicated(rna$gene)),
+          "Ribo count genes not unique" = !any(duplicated(ribo$gene)),
+          "GEO TE table genes not unique" = !any(duplicated(geo_te$geneIDs)))
+cat("RNA counts:", nrow(rna), "genes | Ribo counts:", nrow(ribo), "genes | GEO TE table:",
+    nrow(geo_te), "| supplementary xlsx:", nrow(xl), "\n")
+```
+
+# 2. Reproduce the paper
+
+## 2a. 306 DAP5 targets
+
+Weber et al. report **306** mRNAs with reduced TE in the DAP5 knockout (RiboDiff, FDR < 0.005).
+That number is typed here as the expected value of a replication check; the data are read from
+the files. Both the GEO table and the supplementary xlsx must give it.
+
+```{r targets}
+PAPER_N_TARGETS <- 306L
+n_geo <- sum(geo_te$padj < 0.005 & geo_te$te < 0, na.rm = TRUE)
+n_xl  <- sum(xl$padj < 0.005 & xl$te < 0, na.rm = TRUE)
+cat(sprintf("reduced-TE targets at FDR < 0.005: GEO %d | xlsx %d | paper %d\n", n_geo, n_xl, PAPER_N_TARGETS))
+stopifnot("GEO TE table does not give the paper's 306 targets" = n_geo == PAPER_N_TARGETS,
+          "supplementary xlsx does not give the paper's 306 targets" = n_xl == PAPER_N_TARGETS)
+```
+
+## 2b. The TE column is log2(TE knockout / TE control)
+
+```{r te_identity}
+dev <- with(geo_te, max(abs(te - log2(TEDAP5KO / TEcontrol)), na.rm = TRUE))
+cat("max |te - log2(TEDAP5KO / TEcontrol)|:", signif(dev, 3), "\n")
+stopifnot("TE column is not log2(KO / control) - wrong column or orientation" = dev < 1e-6)
+```
+
+## 2c. Validated targets go down, GAPDH does not
+
+The paper validates these as DAP5-dependent; in the source orientation (KO / control) each must be
+negative. GAPDH is the paper's unaffected control.
+
+```{r validated}
+VALIDATED <- c("WNK1", "ROCK1", "AKT1", "INPPL1", "PIK3R2", "RAF1", "CDK12")
+v <- geo_te %>% filter(geneIDs %in% c(VALIDATED, "GAPDH"))
+knitr::kable(v %>% dplyr::select(geneIDs, te, padj), digits = 3)
+stopifnot("a validated target is missing" = all(VALIDATED %in% v$geneIDs),
+          "a validated DAP5 target does not fall in the knockout" = all(v$te[v$geneIDs %in% VALIDATED] < 0),
+          "GAPDH is significant - it is the paper's unaffected control" = v$padj[v$geneIDs == "GAPDH"] > 0.005)
+```
+
+# 3. Refit with `deFunction`
+
+```{r refit}
+j <- inner_join(rna, ribo, by = "gene", suffix = c("_rna", "_ribo"))
+m <- as.matrix(j[, -1]); rownames(m) <- j$gene
+rna_cols <- grep("_rna$", colnames(m)); ribo_cols <- grep("_ribo$", colnames(m))
+keep <- rowSums(m[, rna_cols]) >= params$min_counts & rowSums(m[, ribo_cols]) >= params$min_counts
+m <- m[keep, ]
+cat(sprintf("genes in both count tables: %d | passing >= %d reads in each assay: %d\n",
+            nrow(j), params$min_counts, nrow(m)))
+
+meta <- tibble(sample_name = colnames(m)) %>%
+  mutate(library = sub(".*_", "", sample_name),
+         comparison_variable = ifelse(grepl("^WT_", sample_name), "WT", "KO"))
+stopifnot("sample metadata did not parse into 2 WT + 2 KO per assay" =
+            all(table(meta$library, meta$comparison_variable) == 2))
+norm <- counts(estimateSizeFactors(DESeqDataSetFromMatrix(
+  m, data.frame(row.names = colnames(m), x = factor(meta$library)), ~ 1)), normalized = TRUE)
+
+run <- function(mode) deFunction(countsMatrix = m, allCounts_Norm = norm, metadata = meta,
+                                 control_condition = "KO", test_condition = "WT", mode = mode)
+res <- map(c(TE = "TE", RNA = "RNA", RIBO = "RIBO"), run)
+refit <- res$TE %>% dplyr::select(geneIDs = gene_id, te_lfc = log2FoldChange, te_padj = padj) %>%
+  left_join(res$RNA  %>% dplyr::select(geneIDs = gene_id, rna_lfc  = log2FoldChange, rna_padj  = padj), by = "geneIDs") %>%
+  left_join(res$RIBO %>% dplyr::select(geneIDs = gene_id, ribo_lfc = log2FoldChange, ribo_padj = padj), by = "geneIDs")
+cat("refit genes:", nrow(refit), "| non-NA te_padj:", sum(!is.na(refit$te_padj)), "\n")
+```
+
+# 4. Direction and agreement with the paper
+
+## 4a. Ruler: DAP5's own mRNA
+
+The knockout destroys EIF4G2's mRNA, so in this orientation (WT / KO) its `rna_lfc` must be
+strongly positive - the same ruler as EIF3D's `rna_lfc` in the MDA-MB-231 files. Its TE cannot
+serve: ribosomes fall with the mRNA, so the ratio barely moves.
+
+```{r ruler_own}
+own <- refit %>% filter(geneIDs == "EIF4G2")
+knitr::kable(own, digits = 3)
+stopifnot("EIF4G2 is not in the refit" = nrow(own) == 1,
+          "EIF4G2 rna_lfc is not strongly positive - the orientation is wrong" = own$rna_lfc > 2)
+```
+
+## 4b. Validated targets are positive after the refit, and the refit tracks RiboDiff
+
+Positive here means DAP5 promotes; the paper's validated targets must all be positive. The refit
+must rank genes like RiboDiff does, against the **negated** RiboDiff value (theirs is KO / control).
+
+```{r agreement}
+vr <- refit %>% filter(geneIDs %in% VALIDATED)
+stopifnot("a validated target is positive in the paper's orientation after the refit" =
+            nrow(vr) == length(VALIDATED) && all(vr$te_lfc > 0))
+a <- inner_join(refit, geo_te %>% dplyr::select(geneIDs, rd = te, rd_padj = padj), by = "geneIDs") %>%
+  filter(is.finite(te_lfc), is.finite(rd))
+rho <- cor(a$te_lfc, -a$rd, method = "spearman")
+shared_targets <- sum(a$te_padj < 0.005 & a$te_lfc > 0 & a$rd_padj < 0.005 & a$rd < 0, na.rm = TRUE)
+cat(sprintf("refit vs negated RiboDiff: Spearman %.3f (n = %d) | refit targets (padj < 0.005, te_lfc > 0): %d | shared with the paper's %d: %d\n",
+            rho, nrow(a), sum(refit$te_padj < 0.005 & refit$te_lfc > 0, na.rm = TRUE),
+            PAPER_N_TARGETS, shared_targets))
+stopifnot("the refit does not track the paper's TE" = rho > params$min_ribodiff_rho)
+
+ggplot(a, aes(-rd, te_lfc)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_abline(linetype = 2, colour = "grey50") +
+  labs(x = "RiboDiff TE, negated: log2(control / DAP5 KO)",
+       y = "deFunction TE refit: log2(WT / KO), apeglm",
+       title = sprintf("Weber 2022 DAP5 KO, HEK293T: Spearman %.3f, n = %d", rho, nrow(a))) +
+  theme_classic(base_size = 12)
+```
+
+# 5. Join to MANE Select by symbol (direct matches only)
+
+```{r mane}
+mane <- read_csv(here(params$mane_csv), col_names = c("gene_id_clean", "transcript_id_clean", "symbol"),
+                 show_col_types = FALSE)
+stopifnot("MANE file is not one transcript per gene" = !any(duplicated(mane$gene_id_clean)),
+          "MANE IDs are versioned - expected bare IDs" = !any(grepl("[.]", mane$transcript_id_clean)))
+dup_sym <- mane$symbol[duplicated(mane$symbol)]
+tested <- refit %>% filter(!is.na(te_lfc), !is.na(te_padj))
+joined <- tested %>% inner_join(mane %>% filter(!symbol %in% dup_sym), by = c("geneIDs" = "symbol"))
+unmatched <- tested %>% filter(!geneIDs %in% joined$geneIDs)
+cat(sprintf("tested genes: %d | matched to a MANE transcript by symbol: %d | unmatched: %d (%.1f%%) | MANE symbols dropped as duplicated: %d\n",
+            nrow(tested), nrow(joined), nrow(unmatched), 100 * nrow(unmatched) / nrow(tested), length(unique(dup_sym))))
+cat(sprintf("unmatched genes among the refit's DAP5 targets (padj < 0.005, te_lfc > 0): %d of %d\n",
+            sum(unmatched$te_padj < 0.005 & unmatched$te_lfc > 0),
+            sum(tested$te_padj < 0.005 & tested$te_lfc > 0)))
+stopifnot("a symbol matched more than one MANE gene" = !any(duplicated(joined$geneIDs)),
+          "EIF4G2 did not match MANE" = "EIF4G2" %in% joined$geneIDs)
+```
+
+**Note on the unmatched genes.** These are genes whose hg19-era symbol is not the current HGNC
+symbol on any MANE Select transcript (renamed genes, readthroughs, non-coding genes with no MANE
+entry). They are dropped rather than rescued through alias tables, by decision; the list is written
+to `output/translational_control_overview/weber_dap5_unmatched_symbols.csv` so the loss can be
+inspected.
+
+# 6. Write
+
+```{r write, eval = isTRUE(params$write_outputs)}
+OUT <- here("output")
+outcome <- joined %>% transmute(gene_id = gene_id_clean, symbol = geneIDs, transcript_id_clean,
+                                te_lfc, te_padj, rna_lfc, rna_padj, ribo_lfc, ribo_padj)
+f_out <- "translation_categories_sidap5_vs_sictrl_hek293t_normoxia_steadystate.csv"
+write_csv(outcome, file.path(OUT, f_out))
+write_csv(unmatched, file.path(OUT, "translational_control_overview", "weber_dap5_unmatched_symbols.csv"))
+
+# The MANE transcript map (cell set "mane") is built by 01q_mane_tx_map.R from this file and the
+# cap-binding outcomes together, so both share one transcript per gene. Run it after this.
+stopifnot("an outcome transcript is duplicated" = !any(duplicated(outcome$transcript_id_clean)))
+
+back <- read_csv(file.path(OUT, f_out), show_col_types = FALSE)
+stopifnot("written outcome lost or gained genes" = nrow(back) == nrow(joined),
+          "written te_lfc differs from the refit" =
+            max(abs(back$te_lfc - joined$te_lfc[match(back$symbol, joined$geneIDs)])) < 1e-12)
+cat("wrote", f_out, "(", nrow(outcome), "genes ) - now run 01q_mane_tx_map.R\n")
+```
+
+# 7. Gene sets for `10_`'s spot-check
+
+Same rule as every other column: positives `te_lfc > 0.5 & padj < 0.05`, negative controls
+`|te_lfc| < 0.5 & padj > 0.3`.
+
+```{r genesets, eval = isTRUE(params$write_outputs)}
+lfc_cut <- as.numeric(params$lfc)
+nm <- paste0("hek293t_normoxia_dap5_promotes_TE_steadystate_lfc", params$lfc)
+p <- outcome %>% filter(te_lfc > lfc_cut, te_padj < 0.05) %>%
+  transmute(db_gene_symbol = symbol, ensembl_gene = gene_id, te_lfc, te_padj, gs_name = nm,
+            gs_description = paste0("genes whose translation DAP5 promotes in HEK293T (Weber 2022, ",
+              "GSE155854), deFunction TE refit, te_lfc = log2(WT / KO) > ", params$lfc, " & padj < 0.05"),
+            gs_source_species = "homo sapiens")
+write_csv(p, here("output", "genesets", paste0(nm, ".csv")))
+n <- outcome %>% filter(abs(te_lfc) < as.numeric(params$neg_lfc), te_padj > as.numeric(params$neg_padj)) %>%
+  transmute(gene_id, symbol, te_lfc, te_padj)
+write_csv(n, here("output", "genesets", paste0("hek293t_normoxia_dap5_negative_controls_lfc", params$neg_lfc, ".csv")))
+cat("DAP5-promoted:", nrow(p), "| negative controls:", nrow(n), "\n")
+stopifnot("positive gene set is implausibly small" = nrow(p) >= 50,
+          "negative control set is smaller than the positive set" = nrow(n) > nrow(p))
+```
+
+```{r session}
+sessionInfo()
+```

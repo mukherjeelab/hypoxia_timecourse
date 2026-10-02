@@ -27,7 +27,7 @@ suppressPackageStartupMessages({
 })
 
 CELL <- { a <- commandArgs(trailingOnly = TRUE); if (length(a)) a[1] else "mcf7six1" }
-stopifnot("cell must be mcf7six1, hela or dhx29" = CELL %in% c("mcf7six1", "hela", "dhx29"))
+stopifnot("cell must be mcf7six1, hela, dhx29 or mane" = CELL %in% c("mcf7six1", "hela", "dhx29", "mane", "mdamb231"))
 txdb_path <- here("accessories", "human", "txdb.gencode49.sqlite")
 m6_path   <- here("output", "predictive_modeling",
                   "feature_matrix_mcf7six1_external_stability.rds")
@@ -40,10 +40,13 @@ stopifnot("TxDb not found - run 00_build_txdb_v49.R first" = file.exists(txdb_pa
 txdb   <- loadDb(txdb_path)
 genome <- BSgenome.Hsapiens.UCSC.hg38
 
-if (CELL %in% c("hela", "dhx29")) {
+if (CELL %in% c("hela", "dhx29", "mane", "mdamb231")) {
   # hela: Roiuk-dominant HeLa transcript. dhx29: the representative transcript per gene from
   # code/dhx29_reanalysis/03 (most footprints, then MANE, CDS length, ID), HEK293T.
-  rds <- c(hela = "precomputed_teleman_tx.rds", dhx29 = "precomputed_dhx29_tx.rds")[[CELL]]
+  # mane: MANE Select for the Weber DAP5 genes (10w_weber_dap5_outcome_prep.Rmd).
+  rds <- c(hela = "precomputed_teleman_tx.rds", dhx29 = "precomputed_dhx29_tx.rds",
+           mane = "precomputed_mane_tx.rds",
+           mdamb231 = "precomputed_mdamb231_tx.rds")[[CELL]]
   tx_all <- unique(readRDS(here("output", "predictive_modeling", rds))$transcript_id_clean)
   cat(CELL, "transcripts:", length(tx_all), "\n")
 } else {

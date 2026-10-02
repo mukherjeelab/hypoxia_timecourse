@@ -20,8 +20,9 @@ g4_dir  <- here("output", "g4mer")
 
 CELL   <- { a <- commandArgs(trailingOnly = TRUE); if (length(a)) a[1] else "mcf7six1" }
 TX_RDS <- c(mcf7six1 = "precomputed_mcf7six1_tx.rds", hela = "precomputed_teleman_tx.rds",
-            dhx29 = "precomputed_dhx29_tx.rds")
-stopifnot("cell must be mcf7six1, hela or dhx29" = CELL %in% names(TX_RDS))
+            dhx29 = "precomputed_dhx29_tx.rds", mane = "precomputed_mane_tx.rds",
+           mdamb231 = "precomputed_mdamb231_tx.rds")
+stopifnot("unknown cell set" = CELL %in% names(TX_RDS))
 tx_map <- readRDS(here("output", "predictive_modeling", TX_RDS[[CELL]]))
 want   <- unique(tx_map$transcript_id_clean)
 cat(CELL, "transcripts:", length(want), "\n")

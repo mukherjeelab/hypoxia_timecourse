@@ -18,7 +18,11 @@
 # recomputed column could differ from the 231 column for reasons that have nothing to do with
 # the transcript set, and the two cell lines would not be comparable.
 #
-# Usage: Rscript code/translational_control_overview/01h_mcf7six1_dhx29_occupancy.R
+# Usage: Rscript code/translational_control_overview/01h_mcf7six1_dhx29_occupancy.R [cell]
+#   cell = mcf7six1 (default) | hela | dhx29. hela / dhx29 score the transcript set in
+#   precomputed_teleman_tx.rds / precomputed_dhx29_tx.rds and write
+#   dhx29_riboseq_occupancy_<cell>.rds. The reproduction check against the 231 file runs first
+#   in every case.
 
 suppressPackageStartupMessages({
   library(GenomicFeatures); library(BSgenome.Hsapiens.UCSC.hg38)
@@ -96,12 +100,18 @@ stopifnot(
   "the reproduction check covered implausibly few transcripts" = nrow(chk) > 7000
 )
 
-# ---- 4. MCF7-SIX1 -------------------------------------------------------------------------
-m6 <- readRDS(here("output", "predictive_modeling",
-                   "feature_matrix_mcf7six1_external_stability.rds"))
+# ---- 4. the target transcript set ------------------------------------------------------------
+CELL <- { a <- commandArgs(trailingOnly = TRUE); if (length(a)) a[1] else "mcf7six1" }
+stopifnot("cell must be mcf7six1, hela, dhx29 or mane" = CELL %in% c("mcf7six1", "hela", "dhx29", "mane", "mdamb231"))
+m6 <- if (CELL == "mcf7six1") readRDS(here("output", "predictive_modeling",
+                                            "feature_matrix_mcf7six1_external_stability.rds")) else
+  readRDS(here("output", "predictive_modeling",
+               c(hela = "precomputed_teleman_tx.rds", dhx29 = "precomputed_dhx29_tx.rds",
+                 mane = "precomputed_mane_tx.rds",
+           mdamb231 = "precomputed_mdamb231_tx.rds")[[CELL]]))
 stopifnot("the MCF7-SIX1 matrix is not one transcript per gene" =
             !any(duplicated(m6$gene_id_clean)))
-mcf <- score_set(m6$transcript_id_clean, "MCF7-SIX1")
+mcf <- score_set(m6$transcript_id_clean, CELL)
 
 out <- mcf %>%
   left_join(m6 %>% transmute(transcript_id_clean,
@@ -111,13 +121,13 @@ stopifnot("a scored MCF7-SIX1 transcript lost its gene mapping" = !any(is.na(out
 
 # Same schema as the 231 file, minus `group`, which notebook 23 adds for its own plots.
 saveRDS(out, here("output", "predictive_modeling",
-                  "dhx29_riboseq_occupancy_mcf7six1.rds"))
+                  paste0("dhx29_riboseq_occupancy_", CELL, ".rds")))
 
 cov_before <- mean(m6$transcript_id_clean %in% sub("[.].*", "", stored$transcript_id_clean))
 cov_after  <- mean(m6$transcript_id_clean %in% out$transcript_id_clean)
-cat(sprintf("\nMCF7-SIX1 coverage of the occupancy feature:\n  joining the 231 table: %.1f%%\n  recomputed here      : %.1f%%\n",
+cat(sprintf("\n%s coverage of the occupancy feature:\n  joining the 231 table: %.1f%%\n  recomputed here      : %.1f%%\n", CELL,
             100 * cov_before, 100 * cov_after))
 cat(sprintf("for reference, the 231 matrix carries it at 83.8%%\n"))
-cat(sprintf("\nscore distribution - 231 stored: median %.4f | MCF7-SIX1 recomputed: median %.4f\n",
+cat(sprintf("\nscore distribution - 231 stored: median %.4f | recomputed: median %.4f\n",
             median(stored$dhx29_occupancy_score), median(out$dhx29_occupancy_score)))
-cat("wrote dhx29_riboseq_occupancy_mcf7six1.rds\n")
+cat("wrote", paste0("dhx29_riboseq_occupancy_", CELL, ".rds"), "\n")

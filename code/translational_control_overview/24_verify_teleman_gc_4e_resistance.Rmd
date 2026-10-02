@@ -1,0 +1,252 @@
+---
+title: "Verification: GC-rich CDS mRNAs resist eIF4E inhibition (Teleman HeLa)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  te_change_rds: "output/predictive_modeling/teleman_riboseq_te_fixed.rds"
+  absolute_te_rds: "output/predictive_modeling/teleman_absolute_te.rds"
+  tx_map_rds: "output/predictive_modeling/precomputed_teleman_tx.rds"
+  matrix_rds: "output/translational_control_overview/feature_matrix_tco_hela.rds"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "24_verify_teleman_gc_4e_resistance.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# The claim, and how it is checked
+
+**Claim.** In HeLa (Roiuk / Teleman, 4E-BP1(4A) overexpression vs empty vector), mRNAs with a
+GC-rich coding sequence keep their translation efficiency better than average when eIF4E is
+inhibited - they are relatively resistant.
+
+`code/predictive_modeling/88_lm_gc3_4e_resistance.Rmd` first showed this. This notebook verifies
+it independently, from source:
+
+| quantity | source |
+|---|---|
+| TE change under 4E inhibition | `76_teleman_4e_riboseq_te_validation.Rmd`'s corrected DESeq2 fit; direction re-asserted here two ways |
+| the transcript for each gene | HeLa's own dominant transcript (`precomputed_teleman_tx.rds`, Roiuk control RNA) |
+| CDS / 5'UTR sequence | GENCODE v49 TxDb + hg38 genome, extracted here |
+| GC, GC1-3, lengths | computed here from that sequence; then asserted equal to the HeLa feature matrix |
+
+Then: how strong and how graded the association is, whether length or the 5'UTR explains it,
+whether expression level explains it, and whether a known 4E-sensitive class behaves as it should.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(GenomicFeatures); library(BSgenome.Hsapiens.UCSC.hg38)
+})
+```
+
+# 1. The TE change, and its direction
+
+`log2FoldChange` is TE(4E-BP1) relative to TE(empty vector). **Positive = TE held up under eIF4E
+inhibition = resistant.** Two independent rulers pin that sign:
+
+1. Teleman / Roiuk name CDKN2B as resistant and GLO1 as sensitive (Fig 1A).
+2. The absolute TE levels in each condition (`97_absolute_te_by_4e_class.Rmd`), differenced, must
+   track this column positively.
+
+```{r te_change}
+fit <- readRDS(here(params$te_change_rds))
+te <- fit$fixed %>% transmute(gene_id_clean = sub("[.].*", "", gene_id), symbol, d = log2FoldChange,
+                              padj, baseMean) %>% filter(is.finite(d))
+abs_te <- readRDS(here(params$absolute_te_rds))
+diff_te <- abs_te$inhibitor %>% dplyr::select(gene_id, bp = log2FoldChange) %>%
+  inner_join(abs_te$vehicle %>% dplyr::select(gene_id, ev = log2FoldChange), by = "gene_id") %>%
+  transmute(gene_id_clean = sub("[.].*", "", gene_id), delta = bp - ev)
+chk <- inner_join(te, diff_te, by = "gene_id_clean")
+r_anchor <- cor(chk$d, chk$delta)
+cdkn2b <- te$d[te$symbol == "CDKN2B"]; glo1 <- te$d[te$symbol == "GLO1"]
+cat(sprintf("CDKN2B %+.2f (resistant) | GLO1 %+.2f (sensitive) | vs TE(bp) - TE(ev): r = %.3f (n = %d)\n",
+            cdkn2b, glo1, r_anchor, nrow(chk)))
+stopifnot("CDKN2B is not resistant - sign flipped" = length(cdkn2b) == 1 && cdkn2b > 0,
+          "GLO1 is not sensitive - sign flipped" = length(glo1) == 1 && glo1 < 0,
+          "the TE change does not match the difference of the absolute TE levels" = r_anchor > 0.9)
+cat(sprintf("genes with a TE change: %d | median %.3f (DESeq2 centres it near 0)\n", nrow(te), median(te$d)))
+```
+
+# 2. Sequence features from source
+
+```{r sequences}
+txm <- readRDS(here(params$tx_map_rds)) %>%
+  transmute(gene_id_clean = as.character(unlist(gene_id_clean)), transcript_id_clean = as.character(unlist(transcript_id_clean)))
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+get_seq <- function(grl) { names(grl) <- sub("[.].*", "", names(grl)); grl <- grl[names(grl) %in% txm$transcript_id_clean]
+  s <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38, grl); setNames(toupper(as.character(s)), names(s)) }
+cds  <- get_seq(cdsBy(txdb, by = "tx", use.names = TRUE))
+utr5 <- get_seq(fiveUTRsByTranscript(txdb, use.names = TRUE))
+gcp <- function(s) 100 * str_count(s, "[GC]") / nchar(s)
+pos_gc <- function(s, p) {             # GC at codon position p, internal codons (ATG and stop removed)
+  n <- nchar(s) %/% 3L
+  if (nchar(s) %% 3L != 0L || n < 2L) return(NA_real_)
+  cod <- substring(s, seq(1, 3 * n, 3), seq(3, 3 * n, 3))
+  if (!tail(cod, 1) %in% c("TAA", "TAG", "TGA")) return(NA_real_)
+  cod <- head(cod, -1); if (cod[1] == "ATG") cod <- cod[-1]
+  if (!length(cod)) return(NA_real_)
+  100 * mean(substr(cod, p, p) %in% c("G", "C"))
+}
+seqf <- tibble(transcript_id_clean = names(cds), cds = unname(cds)) %>%
+  mutate(cds_gc = gcp(cds), gc1 = map_dbl(cds, pos_gc, 1), gc2 = map_dbl(cds, pos_gc, 2), gc3 = map_dbl(cds, pos_gc, 3),
+         log2_cds_length = log2(nchar(cds) + 1)) %>%
+  left_join(tibble(transcript_id_clean = names(utr5), u5 = unname(utr5)), by = "transcript_id_clean") %>%
+  mutate(utr5_gc = gcp(u5), log2_utr5_length = log2(nchar(u5) + 1)) %>% dplyr::select(-cds, -u5)
+d <- te %>% inner_join(txm, by = "gene_id_clean") %>% inner_join(seqf, by = "transcript_id_clean")
+cat(sprintf("genes with a TE change, a HeLa transcript and a v49 CDS: %d of %d\n", nrow(d), nrow(te)))
+
+# ACTB is GC3-rich; a check on the definition itself.
+stopifnot("GC outside [0, 100]" = all(between(d$cds_gc, 0, 100)),
+          "ACTB GC3 is not in the GC3-rich range" = d$gc3[d$symbol == "ACTB"] > 60)
+```
+
+## The same values are in the HeLa feature matrix
+
+```{r vs_matrix}
+m <- readRDS(here(params$matrix_rds))
+v <- d %>% inner_join(m %>% dplyr::select(transcript_id_clean, m_cds_gc = cds_gc, m_gc3 = gc3_internal,
+                                         m_len = log2_cds_length), by = "transcript_id_clean")
+devs <- c(cds_gc = max(abs(v$cds_gc - v$m_cds_gc)), gc3 = max(abs(v$gc3 - v$m_gc3), na.rm = TRUE),
+          log2_cds_length = max(abs(v$log2_cds_length - v$m_len)))
+print(signif(devs, 3)); cat("transcripts compared:", nrow(v), "\n")
+stopifnot("recomputed sequence features differ from the HeLa matrix" = all(devs < 1e-9),
+          "GC3 is missing in one source but not the other" = sum(is.na(v$gc3) != is.na(v$m_gc3)) == 0)
+```
+
+# 3. The association
+
+```{r association}
+rho <- function(x) { k <- is.finite(d$d) & is.finite(d[[x]])
+  ct <- cor.test(d$d[k], d[[x]][k], method = "spearman", exact = FALSE)
+  tibble(feature = x, rho = unname(ct$estimate), p = ct$p.value, n = sum(k)) }
+assoc <- map_dfr(c("cds_gc", "gc1", "gc2", "gc3", "utr5_gc", "log2_cds_length", "log2_utr5_length"), rho)
+knitr::kable(assoc, digits = c(0, 3, 3, 0))
+```
+
+```{r quintiles}
+quint <- d %>% mutate(quintile = ntile(cds_gc, 5)) %>% group_by(quintile) %>%
+  summarise(cds_gc_median = median(cds_gc), te_change_median = median(d), te_change_mean = mean(d),
+            se = sd(d) / sqrt(n()), frac_resistant = mean(d > 0), n = n(), .groups = "drop")
+knitr::kable(quint, digits = 3)
+stopifnot("TE change is not monotone across CDS GC quintiles" = all(diff(quint$te_change_median) > 0))
+```
+
+```{r figure, fig.width = 11, fig.height = 4.8}
+r_cds <- assoc %>% filter(feature == "cds_gc")
+p1 <- ggplot(d, aes(cds_gc, d)) +
+  geom_point(size = 0.3, alpha = 0.15, colour = "grey30") +
+  geom_smooth(method = "loess", colour = "#CC6677", linewidth = 0.9, se = FALSE) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = sprintf("Spearman rho = %.3f, n = %s", r_cds$rho, format(r_cds$n, big.mark = ","))) +
+  labs(x = "CDS GC (%), from GENCODE v49 sequence",
+       y = "TE change, log2(4E-BP1(4A) / empty vector)",
+       title = "GC-rich CDS mRNAs keep their TE under eIF4E inhibition", subtitle = "HeLa, Roiuk / Teleman") +
+  theme_classic(base_size = 12)
+p2 <- ggplot(quint, aes(factor(quintile), te_change_mean)) +
+  geom_col(fill = "#CC6677", width = 0.7) +
+  geom_errorbar(aes(ymin = te_change_mean - se, ymax = te_change_mean + se), width = 0.2) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_text(aes(y = ifelse(te_change_mean > 0, te_change_mean + 0.08, te_change_mean - 0.08),
+                label = sprintf("%.0f%% GC\n%.0f%% up", cds_gc_median, 100 * frac_resistant)), size = 3) +
+  labs(x = "CDS GC quintile", y = "mean TE change (+/- SE)",
+       subtitle = sprintf("n = %s genes per quintile", format(quint$n[1], big.mark = ","))) +
+  theme_classic(base_size = 12)
+gridExtra::grid.arrange(p1, p2, ncol = 2, widths = c(1.3, 1))
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "24_teleman_gc_vs_4e_resistance.pdf"),
+         gridExtra::arrangeGrob(p1, p2, ncol = 2, widths = c(1.3, 1)), width = 11, height = 4.8)
+```
+
+# 4. Is it something else in disguise?
+
+## Length and the 5'UTR
+
+CDS GC co-varies with CDS length and with the 5'UTR. Partial rank correlation: rank everything,
+regress the TE change and CDS GC on the ranks of CDS length, 5'UTR length and 5'UTR GC, and
+correlate the residuals.
+
+```{r partial}
+pk <- d %>% filter(is.finite(log2_utr5_length), is.finite(utr5_gc))
+rr <- function(y) resid(lm(rank(y) ~ rank(pk$log2_cds_length) + rank(pk$log2_utr5_length) + rank(pk$utr5_gc)))
+partial <- cor(rr(pk$d), rr(pk$cds_gc))
+cat(sprintf("CDS GC vs TE change: rho %.3f raw | %.3f after CDS length, 5'UTR length and 5'UTR GC (n = %d)\n",
+            r_cds$rho, partial, nrow(pk)))
+stopifnot("the CDS GC association does not survive the length / 5'UTR controls" = partial > 0.3)
+```
+
+## Expression level
+
+A GC-dependent library or mapping bias would most likely act through counts. Adding log2
+baseMean to a linear model must leave the GC effect intact.
+
+```{r basemean}
+lm0 <- lm(d ~ cds_gc + log2_cds_length, data = d)
+lm1 <- lm(d ~ cds_gc + log2_cds_length + log2(baseMean), data = d)
+kept <- coef(lm1)[["cds_gc"]] / coef(lm0)[["cds_gc"]]
+cat(sprintf("CDS GC coefficient: %.4f -> %.4f with log2(baseMean) (%.1f%% kept) | R2 %.3f -> %.3f\n",
+            coef(lm0)[["cds_gc"]], coef(lm1)[["cds_gc"]], 100 * kept, summary(lm0)$r.squared, summary(lm1)$r.squared))
+stopifnot("expression level explains away the GC effect" = kept > 0.8)
+```
+
+## A known 4E-sensitive class behaves as it should
+
+Ribosomal-protein (5'TOP) mRNAs are the textbook eIF4E / mTOR-sensitive class: their TE must fall.
+
+```{r top}
+top <- d %>% filter(grepl("^RP[LS][0-9]+[AXYL]?[0-9]*$", symbol))
+w <- wilcox.test(top$d, d$d[!d$gene_id_clean %in% top$gene_id_clean])
+cat(sprintf("RPL/RPS mRNAs: median TE change %.2f (n = %d) vs all others %.2f | Wilcoxon p = %.2g | median CDS GC %.1f%%\n",
+            median(top$d), nrow(top), median(d$d[!d$gene_id_clean %in% top$gene_id_clean]), w$p.value, median(top$cds_gc)))
+stopifnot("TOP mRNAs are not 4E-sensitive - the dataset or its sign is off" = median(top$d) < 0)
+```
+
+# 5. Conclusion and what it does not show
+
+```{r summary}
+tibble(check = c("TE-change direction (CDKN2B, GLO1, absolute-TE difference)",
+                 "GC recomputed from GENCODE v49 equals the HeLa matrix",
+                 "Spearman CDS GC vs TE change", "Spearman GC3 vs TE change",
+                 "Monotone across CDS GC quintiles", "Partial rho after length and 5'UTR",
+                 "GC coefficient kept after expression level", "TOP mRNAs fall"),
+       result = c("passed", sprintf("passed (max |dev| %.0e)", max(devs)), sprintf("%.3f", r_cds$rho),
+                  sprintf("%.3f", assoc$rho[assoc$feature == "gc3"]), "yes",
+                  sprintf("%.3f", partial), sprintf("%.1f%%", 100 * kept),
+                  sprintf("median %.2f", median(top$d)))) %>% knitr::kable()
+```
+
+**Verified:** in this dataset, mRNAs with GC-rich coding sequences hold their TE under eIF4E
+inhibition better than the typical mRNA, in a graded way across the whole GC range, and not
+because of CDS length, the 5'UTR, or expression level. The 5'UTR itself carries almost none of
+it, which is notable for an initiation factor.
+
+**Not shown by these data:**
+
+1. **"Still translated" is relative.** DESeq2 centres the TE change on the median gene, so
+   resistant means "lost less than the typical mRNA". If 4E-BP1(4A) lowers global translation,
+   GC-rich mRNAs may still drop in absolute terms; that needs a spike-in or a global measure.
+2. **A GC-dependent technical bias is reduced, not excluded.** A change between conditions
+   cancels any GC bias the two conditions' libraries share, but not one that differs between
+   batches; the library-preparation batches would settle it.
+3. **One cell line, one way of blocking eIF4E.** A second inhibition dataset would make it firmer.
+
+```{r session}
+sessionInfo()
+```

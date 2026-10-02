@@ -21,8 +21,9 @@ args    <- commandArgs(trailingOnly = TRUE)
 # Optional second arg: cell = mcf7six1 (default) | hela.
 CELL    <- if (length(args) >= 2) args[2] else "mcf7six1"
 TX_RDS  <- c(mcf7six1 = "precomputed_mcf7six1_tx.rds", hela = "precomputed_teleman_tx.rds",
-            dhx29 = "precomputed_dhx29_tx.rds")
-stopifnot("cell must be mcf7six1, hela or dhx29" = CELL %in% names(TX_RDS))
+            dhx29 = "precomputed_dhx29_tx.rds", mane = "precomputed_mane_tx.rds",
+           mdamb231 = "precomputed_mdamb231_tx.rds")
+stopifnot("unknown cell set" = CELL %in% names(TX_RDS))
 new_dir <- if (length(args) >= 1) args[1] else here("g4mer", paste0("out_", CELL))
 g4_dir  <- here("output", "g4mer")
 want <- unique(readRDS(here("output", "predictive_modeling", TX_RDS[[CELL]]))$transcript_id_clean)
@@ -36,10 +37,12 @@ for (rg in c("utr5", "cds", "utr3")) {
   old_f <- file.path(g4_dir, paste0("g4mer_summary_", rg, ".tsv"))
   stopifnot("the MDA-MB-231 summary for this region is missing" = file.exists(old_f))
   old <- read_tsv(old_f, show_col_types = FALSE)
-  # Reuse from the 231 base AND from other cell lines' merged summaries (never this cell's own
-  # output file, which is what is being written). Scores are sequence properties, bit-identical.
+  # Reuse from the 231 base AND from every cell set's merged summary, INCLUDING this cell's own
+  # previous output: it is read in full here, before being overwritten below. Excluding it (the
+  # original rule) silently dropped everything a first run had scored whenever 01k_ ran a second
+  # time for the same cell - 1,100 MANE transcripts on 2026-10-01, because 01b_ counts this file
+  # as "already scored" and so never re-sends them. Scores are sequence properties, bit-identical.
   others <- list.files(g4_dir, pattern = paste0("^g4mer_summary_", rg, "_.*\\.tsv$"), full.names = TRUE)
-  others <- others[basename(others) != paste0("g4mer_summary_", rg, "_", CELL, ".tsv")]
   pool <- bind_rows(old, lapply(others, function(f) read_tsv(f, show_col_types = FALSE) %>%
                                   dplyr::select(all_of(colnames(old))))) %>%
     distinct(transcript_id_clean, .keep_all = TRUE)
@@ -63,8 +66,8 @@ for (rg in c("utr5", "cds", "utr3")) {
   out_f <- file.path(g4_dir, paste0("g4mer_summary_", rg, "_", CELL, ".tsv"))
   write_tsv(merged, out_f)
   cov <- nrow(merged) / length(want)
-  cat(sprintf("%-5s reused %6d | new %6d | merged %6d of %6d MCF7-SIX1 transcripts (%.1f%%)%s\n",
-              rg, nrow(reused), nrow(new), nrow(merged), length(want), 100 * cov,
+  cat(sprintf("%-5s reused %6d | new %6d | merged %6d of %6d %s transcripts (%.1f%%)%s\n",
+              rg, nrow(reused), nrow(new), nrow(merged), length(want), CELL, 100 * cov,
               if (nrow(new) == 0) "   [FALLBACK: no new inference, reused only]" else ""))
   rows[[rg]] <- tibble(region = rg, reused = nrow(reused), new = nrow(new),
                        merged = nrow(merged), coverage = cov)

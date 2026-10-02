@@ -1,0 +1,318 @@
+---
+title: "`r paste0('Clustering genes on their SHAP vectors: ', params$label, ', intrinsic model')`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  n_folds: 5
+  ks: "2,3,4,5,6,7,8"
+  n_perm: 50
+  sil_n: 2000
+  save_plots: TRUE
+  test_genes: 0
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  pos_geneset: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "23_shap_gene_clustering.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Every gene in the MDA-MB-231 si3d hypoxia 1hr regression gets a vector of SHAP values - how much
+each intrinsic feature pushed that gene's predicted TE change up or down - and genes are then
+clustered on those vectors to find groups the model explains the same way.
+
+**Decisions (Kate, 2026-10-01)**
+
+- **Every gene, each explained by a model that never saw it.** SHAP on a gene the forest was
+  trained on overstates the fit. So the 10,172 genes are split into 5 folds (stratified on the
+  LFC); for each fold a forest is fitted on the other four - exactly as `10_rf_regression.Rmd`
+  fits, with medians from the training folds only - and the held-out fold is explained. Each
+  gene's SHAP vector therefore comes from a forest that did not train on it.
+- **Intrinsic model** (57 features): external features are other studies' measurements and would
+  group genes partly by which datasets cover them.
+- **Both value scales**: raw SHAP (how strongly, and which way, each feature moved the gene), and
+  normalised within gene (each value divided by the gene's total |SHAP|, so a cluster reflects
+  *which* features drove a gene, not how strongly it was called).
+- **Both levels**: the 11 feature families (SHAP is additive, so a family's value is the exact sum
+  of its members') and the 57 individual features. That makes four clusterings.
+- **Choosing k** uses the null that `03_subgroup_null.R` established for the classifier: permute
+  each column independently across genes (destroying which features co-occur in a gene, keeping
+  every marginal), standardise the observed silhouette **within k** against that null, then take
+  the maximum over k. Taking the raw best-over-k compares different quantities and is known to
+  return a false "no structure". Adapted to 10,172 genes: k-means is fitted on every gene; the
+  silhouette is scored on a fixed random `sil_n` of them, since the full distance matrix (10,172
+  squared) does not fit in memory here.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(ranger); library(treeshap); library(caret)
+  library(cluster); library(pheatmap); library(grid)
+})
+O <- here("output", "translational_control_overview")
+cache_dir <- file.path(O, "shap_oof_cache"); dir.create(cache_dir, showWarnings = FALSE)
+ks <- as.integer(strsplit(params$ks, ",")[[1]])
+```
+
+# 1. The model's genes and features
+
+Taken from the saved regression run, so the gene universe, LFC and feature set are exactly the
+ones that model used. Feature values come unimputed from the matrix; each fold imputes its own.
+
+```{r load}
+md <- readRDS(file.path(O, paste0("rfreg_model_data_", params$suffix, ".rds")))
+fc <- md$feature_cols
+genes <- bind_rows(md$train, md$test) %>% dplyr::select(gene_id_clean, symbol, y = y_t, y_padj)
+fm <- readRDS(file.path(O, params$matrix_rds))
+X <- fm[match(genes$gene_id_clean, fm$gene_id_clean), fc] %>% mutate(across(everything(), ~ as.numeric(unlist(.x))))
+stopifnot("model genes missing from the matrix" = !anyNA(match(genes$gene_id_clean, fm$gene_id_clean)),
+          "target is not untransformed - LFC and y_t would differ" = md$target_transform == "raw")
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+stopifnot("a feature has no family" = !anyNA(fam))
+# Test mode: a random subset with its own cache and no saved outputs, so the whole notebook can be
+# exercised in minutes before the real (hours-long) SHAP run.
+if (params$test_genes > 0) {
+  set.seed(9); keep <- sort(sample(nrow(genes), params$test_genes))
+  genes <- genes[keep, ]; X <- X[keep, ]
+  cache_dir <- file.path(O, "shap_oof_cache_test"); dir.create(cache_dir, showWarnings = FALSE)
+  cat("TEST MODE:", nrow(genes), "genes; nothing is written to plots/ or the outputs\n")
+}
+SAVE <- isTRUE(params$save_plots) && params$test_genes == 0
+# Plot files carry the contrast (e.g. "hypoxia_4hr") so per-timepoint runs do not overwrite each other.
+ptag <- sub("_lfc.*$", "", sub("^eif33d_promotes_", "", params$suffix))
+cat(sprintf("genes %d | features %d in %d families\n", nrow(genes), length(fc), n_distinct(fam)))
+```
+
+## The refit reproduces the saved model
+
+Fitting on the saved run's own split must give the saved held-out predictions exactly, or the
+fold forests below are not the same model.
+
+```{r reproduce}
+fit_forest <- function(Xtr, ytr) {
+  set.seed(md$forest_seed)
+  ranger(x = Xtr, y = ytr, num.trees = 1000, min.node.size = 5, splitrule = "variance",
+         importance = "impurity", seed = md$forest_seed)
+}
+rf0 <- fit_forest(md$train[, fc], md$train$y_t)
+saved <- read_csv(file.path(O, paste0("rfreg_predictions_", params$suffix, ".csv")), show_col_types = FALSE)
+dev0 <- max(abs(predict(rf0, md$test[, fc])$predictions - saved$pred[match(md$test$gene_id_clean, saved$gene_id_clean)]))
+cat("refit vs saved held-out predictions: max |dev|", signif(dev0, 3), "\n")
+stopifnot("the refit does not reproduce the saved model" = dev0 < 1e-9)
+rm(rf0); invisible(gc())
+```
+
+# 2. SHAP for every gene, out of fold
+
+Cached per fold in `shap_oof_cache/`, so an interrupted render resumes. Each fold's SHAP plus
+its baseline must add up to that fold forest's prediction for every gene.
+
+```{r shap_oof}
+set.seed(9)
+folds <- createFolds(genes$y, k = params$n_folds, list = TRUE)
+impute <- function(df, med) { for (cc in fc) df[[cc]][is.na(df[[cc]])] <- med[[cc]]; df }
+res <- map(seq_along(folds), function(f) {
+  cf <- file.path(cache_dir, sprintf("fold%d_%s.rds", f, params$suffix))
+  te <- folds[[f]]
+  if (file.exists(cf)) { r <- readRDS(cf); stopifnot("cached fold does not match" = identical(r$idx, te)); return(r) }
+  tr  <- setdiff(seq_len(nrow(genes)), te)
+  med <- X[tr, ] %>% summarise(across(everything(), ~ median(.x, na.rm = TRUE)))
+  Xtr <- impute(X[tr, ], med); Xte <- impute(X[te, ], med)
+  rf  <- fit_forest(Xtr, genes$y[tr])
+  u   <- ranger.unify(rf, as.data.frame(Xtr))
+  t0  <- Sys.time()
+  sh  <- as.matrix(treeshap(u, as.data.frame(Xte), verbose = FALSE)$shaps[, fc])
+  pr  <- predict(rf, Xte)$predictions
+  leftover <- pr - rowSums(sh)
+  stopifnot("SHAP does not add up to the fold prediction" = diff(range(leftover)) < 1e-6)
+  r <- list(idx = te, shap = sh, pred = pr, baseline = mean(leftover),
+            minutes = as.numeric(difftime(Sys.time(), t0, units = "mins")))
+  saveRDS(r, cf); cat(sprintf("fold %d: %d genes, %.0f min\n", f, length(te), r$minutes)); r
+})
+S <- matrix(NA_real_, nrow(genes), length(fc), dimnames = list(genes$gene_id_clean, fc))
+genes$pred_oof <- NA_real_
+for (r in res) { S[r$idx, ] <- r$shap; genes$pred_oof[r$idx] <- r$pred }
+stopifnot("a gene has no out-of-fold SHAP" = !anyNA(S))
+cat(sprintf("out-of-fold prediction vs LFC: Spearman %.3f (n = %d) | baselines %s\n",
+            cor(genes$pred_oof, genes$y, method = "spearman"), nrow(genes),
+            paste(round(map_dbl(res, "baseline"), 4), collapse = ", ")))
+```
+
+# 3. Four profiles
+
+```{r profiles}
+F <- sapply(sort(unique(fam)), function(g) rowSums(S[, fam == g, drop = FALSE]))
+norm_rows <- function(M) M / pmax(rowSums(abs(M)), 1e-12)
+profiles <- list(`families, raw` = F, `families, normalised` = norm_rows(F),
+                 `features, raw` = S, `features, normalised` = norm_rows(S))
+stopifnot("family sums do not reproduce the feature SHAP total" = max(abs(rowSums(F) - rowSums(S))) < 1e-9)
+map_dfr(profiles, ~ tibble(columns = ncol(.x), sd_mean = mean(apply(.x, 2, sd))), .id = "profile") %>% knitr::kable(digits = 4)
+```
+
+# 4. How many clusters: the null band
+
+```{r null}
+set.seed(9); sil_idx <- sort(sample(nrow(genes), min(params$sil_n, nrow(genes))))
+sil_of <- function(M, k, seed = 9) {
+  set.seed(seed); km <- kmeans(M, centers = k, nstart = 10, iter.max = 50)
+  if (length(unique(km$cluster[sil_idx])) < 2) return(NA_real_)
+  mean(silhouette(km$cluster[sil_idx], dist(M[sil_idx, ]))[, 3])
+}
+null_test <- function(M) {
+  obs <- vapply(ks, function(k) sil_of(M, k), numeric(1))
+  nm <- t(vapply(seq_len(params$n_perm), function(i) {
+    set.seed(1000 + i); P <- apply(M, 2, sample)            # drawn once per replicate
+    vapply(ks, function(k) sil_of(P, k), numeric(1)) }, numeric(length(ks))))
+  mu <- colMeans(nm); sdv <- apply(nm, 2, sd)
+  stopifnot("null has zero variance" = all(sdv > 0))
+  z <- (obs - mu) / sdv
+  z_null <- vapply(seq_len(params$n_perm), function(i) { m2 <- nm[-i, , drop = FALSE]
+    max((nm[i, ] - colMeans(m2)) / apply(m2, 2, sd)) }, numeric(1))
+  list(per_k = tibble(k = ks, observed = obs, null_median = apply(nm, 2, median), null_min = apply(nm, 2, min),
+                      null_max = apply(nm, 2, max), z = z),
+       p_overall = (sum(z_null >= max(z)) + 1) / (params$n_perm + 1),
+       best_k_z = ks[which.max(z)], best_k_sil = ks[which.max(obs)])
+}
+# Cached: the null is the slow part after SHAP, and it depends only on the profiles and params.
+null_cache <- file.path(cache_dir, sprintf("nulls_%s_perm%d_sil%d_k%s.rds", params$suffix, params$n_perm,
+                                           params$sil_n, gsub(",", "-", params$ks)))
+nulls <- if (SAVE && file.exists(null_cache)) readRDS(null_cache) else map(profiles, null_test)
+if (SAVE && !file.exists(null_cache)) saveRDS(nulls, null_cache)
+summary_k <- imap_dfr(nulls, ~ tibble(profile = .y, best_k_sil = .x$best_k_sil, best_k_z = .x$best_k_z,
+                                      max_z = max(.x$per_k$z), p_overall = .x$p_overall))
+knitr::kable(summary_k, digits = 3)
+```
+
+```{r fig_null, fig.width = 11, fig.height = 7}
+band <- imap_dfr(nulls, ~ .x$per_k %>% mutate(profile = .y))
+p_band <- ggplot(band, aes(k)) +
+  geom_ribbon(aes(ymin = null_min, ymax = null_max), fill = "grey85") +
+  geom_line(aes(y = null_median), colour = "grey50", linetype = 2) +
+  geom_line(aes(y = observed), colour = "#E69F00", linewidth = 0.8) + geom_point(aes(y = observed), colour = "#E69F00") +
+  facet_wrap(~ profile, scales = "free_y") +
+  labs(y = sprintf("mean silhouette (%d-gene sample)", length(sil_idx)),
+       title = "Observed silhouette against the column-permuted null, per k",
+       subtitle = sprintf("grey band = null min-max over %d permutations; dashed = null median; n = %d genes",
+                          params$n_perm, nrow(genes))) +
+  theme_classic(base_size = 12)
+p_band
+if (SAVE) ggsave(here("plots", paste0("23_shap_gene_clusters_", ptag, "_null_band.pdf")), p_band, width = 11, height = 7)
+```
+
+# 5. Heatmaps
+
+Genes are columns, ordered by cluster and, within a cluster, by LFC. k is the number of groups.
+Each clustering is drawn twice: at the silhouette peak (`best_k_sil`, the cleanest split - k = 2
+here) and at the k the null test supports most strongly (`best_k_z`, where the groups are most
+clearly real rather than an artefact of clustering), so finer subgroups are visible. Raw
+SHAP colours are capped at the 99th percentile of |SHAP| so a few extreme genes do not wash out the
+rest; the cap is printed. Written as PNG: 10,172 columns as vector cells make a PDF too large to open.
+
+```{r sets}
+# pos_geneset = "" applies the project's rule (LFC > 0.5, padj < 0.05) to this model's own outcome,
+# as 10_ does for the regressed timepoints (normoxia 1+4hr), which have no saved set.
+gs_pos <- if (nzchar(params$pos_geneset))
+  read_csv(here("output", "genesets", params$pos_geneset), show_col_types = FALSE)$ensembl_gene else
+  genes$gene_id_clean[genes$y > 0.5 & !is.na(genes$y_padj) & genes$y_padj < 0.05]
+gs_neg <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"), show_col_types = FALSE) %>%
+  mutate(g = sub("[.].*", "", gene_id)) %>% pull(g)
+genes$set <- case_when(genes$gene_id_clean %in% sub("[.].*", "", gs_pos) ~ "eIF3d promoted",
+                       genes$gene_id_clean %in% gs_neg ~ "negative control", TRUE ~ "other")
+table(genes$set)
+```
+
+```{r heatmaps, fig.width = 14, fig.height = 9, results = "asis"}
+fam_cols <- setNames(colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+                                        "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)), sort(unique(fam)))
+assignments <- list()
+for (nm in names(profiles)) for (k in unique(c(nulls[[nm]]$best_k_sil, nulls[[nm]]$best_k_z))) {
+  M <- profiles[[nm]]
+  k_why <- if (k == nulls[[nm]]$best_k_sil) "silhouette peak" else "best supported vs null"
+  set.seed(9); cl <- kmeans(M, centers = k, nstart = 25, iter.max = 50)$cluster
+  # name clusters by size, largest = 1, so labels are stable across reruns
+  cl <- match(cl, as.integer(names(sort(table(cl), decreasing = TRUE))))
+  assignments[[paste(nm, k)]] <- tibble(gene_id_clean = genes$gene_id_clean, symbol = genes$symbol,
+                                        profile = nm, k = k, cluster = cl)
+  ord <- order(cl, -genes$y)
+  rows <- if (startsWith(nm, "features")) fc[order(fam, fc)] else colnames(M)
+  H <- t(M[ord, rows, drop = FALSE])
+  cap <- if (grepl("raw", nm)) quantile(abs(M), 0.99) else max(abs(M))
+  H[H > cap] <- cap; H[H < -cap] <- -cap
+  acol <- data.frame(cluster = factor(cl[ord]), `LFC (sictrl/si3d)` = genes$y[ord],
+                     `predicted (out of fold)` = genes$pred_oof[ord], `gene set` = genes$set[ord],
+                     check.names = FALSE, row.names = colnames(H))
+  arow <- if (startsWith(nm, "features")) data.frame(family = fam[rows], row.names = rows) else NULL
+  acols <- list(`gene set` = c(`eIF3d promoted` = "#E69F00", `negative control` = "black", other = "grey90"),
+                cluster = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_len(k)], seq_len(k)),
+                `LFC (sictrl/si3d)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(50),
+                `predicted (out of fold)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(50))
+  if (!is.null(arow)) acols$family <- fam_cols
+  hm <- pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
+                 color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+                 breaks = seq(-cap, cap, length.out = 102), annotation_col = acol, annotation_row = arow,
+                 annotation_colors = acols, gaps_col = cumsum(table(cl))[-k], fontsize_row = if (ncol(M) > 20) 6 else 9,
+                 main = sprintf("SHAP, %s | k = %d (%s) | n = %d genes | colour capped at %.3g",
+                                nm, k, k_why, nrow(genes), cap), silent = TRUE)
+  cat("\n\n## ", nm, ", k = ", k, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (SAVE) {
+    f <- here("plots", paste0("23_shap_gene_clusters_", ptag, "_", gsub("[ ,]+", "_", nm), "_k", k, ".png"))
+    png(f, width = 14, height = if (ncol(M) > 20) 11 else 6, units = "in", res = 300)
+    grid.newpage(); grid.draw(hm$gtable); dev.off()
+  }
+}
+```
+
+# 6. What each cluster is
+
+Per clustering and cluster: size, LFC and out-of-fold prediction, how many eIF3d-promoted genes
+it holds, the three families with the largest mean |SHAP| (sign = mean direction), and the
+cluster's median sequence values - so a group can be read as "GC-poor, long 5'UTR" rather than
+only as "GC SHAP positive".
+
+```{r cluster_summary}
+all_assign <- bind_rows(assignments) %>% left_join(genes %>% dplyr::select(gene_id_clean, y, pred_oof, set), by = "gene_id_clean")
+fam_long <- as_tibble(F, rownames = "gene_id_clean") %>% pivot_longer(-gene_id_clean, names_to = "family", values_to = "shap")
+top_fam <- all_assign %>% inner_join(fam_long, by = "gene_id_clean", relationship = "many-to-many") %>%
+  group_by(profile, k, cluster, family) %>% summarise(m = mean(shap), a = mean(abs(shap)), .groups = "drop") %>%
+  group_by(profile, k, cluster) %>% slice_max(a, n = 3) %>%
+  summarise(top_families = paste0(family, ifelse(m > 0, " (+)", " (-)"), collapse = ", "), .groups = "drop")
+seqv <- fm %>% transmute(gene_id_clean, cds_gc, gc3 = gc3_internal, cds_nt = 2^log2_cds_length - 1,
+                         utr5_nt = 2^log2_utr5_length - 1, utr5_access = tco_struct_accessibility_utr5_mean)
+summ <- all_assign %>% left_join(seqv, by = "gene_id_clean") %>% group_by(profile, k, cluster) %>%
+  summarise(n = n(), median_lfc = median(y), median_pred = median(pred_oof),
+            eIF3d_promoted = sum(set == "eIF3d promoted"), neg_controls = sum(set == "negative control"),
+            cds_gc = median(cds_gc), gc3 = median(gc3, na.rm = TRUE), cds_nt = median(cds_nt),
+            utr5_nt = median(utr5_nt), utr5_access = median(utr5_access, na.rm = TRUE), .groups = "drop") %>%
+  left_join(top_fam, by = c("profile", "k", "cluster"))
+knitr::kable(summ, digits = c(0, 0, 0, 0, 3, 3, 0, 0, 1, 1, 0, 0, 3, 0))
+if (SAVE) {
+write_csv(all_assign, file.path(O, paste0("shap_gene_clusters_", params$suffix, ".csv")))
+write_csv(summ, file.path(O, paste0("shap_gene_cluster_summary_", params$suffix, ".csv")))
+saveRDS(list(S = S, genes = genes, folds = folds), file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+}
+```
+
+```{r session}
+sessionInfo()
+```

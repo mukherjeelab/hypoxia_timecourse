@@ -20,6 +20,7 @@ params:
   g4mer_tag: ""
   codon_weights_rds: ""
   cache_tag: ""
+  late_struct_rds: ""
   out_rds: "feature_matrix_tco.rds"
 editor_options:
   chunk_output_type: console
@@ -772,6 +773,26 @@ occ_tx <- if (MUT == "gene_level_join") {
     dplyr::select(transcript_id_clean, hia2026_dhx29_occupancy_tx = dhx29_occupancy_score)
 }
 
+# cnot3_weighted_codon_score is notebook 22's per-GENE value, scored on the CDS of the
+# transcript in precomputed_most_abundant_tx.rds - an older isoform list (Salmon summed over all
+# 108 libraries, footprints included) that disagrees with this matrix on 1,600 MDA-MB-231
+# transcripts, and that every other cell set inherits by gene. The _tx variant scores THIS
+# matrix's own CDS with the same three P-site weights, recovered from the Zhu 2024 source by
+# 01o_cnot3_codon_weights.R and proven there to reproduce notebook 22 exactly.
+cn3 <- readRDS(file.path(out_dir, "cnot3_psite_weights.rds"))
+cn3_score <- function(x) {
+  n <- nchar(x) / 3
+  if (is.na(x) || nchar(x) %% 3 != 0 || n < cn3$min_codons) return(NA_real_)
+  st <- seq(1, nchar(x) - 2, by = 3)
+  sum(cn3$weights[substring(x, st, st + 2)], na.rm = TRUE) / n
+}
+cnot3_tx <- seqs$cds_seq %>%
+  filter(transcript_id_clean %in% features$transcript_id_clean) %>%
+  transmute(transcript_id_clean,
+            cnot3_weighted_codon_score_tx = vapply(cds_sequence, cn3_score, numeric(1)))
+stopifnot("cnot3_weighted_codon_score_tx must be non-negative (notebook 22's invariant)" =
+            all(cnot3_tx$cnot3_weighted_codon_score_tx >= 0, na.rm = TRUE))
+
 # F4. clip_lee_complete_media_bound is bit-identical to clip_lee_glu_dep_bound - the two
 # columns are already identical in the upstream score_card.csv - so clip_cap_binding_count,
 # which sums all three *_bound columns, counts one dataset twice. The corrected count uses the
@@ -793,6 +814,7 @@ features <- features %>%
   left_join(pep, by = "transcript_id_clean") %>%
   left_join(g4, by = "transcript_id_clean") %>%
   left_join(occ_tx, by = "transcript_id_clean") %>%
+  left_join(cnot3_tx, by = "transcript_id_clean") %>%
   left_join(term, by = "transcript_id_clean")
 
 corrected_cols <- c("kozak_pwm_score_v2", "tai_gtrnadb",
@@ -804,7 +826,24 @@ stopifnot("termination columns did not attach" = all(term_cols %in% colnames(fea
             all(pep_cols %in% colnames(features)),
           "g4mer columns did not attach" = all(g4_cols %in% colnames(features)),
           "corrected dhx29 occupancy did not attach" =
-            "hia2026_dhx29_occupancy_tx" %in% colnames(features))
+            "hia2026_dhx29_occupancy_tx" %in% colnames(features),
+          "per-transcript CNOT3 codon score did not attach" =
+            "cnot3_weighted_codon_score_tx" %in% colnames(features))
+
+# Same definition, different transcript: wherever this matrix's transcript IS the one notebook 22
+# scored, the two columns must agree exactly. A difference means the CDS or the weights differ.
+old_tx <- readRDS(here("output", "predictive_modeling", "precomputed_most_abundant_tx.rds"))
+old_tx <- as.character(unlist(old_tx$transcript_id_clean))
+same <- features$transcript_id_clean %in% old_tx &
+        !is.na(features$cnot3_weighted_codon_score) & !is.na(features$cnot3_weighted_codon_score_tx)
+cn3_dev <- max(abs(features$cnot3_weighted_codon_score[same] - features$cnot3_weighted_codon_score_tx[same]))
+cat(sprintf("cnot3 codon score: per-transcript vs notebook 22 on %d transcripts both scored: max |dev| %.2e\n",
+            sum(same), cn3_dev))
+cat(sprintf("  non-NA: per gene %d | per transcript %d | transcripts whose value changes: %d\n",
+            sum(!is.na(features$cnot3_weighted_codon_score)), sum(!is.na(features$cnot3_weighted_codon_score_tx)),
+            sum(abs(features$cnot3_weighted_codon_score - features$cnot3_weighted_codon_score_tx) > 1e-12, na.rm = TRUE)))
+stopifnot("per-transcript CNOT3 score disagrees with notebook 22 on the transcripts it scored" =
+            sum(same) > 1000 && cn3_dev < 1e-12)
 
 # F4 corrected count, built after the join so it sits beside the column it supersedes.
 features <- features %>%
@@ -893,6 +932,29 @@ for (rg in c("utr5", "cds", "utr3")) {
   }
   cat(sprintf("  %-4s rescued: filled %d NA values across %d columns\n", rg, filled,
               length(rcols)))
+}
+
+# Late files: _lunp files written after 01f_ ran (the per-cell precomputes add to the same
+# directories), read with 01l_'s parser, which is gated bit-for-bit against 01f_. Fills NA only,
+# and every value both sources hold must agree, so this cannot change a value already present.
+if (nzchar(params$late_struct_rds) && isTRUE(params$apply_audit_repairs)) {
+  late <- readRDS(here("output", "predictive_modeling", params$late_struct_rds))
+  names(late) <- sub("^struct_", "tco_struct_", names(late))
+  # accessibility only: num_structured_regions is deprecated (F2) and keeps its historical values
+  lcols <- intersect(grep("_accessibility_", names(late), value = TRUE), colnames(features))
+  idx <- match(features$transcript_id_clean, late$transcript_id_clean)
+  filled <- 0; late_dev <- 0
+  for (cc in lcols) {
+    lv <- late[[cc]][idx]
+    both <- !is.na(features[[cc]]) & !is.na(lv)
+    if (any(both)) late_dev <- max(late_dev, max(abs(features[[cc]][both] - lv[both])))
+    take <- is.na(features[[cc]]) & !is.na(lv)
+    features[[cc]][take] <- lv[take]; filled <- filled + sum(take)
+  }
+  cat(sprintf("late structure files: filled %d NA values across %d columns | max |dev| where both exist %.2e\n",
+              filled, length(lcols), late_dev))
+  stopifnot("late structure source disagrees with values already in the matrix" = late_dev < 1e-10,
+            "late structure source matched no columns" = length(lcols) >= 12)
 }
 
 ## --- structure repairs (audit findings F1, F2, F5) -----------------------------------
@@ -1342,7 +1404,8 @@ variant_pairs <- tribble(
   "fop",              "fop_internal",
   "csc",              "csc_internal",
   "hia2026_dhx29_occupancy", "hia2026_dhx29_occupancy_tx",   # F3: gene-level -> transcript
-  "clip_cap_binding_count",  "clip_cap_binding_count_v2"     # F4: drops a duplicated dataset
+  "clip_cap_binding_count",  "clip_cap_binding_count_v2",    # F4: drops a duplicated dataset
+  "cnot3_weighted_codon_score", "cnot3_weighted_codon_score_tx"  # old-list isoform -> own transcript
 )
 
 annotation <- tibble(feature = colnames(features)) %>%
@@ -1438,6 +1501,8 @@ definitions <- tribble(
     "Hia 2026 DHX29 ribosome occupancy, joined on transcript_id_clean (the source key)",
   "clip_cap_binding_count_v2",
     "cap-binding CLIP datasets with evidence, counting the 2 distinct conditions (0-2)",
+  "cnot3_weighted_codon_score_tx",
+    "(CGG x w_CGG + CGA x w_CGA + AGG x w_AGG) / total codons in this transcript's CDS (stop included, >= 10 codons, frame-checked); w = mean CNOT3-IP/input P-site enrichment, Zhu 2024 GSE268324. Notebook 22's definition, scored on this matrix's own transcript",
   "te_lfc",
     "WARNING: this is the siCTRL hypoxia-vs-normoxia 1hr contrast (translation_categories_1hr.csv), NOT an si3d knockdown contrast. Never read it as the eIF3d TE change."
 )

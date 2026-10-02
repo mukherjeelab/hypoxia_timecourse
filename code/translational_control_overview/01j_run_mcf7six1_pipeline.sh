@@ -78,7 +78,7 @@ grep -E "annotation parity|Wrote|Cell line" "$LOG/6_matrix.log" | head
 fi
 
 say "7/7 fit the 4 contrasts x 2 feature sets, then the heatmaps"
-EX="is_dap5_repressed,is_dap5_promoted,dap5_polysome_lfc,clip_eif3_count,cnot3_ribo_enrichment,cnot3_weighted_codon_score,zhu2024_ctrl_halflife,zhu2024_cnot3ko_halflife_logfc,karner2026_mda231_log2_ct,hia2026_dhx29_kd_rna_lfc,hia2026_dhx29_occupancy_tx,clip_cap_binding_count_v2"
+EX="is_dap5_repressed,is_dap5_promoted,dap5_polysome_lfc,clip_eif3_count,cnot3_ribo_enrichment,cnot3_weighted_codon_score,cnot3_weighted_codon_score_tx,zhu2024_ctrl_halflife,zhu2024_cnot3ko_halflife_logfc,karner2026_mda231_log2_ct,hia2026_dhx29_kd_rna_lfc,hia2026_dhx29_occupancy_tx,clip_cap_binding_count_v2"
 RF=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw
 RI=eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw
 M="p\$matrix_rds <- 'feature_matrix_tco_mcf7six1.rds'"
