@@ -1,0 +1,185 @@
+---
+title: "How k is chosen for the SHAP gene clustering (si3d, MDA-MB-231)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  stem: "eif33d_promotes_%s_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  timepoints: "hypoxia_1hr,hypoxia_4hr,hypoxia_24hr,normoxia_1and4hr"
+  null_tag: "perm50_sil2000_k2-3-4-5-6-7-8"
+  ks: "2,3,4,5,6,7,8"
+  n_perm_elbow: 20
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "23b_choosing_k.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# The procedure
+
+`23_shap_gene_clustering.Rmd` groups genes by their out-of-fold SHAP profiles with k-means. **k is
+the number of groups.** Nothing in k-means says what k should be, so every k from 2 to 8 is tried:
+
+1. **Cluster** the genes into k groups (k-means, 10 random starts, `set.seed(9)`).
+2. **Score separation with the silhouette.** For each gene: (mean distance to the nearest other
+   group - mean distance to its own group) / the larger of the two. It runs from -1 (probably in the
+   wrong group) to +1 (clearly in the right one); the score is its mean, computed on a fixed random
+   2,000 genes because the full 10,172 x 10,172 distance matrix does not fit in memory here.
+3. **Null.** Shuffle each column (family or feature) independently across genes - every column
+   keeps its distribution, but which families go together in a gene is destroyed - then cluster
+   and score the same way. 50 shuffles.
+4. **Compare within the same k:** z = (real silhouette - mean shuffled silhouette) / sd of the
+   shuffled silhouettes.
+
+Two k's come out, and the heatmaps are drawn at both:
+
+- **Silhouette peak** (`best_k_sil`): highest raw silhouette. Almost always k = 2, because the
+  silhouette falls as k grows even on random data. The cleanest coarse split, not necessarily the
+  most real structure.
+- **Best supported vs the null** (`best_k_z`): highest z, i.e. where real data beats shuffled data
+  by the most. This is the k reported for each timepoint.
+
+**Is there any structure at all?** The best z is compared with the best z each shuffled data set
+reaches (which pays for having tried seven k's): p = (shuffles at least as extreme + 1) / 51, so the
+smallest possible p is 0.02.
+
+**Why not only the raw silhouette?** Comparing the best raw silhouette over k against the shuffled
+best compares two different quantities - real and shuffled data peak at different k - and on the
+classifier it returned a confident, wrong "no structure". Standardising within each k first, then
+maximising, fixes that (`03_subgroup_null.R`; CLAUDE.md, SHAP subgroups).
+
+**What this notebook adds:** an elbow plot (how much gene-to-gene variation the groups capture as k
+rises), drawn for real **and shuffled** data, because on a continuum like this one the real curve
+alone bends gently and always rises. The gap between the two curves is the part of each k's gain
+that is real structure.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+ks <- as.integer(strsplit(params$ks, ",")[[1]])
+tps <- strsplit(params$timepoints, ",")[[1]]
+tp_lab <- function(x) c(hypoxia_1hr = "hypoxia 1hr", hypoxia_4hr = "hypoxia 4hr", hypoxia_24hr = "hypoxia 24hr",
+                        normoxia_1and4hr = "normoxia 1+4hr")[x]
+have <- tps[file.exists(file.path(O, paste0("shap_oof_", sprintf(params$stem, tps), ".rds"))) &
+            file.exists(file.path(O, "shap_oof_cache", paste0("nulls_", sprintf(params$stem, tps), "_", params$null_tag, ".rds")))]
+if (length(setdiff(tps, have))) cat("not yet available, skipped:", paste(tp_lab(setdiff(tps, have)), collapse = ", "), "\n")
+tps <- have
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+```
+
+# 1. The null test, per k
+
+From `23_`'s cached null results - the same numbers that chose the k in each heatmap.
+
+```{r null_tables}
+nulls <- map(setNames(tps, tps), ~ readRDS(file.path(O, "shap_oof_cache", paste0("nulls_", sprintf(params$stem, .x), "_", params$null_tag, ".rds"))))
+per_k <- imap_dfr(nulls, function(nl, tp) imap_dfr(nl, ~ .x$per_k %>% mutate(profile = .y, timepoint = tp_lab(tp),
+                                                        best_k_z = .x$best_k_z, best_k_sil = .x$best_k_sil, p_overall = .x$p_overall)))
+per_k %>% distinct(timepoint, profile, best_k_sil, best_k_z, p_overall) %>% knitr::kable(digits = 3)
+```
+
+```{r fig_z, fig.width = 12, fig.height = 4.5}
+p_z <- per_k %>% mutate(timepoint = factor(timepoint, levels = tp_lab(tps))) %>%
+  ggplot(aes(k, z, colour = profile)) + geom_hline(yintercept = 0, colour = "grey80") +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.8) +
+  geom_point(data = ~ filter(.x, k == best_k_z), shape = 21, size = 4, stroke = 1.1, fill = NA) +
+  facet_wrap(~ timepoint, nrow = 1) +
+  scale_colour_manual(values = c(`families, normalised` = "#0072B2", `families, raw` = "#56B4E9",
+                                 `features, normalised` = "#CC79A7", `features, raw` = "#D55E00")) +
+  labs(y = "z: real silhouette vs 50 shuffles, same k", title = "How clearly each k beats shuffled data",
+       subtitle = "circled = chosen k (highest z). Note how close several k's are: the choice is a preference, not a sharp optimum") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_z
+if (isTRUE(params$save_plots)) ggsave(here("plots", "23b_choosing_k_z.pdf"), p_z, width = 12, height = 4.5)
+```
+
+# 2. Silhouette against the shuffled band
+
+The family-normalised profile (the one the per-timepoint groups are reported on).
+
+```{r fig_sil, fig.width = 12, fig.height = 4.2}
+p_sil <- per_k %>% filter(profile == "families, normalised") %>% mutate(timepoint = factor(timepoint, levels = tp_lab(tps))) %>%
+  ggplot(aes(k)) + geom_ribbon(aes(ymin = null_min, ymax = null_max), fill = "grey85") +
+  geom_line(aes(y = null_median), linetype = 2, colour = "grey50") +
+  geom_line(aes(y = observed), colour = "#0072B2", linewidth = 0.8) + geom_point(aes(y = observed), colour = "#0072B2") +
+  geom_vline(aes(xintercept = best_k_z), linetype = 3) + facet_wrap(~ timepoint, nrow = 1) +
+  labs(y = "mean silhouette (2,000-gene sample)", title = "Silhouette: real (blue) vs shuffled (grey band = min-max of 50)",
+       subtitle = "falls with k on real AND shuffled data - which is why the raw peak (k = 2) cannot choose k; dotted = chosen k") +
+  theme_classic(base_size = 12)
+p_sil
+if (isTRUE(params$save_plots)) ggsave(here("plots", "23b_choosing_k_silhouette.pdf"), p_sil, width = 12, height = 4.2)
+```
+
+# 3. Elbow plot, real vs shuffled
+
+Variance explained = 1 - (within-group sum of squares / total sum of squares), on the
+family-normalised profile, for k = 1 to 8. Shuffled curves use `n_perm_elbow` shuffles.
+
+```{r elbow}
+fam_norm <- function(S, fc) { fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+  F <- sapply(sort(unique(fam)), function(g) rowSums(S[, fam == g, drop = FALSE])); F / pmax(rowSums(abs(F)), 1e-12) }
+ve <- function(M, k) { if (k == 1) return(0); set.seed(9); km <- kmeans(M, centers = k, nstart = 10, iter.max = 50)
+  1 - km$tot.withinss / km$totss }
+elbow <- map_dfr(tps, function(tp) {
+  o <- readRDS(file.path(O, paste0("shap_oof_", sprintf(params$stem, tp), ".rds")))
+  M <- fam_norm(o$S, colnames(o$S))
+  real <- tibble(k = c(1, ks), ve = vapply(c(1, ks), function(k) ve(M, k), numeric(1)), set = "real")
+  shuf <- map_dfr(seq_len(params$n_perm_elbow), function(i) { set.seed(2000 + i); P <- apply(M, 2, sample)
+    tibble(k = c(1, ks), ve = vapply(c(1, ks), function(k) ve(P, k), numeric(1)), rep = i) }) %>%
+    group_by(k) %>% summarise(lo = min(ve), hi = max(ve), ve = mean(ve), .groups = "drop") %>% mutate(set = "shuffled")
+  bind_rows(real, shuf) %>% mutate(timepoint = tp_lab(tp))
+})
+elbow %>% dplyr::select(timepoint, set, k, ve) %>% pivot_wider(names_from = set, values_from = ve) %>%
+  mutate(real_minus_shuffled = real - shuffled) %>% knitr::kable(digits = 3)
+```
+
+```{r fig_elbow, fig.width = 12, fig.height = 4.5}
+chosen <- per_k %>% filter(profile == "families, normalised") %>% distinct(timepoint, best_k_z)
+p_el <- elbow %>% mutate(timepoint = factor(timepoint, levels = tp_lab(tps))) %>%
+  ggplot(aes(k, 100 * ve)) +
+  geom_ribbon(data = ~ filter(.x, set == "shuffled"), aes(ymin = 100 * lo, ymax = 100 * hi), fill = "grey85") +
+  geom_line(aes(linetype = set, colour = set), linewidth = 0.8) + geom_point(aes(colour = set), size = 1.6) +
+  geom_vline(data = chosen %>% mutate(timepoint = factor(timepoint, levels = tp_lab(tps))), aes(xintercept = best_k_z), linetype = 3) +
+  scale_colour_manual(values = c(real = "#0072B2", shuffled = "grey45"), name = NULL) +
+  scale_linetype_manual(values = c(real = 1, shuffled = 2), name = NULL) +
+  facet_wrap(~ timepoint, nrow = 1) + scale_x_continuous(breaks = 1:8) +
+  labs(y = "% of gene-to-gene variation captured by the groups", x = "k (number of groups)",
+       title = "Elbow plot: real SHAP profiles vs shuffled",
+       subtitle = sprintf("families, normalised; shuffled = mean (band = range) of %d shuffles; dotted = chosen k; n = 10,172 genes",
+                          params$n_perm_elbow)) +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_el
+if (isTRUE(params$save_plots)) ggsave(here("plots", "23b_choosing_k_elbow.pdf"), p_el, width = 12, height = 4.5)
+```
+
+# 4. How to read the choice
+
+- The **elbow** shows how much each extra group buys; the gap to the shuffled curve is the part
+  of that gain that is real co-variation between families rather than what clustering finds in
+  any data.
+- The **z curve** is what actually picks k. Where several k's sit at similar z, they are about
+  equally supported; the chosen k is the best of near-ties, not a sharp optimum.
+- The groups lie along a **continuum** (see the PCA of the profiles in `03b_` / `23_`), so a
+  group is better read as a region of a gradient than as a discrete biological class. The k = 2
+  split (GC-poor vs GC-rich at 1hr) is the dominant axis; higher k resolves secondary axes such
+  as CDS length.
+
+```{r session}
+sessionInfo()
+```

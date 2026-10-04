@@ -1,0 +1,181 @@
+---
+title: "Pathway over-representation (Hallmark, KEGG) in the SHAP gene groups"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  stem: "eif33d_promotes_%s_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  timepoints: "hypoxia_1hr,hypoxia_4hr,hypoxia_24hr,normoxia_1and4hr"
+  padj_cut: 0.05
+  min_gs: 10
+  max_gs: 500
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "27_ora_shap_groups.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Over-representation analysis (ORA) of Hallmark and KEGG pathways in the gene groups from the
+SHAP clustering, run the way this repo has run ORA before
+(`code/ora_c2cp_3d_3e_all_conditions.Rmd`, `code/hypoxic_3d_geneset_characterization.Rmd`):
+`clusterProfiler::enricher` on gene symbols, msigdbr Hallmark (`category = "H"`) and KEGG (C2
+sets whose subcategory contains "KEGG" - currently **both** `CP:KEGG_LEGACY` and
+`CP:KEGG_MEDICUS`, as in the earlier notebook), FDR, gene-set size 10-500, significant at
+adjusted p < 0.05.
+
+**The universe matches the question** (Kate, 2026-10-03):
+
+| groups | universe | question |
+|---|---|---|
+| each timepoint's all-gene groups (`23_`), joint time-course groups (`25_`) | the 10,172 genes clustered | what does this group carry, relative to every modelled gene? |
+| eIF3d target subtypes (`26_`) | **all targets at that contrast** | what is specific to this subtype among eIF3d targets? |
+| eIF3d target subtypes (`26_`) | the 10,172 genes | what does this subtype carry, relative to the transcriptome? |
+
+Groups whose source has not been produced yet are skipped and listed; re-render to add them.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(msigdbr); library(clusterProfiler); library(pheatmap); library(grid) })
+O <- here("output", "translational_control_overview")
+tp_lab <- function(x) c(hypoxia_1hr = "hypoxia 1hr", hypoxia_4hr = "hypoxia 4hr", hypoxia_24hr = "hypoxia 24hr",
+                        normoxia_1and4hr = "normoxia 1+4hr")[x]
+```
+
+# 1. Gene sets
+
+```{r gene_sets}
+hallmark <- suppressWarnings(msigdbr(species = "Homo sapiens", category = "H")) %>% dplyr::select(gs_name, gene_symbol)
+c2 <- suppressWarnings(msigdbr(species = "Homo sapiens", category = "C2"))
+kegg <- c2 %>% filter(grepl("KEGG", gs_subcat, ignore.case = TRUE)) %>% dplyr::select(gs_name, gene_symbol)
+cat("msigdbr", as.character(packageVersion("msigdbr")), "| Hallmark sets:", n_distinct(hallmark$gs_name),
+    "| KEGG sets:", n_distinct(kegg$gs_name), "from", paste(unique(c2$gs_subcat[grepl("KEGG", c2$gs_subcat)]), collapse = " + "), "\n")
+stopifnot("Hallmark should have 50 sets" = n_distinct(hallmark$gs_name) == 50, "no KEGG sets found" = nrow(kegg) > 0)
+collections <- list(Hallmark = hallmark, KEGG = kegg)
+```
+
+# 2. The groups
+
+```{r groups}
+fm <- readRDS(file.path(O, "feature_matrix_tco.rds"))
+sym <- setNames(fm$symbol, fm$gene_id_clean)
+all_genes <- fm$gene_id_clean
+# The null-supported k, read from 23_'s cached null results. "Largest k in the cluster file" is NOT
+# safe: 23_ writes both the silhouette-peak and the best-supported k, and either can be larger
+# (24hr families-raw: best supported 2, silhouette peak 4).
+best_k_of <- function(tp, profile = "families, normalised") {
+  f <- list.files(file.path(O, "shap_oof_cache"), pattern = paste0("^nulls_", sprintf(params$stem, tp), "_"), full.names = TRUE)
+  stopifnot("no cached null results for this timepoint - render 23_ first" = length(f) >= 1)
+  readRDS(f[1])[[profile]]$best_k_z }
+groups <- list()       # each: name, grouping, genes (ids), universe (ids), universe_label
+add <- function(grouping, name, ids, universe, ulab) groups[[length(groups) + 1]] <<- list(grouping = grouping, name = name, ids = ids, universe = universe, ulab = ulab)
+skipped <- character(0)
+for (tp in strsplit(params$timepoints, ",")[[1]]) {
+  f <- file.path(O, paste0("shap_gene_clusters_", sprintf(params$stem, tp), ".csv"))
+  if (!file.exists(f)) { skipped <- c(skipped, paste("per-timepoint groups,", tp_lab(tp))); next }
+  a <- read_csv(f, show_col_types = FALSE) %>% filter(profile == "families, normalised")
+  if ("k" %in% names(a)) a <- a %>% filter(k == best_k_of(tp))
+  for (g in sort(unique(a$cluster))) add(paste0("all genes, ", tp_lab(tp)), paste0(tp_lab(tp), " group ", g),
+                                         a$gene_id_clean[a$cluster == g], a$gene_id_clean, "clustered genes")
+}
+f25 <- file.path(O, "shap_timecourse_joint_groups_eif3d_mdamb231.csv")
+if (file.exists(f25)) { j <- read_csv(f25, show_col_types = FALSE)
+  for (g in sort(unique(j$joint_group))) add("joint time course", paste0("joint group ", g), j$gene_id_clean[j$joint_group == g], j$gene_id_clean, "clustered genes")
+} else skipped <- c(skipped, "joint time-course groups (25_)")
+f26 <- file.path(O, "eif3d_target_subtypes_mdamb231.csv")
+if (file.exists(f26)) { s <- read_csv(f26, show_col_types = FALSE)
+  for (an in unique(s$anchor)) { sa <- s %>% filter(anchor == an)
+    for (g in sort(unique(sa$subtype))) {
+      add(paste0("targets at ", an, " vs all targets"), paste0(an, " subtype ", g), sa$gene_id_clean[sa$subtype == g], sa$gene_id_clean, "all targets at this contrast")
+      add(paste0("targets at ", an, " vs all genes"), paste0(an, " subtype ", g), sa$gene_id_clean[sa$subtype == g], all_genes, "all modelled genes") } }
+} else skipped <- c(skipped, "target subtypes (26_)")
+if (length(skipped)) cat("not available yet, skipped:", paste(skipped, collapse = "; "), "\n")
+tibble(grouping = map_chr(groups, "grouping"), group = map_chr(groups, "name"), genes = map_int(groups, ~ length(.x$ids)),
+       universe = map_int(groups, ~ length(.x$universe)), universe_is = map_chr(groups, "ulab")) %>% knitr::kable()
+```
+
+# 3. ORA
+
+```{r ora}
+run_one <- function(gr, coll_name) {
+  g <- unique(na.omit(sym[gr$ids])); u <- unique(na.omit(sym[gr$universe]))
+  r <- tryCatch(enricher(gene = g, universe = u, TERM2GENE = collections[[coll_name]], pAdjustMethod = "fdr",
+                         pvalueCutoff = 1, qvalueCutoff = 1, minGSSize = params$min_gs, maxGSSize = params$max_gs),
+                error = function(e) NULL)
+  if (is.null(r) || !nrow(r@result)) return(NULL)
+  r@result %>% as_tibble() %>%
+    transmute(collection = coll_name, grouping = gr$grouping, group = gr$name, universe_is = gr$ulab,
+              pathway = ID, GeneRatio, BgRatio, Count, pvalue, p.adjust,
+              # (k / n) / (M / N): both denominators count only genes annotated in this collection,
+              # exactly as clusterProfiler's GeneRatio and BgRatio do.
+              fold_enrichment = (as.numeric(sub("/.*", "", GeneRatio)) / as.numeric(sub(".*/", "", GeneRatio))) /
+                                (as.numeric(sub("/.*", "", BgRatio)) / as.numeric(sub(".*/", "", BgRatio))),
+              genes = geneID)
+}
+ora <- map_dfr(names(collections), function(cn) map_dfr(groups, run_one, coll_name = cn))
+sig <- ora %>% filter(p.adjust < params$padj_cut)
+ora %>% group_by(collection, grouping, group) %>% summarise(significant = sum(p.adjust < params$padj_cut), .groups = "drop") %>%
+  pivot_wider(names_from = collection, values_from = significant, values_fill = 0) %>% knitr::kable()
+if (isTRUE(params$save_plots)) write_csv(ora, file.path(O, "ora_shap_groups_hallmark_kegg.csv"))
+```
+
+## Significant pathways
+
+```{r sig_table}
+sig %>% arrange(collection, grouping, group, p.adjust) %>%
+  transmute(collection, grouping, group, pathway, GeneRatio, BgRatio, fold_enrichment = round(fold_enrichment, 2),
+            p.adjust = signif(p.adjust, 2)) %>% knitr::kable()
+```
+
+# 4. Figures
+
+One heatmap per grouping and collection: fold enrichment for every pathway significant in at
+least one of its groups, `*` where adjusted p < 0.05.
+
+```{r heatmaps, fig.width = 9, fig.height = 7, results = "asis"}
+for (gp in unique(ora$grouping)) for (cn in names(collections)) {
+  d <- ora %>% filter(grouping == gp, collection == cn)
+  sp <- d %>% filter(p.adjust < params$padj_cut) %>% pull(pathway) %>% unique()
+  if (!length(sp)) { cat("\n\n**", gp, " - ", cn, ":** no significant pathways\n", sep = ""); next }
+  grp_order <- unique(map_chr(Filter(function(x) x$grouping == gp, groups), "name"))
+  W <- d %>% filter(pathway %in% sp) %>% dplyr::select(pathway, group, fold_enrichment) %>%
+    pivot_wider(names_from = group, values_from = fold_enrichment, values_fill = 0) %>% column_to_rownames("pathway")
+  for (cc in setdiff(grp_order, colnames(W))) W[[cc]] <- 0
+  W <- as.matrix(W[, grp_order, drop = FALSE])
+  S <- d %>% filter(pathway %in% sp) %>% mutate(s = ifelse(p.adjust < params$padj_cut, "*", "")) %>%
+    dplyr::select(pathway, group, s) %>% pivot_wider(names_from = group, values_from = s, values_fill = "") %>% column_to_rownames("pathway")
+  for (cc in setdiff(grp_order, colnames(S))) S[[cc]] <- ""
+  S <- as.matrix(S[rownames(W), grp_order, drop = FALSE])
+  n_lab <- sapply(grp_order, function(g) length(Filter(function(x) x$grouping == gp && x$name == g, groups)[[1]]$ids))
+  colnames(W) <- paste0(grp_order, " (n = ", n_lab, ")")
+  hm <- pheatmap(W, cluster_rows = nrow(W) > 2, cluster_cols = FALSE, color = colorRampPalette(c("white", "#F4B183", "#D55E00"))(100),
+                 breaks = seq(0, max(W, 1), length.out = 101), display_numbers = S, number_color = "black", fontsize_number = 11,
+                 fontsize_row = 7, angle_col = 45, cellwidth = 34,
+                 main = sprintf("%s ORA, %s\nfold enrichment; * adjusted p < %.2f; universe: %s", cn, gp, params$padj_cut,
+                                Filter(function(x) x$grouping == gp, groups)[[1]]$ulab), silent = TRUE)
+  cat("\n\n## ", gp, " - ", cn, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (isTRUE(params$save_plots)) {
+    f <- here("plots", paste0("27_ora_", tolower(cn), "_", gsub("[^A-Za-z0-9]+", "_", gp), ".pdf"))
+    pdf(f, width = 9, height = 2.5 + 0.17 * nrow(W)); grid.newpage(); grid.draw(hm$gtable); dev.off() }
+}
+```
+
+```{r session}
+sessionInfo()
+```

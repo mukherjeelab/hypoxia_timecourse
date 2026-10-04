@@ -1,0 +1,191 @@
+---
+title: "Subtypes of eIF3d target mRNAs and how they change over time (MDA-MB-231)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  stem: "eif33d_promotes_%s_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  timepoints: "hypoxia_1hr,hypoxia_4hr,hypoxia_24hr,normoxia_1and4hr"
+  anchors: "hypoxia_1hr,normoxia_1and4hr"
+  min_targets: 100
+  ks: "2,3,4,5,6"
+  n_perm: 50
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "26_target_subtypes_over_time.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-03: look at the SHAP groups **specifically among mRNAs eIF3d promotes**, at each
+timepoint. Only hypoxia 1hr (1,436 targets) and normoxia 1+4hr have enough targets to cluster;
+hypoxia 4hr (29) and 24hr (5) are too few, but nearly all of them are also 1hr targets. So:
+
+1. **Subtypes.** For each anchor contrast with at least `min_targets` targets (hypoxia 1hr;
+   normoxia 1+4hr, time-regressed, once its SHAP exists), cluster its targets on their
+   family-level SHAP at that contrast (normalised within gene), with k chosen against the
+   column-shuffled null exactly as in `23_` / `23b_`.
+2. **Follow each subtype through time:** its mean family SHAP at every timepoint, its TE change
+   (LFC) at every timepoint, and which of the few 4hr / 24hr targets fall in it.
+3. **Baseline:** the eIF3d negative-control genes are shown as an extra row, so a subtype's
+   profile can be read against non-targets.
+
+Targets: the saved gene sets for hypoxia 1hr / 4hr / 24hr (`TE LFC > 0.5`, `padj < 0.05`); for
+normoxia 1+4hr the same rule applied to its own outcome, as `10_` does (it has no saved set).
+SHAP is the out-of-fold intrinsic-model SHAP from `23_`. Any timepoint whose SHAP has not been
+computed yet is skipped and listed; re-render once it exists.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(cluster); library(pheatmap); library(grid) })
+O <- here("output", "translational_control_overview")
+ks <- as.integer(strsplit(params$ks, ",")[[1]])
+tp_lab <- function(x) c(hypoxia_1hr = "hypoxia 1hr", hypoxia_4hr = "hypoxia 4hr", hypoxia_24hr = "hypoxia 24hr",
+                        normoxia_1and4hr = "normoxia 1+4hr")[x]
+tps_all <- strsplit(params$timepoints, ",")[[1]]
+f_oof <- function(tp) file.path(O, paste0("shap_oof_", sprintf(params$stem, tp), ".rds"))
+tps <- tps_all[file.exists(f_oof(tps_all))]
+if (length(setdiff(tps_all, tps))) cat("SHAP not computed yet, skipped:", paste(tp_lab(setdiff(tps_all, tps)), collapse = ", "), "\n")
+```
+
+# 1. Data and targets
+
+```{r data}
+# Each contrast's SHAP stores its genes in train-then-test order, and the split differs between
+# contrasts, so align every timepoint to one order (by gene ID) before anything is combined.
+align <- function(o) { ord <- order(o$genes$gene_id_clean); o$S <- o$S[ord, , drop = FALSE]; o$genes <- o$genes[ord, ]; o }
+oof <- map(setNames(tps, tps), ~ align(readRDS(f_oof(.x))))
+stopifnot("timepoints do not cover the same genes" = all(map_lgl(oof, ~ setequal(.x$genes$gene_id_clean, oof[[1]]$genes$gene_id_clean))))
+stopifnot("timepoints do not share genes in one order" = all(map_lgl(oof, ~ identical(.x$genes$gene_id_clean, oof[[1]]$genes$gene_id_clean))))
+genes <- oof[[1]]$genes %>% dplyr::select(gene_id_clean, symbol)
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+fc <- colnames(oof[[1]]$S); fam <- setNames(ann$family[match(fc, ann$feature)], fc); fams <- sort(unique(fam))
+fam_norm <- function(S) { F <- sapply(fams, function(g) rowSums(S[, fam == g, drop = FALSE])); F / pmax(rowSums(abs(F)), 1e-12) }
+B <- map(oof, ~ fam_norm(.x$S))
+padj_of <- function(tp) { md <- readRDS(file.path(O, paste0("rfreg_model_data_", sprintf(params$stem, tp), ".rds")))
+  a <- bind_rows(md$train, md$test); a$y_padj[match(genes$gene_id_clean, a$gene_id_clean)] }
+sets <- c(hypoxia_1hr = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv", hypoxia_4hr = "hypoxia_3d_promotes_TE_4hr_lfc0.5.csv",
+          hypoxia_24hr = "hypoxia_3d_promotes_TE_24hr_lfc0.5.csv")
+for (tp in tps) {
+  genes[[paste0("lfc_", tp)]] <- oof[[tp]]$genes$y
+  genes[[paste0("target_", tp)]] <- if (tp %in% names(sets))
+    genes$gene_id_clean %in% sub("[.].*", "", read_csv(here("output", "genesets", sets[[tp]]), show_col_types = FALSE)$ensembl_gene) else {
+    p <- padj_of(tp); genes[[paste0("lfc_", tp)]] > 0.5 & !is.na(p) & p < 0.05 }
+}
+neg <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"), show_col_types = FALSE) %>%
+  mutate(g = sub("[.].*", "", gene_id)) %>% pull(g)
+genes$neg_control <- genes$gene_id_clean %in% neg
+fm <- readRDS(file.path(O, "feature_matrix_tco.rds"))
+genes$cds_gc <- fm$cds_gc[match(genes$gene_id_clean, fm$gene_id_clean)]
+genes$cds_nt <- 2^fm$log2_cds_length[match(genes$gene_id_clean, fm$gene_id_clean)] - 1
+tibble(timepoint = tp_lab(tps), targets = map_int(tps, ~ sum(genes[[paste0("target_", .x)]]))) %>% knitr::kable()
+if (all(c("hypoxia_1hr") %in% tps)) for (tp in setdiff(tps, "hypoxia_1hr"))
+  cat(sprintf("%s targets that are also hypoxia 1hr targets: %d of %d\n", tp_lab(tp),
+              sum(genes[[paste0("target_", tp)]] & genes$target_hypoxia_1hr), sum(genes[[paste0("target_", tp)]])))
+```
+
+# 2. Subtypes, and each subtype followed through time
+
+```{r subtypes, fig.width = 15, fig.height = 4.5, results = "asis"}
+null_k <- function(M) {
+  sil <- function(X, k, s = 9) { set.seed(s); km <- kmeans(X, centers = k, nstart = 10, iter.max = 50)
+    if (length(unique(km$cluster)) < 2) return(NA_real_); mean(silhouette(km$cluster, dist(X))[, 3]) }
+  obs <- vapply(ks, function(k) sil(M, k), numeric(1))
+  nm <- t(vapply(seq_len(params$n_perm), function(i) { set.seed(1000 + i); P <- apply(M, 2, sample)
+    vapply(ks, function(k) sil(P, k), numeric(1)) }, numeric(length(ks))))
+  z <- (obs - colMeans(nm)) / apply(nm, 2, sd)
+  z_null <- vapply(seq_len(params$n_perm), function(i) { m2 <- nm[-i, , drop = FALSE]
+    max((nm[i, ] - colMeans(m2)) / apply(m2, 2, sd)) }, numeric(1))
+  list(per_k = tibble(k = ks, observed = obs, null_median = apply(nm, 2, median), z = z),
+       k = ks[which.max(z)], p = (sum(z_null >= max(z)) + 1) / (params$n_perm + 1))
+}
+div <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(101)
+allB <- do.call(cbind, map(tps, function(tp) { X <- B[[tp]]; colnames(X) <- paste0(colnames(X), " | ", tp_lab(tp)); X }))
+col_ann <- data.frame(timepoint = factor(sub(".* \\| ", "", colnames(allB)), levels = tp_lab(tps)), row.names = colnames(allB))
+tp_cols <- list(timepoint = setNames(c("#F2C6DE", "#CC79A7", "#7A2E5C", "#009E73")[match(tps, tps_all)], tp_lab(tps)))
+memberships <- list(); lfc_long <- list(); ktab <- list()
+for (anchor in intersect(strsplit(params$anchors, ",")[[1]], tps)) {
+  tg <- genes[[paste0("target_", anchor)]]
+  if (sum(tg) < params$min_targets) { cat(sprintf("\n\n%s: %d targets, fewer than %d - not clustered\n", tp_lab(anchor), sum(tg), params$min_targets)); next }
+  M <- B[[anchor]][tg, ]
+  nk <- null_k(M); k <- nk$k
+  ktab[[anchor]] <- nk$per_k %>% mutate(anchor = tp_lab(anchor), chosen = k == nk$k, p_overall = nk$p)
+  set.seed(9); cl <- kmeans(M, centers = k, nstart = 25, iter.max = 50)$cluster
+  cl <- match(cl, as.integer(names(sort(table(cl), decreasing = TRUE))))
+  idx <- which(tg)
+  memberships[[anchor]] <- tibble(gene_id_clean = genes$gene_id_clean[idx], symbol = genes$symbol[idx],
+                                  anchor = tp_lab(anchor), subtype = cl)
+  # compact: subtype rows (+ negative-control baseline), family x timepoint columns
+  rows <- lapply(sort(unique(cl)), function(g) idx[cl == g]); names(rows) <- paste("subtype", sort(unique(cl)))
+  rows[["negative controls"]] <- which(genes$neg_control)
+  Mm <- t(sapply(rows, function(r) colMeans(allB[r, , drop = FALSE])))
+  later <- setdiff(names(sets), anchor); later <- intersect(later, tps)
+  lab <- sapply(names(rows), function(nm) { r <- rows[[nm]]
+    sprintf("%s | n = %d | GC %.0f%%, %s nt | LFC %s%s", nm, length(r), median(genes$cds_gc[r], na.rm = TRUE),
+            format(round(median(genes$cds_nt[r], na.rm = TRUE)), big.mark = ","),
+            paste(sprintf("%.2f", sapply(tps, function(tp) median(genes[[paste0("lfc_", tp)]][r]))), collapse = "/"),
+            if (length(later) && nm != "negative controls") paste0(" | also target at ",
+              paste(sprintf("%s: %d", sub("hypoxia ", "", tp_lab(later)), sapply(later, function(tp) sum(genes[[paste0("target_", tp)]][r]))), collapse = ", ")) else "") })
+  rownames(Mm) <- lab
+  capm <- max(abs(Mm))
+  hm <- pheatmap(Mm, cluster_rows = FALSE, cluster_cols = FALSE, color = div, breaks = seq(-capm, capm, length.out = 102),
+                 annotation_col = col_ann, annotation_colors = tp_cols, labels_col = sub(" \\|.*", "", colnames(Mm)),
+                 gaps_col = cumsum(rep(length(fams), length(tps)))[-length(tps)], gaps_row = nrow(Mm) - 1,
+                 display_numbers = matrix(sprintf("%.2f", Mm), nrow(Mm)), number_color = "grey20", fontsize_number = 6.5,
+                 angle_col = 90, fontsize = 9, cellheight = 22,
+                 main = sprintf("eIF3d targets at %s (n = %d): %d subtypes (p = %.2f vs null), followed through time\nrow LFC = median TE change at %s",
+                                tp_lab(anchor), sum(tg), k, nk$p, paste(tp_lab(tps), collapse = " / ")), fontsize_main = 10, silent = TRUE)
+  cat("\n\n## Targets at ", tp_lab(anchor), "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (isTRUE(params$save_plots)) { pdf(here("plots", paste0("26_target_subtypes_", anchor, ".pdf")), width = 15, height = 3 + 0.35 * nrow(Mm))
+    grid.newpage(); grid.draw(hm$gtable); dev.off() }
+  lfc_long[[anchor]] <- bind_rows(lapply(names(rows), function(nm) { r <- rows[[nm]]
+    map_dfr(tps, ~ tibble(group = nm, timepoint = tp_lab(.x), lfc = genes[[paste0("lfc_", .x)]][r])) })) %>% mutate(anchor = tp_lab(anchor))
+}
+```
+
+## How k was chosen for each anchor
+
+```{r ktable}
+if (length(ktab)) knitr::kable(bind_rows(ktab), digits = 3)
+```
+
+## Do the subtypes stay eIF3d-dependent? TE change over time
+
+```{r lfc_over_time, fig.width = 13, fig.height = 5}
+if (length(lfc_long)) {
+  L <- bind_rows(lfc_long) %>% mutate(timepoint = factor(timepoint, levels = tp_lab(tps)))
+  p_l <- ggplot(L, aes(timepoint, lfc, fill = group)) + geom_hline(yintercept = 0, colour = "grey60") +
+    geom_boxplot(outlier.shape = NA, width = 0.7, position = position_dodge(0.8)) +
+    coord_cartesian(ylim = quantile(L$lfc, c(0.02, 0.98), na.rm = TRUE)) +
+    scale_fill_manual(values = c(setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9"), paste("subtype", 1:6)),
+                                 `negative controls` = "grey70"), name = NULL) +
+    facet_wrap(~ anchor, labeller = labeller(anchor = function(x) paste("targets defined at", x))) +
+    labs(x = NULL, y = "TE change, log2(sictrl / si3d)", title = "Each target subtype's TE change at every timepoint",
+         subtitle = "boxes = median and IQR, whiskers to 1.5 IQR, outliers hidden; y clipped to the 2-98% range") +
+    theme_classic(base_size = 12) + theme(legend.position = "bottom", axis.text.x = element_text(angle = 20, hjust = 1))
+  print(p_l)
+  if (isTRUE(params$save_plots)) ggsave(here("plots", "26_target_subtypes_lfc_over_time.pdf"), p_l, width = 13, height = 5)
+}
+if (isTRUE(params$save_plots) && length(memberships))
+  write_csv(bind_rows(memberships), file.path(O, "eif3d_target_subtypes_mdamb231.csv"))
+```
+
+```{r session}
+sessionInfo()
+```

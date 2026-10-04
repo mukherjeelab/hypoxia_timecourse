@@ -1,0 +1,169 @@
+---
+title: "Linear model vs random forest: do they credit the same feature families? (si3d hypoxia 1, 4, 24 hr)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  stem: "eif33d_promotes_hypoxia_%s_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  timepoints: "1hr,4hr,24hr"
+  drop_for_rank: "term_stop_TAA"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "13b_linear_vs_forest_shap.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+`13_linear_regression.Rmd` showed that ordinary least squares (OLS) predicts the TE change as well
+as the forest at 1, 4 and 24 hr. Comparing OLS **coefficients** with forest SHAP feature by
+feature is unfair, though: the features are collinear (`cds_gc` has VIF ~51), and OLS can split
+credit among near-duplicates arbitrarily (a large positive coefficient cancelling a large negative
+one). So here both models are put on the same footing:
+
+- **Linear SHAP is exact.** For a linear model, feature j's SHAP value for gene i is
+  `beta_j * (x_ij - mean_j)`, with the mean taken over the training genes (the same background a
+  tree explainer uses).
+- **Sum within families.** SHAP is additive, so a family's value is the exact sum of its members'.
+  The GC family gets its total credit whichever GC column OLS happened to load onto - which is
+  what cancels the collinearity problem.
+- **Same genes.** Both are evaluated on the 200 held-out genes `11_shap_regression.Rmd` explained
+  for the forest, so the two are compared gene for gene.
+
+Two questions per timepoint: do the models give each family a similar **share** of the credit,
+and do they attribute it to the **same genes** (per-gene correlation of a family's SHAP between
+the two models)?
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+tps <- strsplit(params$timepoints, ",")[[1]]
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+```
+
+```{r compute}
+one_tp <- function(tp) {
+  sfx <- sprintf(params$stem, tp)
+  md  <- readRDS(file.path(O, paste0("rfreg_model_data_", sfx, ".rds")))
+  fc_all <- md$feature_cols; fc <- setdiff(fc_all, params$drop_for_rank)
+  Xtr <- as.matrix(md$train[, fc]); stopifnot("OLS design not full rank" = qr(cbind(1, Xtr))$rank == ncol(Xtr) + 1)
+  ols <- lm(md$train$y_t ~ Xtr); beta <- coef(ols)[-1]; names(beta) <- fc
+  fam <- setNames(ann$family[match(fc_all, ann$feature)], fc_all); stopifnot(!anyNA(fam))
+  # forest SHAP for the explained held-out genes, as saved by 11_
+  pg <- read_csv(file.path(O, paste0("shapreg_per_gene_", sfx, ".csv")), show_col_types = FALSE)
+  stopifnot("per-gene SHAP lacks some features" = all(fc_all %in% names(pg)))
+  Sf <- as.matrix(pg[, fc_all])
+  left <- pg$pred - rowSums(Sf)
+  stopifnot("forest SHAP does not add up to the forest prediction" = diff(range(left)) < 1e-6)
+  # linear SHAP on the same genes, from their (imputed) held-out feature values
+  te <- md$test[match(pg$gene_id_clean, md$test$gene_id_clean), ]
+  stopifnot("explained genes are not all held-out genes" = !anyNA(te$gene_id_clean))
+  Sl <- matrix(0, nrow(te), length(fc_all), dimnames = list(NULL, fc_all))
+  Sl[, fc] <- sweep(as.matrix(te[, fc]), 2, colMeans(Xtr)) %*% diag(beta)
+  pred_lin <- predict(ols, newdata = list(Xtr = as.matrix(te[, fc])))
+  stopifnot("linear SHAP does not add up to the OLS prediction" =
+              diff(range(pred_lin - rowSums(Sl))) < 1e-6)
+  famsum <- function(S) sapply(sort(unique(fam)), function(g) rowSums(S[, fam == g, drop = FALSE]))
+  Ff <- famsum(Sf); Fl <- famsum(Sl)
+  share <- function(Fm) 100 * colMeans(abs(Fm)) / sum(colMeans(abs(Fm)))
+  tibble(timepoint = tp, family = colnames(Ff), forest_share = share(Ff), linear_share = share(Fl),
+         per_gene_r = map_dbl(colnames(Ff), ~ suppressWarnings(cor(Ff[, .x], Fl[, .x]))),
+         n_genes = nrow(Ff), pred_r = cor(pg$pred, pred_lin, method = "spearman"))
+}
+res <- map_dfr(tps, one_tp) %>% mutate(timepoint = factor(timepoint, levels = tps))
+res %>% distinct(timepoint, n_genes, pred_r) %>% knitr::kable(digits = 3, caption = "Genes compared, and how similarly the two models rank them")
+knitr::kable(res %>% dplyr::select(timepoint, family, forest_share, linear_share, per_gene_r) %>% arrange(timepoint, desc(forest_share)), digits = 2)
+```
+
+# Family shares, side by side
+
+```{r fig_shares, fig.width = 13, fig.height = 5}
+p1 <- res %>% pivot_longer(c(forest_share, linear_share), names_to = "model", values_to = "share") %>%
+  mutate(model = recode(model, forest_share = "random forest", linear_share = "linear (OLS)"),
+         family = fct_reorder(family, share, .fun = max)) %>%
+  ggplot(aes(share, family, fill = model)) + geom_col(position = position_dodge(0.75), width = 0.7) +
+  facet_wrap(~ timepoint, labeller = labeller(timepoint = function(x) paste("si3d hypoxia", x))) +
+  scale_fill_manual(values = c(`random forest` = "#E69F00", `linear (OLS)` = "#0072B2"), name = NULL) +
+  labs(x = "share of SHAP credit (%)", y = NULL, title = "Which feature families each model credits",
+       subtitle = sprintf("full model, MDA-MB-231; SHAP summed within family; n = %d held-out genes per timepoint", res$n_genes[1])) +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p1
+if (isTRUE(params$save_plots)) ggsave(here("plots", "13b_linear_vs_forest_family_shares.pdf"), p1, width = 13, height = 5)
+```
+
+# Do they credit the same genes?
+
+For each family, the correlation across genes between the forest's and the linear model's SHAP
+for that family. High means the two models push the same genes the same way through that family.
+Families with tiny shares are noisy here and are shown faded.
+
+```{r fig_agreement, fig.width = 8, fig.height = 5}
+p2 <- res %>% mutate(family = fct_reorder(family, forest_share, .fun = max),
+                     big = (forest_share + linear_share) / 2 >= 2) %>%
+  ggplot(aes(timepoint, family, fill = per_gene_r)) + geom_tile(aes(alpha = big), colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", per_gene_r)), size = 3.2) +
+  scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0, limits = c(-1, 1), name = "r") +
+  scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.35), guide = "none") +
+  labs(x = "si3d hypoxia", y = NULL, title = "Per-gene agreement of family SHAP, forest vs linear",
+       subtitle = sprintf("Pearson r across n = %d held-out genes; faded = mean share < 2%%", res$n_genes[1])) +
+  theme_classic(base_size = 12)
+p2
+if (isTRUE(params$save_plots)) ggsave(here("plots", "13b_linear_vs_forest_family_agreement.pdf"), p2, width = 8, height = 5)
+```
+
+# Held-out fit, forest vs OLS
+
+Every held-out gene (the 20% the models never trained on), predicted against observed TE change.
+R² is computed on these held-out genes as 1 - SSE / SST, so it is the share of the held-out
+variance each model explains (it can be below the squared correlation, and below zero for a model
+worse than predicting the mean). Both models are scored on the same genes from `13_`'s saved
+predictions.
+
+```{r fig_heldout_r2, fig.width = 12, fig.height = 7.5}
+ho <- map_dfr(tps, function(tp) {
+  read_csv(file.path(O, paste0("linreg_predictions_", sprintf(params$stem, tp), ".csv")), show_col_types = FALSE) %>%
+    transmute(timepoint = tp, y, `linear (OLS)` = pred_ols, `random forest` = pred_rf) }) %>%
+  pivot_longer(c(`linear (OLS)`, `random forest`), names_to = "model", values_to = "pred") %>%
+  mutate(timepoint = factor(timepoint, levels = tps), model = factor(model, levels = c("random forest", "linear (OLS)")))
+r2 <- ho %>% group_by(timepoint, model) %>%
+  summarise(r2 = 1 - sum((y - pred)^2) / sum((y - mean(y))^2), spearman = cor(y, pred, method = "spearman"),
+            n = n(), .groups = "drop")
+knitr::kable(r2, digits = 3)
+lim <- quantile(ho$y, c(0.002, 0.998))
+p3 <- ggplot(ho, aes(pred, y, colour = model)) +
+  geom_hline(yintercept = 0, colour = "grey85") + geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(size = 0.6, alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey40") +
+  geom_text(data = r2, aes(x = -Inf, y = Inf, label = sprintf("  R² = %.3f\n  Spearman = %.3f\n  n = %s", r2, spearman, format(n, big.mark = ","))),
+            hjust = 0, vjust = 1.2, size = 3.4, colour = "black", inherit.aes = FALSE) +
+  scale_colour_manual(values = c(`random forest` = "#E69F00", `linear (OLS)` = "#0072B2"), guide = "none") +
+  facet_grid(model ~ timepoint, labeller = labeller(timepoint = function(x) paste("si3d hypoxia", x))) +
+  coord_cartesian(ylim = lim) +
+  labs(x = "predicted TE change, log2(sictrl / si3d)", y = "observed TE change, log2(sictrl / si3d)",
+       title = "Held-out genes: random forest vs linear regression",
+       subtitle = "full model, MDA-MB-231; dashed = perfect prediction; y axis clipped to the central 99.6% of genes for display") +
+  theme_classic(base_size = 12)
+p3
+if (isTRUE(params$save_plots)) ggsave(here("plots", "13b_heldout_r2_forest_vs_ols.pdf"), p3, width = 12, height = 7.5)
+```
+
+```{r session}
+sessionInfo()
+```

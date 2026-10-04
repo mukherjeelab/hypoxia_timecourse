@@ -197,8 +197,14 @@ null_test <- function(M) {
 # Cached: the null is the slow part after SHAP, and it depends only on the profiles and params.
 null_cache <- file.path(cache_dir, sprintf("nulls_%s_perm%d_sil%d_k%s.rds", params$suffix, params$n_perm,
                                            params$sil_n, gsub(",", "-", params$ks)))
-nulls <- if (SAVE && file.exists(null_cache)) readRDS(null_cache) else map(profiles, null_test)
-if (SAVE && !file.exists(null_cache)) saveRDS(nulls, null_cache)
+# The cache is keyed on params only, so it also stores a fingerprint of the SHAP it was computed
+# on; a cache from different SHAP (e.g. after a recompute) is ignored rather than silently reused.
+fp <- c(nrow(profiles[[1]]), round(sum(abs(profiles[["features, raw"]])), 6))
+cached <- if (SAVE && file.exists(null_cache)) readRDS(null_cache) else NULL
+nulls <- if (!is.null(cached) && identical(attr(cached, "fingerprint"), fp)) cached else {
+  if (!is.null(cached)) cat("cached null results are from different SHAP - recomputing\n")
+  structure(map(profiles, null_test), fingerprint = fp) }
+if (SAVE && (is.null(cached) || !identical(attr(cached, "fingerprint"), fp))) saveRDS(nulls, null_cache)
 summary_k <- imap_dfr(nulls, ~ tibble(profile = .y, best_k_sil = .x$best_k_sil, best_k_z = .x$best_k_z,
                                       max_z = max(.x$per_k$z), p_overall = .x$p_overall))
 knitr::kable(summary_k, digits = 3)
@@ -259,21 +265,25 @@ for (nm in names(profiles)) for (k in unique(c(nulls[[nm]]$best_k_sil, nulls[[nm
   H <- t(M[ord, rows, drop = FALSE])
   cap <- if (grepl("raw", nm)) quantile(abs(M), 0.99) else max(abs(M))
   H[H > cap] <- cap; H[H < -cap] <- -cap
-  acol <- data.frame(cluster = factor(cl[ord]), `LFC (sictrl/si3d)` = genes$y[ord],
-                     `predicted (out of fold)` = genes$pred_oof[ord], `gene set` = genes$set[ord],
+  # pheatmap spreads a continuous annotation over the values' own min..max, so with LFC running
+  # -6..+4 white sat near -1 and every gene between -0.5 and 1.5 looked the same. Capping at a
+  # symmetric +/- 1.5 (both caps are always hit) puts white at exactly 0.
+  sym <- function(x, cap = 1.5) { x <- pmin(pmax(x, -cap), cap); x[c(which.min(x), which.max(x))] <- c(-cap, cap); x }
+  acol <- data.frame(cluster = factor(cl[ord]), `LFC sictrl/si3d (cap 1.5)` = sym(genes$y[ord]),
+                     `predicted LFC (cap 1.5)` = sym(genes$pred_oof[ord]), `gene set` = genes$set[ord],
                      check.names = FALSE, row.names = colnames(H))
   arow <- if (startsWith(nm, "features")) data.frame(family = fam[rows], row.names = rows) else NULL
   acols <- list(`gene set` = c(`eIF3d promoted` = "#E69F00", `negative control` = "black", other = "grey90"),
                 cluster = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_len(k)], seq_len(k)),
-                `LFC (sictrl/si3d)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(50),
-                `predicted (out of fold)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(50))
+                `LFC sictrl/si3d (cap 1.5)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51),
+                `predicted LFC (cap 1.5)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51))
   if (!is.null(arow)) acols$family <- fam_cols
   hm <- pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
                  color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
                  breaks = seq(-cap, cap, length.out = 102), annotation_col = acol, annotation_row = arow,
                  annotation_colors = acols, gaps_col = cumsum(table(cl))[-k], fontsize_row = if (ncol(M) > 20) 6 else 9,
-                 main = sprintf("SHAP, %s | k = %d (%s) | n = %d genes | colour capped at %.3g",
-                                nm, k, k_why, nrow(genes), cap), silent = TRUE)
+                 main = sprintf("%s | SHAP, %s | k = %d (%s) | n = %d genes | body capped at %.3g",
+                                params$label, nm, k, k_why, nrow(genes), cap), fontsize = 9, silent = TRUE)
   cat("\n\n## ", nm, ", k = ", k, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
   if (SAVE) {
     f <- here("plots", paste0("23_shap_gene_clusters_", ptag, "_", gsub("[ ,]+", "_", nm), "_k", k, ".png"))

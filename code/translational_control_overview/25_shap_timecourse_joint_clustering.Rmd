@@ -74,13 +74,21 @@ load_tp <- function(tp) {
   stopifnot("out-of-fold SHAP missing - render 23_shap_gene_clustering.Rmd for this timepoint first" = file.exists(f))
   readRDS(f)
 }
-oof <- map(setNames(c(tps, ref), c(tps, ref)), load_tp)
+# Each contrast's SHAP stores its genes in train-then-test order, and the split differs between
+# contrasts, so align every timepoint to one order (by gene ID) before anything is combined.
+align <- function(o) { ord <- order(o$genes$gene_id_clean); o$S <- o$S[ord, , drop = FALSE]; o$genes <- o$genes[ord, ]; o }
+oof <- map(setNames(c(tps, ref), c(tps, ref)), ~ align(load_tp(.x)))
+stopifnot("timepoints do not cover the same genes" = all(map_lgl(oof, ~ setequal(.x$genes$gene_id_clean, oof[[1]]$genes$gene_id_clean))))
 if (nzchar(params$test_reuse)) cat("TEST MODE: every timepoint reuses", params$test_reuse, "\n")
 ids <- map(oof, ~ .x$genes$gene_id_clean)
 stopifnot("timepoints do not cover the same genes in the same order" = all(map_lgl(ids, identical, ids[[1]])),
           "timepoints do not share one feature set" = all(map_lgl(oof, ~ identical(colnames(.x$S), colnames(oof[[1]]$S)))))
 genes <- oof[[1]]$genes %>% dplyr::select(gene_id_clean, symbol)
 for (tp in names(oof)) genes[[paste0("lfc_", tp)]] <- oof[[tp]]$genes$y
+# padj comes from the regression run's saved model data (every timepoint has it; older SHAP caches do not).
+padj_of <- function(tp) { md <- readRDS(file.path(O, paste0("rfreg_model_data_",
+    sprintf(params$stem, if (nzchar(params$test_reuse)) params$test_reuse else tp), ".rds")))
+  a <- bind_rows(md$train, md$test); a$y_padj[match(genes$gene_id_clean, a$gene_id_clean)] }
 fc <- colnames(oof[[1]]$S)
 ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
 fam <- setNames(ann$family[match(fc, ann$feature)], fc)
@@ -138,7 +146,8 @@ sets <- list(hypoxia_1hr = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv", hypoxia_4hr 
              hypoxia_24hr = "hypoxia_3d_promotes_TE_24hr_lfc0.5.csv")
 for (tp in names(sets)) genes[[paste0("promoted_", tp)]] <- genes$gene_id_clean %in%
   sub("[.].*", "", read_csv(here("output", "genesets", sets[[tp]]), show_col_types = FALSE)$ensembl_gene)
-rg <- oof[[ref]]$genes; genes[[paste0("promoted_", ref)]] <- rg$y > 0.5 & !is.na(rg$y_padj) & rg$y_padj < 0.05
+rp <- padj_of(ref); ry <- genes[[paste0("lfc_", ref)]]
+genes[[paste0("promoted_", ref)]] <- ry > 0.5 & !is.na(rp) & rp < 0.05
 assign_k <- list()
 for (k in unique(c(k_sil, k_z))) {
   set.seed(9); cl <- kmeans(J, centers = k, nstart = 25, iter.max = 50)$cluster
@@ -147,11 +156,13 @@ for (k in unique(c(k_sil, k_z))) {
   ord <- order(cl, -genes$lfc_hypoxia_1hr)
   H <- t(cbind(J, R)[ord, ]); cap <- max(abs(H))
   acol <- data.frame(group = factor(cl[ord]), check.names = FALSE, row.names = colnames(H))
-  for (tp in c(tps, ref)) acol[[paste("LFC", tp_lab(tp))]] <- genes[[paste0("lfc_", tp)]][ord]
+  # Symmetric cap so white is exactly LFC 0 (pheatmap scales an annotation over its own min..max).
+  sym <- function(x, cap = 1.5) { x <- pmin(pmax(x, -cap), cap); x[c(which.min(x), which.max(x))] <- c(-cap, cap); x }
+  for (tp in c(tps, ref)) acol[[paste("LFC", tp_lab(tp))]] <- sym(genes[[paste0("lfc_", tp)]][ord])
   for (tp in c(tps, ref)) acol[[paste("promoted", tp_lab(tp))]] <- ifelse(genes[[paste0("promoted_", tp)]][ord], "yes", "no")
   arow <- data.frame(timepoint = factor(sub(".* \\| ", "", rownames(H)), levels = tp_lab(c(tps, ref))),
                      family = sub(" \\|.*", "", rownames(H)), row.names = rownames(H))
-  div <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(50)
+  div <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(51)
   acols <- c(list(group = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_len(k)], seq_len(k)),
                   timepoint = setNames(c("#F2C6DE", "#CC79A7", "#7A2E5C", "#009E73"), tp_lab(c(tps, ref))),
                   family = setNames(colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)), sort(unique(fam)))),
@@ -225,10 +236,17 @@ Each timepoint's own clustering (from `23_`, families normalised, at its best-su
 cross-tabulated: how genes in each 1hr group distribute at 4hr, and 4hr at 24hr.
 
 ```{r transitions, fig.width = 11, fig.height = 4.5}
+# The null-supported k, read from 23_'s cached null results. "Largest k in the cluster file" is NOT
+# safe: 23_ writes both the silhouette-peak and the best-supported k, and either can be larger
+# (24hr families-raw: best supported 2, silhouette peak 4).
+best_k_of <- function(tp, profile = "families, normalised") {
+  f <- list.files(file.path(O, "shap_oof_cache"), pattern = paste0("^nulls_", sprintf(params$stem, tp), "_"), full.names = TRUE)
+  stopifnot("no cached null results for this timepoint - render 23_ first" = length(f) >= 1)
+  readRDS(f[1])[[profile]]$best_k_z }
 own <- map(setNames(tps, tps), function(tp) {
   f <- file.path(O, paste0("shap_gene_clusters_", sprintf(params$stem, if (nzchar(params$test_reuse)) params$test_reuse else tp), ".csv"))
   a <- read_csv(f, show_col_types = FALSE) %>% filter(profile == "families, normalised")
-  a %>% filter(k == max(k)) %>% dplyr::select(gene_id_clean, cluster) })
+  a %>% filter(k == best_k_of(if (nzchar(params$test_reuse)) params$test_reuse else tp)) %>% dplyr::select(gene_id_clean, cluster) })
 pairs <- list(c(tps[1], tps[2]), c(tps[2], tps[3]))
 tr <- map_dfr(pairs, function(p) inner_join(own[[p[1]]], own[[p[2]]], by = "gene_id_clean", suffix = c("_from", "_to")) %>%
   dplyr::count(cluster_from, cluster_to) %>% mutate(step = paste(tp_lab(p[1]), "->", tp_lab(p[2]))))
@@ -242,6 +260,63 @@ p_tr
 if (SAVE) ggsave(here("plots", "25_shap_timecourse_group_transitions.pdf"), p_tr, width = 11, height = 4.5)
 if (SAVE) write_csv(genes %>% mutate(joint_group = cl, k = as.integer(k_use)),
                     file.path(O, "shap_timecourse_joint_groups_eif3d_mdamb231.csv"))
+```
+
+# 7. Each timepoint's own groups, followed through time
+
+For each timepoint, its own groups (from `23_`, families normalised, at its best-supported k) are
+held fixed and their family SHAP is shown at **every** timepoint. Reading across a row shows how
+the same genes' explanation changes from 1hr to 4hr to 24hr, with normoxia 1+4hr alongside.
+
+```{r follow_groups, fig.width = 15, fig.height = 4, results = "asis"}
+own_all <- map(setNames(tps, tps), function(tp) {
+  f <- file.path(O, paste0("shap_gene_clusters_", sprintf(params$stem, if (nzchar(params$test_reuse)) params$test_reuse else tp), ".csv"))
+  read_csv(f, show_col_types = FALSE) %>% filter(profile == "families, normalised") %>%
+    filter(k == best_k_of(if (nzchar(params$test_reuse)) params$test_reuse else tp)) %>%
+    dplyr::select(gene_id_clean, cluster) %>% { .$cluster[match(genes$gene_id_clean, .$gene_id_clean)] } })
+fmv <- readRDS(file.path(O, "feature_matrix_tco.rds"))
+gc_of <- fmv$cds_gc[match(genes$gene_id_clean, fmv$gene_id_clean)]; len_of <- 2^fmv$log2_cds_length[match(genes$gene_id_clean, fmv$gene_id_clean)] - 1
+allb <- do.call(cbind, blocks[c(tps, ref)])
+cap_all <- max(abs(allb))
+div101 <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(101)
+fam_order <- sort(unique(fam))
+col_ann <- data.frame(timepoint = factor(sub(".* \\| ", "", colnames(allb)), levels = tp_lab(c(tps, ref))),
+                      row.names = colnames(allb))
+tp_cols <- list(timepoint = setNames(c("#F2C6DE", "#CC79A7", "#7A2E5C", "#009E73"), tp_lab(c(tps, ref))))
+for (anchor in tps) {
+  cl_a <- own_all[[anchor]]
+  # (a) compact: one row per group, mean family SHAP at every timepoint
+  Mm <- t(sapply(sort(unique(cl_a)), function(g) colMeans(allb[cl_a == g, , drop = FALSE])))
+  rownames(Mm) <- sapply(sort(unique(cl_a)), function(g) sprintf("%s group %d | n = %s | CDS GC %.0f%%, %s nt | median LFC %.2f",
+    tp_lab(anchor), g, format(sum(cl_a == g), big.mark = ","), median(gc_of[cl_a == g], na.rm = TRUE),
+    format(round(median(len_of[cl_a == g], na.rm = TRUE)), big.mark = ","), median(genes[[paste0("lfc_", anchor)]][cl_a == g])))
+  capm <- max(abs(Mm))
+  hm <- pheatmap(Mm, cluster_rows = FALSE, cluster_cols = FALSE, color = div101, breaks = seq(-capm, capm, length.out = 102),
+                 annotation_col = col_ann, annotation_colors = tp_cols, labels_col = sub(" \\|.*", "", colnames(Mm)),
+                 gaps_col = cumsum(rep(length(fam_order), length(c(tps, ref))))[-length(c(tps, ref))],
+                 display_numbers = matrix(sprintf("%.2f", Mm), nrow(Mm)), number_color = "grey20", fontsize_number = 6.5,
+                 angle_col = 90, fontsize = 9, cellheight = 22,
+                 main = sprintf("Groups defined at %s, followed through time: mean family SHAP (normalised within gene and timepoint)", tp_lab(anchor)),
+                 silent = TRUE)
+  cat("\n\n## Groups defined at ", tp_lab(anchor), "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (SAVE) { pdf(here("plots", paste0("25_follow_groups_", anchor, ".pdf")), width = 15, height = 2.6 + 0.32 * nrow(Mm))
+    grid.newpage(); grid.draw(hm$gtable); dev.off() }
+  # (b) every gene: ordered by the anchor's groups, all timepoint blocks stacked
+  ord <- order(cl_a, -genes[[paste0("lfc_", anchor)]])
+  H <- t(allb[ord, ]); H[H > cap_all] <- cap_all; H[H < -cap_all] <- -cap_all
+  acol <- data.frame(group = factor(cl_a[ord]), row.names = colnames(H))
+  arow <- data.frame(timepoint = col_ann$timepoint, row.names = rownames(H))
+  hg <- pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE, color = div101,
+                 breaks = seq(-cap_all, cap_all, length.out = 102), annotation_col = acol, annotation_row = arow,
+                 annotation_colors = c(tp_cols, list(group = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_along(unique(cl_a))], sort(unique(cl_a))))),
+                 gaps_col = cumsum(table(cl_a))[-length(unique(cl_a))],
+                 gaps_row = cumsum(rep(length(fam_order), length(c(tps, ref))))[-length(c(tps, ref))],
+                 labels_row = sub(" \\|.*", "", rownames(H)), fontsize_row = 7,
+                 main = sprintf("Every gene, grouped as at %s; family SHAP at each timepoint (n = %d genes)", tp_lab(anchor), nrow(allb)),
+                 silent = TRUE)
+  if (SAVE) { png(here("plots", paste0("25_follow_groups_", anchor, "_genes.png")), width = 15, height = 11, units = "in", res = 250)
+    grid.newpage(); grid.draw(hg$gtable); dev.off() }
+}
 ```
 
 ```{r session}
