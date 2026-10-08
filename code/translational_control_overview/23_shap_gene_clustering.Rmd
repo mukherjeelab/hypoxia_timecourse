@@ -18,6 +18,9 @@ params:
   test_genes: 0
   label: "MDA-MB-231 si3d hypoxia 1hr"
   pos_geneset: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"
+  pos_label: "eIF3d promoted"
+  neg_geneset: "predictive_modeling/negative_control_genes.csv"
+  lfc_label: "LFC sictrl/si3d"
 editor_options:
   chunk_output_type: console
 ---
@@ -38,7 +41,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # What this notebook does
 
-Every gene in the MDA-MB-231 si3d hypoxia 1hr regression gets a vector of SHAP values - how much
+Every gene in the `r params$label` regression gets a vector of SHAP values - how much
 each intrinsic feature pushed that gene's predicted TE change up or down - and genes are then
 clustered on those vectors to find groups the model explains the same way.
 
@@ -218,7 +221,7 @@ p_band <- ggplot(band, aes(k)) +
   geom_line(aes(y = observed), colour = "#E69F00", linewidth = 0.8) + geom_point(aes(y = observed), colour = "#E69F00") +
   facet_wrap(~ profile, scales = "free_y") +
   labs(y = sprintf("mean silhouette (%d-gene sample)", length(sil_idx)),
-       title = "Observed silhouette against the column-permuted null, per k",
+       title = sprintf("Observed silhouette against the column-permuted null, per k: %s", params$label),
        subtitle = sprintf("grey band = null min-max over %d permutations; dashed = null median; n = %d genes",
                           params$n_perm, nrow(genes))) +
   theme_classic(base_size = 12)
@@ -241,9 +244,12 @@ rest; the cap is printed. Written as PNG: 10,172 columns as vector cells make a 
 gs_pos <- if (nzchar(params$pos_geneset))
   read_csv(here("output", "genesets", params$pos_geneset), show_col_types = FALSE)$ensembl_gene else
   genes$gene_id_clean[genes$y > 0.5 & !is.na(genes$y_padj) & genes$y_padj < 0.05]
-gs_neg <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"), show_col_types = FALSE) %>%
-  mutate(g = sub("[.].*", "", gene_id)) %>% pull(g)
-genes$set <- case_when(genes$gene_id_clean %in% sub("[.].*", "", gs_pos) ~ "eIF3d promoted",
+# neg_geneset = "" for an outcome with no knockdown (e.g. siCTRL hypoxia vs normoxia), where the
+# si3d negative controls mean nothing; pos_label / lfc_label name that outcome's own sets.
+gs_neg <- if (nzchar(params$neg_geneset)) read_csv(here("output", params$neg_geneset), show_col_types = FALSE) %>%
+  mutate(g = sub("[.].*", "", gene_id)) %>% pull(g) else character(0)
+POS <- params$pos_label; LFCN <- paste0(params$lfc_label, " (cap 1.5)")
+genes$set <- case_when(genes$gene_id_clean %in% sub("[.].*", "", gs_pos) ~ POS,
                        genes$gene_id_clean %in% gs_neg ~ "negative control", TRUE ~ "other")
 table(genes$set)
 ```
@@ -269,14 +275,17 @@ for (nm in names(profiles)) for (k in unique(c(nulls[[nm]]$best_k_sil, nulls[[nm
   # -6..+4 white sat near -1 and every gene between -0.5 and 1.5 looked the same. Capping at a
   # symmetric +/- 1.5 (both caps are always hit) puts white at exactly 0.
   sym <- function(x, cap = 1.5) { x <- pmin(pmax(x, -cap), cap); x[c(which.min(x), which.max(x))] <- c(-cap, cap); x }
-  acol <- data.frame(cluster = factor(cl[ord]), `LFC sictrl/si3d (cap 1.5)` = sym(genes$y[ord]),
+  acol <- data.frame(cluster = factor(cl[ord]), lfc = sym(genes$y[ord]),
                      `predicted LFC (cap 1.5)` = sym(genes$pred_oof[ord]), `gene set` = genes$set[ord],
                      check.names = FALSE, row.names = colnames(H))
+  names(acol)[2] <- LFCN
   arow <- if (startsWith(nm, "features")) data.frame(family = fam[rows], row.names = rows) else NULL
-  acols <- list(`gene set` = c(`eIF3d promoted` = "#E69F00", `negative control` = "black", other = "grey90"),
+  acols <- list(`gene set` = setNames(c("#E69F00", "black", "grey90"), c(POS, "negative control", "other")),
                 cluster = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_len(k)], seq_len(k)),
-                `LFC sictrl/si3d (cap 1.5)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51),
+                lfc = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51),
                 `predicted LFC (cap 1.5)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51))
+  names(acols)[names(acols) == "lfc"] <- LFCN
+  acols$`gene set` <- acols$`gene set`[names(acols$`gene set`) %in% genes$set]
   if (!is.null(arow)) acols$family <- fam_cols
   hm <- pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
                  color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
@@ -295,7 +304,7 @@ for (nm in names(profiles)) for (k in unique(c(nulls[[nm]]$best_k_sil, nulls[[nm
 
 # 6. What each cluster is
 
-Per clustering and cluster: size, LFC and out-of-fold prediction, how many eIF3d-promoted genes
+Per clustering and cluster: size, LFC and out-of-fold prediction, how many positive-set (`r params$pos_label`) genes
 it holds, the three families with the largest mean |SHAP| (sign = mean direction), and the
 cluster's median sequence values - so a group can be read as "GC-poor, long 5'UTR" rather than
 only as "GC SHAP positive".
@@ -311,7 +320,7 @@ seqv <- fm %>% transmute(gene_id_clean, cds_gc, gc3 = gc3_internal, cds_nt = 2^l
                          utr5_nt = 2^log2_utr5_length - 1, utr5_access = tco_struct_accessibility_utr5_mean)
 summ <- all_assign %>% left_join(seqv, by = "gene_id_clean") %>% group_by(profile, k, cluster) %>%
   summarise(n = n(), median_lfc = median(y), median_pred = median(pred_oof),
-            eIF3d_promoted = sum(set == "eIF3d promoted"), neg_controls = sum(set == "negative control"),
+            n_pos_set = sum(set == POS), neg_controls = sum(set == "negative control"),
             cds_gc = median(cds_gc), gc3 = median(gc3, na.rm = TRUE), cds_nt = median(cds_nt),
             utr5_nt = median(utr5_nt), utr5_access = median(utr5_access, na.rm = TRUE), .groups = "drop") %>%
   left_join(top_fam, by = c("profile", "k", "cluster"))

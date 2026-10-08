@@ -16,6 +16,8 @@ params:
   out_tag: ""
   allow_mixed_genes: FALSE
   footnote: ""
+  dir_cutoff: 0.3
+  n_beeswarm: 15
 editor_options:
   chunk_output_type: console
 ---
@@ -223,7 +225,7 @@ meta <- tibble(experiment = exps$label, suffix = exps$suffix) %>%
          condition = case_when(str_detect(suffix, "_capbind_(glu|tg)vs") ~ "cap binding, stress ratio",
                                str_detect(suffix, "_capbind_")  ~ "cap binding",
                                # Herrmannova HeLa is a steady-state knockdown, not a hypoxia
-                               # experiment, so it is labelled "no stress" (normoxia's colour).
+                               # experiment, so it is labelled "no stress" (a light tint of normoxia's green).
                                # Weber DAP5 (HEK293T) is a steady-state knockout, likewise.
                                str_detect(suffix, "_hela_|_dhx29ip_|_hek293t_normoxia_") ~ "no stress",
                                str_detect(suffix, "_hypoxia_")  ~ "hypoxia",
@@ -282,6 +284,9 @@ anno_col <- perf %>%
 # The isoforms track only carries information when some column was fitted on another cell line's
 # isoforms. Otherwise it duplicates the cell-line track exactly, so it is dropped.
 if (all(meta$isoforms == meta$cell_line)) anno_col$isoforms <- NULL
+# With a single column rho has no range, so its colour bar says nothing and its legend degenerates
+# to "0.5 ... 0.5"; the value is already printed in the column label.
+if (nrow(anno_col) == 1) anno_col$rho <- NULL
 
 # The two reserved project hues, used here for exactly what they are reserved for: eIF3d is
 # Okabe-Ito orange and eIF3e Okabe-Ito light blue throughout this project. Condition therefore
@@ -308,7 +313,7 @@ anno_col_colors <- list(
                           `DHX29` = "#882255",                           # Tol wine
                           `eIF4E` = "#CC6677",                           # Tol rose
                           `DAP5`  = "#DDCC77")[unique(meta$factor_kd)],  # Tol sand
-  condition           = c(hypoxia = "#CC79A7", normoxia = "#009E73", `no stress` = "#009E73",
+  condition           = c(hypoxia = "#CC79A7", normoxia = "#009E73", `no stress` = "#8FD3BD",   # light tint of normoxia: unstressed, but distinguishable
                           `cap binding` = "#332288",                 # Tol indigo
                           # lighter indigo: a variant of cap binding, and not DAP5's sand
                           `cap binding, stress ratio` = "#8C7FC7")[unique(meta$condition)],
@@ -545,7 +550,20 @@ if (!any(grepl("minus9|context_m9", modelled)))
 # Capturing the gtable ONCE with silent = TRUE and drawing it twice avoids both: the device
 # survives, the inline figure is captured, and the file is a real figure.
 draw_and_save <- function(args, fname = NULL, width = 9, height = NULL,
-                          cellheight = 13) {
+                          cellheight = 13, scale_title = NULL) {
+  # Name the colour scale. pheatmap has no legend title, so the title is the label of the top
+  # legend break. Inferred from the scale unless given: every signed scale in this notebook is a
+  # direction (correlation of a feature's value with its own SHAP, -1..1) and every unsigned one
+  # is a share of total mean |SHAP|. These do NOT sum to the model's rho: per gene, SHAP sums to
+  # that gene's prediction minus the mean prediction; shares sum to 100.
+  if (!is.null(args$breaks) && is.null(args$legend_breaks)) {
+    rng <- range(args$breaks)
+    if (is.null(scale_title)) scale_title <- if (rng[1] < 0) "direction\ncor(value, SHAP)" else "SHAP share (%)"
+    b <- pretty(rng, n = 5)
+    b <- b[b >= rng[1] & b <= rng[2] - 0.15 * diff(rng)]
+    args$legend_breaks <- c(b, rng[2])
+    args$legend_labels <- c(format(b, trim = TRUE), scale_title)
+  }
   # Rows get a FIXED height in points and the page grows to fit, rather than a fixed page
   # squeezing the rows. With 11 families in a 4-inch page the row labels overlapped and the
   # dendrogram took most of the height; a fixed cellheight makes every row legible whether
@@ -580,6 +598,11 @@ draw_and_save <- function(args, fname = NULL, width = 9, height = NULL,
     width <- max(width, cw * ncol(args$mat) / 72 +      # the matrix itself
                         0.07 * max(nchar(rownames(args$mat))) +   # row labels
                         (if (!is.null(args$annotation_row)) 0.5 else 0) + 3.2)  # legends
+    # Then never narrower than the drawn figure itself. The estimate above is a floor; legend
+    # widths (e.g. a two-line scale title) are absolute and not in it, and a page narrower than
+    # the gtable clips BOTH edges because pheatmap centres the figure.
+    need <- grid::convertWidth(sum(ph$gtable$widths), "in", valueOnly = TRUE)
+    if (is.finite(need)) width <- max(width, need + 0.4)
     pdf(file.path(here("plots"), fname), width = width, height = height)
     grid.newpage(); grid.draw(ph$gtable); foot(); dev.off()
   }
@@ -682,7 +705,8 @@ comb_args <- list(
   na_col = "grey88",
   fontsize_row = 8, fontsize_col = 9, cellwidth = 46,
   main = "Colour = direction (vermillion up, blue down, grey undefined)\nNumber = SHAP share (%), rows ordered by it")
-draw_and_save(comb_args, tagf("15_heatmap_features_combined", "pdf"), width = 9)
+draw_and_save(comb_args, tagf("15_heatmap_features_combined", "pdf"), width = 9,
+              scale_title = "colour: direction\nnumber: share (%)")
 
 n_na <- sum(is.na(Md[, 1]))
 cat(sprintf("\ndirection: %d push UP, %d push DOWN, %d undefined\n",
@@ -767,6 +791,91 @@ if (nrow(mixed)) {
 tab <- fam_long %>% arrange(desc(share))
 if (!is.null(fam_floor)) tab <- tab %>% left_join(fam_floor, by = "family")
 print(as.data.frame(tab %>% mutate(across(where(is.numeric), ~ round(., 3)))), row.names = FALSE)
+```
+
+# 2b. Signed share: importance with the direction it pushes
+
+The main view (decided by Kate, 2026-10-04). Each cell is the SHAP share (%) carrying the sign of
+the direction - negative means higher feature values push the predicted TE change DOWN. A sign is
+only given where the push is consistent: |cor(value, SHAP)| >= `r params$dir_cutoff`, and, where
+the 20-seed sweep measured it (si3d hypoxia 1hr, full model only), the sign does not flip across
+seeds. Otherwise the cell is grey: the feature carries that share but has no single direction.
+For a family, direction is the share-weighted mean over its members, so mixed families go grey.
+
+```{r fig_signed_share, fig.width = max(7, 0.6 * nrow(exps) + 6), fig.height = 13}
+signed_mat <- function(share_m, dir_m, unstable_rows = character(0)) {
+  ok <- !is.na(dir_m) & abs(dir_m) >= params$dir_cutoff
+  ok[rownames(ok) %in% unstable_rows, ] <- FALSE
+  v <- share_m * sign(dir_m); v[!ok] <- NA
+  list(v = v, lab = matrix(ifelse(ok, sprintf("%+.1f", v), sprintf("%.1f", share_m)),
+                           nrow(v), dimnames = dimnames(v)))
+}
+draw_signed <- function(sm, fname, annor = NULL, annoc = NULL, fontsize_row = 9) {
+  lim <- max(abs(sm$v), na.rm = TRUE)
+  args <- list(mat = sm$v, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+               breaks = seq(-lim, lim, length.out = 102), na_col = "grey85",
+               cluster_rows = FALSE, cluster_cols = ncol(sm$v) > 2,
+               annotation_row = annor, annotation_col = anno_col,
+               annotation_colors = c(annoc, anno_col_colors),
+               display_numbers = if (ncol(sm$v) <= 4) sm$lab else FALSE,
+               fontsize_number = 7, number_color = "black",
+               labels_col = lab_for(sm$v), fontsize_row = fontsize_row, fontsize_col = 9, cellwidth = 42)
+  draw_and_save(args, fname, width = 7.5,
+                scale_title = sprintf("signed SHAP share (%%)\ngrey: |direction| < %.1f", params$dir_cutoff))
+}
+# Families: rows in the share order of the magnitude panel.
+sf <- signed_mat(Mf, Mfd)
+draw_signed(sf, tagf("15_heatmap_family_signed_share", "pdf"))
+# Features: seed-unstable signs are withheld where they were measured.
+sfe <- signed_mat(M, Md[rownames(M), , drop = FALSE], unstable)
+draw_signed(sfe, tagf("15_heatmap_features_signed_share", "pdf"),
+            annor = anno_row["family"], annoc = list(family = fam_cols), fontsize_row = 8)
+cat(sprintf("families with a sign: %d of %d cells | features: %d of %d cells (cutoff |cor| >= %.1f%s)\n",
+            sum(!is.na(sf$v)), length(sf$v), sum(!is.na(sfe$v)), length(sfe$v), params$dir_cutoff,
+            if (length(unstable)) sprintf(", %d seed-unstable features withheld", length(unstable)) else ""))
+```
+
+# 2c. Beeswarm (single experiment only)
+
+The standard SHAP summary plot: one dot per gene, x = that feature's SHAP value for the gene,
+colour = the gene's feature value (percentile within the feature). Shows what a single number
+cannot - whether the push is monotonic, and how it is spread across genes. Uses the out-of-fold
+SHAP for every gene when `23_` has computed it for this run, otherwise the held-out genes `11_`
+explained.
+
+```{r fig_beeswarm, fig.width = 8, fig.height = 7, eval = nrow(exps) == 1}
+sfx1 <- exps$suffix[1]
+oof_f <- file.path(out_dir, paste0("shap_oof_", sfx1, ".rds"))
+md1 <- readRDS(file.path(out_dir, paste0("rfreg_model_data_", sfx1, ".rds")))
+vals <- bind_rows(md1$train, md1$test)
+if (file.exists(oof_f)) {
+  o <- readRDS(oof_f); Sb <- o$S; gid <- o$genes$gene_id_clean
+  src <- sprintf("out-of-fold SHAP, all %s genes", format(length(gid), big.mark = ","))
+} else {
+  pg <- read_csv(file.path(out_dir, paste0("shapreg_per_gene_", sfx1, ".csv")), show_col_types = FALSE)
+  Sb <- as.matrix(pg[, intersect(md1$feature_cols, names(pg))]); gid <- pg$gene_id_clean
+  src <- sprintf("SHAP on %d held-out genes", length(gid))
+}
+top <- long %>% arrange(desc(share)) %>% filter(feature %in% colnames(Sb)) %>% head(params$n_beeswarm)
+bs <- map_dfr(top$feature, function(f) {
+  x <- vals[[f]][match(gid, vals$gene_id_clean)]
+  tibble(feature = f, shap = Sb[, f], pct = rank(x, na.last = "keep") / sum(!is.na(x)))
+}) %>% mutate(feature = factor(feature, levels = rev(top$feature)))
+stopifnot("beeswarm: gene IDs did not match the model data" = mean(!is.na(bs$pct)) > 0.95)
+lab_y <- setNames(sprintf("%s  (%.1f%%)", top$feature, top$share), top$feature)
+p_bs <- ggplot(bs, aes(shap, feature, colour = pct)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  ggbeeswarm::geom_quasirandom(size = 0.35, alpha = 0.6, groupOnX = FALSE, width = 0.4) +
+  scale_colour_gradient2(low = "#0072B2", mid = "grey85", high = "#D55E00", midpoint = 0.5,
+                         limits = c(0, 1), breaks = c(0, 0.5, 1), labels = c("low", "mid", "high"),
+                         name = "feature value\n(percentile)") +
+  scale_y_discrete(labels = lab_y) +
+  labs(x = "SHAP value (contribution to predicted TE change)", y = NULL,
+       title = exps$label[1],
+       subtitle = sprintf("top %d features by SHAP share (in brackets); %s", nrow(top), src)) +
+  theme_classic(base_size = 11)
+p_bs
+if (isTRUE(params$save_plots)) ggsave(here("plots", tagf("15_shap_beeswarm", "pdf")), p_bs, width = 8, height = 7)
 ```
 
 # 3. Grouped by correlated cluster

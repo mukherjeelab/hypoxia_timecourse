@@ -1,0 +1,298 @@
+---
+title: "Do the NanoLuc codon variants look like eIF3d targets?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  recompute_features: FALSE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Four reporter constructs - a parent NanoLuc, a codon-**adapted** variant, an **anti-adapted**
+variant, and a **negative control** that is a positional shuffle of the parent's own codons -
+are scored by the models built on MDA-MB-231 transcripts, to ask how much each one *looks like*
+an mRNA whose translation depends on eIF3d.
+
+**Four models, all intrinsic (57 sequence-derived features).** The external block is 12
+measurements made on endogenous genes (eIF3 CLIP, DAP5 sensitivity, published half-lives,
+DHX29); a plasmid has none of them, and median-imputing would give all four constructs the
+same values while shifting every score toward the average gene. So the intrinsic model is the
+only version where every input is real.
+
+| | hypoxia 1hr | normoxia 1+4hr |
+|---|---|---|
+| **classifier** | promoted vs negative controls, P(target) | same |
+| **regression** | predicted TE log2FC on si3d, all genes | same |
+
+**The features are computed from sequence**, because a plasmid has no annotation. That path is
+re-implemented in `33b_`/`33c_`/`33d_` and **validated against the stored matrix** by
+`33e_`/`33f_`/`33g_`: all 57 reproduce exactly on real transcripts. Sequences are parsed and
+spliced by `33a_`.
+
+**What this can and cannot say.** The models were trained on endogenous transcripts. These
+constructs sit outside that population - a non-human CDS, vector UTRs, an unusual length
+profile - and, more importantly, the adapted and anti-adapted variants were *designed* by
+tuning codon usage, which is what several of the strongest features measure. A separation
+between them is therefore close to arithmetic, not independent evidence. The informative
+comparisons are the ones that were not built in: the size of the separation relative to real
+transcripts, whether the ranking agrees across the two conditions and the two model types, and
+whether the parent and its shuffled control (identical codon composition) come out together.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(ranger); library(treeshap)
+})
+O <- here("output", "translational_control_overview")
+cache <- file.path(O, "plasmid_features.rds")
+```
+
+# 1. Features for the four constructs
+
+```{r features}
+pl <- read_csv(here("accessories", "transcribed_plasmids_parsed.csv"), show_col_types = FALSE)
+stopifnot("expected the four NanoLuc constructs" = nrow(pl) == 4,
+          "constructs are not one backbone" = n_distinct(pl$utr5) == 1 && n_distinct(pl$utr3) == 1)
+
+if (params$recompute_features || !file.exists(cache)) {
+  source(here("code", "translational_control_overview", "33b_sequence_features.R"))
+  source(here("code", "translational_control_overview", "33c_structure_features.R"))
+  source(here("code", "translational_control_overview", "33d_g4_features.R"))
+  d  <- pl %>% transmute(id = construct, utr5, cds, utr3)
+  sq <- seq_features(d)
+  f  <- sq %>% left_join(structure_features(d), by = "id") %>%
+               left_join(g4_features(d, sq), by = "id")
+  saveRDS(f, cache)
+} else {
+  f <- readRDS(cache)
+}
+
+MODELS <- tribble(
+  ~label,                  ~kind,         ~suffix,
+  "hypoxia 1hr",           "classifier",  "eif33d_promotes_hypoxia_1hr_lfc0.5_tco_intrinsic_corrected_both_clipaggregate",
+  "normoxia 1+4hr",        "classifier",  "eif33d_promotes_normoxia_1and4hr_lfc0.5_tco_intrinsic_corrected_both_clipaggregate",
+  "hypoxia 1hr",           "regression",  "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw",
+  "normoxia 1+4hr",        "regression",  "eif33d_promotes_normoxia_1and4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw")
+
+md_of <- function(s, kind) readRDS(file.path(O, paste0(
+  if (kind == "classifier") "rf_model_data_" else "rfreg_model_data_", s, ".rds")))
+mdl_of <- function(s, kind) readRDS(file.path(O, paste0(
+  if (kind == "classifier") "rf_classifier_" else "rfreg_model_", s, ".rds")))
+
+FC <- md_of(MODELS$suffix[1], "classifier")$feature_cols
+stopifnot("every model must use the same 57 features" =
+            all(map_lgl(seq_len(nrow(MODELS)), ~ identical(md_of(MODELS$suffix[.x], MODELS$kind[.x])$feature_cols, FC))),
+          "a feature is missing for the constructs" = all(FC %in% names(f)),
+          "a construct feature is NA - the models would see an imputed value" =
+            !anyNA(f[, FC]))
+X <- as.data.frame(f[, FC]); rownames(X) <- f$id
+cat("features:", length(FC), "| constructs:", nrow(X), "| no missing values\n")
+```
+
+## Which features can differ at all
+
+The four share a backbone and a protein, so most features are identical by construction. This
+table is the honest denominator for everything below: only these columns can separate them,
+and between the parent and its shuffled control only the position-dependent ones can.
+
+```{r what_varies}
+varies <- f %>% dplyr::select(id, all_of(FC)) %>% pivot_longer(-id) %>%
+  group_by(name) %>% summarise(n_distinct = n_distinct(round(value, 10)),
+                               spread = diff(range(value)), .groups = "drop") %>%
+  filter(n_distinct > 1) %>% arrange(desc(spread))
+cat(nrow(varies), "of", length(FC), "features differ between constructs;",
+    length(FC) - nrow(varies), "are identical\n")
+pn <- f %>% filter(id %in% c("parent_bidir", "negative_control_3d")) %>%
+  dplyr::select(all_of(FC)) %>% summarise(across(everything(), ~ diff(range(.x)))) %>%
+  pivot_longer(everything()) %>% filter(value > 1e-10)
+cat("parent vs negative control (identical codon composition):", nrow(pn), "features differ -",
+    paste(pn$name, collapse = ", "), "\n")
+print(as.data.frame(varies), digits = 4)
+```
+
+# 2. Predictions
+
+A classifier probability is calibrated against a training set deliberately balanced 50/50
+between eIF3d-promoted genes and negative controls, so 0.5 is **not** "a typical transcript".
+It is reported next to the held-out distribution of each class, which is what makes it
+readable. The regression predicts a TE log2 fold change directly and is placed against all
+`r format(nrow(readRDS(file.path(O, "feature_matrix_tco.rds"))), big.mark = ",")` transcripts.
+
+```{r predict}
+ref_matrix <- readRDS(file.path(O, "feature_matrix_tco.rds"))
+
+predict_one <- function(suffix, kind, label) {
+  md <- md_of(suffix, kind); mdl <- mdl_of(suffix, kind)
+  # Training medians impute the reference matrix exactly as the model was trained. Imputing with
+  # a median leaves that median unchanged, so the saved (already imputed) training split carries
+  # the same medians the model was fitted with.
+  meds <- md$train %>% dplyr::select(all_of(FC)) %>% summarise(across(everything(), median, na.rm = TRUE))
+  ref <- ref_matrix %>% dplyr::select(transcript_id_clean, all_of(FC))
+  for (cl in FC) ref[[cl]][is.na(ref[[cl]])] <- meds[[cl]]
+
+  pr <- function(newdata) {
+    p <- predict(mdl, data = as.data.frame(newdata))$predictions
+    if (is.matrix(p)) p[, md$pos_label] else p
+  }
+  # Computed before the tibble: inside tibble(), `kind` would resolve to the column being
+  # created rather than to the argument.
+  is_pos <- if (kind == "classifier") md$test$eif3d_target == md$pos_label else md$test$y > 0.5
+  tibble(label = label, kind = kind, suffix = suffix,
+         construct = rownames(X), pred = pr(X[, FC]),
+         ref_pred = list(pr(ref[, FC])),
+         test_pred = list(pr(md$test[, FC])),
+         test_is_pos = list(is_pos))
+}
+
+preds <- pmap_dfr(list(MODELS$suffix, MODELS$kind, MODELS$label), predict_one) %>%
+  rowwise() %>%
+  mutate(pct_transcriptome = 100 * mean(ref_pred < pred),
+         pct_heldout_pos   = 100 * mean(test_pred[test_is_pos] < pred)) %>%
+  ungroup()
+
+print(as.data.frame(preds %>% dplyr::select(kind, label, construct, pred, pct_transcriptome)), digits = 4)
+```
+
+```{r pred_table}
+preds %>%
+  mutate(cell = sprintf("%.3f (%.0f%%)", pred, pct_transcriptome)) %>%
+  dplyr::select(construct, kind, label, cell) %>%
+  pivot_wider(names_from = c(kind, label), values_from = cell) %>%
+  arrange(match(construct, c("3d-adapted", "parent_bidir", "negative_control_3d", "3d-anti_adapted"))) %>%
+  as.data.frame() %>% print()
+cat("\ncell = prediction (percentile among all transcripts under that model)\n")
+```
+
+```{r fig_predictions, fig.width = 12, fig.height = 7.5}
+suppressPackageStartupMessages(library(ggrepel))
+ord <- c("3d-adapted", "parent_bidir", "negative_control_3d", "3d-anti_adapted")
+# The Okabe-Ito orange and sky blue are reserved project-wide for eIF3d and eIF3e, and every
+# construct here is an eIF3d experiment, so neither is used to label one construct. The parent
+# and its shuffled control get black and grey rather than two near-identical greys.
+cols <- c("3d-adapted" = "#D55E00", "parent_bidir" = "black",
+          "negative_control_3d" = "grey60", "3d-anti_adapted" = "#0072B2")
+short <- c("3d-adapted" = "adapted", "parent_bidir" = "parent",
+           "negative_control_3d" = "neg ctrl", "3d-anti_adapted" = "anti-adapted")
+
+bg <- preds %>% dplyr::select(kind, label, ref_pred) %>% distinct(kind, label, .keep_all = TRUE) %>%
+  unnest(ref_pred) %>% mutate(panel = paste0(kind, " | ", label))
+pt <- preds %>% mutate(panel = paste0(kind, " | ", label),
+                       construct = factor(construct, ord), lab = short[as.character(construct)])
+
+# The regression predictions occupy a narrow slice of a wide distribution, so an unzoomed axis
+# stacks all four constructs on one tick. Each panel is clipped to the central 98% of its own
+# reference distribution, widened if needed to hold every construct.
+lims <- bg %>% group_by(panel) %>%
+  summarise(lo = quantile(ref_pred, 0.01), hi = quantile(ref_pred, 0.99), .groups = "drop") %>%
+  left_join(pt %>% group_by(panel) %>% summarise(pmin = min(pred), pmax = max(pred), .groups = "drop"),
+            by = "panel") %>%
+  mutate(pad = 0.08 * (pmax(hi, pmax) - pmin(lo, pmin)),
+         lo = pmin(lo, pmin) - pad, hi = pmax(hi, pmax) + pad)
+bg  <- bg %>% left_join(lims, by = "panel") %>% filter(ref_pred >= lo, ref_pred <= hi)
+
+p <- ggplot(bg, aes(ref_pred)) +
+  geom_density(fill = "grey85", colour = "grey55", alpha = 0.7, linewidth = 0.4) +
+  geom_vline(data = pt, aes(xintercept = pred, colour = construct), linewidth = 0.9) +
+  geom_text_repel(data = pt, aes(x = pred, y = 0, label = lab, colour = construct),
+                  angle = 90, hjust = 0, size = 3.1, direction = "x", seed = 9,
+                  box.padding = 0.25, min.segment.length = 0.1, segment.size = 0.3,
+                  show.legend = FALSE) +
+  facet_wrap(~ panel, scales = "free") +
+  scale_colour_manual(values = cols, name = NULL, labels = short) +
+  expand_limits(y = 0) +
+  labs(x = "model prediction", y = "density",
+       title = "Where the constructs fall against all transcripts",
+       subtitle = sprintf("grey = all %s transcripts scored by the same model; axes clipped to the central 98%% of each distribution",
+                          format(nrow(ref_matrix), big.mark = ",")),
+       caption = "Classifier: P(eIF3d-promoted), calibrated on a balanced training set, so 0.5 is not 'a typical transcript'.\nRegression: predicted TE log2FC on si3d.") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"))
+print(p)
+ggsave(here("plots", "33_plasmid_predictions.pdf"), p, width = 12, height = 7.5)
+```
+
+The four models use different scales, so percentile against the transcriptome is the one view
+that puts them side by side.
+
+```{r fig_percentile, fig.width = 9, fig.height = 4.5}
+pp <- preds %>% mutate(construct = factor(construct, rev(ord)),
+                       panel = paste0(kind, " | ", label))
+ppct <- ggplot(pp, aes(pct_transcriptome, construct, colour = construct)) +
+  geom_vline(xintercept = 50, colour = "grey70", linetype = "dashed", linewidth = 0.4) +
+  geom_segment(aes(x = 50, xend = pct_transcriptome, yend = construct), linewidth = 0.5) +
+  geom_point(size = 3.4) +
+  geom_text(aes(label = sprintf("%.0f", pct_transcriptome)), vjust = -1.1, size = 3, show.legend = FALSE) +
+  facet_wrap(~ panel, nrow = 1) +
+  scale_colour_manual(values = cols, guide = "none") +
+  scale_y_discrete(labels = short) +
+  scale_x_continuous(limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
+  labs(x = "percentile among all transcripts", y = NULL,
+       title = "The same four predictions on one comparable scale",
+       subtitle = "dashed = the median transcript; higher = looks more like an eIF3d-dependent mRNA") +
+  theme_classic(base_size = 12) +
+  theme(panel.grid.major.y = element_line(colour = "grey92"))
+print(ppct)
+ggsave(here("plots", "33_plasmid_percentiles.pdf"), ppct, width = 9, height = 4.5)
+```
+
+# 3. Why: per-construct SHAP
+
+SHAP is run on the **regression** models, where the forest is a regression forest and TreeSHAP
+applies directly - no surrogate, so no fidelity apparatus is needed. (The classifier is a
+probability forest, which `treeshap` cannot take; `03_shap.Rmd` handles that with a surrogate,
+which is not worth importing for four sequences.) Values are additive, so a family's
+contribution is the exact sum of its members'.
+
+```{r shap, fig.width = 11, fig.height = 7}
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+shap_one <- function(suffix, label) {
+  md <- md_of(suffix, "regression"); mdl <- mdl_of(suffix, "regression")
+  uni <- ranger.unify(mdl, as.data.frame(md$train[, FC]))
+  s <- treeshap(uni, X[, FC], verbose = FALSE)$shaps
+  as_tibble(s) %>% mutate(construct = rownames(X), label = label, .before = 1)
+}
+shap <- map2_dfr(MODELS$suffix[MODELS$kind == "regression"],
+                 MODELS$label[MODELS$kind == "regression"], shap_one)
+
+fam <- shap %>% pivot_longer(all_of(FC), names_to = "feature", values_to = "shap") %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+  group_by(label, construct, family) %>% summarise(shap = sum(shap), .groups = "drop")
+
+pf <- fam %>%
+  mutate(construct = factor(construct, ord),
+         family = fct_reorder(family, abs(shap), .fun = max)) %>%
+  ggplot(aes(shap, family, fill = construct)) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.4) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  facet_wrap(~ label) +
+  scale_fill_manual(values = cols, name = NULL) +
+  labs(x = "summed SHAP (predicted TE log2FC)", y = NULL,
+       title = "What drives each construct's predicted TE change",
+       subtitle = "Regression model, TreeSHAP; family sums are exact because SHAP is additive",
+       caption = "Positive = pushes the predicted si3d TE log2FC up (more eIF3d-dependent).") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"))
+print(pf)
+ggsave(here("plots", "33_plasmid_shap_families.pdf"), pf, width = 11, height = 7)
+print(as.data.frame(fam %>% pivot_wider(names_from = construct, values_from = shap)), digits = 3)
+```
+
+# 4. Export
+
+```{r export}
+write_csv(f, file.path(O, "plasmid_features.csv"))
+write_csv(preds %>% dplyr::select(kind, label, construct, pred, pct_transcriptome, pct_heldout_pos),
+          file.path(O, "plasmid_predictions.csv"))
+write_csv(fam, file.path(O, "plasmid_shap_families.csv"))
+cat("wrote plasmid_features.csv, plasmid_predictions.csv, plasmid_shap_families.csv\n")
+```

@@ -1,0 +1,119 @@
+---
+title: "Intrinsic vs full model: held-out accuracy per experiment"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  n_boot: 1000
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "30_intrinsic_vs_full_heldout.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this shows
+
+For every experiment with both an **intrinsic** model (sequence-derived features only) and a
+**full** model (intrinsic + external experimental data: CLIP, stability/DHX29/CNOT3, DAP5),
+the held-out Spearman between predicted and observed outcome - the "rho" printed on the SHAP
+heatmaps. Both models of a pair use the same split seed on the same genes, which is asserted, so
+they are scored on **identical held-out genes** and the difference is paired. Its 95% interval
+is a paired bootstrap over those genes (`set.seed(9)`).
+
+Only the current own-isoform runs are used (MDA-MB-231 `tcoreg`, MCF7-SIX1 `tcoreg_mcf7tx`, HeLa
+`tcoreg_helatx`). DAP5 is left out: its full model would carry the DAP5 features describing its
+own outcome.
+
+```{r data}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+T <- "_corrected_both_clipaggregate_yraw"
+runs <- tribble(
+  ~label,                         ~stem,                                      ~fs,
+  "MDA-MB-231 3d hypoxia 1hr",    "eif33d_promotes_hypoxia_1hr",              "tcoreg",
+  "MDA-MB-231 3d hypoxia 4hr",    "eif33d_promotes_hypoxia_4hr",              "tcoreg",
+  "MDA-MB-231 3d hypoxia 24hr",   "eif33d_promotes_hypoxia_24hr",             "tcoreg",
+  "MDA-MB-231 3d normoxia 1+4hr", "eif33d_promotes_normoxia_1and4hr",         "tcoreg",
+  "MDA-MB-231 3e hypoxia 1hr",    "eif33e_promotes_hypoxia_1hr",              "tcoreg",
+  "MDA-MB-231 3e hypoxia 4hr",    "eif33e_promotes_hypoxia_4hr",              "tcoreg",
+  "MDA-MB-231 3e hypoxia 24hr",   "eif33e_promotes_hypoxia_24hr",             "tcoreg",
+  "MDA-MB-231 3e normoxia 1+4hr", "eif33e_promotes_normoxia_1and4hr",         "tcoreg",
+  "MCF7-SIX1 3d hypoxia 1hr",     "eif33d_promotes_mcf7six1_hypoxia_1hr",     "tcoreg_mcf7tx",
+  "MCF7-SIX1 3d normoxia 1hr",    "eif33d_promotes_mcf7six1_normoxia_1hr",    "tcoreg_mcf7tx",
+  "MCF7-SIX1 3e hypoxia 1hr",     "eif33e_promotes_mcf7six1_hypoxia_1hr",     "tcoreg_mcf7tx",
+  "MCF7-SIX1 3e normoxia 1hr",    "eif33e_promotes_mcf7six1_normoxia_1hr",    "tcoreg_mcf7tx",
+  "HeLa 3d (Herrmannova)",        "eif33d_promotes_hela_normoxia_steadystate", "tcoreg_helatx",
+  "HeLa 3e (Herrmannova)",        "eif33e_promotes_hela_normoxia_steadystate", "tcoreg_helatx") %>%
+  mutate(full = paste0(stem, "_lfc0.5_", fs, T), intrinsic = paste0(stem, "_lfc0.5_", fs, "_intrinsic", T))
+pred_of <- function(sfx) read_csv(file.path(O, paste0("rfreg_predictions_", sfx, ".csv")), show_col_types = FALSE) %>%
+  filter(split == "test")
+perf_of <- function(sfx) read_csv(file.path(O, paste0("rfreg_performance_", sfx, ".csv")), show_col_types = FALSE,
+                                  col_names = c("metric", "value"), skip = 1) %>% deframe()
+have <- runs %>% filter(file.exists(file.path(O, paste0("rfreg_predictions_", full, ".csv"))),
+                        file.exists(file.path(O, paste0("rfreg_predictions_", intrinsic, ".csv"))))
+if (nrow(have) < nrow(runs)) cat("missing, skipped:", paste(setdiff(runs$label, have$label), collapse = "; "), "\n")
+
+res <- pmap_dfr(have, function(label, stem, fs, full, intrinsic) {
+  a <- pred_of(full); b <- pred_of(intrinsic)
+  stopifnot("full and intrinsic held-out genes differ" = setequal(a$gene_id_clean, b$gene_id_clean))
+  d <- inner_join(a %>% dplyr::select(gene_id_clean, y, p_full = pred),
+                  b %>% dplyr::select(gene_id_clean, y2 = y, p_int = pred), by = "gene_id_clean")
+  stopifnot("the two runs model different outcomes" = max(abs(d$y - d$y2)) < 1e-12)
+  rf <- cor(d$y, d$p_full, method = "spearman"); ri <- cor(d$y, d$p_int, method = "spearman")
+  # The saved headline metric must be what is recomputed here.
+  stopifnot("recomputed Spearman disagrees with the saved performance file" =
+              abs(rf - perf_of(full)[["spearman_raw_y"]]) < 1e-9 && abs(ri - perf_of(intrinsic)[["spearman_raw_y"]]) < 1e-9)
+  set.seed(9)
+  diffs <- replicate(params$n_boot, { i <- sample.int(nrow(d), replace = TRUE)
+    cor(d$y[i], d$p_full[i], method = "spearman") - cor(d$y[i], d$p_int[i], method = "spearman") })
+  tibble(label, n = nrow(d), full = rf, intrinsic = ri, diff = rf - ri,
+         lo = quantile(diffs, 0.025), hi = quantile(diffs, 0.975))
+}) %>% mutate(cell_line = str_extract(label, "^[^ ]+"), label = fct_reorder(label, full))
+knitr::kable(res %>% dplyr::select(-cell_line), digits = 3,
+             caption = "Held-out Spearman; diff = full - intrinsic with paired-bootstrap 95% CI")
+```
+
+# Figure
+
+```{r fig, fig.width = 11, fig.height = 6}
+library(patchwork)
+long <- res %>% pivot_longer(c(full, intrinsic), names_to = "model", values_to = "rho") %>%
+  mutate(model = recode(model, full = "full (intrinsic + external)", intrinsic = "intrinsic (sequence only)"))
+p1 <- ggplot(long, aes(rho, label)) +
+  geom_segment(data = res, aes(x = intrinsic, xend = full, y = label, yend = label), colour = "grey70", inherit.aes = FALSE) +
+  geom_point(aes(colour = model), size = 2.6) +
+  scale_colour_manual(values = c(`full (intrinsic + external)` = "black", `intrinsic (sequence only)` = "#CC79A7"), name = NULL) +
+  labs(x = "held-out Spearman, predicted vs observed", y = NULL, title = "Held-out accuracy per experiment") +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+p2 <- ggplot(res, aes(diff, label)) +
+  geom_vline(xintercept = 0, colour = "grey60", linetype = 2) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.3, colour = "grey40") +
+  geom_point(size = 2.2) +
+  geom_text(aes(x = max(hi) + 0.01, label = paste0("n = ", format(n, big.mark = ","))), hjust = 0, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+  labs(x = "full - intrinsic (paired bootstrap 95% CI)", y = NULL, title = "What the external data add") +
+  theme_classic(base_size = 11) + theme(axis.text.y = element_blank())
+p <- p1 + p2 + plot_layout(widths = c(1.2, 1)) +
+  plot_annotation(caption = "Same held-out genes for both models of each experiment; n = held-out genes. Spearman as printed on the SHAP heatmaps.")
+p
+if (isTRUE(params$save_plots)) ggsave(here("plots", "30_intrinsic_vs_full_heldout_spearman.pdf"), p, width = 11, height = 6)
+```
+
+```{r session}
+sessionInfo()
+```

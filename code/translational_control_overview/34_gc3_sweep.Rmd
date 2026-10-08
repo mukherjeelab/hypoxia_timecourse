@@ -1,0 +1,182 @@
+---
+title: "What GC3 do the models actually prefer? A synonymous sweep on the NanoLuc backbone"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  reps: 4
+  recompute: FALSE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Why
+
+`33_` found that the codon-**adapted** construct scores *lower* as an eIF3d target than the
+parent it was built from, because it was pushed past the edge of the training data: its GC3
+(12.3%) and CAI (0.508) are lower than **every one of the 10,172 transcripts** the models were
+fitted on, and lower than all 1,436 eIF3d-promoted genes. A random forest cannot extrapolate,
+so going further buys nothing, while the codon-optimality features it drags down actively cost.
+
+That raises the question this notebook answers: **along the axis a codon design can actually
+move - synonymous substitution - where does the predicted score peak?**
+
+**The sweep.** `34a_` recodes the parent NanoLuc CDS at 21 levels of GC preference, `r params$reps`
+independent variants each, protein held identical and the initiator and stop untouched. GC3
+spans about 4% to 99%, which brackets all four real constructs. Every variant gets the full
+57-feature treatment and all four models.
+
+**It deliberately does not hold CAI constant.** Across the transcriptome GC3 and CAI correlate
+at rho = 0.85, so synonymous choice cannot move them independently; the sweep therefore measures
+the *net* effect of recoding, which is what a design actually buys. That coupling is plotted
+rather than assumed.
+
+**Read it as a property of the models, not of the cell.** It says where these forests, trained
+on endogenous mRNAs, score a sequence highest. It is not a prediction that such a construct
+would behave that way.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+cache <- file.path(O, "gc3_sweep_features.rds")
+ord  <- c("3d-adapted", "parent_bidir", "negative_control_3d", "3d-anti_adapted")
+cols <- c("3d-adapted" = "#E69F00", "parent_bidir" = "grey30",
+          "negative_control_3d" = "grey60", "3d-anti_adapted" = "#0072B2")
+```
+
+# 1. Build the variants and their features
+
+```{r build}
+pl <- read_csv(here("accessories", "transcribed_plasmids_parsed.csv"), show_col_types = FALSE)
+stopifnot("the constructs must share one backbone" =
+            n_distinct(pl$utr5) == 1 && n_distinct(pl$utr3) == 1)
+U5 <- pl$utr5[1]; U3 <- pl$utr3[1]
+
+if (params$recompute || !file.exists(cache)) {
+  source(here("code", "translational_control_overview", "34a_synonymous_variants.R"))
+  source(here("code", "translational_control_overview", "33b_sequence_features.R"))
+  source(here("code", "translational_control_overview", "33c_structure_features.R"))
+  source(here("code", "translational_control_overview", "33d_g4_features.R"))
+  sw <- synonymous_sweep(pl$cds[pl$construct == "parent_bidir"],
+                         ps = seq(0, 1, by = 0.05), reps = params$reps)
+  d <- tibble(id = sw$id, utr5 = U5, cds = sw$cds, utr3 = U3)
+  sq <- seq_features(d)
+  f  <- sq %>% left_join(structure_features(d), by = "id") %>%
+               left_join(g4_features(d, sq), by = "id") %>%
+               left_join(sw %>% dplyr::select(id, p, rep), by = "id")
+  saveRDS(f, cache)
+} else {
+  f <- readRDS(cache)
+}
+cat("sweep variants:", nrow(f), "| GC3 range",
+    paste(round(range(f$gc3_internal), 1), collapse = " - "), "%\n")
+
+real <- readRDS(file.path(O, "plasmid_features.rds")) %>% mutate(p = NA_real_, rep = NA_integer_)
+stopifnot("sweep and constructs do not share the feature set" =
+            setequal(setdiff(names(f), c("p", "rep")), setdiff(names(real), c("p", "rep"))))
+```
+
+# 2. Score every variant with all four models
+
+```{r predict}
+MODELS <- tribble(
+  ~label,            ~kind,        ~suffix,
+  "hypoxia 1hr",     "classifier", "eif33d_promotes_hypoxia_1hr_lfc0.5_tco_intrinsic_corrected_both_clipaggregate",
+  "normoxia 1+4hr",  "classifier", "eif33d_promotes_normoxia_1and4hr_lfc0.5_tco_intrinsic_corrected_both_clipaggregate",
+  "hypoxia 1hr",     "regression", "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw",
+  "normoxia 1+4hr",  "regression", "eif33d_promotes_normoxia_1and4hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw")
+suppressPackageStartupMessages(library(ranger))
+
+md_of  <- function(s, k) readRDS(file.path(O, paste0(if (k == "classifier") "rf_model_data_" else "rfreg_model_data_", s, ".rds")))
+mdl_of <- function(s, k) readRDS(file.path(O, paste0(if (k == "classifier") "rf_classifier_" else "rfreg_model_", s, ".rds")))
+FC <- md_of(MODELS$suffix[1], "classifier")$feature_cols
+stopifnot("a feature is missing from the sweep" = all(FC %in% names(f)),
+          "a sweep feature is NA" = !anyNA(f[, FC]))
+
+score <- function(suffix, kind, label, newdata) {
+  md <- md_of(suffix, kind); mdl <- mdl_of(suffix, kind)
+  p <- predict(mdl, data = as.data.frame(newdata[, FC]))$predictions
+  if (is.matrix(p)) p[, md$pos_label] else p
+}
+sweep_pred <- pmap_dfr(list(MODELS$suffix, MODELS$kind, MODELS$label), function(s, k, l)
+  f %>% dplyr::select(id, gc3 = gc3_internal, cai = cai_internal, csc = csc_internal, p, rep) %>%
+    mutate(kind = k, label = l, pred = score(s, k, l, f)))
+real_pred <- pmap_dfr(list(MODELS$suffix, MODELS$kind, MODELS$label), function(s, k, l)
+  real %>% dplyr::select(id, gc3 = gc3_internal, cai = cai_internal, csc = csc_internal) %>%
+    mutate(kind = k, label = l, pred = score(s, k, l, real)))
+```
+
+# 3. Where does the predicted score peak?
+
+```{r peak}
+peaks <- sweep_pred %>% group_by(kind, label, gc3_bin = round(gc3 / 5) * 5) %>%
+  summarise(pred = mean(pred), .groups = "drop_last") %>%
+  slice_max(pred, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  dplyr::rename(peak_gc3 = gc3_bin, peak_pred = pred)
+md_reg <- md_of(MODELS$suffix[3], "regression")
+allg <- bind_rows(md_reg$train, md_reg$test)
+pos_gc3 <- allg %>% filter(y > 0.5, !is.na(y_padj), y_padj < 0.05) %>% pull(gc3_internal)
+cat(sprintf("real eIF3d-promoted genes: GC3 median %.1f%%, IQR %.1f-%.1f%%, 5-95%% %.1f-%.1f%%\n",
+            median(pos_gc3), quantile(pos_gc3, .25), quantile(pos_gc3, .75),
+            quantile(pos_gc3, .05), quantile(pos_gc3, .95)))
+print(as.data.frame(peaks), digits = 4)
+```
+
+```{r fig_sweep, fig.width = 11, fig.height = 7}
+pg <- ggplot(sweep_pred, aes(gc3, pred)) +
+  annotate("rect", xmin = quantile(pos_gc3, .25), xmax = quantile(pos_gc3, .75),
+           ymin = -Inf, ymax = Inf, fill = "#009E73", alpha = 0.12) +
+  geom_vline(xintercept = median(pos_gc3), colour = "#009E73", linetype = "dashed", linewidth = 0.5) +
+  geom_point(colour = "grey55", size = 1.1, alpha = 0.7) +
+  geom_smooth(method = "loess", span = 0.5, se = TRUE, colour = "black", linewidth = 0.7) +
+  geom_point(data = real_pred, aes(colour = factor(id, ord)), size = 3.2) +
+  facet_wrap(~ kind + label, scales = "free_y") +
+  scale_colour_manual(values = cols, name = NULL) +
+  labs(x = "GC3 of the CDS (%)", y = "model prediction",
+       title = "Predicted eIF3d-dependence across a synonymous GC3 sweep",
+       subtitle = sprintf("grey = %d synonymous recodings of the parent NanoLuc CDS (protein identical); green band = IQR of real eIF3d-promoted genes, dashed = their median",
+                          nrow(f)),
+       caption = "Classifier: P(eIF3d-promoted). Regression: predicted TE log2FC on si3d.\nA random forest cannot extrapolate, so the curve necessarily flattens beyond the training range.") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"))
+print(pg)
+ggsave(here("plots", "34_gc3_sweep.pdf"), pg, width = 11, height = 7)
+```
+
+# 4. GC3 and codon optimality cannot be separated
+
+```{r fig_coupling, fig.width = 10, fig.height = 4.5}
+cp <- sweep_pred %>% distinct(id, gc3, cai, csc) %>%
+  pivot_longer(c(cai, csc), names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric, cai = "CAI (internal)", csc = "CSC (internal)"))
+rp <- real_pred %>% distinct(id, gc3, cai, csc) %>%
+  pivot_longer(c(cai, csc), names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric, cai = "CAI (internal)", csc = "CSC (internal)"))
+pc <- ggplot(cp, aes(gc3, value)) +
+  geom_point(colour = "grey55", size = 1.1, alpha = 0.7) +
+  geom_point(data = rp, aes(colour = factor(id, ord)), size = 3.2) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_colour_manual(values = cols, name = NULL) +
+  labs(x = "GC3 of the CDS (%)", y = NULL,
+       title = "Synonymous recoding moves GC3 and codon optimality together",
+       subtitle = "which is why lowering GC3 past the natural range costs CAI and CSC") +
+  theme_classic(base_size = 12) + theme(legend.position = "top")
+print(pc)
+ggsave(here("plots", "34_gc3_vs_codon_optimality.pdf"), pc, width = 10, height = 4.5)
+```
+
+# 5. Export
+
+```{r export}
+write_csv(sweep_pred, file.path(O, "gc3_sweep_predictions.csv"))
+write_csv(peaks, file.path(O, "gc3_sweep_peaks.csv"))
+cat("wrote gc3_sweep_predictions.csv, gc3_sweep_peaks.csv\n")
+```

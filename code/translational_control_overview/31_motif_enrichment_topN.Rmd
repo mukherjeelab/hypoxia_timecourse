@@ -1,0 +1,321 @@
+---
+title: "Motif enrichment in each experiment's top-N promoted transcripts (model-free)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  experiments: ""          # "" = the columns of 15b_'s intrinsic figure (with cap binding), read from 15b_ itself
+  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;_helatx_=feature_matrix_tco_hela.rds;_hektx_=feature_matrix_tco_dhx29.rds;_manetx_=feature_matrix_tco_mane.rds;=feature_matrix_tco.rds"
+  top_n: 200
+  padj_max: 0.05
+  k: 6
+  pwm_min_score: "80%"
+  min_present: 20          # a motif must be present AND absent in >= this many transcripts of a column to be tested
+  fdr: 0.05
+  n_label: 8
+  n_cores: 4
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "31_motif_enrichment_topN.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this asks
+
+Option 2 of the motif question (Kate, 2026-10-04): no motifs go into the forest - they were dropped
+from the models because thousands of low-signal columns crowded out the real predictors
+(`code/predictive_modeling/FEATURE_DECISION_LOG.Rmd`, Sec. 4). Instead, for each experiment
+separately: **are particular sequence motifs over- or under-represented among its top-N promoted
+transcripts, relative to every other transcript in that experiment?**
+
+**Decisions**
+
+- **Top set** = the same rule as the top-N feature-means heatmap (`17_`): the top `r params$top_n`
+  genes by LFC among those with padj < `r params$padj_max` and LFC > 0, filled by LFC alone when
+  fewer pass. **Background** = every other gene in that experiment's modelled set.
+- **Own transcripts.** Each experiment's gene -> transcript map is its own feature matrix
+  (own dominant isoform; MANE for the starred columns). Sequences are extracted **from the genome**
+  (GENCODE v49 txdb + hg38), not taken from the matrix, and checked against it.
+- **Two motif types, per region (5'UTR, CDS, 3'UTR):** every `r params$k`-mer, and the 306 RBP
+  PWMs used before (131 RBNS + 175 CISBP-RNA, `FeatureReachR`), a hit being a window scoring >=
+  `r params$pwm_min_score` of the PWM's maximum - the threshold `01c_kmer_motif_precompute` used.
+- **Presence, adjusted for length and GC.** Per transcript, a motif is present or absent in the
+  region. Each motif is tested with a logistic regression `present ~ top + log2(region length) +
+  region GC%`. Without the covariates the test mostly rediscovers that top sets are GC-poor and
+  short-CDS (the SHAP result) - a longer region simply contains more k-mers, and AT-rich k-mers sit
+  in AT-rich regions. The effect reported is the **adjusted log odds ratio** for top vs background;
+  BH FDR within experiment x region x motif type.
+- Motifs present (or absent) in fewer than `r params$min_present` transcripts of a column are not
+  tested. In the CDS most 6-mers are present in nearly every transcript, so CDS k-mer power is low
+  by construction.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(Biostrings); library(GenomicFeatures)
+  library(BSgenome.Hsapiens.UCSC.hg38); library(pheatmap); library(grid); library(ggrepel); library(parallel)
+})
+O  <- here("output", "translational_control_overview")
+CD <- file.path(O, "motif_cache"); dir.create(CD, showWarnings = FALSE)
+regions <- c("utr5", "cds", "utr3")
+reg_lab <- c(utr5 = "5'UTR", cds = "CDS", utr3 = "3'UTR")
+```
+
+# 1. Experiments, top sets and transcripts
+
+```{r experiments}
+parse_pairs <- function(s) {
+  parts <- str_trim(str_split(s, ";")[[1]]); parts <- parts[nzchar(parts)]
+  tibble(key = str_trim(str_replace(parts, "=.*$", "")), val = str_trim(str_replace(parts, "^[^=]*=", "")))
+}
+ex_str <- params$experiments
+if (!nzchar(ex_str)) {   # the 15b_ intrinsic + cap-binding column list, evaluated from that file
+  src <- parse(here("code", "translational_control_overview", "15b_render_all_celllines.R"))
+  keep <- vapply(src, function(e) is.call(e) && identical(e[[1]], as.name("<-")) &&
+                   as.character(e[[2]]) %in% c("T", "mk"), logical(1))
+  env15 <- new.env(); env15$with_capbind <- TRUE
+  for (e in src[keep]) eval(e, env15)
+  ex_str <- env15$mk("_intrinsic")
+}
+exps <- parse_pairs(ex_str) %>% dplyr::rename(label = key, suffix = val)
+mmap <- parse_pairs(params$matrix_map)
+exps$matrix_rds <- map_chr(exps$suffix, function(s) (mmap %>% filter(key == "" | str_detect(s, fixed(key))))$val[1])
+stopifnot("an experiment label is duplicated" = !any(duplicated(exps$label)))
+matrices <- set_names(unique(exps$matrix_rds)) %>%
+  map(~ readRDS(file.path(O, .x)) %>% dplyr::select(gene_id_clean, transcript_id_clean, symbol,
+                                                     any_of(c("log2_utr5_length", "log2_cds_length", "log2_utr3_length"))))
+walk(matrices, ~ stopifnot("a feature matrix is not one transcript per gene" = !any(duplicated(.x$gene_id_clean))))
+
+# Same top-set rule as 17_.
+sets <- pmap(list(exps$label, exps$suffix, exps$matrix_rds), function(label, suffix, matrix_rds) {
+  md <- readRDS(file.path(O, paste0("rfreg_model_data_", suffix, ".rds")))
+  g <- bind_rows(md$train, md$test) %>% dplyr::select(gene_id_clean, y, y_padj)
+  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(g$gene_id_clean)))
+  N <- as.integer(params$top_n)
+  sig <- g %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > 0) %>% arrange(desc(y))
+  top <- sig %>% slice_head(n = N)
+  if (nrow(top) < N) top <- bind_rows(top, g %>% filter(!gene_id_clean %in% top$gene_id_clean) %>%
+                                        arrange(desc(y)) %>% slice_head(n = N - nrow(top)))
+  stopifnot("could not fill the top set" = nrow(top) == N)
+  fm <- matrices[[matrix_rds]]
+  g %>% inner_join(fm %>% dplyr::select(gene_id_clean, transcript_id_clean), by = "gene_id_clean") %>%
+    mutate(top = gene_id_clean %in% top$gene_id_clean,
+           n_significant = if (all(is.na(g$y_padj))) NA_integer_ else min(nrow(sig), N))
+}) %>% set_names(exps$label)
+tibble(experiment = names(sets), genes = map_int(sets, nrow), top = map_int(sets, ~ sum(.x$top)),
+       n_significant_in_top = map_int(sets, ~ .x$n_significant[1])) %>% knitr::kable()
+stopifnot("a top gene has no transcript in its matrix" = all(map_int(sets, ~ sum(.x$top)) == params$top_n))
+```
+
+# 2. Region sequences from the genome
+
+```{r sequences}
+all_tx <- unique(unlist(map(matrices, "transcript_id_clean")))
+seq_cache <- file.path(CD, "region_seqs.rds")
+seqs <- if (file.exists(seq_cache)) readRDS(seq_cache) else NULL
+if (is.null(seqs) || !all(all_tx %in% names(seqs$cds))) {
+  txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+  get_region <- function(grl) {
+    names(grl) <- sub("[.].*", "", names(grl)); grl <- grl[names(grl) %in% all_tx]
+    extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38, grl)
+  }
+  seqs <- list(utr5 = get_region(fiveUTRsByTranscript(txdb, use.names = TRUE)),
+               cds  = get_region(cdsBy(txdb, by = "tx", use.names = TRUE)),
+               utr3 = get_region(threeUTRsByTranscript(txdb, use.names = TRUE)))
+  saveRDS(seqs, seq_cache)
+}
+seqs <- map(seqs, ~ .x[names(.x) %in% all_tx])
+cat(sprintf("%s: %d transcripts\n", reg_lab, map_int(seqs, length)), sep = "")
+
+# Checks against the matrices and against biology.
+cds <- seqs$cds
+stopifnot("CDS sequences do not start with ATG" = mean(subseq(cds, 1, 3) == "ATG") > 0.97)
+len_check <- imap_dfr(matrices, function(fm, nm) map_dfr(regions, function(r) {
+  col <- paste0("log2_", r, "_length"); if (!col %in% names(fm)) return(NULL)
+  s <- seqs[[r]]; m <- match(fm$transcript_id_clean, names(s)); k <- !is.na(m) & !is.na(fm[[col]])
+  tibble(matrix = nm, region = r, n = sum(k),
+         frac_exact = mean(abs(log2(width(s)[m[k]] + 1) - fm[[col]][k]) < 1e-6))
+}))
+knitr::kable(len_check, digits = 4, caption = "Region length from the genome vs the matrix's log2 length")
+stopifnot("extracted region lengths do not reproduce the matrices" = all(len_check$frac_exact > 0.99))
+actb <- matrices[["feature_matrix_tco.rds"]] %>% filter(symbol == "ACTB") %>% pull(transcript_id_clean)
+actb_gc <- 100 * letterFrequency(cds[actb], "GC", as.prob = TRUE)[1]
+cat(sprintf("ACTB CDS GC: %.1f%%\n", actb_gc))
+stopifnot("ACTB CDS GC outside 50-70%" = between(actb_gc, 50, 70))
+# Strand / orientation: ribosomal-protein mRNAs are 5'TOP - their 5'UTR starts with C.
+rp_tx <- unique(unlist(map(matrices, ~ .x$transcript_id_clean[grepl("^RP[SL][0-9]+[AXY]?$", .x$symbol)])))
+u5 <- seqs$utr5[width(seqs$utr5) > 0]
+first_c <- as.character(subseq(u5, 1, 1)) == "C"
+f_rp <- mean(first_c[names(u5) %in% rp_tx]); f_bg <- mean(first_c[!names(u5) %in% rp_tx])
+cat(sprintf("5'UTR starts with C: ribosomal-protein mRNAs %.2f (n = %d) vs others %.2f\n",
+            f_rp, sum(names(u5) %in% rp_tx), f_bg))
+stopifnot("ribosomal-protein 5'UTRs do not start with C more often - orientation or region is wrong" = f_rp > 1.5 * f_bg)
+```
+
+# 3. Motif presence per transcript
+
+```{r presence}
+# k-mers: presence of each k-mer anywhere in the region. Biostrings drops names on frequency
+# matrices, so rownames are restored explicitly (project memory note).
+kmer_presence <- function(r) {
+  f <- file.path(CD, sprintf("kmer%d_presence_%s.rds", params$k, r))
+  if (file.exists(f)) { x <- readRDS(f); if (all(names(seqs[[r]]) %in% rownames(x))) return(x) }
+  s <- seqs[[r]]; s <- s[width(s) >= params$k]
+  m <- oligonucleotideFrequency(s, width = params$k) > 0
+  rownames(m) <- names(s); saveRDS(m, f); m
+}
+# RBP PWMs: all sequences of a region concatenated with N spacers, matched once per motif, and hits
+# mapped back to their transcript (hits spanning a spacer are discarded). Far faster than per
+# sequence; the check below proves it gives identical counts.
+pwms <- c(setNames(FeatureReachR::RBNS_PWM, paste0("RBNS ", names(FeatureReachR::RBNS_PWM))),
+          setNames(FeatureReachR::CISBPRNA_hs_PWM, paste0("CISBP ", names(FeatureReachR::CISBPRNA_hs_PWM))))
+pwms <- map(pwms, function(m) { m <- as.matrix(m); rownames(m) <- c("A", "C", "G", "T"); m })
+spacer <- 30
+concat_hits <- function(m, s) {
+  big <- DNAString(paste(as.character(s), collapse = strrep("N", spacer)))
+  st <- cumsum(c(1, head(width(s), -1) + spacer)); en <- st + width(s) - 1
+  h <- start(matchPWM(m, big, min.score = params$pwm_min_score, with.score = FALSE))
+  i <- findInterval(h, st); ok <- i > 0 & (h + ncol(m) - 1) <= en[pmax(i, 1)]
+  tabulate(i[ok], nbins = length(s))
+}
+pwm_presence <- function(r) {
+  f <- file.path(CD, sprintf("pwm_presence_%s.rds", r))
+  if (file.exists(f)) { x <- readRDS(f); if (all(names(seqs[[r]]) %in% rownames(x))) return(x) }
+  s <- seqs[[r]]; s <- s[width(s) > 0]
+  m <- sapply(pwms, function(p) concat_hits(p, s) > 0); rownames(m) <- names(s); saveRDS(m, f); m
+}
+# Proof that the concatenation trick is exact: per-sequence matching on 150 random transcripts.
+set.seed(9)
+chk_s <- seqs$utr3[sample(which(width(seqs$utr3) > 50), 150)]
+chk <- map_lgl(pwms[c(1, 50, 200)], function(p)
+  identical(concat_hits(p, chk_s), vapply(seq_along(chk_s), function(j)
+    length(matchPWM(p, chk_s[[j]], min.score = params$pwm_min_score)), integer(1))))
+stopifnot("concatenated PWM matching disagrees with per-sequence matching" = all(chk))
+cat("concatenated PWM matching reproduces per-sequence counts exactly (3 motifs x 150 transcripts)\n")
+```
+
+# 4. Tests
+
+```{r tests}
+gc_pct <- map(seqs, ~ setNames(100 * letterFrequency(.x, "GC", as.prob = TRUE)[, 1], names(.x)))
+fit_one <- function(pres, X) {
+  f <- suppressWarnings(glm.fit(X, pres, family = binomial()))
+  if (!f$converged) return(c(NA, NA))
+  se <- sqrt(diag(chol2inv(qr.R(f$qr))))[2]
+  c(f$coefficients[2], se)
+}
+test_set <- function(P, r, type) {
+  res_f <- file.path(CD, sprintf("tests_%s_%s_top%d_k%d.rds", type, r, params$top_n, params$k))
+  key <- digest_key <- paste(names(sets), map_chr(sets, ~ paste(sum(.x$top), sum(.x$gene_id_clean %in% .x$gene_id_clean[.x$top]))), collapse = "|")
+  if (file.exists(res_f)) { x <- readRDS(res_f); if (identical(attr(x, "key"), key)) return(x) }
+  out <- imap_dfr(sets, function(g, lab) {
+    g <- g %>% filter(transcript_id_clean %in% rownames(P))
+    Pm <- P[g$transcript_id_clean, , drop = FALSE]
+    len <- log2(width(seqs[[r]])[match(g$transcript_id_clean, names(seqs[[r]]))])
+    X <- cbind(1, top = as.numeric(g$top), len = len, gc = gc_pct[[r]][g$transcript_id_clean])
+    np <- colSums(Pm); keep <- np >= params$min_present & (nrow(Pm) - np) >= params$min_present
+    cols <- which(keep)
+    est <- mclapply(cols, function(j) fit_one(as.numeric(Pm[, j]), X), mc.cores = params$n_cores)
+    est <- do.call(rbind, est)
+    tibble(experiment = lab, region = r, type = type, motif = colnames(Pm)[cols],
+           log_or = est[, 1], se = est[, 2],
+           frac_top = colMeans(Pm[g$top, cols, drop = FALSE]), frac_bg = colMeans(Pm[!g$top, cols, drop = FALSE]),
+           n_top = sum(g$top), n_bg = sum(!g$top)) %>%
+      mutate(p = 2 * pnorm(-abs(log_or / se)), fdr = p.adjust(p, "BH"))
+  })
+  attr(out, "key") <- key; saveRDS(out, res_f); out
+}
+res <- map_dfr(regions, function(r) {
+  t0 <- Sys.time()
+  a <- test_set(kmer_presence(r), r, "k-mer"); b <- test_set(pwm_presence(r), r, "RBP motif")
+  cat(sprintf("%s: %.1f min\n", reg_lab[r], as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  bind_rows(a, b)
+}) %>% mutate(region = factor(reg_lab[region], levels = reg_lab), rbp = ifelse(type == "RBP motif", sub("^(RBNS|CISBP) (M[0-9]+_[0-9.]+_)?", "", motif), NA))
+# Perfect separation: a motif absent from (or present in) EVERY top-set transcript has no finite
+# odds ratio; glm returns a runaway estimate (|log OR| ~ 15) with a huge SE. Those are not
+# estimable, so they are dropped and FDR is recomputed over the estimable tests only.
+n_sep <- sum(res$frac_top %in% c(0, 1) | abs(res$log_or) > 10, na.rm = TRUE)
+res <- res %>% filter(!(frac_top %in% c(0, 1)), is.na(log_or) | abs(log_or) <= 10) %>%
+  group_by(experiment, region, type) %>% mutate(fdr = p.adjust(p, "BH")) %>% ungroup()
+cat(sprintf("dropped %d tests with perfect separation (motif absent from, or present in, every top-set transcript)\n", n_sep))
+write_csv(res, file.path(O, sprintf("motif_enrichment_top%d.csv", params$top_n)))
+res %>% group_by(type, region) %>%
+  summarise(tests = n(), enriched = sum(fdr < params$fdr & log_or > 0, na.rm = TRUE),
+            depleted = sum(fdr < params$fdr & log_or < 0, na.rm = TRUE), .groups = "drop") %>%
+  knitr::kable(caption = sprintf("Significant at FDR < %.2f, summed over experiments", params$fdr))
+```
+
+# 5. One figure per experiment
+
+Per experiment: a volcano for each motif type and region. x = adjusted log odds ratio (top vs
+background), y = -log10 FDR; the dashed line is FDR = `r params$fdr`. The `r params$n_label`
+strongest significant motifs on each side are labelled. Saved as
+`plots/31_motif_enrichment_top`r params$top_n`_<experiment>.pdf`.
+
+```{r per_experiment, fig.width = 13, fig.height = 8, results = "asis"}
+slug <- function(x) gsub("[^A-Za-z0-9]+", "_", gsub("\\*", "", x)) %>% str_remove("_$")
+for (lab in names(sets)) {
+  d <- res %>% filter(experiment == lab, !is.na(fdr)) %>% mutate(nl = -log10(pmax(fdr, 1e-300)),
+        sig = fdr < params$fdr, show = ifelse(type == "RBP motif", rbp, motif))
+  labs_d <- d %>% filter(sig) %>% group_by(type, region, sign(log_or)) %>% slice_max(nl, n = params$n_label) %>% ungroup()
+  p <- ggplot(d, aes(log_or, nl)) +
+    geom_hline(yintercept = -log10(params$fdr), linetype = 2, colour = "grey60") + geom_vline(xintercept = 0, colour = "grey80") +
+    geom_point(aes(colour = ifelse(!sig, "n.s.", ifelse(log_or > 0, "enriched in top", "depleted in top"))), size = 0.7, alpha = 0.7) +
+    geom_text_repel(data = labs_d, aes(label = show), size = 2.4, max.overlaps = 30, min.segment.length = 0) +
+    scale_colour_manual(values = c(`enriched in top` = "#D55E00", `depleted in top` = "#0072B2", n.s. = "grey80"), name = NULL) +
+    facet_grid(type ~ region, scales = "free") +
+    labs(x = "adjusted log odds ratio, top vs background (length + GC adjusted)", y = "-log10 FDR",
+         title = lab, subtitle = sprintf("top %d (%s significant at padj < %.2f) vs %s other transcripts; %d-mers and %d RBP PWMs per region",
+                                         params$top_n, ifelse(is.na(sets[[lab]]$n_significant[1]), "no padj;", sets[[lab]]$n_significant[1]),
+                                         params$padj_max, format(sum(!sets[[lab]]$top), big.mark = ","), params$k, length(pwms))) +
+    theme_bw(base_size = 10) + theme(legend.position = "bottom")
+  cat("\n\n## ", lab, "\n\n", sep = ""); print(p)
+  if (isTRUE(params$save_plots))
+    ggsave(here("plots", sprintf("31_motif_enrichment_top%d_%s.pdf", params$top_n, slug(lab))), p, width = 13, height = 8)
+}
+```
+
+# 6. Across experiments
+
+RBP motifs significant (FDR < `r params$fdr`) in at least two experiments in a region. Cell =
+signed -log10 FDR (positive = enriched in the top set); blank = not tested. One heatmap per region.
+
+```{r across, fig.width = 13, fig.height = 9, results = "asis"}
+for (r in reg_lab) {
+  d <- res %>% filter(type == "RBP motif", region == r, !is.na(fdr)) %>% mutate(v = sign(log_or) * -log10(pmax(fdr, 1e-50)))
+  keep <- d %>% group_by(motif) %>% summarise(n = sum(fdr < params$fdr), .groups = "drop") %>% filter(n >= 2) %>% pull(motif)
+  if (length(keep) < 2) { cat("\n\n", r, ": fewer than two RBP motifs significant in >= 2 experiments\n"); next }
+  M <- d %>% filter(motif %in% keep) %>% dplyr::select(motif, experiment, v) %>%
+    pivot_wider(names_from = experiment, values_from = v) %>% column_to_rownames("motif") %>% as.matrix()
+  lim <- max(abs(M), na.rm = TRUE)
+  hm <- pheatmap(M, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101), breaks = seq(-lim, lim, length.out = 102),
+                 na_col = "grey92", cluster_rows = nrow(M) > 2, cluster_cols = ncol(M) > 2,
+                 fontsize_row = 6, fontsize_col = 8, cellwidth = 14, cellheight = 7,
+                 main = sprintf("%s: RBP motifs, signed -log10 FDR\ntop %d vs rest, length + GC adjusted", r, params$top_n), silent = TRUE)
+  cat("\n\n## ", r, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (isTRUE(params$save_plots)) {
+    w <- grid::convertWidth(sum(hm$gtable$widths), "in", valueOnly = TRUE); h <- grid::convertHeight(sum(hm$gtable$heights), "in", valueOnly = TRUE)
+    pdf(here("plots", sprintf("31_motif_rbp_heatmap_top%d_%s.pdf", params$top_n, slug(r))), width = max(8, w + 0.5), height = max(5, h + 0.5))
+    grid.draw(hm$gtable); dev.off()
+  }
+}
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,240 @@
+---
+title: "The hypoxia 1hr SHAP clusters: what drives each, and its TE change over time"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  stem: "eif33d_promotes_%s_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  anchor: "hypoxia_1hr"
+  timepoints: "normoxia_1and4hr,hypoxia_1hr,hypoxia_4hr,hypoxia_24hr"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "28_cluster_summary_figure.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this figure shows
+
+One row per cluster from the MDA-MB-231 si3d hypoxia 1hr SHAP clustering
+(`23_shap_gene_clustering.Rmd`, families normalised within gene, at the k best supported against
+the shuffled null; `26_target_subtypes_over_time.Rmd` for the eIF3d-target subtypes).
+
+- **Left - what drives it:** the cluster's mean SHAP per feature family at hypoxia 1hr
+  (normalised within gene, so each gene's family values sum to 1 in absolute value). Positive =
+  that family pushes the cluster's predicted TE change up.
+- **Right - its TE change over time:** violins of log2(sictrl / si3d) TE change for the cluster's
+  genes at normoxia 1+4hr (time-regressed), then hypoxia 1hr, 4hr and 24hr, with every modelled gene
+  as a grey violin behind for reference. Point = median; the label gives the median and n.
+  Wilcoxon p compares the cluster with all other genes at that timepoint.
+
+**The clusters are defined once, at hypoxia 1hr, and held fixed.** Every other column follows the
+same genes; it is not a re-clustering at that timepoint. The hypoxia 1hr column is shaded and
+labelled "clusters defined here".
+
+Two versions: all 10,172 modelled genes in their 1hr clusters, and the 1,436 eIF3d targets at
+hypoxia 1hr in their subtypes.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(patchwork) })
+O <- here("output", "translational_control_overview")
+tps <- strsplit(params$timepoints, ",")[[1]]
+tp_lab <- function(x) c(hypoxia_1hr = "hypoxia 1hr", hypoxia_4hr = "hypoxia 4hr", hypoxia_24hr = "hypoxia 24hr",
+                        normoxia_1and4hr = "normoxia 1+4hr")[x]
+cl_cols <- c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")
+```
+
+```{r data}
+align <- function(o) { ord <- order(o$genes$gene_id_clean); o$S <- o$S[ord, , drop = FALSE]; o$genes <- o$genes[ord, ]; o }
+oof <- map(setNames(tps, tps), ~ align(readRDS(file.path(O, paste0("shap_oof_", sprintf(params$stem, .x), ".rds")))))
+ids <- oof[[params$anchor]]$genes$gene_id_clean
+stopifnot("timepoints do not cover the same genes" = all(map_lgl(oof, ~ identical(.x$genes$gene_id_clean, ids))))
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+S <- oof[[params$anchor]]$S; fc <- colnames(S); fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+F <- sapply(sort(unique(fam)), function(g) rowSums(S[, fam == g, drop = FALSE])); F <- F / pmax(rowSums(abs(F)), 1e-12)
+lfc <- map_dfr(tps, ~ tibble(gene_id_clean = ids, timepoint = tp_lab(.x), lfc = oof[[.x]]$genes$y))
+fm <- readRDS(file.path(O, "feature_matrix_tco.rds"))
+seqv <- tibble(gene_id_clean = ids, cds_gc = fm$cds_gc[match(ids, fm$gene_id_clean)],
+               cds_nt = 2^fm$log2_cds_length[match(ids, fm$gene_id_clean)] - 1)
+best_k <- readRDS(list.files(file.path(O, "shap_oof_cache"), pattern = paste0("^nulls_", sprintf(params$stem, params$anchor), "_"),
+                             full.names = TRUE)[1])[["families, normalised"]]$best_k_z
+all_cl <- read_csv(file.path(O, paste0("shap_gene_clusters_", sprintf(params$stem, params$anchor), ".csv")), show_col_types = FALSE) %>%
+  filter(profile == "families, normalised", k == best_k) %>% dplyr::select(gene_id_clean, cluster)
+tg_cl <- read_csv(file.path(O, "eif3d_target_subtypes_mdamb231.csv"), show_col_types = FALSE) %>%
+  filter(anchor == tp_lab(params$anchor)) %>% transmute(gene_id_clean, cluster = subtype)
+cat("all-gene clusters at k =", best_k, "| target subtypes:", n_distinct(tg_cl$cluster), "\n")
+```
+
+```{r figure_fn}
+# Name a cluster by the sequence property that sets it apart (median vs all modelled genes).
+name_cluster <- function(g) {
+  d <- seqv %>% filter(gene_id_clean %in% g); gc0 <- median(seqv$cds_gc, na.rm = TRUE); ln0 <- median(seqv$cds_nt, na.rm = TRUE)
+  gc <- median(d$cds_gc, na.rm = TRUE); ln <- median(d$cds_nt, na.rm = TRUE)
+  tag <- c(if (gc < gc0 - 3) "GC-poor" else if (gc > gc0 + 3) "GC-rich",
+           if (ln < 0.6 * ln0) "short CDS" else if (ln > 1.4 * ln0) "long CDS")
+  sprintf("%s\n(CDS GC %.0f%%, %s nt)", if (length(tag)) paste(tag, collapse = ", ") else "mixed",
+          gc, format(round(ln), big.mark = ","))
+}
+make_figure <- function(cl, title, unit = "cluster", lfc_df = lfc, lvls = tp_lab(tps), shade = tp_lab(params$anchor),
+                        ylab = "TE change, log2(sictrl / si3d)",
+                        right_txt = "Right: the SAME genes' TE change at each condition (coloured) over all modelled genes (grey) - groups are fixed at hypoxia 1hr, not re-clustered.\n") {
+  ks <- sort(unique(cl$cluster))
+  rows <- lapply(ks, function(k) {
+    g <- cl$gene_id_clean[cl$cluster == k]; col <- cl_cols[k]
+    # left: drivers
+    drv <- tibble(family = colnames(F), value = colMeans(F[ids %in% g, , drop = FALSE])) %>%
+      mutate(family = fct_reorder(family, abs(value)))
+    p1 <- ggplot(drv, aes(value, family, fill = value > 0)) + geom_col(width = 0.7) +
+      geom_vline(xintercept = 0, colour = "grey50") +
+      scale_fill_manual(values = c(`TRUE` = "#D55E00", `FALSE` = "#0072B2"), guide = "none") +
+      scale_x_continuous(limits = c(-0.5, 0.5)) +
+      labs(x = if (k == tail(ks, 1)) "mean SHAP at hypoxia 1hr (normalised within gene)" else NULL, y = NULL,
+           title = sprintf("Hypoxia 1hr %s %d: %s", unit, k, name_cluster(g))) +
+      theme_classic(base_size = 10) + theme(plot.title = element_text(size = 10, colour = "black"),
+                                            panel.border = element_rect(colour = col, fill = NA, linewidth = 1.2))
+    # right: LFC over time
+    d <- lfc_df %>% mutate(in_cl = gene_id_clean %in% g, timepoint = factor(timepoint, levels = lvls))
+    xa <- match(shade, levels(d$timepoint))
+    st <- d %>% group_by(timepoint) %>%
+      summarise(med = median(lfc[in_cl]), n = sum(in_cl), p = wilcox.test(lfc[in_cl], lfc[!in_cl])$p.value, .groups = "drop")
+    lim <- range(quantile(lfc_df$lfc, c(0.01, 0.99)), quantile(d$lfc[d$in_cl], c(0.01, 0.99)))
+    top <- lim[2] + 0.45 * diff(lim)   # label band sits above the data, never over a violin
+    dv <- filter(d, between(lfc, lim[1], lim[2]))   # drawing only; medians and p use every gene
+    p2 <- ggplot(dv, aes(timepoint, lfc)) +
+      { if (!is.na(xa)) annotate("rect", xmin = xa - 0.5, xmax = xa + 0.5, ymin = -Inf, ymax = Inf, fill = "grey95") } +
+      geom_hline(yintercept = 0, colour = "grey60", linetype = 2) +
+      geom_violin(fill = "grey90", colour = NA, width = 0.9) +
+      geom_violin(data = filter(dv, in_cl), fill = col, alpha = 0.55, colour = col, width = 0.6) +
+      geom_point(data = st, aes(timepoint, med), size = 2, inherit.aes = FALSE) +
+      geom_text(data = st, aes(timepoint, top, label = sprintf("median %.2f\nn = %s\np %s", med, format(n, big.mark = ","), ifelse(p < 1e-300, "< 1e-300", sprintf("= %.1g", p)))),
+                size = 2.5, vjust = 1, inherit.aes = FALSE) +
+      coord_cartesian(ylim = c(lim[1], top)) +
+      scale_x_discrete(labels = function(x) ifelse(x %in% shade, paste0(x, "\n(clusters defined here)"), x)) +
+      labs(x = NULL, y = ylab) +
+      theme_classic(base_size = 10)
+    p1 + p2 + plot_layout(widths = c(1, 1.6))
+  })
+  wrap_plots(rows, ncol = 1) + plot_annotation(title = title,
+    subtitle = paste("Left: what pushes each group's predicted TE change (mean family SHAP, MDA-MB-231 si3d hypoxia 1hr, intrinsic model).\n",
+                     right_txt,
+                     "p = Wilcoxon, group vs all other genes at that condition; violins drawn on the central 98% (medians and p use every gene)."),
+    theme = theme(plot.subtitle = element_text(size = 9)))
+}
+```
+
+# All modelled genes, by their hypoxia 1hr cluster
+
+```{r fig_all, fig.width = 12, fig.height = 13}
+p_all <- make_figure(all_cl, sprintf("Clusters defined on hypoxia 1hr SHAP (all %s modelled genes, k = %d), followed across conditions", format(nrow(all_cl), big.mark = ","), best_k))
+p_all
+if (isTRUE(params$save_plots)) ggsave(here("plots", "28_hypoxia_1hr_clusters_drivers_and_lfc.pdf"), p_all,
+                                      width = 12, height = 3.2 * n_distinct(all_cl$cluster) + 1)
+```
+
+# eIF3d targets at hypoxia 1hr, by subtype
+
+```{r fig_targets, fig.width = 12, fig.height = 10}
+p_tg <- make_figure(tg_cl, sprintf("Subtypes of the %s eIF3d targets, defined on hypoxia 1hr SHAP, followed across conditions", format(nrow(tg_cl), big.mark = ",")), unit = "subtype")
+p_tg
+if (isTRUE(params$save_plots)) ggsave(here("plots", "28_hypoxia_1hr_target_subtypes_drivers_and_lfc.pdf"), p_tg,
+                                      width = 12, height = 3.2 * n_distinct(tg_cl$cluster) + 1)
+```
+
+# The same groups in the control hypoxic response (siCTRL, hypoxia vs normoxia)
+
+The groups are still the ones defined on si3d hypoxia 1hr SHAP. What changes is the readout: the
+**siCTRL hypoxia vs normoxia** contrast at 1, 4 and 24hr, which describes the cells' own hypoxic
+response with no knockdown involved. Source: `output/translation_categories_{1,4,24}hr.csv`
+(`rna_ribo_te_analysis.Rmd`, `control_condition = "normoxia"`, `test_condition = "hypoxia"`,
+spike-in normalised), so every column is **log2(hypoxia / normoxia)**: positive means higher in
+hypoxia.
+
+**Spike-in normalisation means TE falls across the whole transcriptome under hypoxia** (all-gene
+medians are printed below), so a group's own median mostly tracks that global drop. The comparison
+that matters is the group **against the grey all-gene violin** at the same timepoint, which the
+Wilcoxon p tests.
+
+```{r hyp_data}
+hyp <- map_dfr(c(1, 4, 24), function(t) {
+  read_csv(here("output", sprintf("translation_categories_%dhr.csv", t)), show_col_types = FALSE) %>%
+    transmute(gene_id_clean = sub("\\..*", "", gene_id), timepoint = sprintf("%dhr", t), rna_lfc, ribo_lfc, te_lfc)
+})
+# Direction check: classic HIF targets must rise in RNA by 24hr if the files are log2(hypoxia / normoxia).
+hif <- hyp %>% filter(timepoint == "24hr", gene_id_clean %in% c("ENSG00000107159", "ENSG00000112715")) # CA9, VEGFA
+stopifnot("hypoxia contrast direction flipped: CA9/VEGFA RNA not up at 24hr" = nrow(hif) == 2, all(hif$rna_lfc > 0.5))
+hyp <- hyp %>% filter(gene_id_clean %in% ids)          # restrict to the modelled genes, as the groups are
+hyp %>% group_by(timepoint) %>% summarise(n = sum(!is.na(te_lfc)), median_te = median(te_lfc, na.rm = TRUE),
+                                          median_rna = median(rna_lfc, na.rm = TRUE), median_ribo = median(ribo_lfc, na.rm = TRUE)) %>%
+  knitr::kable(digits = 3, caption = "All modelled genes, siCTRL hypoxia vs normoxia")
+hyp_lvls <- paste("hypoxia", c("1hr", "4hr", "24hr"), "vs normoxia")
+hyp_te <- hyp %>% filter(!is.na(te_lfc)) %>% transmute(gene_id_clean, timepoint = paste("hypoxia", timepoint, "vs normoxia"), lfc = te_lfc)
+hyp_txt <- "Right: the SAME genes' TE change in siCTRL, hypoxia vs normoxia, at each timepoint (coloured) over all modelled genes (grey); no knockdown in this readout.\n"
+```
+
+```{r fig_hyp_all, fig.width = 12, fig.height = 13}
+p_hyp_all <- make_figure(all_cl, sprintf("si3d hypoxia 1hr clusters (k = %d) in the control hypoxic response", best_k),
+                         lfc_df = hyp_te, lvls = hyp_lvls, shade = NA, ylab = "siCTRL TE change, log2(hypoxia / normoxia)", right_txt = hyp_txt)
+p_hyp_all
+if (isTRUE(params$save_plots)) ggsave(here("plots", "28_hypoxia_1hr_clusters_sictrl_hypoxic_response.pdf"), p_hyp_all,
+                                      width = 12, height = 3.2 * n_distinct(all_cl$cluster) + 1)
+```
+
+```{r fig_hyp_targets, fig.width = 12, fig.height = 10}
+p_hyp_tg <- make_figure(tg_cl, "si3d hypoxia 1hr target subtypes in the control hypoxic response", unit = "subtype",
+                        lfc_df = hyp_te, lvls = hyp_lvls, shade = NA, ylab = "siCTRL TE change, log2(hypoxia / normoxia)", right_txt = hyp_txt)
+p_hyp_tg
+if (isTRUE(params$save_plots)) ggsave(here("plots", "28_hypoxia_1hr_target_subtypes_sictrl_hypoxic_response.pdf"), p_hyp_tg,
+                                      width = 12, height = 3.2 * n_distinct(tg_cl$cluster) + 1)
+```
+
+## Is it RNA or ribosome footprints?
+
+TE = footprints / RNA, so a group's TE shift can come from either leg. Each group's median minus the
+all-gene median at the same timepoint (0 = moves exactly like the transcriptome).
+
+```{r fig_hyp_legs, fig.width = 11, fig.height = 6}
+legs <- bind_rows(all_cl %>% mutate(set = "all modelled genes, 1hr clusters"),
+                  tg_cl %>% mutate(set = "eIF3d targets, 1hr subtypes")) %>%
+  mutate(name = map_chr(seq_len(n()), ~ NA_character_))
+grp_names <- legs %>% distinct(set, cluster) %>%
+  mutate(name = map2_chr(set, cluster, ~ sprintf("%d: %s", .y, sub("\n.*", "", name_cluster(legs$gene_id_clean[legs$set == .x & legs$cluster == .y])))))
+rel <- legs %>% dplyr::select(-name) %>% left_join(grp_names, by = c("set", "cluster")) %>%
+  inner_join(pivot_longer(hyp, c(rna_lfc, ribo_lfc, te_lfc), names_to = "leg", values_to = "v"), by = "gene_id_clean",
+             relationship = "many-to-many") %>%
+  filter(!is.na(v)) %>% group_by(set, cluster, name, leg, timepoint) %>% summarise(med = median(v), n = n(), .groups = "drop") %>%
+  left_join(pivot_longer(hyp, c(rna_lfc, ribo_lfc, te_lfc), names_to = "leg", values_to = "v") %>%
+              group_by(leg, timepoint) %>% summarise(all = median(v, na.rm = TRUE), .groups = "drop"), by = c("leg", "timepoint")) %>%
+  mutate(rel = med - all, timepoint = factor(timepoint, levels = c("1hr", "4hr", "24hr")),
+         leg = factor(recode(leg, rna_lfc = "RNA", ribo_lfc = "footprints", te_lfc = "TE"), levels = c("RNA", "footprints", "TE")))
+knitr::kable(rel %>% dplyr::select(set, name, leg, timepoint, n, med, all, rel) %>% arrange(set, name, leg, timepoint), digits = 3)
+p_legs <- ggplot(rel, aes(timepoint, rel, colour = factor(cluster), group = cluster)) +
+  geom_hline(yintercept = 0, colour = "grey60", linetype = 2) + geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  ggrepel::geom_text_repel(data = ~ filter(.x, timepoint == "24hr"), aes(label = name), size = 2.6, nudge_x = 0.3, direction = "y",
+                           hjust = 0, segment.colour = "grey70", show.legend = FALSE) +
+  facet_grid(set ~ leg) + scale_colour_manual(values = cl_cols, guide = "none") +
+  scale_x_discrete(expand = expansion(add = c(0.3, 1.6))) +
+  labs(x = "siCTRL, hypoxia vs normoxia", y = "group median minus all-gene median, log2(hypoxia / normoxia)",
+       title = "Which leg moves each 1hr group in the control hypoxic response",
+       subtitle = "groups defined on si3d hypoxia 1hr SHAP; 0 = moves like the transcriptome; n per group in the table above") +
+  theme_classic(base_size = 11)
+p_legs
+if (isTRUE(params$save_plots)) ggsave(here("plots", "28_hypoxia_1hr_groups_sictrl_rna_ribo_te.pdf"), p_legs, width = 11, height = 6)
+```
+
+```{r session}
+sessionInfo()
+```
