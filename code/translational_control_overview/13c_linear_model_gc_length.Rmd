@@ -1,0 +1,446 @@
+---
+title: "A two-term linear model of eIF3d-dependent TE change: CDS GC and CDS length (MDA-MB-231, hypoxia 1hr)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  rf_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "13c_linear_model_gc_length.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-12: the simplest readable model of how much a gene's translation efficiency (TE)
+drops when eIF3d is knocked down at hypoxia 1hr:
+
+`te_lfc ~ cds_gc + log2_cds_length`
+
+These are the two features the random-forest regression leans on most once near-duplicates are
+set aside: `cds_gc` is the top feature by mean |SHAP| (13.0% of the total) and `log2_cds_length`
+third (7.3%). The second, `gc3_internal`, is 0.93-correlated with `cds_gc` and would only split
+its credit. GC and length are nearly uncorrelated with each other, so the two terms measure
+separate things.
+
+- **Outcome:** `te_lfc` = log2(sictrl / si3d) TE change. Positive = TE is lower without eIF3d =
+  eIF3d promotes translation (the filename says si3d_vs_sictrl; the coefficient is
+  sictrl_vs_si3d, checked below against EIF3D's own mRNA).
+- **Genes:** the 10,172 genes of the intrinsic forest regression (`10_rf_regression.Rmd`), so
+  this model and the forest describe the same genes.
+- **Linear only.** Both effects bend somewhat (GC steepens above ~55%, length flattens beyond
+  ~1,700 nt), and splines would add under one point of R². Deliberately left out for now.
+- **No held-out set.** Three fitted numbers on 10,172 genes cannot overfit; a 10-fold
+  cross-validated R² is printed alongside the in-sample one to show it.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(patchwork) })
+O <- here("output", "translational_control_overview")
+```
+
+# 1. Data
+
+```{r data}
+md <- readRDS(file.path(O, paste0("rfreg_model_data_", params$rf_suffix, ".rds")))
+stopifnot("forest outcome is transformed - y would not be the raw LFC" = md$target_transform == "raw")
+genes <- bind_rows(md$train, md$test) %>% dplyr::select(gene_id_clean, symbol, y)
+
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("[.].*", "", gene_id))
+# Direction: EIF3D is the siRNA's target, so its own mRNA must be strongly positive under
+# log2(sictrl / si3d) (~+2.9 at hypoxia 1hr).
+eif3d_rna <- de$rna_lfc[de$symbol == "EIF3D"]
+stopifnot("EIF3D rna_lfc not strongly positive - direction may have flipped" = length(eif3d_rna) == 1 && eif3d_rna > 1)
+cat(sprintf("EIF3D rna_lfc = %.2f -> log2(sictrl / si3d) confirmed\n", eif3d_rna))
+
+d <- genes %>% left_join(de %>% dplyr::select(gene_id_clean, te_lfc), by = "gene_id_clean")
+stopifnot("forest outcome is not this file's te_lfc" = max(abs(d$y - d$te_lfc)) < 1e-9)
+
+fm <- readRDS(file.path(O, "feature_matrix_tco.rds")) %>% distinct(gene_id_clean, .keep_all = TRUE)
+d <- d %>% mutate(cds_gc = as.numeric(unlist(fm$cds_gc[match(gene_id_clean, fm$gene_id_clean)])),
+                  log2_cds_length = as.numeric(unlist(fm$log2_cds_length[match(gene_id_clean, fm$gene_id_clean)])),
+                  cds_nt = 2^log2_cds_length - 1)
+stopifnot("genes missing from the matrix" = !anyNA(match(d$gene_id_clean, fm$gene_id_clean)),
+          "CDS GC outside [0, 100]" = all(d$cds_gc >= 0 & d$cds_gc <= 100, na.rm = TRUE),
+          "TE LFC not finite" = all(is.finite(d$te_lfc)))
+# ACTB CDS GC%: expected 50-70%
+stopifnot("ACTB CDS GC outside 50-70%" = between(d$cds_gc[d$symbol == "ACTB"], 50, 70))
+d <- d %>% filter(!is.na(cds_gc), !is.na(log2_cds_length))
+cat(sprintf("genes modelled: %d | median CDS GC %.1f%% | median CDS %s nt | median TE change %.3f\n",
+            nrow(d), median(d$cds_gc), format(round(median(d$cds_nt)), big.mark = ","), median(d$te_lfc)))
+```
+
+# 2. The model
+
+```{r fit}
+fit <- lm(te_lfc ~ cds_gc + log2_cds_length, data = d)
+summary(fit)
+
+# Standardized: refit on z-scored predictors, so the two slopes are per SD and comparable.
+fit_z <- lm(te_lfc ~ scale(cds_gc) + scale(log2_cds_length), data = d)
+ci <- confint(fit)
+coefs <- tibble(term = c("CDS GC", "CDS length"),
+                per_unit = coef(fit)[-1],
+                natural = c(10 * coef(fit)[["cds_gc"]], coef(fit)[["log2_cds_length"]]),
+                natural_lo = c(10 * ci["cds_gc", 1], ci["log2_cds_length", 1]),
+                natural_hi = c(10 * ci["cds_gc", 2], ci["log2_cds_length", 2]),
+                natural_unit = c("per +10 percentage points GC", "per doubling of CDS length"),
+                per_sd = coef(fit_z)[-1],
+                p = summary(fit)$coefficients[-1, 4])
+knitr::kable(coefs, digits = c(0, 4, 3, 3, 3, 0, 3, 300))
+
+# 10-fold cross-validated R2, to show in-sample R2 is not inflated.
+set.seed(9); fold <- sample(rep(1:10, length.out = nrow(d)))
+pred_cv <- numeric(nrow(d))
+for (k in 1:10) pred_cv[fold == k] <- predict(lm(te_lfc ~ cds_gc + log2_cds_length, data = d[fold != k, ]), d[fold == k, ])
+r2_cv <- 1 - sum((d$te_lfc - pred_cv)^2) / sum((d$te_lfc - mean(d$te_lfc))^2)
+# Adjusted R2 is reported wherever models with different numbers of terms are compared or a
+# model's fit is quoted; the cross-validated R2 is already out-of-sample and is not adjusted.
+r2 <- summary(fit)$r.squared; r2_adj <- summary(fit)$adj.r.squared
+cat(sprintf("R2 %.4f | adjusted R2 %.4f | 10-fold cross-validated R2 %.4f | n = %d\n", r2, r2_adj, r2_cv, nrow(d)))
+
+# Each term alone, for how much the other adds.
+alone <- tibble(model = c("CDS GC only", "CDS length only", "CDS GC + CDS length"),
+                r2 = c(summary(lm(te_lfc ~ cds_gc, d))$r.squared,
+                       summary(lm(te_lfc ~ log2_cds_length, d))$r.squared, r2),
+                adj_r2 = c(summary(lm(te_lfc ~ cds_gc, d))$adj.r.squared,
+                           summary(lm(te_lfc ~ log2_cds_length, d))$adj.r.squared, r2_adj))
+knitr::kable(alone, digits = 4)
+cat(sprintf("Predictor correlation: Spearman rho(CDS GC, log2 CDS length) = %.3f\n",
+            cor(d$cds_gc, d$log2_cds_length, method = "spearman")))
+```
+
+# 3. Figure
+
+Each panel shows every gene (grey) and the model's line for that term with the other held at its
+median (orange = eIF3d). The model is additive, so each line is the same whatever value the other
+term is held at; only its height changes.
+
+```{r figure, fig.width = 6, fig.height = 5}
+gc_med <- median(d$cds_gc); len_med <- median(d$log2_cds_length)
+line_gc <- tibble(cds_gc = seq(min(d$cds_gc), max(d$cds_gc), length.out = 100), log2_cds_length = len_med) %>%
+  mutate(pred = predict(fit, newdata = .))
+line_len <- tibble(log2_cds_length = seq(min(d$log2_cds_length), max(d$log2_cds_length), length.out = 100), cds_gc = gc_med) %>%
+  mutate(pred = predict(fit, newdata = .), cds_nt = 2^log2_cds_length - 1)
+ylim <- quantile(d$te_lfc, c(0.01, 0.99))
+# Two separate figures, each carrying the model, its fit and n, since it may be shown alone.
+fit_lab <- annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.8,
+                   label = sprintf("adjusted R² = %.3f\nn = %s genes", r2_adj, scales::comma(nrow(d))))
+p_gc <- ggplot(d, aes(cds_gc, te_lfc)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_line(data = line_gc, aes(y = pred), colour = "#E69F00", linewidth = 1) + fit_lab +
+  coord_cartesian(ylim = ylim) +
+  labs(x = "CDS GC (%)", y = "TE LFC (sictrl vs si3d)",
+       title = "eIF3d-dependent TE change vs CDS GC\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "TE LFC ~ CDS GC + log2 CDS length") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_len <- ggplot(d, aes(log2_cds_length, te_lfc)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_line(data = line_len, aes(y = pred), colour = "#E69F00", linewidth = 1) + fit_lab +
+  coord_cartesian(ylim = ylim) +
+  labs(x = "log2 CDS length (nt)", y = "TE LFC (sictrl vs si3d)",
+       title = "eIF3d-dependent TE change vs CDS length\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "TE LFC ~ CDS GC + log2 CDS length") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_gc
+p_len
+if (isTRUE(params$save_plots)) {
+  ggsave(here("plots", "13c_linear_model_cds_gc_hypoxia_1hr.pdf"), p_gc, width = 6.5, height = 5)
+  ggsave(here("plots", "13c_linear_model_cds_length_hypoxia_1hr.pdf"), p_len, width = 6.5, height = 5)
+}
+```
+
+# 3b. Each variable on its own
+
+The same plots with a one-term model each, `te_lfc ~ CDS GC` and `te_lfc ~ log2 CDS length`, so
+each line and adjusted R² belong to that variable alone. Each alone explains less than its share
+in the joint model: GC and length are correlated and partly mask each other when fit separately.
+
+```{r figure_single, fig.width = 6, fig.height = 5}
+fit_gc1 <- lm(te_lfc ~ cds_gc, data = d)
+fit_len1 <- lm(te_lfc ~ log2_cds_length, data = d)
+# Pearson r carries the sign R2 drops; with one predictor r^2 is the unadjusted R2.
+single_lab <- function(m, x) annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.8,
+  label = sprintf("Pearson r = %.3f\nadjusted R² = %.3f\nn = %s genes", cor(x, d$te_lfc),
+                  summary(m)$adj.r.squared, scales::comma(nrow(d))))
+stopifnot(abs(cor(d$cds_gc, d$te_lfc)^2 - summary(fit_gc1)$r.squared) < 1e-10,
+          abs(cor(d$log2_cds_length, d$te_lfc)^2 - summary(fit_len1)$r.squared) < 1e-10)
+cat(sprintf("adjusted R2: GC alone %.4f | length alone %.4f | both %.4f\n",
+            summary(fit_gc1)$adj.r.squared, summary(fit_len1)$adj.r.squared, r2_adj))
+p_gc1 <- ggplot(d, aes(cds_gc, te_lfc)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_line(data = line_gc %>% mutate(pred = predict(fit_gc1, newdata = .)), aes(y = pred),
+            colour = "#E69F00", linewidth = 1) + single_lab(fit_gc1, d$cds_gc) +
+  coord_cartesian(ylim = ylim) +
+  labs(x = "CDS GC (%)", y = "TE LFC (sictrl vs si3d)",
+       title = "eIF3d-dependent TE change vs CDS GC\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "TE LFC ~ CDS GC") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_len1 <- ggplot(d, aes(log2_cds_length, te_lfc)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_line(data = line_len %>% mutate(pred = predict(fit_len1, newdata = .)), aes(y = pred),
+            colour = "#E69F00", linewidth = 1) + single_lab(fit_len1, d$log2_cds_length) +
+  coord_cartesian(ylim = ylim) +
+  labs(x = "log2 CDS length (nt)", y = "TE LFC (sictrl vs si3d)",
+       title = "eIF3d-dependent TE change vs CDS length\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "TE LFC ~ log2 CDS length") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_gc1
+p_len1
+if (isTRUE(params$save_plots)) {
+  ggsave(here("plots", "13c_linear_model_cds_gc_only_hypoxia_1hr.pdf"), p_gc1, width = 6.5, height = 5)
+  ggsave(here("plots", "13c_linear_model_cds_length_only_hypoxia_1hr.pdf"), p_len1, width = 6.5, height = 5)
+}
+```
+
+# 4. Does the GC effect depend on length? The interaction term
+
+`te_lfc ~ cds_gc * log2_cds_length` adds one term, `cds_gc:log2_cds_length`, which lets the GC
+slope change with CDS length. If it is zero, GC has the same effect on short and long mRNAs and
+the additive model above is enough.
+
+The figure splits genes into thirds by CDS length. Points are the **observed** mean TE change
+in 5-point GC bins within each third (bins with fewer than 30 genes dropped); lines are the
+interaction model's prediction at each third's median length. Parallel lines = no interaction.
+
+```{r interaction}
+fit_int <- lm(te_lfc ~ cds_gc * log2_cds_length, data = d)
+int_row <- summary(fit_int)$coefficients["cds_gc:log2_cds_length", ]
+int_test <- anova(fit, fit_int)
+knitr::kable(summary(fit_int)$coefficients, digits = 6)
+cat(sprintf("interaction: %.2e per GC point per doubling (SE %.2e), p = %.3f | F-test vs additive p = %.3f | adjusted R2 %.4f -> %.4f\n",
+            int_row[["Estimate"]], int_row[["Std. Error"]], int_row[["Pr(>|t|)"]], int_test$`Pr(>F)`[2],
+            r2_adj, summary(fit_int)$adj.r.squared))
+# GC slope (per +10 points) implied at short / median / long CDS
+len_q <- quantile(d$log2_cds_length, c(0.1, 0.5, 0.9))
+tibble(cds_length_nt = round(2^len_q - 1),
+       gc_slope_per_10pts = 10 * (coef(fit_int)[["cds_gc"]] + coef(fit_int)[["cds_gc:log2_cds_length"]] * len_q)) %>%
+  knitr::kable(digits = 4)
+```
+
+```{r interaction_figure, fig.width = 7, fig.height = 5}
+d <- d %>% mutate(len_third = ntile(log2_cds_length, 3))
+thirds <- d %>% group_by(len_third) %>%
+  summarise(n = n(), lo = min(log2_cds_length), hi = max(log2_cds_length), med_len = median(log2_cds_length), .groups = "drop") %>%
+  mutate(label = sprintf("%.1f-%.1f (n = %s)", lo, hi,
+                         scales::comma(n)))
+len_cols <- setNames(c("#0072B2", "#CC79A7", "#009E73"), thirds$label)   # orange / sky blue are reserved for eIF3d / eIF3e
+obs <- d %>% mutate(gc_bin = floor(cds_gc / 5) * 5 + 2.5) %>% group_by(len_third, gc_bin) %>%
+  summarise(n = n(), mean_lfc = mean(te_lfc), se = sd(te_lfc) / sqrt(n), .groups = "drop") %>%
+  filter(n >= 30) %>% left_join(thirds %>% dplyr::select(len_third, label), by = "len_third")
+lines_int <- thirds %>% dplyr::select(len_third, label, med_len) %>%
+  crossing(cds_gc = seq(min(obs$gc_bin) - 2.5, max(obs$gc_bin) + 2.5, length.out = 100)) %>%
+  mutate(pred = predict(fit_int, newdata = tibble(cds_gc = cds_gc, log2_cds_length = med_len)))
+p_int <- ggplot(obs, aes(gc_bin, mean_lfc, colour = label)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_line(data = lines_int, aes(cds_gc, pred), linewidth = 0.8) +
+  geom_pointrange(aes(ymin = mean_lfc - se, ymax = mean_lfc + se), size = 0.3) +
+  scale_colour_manual(values = len_cols, breaks = thirds$label, name = "log2 CDS length third") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.8, colour = "black",
+           label = sprintf("adjusted R² = %.3f\ninteraction p = %.2f\nn = %s genes", summary(fit_int)$adj.r.squared,
+                           int_row[["Pr(>|t|)"]], scales::comma(nrow(d)))) +
+  labs(x = "CDS GC (%)", y = "TE LFC (sictrl vs si3d)",
+       title = "eIF3d-dependent TE change vs CDS GC\nMDA-MB-231 hypoxia 1hr, mean +/- SE per 5-point GC bin",
+       subtitle = "TE LFC ~ CDS GC * log2 CDS length") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_int
+if (isTRUE(params$save_plots)) ggsave(here("plots", "13c_linear_model_gc_length_interaction_hypoxia_1hr.pdf"), p_int, width = 7, height = 5)
+```
+
+# 4b. Seeing GC and length together
+
+Three views of the two predictors at once:
+
+- **Grid heatmap**: genes binned by CDS GC (5-point bins) and log2 CDS length (1-unit bins, one
+  doubling), coloured by the observed mean TE LFC per tile; tiles with fewer than 20 genes are
+  blank. No model is involved. With no interaction, the colour changes along both axes but
+  the pattern is the same in every row and column.
+- **Partial residual plots**: each gene's TE LFC with the *other* term's fitted effect removed
+  (`te_lfc - b_other * (x_other - mean(x_other))`), plotted against this term, with the
+  additive model's line. This is the data behind each unique effect. "Unique adjusted R²" is the
+  combined model's adjusted R² minus that of the model without this term.
+- **Predictor scatter**: CDS GC against log2 CDS length, to show how correlated the two inputs
+  are. That correlation is why each term's slope changes when the other is added.
+
+```{r together_grid, fig.width = 6.5, fig.height = 5}
+grid <- d %>%
+  mutate(gc_bin = floor(cds_gc / 5) * 5 + 2.5, len_bin = floor(log2_cds_length) + 0.5) %>%
+  group_by(gc_bin, len_bin) %>%
+  summarise(n = n(), mean_lfc = mean(te_lfc), .groups = "drop") %>%
+  filter(n >= 20)
+lim <- max(abs(grid$mean_lfc))
+p_grid <- ggplot(grid, aes(gc_bin, len_bin, fill = mean_lfc)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_gradientn(colours = c("#0072B2", "white", "#D55E00"), limits = c(-lim, lim),
+                       name = "mean\nTE LFC") +
+  scale_x_continuous(breaks = seq(30, 80, 10)) + scale_y_continuous(breaks = 4:14) +
+  labs(x = "CDS GC (%)", y = "log2 CDS length (nt)",
+       title = "eIF3d-dependent TE change by CDS GC and length\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "mean TE LFC per bin",
+       caption = sprintf("%s genes in %d tiles with >= 20 genes", scales::comma(sum(grid$n)), nrow(grid))) +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_grid
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "13c_linear_model_gc_length_grid_hypoxia_1hr.pdf"), p_grid, width = 6.5, height = 5)
+```
+
+```{r together_partial, fig.width = 6, fig.height = 5}
+b_gc <- coef(fit)[["cds_gc"]]; b_len <- coef(fit)[["log2_cds_length"]]
+d <- d %>% mutate(pr_gc = te_lfc - b_len * (log2_cds_length - mean(log2_cds_length)),
+                  pr_len = te_lfc - b_gc * (cds_gc - mean(cds_gc)))
+# The additive model's line through the partial residuals has exactly that term's slope.
+stopifnot(abs(coef(lm(pr_gc ~ cds_gc, d))[[2]] - b_gc) < 1e-10,
+          abs(coef(lm(pr_len ~ log2_cds_length, d))[[2]] - b_len) < 1e-10)
+uniq_gc <- r2_adj - summary(fit_len1)$adj.r.squared
+uniq_len <- r2_adj - summary(fit_gc1)$adj.r.squared
+beta_add <- coef(lm(scale(te_lfc) ~ scale(cds_gc) + scale(log2_cds_length), d))[-1]
+pr_lab <- function(beta, uniq) annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.8,
+  label = sprintf("standardized beta = %.3f\nunique adjusted R² = %.3f\nn = %s genes", beta, uniq, scales::comma(nrow(d))))
+pr_line_gc <- tibble(cds_gc = range(d$cds_gc)) %>%
+  mutate(pred = coef(fit)[[1]] + b_gc * cds_gc + b_len * mean(d$log2_cds_length))
+pr_line_len <- tibble(log2_cds_length = range(d$log2_cds_length)) %>%
+  mutate(pred = coef(fit)[[1]] + b_len * log2_cds_length + b_gc * mean(d$cds_gc))
+p_pr_gc <- ggplot(d, aes(cds_gc, pr_gc)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_line(data = pr_line_gc, aes(y = pred), colour = "#E69F00", linewidth = 1) +
+  pr_lab(beta_add[[1]], uniq_gc) + coord_cartesian(ylim = ylim) +
+  labs(x = "CDS GC (%)", y = "TE LFC, adjusted for CDS length",
+       title = "eIF3d-dependent TE change vs CDS GC, length removed\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "TE LFC ~ CDS GC + log2 CDS length") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_pr_len <- ggplot(d, aes(log2_cds_length, pr_len)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_line(data = pr_line_len, aes(y = pred), colour = "#E69F00", linewidth = 1) +
+  pr_lab(beta_add[[2]], uniq_len) + coord_cartesian(ylim = ylim) +
+  labs(x = "log2 CDS length (nt)", y = "TE LFC, adjusted for CDS GC",
+       title = "eIF3d-dependent TE change vs CDS length, GC removed\nMDA-MB-231 hypoxia 1hr",
+       subtitle = "TE LFC ~ CDS GC + log2 CDS length") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 13, face = "bold", hjust = 0.5))
+p_pr_gc
+p_pr_len
+if (isTRUE(params$save_plots)) {
+  ggsave(here("plots", "13c_linear_model_partial_cds_gc_hypoxia_1hr.pdf"), p_pr_gc, width = 6.5, height = 5)
+  ggsave(here("plots", "13c_linear_model_partial_cds_length_hypoxia_1hr.pdf"), p_pr_len, width = 6.5, height = 5)
+}
+```
+
+```{r together_predictors, fig.width = 6, fig.height = 5}
+p_pred <- ggplot(d, aes(cds_gc, log2_cds_length)) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black", linewidth = 0.8, se = FALSE) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.8,
+           label = sprintf("Pearson r = %.3f\nSpearman rho = %.3f\nn = %s genes",
+                           cor(d$cds_gc, d$log2_cds_length),
+                           cor(d$cds_gc, d$log2_cds_length, method = "spearman"), scales::comma(nrow(d)))) +
+  labs(x = "CDS GC (%)", y = "log2 CDS length (nt)",
+       title = "CDS GC vs CDS length, the two predictors\nMDA-MB-231 hypoxia 1hr genes") +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12))
+p_pred
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "13c_linear_model_gc_vs_length_hypoxia_1hr.pdf"), p_pred, width = 6.5, height = 5)
+```
+
+# 5. Beta coefficients for every model
+
+One row per term per model, with two kinds of coefficient:
+
+- **b** (unstandardized): the slope in the model's own units, LFC per GC percentage point or per
+  log2 unit (one doubling) of CDS length.
+- **beta** (standardized): the same model refit with the outcome and both predictors z-scored,
+  so it is the change in TE change, in SDs, per SD of the predictor, comparable across terms.
+  With one predictor, beta equals Pearson r. For the interaction model the predictors are
+  z-scored *before* forming the product, so the main-effect betas are the slopes at the mean of
+  the other term rather than at zero.
+
+```{r betas}
+zd <- d %>% mutate(z_te = as.numeric(scale(te_lfc)), z_gc = as.numeric(scale(cds_gc)),
+                   z_len = as.numeric(scale(log2_cds_length)))
+models <- list(
+  "CDS GC only"          = list(raw = te_lfc ~ cds_gc,                     z = z_te ~ z_gc),
+  "CDS length only"      = list(raw = te_lfc ~ log2_cds_length,            z = z_te ~ z_len),
+  "CDS GC + CDS length"  = list(raw = te_lfc ~ cds_gc + log2_cds_length,   z = z_te ~ z_gc + z_len),
+  "CDS GC * CDS length"  = list(raw = te_lfc ~ cds_gc * log2_cds_length,   z = z_te ~ z_gc * z_len))
+term_names <- c(cds_gc = "CDS GC", log2_cds_length = "log2 CDS length",
+                "cds_gc:log2_cds_length" = "CDS GC x log2 CDS length")
+betas <- imap_dfr(models, function(m, nm) {
+  fr <- lm(m$raw, data = d); fz <- lm(m$z, data = zd)
+  sr <- summary(fr)$coefficients[-1, , drop = FALSE]; ci <- confint(fr)[-1, , drop = FALSE]
+  ciz <- confint(fz)[-1, , drop = FALSE]
+  stopifnot(length(coef(fz)) == length(coef(fr)))   # same terms in the same order
+  tibble(model = nm, term = unname(term_names[rownames(sr)]),
+         b = sr[, "Estimate"], b_se = sr[, "Std. Error"], b_lo = ci[, 1], b_hi = ci[, 2],
+         beta = unname(coef(fz)[-1]), beta_lo = ciz[, 1], beta_hi = ciz[, 2], p = sr[, "Pr(>|t|)"],
+         adj_r2 = summary(fr)$adj.r.squared, n = nobs(fr))
+})
+# beta of a one-predictor model is Pearson r
+stopifnot(abs(betas$beta[betas$model == "CDS GC only"] - cor(d$cds_gc, d$te_lfc)) < 1e-10,
+          abs(betas$beta[betas$model == "CDS length only"] - cor(d$log2_cds_length, d$te_lfc)) < 1e-10)
+knitr::kable(betas, digits = c(0, 0, 5, 5, 5, 5, 3, 3, 3, 300, 4, 0))
+```
+
+```{r beta_bar, fig.width = 7, fig.height = 4.5}
+term_cols <- c("CDS GC" = "#0072B2", "log2 CDS length" = "#CC79A7", "CDS GC x log2 CDS length" = "#009E73")
+model_labs <- betas %>% distinct(model, adj_r2) %>%
+  mutate(lab = sprintf("%s\nadj. R² = %.3f", model, adj_r2))
+bd <- betas %>% left_join(model_labs %>% dplyr::select(model, lab), by = "model") %>%
+  mutate(lab = factor(lab, levels = model_labs$lab), term = factor(term, levels = names(term_cols)))
+p_beta <- ggplot(bd, aes(lab, beta, fill = term)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_col(position = position_dodge(width = 0.8, preserve = "single"), width = 0.75) +
+  geom_errorbar(aes(ymin = beta_lo, ymax = beta_hi),
+                position = position_dodge(width = 0.8, preserve = "single"), width = 0.2, linewidth = 0.4) +
+  scale_fill_manual(values = term_cols, name = NULL) +
+  labs(x = NULL, y = "standardized beta (SD per SD)",
+       title = "eIF3d-dependent TE change, standardized betas\nMDA-MB-231 hypoxia 1hr",
+       subtitle = sprintf("error bars = 95%% CI; n = %s genes", scales::comma(nrow(d)))) +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12),
+                                        plot.subtitle = element_text(size = 9),
+                                        axis.text.x = element_text(size = 9), legend.position = "bottom")
+p_beta
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "13c_linear_model_betas_hypoxia_1hr.pdf"), p_beta, width = 7, height = 4.5)
+```
+
+```{r save}
+if (isTRUE(params$save_plots)) {
+  write_csv(coefs %>% mutate(r2 = r2, adj_r2 = r2_adj, r2_cv = r2_cv, n = nrow(d), intercept = coef(fit)[[1]]),
+            file.path(O, "linear_model_gc_length_hypoxia_1hr_coefficients.csv"))
+  write_csv(betas, file.path(O, "linear_model_gc_length_hypoxia_1hr_betas_all_models.csv"))
+}
+```
+
+```{r session}
+sessionInfo()
+```

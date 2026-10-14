@@ -1,0 +1,308 @@
+---
+title: "`r paste0('Clustering eIF3d targets on feature-level SHAP: ', params$label)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  later_sets: "4hr=hypoxia_3d_promotes_TE_4hr_lfc0.5.csv,24hr=hypoxia_3d_promotes_TE_24hr_lfc0.5.csv"
+  ks: "2,3,4,5,6,7,8"
+  n_perm: 50
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "26b_target_subtypes_features.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-12: the per-feature SHAP heatmap from `23_shap_gene_clustering.Rmd`, but
+clustering **only the mRNAs eIF3d promotes** (the saved `r params$label` positive set) instead of
+all 10,172 modelled genes. `26_target_subtypes_over_time.Rmd` clusters the same genes on the 11
+feature families; this one uses the 57 individual features.
+
+- **SHAP is reused, not recomputed.** Each gene's SHAP comes from `23_`'s out-of-fold run: the
+  intrinsic regression forest fitted on all genes, with each gene explained by a fold forest
+  that never trained on it. The targets are subset *after* explanation - a forest fitted on
+  targets alone would have no non-targets to contrast them against.
+- **Two profiles:** features normalised within gene (each value / the gene's total |SHAP|, so a
+  cluster reflects *which* features drove a gene) and features raw (also how strongly).
+- **k** (the number of clusters) is chosen against the column-shuffled null exactly as in `23_`:
+  permute each feature independently across genes, standardise the observed silhouette within k,
+  then maximise over k. With ~1,400 genes the silhouette is computed on every gene, no sample.
+- **Top strips:** cluster and TE change. Whether a gene is also a 4hr / 24hr target is kept in the summary table only.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(cluster); library(pheatmap); library(grid)
+})
+O <- here("output", "translational_control_overview")
+ks <- as.integer(strsplit(params$ks, ",")[[1]])
+SAVE <- isTRUE(params$save_plots)
+ptag <- sub("_lfc.*$", "", sub("^eif33d_promotes_", "", params$suffix))
+```
+
+# 1. Targets and their SHAP
+
+```{r load}
+f_oof <- file.path(O, paste0("shap_oof_", params$suffix, ".rds"))
+stopifnot("out-of-fold SHAP not found - knit 23_shap_gene_clustering.Rmd with this suffix" = file.exists(f_oof))
+oof <- readRDS(f_oof)
+fc <- colnames(oof$S)
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+stopifnot("a feature has no family" = !anyNA(fam),
+          "SHAP rows and genes out of step" = identical(rownames(oof$S), oof$genes$gene_id_clean))
+
+tg <- oof$genes$set == "eIF3d promoted"
+genes <- oof$genes[tg, ]
+S <- oof$S[tg, , drop = FALSE]
+# The positive set is TE LFC > 0.5 and padj < 0.05, so every target must satisfy both here.
+stopifnot("a target fails the positive-set rule" = all(genes$y > 0.5 & genes$y_padj < 0.05))
+
+later <- strsplit(strsplit(params$later_sets, ",")[[1]], "=")
+for (s in later) genes[[paste0("target_", s[1])]] <- genes$gene_id_clean %in%
+  sub("[.].*", "", read_csv(here("output", "genesets", s[2]), show_col_types = FALSE)$ensembl_gene)
+genes$later <- {
+  l4 <- genes$target_4hr; l24 <- genes$target_24hr
+  case_when(l4 & l24 ~ "4hr and 24hr", l4 ~ "4hr", l24 ~ "24hr", TRUE ~ "1hr only")
+}
+cat(sprintf("targets %d of %d modelled genes | features %d in %d families\n",
+            nrow(genes), nrow(oof$genes), length(fc), n_distinct(fam)))
+table(also_target = genes$later)
+```
+
+# 2. Two profiles
+
+```{r profiles}
+norm_rows <- function(M) M / pmax(rowSums(abs(M)), 1e-12)
+profiles <- list(`features, normalised` = norm_rows(S), `features, raw` = S)
+stopifnot("normalised rows do not sum to 1 in |SHAP|" = all(abs(rowSums(abs(profiles[[1]])) - 1) < 1e-9))
+```
+
+# 3. How many clusters: the null band
+
+```{r null}
+sil_of <- function(M, k, seed = 9) {
+  set.seed(seed); km <- kmeans(M, centers = k, nstart = 10, iter.max = 50)
+  if (length(unique(km$cluster)) < 2) return(NA_real_)
+  mean(silhouette(km$cluster, dist(M))[, 3])
+}
+null_test <- function(M) {
+  obs <- vapply(ks, function(k) sil_of(M, k), numeric(1))
+  nm <- t(vapply(seq_len(params$n_perm), function(i) {
+    set.seed(1000 + i); P <- apply(M, 2, sample)
+    vapply(ks, function(k) sil_of(P, k), numeric(1)) }, numeric(length(ks))))
+  mu <- colMeans(nm); sdv <- apply(nm, 2, sd)
+  stopifnot("null has zero variance" = all(sdv > 0))
+  z <- (obs - mu) / sdv
+  z_null <- vapply(seq_len(params$n_perm), function(i) { m2 <- nm[-i, , drop = FALSE]
+    max((nm[i, ] - colMeans(m2)) / apply(m2, 2, sd)) }, numeric(1))
+  list(per_k = tibble(k = ks, observed = obs, null_median = apply(nm, 2, median), null_min = apply(nm, 2, min),
+                      null_max = apply(nm, 2, max), z = z),
+       p_overall = (sum(z_null >= max(z)) + 1) / (params$n_perm + 1),
+       best_k_z = ks[which.max(z)], best_k_sil = ks[which.max(obs)])
+}
+null_cache <- file.path(O, "shap_oof_cache", sprintf("nulls_targets_%s_perm%d_k%s.rds",
+                                                     params$suffix, params$n_perm, gsub(",", "-", params$ks)))
+fp <- c(nrow(S), round(sum(abs(S)), 6))
+cached <- if (file.exists(null_cache)) readRDS(null_cache) else NULL
+nulls <- if (!is.null(cached) && identical(attr(cached, "fingerprint"), fp)) cached else
+  structure(map(profiles, null_test), fingerprint = fp)
+if (SAVE && !identical(nulls, cached)) saveRDS(nulls, null_cache)
+imap_dfr(nulls, ~ tibble(profile = .y, best_k_sil = .x$best_k_sil, best_k_z = .x$best_k_z,
+                         max_z = max(.x$per_k$z), p_overall = .x$p_overall)) %>% knitr::kable(digits = 3)
+imap_dfr(nulls, ~ .x$per_k %>% mutate(profile = .y)) %>% knitr::kable(digits = 4)
+```
+
+```{r fig_null, fig.width = 10, fig.height = 4.5}
+band <- imap_dfr(nulls, ~ .x$per_k %>% mutate(profile = .y))
+p_band <- ggplot(band, aes(k)) +
+  geom_ribbon(aes(ymin = null_min, ymax = null_max), fill = "grey85") +
+  geom_line(aes(y = null_median), colour = "grey50", linetype = 2) +
+  geom_line(aes(y = observed), colour = "#E69F00", linewidth = 0.8) + geom_point(aes(y = observed), colour = "#E69F00") +
+  facet_wrap(~ profile, scales = "free_y") +
+  labs(y = "mean silhouette", title = sprintf("eIF3d targets, %s: observed silhouette against the column-permuted null", params$label),
+       subtitle = sprintf("grey band = null min-max over %d permutations; dashed = null median; n = %d genes",
+                          params$n_perm, nrow(genes))) +
+  theme_classic(base_size = 12)
+p_band
+if (SAVE) ggsave(here("plots", paste0("26b_target_shap_features_", ptag, "_null_band.pdf")), p_band, width = 10, height = 4.5)
+```
+
+# 4. Heatmaps
+
+Genes are columns, ordered by cluster and, within a cluster, by TE change. Each profile is drawn
+at the silhouette peak (`best_k_sil`, the cleanest split) and, if different, at the k best
+supported against the null (`best_k_z`). Raw SHAP colours are capped at the 99th percentile of |SHAP|.
+
+```{r heatmaps, fig.width = 14, fig.height = 11, results = "asis"}
+# Same family colours as 23_, so the two heatmaps can be read side by side.
+fam_cols <- setNames(colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+                                        "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)), sort(unique(fam)))
+sym <- function(x, cap = 1.5) { x <- pmin(pmax(x, -cap), cap); x[c(which.min(x), which.max(x))] <- c(-cap, cap); x }
+rows <- fc[order(fam, fc)]
+assignments <- list()
+for (nm in names(profiles)) for (k in unique(c(nulls[[nm]]$best_k_sil, nulls[[nm]]$best_k_z))) {
+  M <- profiles[[nm]]
+  k_why <- if (k == nulls[[nm]]$best_k_sil) "silhouette peak" else "best supported vs null"
+  set.seed(9); cl <- kmeans(M, centers = k, nstart = 25, iter.max = 50)$cluster
+  cl <- match(cl, as.integer(names(sort(table(cl), decreasing = TRUE))))   # largest = 1
+  assignments[[paste(nm, k)]] <- tibble(gene_id_clean = genes$gene_id_clean, symbol = genes$symbol,
+                                        profile = nm, k = k, k_choice = k_why, cluster = cl)
+  ord <- order(cl, -genes$y)
+  H <- t(M[ord, rows, drop = FALSE])
+  cap <- if (grepl("raw", nm)) quantile(abs(M), 0.99) else max(abs(M))
+  H[H > cap] <- cap; H[H < -cap] <- -cap
+  acol <- data.frame(cluster = factor(cl[ord]), `LFC sictrl/si3d (cap 1.5)` = sym(genes$y[ord]),
+                     check.names = FALSE, row.names = colnames(H))
+  acols <- list(cluster = setNames(c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")[seq_len(k)], seq_len(k)),
+                `LFC sictrl/si3d (cap 1.5)` = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51),
+                family = fam_cols)
+  hm <- pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
+                 color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+                 breaks = seq(-cap, cap, length.out = 102), annotation_col = acol,
+                 annotation_row = data.frame(family = fam[rows], row.names = rows),
+                 annotation_colors = acols, gaps_col = cumsum(table(cl))[-k], fontsize_row = 6,
+                 main = sprintf("%s eIF3d targets (n = %d genes)\nSHAP, %s | k = %d%s",
+                                params$label, nrow(genes), nm, k, if (k_why == "silhouette peak") "" else paste0(" (", k_why, ")")), fontsize = 9, silent = TRUE)
+  cat("\n\n## ", nm, ", k = ", k, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (SAVE) {
+    f <- here("plots", paste0("26b_target_shap_features_", ptag, "_", gsub("[ ,]+", "_", nm), "_k", k))
+    png(paste0(f, ".png"), width = 14, height = 11, units = "in", res = 300); grid.newpage(); grid.draw(hm$gtable); dev.off()
+    pdf(paste0(f, ".pdf"), width = 14, height = 11); grid.newpage(); grid.draw(hm$gtable); dev.off()
+  }
+}
+```
+
+# 5. What each cluster is
+
+Per clustering and cluster: size, TE change, the five features with the largest mean |SHAP|
+(sign = mean direction), and the cluster's median sequence values, so a group reads as e.g.
+"GC-rich, short CDS" rather than only as SHAP colours.
+
+```{r cluster_summary}
+fm <- readRDS(file.path(O, params$matrix_rds))
+seqv <- fm %>% transmute(gene_id_clean, cds_gc, gc3 = gc3_internal, cds_nt = 2^log2_cds_length - 1,
+                         utr5_nt = 2^log2_utr5_length - 1, utr5_access = tco_struct_accessibility_utr5_mean) %>%
+  distinct(gene_id_clean, .keep_all = TRUE)
+all_assign <- bind_rows(assignments) %>%
+  left_join(genes %>% dplyr::select(gene_id_clean, y, pred_oof, later), by = "gene_id_clean")
+shap_long <- as_tibble(S, rownames = "gene_id_clean") %>% pivot_longer(-gene_id_clean, names_to = "feature", values_to = "shap")
+top_feat <- all_assign %>% dplyr::select(profile, k, cluster, gene_id_clean) %>%
+  inner_join(shap_long, by = "gene_id_clean", relationship = "many-to-many") %>%
+  group_by(profile, k, cluster, feature) %>% summarise(m = mean(shap), a = mean(abs(shap)), .groups = "drop") %>%
+  group_by(profile, k, cluster) %>% slice_max(a, n = 5) %>%
+  summarise(top_features = paste0(feature, ifelse(m > 0, " (+)", " (-)"), collapse = ", "), .groups = "drop")
+summ <- all_assign %>% left_join(seqv, by = "gene_id_clean") %>% group_by(profile, k, cluster) %>%
+  summarise(n = n(), median_lfc = median(y), median_pred = median(pred_oof),
+            also_4hr_or_24hr = sum(later != "1hr only"),
+            cds_gc = median(cds_gc, na.rm = TRUE), gc3 = median(gc3, na.rm = TRUE), cds_nt = median(cds_nt, na.rm = TRUE),
+            utr5_nt = median(utr5_nt, na.rm = TRUE), utr5_access = median(utr5_access, na.rm = TRUE), .groups = "drop") %>%
+  left_join(top_feat, by = c("profile", "k", "cluster"))
+stopifnot("every target must be in every clustering" = all(dplyr::count(all_assign, profile, k)$n == nrow(genes)))
+knitr::kable(summ, digits = c(0, 0, 0, 0, 3, 3, 0, 1, 1, 0, 0, 3, 0))
+if (SAVE) {
+  write_csv(all_assign, file.path(O, paste0("target_shap_feature_clusters_", params$suffix, ".csv")))
+  write_csv(summ, file.path(O, paste0("target_shap_feature_cluster_summary_", params$suffix, ".csv")))
+}
+```
+
+# 6. The features themselves: correlation with TE change, and mean value per cluster
+
+Same 57 rows, in the same order and with the same family bar as the heatmaps above, for the
+**normalised k = 3** clustering (Kate, 2026-10-12: stick with three). Feature values come
+unimputed from the matrix; each cell uses the genes that have a value.
+
+- **Left - correlation with TE change:** Spearman rho between the feature's value and
+  log2(sictrl / si3d) TE change. The first column is every modelled gene; the rest are within the
+  targets. Within targets the TE change is already truncated at > 0.5, so those correlations are
+  weaker by construction and answer a different question (which features track *how strongly* a
+  target depends on eIF3d).
+- **Right - mean value:** each group's mean expressed as a z-score against all modelled genes
+  ((group mean - all-gene mean) / all-gene sd), so features on different scales share one colour
+  bar. Orange = higher than a typical modelled gene, blue = lower. Raw means are in the CSV.
+
+```{r feature_panels, fig.width = 11, fig.height = 11}
+suppressPackageStartupMessages({ library(ComplexHeatmap); library(circlize) })
+cl3 <- assignments[["features, normalised 3"]]
+stopifnot("normalised k = 3 clustering missing" = !is.null(cl3), identical(cl3$gene_id_clean, genes$gene_id_clean))
+Xall <- fm[match(oof$genes$gene_id_clean, fm$gene_id_clean), fc] %>%
+  mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>% as.matrix()
+stopifnot("modelled genes missing from the matrix" = !anyNA(match(oof$genes$gene_id_clean, fm$gene_id_clean)))
+yall <- oof$genes$y
+grp <- list(all = rep(TRUE, nrow(oof$genes)), targets = tg)
+for (g in 1:3) grp[[paste("cluster", g)]] <- oof$genes$gene_id_clean %in% cl3$gene_id_clean[cl3$cluster == g]
+n_of <- map_int(grp, sum)
+lab <- c(all = sprintf("all modelled genes\n(n = %s)", format(n_of[["all"]], big.mark = ",")),
+         targets = sprintf("all targets\n(n = %s)", format(n_of[["targets"]], big.mark = ",")),
+         setNames(sprintf("cluster %d\n(n = %d)", 1:3, n_of[paste("cluster", 1:3)]), paste("cluster", 1:3)))
+
+rho <- sapply(grp, function(w) apply(Xall[w, rows, drop = FALSE], 2, function(x)
+  if (sum(!is.na(x)) < 10 || sd(x, na.rm = TRUE) == 0) NA_real_ else cor(x, yall[w], method = "spearman", use = "complete.obs")))
+mu_all <- colMeans(Xall[, rows], na.rm = TRUE); sd_all <- apply(Xall[, rows], 2, sd, na.rm = TRUE)
+raw_mean <- sapply(grp[-1], function(w) colMeans(Xall[w, rows, drop = FALSE], na.rm = TRUE))
+zmean <- (raw_mean - mu_all) / ifelse(sd_all > 0, sd_all, NA)
+stopifnot("correlation outside [-1, 1]" = all(abs(rho) <= 1, na.rm = TRUE),
+          "group means not finite" = all(is.finite(raw_mean[sd_all > 0, ])))
+colnames(rho) <- lab[colnames(rho)]; colnames(zmean) <- lab[colnames(zmean)]
+
+fam_ha <- rowAnnotation(family = fam[rows], col = list(family = fam_cols), show_annotation_name = FALSE)
+cell_txt <- function(M) function(j, i, x, y, w, h, fill)
+  if (!is.na(M[i, j])) grid.text(sprintf("%.2f", M[i, j]), x, y, gp = gpar(fontsize = 5.5, col = "grey20"))
+rcap <- max(abs(rho), na.rm = TRUE); zcap <- quantile(abs(zmean), 0.98, na.rm = TRUE)
+# Two separate figures, each with its own family bar and feature names.
+panel <- function(M, cap, legend, title, subtitle) {
+  ht <- Heatmap(M, name = legend, left_annotation = fam_ha,
+                col = colorRamp2(c(-cap, 0, cap), c("#0072B2", "white", "#D55E00")), na_col = "grey85",
+                cluster_rows = FALSE, cluster_columns = FALSE, row_names_gp = gpar(fontsize = 6.5),
+                column_names_rot = 45, column_names_gp = gpar(fontsize = 8), cell_fun = cell_txt(M),
+                column_title = subtitle, column_title_gp = gpar(fontsize = 10))
+  list(ht = ht, title = sprintf("%s eIF3d targets, normalised SHAP k = 3\n%s", params$label, title))
+}
+panels <- list(
+  cor = panel(rho, rcap, "Spearman rho\nwith TE change", "correlation of each feature with TE change",
+              "Spearman rho with log2(sictrl / si3d) TE change"),
+  mean = panel(zmean, zcap, "mean value\n(z vs all genes)", "mean feature value per cluster",
+               "z-score vs all modelled genes: (group mean - all-gene mean) / all-gene sd"))
+draw_panel <- function(p) draw(p$ht, column_title = p$title, merge_legend = TRUE,
+                               column_title_gp = gpar(fontsize = 11, fontface = "bold"))
+for (p in panels) draw_panel(p)
+if (SAVE) {
+  for (nm in names(panels)) {
+    f <- here("plots", paste0("26b_target_feature_", nm, "_", ptag, "_k3"))
+    w <- if (nm == "cor") 8.5 else 8
+    pdf(paste0(f, ".pdf"), width = w, height = 11); draw_panel(panels[[nm]]); dev.off()
+    png(paste0(f, ".png"), width = w, height = 11, units = "in", res = 300); draw_panel(panels[[nm]]); dev.off()
+  }
+  write_csv(tibble(feature = rows, family = fam[rows]) %>%
+              bind_cols(as_tibble(setNames(as.data.frame(rho), paste0("rho_", names(grp))))) %>%
+              bind_cols(as_tibble(setNames(as.data.frame(raw_mean), paste0("mean_", names(grp)[-1])))) %>%
+              mutate(mean_all = mu_all, sd_all = sd_all) %>%
+              bind_cols(as_tibble(setNames(as.data.frame(zmean), paste0("z_", names(grp)[-1])))),
+            file.path(O, paste0("target_feature_cor_and_mean_", params$suffix, ".csv")))
+}
+```
+
+```{r session}
+sessionInfo()
+```
