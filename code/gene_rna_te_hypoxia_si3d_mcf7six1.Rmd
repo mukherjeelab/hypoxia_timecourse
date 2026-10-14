@@ -1,0 +1,347 @@
+---
+title: "mRNA and TE changes for one gene against the transcriptome (MCF7-SIX1)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  gene_id: "ENSG00000067248"   # version-stripped; default DHX29
+  gene_label: "DHX29"
+  mcf7_repo: "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 7.5)
+# params only exists during knit; running chunks by hand needs this fallback
+if (!exists("params") || !is.list(params))
+  params <- list(gene_id = "ENSG00000067248", gene_label = "DHX29",
+                 mcf7_repo = "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia",
+                 save_plots = TRUE)
+```
+
+# Purpose
+
+MCF7-SIX1 counterpart of `gene_rna_te_hypoxia_si3d_231.Rmd`: where one gene sits, for mRNA
+and translation efficiency (TE), relative to every other gene in the same contrast.
+
+**What MCF7-SIX1 has, and what it lacks, relative to MDA-MB-231:**
+
+- **One timepoint only (1hr).** There is no 4hr, 24hr or time-regressed contrast.
+- **Control cells (siCTRL), hypoxia vs normoxia, 1hr** - mRNA and TE, `log2(hypoxia / normoxia)`,
+  from the other repo's `counts/all_norm_to_hyp_changes.csv`.
+- **eIF3d knockdown, hypoxia 1hr and normoxia 1hr - TE only.** The knockdown analysis in the
+  other repo fitted only the TE interaction term; no knockdown mRNA contrast exists, so the
+  knockdown panel has no mRNA row.
+- **Not spike-in normalised** (MDA-MB-231 is), so medians sit near zero and magnitudes are not
+  comparable across cell lines. Compare percentiles, not raw log2FC.
+
+The knockdown files in this repo have already been flipped to match MDA-MB-231:
+`te_lfc = -source_log2FoldChange`, so positive = the knockdown lowers TE = eIF3d promotes it.
+The original DESeq2 coefficient was `log2(si3d / sictrl)`.
+
+```{r libs}
+library(tidyverse)
+library(here)
+library(patchwork)
+
+GENE_ID    <- params$gene_id
+GENE_LABEL <- params$gene_label
+GENE_COL   <- "#0072B2"   # Okabe-Ito dark blue; orange / sky blue are reserved for si3d / si3e
+REST_COL   <- "grey70"
+```
+
+# Load
+
+```{r load}
+ctrl_file <- file.path(params$mcf7_repo, "counts", "all_norm_to_hyp_changes.csv")
+stopifnot("MCF7-SIX1 control hypoxia table not found" = file.exists(ctrl_file))
+
+ctrl <- read_csv(ctrl_file, show_col_types = FALSE) %>%
+  transmute(gene_id_clean = sub("\\..*", "", gene_id), contrast = "1hr",
+            rna_lfc = LFC_rna_sictrl, rna_padj = padj_rna_sictrl,
+            te_lfc  = LFC_te_sictrl,  te_padj  = padj_te_sictrl) %>%
+  filter(!is.na(te_padj)) %>%
+  mutate(contrast = factor(contrast))
+
+read_kd <- function(file, label) {
+  read_csv(here("output", file), show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id), contrast = label)
+}
+kd_raw <- bind_rows(
+  read_kd("translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv",  "Hypoxia 1hr"),
+  read_kd("translation_categories_si3d_vs_sictrl_mcf7six1_normoxia_1hr.csv", "Normoxia 1hr")
+)
+kd <- kd_raw %>%
+  filter(!is.na(te_padj)) %>%
+  transmute(gene_id_clean, contrast = factor(contrast, c("Hypoxia 1hr", "Normoxia 1hr")),
+            rna_lfc = NA_real_, rna_padj = NA_real_, te_lfc, te_padj)
+```
+
+# Direction checks
+
+The usual check (the knockdown target's own mRNA must be strongly positive) cannot run here:
+there is no knockdown mRNA column, so it would silently skip. Instead:
+
+- **Control contrast, parsed from the producing source.** `5_hypoxicresponse.Rmd` must set
+  `normoxia` as the reference level for the TE, mRNA and ribosome fits. At 1hr the classic HIF
+  targets have not moved yet in these cells, so there is no biological ruler to use.
+- **Knockdown, the flip itself.** `te_lfc` must be exactly `-source_log2FoldChange`.
+- **Knockdown, against independent data.** The flipped MCF7-SIX1 TE must correlate positively
+  with the matched MDA-MB-231 contrast (previously measured at Spearman +0.12 to +0.43;
+  un-flipped it is negative).
+
+```{r direction_checks}
+src <- readLines(file.path(params$mcf7_repo, "code", "5_hypoxicresponse.Rmd"))
+ref_lines <- grep("metadata_acute_sictrl(_rna|_ribo)?\\$condition <- relevel", src, value = TRUE)
+stopifnot("expected 3 relevel calls for the siCTRL hypoxia fits" = length(ref_lines) == 3,
+          "siCTRL hypoxia contrast reference is not normoxia" = all(grepl('ref = "normoxia"', ref_lines)))
+
+stopifnot("knockdown te_lfc is not the negated source coefficient" =
+            isTRUE(all.equal(kd_raw$te_lfc, -kd_raw$source_log2FoldChange)))
+
+match_231 <- c("Hypoxia 1hr"  = "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+               "Normoxia 1hr" = "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv")
+rho <- imap_dbl(match_231, function(f, lab) {
+  m231 <- read_csv(here("output", f), show_col_types = FALSE) %>%
+    transmute(gene_id_clean = sub("\\..*", "", gene_id), te_231 = te_lfc)
+  j <- kd %>% filter(contrast == lab) %>% inner_join(m231, by = "gene_id_clean")
+  cor(j$te_lfc, j$te_231, method = "spearman", use = "complete.obs")
+})
+print(round(rho, 3))
+stopifnot("flipped MCF7-SIX1 TE does not agree with the matched MDA-MB-231 contrast" = all(rho > 0))
+
+stopifnot(
+  "gene missing from the control contrast"  = nrow(filter(ctrl, gene_id_clean == GENE_ID)) == 1,
+  "gene missing from a knockdown contrast"  = nrow(filter(kd,   gene_id_clean == GENE_ID)) == 2
+)
+```
+
+# Table
+
+```{r table}
+summarise_gene <- function(d) {
+  has_rna <- any(!is.na(d$rna_lfc))
+  d %>%
+    group_by(contrast) %>%
+    summarise(
+      n          = n(),
+      median_rna = if (has_rna) median(rna_lfc, na.rm = TRUE) else NA_real_,
+      median_te  = median(te_lfc),
+      rna_pct    = if (has_rna) mean(rna_lfc <= rna_lfc[gene_id_clean == GENE_ID], na.rm = TRUE) * 100 else NA_real_,
+      te_pct     = mean(te_lfc <= te_lfc[gene_id_clean == GENE_ID]) * 100,
+      .groups = "drop") %>%
+    left_join(d %>% filter(gene_id_clean == GENE_ID) %>%
+                dplyr::select(contrast, rna_lfc, rna_padj, te_lfc, te_padj), by = "contrast") %>%
+    dplyr::select(contrast, rna_lfc, rna_padj, rna_pct, median_rna,
+                  te_lfc, te_padj, te_pct, median_te, n)
+}
+
+tab <- bind_rows(summarise_gene(ctrl) %>% mutate(set = "Control: hypoxia vs normoxia"),
+                 summarise_gene(kd)   %>% mutate(set = "eIF3d knockdown: sictrl vs si3d")) %>%
+  mutate(contrast = as.character(contrast)) %>%
+  relocate(set)
+knitr::kable(tab, digits = c(0, 0, 2, 4, 0, 2, 2, 4, 0, 2, 0),
+             caption = paste0(GENE_LABEL, " in MCF7-SIX1: log2FC, padj, percentile among all tested ",
+                              "genes, and the transcriptome median (knockdown mRNA not available)"))
+```
+
+# Figure
+
+```{r figure}
+to_long <- function(d) {
+  d %>%
+    pivot_longer(c(rna_lfc, te_lfc), names_to = "measure", values_to = "lfc") %>%
+    mutate(padj = if_else(measure == "rna_lfc", rna_padj, te_padj),
+           measure = factor(if_else(measure == "rna_lfc", "mRNA", "TE"), c("mRNA", "TE"))) %>%
+    filter(is.finite(lfc))
+}
+
+# "*" padj < 0.05, "ns" tested but not significant, blank when no contrast exists
+stars <- function(p) case_when(is.na(p) ~ "", p < 0.05 ~ "*", TRUE ~ "ns")
+ordinal <- function(x) {
+  x <- round(x)
+  suf <- ifelse(x %% 100 %in% 11:13, "th", c("th", "st", "nd", "rd", rep("th", 6))[x %% 10 + 1])
+  paste0(x, suf)
+}
+
+panel <- function(d, title, ylab) {
+  long <- to_long(d)
+  pt <- long %>% filter(gene_id_clean == GENE_ID)
+  pct <- long %>% group_by(contrast, measure) %>%
+    summarise(pct = mean(lfc <= lfc[gene_id_clean == GENE_ID]) * 100, n = n(), .groups = "drop")
+  pt <- pt %>% left_join(pct, by = c("contrast", "measure")) %>%
+    mutate(lab = sprintf("%+.2f %s\n%s pct", lfc, stars(padj), ordinal(pct)))
+  n_lab <- pct %>% group_by(measure) %>%
+    summarise(lab = paste0("n = ", format(min(n), big.mark = ","),
+                           if (min(n) != max(n)) paste0("-", format(max(n), big.mark = ",")) else ""),
+              .groups = "drop")
+  # Clip the y range to the bulk of the distribution (0.5-99.5%) so the medians are readable,
+  # always keeping the gene's own point in range.
+  lims <- long %>% group_by(measure) %>%
+    summarise(lo = min(quantile(lfc, 0.005), min(pt$lfc[pt$measure == cur_group()$measure])) - 0.3,
+              hi = max(quantile(lfc, 0.995), max(pt$lfc[pt$measure == cur_group()$measure])) + 0.3,
+              .groups = "drop")
+  long <- long %>% left_join(lims, by = "measure") %>% filter(lfc >= lo, lfc <= hi)
+
+  ggplot(long, aes(x = contrast, y = lfc)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey40") +
+    geom_violin(fill = REST_COL, colour = NA, alpha = 0.6, scale = "width", width = 0.8) +
+    geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", colour = "grey30",
+                 linewidth = 0.3) +
+    geom_point(data = pt, colour = GENE_COL, size = 3.2) +
+    geom_text(data = pt, aes(label = lab), colour = GENE_COL, size = 3.1,
+              hjust = 0, nudge_x = 0.22, lineheight = 0.9) +
+    geom_text(data = n_lab, aes(x = -Inf, y = Inf, label = lab), inherit.aes = FALSE,
+              hjust = -0.1, vjust = 1.3, size = 3.1, colour = "grey30") +
+    facet_wrap(~ measure, ncol = 1, scales = "free_y") +
+    scale_x_discrete(expand = expansion(add = c(0.5, 0.9))) +
+    labs(title = title, x = NULL, y = ylab) +
+    theme_classic(base_size = 12) +
+    theme(strip.background = element_blank(),
+          strip.text = element_text(hjust = 0, face = "bold", size = 13),
+          plot.title = element_text(face = "bold", size = 12))
+}
+
+pA <- panel(ctrl, "Control cells: hypoxia vs normoxia", "log2(hypoxia / normoxia)")
+# Knockdown has TE only; the spacer keeps its TE panel level with the control TE panel.
+pB <- panel(kd, "eIF3d knockdown (TE only)", "log2(sictrl / si3d)")
+pB_col <- wrap_elements(full = grid::textGrob(
+            "No knockdown mRNA contrast\nexists for MCF7-SIX1",
+            gp = grid::gpar(col = "grey40", fontsize = 11))) / pB +
+  plot_layout(heights = c(1, 1))
+
+p <- (pA | pB_col) + plot_layout(widths = c(1.4, 2.2)) +
+  plot_annotation(
+    title = paste(GENE_LABEL, "in MCF7-SIX1 (1hr only)"),
+    subtitle = paste0("Blue point = ", GENE_LABEL,
+                      "; grey = all genes tested in that contrast (box = median and IQR).\n",
+                      "Label: log2FC (* = padj < 0.05) and percentile among all genes. ",
+                      "Positive in the knockdown panel = si3d lowers it. Not spike-in normalised."),
+    theme = theme(plot.title = element_text(face = "bold", size = 15),
+                  plot.subtitle = element_text(size = 10)))
+p
+
+if (params$save_plots) {
+  out <- here("plots", paste0("gene_rna_te_hypoxia_si3d_mcf7six1_", GENE_LABEL, ".pdf"))
+  ggsave(out, p, width = 9, height = 7.5)
+  cat("Saved", out, "\n")
+}
+```
+
+# Per-sample values
+
+The figure above shows fold changes from DESeq2 contrasts. Here are the **values themselves**
+for each sample, from the per-sample TE tables:
+
+- **mRNA** and **ribosome footprints** = log2(spike-in normalised counts + 1).
+- **TE** = log2(ribosome footprints) - log2(mRNA) for the matched ribosome and RNA library.
+
+Bar = mean of the replicates, points = individual replicates. A star means the DESeq2 contrast
+for that pair has padj < 0.05 and "ns" that it was tested and is not significant; the star comes from the same contrast tables used above, not
+from a test on these points.
+
+```{r value_helpers}
+VALUE_NAMES <- c(rna = "mRNA", ribo = "Ribosome footprints", TE = "TE")
+VALUE_UNITS <- c(rna = "log2(norm counts + 1)", ribo = "log2(norm counts + 1)", TE = "log2(ribo / mRNA)")
+
+# Bars of replicate means, replicate points, and a padj label above each pair - one small plot
+# per measure so each carries its own y-axis units. `sig` has one row per x position and
+# measure, with that contrast's padj and log2FC. `x_labels` relabels the x ticks.
+value_panel <- function(vals, x, fill, fill_values, sig, comparison, x_labels = waiver()) {
+  one <- function(ms) {
+    v <- vals %>% filter(measure == ms)
+    means <- v %>% group_by(.data[[x]], .data[[fill]]) %>%
+      summarise(value = mean(value), .groups = "drop")
+    # label sits above the taller of bar or points for that pair, offset by 8% of the range
+    off <- 0.08 * diff(range(c(0, v$value)))
+    star <- v %>% group_by(.data[[x]]) %>%
+      summarise(y = max(c(0, value)) + off, .groups = "drop") %>%
+      left_join(sig %>% filter(measure == ms) %>% dplyr::select(-measure), by = x) %>%
+      filter(!is.na(padj)) %>%
+      # significant pairs carry the DESeq2 log2FC next to the star
+      mutate(lab = if_else(padj < 0.05, sprintf("* %+.2f", lfc), "ns"))
+
+    ggplot(v, aes(x = .data[[x]], y = value, fill = .data[[fill]])) +
+      geom_col(data = means, position = position_dodge(width = 0.75), width = 0.7) +
+      geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.75, seed = 9),
+                 size = 1.6, shape = 21, colour = "black", show.legend = FALSE) +
+      geom_hline(yintercept = 0, linewidth = 0.5) +
+      geom_text(data = star, aes(x = .data[[x]], y = y, label = lab,
+                                size = if_else(lab == "ns", 4, 4.5)),
+                inherit.aes = FALSE, vjust = 0.3, show.legend = FALSE) +
+      scale_size_identity() +
+      scale_fill_manual(values = fill_values, name = NULL) +
+      scale_x_discrete(labels = x_labels) +
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+      labs(title = paste0(VALUE_NAMES[[ms]], ": ", comparison), x = NULL, y = VALUE_UNITS[[ms]]) +
+      ggprism::theme_prism(base_size = 12) +
+      theme(plot.title = element_text(hjust = 0, face = "bold", size = 12),
+            axis.title.y = element_text(size = 11))
+  }
+  wrap_plots(lapply(intersect(names(VALUE_NAMES), unique(vals$measure)), one),
+             nrow = 1, guides = "collect") &
+    theme(legend.position = "right")
+}
+```
+
+```{r values_mcf7, fig.width = 11, fig.height = 4.5}
+# Per-sample table written by the other repo's 2_calculate_te.Rmd. Columns are
+# {condition}_{treatment}_{rep}_{TE|rna|ribo}. There TE was shifted by a constant (+0.7617,
+# the global median) so values are relative; one si3e ribosome replicate was dropped as an
+# outlier, which does not touch the siCTRL / si3d samples shown here.
+mv <- read_csv(file.path(params$mcf7_repo, "counts", "calculate_te", "complete_te_list.csv"),
+               show_col_types = FALSE) %>%
+  filter(sub("\\..*", "", gene_id) == GENE_ID) %>%
+  dplyr::select(matches("^(normoxia|hypoxia)_(sictrl|si3d)_[abc]_(TE|rna|ribo)$")) %>%
+  pivot_longer(everything(), names_to = "col", values_to = "value") %>%
+  tidyr::extract(col, c("condition", "treatment", "rep", "measure"),
+                 "^(normoxia|hypoxia)_(sictrl|si3d)_([abc])_(TE|rna|ribo)$") %>%
+  mutate(condition = factor(str_to_title(condition), c("Normoxia", "Hypoxia")),
+         treatment = factor(treatment, c("sictrl", "si3d")),
+         hours = factor("1hr"))
+stopifnot("gene not found in the MCF7-SIX1 per-sample table" = nrow(mv) > 0,
+          "expected 3 replicates per group" =
+            all(dplyr::count(mv, condition, treatment, measure)$n == 3))
+
+# padj: control from the hypoxia table above; knockdown has TE only (no RNA or ribosome
+# contrast exists, so those knockdown bars carry no star - untested, not non-significant).
+g_ctrl <- read_csv(ctrl_file, show_col_types = FALSE) %>%
+  filter(sub("\\..*", "", gene_id) == GENE_ID)
+ctrl_sig <- tibble(hours = factor("1hr"), measure = c("rna", "ribo", "TE"),
+                   padj = c(g_ctrl$padj_rna_sictrl, g_ctrl$padj_ribo_sictrl, g_ctrl$padj_te_sictrl),
+                   lfc  = c(g_ctrl$LFC_rna_sictrl,  g_ctrl$LFC_ribo_sictrl,  g_ctrl$LFC_te_sictrl))
+kd_sig <- kd %>% filter(gene_id_clean == GENE_ID) %>%
+  transmute(condition = factor(sub(" 1hr", "", contrast), c("Normoxia", "Hypoxia")),
+            measure = "TE", padj = te_padj, lfc = te_lfc)
+
+vA <- value_panel(mv %>% filter(treatment == "sictrl"), "hours", "condition",
+                  c(Normoxia = "#0072B2", Hypoxia = "#CC79A7"), ctrl_sig,
+                  comparison = "hyp vs norm")
+vB <- value_panel(mv, "condition", "treatment",
+                  c(sictrl = "#999999", si3d = "#E69F00"), kd_sig,
+                  comparison = "sictrl vs si3d",
+                  x_labels = function(x) paste(x, "1hr"))
+# Two separate figures: the control-cell hypoxic response, and the effect of eIF3d knockdown.
+ann <- function(title, subtitle)
+  plot_annotation(title = title, subtitle = subtitle,
+                  theme = theme(plot.title = element_text(face = "bold", size = 15),
+                                plot.subtitle = element_text(size = 10)))
+base_sub <- "* = DESeq2 padj < 0.05."
+
+pv_ctrl <- vA + ann(paste(GENE_LABEL, "in MCF7-SIX1: hypoxic response in control cells"),
+                    paste0(base_sub, "\nlog2FC = log2(hypoxia / normoxia). TE is median-shifted."))
+pv_kd   <- vB + ann(paste(GENE_LABEL, "in MCF7-SIX1: effect of eIF3d knockdown"),
+                    paste0(base_sub, "\nlog2FC = log2(sictrl / si3d), positive = si3d lowers it. TE is median-shifted."))
+pv_ctrl
+pv_kd
+
+if (params$save_plots) {
+  stem <- paste0("gene_rna_te_hypoxia_si3d_mcf7six1_", GENE_LABEL)
+  ggsave(here("plots", paste0(stem, "_values_hypoxia_ctrl.pdf")), pv_ctrl, width = 11, height = 4.5)
+  ggsave(here("plots", paste0(stem, "_values_si3d.pdf")),         pv_kd,   width = 11, height = 4.5)
+  cat("Saved", paste0(stem, c("_values_hypoxia_ctrl.pdf", "_values_si3d.pdf")), sep = "\n")
+}
+```

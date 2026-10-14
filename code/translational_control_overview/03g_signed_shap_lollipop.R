@@ -12,17 +12,25 @@
 #   regression (10_/11_, "_tcoreg_"):  shapreg_feature_{suffix}.csv, variance-reduction importance
 # Both explain a random sample of held-out genes with TreeSHAP (03_ via its default engine,
 # per 03c_kernelshap_comparison; 11_ directly, as a regression forest needs no surrogate).
-#   Rscript code/translational_control_overview/03g_signed_shap_lollipop.R [suffix] [top_n]
+#   Rscript code/translational_control_overview/03g_signed_shap_lollipop.R [suffix] [top_n] [engine]
+# Interactively: edit the settings block below and run top to bottom.
 suppressPackageStartupMessages({ library(tidyverse); library(here) })
 
-args   <- commandArgs(trailingOnly = TRUE)
-suffix <- if (length(args) >= 1) args[1] else
-  "eif33d_promotes_hypoxia_1hr_lfc0.5_tco_corrected_both_clipaggregate"
-top_n  <- if (length(args) >= 2) as.integer(args[2]) else 30L
+## ---- settings: edit these when running interactively (Positron / RStudio) ----
+# Command-line arguments, when given, override them. The defaults reproduce the eIF4E-inclusive
+# hypoxia 1hr classifier explained with Kernel SHAP.
+suffix <- "eif33d_promotes_hypoxia_1hr_lfc0.5_tco4e_corrected_both_clipaggregate"
+top_n  <- 30L
 # "kernelshap" plots the Shapley values of the ACTUAL probability forest instead of the
 # surrogate's. 03_shap.Rmd suffixes its outputs with the engine but the MODEL files are shared,
 # so the engine tag is appended to the SHAP and output paths only.
-engine <- if (length(args) >= 3) args[3] else "treeshap"
+engine <- "kernelshap"
+## ---------------------------------------------------------------------------------
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) >= 1) suffix <- args[1]
+if (length(args) >= 2) top_n  <- as.integer(args[2])
+if (length(args) >= 3) engine <- args[3]
 stopifnot("engine must be treeshap or kernelshap" = engine %in% c("treeshap", "kernelshap"))
 etag <- if (engine == "treeshap") "" else paste0("_", engine)
 O <- here("output", "translational_control_overview")
@@ -103,7 +111,61 @@ p <- top %>%
   theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"),
         plot.caption.position = "plot", plot.title.position = "plot")
 
-out_pdf <- here("plots", paste0("03g_signed_shap_lollipop_", suffix, etag, ".pdf"))
+print(p)   # shows in the Plots pane when run interactively
+
+out_pdf <- here("plots",paste0("03g_signed_shap_lollipop_", suffix, etag, ".pdf"))
 ggsave(out_pdf, p, width = 8.5, height = 0.25 * nrow(top) + 2.8)
 write_csv(tbl %>% arrange(desc(mean_abs_shap)), file.path(O, paste0("shap_signed_importance_", suffix, etag, ".csv")))
 cat("wrote", out_pdf, "\n")
+
+
+
+
+
+
+tbl <- read_csv(f["shap"], show_col_types = FALSE) %>%
+  dplyr::select(feature, mean_abs_shap, shap_value_cor) %>%
+  left_join(ann %>% dplyr::select(feature, block, family), by = "feature") %>%
+  left_join(imp %>% dplyr::select(feature, impurity = importance), by = "feature") %>%
+  mutate(share_pct = 100 * mean_abs_shap / sum(mean_abs_shap),
+         signed_share = share_pct * sign(shap_value_cor),
+         category = case_when(family == "clip" ~ "eIF3 binding evidence",
+                              family == "dap5" ~ "Sensitivity to DAP5",
+                              block  == "eif4e" ~ "Sensitivity to eIF4E",
+                              TRUE ~ "Intrinsic mRNA features"))
+stopifnot("SHAP table does not cover exactly the model's features" = setequal(tbl$feature, md$feature_cols),
+          "feature missing from annotation or impurity importance" = !anyNA(tbl$block), !anyNA(tbl$impurity))
+
+
+
+
+
+
+
+
+
+
+
+
+p <- top %>%
+  mutate(feature = fct_reorder(feature, signed_share),
+         category = factor(category, levels = names(category_colors))) %>%
+  ggplot(aes(signed_share, feature, colour = category)) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = signed_share, yend = feature), colour = "grey80", linewidth = 0.5) +
+  geom_point(size = 2.8) +
+  scale_colour_manual(values = category_colors, name = NULL, drop = TRUE) +
+  labs(x = if (is_reg) "signed SHAP share (%)\n(right = higher values predict a larger TE drop on si3d)"
+           else        "signed SHAP share (%)\n(right = higher values push toward eIF3d-promoted)",
+       y = NULL,
+       title = sprintf("Top %d features: SHAP importance signed by direction", nrow(top)),
+       subtitle = sprintf("%s | %s | n = %d held-out genes explained\n%s vs mean |SHAP| Spearman = %.2f, n = %d features",
+                          paste0(if (is_reg) "Regression (TE LFC, all genes)" else "Classifier (promoted vs negative controls)",
+                                 if (engine == "kernelshap") ", Kernel SHAP on the probability forest" else ""),
+                          what, n_expl, imp_name, rho, nrow(tbl)),
+       caption = "Bar = share of total mean |SHAP| x sign of cor(feature value, its SHAP value) over the explained genes.") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"),
+        plot.caption.position = "plot", plot.title.position = "plot")
+
+print(p)

@@ -1,0 +1,718 @@
+---
+title: "98 - Which amino acids shift synonymous codon choice in a gene set (vs the rest of the transcriptome)"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  geneset: "hypoxia_3d_promotes_TE_1hr_lfc0.5"
+  # Plot labels for the gene set. Thresholds are those in code/generate_signatures.Rmd
+  # (te_padj < 0.05, te_lfc > 0.5); set both when changing `geneset`.
+  set_context: "1 hr hypoxia"
+  set_definition: "TE padj < 0.05, TE LFC > 0.5"
+  n_draws: 1000
+  n_gc3_bins: 100
+  n_cal: 30
+  n_cal_draws: 100
+editor_options:
+  chunk_output_type: console
+---
+
+Ranks amino acids by how far a gene set's synonymous codon choice departs from the
+**rest of the transcriptome**, with no negative-control set. MDA-MB-231: transcripts
+and isoforms are those of the 231 feature matrix.
+
+**Comparator.** Every transcript in the feature matrix that is *not* in the gene set.
+The expected usage of codon j within amino acid AA is the mean per-transcript fraction
+of AA's codons that are j across those transcripts - the transcriptome-corrected RSCU
+(bg-RSCU) background of notebook 38, minus the gene set. A gene set's mean bg-RSCU
+for codon j is exactly `p_set_j / p_bg_j`.
+
+**Per-amino-acid effect size.** Total variation distance (TVD) between the set's and
+the background's within-family proportions:
+
+TVD_AA = 0.5 * sum_j |p_set_j - p_bg_j| = 0.5 * sum_j p_bg_j * |bgRSCU_j - 1|
+
+It is the fraction of AA's codons that would have to switch synonym to make the set
+look like the background, in [0, 1] for every family size.
+
+**Floors.** TVD has a noise floor that is higher for larger families and rarer amino
+acids, so each amino acid is scored against its own: `n_draws` comparison sets the
+same size as the gene set. Two rules make the gene set and its comparison sets
+exchangeable, and the calibration in Section 5 fails if either is broken:
+
+1. **Every set is scored against everything except itself.** The gene set against the
+   rest of the transcriptome, and each comparison set against the transcriptome minus
+   that set (gene set included). Leaving a comparison set inside its own background
+   shrinks every floor by ~n_set / n (16% here): 12.8% false positives instead of 5%.
+2. **Comparison sets are drawn from the whole transcriptome, gene set included.** A
+   1,420-transcript AT-rich gene set holds a large share of all AT-rich transcripts;
+   drawing GC3-matched sets only from what is left forces them onto the same few
+   leftover transcripts, so the floor is too narrow (9-12% false positives on AT-skewed
+   fakes, whatever the matching method). Under the null the gene set *is* a random set
+   with its GC3, so it belongs in the population it is compared with.
+
+- **random** - any transcripts. Does this amino acid's codon choice differ from a
+  typical mRNA's?
+- **GC3-matched** - stratified on GC3 (GC at synonymous third positions): the
+  transcriptome is cut into `n_gc3_bins` equal-count GC3 bins and each draw takes as
+  many transcripts from each bin as the gene set has there, sampled from the *whole*
+  bin. Does it differ *beyond what the genes' GC3 predicts*? Bins have to be fine
+  (10 bins left the gene set at the AT-rich end of each bin); nearest-neighbour
+  matching was tried instead and fails calibration, because it restricts every draw
+  to the same small set of neighbours. 100 bins: 4.8% false positives on AT-skewed
+  fakes.
+
+z = (observed - null mean) / null sd; empirical p = (k + 1) / (n + 1), so the floor
+is 1 / (n_draws + 1), not 0. BH across the 18 multi-codon amino acids.
+
+**Calibration (Section 5)** runs the whole procedure on fake gene sets with no codon
+selection, including ones given the gene set's AT-skew, and checks that the
+GC3-matched floor calls ~5% of them significant.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# `params` only exists during knit; fallbacks match the YAML defaults.
+if (!exists("params") || !is.list(params)) {
+  params <- list(geneset = "hypoxia_3d_promotes_TE_1hr_lfc0.5",
+                 set_context = "1 hr hypoxia", set_definition = "TE padj < 0.05, TE LFC > 0.5",
+                 n_draws = 1000,
+                 n_gc3_bins = 100, n_cal = 30, n_cal_draws = 100)
+}
+```
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(coRdon)
+library(Matrix)
+```
+
+---
+
+# Section 1: CDS sequences and codon counts
+
+Same transcript universe and CDS extraction as notebook 38, plus one extra mask:
+transcripts with no terminal stop codon (GENCODE `cds_end_NF`, truncated CDS) are
+dropped, since in-frame truncated CDSs pass the `%% 3` filter but are incomplete.
+
+```{r load_data}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+keep_tx <- feature_matrix$transcript_id_clean
+
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+cds_all         <- cdsBy(txdb, by = "tx", use.names = TRUE)
+cds_seqs_all    <- extractTranscriptSeqs(genome, cds_all)
+cds_names_clean <- sub("\\..*", "", names(cds_seqs_all))
+
+keep_idx <- cds_names_clean %in% keep_tx
+cds      <- cds_seqs_all[keep_idx]
+names(cds) <- cds_names_clean[keep_idx]
+
+n_start  <- length(cds)
+in_frame <- width(cds) %% 3 == 0
+cds      <- cds[in_frame]
+last3    <- as.character(subseq(cds, start = width(cds) - 2))
+has_stop <- last3 %in% c("TAA", "TAG", "TGA")
+cds      <- cds[has_stop]
+
+cat("Transcripts in feature matrix with a CDS:", n_start, "\n")
+cat("  dropped, not divisible by 3:", sum(!in_frame), "\n")
+cat("  dropped, in frame but no terminal stop:", sum(!has_stop), "\n")
+cat("  kept:", length(cds), "\n")
+stopifnot("duplicate transcript IDs in CDS set" = !anyDuplicated(names(cds)))
+```
+
+```{r codon_counts}
+counts_mat <- codonCounts(codonTable(cds))
+rownames(counts_mat) <- names(cds)   # coRdon drops names
+
+gen_code     <- Biostrings::getGeneticCode("SGC0")
+sense_codons <- names(gen_code[gen_code != "*"])
+aa_to_codons <- split(sense_codons, gen_code[sense_codons])
+multi_aa     <- names(aa_to_codons)[lengths(aa_to_codons) > 1]
+
+aa_three_letter <- c(
+  A = "Ala", C = "Cys", D = "Asp", E = "Glu", F = "Phe",
+  G = "Gly", H = "His", I = "Ile", K = "Lys", L = "Leu",
+  M = "Met", N = "Asn", P = "Pro", Q = "Gln", R = "Arg",
+  S = "Ser", T = "Thr", V = "Val", W = "Trp", Y = "Tyr"
+)
+aa_full_name <- c(
+  A = "Alanine", C = "Cysteine", D = "Aspartic acid", E = "Glutamic acid",
+  F = "Phenylalanine", G = "Glycine", H = "Histidine", I = "Isoleucine",
+  K = "Lysine", L = "Leucine", M = "Methionine", N = "Asparagine",
+  P = "Proline", Q = "Glutamine", R = "Arginine", S = "Serine",
+  T = "Threonine", V = "Valine", W = "Tryptophan", Y = "Tyrosine"
+)
+
+stopifnot(
+  "expected 18 multi-codon amino acids" = length(multi_aa) == 18,
+  "codon columns missing" = all(sense_codons %in% colnames(counts_mat)),
+  "rownames lost" = identical(rownames(counts_mat), names(cds))
+)
+```
+
+---
+
+# Section 2: Gene set
+
+```{r gene_set}
+geneset_path <- here("output", "genesets", paste0(params$geneset, ".csv"))
+stopifnot("gene set CSV not found" = file.exists(geneset_path))
+set_genes <- read_csv(geneset_path, show_col_types = FALSE)$ensembl_gene
+
+tx_gene <- feature_matrix %>%
+  transmute(transcript_id_clean,
+            ensembl_gene = sub("\\..*", "", gene_id)) %>%
+  filter(transcript_id_clean %in% rownames(counts_mat))
+
+set_tx   <- tx_gene$transcript_id_clean[tx_gene$ensembl_gene %in% set_genes]
+is_set   <- rownames(counts_mat) %in% set_tx
+set_idx  <- which(is_set)
+pool_idx <- which(!is_set)          # the gene set's background
+univ_idx <- seq_len(nrow(counts_mat)) # source of every comparison set (rule 2)
+n_set    <- length(set_idx)
+n_bg     <- nrow(counts_mat)
+
+# Factor label and colour follow the gene set, so an si3e run is not drawn as eIF3d
+kd_factor <- if (grepl("_3e_", params$geneset)) "eIF3e" else "eIF3d"
+set_col   <- c(eIF3d = "#E69F00", eIF3e = "#56B4E9")[[kd_factor]]
+
+cat("Gene set:", params$geneset, "(", kd_factor, ")\n")
+cat("  genes in CSV:", length(set_genes), "| transcripts in CDS universe:", n_set, "\n")
+cat("  background (rest of transcriptome):", length(pool_idx), "transcripts\n")
+stopifnot("gene set has too few transcripts" = n_set >= 50,
+          "one transcript per gene expected" =
+            !anyDuplicated(tx_gene$ensembl_gene[tx_gene$transcript_id_clean %in% set_tx]),
+          "gene set and background overlap" = !any(set_idx %in% pool_idx))
+```
+
+---
+
+# Section 3: Within-family proportions, background and GC3
+
+For each amino acid, a transcripts x codons matrix of within-family proportions. A
+transcript with no codons for that amino acid is NA for it and is left out of every
+mean, as in notebook 38.
+
+```{r proportions}
+prop_list <- map(set_names(multi_aa), function(aa) {
+  cnt <- counts_mat[, aa_to_codons[[aa]], drop = FALSE]
+  tot <- rowSums(cnt)
+  p   <- cnt / tot
+  p[tot == 0, ] <- NA
+  p
+})
+
+# Background from a set of rows (reused for the calibration fakes)
+bg_from <- function(rows) map(prop_list, ~ colMeans(.x[rows, , drop = FALSE], na.rm = TRUE))
+bg_props <- bg_from(pool_idx)
+
+stopifnot(
+  "background proportions do not sum to 1" =
+    all(abs(map_dbl(bg_props, sum) - 1) < 1e-9),
+  "background proportion outside [0, 1]" =
+    all(unlist(bg_props) >= 0 & unlist(bg_props) <= 1)
+)
+
+# Biological spot-check on the background
+leu <- bg_props[["L"]]
+stopifnot("CTG should be the most-used Leu codon in human mRNA" =
+            names(leu)[which.max(leu)] == "CTG")
+cat("Leu background proportions:", paste(names(leu), round(leu, 3), collapse = "  "), "\n")
+```
+
+```{r gc3}
+# GC3 at synonymous third positions only (multi-codon amino acids), so Met/Trp and
+# stop do not enter.
+syn_codons <- unlist(aa_to_codons[multi_aa])
+gc_end     <- syn_codons[substr(syn_codons, 3, 3) %in% c("G", "C")]
+gc3_syn    <- 100 * rowSums(counts_mat[, gc_end]) / rowSums(counts_mat[, syn_codons])
+
+stopifnot("GC3 outside [0, 100]" = all(gc3_syn >= 0 & gc3_syn <= 100, na.rm = TRUE),
+          "GC3 median outside [40, 65]" = between(median(gc3_syn), 40, 65))
+cat("Synonymous-site GC3 median: background", round(median(gc3_syn[pool_idx]), 1),
+    "| gene set", round(median(gc3_syn[set_idx]), 1), "\n")
+```
+
+---
+
+# Section 4: Observed TVD and the two floors
+
+Set means are computed for all draws at once: each floor is an indicator matrix
+(transcripts x draws), and a set's mean proportion is `t(P) %*% W / t(valid) %*% W`
+with NAs zeroed.
+
+```{r tvd_engine}
+# Mean within-family proportions for many sets at once.
+# W: sparse 0/1 matrix, transcripts x sets. Returns list (per AA) of codons x sets.
+set_means <- function(W) {
+  map(prop_list, function(p) {
+    valid <- !is.na(p[, 1])
+    p0    <- p; p0[!valid, ] <- 0
+    num   <- as.matrix(crossprod(p0, W))
+    den   <- as.numeric(crossprod(as.numeric(valid), W))
+    sweep(num, 2, den, "/")
+  })
+}
+# Background for each comparison set = universe minus that set (rule 1). Duplicates
+# (possible only when a GC3 bin is smaller than the gene set's count there) are removed
+# once from the background but weighted in the set mean.
+rest_bg <- function(W, universe) {
+  W@x[] <- 1
+  map(prop_list, function(p) {
+    valid <- !is.na(p[, 1])
+    p0    <- p; p0[!valid, ] <- 0
+    num   <- as.matrix(crossprod(p0, W))
+    den   <- as.numeric(crossprod(as.numeric(valid), W))
+    (colSums(p0[universe, , drop = FALSE]) - num) /
+      matrix(sum(valid[universe]) - den, nrow(num), ncol(num), byrow = TRUE)
+  })
+}
+# bg: per AA either a codon vector (one background) or a codons x sets matrix
+tvd_from_means <- function(means, bg) {
+  map(names(means), function(aa) 0.5 * colSums(abs(means[[aa]] - bg[[aa]]))) %>%
+    set_names(names(means)) %>% as_tibble()
+}
+idx_to_W <- function(idx_list) {
+  sparseMatrix(i = unlist(idx_list),
+               j = rep(seq_along(idx_list), lengths(idx_list)),
+               x = 1, dims = c(n_bg, length(idx_list)))
+}
+
+# GC3-stratified draws: bins = equal-count GC3 quantiles of the candidates; each draw
+# takes the target set's count per bin from the whole bin (with replacement only when
+# a bin is smaller than that count).
+gc3_strat_draws <- function(target_idx, candidates, n_bins, n_draws) {
+  br    <- unique(quantile(gc3_syn[candidates], seq(0, 1, length.out = n_bins + 1)))
+  b_c   <- cut(gc3_syn[candidates], br, include.lowest = TRUE, labels = FALSE)
+  b_t   <- cut(gc3_syn[target_idx], br, include.lowest = TRUE, labels = FALSE)
+  need  <- tabulate(b_t, max(b_c))
+  pools <- split(candidates, factor(b_c, levels = seq_len(max(b_c))))
+  replicate(n_draws, unlist(map2(pools, need, function(pl, k) {
+    if (k == 0) integer(0) else pl[sample.int(length(pl), k, replace = k > length(pl))]
+  })), simplify = FALSE)
+}
+
+# Empirical scoring of one observed TVD row against a null TVD table
+score_vs <- function(obs, null_tvd) {
+  map_dfr(multi_aa, function(aa) {
+    nul <- null_tvd[[aa]]; o <- obs[[aa]]
+    tibble(amino_acid = aa, tvd = o,
+           null_median = median(nul),
+           null_lo = quantile(nul, 0.05), null_hi = quantile(nul, 0.95),
+           z = (o - mean(nul)) / sd(nul),
+           p_emp = (sum(nul >= o) + 1) / (length(nul) + 1))
+  }) %>% mutate(q = p.adjust(p_emp, "BH"))
+}
+
+obs_means <- set_means(idx_to_W(list(set_idx)))
+obs_tvd   <- tvd_from_means(obs_means, bg_props)
+stopifnot("TVD outside [0, 1]" = all(obs_tvd >= 0 & obs_tvd <= 1))
+```
+
+```{r null_random}
+set.seed(9)
+idx_random <- replicate(params$n_draws, univ_idx[sample.int(length(univ_idx), n_set)],
+                        simplify = FALSE)
+W_random          <- idx_to_W(idx_random)
+null_random_means <- set_means(W_random)
+null_random_bg    <- rest_bg(W_random, univ_idx)
+null_random_tvd   <- tvd_from_means(null_random_means, null_random_bg)
+
+# Sanity: across random draws the mean bg-RSCU of every codon is ~1 by construction
+mean_bg_rscu <- unlist(map(names(null_random_means),
+                           ~ rowMeans(null_random_means[[.x]] / null_random_bg[[.x]])))
+stopifnot("random-null mean bg-RSCU drifts from 1" = all(abs(mean_bg_rscu - 1) < 0.01))
+```
+
+```{r null_gc3}
+set.seed(9)
+idx_gc3 <- gc3_strat_draws(set_idx, univ_idx, params$n_gc3_bins, params$n_draws)
+stopifnot("matched draws are the wrong size" = all(lengths(idx_gc3) == n_set))
+cat("Matched draws containing a repeated transcript:",
+    round(mean(map_lgl(idx_gc3, ~ anyDuplicated(.x) > 0)), 3), "\n")
+W_gc3          <- idx_to_W(idx_gc3)
+null_gc3_means <- set_means(W_gc3)
+null_gc3_bg    <- rest_bg(W_gc3, univ_idx)
+null_gc3_tvd   <- tvd_from_means(null_gc3_means, null_gc3_bg)
+
+# Matching quality across the whole distribution, not just the centre
+probs   <- seq(0.05, 0.95, by = 0.05)
+q_set   <- quantile(gc3_syn[set_idx], probs)
+q_match <- rowMeans(sapply(idx_gc3, function(ix) quantile(gc3_syn[ix], probs)))
+q_rand  <- rowMeans(sapply(idx_random[1:100], function(ix) quantile(gc3_syn[ix], probs)))
+cat("GC3, max |quantile difference| from gene set (5th-95th pct):",
+    "matched", round(max(abs(q_match - q_set)), 3),
+    "| random", round(max(abs(q_rand - q_set)), 2), "points\n")
+stopifnot("GC3 matching off by > 0.25 points at some quantile" =
+            max(abs(q_match - q_set)) < 0.25)
+```
+
+```{r score}
+aa_scores <- bind_rows(
+  score_vs(obs_tvd, null_random_tvd) %>% mutate(null = "random"),
+  score_vs(obs_tvd, null_gc3_tvd)    %>% mutate(null = "GC3-matched")
+) %>%
+  mutate(aa_label = paste0(aa_full_name[amino_acid], " (",
+                           lengths(aa_to_codons)[amino_acid], " codons)"))
+
+aa_scores %>%
+  dplyr::select(null, aa_label, tvd, null_median, z, p_emp, q) %>%
+  arrange(null, desc(z)) %>%
+  mutate(across(c(tvd, null_median), ~ round(.x, 4)), z = round(z, 2)) %>%
+  knitr::kable()
+```
+
+---
+
+# Section 5: Calibration on fake gene sets
+
+The calibration world is the non-target transcripts, so the real gene set plays no
+part. Each fake gene set is `n_set` of them, run through the **whole** procedure: its
+own background (world minus the fake) and `n_cal_draws` comparison sets of each kind,
+drawn from the whole world and scored against the world minus themselves. Two kinds:
+
+- **plain** - a random sample. Both floors should call it significant ~5% of the time.
+- **AT-skewed** - sampled with weight `exp(-beta * GC3)`, `beta` tuned so its median
+  GC3 matches the gene set's. It has the gene set's GC3 shift and no other codon
+  selection. The GC3-matched floor should still call ~5% significant; if GC3 leaks
+  through the matching, or the floor is too narrow, this rate rises. The random floor should
+  call most of them significant, showing that a pure GC3 shift is enough to produce
+  the random-floor result.
+
+The rate is over (fake x amino acid) tests at raw p < 0.05 (p floor 1 / (n_cal_draws + 1)).
+With the defaults (30 fakes x 18 amino acids = 540 tests per row) ~27 hits are expected
+at a calibrated 5%. The asserted band is 2-9%; the failed designs above ran 9-13%.
+
+```{r calibration}
+# Tune the AT-skew: fine grid, median GC3 averaged over 5 draws per beta
+set.seed(9)
+betas  <- seq(0, 0.1, by = 0.001)
+med_at <- map_dbl(betas, function(b) {
+  mean(replicate(5, median(gc3_syn[sample(pool_idx, n_set, prob = exp(-b * gc3_syn[pool_idx]))])))
+})
+beta <- betas[which.min(abs(med_at - median(gc3_syn[set_idx])))]
+cat("AT-skew beta:", beta, "| tuned median GC3:", round(med_at[betas == beta], 2),
+    "| gene set:", round(median(gc3_syn[set_idx]), 2), "\n")
+
+world <- pool_idx
+run_fake <- function(fake_idx) {
+  obs_c <- tvd_from_means(set_means(idx_to_W(list(fake_idx))), bg_from(setdiff(world, fake_idx)))
+  W_r <- idx_to_W(replicate(params$n_cal_draws, world[sample.int(length(world), n_set)],
+                            simplify = FALSE))
+  W_m <- idx_to_W(gc3_strat_draws(fake_idx, world, params$n_gc3_bins, params$n_cal_draws))
+  bind_rows(
+    score_vs(obs_c, tvd_from_means(set_means(W_r), rest_bg(W_r, world))) %>% mutate(null = "random"),
+    score_vs(obs_c, tvd_from_means(set_means(W_m), rest_bg(W_m, world))) %>% mutate(null = "GC3-matched")
+  ) %>% mutate(fake_gc3_median = median(gc3_syn[fake_idx]))
+}
+
+set.seed(9)
+cal <- bind_rows(
+  map_dfr(seq_len(params$n_cal), ~ run_fake(sample(pool_idx, n_set)) %>%
+            mutate(fake = "plain", rep = .x)),
+  map_dfr(seq_len(params$n_cal), ~ run_fake(sample(pool_idx, n_set,
+                                                   prob = exp(-beta * gc3_syn[pool_idx]))) %>%
+            mutate(fake = "AT-skewed", rep = .x))
+)
+
+cal_summary <- cal %>%
+  group_by(fake, null) %>%
+  summarise(n_tests = n(),
+            frac_p05 = mean(p_emp < 0.05),
+            frac_q05 = mean(q < 0.05),
+            fake_gc3_median = median(fake_gc3_median), .groups = "drop")
+knitr::kable(cal_summary, digits = 3)
+cat("Gene set GC3 median for comparison:", round(median(gc3_syn[set_idx]), 1), "\n")
+
+rate <- function(f, n) cal_summary$frac_p05[cal_summary$fake == f & cal_summary$null == n]
+stopifnot(
+  "random floor miscalibrated on plain fakes (outside 2-9%)" =
+    between(rate("plain", "random"), 0.02, 0.09),
+  "GC3-matched floor miscalibrated on plain fakes (outside 2-9%)" =
+    between(rate("plain", "GC3-matched"), 0.02, 0.09),
+  "GC3-matched floor miscalibrated on AT-skewed fakes (outside 2-9%)" =
+    between(rate("AT-skewed", "GC3-matched"), 0.02, 0.09),
+  "AT-skewed fakes did not reach the gene set's GC3"   =
+    abs(median(cal$fake_gc3_median[cal$fake == "AT-skewed"]) - median(gc3_syn[set_idx])) < 1
+)
+```
+
+```{r plot_calibration, fig.width=8, fig.height=5}
+p_cal <- cal %>%
+  mutate(null = factor(null, levels = c("random", "GC3-matched"),
+                       labels = c("random floor", "GC3-matched floor")),
+         fake = factor(fake, levels = c("plain", "AT-skewed"))) %>%
+  ggplot(aes(x = p_emp)) +
+  geom_histogram(breaks = seq(0, 1, by = 0.05), fill = "grey60", colour = "white") +
+  facet_wrap(~ fake + null, ncol = 2, scales = "free_y") +
+  labs(title = "Calibration: empirical p for fake gene sets with no codon selection",
+       subtitle = sprintf("%d fakes x 18 amino acids per row; n = %d transcripts each; flat = calibrated",
+                          params$n_cal, n_set),
+       x = "Empirical p", y = "Tests") +
+  theme_classic(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+p_cal
+ggsave(here("plots", paste0("98_calibration_", params$geneset, ".pdf")),
+       p_cal, width = 8, height = 5)
+```
+
+---
+
+# Section 6: Ranked amino acids
+
+Grey bar = 5-95% of TVD for GC3-matched transcriptome sets of the same size (the floor);
+tick = floor median; point = the gene set. The main figure is the GC3-matched floor;
+the random-floor version is saved alongside.
+
+```{r plot_ranked, fig.width=8.5, fig.height=6.5}
+rand_z <- aa_scores %>% filter(null == "random")
+
+plot_floor <- function(null_lbl, subtitle) {
+  d <- aa_scores %>% filter(null == null_lbl) %>%
+    mutate(aa_label = fct_reorder(aa_label, z),
+           sig = if_else(q < 0.05, "BH q < 0.05", "n.s."),
+           lab = sprintf("z = %.1f", z))
+  ggplot(d, aes(y = aa_label)) +
+    geom_linerange(aes(xmin = null_lo, xmax = null_hi), linewidth = 3, colour = "grey80") +
+    geom_point(aes(x = null_median), shape = 124, size = 4, colour = "grey50") +
+    geom_point(aes(x = tvd, shape = sig), colour = set_col, size = 2.6) +
+    geom_text(aes(x = pmax(tvd, null_hi), label = lab), hjust = -0.25, size = 2.8) +
+    scale_shape_manual(values = c("BH q < 0.05" = 16, "n.s." = 1), name = NULL, drop = FALSE) +
+    scale_x_continuous(expand = expansion(mult = c(0.02, 0.25))) +
+    labs(title = sprintf("Synonymous codon choice in %s targets vs rest of transcriptome", kd_factor),
+         subtitle = subtitle,
+         x = "Fraction of the amino acid's codons that differ from background (TVD)",
+         y = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top", plot.subtitle = element_text(size = 9))
+}
+
+p_rank_gc3 <- plot_floor("GC3-matched", sprintf(
+  paste0("Grey = expected from GC3 alone: 5-95%% of %d transcriptome sets with the targets' GC3 distribution.\n",
+         "n = %d targets vs %d rest of transcriptome. Against unmatched random sets all %d amino acids\n",
+         "differ (z %.0f to %.0f, p <= %.3f), because targets' synonymous GC3 is %.1f%% vs %.1f%%.\n",
+         "This panel asks what remains beyond GC3."),
+  params$n_draws, n_set, length(pool_idx), nrow(rand_z), min(rand_z$z), max(rand_z$z),
+  max(rand_z$p_emp), median(gc3_syn[set_idx]), median(gc3_syn[pool_idx])))
+p_rank_rand <- plot_floor("random", sprintf(
+  "Grey = chance alone: 5-95%% of %d random transcriptome sets.\nn = %d targets vs %d rest of transcriptome. Not adjusted for GC3.",
+  params$n_draws, n_set, length(pool_idx)))
+
+p_rank_gc3
+ggsave(here("plots", paste0("98_aa_codon_tvd_ranked_", params$geneset, ".pdf")),
+       p_rank_gc3, width = 8.5, height = 6.5)
+ggsave(here("plots", paste0("98_aa_codon_tvd_ranked_random_floor_", params$geneset, ".pdf")),
+       p_rank_rand, width = 8.5, height = 6.5)
+```
+
+---
+
+# Section 7: Which codons drive each amino acid
+
+Mean bg-RSCU of the gene set per codon (1 = background usage), with the 5-95% band
+from the same floor. Panels ordered by GC3-matched z. Colour = third-position base, so
+a GC3-driven shift reads as all GC-ending codons down and AT-ending up.
+
+```{r codon_detail}
+order_aa <- aa_scores %>% filter(null == "GC3-matched") %>% arrange(desc(z)) %>% pull(aa_label)
+
+codon_detail <- function(null_means, null_bg, label) {
+  map_dfr(multi_aa, function(aa) {
+    bg <- bg_props[[aa]]
+    nr <- null_means[[aa]] / null_bg[[aa]]   # each set relative to the rest of the pool
+    tibble(amino_acid = aa, codon = names(bg),
+           bg_rscu = obs_means[[aa]][, 1] / bg,
+           lo = apply(nr, 1, quantile, 0.05), hi = apply(nr, 1, quantile, 0.95))
+  }) %>%
+    mutate(null = label,
+           ending = if_else(substr(codon, 3, 3) %in% c("G", "C"), "GC-ending", "AT-ending"))
+}
+codon_df <- bind_rows(codon_detail(null_random_means, null_random_bg, "random"),
+                      codon_detail(null_gc3_means,    null_gc3_bg,    "GC3-matched")) %>%
+  left_join(aa_scores %>% dplyr::select(amino_acid, null, aa_label), by = c("amino_acid", "null")) %>%
+  mutate(aa_label = factor(aa_label, levels = order_aa))
+
+write_csv(codon_df, here("output", "predictive_modeling",
+                         paste0("98_codon_bg_rscu_vs_null_", params$geneset, ".csv")))
+write_csv(aa_scores, here("output", "predictive_modeling",
+                          paste0("98_aa_tvd_scores_", params$geneset, ".csv")))
+write_csv(cal, here("output", "predictive_modeling",
+                    paste0("98_calibration_", params$geneset, ".csv")))
+```
+
+```{r plot_codons, fig.width=11, fig.height=9}
+codon_titles <- list(
+  "GC3-matched" = c(
+    sprintf("Codon usage in %s targets (n = %d): what GC3 does not explain", kd_factor, n_set),
+    paste0("Point = targets. Grey = where the codon would sit if targets differed only in GC3 ",
+           "(5-95% of GC3-matched transcriptome sets).\nPoint outside grey = shift beyond GC3. ",
+           "Dashed line = usage in the rest of the transcriptome.\nBar height = chance variation for that codon; rare codons have taller bars because bg-RSCU divides by the codon's usual frequency.")),
+  "random" = c(
+    sprintf("Codon usage in %s targets (n = %d) vs the rest of the transcriptome", kd_factor, n_set),
+    paste0("Point = targets. Grey = 5-95% of random transcriptome sets of the same size (chance alone). ",
+           "Dashed line = usage in the rest of the transcriptome.\nBar height = chance variation for that codon; rare codons have taller bars because bg-RSCU divides by the codon's usual frequency."))
+)
+
+plot_codons <- function(lbl) {
+  ggplot(filter(codon_df, null == lbl), aes(x = codon, y = bg_rscu)) +
+    geom_hline(yintercept = 1, linewidth = 0.3, colour = "grey50", linetype = "dashed") +
+    geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 3, colour = "grey85") +
+    geom_point(aes(colour = ending), size = 2.4) +
+    scale_colour_manual(values = c("GC-ending" = "#0072B2", "AT-ending" = "#CC79A7"),
+                        name = "Third position") +
+    facet_wrap(~ aa_label, scales = "free_x", nrow = 3) +
+    labs(title = codon_titles[[lbl]][1], subtitle = codon_titles[[lbl]][2],
+         x = "Codon", y = "Mean bg-RSCU (1 = rest of transcriptome)") +
+    theme_classic(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+          plot.subtitle = element_text(size = 9),
+          strip.text = element_text(face = "bold"), legend.position = "top")
+}
+p_cod_gc3  <- plot_codons("GC3-matched"); p_cod_gc3
+p_cod_rand <- plot_codons("random");      p_cod_rand
+ggsave(here("plots", paste0("98_codon_bg_rscu_gc3_null_", params$geneset, ".pdf")),
+       p_cod_gc3, width = 11, height = 9)
+ggsave(here("plots", paste0("98_codon_bg_rscu_random_null_", params$geneset, ".pdf")),
+       p_cod_rand, width = 11, height = 9)
+```
+
+## One row per amino acid, one dot per codon
+
+The simple view: each codon's mean bg-RSCU in the gene set (1 = usage in the rest of
+the transcriptome), one row per amino acid, coloured by whether the codon ends in A/U
+or G/C. Rows ordered by the amino acid's TVD (how far its codon choice moves overall).
+Grey band = 5-95% of random transcriptome sets of the same size, i.e. chance alone.
+Not adjusted for GC3 - this shows the shift itself, not what remains beyond GC3.
+
+```{r plot_codon_rows, fig.width=9, fig.height=8}
+row_order <- aa_scores %>% filter(null == "random") %>% arrange(tvd) %>% pull(aa_label)
+rows_df <- codon_df %>%
+  filter(null == "random") %>%
+  mutate(aa_label = factor(as.character(aa_label), levels = row_order),
+         ending   = factor(if_else(ending == "AT-ending", "AU-ending", "GC-ending"),
+                           levels = c("AU-ending", "GC-ending")),
+         codon_rna = chartr("T", "U", codon))
+chance <- rows_df %>% group_by(aa_label) %>%
+  summarise(lo = min(lo), hi = max(hi), .groups = "drop")
+
+p_rows <- ggplot(rows_df, aes(x = bg_rscu, y = aa_label)) +
+  geom_vline(xintercept = 1, linewidth = 0.3, linetype = "dashed", colour = "grey50") +
+  geom_linerange(data = chance, aes(xmin = lo, xmax = hi, y = aa_label),
+                 inherit.aes = FALSE, linewidth = 4, colour = "grey85") +
+  geom_point(aes(colour = ending), size = 2.6) +
+  ggrepel::geom_text_repel(aes(label = codon_rna, colour = ending), size = 2.6,
+                           direction = "y", nudge_y = 0.32, segment.size = 0.2,
+                           min.segment.length = 0.1, box.padding = 0.1,
+                           show.legend = FALSE, seed = 9) +
+  scale_colour_manual(values = c("AU-ending" = "#CC79A7", "GC-ending" = "#0072B2"),
+                      name = NULL) +
+  labs(title = sprintf("Codon usage in %s targets (%s)", kd_factor, params$set_context),
+       subtitle = sprintf(paste0("Targets: %s. n = %d targets vs %d rest of transcriptome.\n",
+                                 "Grey = chance alone (5-95%% of %d random sets). ",
+                                 "Rows ordered by overall shift. Not adjusted for GC3."),
+                          params$set_definition, n_set, length(pool_idx), params$n_draws),
+       x = "Target codon usage relative to rest of transcriptome (bg-RSCU)", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", plot.subtitle = element_text(size = 9))
+p_rows
+ggsave(here("plots", paste0("98_codon_rows_bg_rscu_", params$geneset, ".pdf")),
+       p_rows, width = 9, height = 8)
+```
+
+---
+
+# Section 8: Per-gene codon share against GC3
+
+The GC3-matched comparison works on set averages. This shows the same question one
+gene at a time: each gene's share of a codon within its amino acid, against its own
+synonymous GC3. If targets prefer the codon beyond what GC3 predicts, the target trend
+sits above (or below) the rest-of-transcriptome trend **at the same GC3**; if the
+shift is GC3 alone, the two trends overlap and the targets simply sit further left.
+
+Panels: amino acids with GC3-matched BH q < 0.05 (the top two by z if none), and
+within each the codons whose target mean falls outside the GC3-matched band, at most
+two, ordered by how far outside. Two-codon families show one codon, since the other is
+its mirror image. Trends are GAM smooths (`s(GC3)`) with 95% bands; points are
+individual genes, targets drawn on top.
+
+```{r per_gene_select}
+sel_aa <- aa_scores %>% filter(null == "GC3-matched") %>% arrange(desc(z))
+sel_aa <- if (any(sel_aa$q < 0.05)) filter(sel_aa, q < 0.05) else head(sel_aa, 2)
+
+sel_codons <- codon_df %>%
+  filter(null == "GC3-matched", amino_acid %in% sel_aa$amino_acid) %>%
+  mutate(outside = pmax(lo - bg_rscu, bg_rscu - hi, 0) / (hi - lo),
+         n_syn = lengths(aa_to_codons)[amino_acid]) %>%
+  group_by(amino_acid) %>%
+  arrange(desc(outside), .by_group = TRUE) %>%
+  filter(outside > 0 | row_number() == 1) %>%          # always at least one codon per AA
+  slice_head(n = 2) %>%
+  filter(n_syn > 2 | row_number() == 1) %>%            # 2-codon families: one codon
+  ungroup() %>%
+  mutate(amino_acid = factor(amino_acid, levels = sel_aa$amino_acid)) %>%
+  arrange(amino_acid)
+stopifnot("no codons selected for the per-gene plot" = nrow(sel_codons) > 0)
+sel_codons %>% dplyr::select(amino_acid, codon, ending, bg_rscu, lo, hi) %>% knitr::kable(digits = 3)
+
+per_gene <- pmap_dfr(list(as.character(sel_codons$amino_acid), sel_codons$codon),
+                     function(aa, cod) {
+  tibble(row = seq_len(n_bg), share = prop_list[[aa]][, cod], gc3 = gc3_syn,
+         group = if_else(is_set, paste(kd_factor, "targets"), "Rest of transcriptome"),
+         panel = sprintf("%s: %s share", aa_full_name[[aa]], cod))
+}) %>%
+  filter(!is.na(share)) %>%
+  mutate(panel = factor(panel, levels = unique(panel)),
+         group = factor(group, levels = c("Rest of transcriptome", paste(kd_factor, "targets"))))
+
+stopifnot("codon share outside [0, 1]" = all(per_gene$share >= 0 & per_gene$share <= 1))
+panel_n <- per_gene %>% dplyr::count(panel, group) %>%
+  pivot_wider(names_from = group, values_from = n)
+knitr::kable(panel_n)
+```
+
+```{r plot_per_gene, fig.width=10, fig.height=4}
+grp_cols <- setNames(c("grey50", set_col), levels(per_gene$group))
+n_lab <- per_gene %>% group_by(panel) %>%
+  summarise(lab = sprintf("n = %d targets, %d rest",
+                          sum(group != "Rest of transcriptome"), sum(group == "Rest of transcriptome")),
+            .groups = "drop")
+
+p_gene <- ggplot(per_gene, aes(x = gc3, y = share, colour = group, fill = group)) +
+  geom_point(data = filter(per_gene, group == "Rest of transcriptome"),
+             size = 0.4, alpha = 0.08, shape = 16) +
+  geom_point(data = filter(per_gene, group != "Rest of transcriptome"),
+             size = 0.6, alpha = 0.25, shape = 16) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), linewidth = 0.8, alpha = 0.15) +
+  geom_text(data = n_lab, aes(x = -Inf, y = Inf, label = lab), inherit.aes = FALSE,
+            hjust = -0.05, vjust = 1.4, size = 3) +
+  scale_colour_manual(values = grp_cols, name = NULL) +
+  scale_fill_manual(values = grp_cols, name = NULL) +
+  facet_wrap(~ panel, nrow = 1, scales = "free_y") +
+  labs(title = sprintf("Do %s targets prefer these codons at the same GC3?", kd_factor),
+       subtitle = paste0("Each point = one gene. Lines = GAM trend with 95% band. ",
+                         "Gap between lines at the same GC3 = preference beyond GC3."),
+       x = "Synonymous-site GC3 of the gene (%)", y = "Codon share within its amino acid") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", strip.text = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_gene
+ggsave(here("plots", paste0("98_per_gene_codon_share_vs_gc3_", params$geneset, ".pdf")),
+       p_gene, width = max(5, 3.4 * nlevels(per_gene$panel)), height = 4)
+```
+
+```{r session_info}
+sessionInfo()
+```
