@@ -1,0 +1,387 @@
+---
+title: "`r paste0('Clustering ', params$set_word, ' on transcriptome feature z-scores: ', params$label)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  geneset_csv: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"
+  matrix_rds: "feature_matrix_tco.rds"
+  features_from: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  set_word: "eIF3d targets"
+  lfc_label: "TE LFC sictrl/si3d (cap 1.5)"
+  tag: "hypoxia_1hr"
+  z_cap: 3
+  k_report: 3
+  ks: "2,3,4,5,6,7,8"
+  n_perm: 50
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "26c_target_clusters_feature_zscores.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-20: a model-free alternative to the SHAP clustering in `26b_target_subtypes_features.Rmd`.
+
+1. **Background = every gene with a TE LFC** in the DESeq2 table that also has a row in the
+   feature matrix (genes without features cannot be scored).
+2. **Each feature is z-scored against that background**: z = (gene value - background mean) /
+   background sd. A target's z-score therefore says how unusual it is *compared with a typical
+   measured mRNA*, in sd units, so features on different scales become comparable.
+3. **Only the `r params$set_word` are clustered** (k-means on their z-score profiles). Nothing
+   from the forest is used: no SHAP, no predictions. The forest's run is read only for its list
+   of 57 intrinsic features, so the rows match the SHAP heatmaps and the two can be compared.
+
+How this differs from SHAP clustering: SHAP groups genes by *why the model scores them*, so
+features the model ignores carry no weight. Here every feature carries weight in proportion to
+how unusual the gene is on it, whether or not it relates to TE. Two consequences:
+
+- **Correlated features count several times.** The GC family has many near-duplicate columns,
+  so GC differences pull harder on the clustering than one feature would.
+- **Outliers must be tamed.** Some features are extremely skewed (max |z| near 100), and k-means
+  would give a single extreme gene its own cluster. z is capped at +/-`r params$z_cap` before
+  clustering, and missing values are set to 0 (= the transcriptome mean). Section 7 checks that
+  the clusters do not depend on either choice.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(cluster); library(pheatmap); library(grid)
+})
+O <- here("output", "translational_control_overview")
+ks <- as.integer(strsplit(params$ks, ",")[[1]])
+K <- as.integer(params$k_report)
+ZC <- params$z_cap
+SAVE <- isTRUE(params$save_plots)
+lab_set <- paste(params$label, params$set_word)
+pf <- function(x) here("plots", paste0("26c_target_zclust_", params$tag, "_", x))
+cl_cols <- c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")
+stopifnot("k_report must be one of ks" = K %in% ks, "z_cap must be positive" = ZC > 0)
+```
+
+# 1. Background, features and targets
+
+```{r load}
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("[.].*", "", gene_id))
+stopifnot("DE table has duplicate genes" = !anyDuplicated(de$gene_id_clean),
+          "DE table lacks te_lfc / te_padj" = all(c("te_lfc", "te_padj") %in% names(de)))
+# Direction check: the siRNA depletes its own target, so EIF3D must be strongly positive in log2(sictrl / si3d)
+eif3d <- de$rna_lfc[de$symbol %in% "EIF3D"]
+stopifnot("EIF3D not found once in the DE table" = length(eif3d) == 1,
+          "EIF3D rna_lfc not > 1 - wrong file or flipped direction" = eif3d > 1)
+cat(sprintf("%s: EIF3D rna_lfc = %.2f (knockdown confirmed, positive = eIF3d promotes)\n", params$de_file, eif3d))
+
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("feature matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean))
+fc <- readRDS(file.path(O, paste0("rfreg_model_data_", params$features_from, ".rds")))$feature_cols
+stopifnot("features missing from the matrix" = all(fc %in% names(fm)))
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+stopifnot("a feature has no family" = !anyNA(fam))
+rows <- fc[order(fam, fc)]          # same row order as the 26b SHAP heatmaps
+
+bg <- de %>% filter(!is.na(te_lfc), gene_id_clean %in% fm$gene_id_clean) %>% arrange(gene_id_clean)
+X <- fm[match(bg$gene_id_clean, fm$gene_id_clean), rows] %>%
+  mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>% as.matrix()
+rownames(X) <- bg$gene_id_clean
+stopifnot("ACTB CDS GC outside 50-70%" = between(X[bg$symbol %in% "ACTB", "cds_gc"], 50, 70),
+          "background unexpectedly small" = nrow(bg) > 9000)
+
+tg <- bg$te_lfc > 0.5 & !is.na(bg$te_padj) & bg$te_padj < 0.05
+gs <- sub("[.].*", "", read_csv(here("output", "genesets", params$geneset_csv), show_col_types = FALSE)$ensembl_gene)
+stopifnot("targets differ from the saved gene-set CSV" = setequal(bg$gene_id_clean[tg], intersect(gs, bg$gene_id_clean)))
+genes <- bg[tg, ]
+cat(sprintf("background: %s genes with a TE LFC and features (of %s in the DE table, %s in the matrix)\n",
+            format(nrow(bg), big.mark = ","), format(sum(!is.na(de$te_lfc)), big.mark = ","), format(nrow(fm), big.mark = ",")))
+cat(sprintf("targets: %d (TE LFC > 0.5, padj < 0.05; = %s within the background, %d of %d CSV genes have features)\n",
+            nrow(genes), params$geneset_csv, nrow(genes), length(gs)))
+cat(sprintf("features: %d in %d families\n", length(rows), n_distinct(fam)))
+```
+
+# 2. Z-scores against the transcriptome
+
+```{r zscores}
+mu <- colMeans(X, na.rm = TRUE); sdv <- apply(X, 2, sd, na.rm = TRUE)
+stopifnot("a feature is constant across the background" = all(sdv > 0))
+Z_full <- sweep(sweep(X, 2, mu), 2, sdv, "/")                  # uncapped, NA kept
+stopifnot("background z not mean 0" = max(abs(colMeans(Z_full, na.rm = TRUE))) < 1e-9,
+          "background z not sd 1" = max(abs(apply(Z_full, 2, sd, na.rm = TRUE) - 1)) < 1e-9)
+prep <- function(Z, cap = ZC) { Z[is.na(Z)] <- 0; pmin(pmax(Z, -cap), cap) }
+Zt_full <- Z_full[genes$gene_id_clean, , drop = FALSE]
+Zt <- prep(Zt_full)                                           # what k-means sees
+stopifnot("target rows out of step" = identical(rownames(Zt), genes$gene_id_clean))
+
+tibble(feature = rows, family = fam[rows],
+       targets_missing = colSums(is.na(Zt_full)),
+       targets_capped = colSums(abs(Zt_full) > ZC, na.rm = TRUE),
+       target_mean_z = colMeans(Zt_full, na.rm = TRUE),
+       max_abs_z_background = apply(abs(Z_full), 2, max, na.rm = TRUE)) %>%
+  arrange(desc(abs(target_mean_z))) %>% knitr::kable(digits = 2)
+cat(sprintf("target cells: %d missing set to 0, %d capped at +/-%g (of %s)\n",
+            sum(is.na(Zt_full)), sum(abs(Zt_full) > ZC, na.rm = TRUE), ZC, format(length(Zt_full), big.mark = ",")))
+```
+
+# 3. How many clusters
+
+Three views. They should agree before a k is trusted.
+
+- **Elbow, % explained:** 1 - WSS(k) / WSS(1), where WSS is the total squared distance from each
+  gene to its cluster centre. The grey curve is the same for z-scores shuffled within each
+  feature (destroys which features go together, keeps each feature's distribution).
+- **Elbow, raw WSS (pheatmap `kmeans_k`, one start):** the lab's teaching-code version.
+- **Silhouette vs the shuffled null:** for each gene, (b - a) / max(a, b), a = mean distance to
+  its own cluster, b = to the nearest other; mean over genes. Observed is compared within each k
+  against `r params$n_perm` shuffles, as in 26b.
+
+```{r elbow, fig.width = 7, fig.height = 4.5}
+wss <- function(M, k) { set.seed(9); kmeans(M, k, nstart = 25, iter.max = 50)$tot.withinss }
+obs <- vapply(1:8, function(k) wss(Zt, k), numeric(1))
+shuf <- rowMeans(vapply(1:10, function(i) { set.seed(1000 + i); P <- apply(Zt, 2, sample)
+  vapply(1:8, function(k) wss(P, k), numeric(1)) }, numeric(8)))
+elbow <- tibble(k = 1:8, real = 100 * (1 - obs / obs[1]), shuffled = 100 * (1 - shuf / shuf[1])) %>%
+  mutate(gain_real = real - lag(real), gain_shuffled = shuffled - lag(shuffled))
+knitr::kable(elbow, digits = 1)
+p_elbow <- elbow %>% pivot_longer(c(real, shuffled), names_to = "data") %>%
+  ggplot(aes(k, value, colour = data, linetype = data)) +
+  geom_vline(xintercept = K, colour = "grey80") + geom_line(linewidth = 0.8) + geom_point() +
+  scale_colour_manual(values = c(real = "#E69F00", shuffled = "grey50"), name = NULL,
+                      labels = c(real = "real z-scores", shuffled = "shuffled z-scores\n(no real groups)")) +
+  scale_linetype_manual(values = c(real = 1, shuffled = 2), name = NULL,
+                        labels = c(real = "real z-scores", shuffled = "shuffled z-scores\n(no real groups)")) +
+  scale_x_continuous(breaks = 1:8) +
+  labs(x = "number of clusters (k)", y = "% of variance explained by clusters",
+       title = sprintf("%s:\nk-means elbow plot, feature z-scores", lab_set),
+       subtitle = sprintf("z vs %s background genes; shuffled = mean of 10; grey line = k = %d; n = %s targets",
+                          format(nrow(bg), big.mark = ","), K, format(nrow(genes), big.mark = ","))) +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12), plot.subtitle = element_text(size = 9))
+p_elbow
+if (SAVE) ggsave(pf("elbow.pdf"), p_elbow, width = 7, height = 4.5)
+```
+
+```{r elbow_pheatmap, fig.width = 7, fig.height = 4.5}
+wss_ph <- function(knum, x) pheatmap::pheatmap(mat = x, kmeans_k = knum, scale = "none", cluster_cols = FALSE,
+                                               clustering_distance_rows = "euclidean", clustering_method = "ward.D2",
+                                               silent = TRUE)$kmeans$tot.withinss
+k2test <- 2:15
+set.seed(9)
+elbow_ph <- tibble(k = k2test, wss_pheatmap = map_vec(k2test, wss_ph, x = Zt),
+                   wss_25_starts = map_vec(k2test, function(k) { set.seed(9); kmeans(Zt, k, nstart = 25, iter.max = 100)$tot.withinss }))
+# Best-of-25 is usually but not necessarily lower: pheatmap's single start is not one of the 25.
+cat(sprintf("k where the single start beat best-of-25: %s\n", paste(elbow_ph$k[elbow_ph$wss_pheatmap < elbow_ph$wss_25_starts - 1e-9], collapse = ", ")))
+knitr::kable(elbow_ph %>% mutate(single_start_excess_pct = 100 * (wss_pheatmap / wss_25_starts - 1)), digits = 1)
+p_elbow_ph <- ggplot(elbow_ph, aes(k, wss_pheatmap)) +
+  geom_vline(xintercept = K, colour = "grey80") + geom_line(colour = "grey50") + geom_point() +
+  scale_x_continuous(breaks = k2test) +
+  labs(x = "number of clusters K", y = "total within-cluster sum of squares",
+       title = sprintf("%s:\nk-means elbow plot (pheatmap kmeans_k), feature z-scores", lab_set),
+       subtitle = sprintf("one k-means start per k, set.seed(9); grey line = k = %d; n = %s targets", K, format(nrow(genes), big.mark = ","))) +
+  cowplot::theme_cowplot(font_size = 12) + theme(plot.title = element_text(face = "bold", size = 12), plot.subtitle = element_text(size = 9))
+p_elbow_ph
+if (SAVE) ggsave(pf("elbow_wss_pheatmap.pdf"), p_elbow_ph, width = 7, height = 4.5)
+```
+
+```{r null, fig.width = 7, fig.height = 4.5}
+D <- dist(Zt)
+sil_of <- function(M, k, d = dist(M)) {
+  set.seed(9); km <- kmeans(M, centers = k, nstart = 10, iter.max = 50)
+  mean(silhouette(km$cluster, d)[, 3])
+}
+null_cache <- file.path(O, "shap_oof_cache", sprintf("nulls_zclust_%s_cap%g_perm%d_k%s.rds",
+                                                     params$tag, ZC, params$n_perm, gsub(",", "-", params$ks)))
+fp <- c(nrow(Zt), round(sum(abs(Zt)), 6))
+cached <- if (file.exists(null_cache)) readRDS(null_cache) else NULL
+if (!is.null(cached) && identical(cached$fingerprint, fp)) nl <- cached else {
+  nm <- t(vapply(seq_len(params$n_perm), function(i) { set.seed(1000 + i); P <- apply(Zt, 2, sample)
+    dP <- dist(P); vapply(ks, function(k) sil_of(P, k, dP), numeric(1)) }, numeric(length(ks))))
+  nl <- list(fingerprint = fp, null = nm)
+  if (SAVE) saveRDS(nl, null_cache)
+}
+sil_obs <- vapply(ks, function(k) sil_of(Zt, k, D), numeric(1))
+nm <- nl$null
+z <- (sil_obs - colMeans(nm)) / apply(nm, 2, sd)
+z_null <- vapply(seq_len(nrow(nm)), function(i) { m2 <- nm[-i, , drop = FALSE]
+  max((nm[i, ] - colMeans(m2)) / apply(m2, 2, sd)) }, numeric(1))
+band <- tibble(k = ks, observed = sil_obs, null_median = apply(nm, 2, median),
+               null_min = apply(nm, 2, min), null_max = apply(nm, 2, max), z = z)
+knitr::kable(band, digits = 4)
+best_k_sil <- ks[which.max(sil_obs)]; best_k_z <- ks[which.max(z)]
+cat(sprintf("silhouette peak k = %d | best supported vs null k = %d (z = %.1f) | overall p = %.3f (%d shuffles)\n",
+            best_k_sil, best_k_z, max(z), (sum(z_null >= max(z)) + 1) / (nrow(nm) + 1), nrow(nm)))
+p_band <- ggplot(band, aes(k)) +
+  geom_ribbon(aes(ymin = null_min, ymax = null_max), fill = "grey85") +
+  geom_line(aes(y = null_median), colour = "grey50", linetype = 2) +
+  geom_line(aes(y = observed), colour = "#E69F00", linewidth = 0.8) + geom_point(aes(y = observed), colour = "#E69F00") +
+  geom_text(aes(y = observed, label = sprintf("z = %.1f", z)), vjust = -1, size = 3) +
+  scale_x_continuous(breaks = ks) + scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  labs(x = "number of clusters (k)", y = "mean silhouette score",
+       title = sprintf("%s:\nsilhouette score, real vs shuffled feature z-scores", lab_set),
+       subtitle = sprintf("orange = real; grey band = range over %d shuffles (each feature permuted across genes);\ndashed = shuffled median; z = (real - shuffled mean) / shuffled sd; n = %s targets",
+                          nrow(nm), format(nrow(genes), big.mark = ","))) +
+  theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12), plot.subtitle = element_text(size = 9))
+p_band
+if (SAVE) ggsave(pf("silhouette_null_band.pdf"), p_band, width = 7, height = 4.5)
+```
+
+# 4. Heatmaps of per-gene z-scores
+
+Genes are columns, ordered by cluster and, within a cluster, by TE change; features are rows,
+grouped by family as in the SHAP heatmaps. Color = the gene's z-score against all background
+genes (orange higher than a typical mRNA, blue lower), capped at +/-`r params$z_cap`, exactly the
+values k-means saw. Drawn at k = `r params$k_report` (`k_report`) and at the silhouette peak if different.
+
+```{r heatmaps, fig.width = 14, fig.height = 11, results = "asis"}
+fam_cols <- setNames(colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+                                        "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)), sort(unique(fam)))
+sym <- function(x, cap = 1.5) { x <- pmin(pmax(x, -cap), cap); x[c(which.min(x), which.max(x))] <- c(-cap, cap); x }
+cluster_k <- function(M, k) {
+  set.seed(9); cl <- kmeans(M, centers = k, nstart = 25, iter.max = 50)$cluster
+  match(cl, as.integer(names(sort(table(cl), decreasing = TRUE))))   # largest = 1
+}
+assignments <- list()
+for (k in unique(c(K, best_k_sil))) {
+  cl <- cluster_k(Zt, k)
+  assignments[[as.character(k)]] <- tibble(gene_id_clean = genes$gene_id_clean, symbol = genes$symbol, k = k,
+                                           cluster = cl, te_lfc = genes$te_lfc)
+  ord <- order(cl, -genes$te_lfc)
+  H <- t(Zt[ord, rows, drop = FALSE])
+  acol <- data.frame(cluster = factor(cl[ord]), lfc = sym(genes$te_lfc[ord]), check.names = FALSE, row.names = colnames(H))
+  names(acol)[2] <- params$lfc_label
+  acols <- list(cluster = setNames(cl_cols[seq_len(k)], seq_len(k)),
+                lfc_tmp = colorRampPalette(c("#0072B2", "white", "#D55E00"))(51), family = fam_cols)
+  names(acols)[names(acols) == "lfc_tmp"] <- params$lfc_label
+  hm <- pheatmap::pheatmap(H, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
+                 color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+                 breaks = seq(-ZC, ZC, length.out = 102), annotation_col = acol,
+                 annotation_row = data.frame(family = fam[rows], row.names = rows),
+                 annotation_colors = acols, gaps_col = cumsum(table(cl))[-k], fontsize_row = 6,
+                 main = sprintf("%s (n = %s genes)\nclustered on feature z-scores | k-means k = %d%s\ncolor = z-score vs all %s genes with a TE LFC (orange higher, blue lower, capped at +/-%g; missing = 0)",
+                                lab_set, format(nrow(genes), big.mark = ","), k,
+                                if (k == best_k_sil && k != K) " (silhouette peak)" else "",
+                                format(nrow(bg), big.mark = ","), ZC),
+                 fontsize = 9, silent = TRUE)
+  cat("\n\n## k = ", k, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (SAVE) {
+    png(pf(paste0("heatmap_k", k, ".png")), width = 14, height = 11, units = "in", res = 300); grid.newpage(); grid.draw(hm$gtable); dev.off()
+    pdf(pf(paste0("heatmap_k", k, ".pdf")), width = 14, height = 11); grid.newpage(); grid.draw(hm$gtable); dev.off()
+  }
+}
+```
+
+# 5. Mean z-score per cluster
+
+One column per group: all targets, then each k = `r params$k_report` cluster. Each cell is the group's mean
+z-score on the **uncapped** values over the genes that have one, so it reads directly as "this
+cluster sits X sd above a typical mRNA". The number is printed in each cell.
+
+```{r mean_panel, fig.width = 7, fig.height = 11}
+suppressPackageStartupMessages({ library(ComplexHeatmap); library(circlize) })
+clK <- assignments[[as.character(K)]]$cluster
+grp <- c(list(`all targets` = rep(TRUE, nrow(genes))), setNames(lapply(seq_len(K), function(g) clK == g), paste("cluster", seq_len(K))))
+zmean <- sapply(grp, function(w) colMeans(Zt_full[w, rows, drop = FALSE], na.rm = TRUE))
+colnames(zmean) <- sprintf("%s\n(n = %s)", names(grp), format(map_int(grp, sum), big.mark = ",", trim = TRUE))
+# independent recomputation from the raw values: (cluster mean - background mean) / background sd
+chk <- sapply(seq_len(K), function(g) (colMeans(X[genes$gene_id_clean[clK == g], rows, drop = FALSE], na.rm = TRUE) - mu[rows]) / sdv[rows])
+stopifnot("cluster mean z does not match the raw-value recomputation" = max(abs(chk - zmean[, -1])) < 1e-9)
+zcap <- max(1, quantile(abs(zmean), 0.98, na.rm = TRUE))
+ht <- Heatmap(zmean, name = "mean z-score\nvs background",
+              left_annotation = rowAnnotation(family = fam[rows], col = list(family = fam_cols), show_annotation_name = FALSE),
+              col = colorRamp2(c(-zcap, 0, zcap), c("#0072B2", "white", "#D55E00")),
+              cluster_rows = FALSE, cluster_columns = FALSE, row_names_gp = gpar(fontsize = 6.5),
+              column_names_rot = 45, column_names_gp = gpar(fontsize = 8),
+              cell_fun = function(j, i, x, y, w, h, fill) grid.text(sprintf("%.2f", zmean[i, j]), x, y, gp = gpar(fontsize = 5.5, col = "grey20")),
+              column_title = sprintf("(group mean - mean of %s background genes) / background sd", format(nrow(bg), big.mark = ",")),
+              column_title_gp = gpar(fontsize = 9))
+draw_mean <- function() draw(ht, merge_legend = TRUE, column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+                             column_title = sprintf("%s\nmean feature z-score per cluster (z-score clusters, k = %d)", lab_set, K))
+draw_mean()
+if (SAVE) {
+  pdf(pf(paste0("cluster_mean_k", K, ".pdf")), width = 7, height = 11); draw_mean(); dev.off()
+  png(pf(paste0("cluster_mean_k", K, ".png")), width = 7, height = 11, units = "in", res = 300); draw_mean(); dev.off()
+}
+```
+
+```{r cluster_summary}
+seqv <- tibble(gene_id_clean = rownames(X), cds_gc = X[, "cds_gc"], gc3 = X[, "gc3_internal"],
+               cds_nt = 2^X[, "log2_cds_length"] - 1, utr5_nt = 2^X[, "log2_utr5_length"] - 1,
+               utr3_nt = 2^X[, "log2_utr3_length"] - 1)
+top <- map_dfr(seq_len(K), function(g) { m <- zmean[, g + 1]; o <- order(-abs(m))[1:5]
+  tibble(cluster = g, top_features = paste0(rows[o], sprintf(" (%+.1f)", m[o]), collapse = ", ")) })
+summ <- assignments[[as.character(K)]] %>% left_join(seqv, by = "gene_id_clean") %>% group_by(cluster) %>%
+  summarise(n = n(), median_te_lfc = median(te_lfc), cds_gc = median(cds_gc, na.rm = TRUE), gc3 = median(gc3, na.rm = TRUE),
+            cds_nt = median(cds_nt, na.rm = TRUE), utr5_nt = median(utr5_nt, na.rm = TRUE),
+            utr3_nt = median(utr3_nt, na.rm = TRUE), .groups = "drop") %>%
+  left_join(top, by = "cluster")
+bg_row <- seqv %>% summarise(cds_gc = median(cds_gc, na.rm = TRUE), gc3 = median(gc3, na.rm = TRUE), cds_nt = median(cds_nt, na.rm = TRUE),
+                             utr5_nt = median(utr5_nt, na.rm = TRUE), utr3_nt = median(utr3_nt, na.rm = TRUE)) %>%
+  mutate(cluster = NA, n = nrow(bg), median_te_lfc = median(bg$te_lfc), top_features = "background (all genes with a TE LFC)")
+knitr::kable(bind_rows(summ, bg_row), digits = 1)
+kw <- kruskal.test(te_lfc ~ factor(cluster), data = assignments[[as.character(K)]])
+cat(sprintf("TE LFC differs between clusters? Kruskal-Wallis p = %.3g\n", kw$p.value))
+if (SAVE) {
+  write_csv(bind_rows(assignments), file.path(O, paste0("target_zscore_clusters_", params$tag, ".csv")))
+  write_csv(bind_rows(summ, bg_row), file.path(O, paste0("target_zscore_cluster_summary_", params$tag, ".csv")))
+  write_csv(as_tibble(zmean, rownames = "feature") %>% mutate(family = fam[feature], .after = feature),
+            file.path(O, paste0("target_zscore_cluster_means_", params$tag, ".csv")))
+}
+```
+
+# 6. Same genes, same groups as the SHAP clustering?
+
+Cross-tabulation against the k = `r params$k_report` SHAP clusters from 26b (both profiles) and the adjusted Rand
+index (ARI: 1 = identical partitions, 0 = no more agreement than chance).
+
+```{r vs_shap}
+f_shap <- file.path(O, paste0("target_shap_feature_clusters_", params$features_from, ".csv"))
+if (file.exists(f_shap)) {
+  shap_cl <- read_csv(f_shap, show_col_types = FALSE) %>% filter(k == K)
+  for (p in unique(shap_cl$profile)) {
+    s <- shap_cl %>% filter(profile == p)
+    stopifnot("SHAP clustering covers different genes" = setequal(s$gene_id_clean, genes$gene_id_clean))
+    zc <- clK[match(s$gene_id_clean, genes$gene_id_clean)]
+    cat(sprintf("\nSHAP %s k = %d vs z-score k = %d: ARI = %.2f\n", p, K, K, mclust::adjustedRandIndex(s$cluster, zc)))
+    print(table(`SHAP cluster` = s$cluster, `z-score cluster` = zc))
+  }
+} else cat("no SHAP clustering CSV for", params$features_from, "- knit 26b first to compare\n")
+```
+
+# 7. Do the clusters depend on the cap or the missing-value fill?
+
+The k = `r params$k_report` clustering redone three ways and compared by ARI with the one shown above:
+a looser cap (+/-5), no cap at all, and rank-based z-scores (each feature converted to normal
+scores over the background, which removes skew without a cap). High ARI = the choice did not
+matter.
+
+```{r robustness}
+rank_z <- apply(X, 2, function(x) qnorm((rank(x, na.last = "keep") - 0.5) / sum(!is.na(x))))
+rownames(rank_z) <- rownames(X)
+alt <- list(`cap +/-5` = prep(Zt_full, 5), `no cap` = prep(Zt_full, Inf),
+            `rank-based z` = prep(rank_z[genes$gene_id_clean, rows], Inf))
+tibble(variant = names(alt), ARI_vs_shown = map_dbl(alt, ~ mclust::adjustedRandIndex(cluster_k(.x, K), clK)),
+       cluster_sizes = map_chr(alt, ~ paste(tabulate(cluster_k(.x, K)), collapse = "/"))) %>%
+  bind_rows(tibble(variant = sprintf("shown (cap +/-%g)", ZC), ARI_vs_shown = 1, cluster_sizes = paste(tabulate(clK), collapse = "/")), .) %>%
+  knitr::kable(digits = 2)
+```
+
+```{r session}
+sessionInfo()
+```
