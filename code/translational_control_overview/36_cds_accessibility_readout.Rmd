@@ -1,0 +1,282 @@
+---
+title: "CDS accessibility (tco_struct_accessibility_cds_mean): what it measures and the data"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  set_label: "eIF3d promoted"
+  n_verify: 200
+  n_verify_seq: 100
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "36_cds_accessibility_readout.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What the feature is
+
+Kate, 2026-10-27: `tco_struct_accessibility_cds_mean` is the sixth-ranked feature for the
+eIF3d targets (`26d_target_cluster_feature_importance.Rmd`). This notebook says what it
+measures, pulls the per-gene values out of the matrix, and re-derives them from the raw folding
+output so the description below is checked, not assumed.
+
+**Readout: the average probability that a CDS nucleotide is unpaired.** 0 = every position is
+base-paired in essentially every predicted structure; 1 = every position is single-stranded.
+Higher = a more open, less structured CDS. It is a probability, so unitless and bounded [0, 1].
+
+**How it was computed, step by step** (source for each step in brackets):
+
+1. **Which transcript.** One per gene: the most abundant isoform in siCTRL normoxia MDA-MB-231
+   RNA-seq (`output/predictive_modeling/precomputed_most_abundant_tx.rds`, read by
+   `cluster_scripts/viennarna/01b_generate_fasta_cds_utr3.R`). Not the MANE transcript (61% of
+   them are MANE).
+2. **Which sequence.** The CDS alone, from GENCODE v49 (`cdsBy(txdb, by = "tx")` on
+   `txdb.gencode49.sqlite`, genome hg38), sequences >= 10 nt
+   (`01b_generate_fasta_cds_utr3.R`). The CDS is **folded in isolation**: no 5'UTR or 3'UTR is
+   attached, so pairing between the CDS and the UTRs is not modelled. The folded sequence runs
+   from the start codon **through the stop codon** (section 3: 100/100 sampled transcripts start
+   ATG and end TAA/TAG/TGA, and the folded length equals the GENCODE CDS length).
+   **The stop-codon fix from the collaborator reconciliation does not cover structure.** It added
+   stop-free `_internal` variants for GC3, CAI, FOP and CSC only; for structure,
+   `00_feature_reconciliation.Rmd` section 6 decided "keep ours, do not refold". Dropping the
+   stop codon's three positions from the stored profiles (an approximation: a true refold would
+   also shift neighbouring positions) moves `cds_mean` by a median 0.0008 (max 0.017; between-gene
+   sd 0.037) and `stop_proximal_cds` by a median 0.031 (max 0.099), n = 500 transcripts
+   (Kate + Claude, 2026-10-27).
+3. **Folding.** ViennaRNA `RNAplfold -W 150 -L 100 -u 30`, on a compute cluster. RNAplfold
+   folds every 150-nt window sliding along the sequence (`-W 150`), allows base pairs at most
+   100 nt apart (`-L 100`), and averages each position's pairing probability over all windows
+   that contain it. So it captures **local** structure; long-range pairs (> 100 nt) are
+   ignored by design. `-u 30` writes unpaired probabilities for stretches of 1 to 30 nt. The
+   parameters were recovered from the stored files themselves (60/60 byte-identical
+   regenerations, `cluster_scripts/viennarna/02e_validate_rnaplfold_params.R`); the committed
+   cluster script omits `-u 30`. The 5'UTR was folded with *different* parameters
+   (`-W 80 -L 40`), so the 5'UTR and CDS accessibility features are not directly comparable.
+4. **Per-position value.** From each transcript's `_lunp` file
+   (`accessories/plfold_output/rnaplfold_output/cds_rnaplfold_output/<transcript>_lunp`), only
+   the `l=1` column is used: the probability that **the single nucleotide** at position i is
+   unpaired. The `l=2..30` columns (stretches) are not used.
+5. **Aggregate.** `tco_struct_accessibility_cds_mean` = mean of that column over every CDS
+   position. Its siblings: `_start_proximal_cds` = mean of positions 1-30, `_stop_proximal_cds`
+   = mean of the last 30, `_cds_sd` = the sd (`01f_recompute_structure.R`).
+6. **The phantom-zero fix.** The original extraction (`code/predictive_modeling/01k_`) missed
+   the `_lunp` header line because it starts with a space, read it as an all-NA row and filled
+   it with 0, adding a fake "fully paired" position to every transcript. This fork recomputes
+   all structure columns from the same `_lunp` files with correct parsing
+   (`01f_recompute_structure.R`, which first reproduces the buggy values bit-for-bit as proof).
+   For this aggregate the shift is small (median +0.0004); the frozen pipeline's
+   `struct_accessibility_cds_mean` still carries it.
+7. **Missing values.** Transcripts the cluster run never scored were folded locally with the
+   same parameters (`01e_score_missing_structure.R`), and transcripts whose structure had been
+   zero-filled are set back to NA (`01_build_feature_matrix.Rmd`, audit finding F1). Inside the
+   model, remaining NAs are imputed; in this notebook they stay NA.
+
+**What it is not.** It is a prediction from sequence (thermodynamic folding), not a
+measurement - no SHAPE or DMS data are involved. It is also strongly tied to GC content: G-C
+pairs are more stable, so GC-rich sequence is predicted to be more paired. Section 4 measures
+how much of the feature is GC.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+lunp_dir <- here("accessories", "plfold_output", "rnaplfold_output", "cds_rnaplfold_output")
+f_cols <- c(cds_mean = "tco_struct_accessibility_cds_mean",
+            start_30 = "tco_struct_accessibility_start_proximal_cds",
+            stop_30  = "tco_struct_accessibility_stop_proximal_cds",
+            cds_sd   = "tco_struct_accessibility_cds_sd")
+```
+
+# 1. The data
+
+One row per modelled gene (the genes in the intrinsic regression forest), with the feature, its
+three siblings, CDS GC and length, TE change (log2(sictrl / si3d), hypoxia 1hr), whether the gene
+is an eIF3d target, and its cluster in both SHAP clusterings from
+`26b_target_subtypes_features.Rmd` (k = 3; NA for non-targets).
+
+```{r load}
+oof <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "feature columns missing" = all(c(f_cols, "cds_gc", "log2_cds_length") %in% colnames(fm)),
+          "modelled genes missing from the matrix" = all(oof$genes$gene_id_clean %in% fm$gene_id_clean))
+cl <- read_csv(file.path(O, paste0("target_shap_feature_clusters_", params$suffix, ".csv")), show_col_types = FALSE) %>%
+  filter(k == 3, profile %in% c("features, normalized", "features, raw")) %>%
+  transmute(gene_id_clean, profile = if_else(grepl("normalized", profile), "cluster_normalized", "cluster_raw"), cluster) %>%
+  pivot_wider(names_from = profile, values_from = cluster)
+
+d <- oof$genes %>% dplyr::select(gene_id_clean, symbol, te_lfc = y, te_padj = y_padj, set) %>%
+  left_join(fm %>% dplyr::select(gene_id_clean, transcript_id_clean, all_of(unname(f_cols)), cds_gc, log2_cds_length) %>%
+              mutate(across(-c(gene_id_clean, transcript_id_clean), ~ as.numeric(unlist(.x)))), by = "gene_id_clean") %>%
+  dplyr::rename(!!!f_cols) %>%
+  mutate(cds_nt = round(2^log2_cds_length - 1), target = set == params$set_label) %>%
+  left_join(cl, by = "gene_id_clean")
+for (v in names(f_cols)) stopifnot("accessibility outside [0, 1]" = all(d[[v]] >= 0 & d[[v]] <= 1, na.rm = TRUE))
+stopifnot("one row per modelled gene" = nrow(d) == nrow(oof$genes) && !anyDuplicated(d$gene_id_clean),
+          "targets lost clusters" = all(!is.na(d$cluster_normalized[d$target])) && all(is.na(d$cluster_normalized[!d$target])))
+cat(sprintf("%s modelled genes, %d targets | cds_mean present for %s (%.1f%%)\n",
+            scales::comma(nrow(d)), sum(d$target), scales::comma(sum(!is.na(d$cds_mean))), 100 * mean(!is.na(d$cds_mean))))
+summary(d$cds_mean)
+if (SAVE) write_csv(d, file.path(O, paste0("cds_accessibility_readout_", params$suffix, ".csv")))
+```
+
+# 2. Re-derive the values from the folding output
+
+For a random `r params$n_verify` modelled transcripts that have a `_lunp` file: read the `l=1`
+column with correct header handling and take its mean. It must equal the matrix value. Values
+that came from the local re-folding (step 7) have no file here and are not sampled.
+
+```{r verify_lunp}
+read_l1 <- function(fp) {
+  lines <- readLines(fp, warn = FALSE)
+  dl <- lines[(max(grep("^[[:space:]]*#", lines)) + 1):length(lines)]   # header line may start with a space
+  dl <- dl[nzchar(trimws(dl))]
+  x <- strsplit(dl, "\t", fixed = TRUE)
+  tibble(pos = as.integer(vapply(x, `[`, "", 1)), l1 = as.numeric(vapply(x, `[`, "", 2)))
+}
+has_file <- file.exists(file.path(lunp_dir, paste0(d$transcript_id_clean, "_lunp")))
+cat(sprintf("modelled transcripts with a _lunp file: %s of %s\n", scales::comma(sum(has_file)), scales::comma(nrow(d))))
+set.seed(9); vs <- d[has_file & !is.na(d$cds_mean), ] %>% slice_sample(n = params$n_verify)
+ver <- vs %>% mutate(lunp = map(transcript_id_clean, ~ read_l1(file.path(lunp_dir, paste0(.x, "_lunp")))),
+                     n_pos = map_int(lunp, nrow),
+                     consecutive = map_lgl(lunp, ~ identical(.x$pos, seq_len(nrow(.x)))),
+                     any_na = map_lgl(lunp, ~ anyNA(.x$l1)),
+                     re_mean = map_dbl(lunp, ~ mean(.x$l1)),
+                     re_start = map_dbl(lunp, ~ mean(.x$l1[1:min(30, nrow(.x))])),
+                     re_stop = map_dbl(lunp, ~ mean(.x$l1[max(1, nrow(.x) - 29):nrow(.x)])))
+stopifnot("positions are not 1..n" = all(ver$consecutive), "l=1 column has NAs" = !any(ver$any_na),
+          "re-derived mean differs from the matrix" = max(abs(ver$re_mean - ver$cds_mean)) < 1e-9,
+          "re-derived start-proximal differs" = max(abs(ver$re_start - ver$start_30)) < 1e-9,
+          "re-derived stop-proximal differs" = max(abs(ver$re_stop - ver$stop_30)) < 1e-9)
+cat(sprintf("re-derived from _lunp: max |deviation| mean %.1e, first 30 %.1e, last 30 %.1e (n = %d)\n",
+            max(abs(ver$re_mean - ver$cds_mean)), max(abs(ver$re_start - ver$start_30)),
+            max(abs(ver$re_stop - ver$stop_30)), nrow(ver)))
+```
+
+# 3. What sequence was folded: length and the stop codon
+
+The number of `_lunp` positions is the length of the folded sequence. Compare it with the GENCODE
+v49 CDS of the same transcript, and read that CDS's last codon, for `r params$n_verify_seq` of the
+transcripts above.
+
+```{r verify_seq}
+suppressPackageStartupMessages({ library(GenomicFeatures); library(BSgenome.Hsapiens.UCSC.hg38); library(Biostrings) })
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds_all <- cdsBy(txdb, by = "tx", use.names = TRUE)
+names(cds_all) <- sub("[.].*", "", names(cds_all))
+vq <- ver %>% slice_head(n = params$n_verify_seq) %>% filter(transcript_id_clean %in% names(cds_all))
+seqs <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38, cds_all[vq$transcript_id_clean])
+vq <- vq %>% mutate(gencode_cds_nt = width(seqs),
+                    first_codon = as.character(subseq(seqs, 1, 3)),
+                    last_codon = as.character(subseq(seqs, width(seqs) - 2, width(seqs))))
+stopifnot("too few transcripts found in the TxDb" = nrow(vq) >= 0.9 * params$n_verify_seq,
+          "folded length differs from the GENCODE CDS" = all(vq$n_pos == vq$gencode_cds_nt),
+          "matrix CDS length differs from the GENCODE CDS" = all(abs(vq$cds_nt - vq$gencode_cds_nt) <= 1))
+cat(sprintf("folded length = GENCODE CDS length for %d/%d transcripts\n", sum(vq$n_pos == vq$gencode_cds_nt), nrow(vq)))
+cat("first codon:\n"); print(table(vq$first_codon))
+cat("last codon of the folded sequence:\n"); print(table(vq$last_codon))
+stop_frac <- mean(vq$last_codon %in% c("TAA", "TAG", "TGA"))
+cat(sprintf("=> the stop codon %s part of the folded CDS (%.0f%% end in a stop codon)\n",
+            if (stop_frac > 0.9) "IS" else if (stop_frac < 0.1) "is NOT" else "is INCONSISTENTLY", 100 * stop_frac))
+```
+
+# 4. What it tracks: GC and length
+
+Spearman rho across all modelled genes. A feature that is mostly GC in disguise would correlate
+strongly negatively with `cds_gc` (more GC, more pairing, lower accessibility).
+
+```{r confounds}
+cc <- d %>% filter(!is.na(cds_mean))
+rh <- tibble(with = c("cds_gc", "log2_cds_length", "start_30", "stop_30", "cds_sd"),
+             rho = map_dbl(with, ~ cor(cc$cds_mean, cc[[.x]], method = "spearman", use = "complete.obs")),
+             n = map_int(with, ~ sum(!is.na(cc[[.x]]))))
+knitr::kable(rh, digits = 3, caption = "Spearman rho of cds_mean with ...")
+fit <- lm(cds_mean ~ cds_gc, data = cc)
+cat(sprintf("linear fit cds_mean ~ cds_gc: adjusted R2 = %.3f (n = %s) - the share of the feature's variance that is linear in CDS GC\n",
+            summary(fit)$adj.r.squared, scales::comma(nrow(cc))))
+cc$resid_gc <- resid(fit)
+```
+
+```{r fig_gc, fig.width = 7, fig.height = 5.5}
+p_gc <- ggplot(cc %>% arrange(target), aes(cds_gc, cds_mean)) +
+  geom_point(aes(colour = if_else(target, "eIF3d targets", "all other genes")), size = 0.5, alpha = 0.5) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black", linewidth = 0.6) +
+  scale_colour_manual(values = c("eIF3d targets" = "#E69F00", "all other genes" = "grey70"), name = NULL) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4,
+           label = sprintf("Spearman rho = %.2f\nadjusted R2 (linear) = %.2f\nn = %s",
+                           rh$rho[rh$with == "cds_gc"], summary(fit)$adj.r.squared, scales::comma(nrow(cc)))) +
+  labs(x = "CDS GC (%)", y = "mean CDS accessibility (P unpaired)",
+       title = sprintf("%s: CDS accessibility vs CDS GC", params$label),
+       subtitle = "RNAplfold -W 150 -L 100, CDS folded alone;\nunpaired probability (l = 1) averaged over the CDS") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom") + guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1)))
+p_gc
+if (SAVE) ggsave(here("plots", "36_cds_accessibility_vs_cds_gc.pdf"), p_gc, width = 7, height = 5.5)
+```
+
+# 5. Targets and clusters
+
+Accessibility for the eIF3d targets against every other modelled gene, and per SHAP cluster
+(normalized profile, k = 3). Shown raw and as the residual after CDS GC (section 4's linear fit),
+which asks whether targets are more open *than their GC predicts*.
+
+```{r fig_groups, fig.width = 11, fig.height = 5}
+grp <- bind_rows(cc %>% mutate(group = if_else(target, "all targets", "all other genes")),
+                 cc %>% filter(target) %>% mutate(group = paste("cluster", cluster_normalized))) %>%
+  mutate(group = factor(group, levels = c("all other genes", "all targets", paste("cluster", 1:3)))) %>%
+  pivot_longer(c(cds_mean, resid_gc), names_to = "scale", values_to = "value") %>%
+  mutate(scale = recode(scale, cds_mean = "mean CDS accessibility", resid_gc = "residual after CDS GC"))
+n_lab <- grp %>% filter(scale == "mean CDS accessibility") %>% dplyr::count(group) %>%
+  mutate(lab = sprintf("%s\n(n = %s)", group, scales::comma(n)))
+wt <- grp %>% group_by(scale) %>%
+  summarise(p = wilcox.test(value[group == "all targets"], value[group == "all other genes"])$p.value, .groups = "drop")
+p_grp <- ggplot(grp, aes(group, value, fill = group)) +
+  geom_boxplot(outlier.size = 0.3, linewidth = 0.4) +
+  geom_text(data = wt, aes(x = Inf, y = Inf, label = sprintf("targets vs others\nWilcoxon p = %.1e", p)),
+            hjust = 1.1, vjust = 1.4, inherit.aes = FALSE, size = 3.3) +
+  scale_fill_manual(values = c("all other genes" = "grey70", "all targets" = "#E69F00",
+                               "cluster 1" = "#0072B2", "cluster 2" = "#CC79A7", "cluster 3" = "#009E73"), guide = "none") +
+  scale_x_discrete(labels = setNames(n_lab$lab, n_lab$group)) +
+  facet_wrap(~ scale, scales = "free_y") +
+  labs(x = NULL, y = NULL, title = sprintf("%s: CDS accessibility by group", params$label),
+       subtitle = "clusters = eIF3d targets grouped by normalized SHAP profile, k = 3") +
+  theme_classic(base_size = 12) + theme(axis.text.x = element_text(size = 9))
+p_grp
+if (SAVE) ggsave(here("plots", "36_cds_accessibility_by_group.pdf"), p_grp, width = 11, height = 5)
+
+# Relationship with TE change across all modelled genes, raw and GC-adjusted
+knitr::kable(tibble(measure = c("cds_mean", "residual after CDS GC", "cds_gc (for reference)"),
+                    rho_with_te_change = c(cor(cc$cds_mean, cc$te_lfc, method = "spearman"),
+                                           cor(cc$resid_gc, cc$te_lfc, method = "spearman"),
+                                           cor(cc$cds_gc, cc$te_lfc, method = "spearman")),
+                    n = nrow(cc)), digits = 3,
+             caption = "Spearman rho with TE change, log2(sictrl / si3d), all modelled genes")
+med_tab <- function(x) x %>% summarise(n = n(), median_cds_mean = median(cds_mean), median_resid_gc = median(resid_gc),
+                                       median_cds_gc = median(cds_gc), .groups = "drop")
+knitr::kable(bind_rows(cc %>% group_by(group = if_else(target, "all targets", "all other genes")) %>% med_tab(),
+                       cc %>% filter(target) %>% group_by(group = paste("cluster", cluster_normalized)) %>% med_tab()),
+             digits = 4, caption = "medians per group")
+```
+
+```{r session}
+sessionInfo()
+```

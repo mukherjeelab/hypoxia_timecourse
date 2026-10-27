@@ -1,0 +1,394 @@
+---
+title: "`r paste0('Where ', params$gene, ' sits on the top eIF3d hypoxia model features: ', c('231' = 'MDA-MB-231', mcf7six1 = 'MCF7-SIX1')[[params$cell_line]])`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  gene: "RAC1"
+  cell_line: "231"            # "231" or "mcf7six1" - picks the feature matrix (the background)
+  top_n: 15
+  gene_top_n: 10              # rows in the figure ordered by the gene's own SHAP
+  # The feature list comes from this one model for every cell line, so the figures are comparable
+  rank_from: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+  # Required whenever rank_from is not the default: filenames do not carry rank_from, so an
+  # untagged run on another model would overwrite this one's outputs
+  out_tag: ""                 # e.g. "intrinsic" -> 35_gene_feature_percentiles_intrinsic_...
+  model_desc: "TE regression forest"   # how subtitles name the model
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+# params only exists during knit; running chunks by hand needs this fallback
+if (!exists("params") || !is.list(params))
+  params <- list(gene = "RAC1", cell_line = "231", top_n = 15, gene_top_n = 10,
+                 rank_from = "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw",
+                 out_tag = "", model_desc = "TE regression forest",
+                 save_plots = TRUE)
+```
+
+# Purpose
+
+Where does one gene sit, feature by feature, relative to every other transcript in a cell
+line's feature matrix? One row per feature on a shared 0-100 percentile scale, so lengths in
+nucleotides, GC in percent and accessibility on 0-1 can share one axis. The gene's value is
+printed beside each row.
+
+- **Which features:** the `top_n` features with the largest mean |SHAP| in an MDA-MB-231 si3d
+  hypoxia 1hr TE regression forest (`rank_from`, SHAP from `11_shap_regression.Rmd`). The
+  default model has intrinsic and external features; `rank_from` can point at another, such as
+  the intrinsic-only forest, with `out_tag` set so its outputs get their own filenames. The same
+  list is used for both cell lines.
+- **Background:** every transcript in the chosen cell line's feature matrix, each on that cell
+  line's own dominant isoform (`feature_matrix_tco.rds` for MDA-MB-231,
+  `feature_matrix_tco_mcf7six1.rds` for MCF7-SIX1).
+- **Percentile** is mid-rank: the share of transcripts below the gene's value plus half the share
+  tied with it, so a value shared by many transcripts lands in the middle of that tie rather
+  than at its top.
+- **Descriptive only.** This shows where the gene sits, not how the model used those values for
+  this gene; that needs the gene's own SHAP values.
+
+```{r libs}
+library(tidyverse)
+library(here)
+library(treeshap)
+
+O <- here("output", "translational_control_overview")
+GENE <- params$gene
+CELL <- params$cell_line
+stopifnot("cell_line must be 231 or mcf7six1" = CELL %in% c("231", "mcf7six1"))
+CELL_LABEL <- c("231" = "MDA-MB-231", mcf7six1 = "MCF7-SIX1")[[CELL]]
+DEFAULT_RANK_FROM <- "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_corrected_both_clipaggregate_yraw"
+stopifnot("out_tag is required when rank_from is not the default model - outputs would overwrite it" =
+            params$rank_from == DEFAULT_RANK_FROM || nzchar(params$out_tag))
+OUT_STEM   <- paste0("35_gene_feature_percentiles", if (nzchar(params$out_tag)) paste0("_", params$out_tag))
+MODEL_DESC <- params$model_desc
+# Figure height for n feature rows: 5.5 in at the default 15, so default figures keep their size
+fig_h <- function(n) 1.6 + 0.26 * n
+GENE_COL <- "#0072B2"   # Okabe-Ito dark blue; orange / sky blue are reserved for si3d / si3e
+TARGET_COL <- "#009E73" # Okabe-Ito bluish green: eIF3d target interquartile band
+```
+
+# Load
+
+```{r load}
+mat_file <- c("231" = "feature_matrix_tco.rds", mcf7six1 = "feature_matrix_tco_mcf7six1.rds")[[CELL]]
+fm <- readRDS(file.path(O, mat_file))
+
+shap_file  <- file.path(O, paste0("shapreg_feature_", params$rank_from, ".csv"))
+model_file <- file.path(O, paste0("rfreg_model_", params$rank_from, ".rds"))
+shap <- read_csv(shap_file, show_col_types = FALSE)
+
+top <- shap %>%
+  arrange(desc(mean_abs_shap)) %>%
+  slice_head(n = params$top_n) %>%
+  mutate(rank = row_number()) %>%
+  dplyr::select(rank, feature, family, block, mean_abs_shap, share_pct)
+
+# eIF3d targets in this cell line (TE promoted by eIF3d, hypoxia 1hr, lfc > 0.5)
+target_file <- here("output", "genesets",
+                    c("231" = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
+                      mcf7six1 = "mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv")[[CELL]])
+targets <- read_csv(target_file, show_col_types = FALSE)
+is_target <- fm$gene_id_clean %in% targets$ensembl_gene
+```
+
+# Checks
+
+```{r checks}
+stopifnot(
+  # SHAP written before the model was last refit would explain a different forest
+  "SHAP output predates the model it ranks - re-render 11_shap_regression.Rmd" =
+    file.mtime(shap_file) >= file.mtime(model_file),
+  "SHAP ranks are not 1..n in mean |SHAP| order" =
+    identical(as.integer(shap$rank_shap[order(-shap$mean_abs_shap)]), seq_len(nrow(shap))),
+  "fewer features than top_n" = nrow(top) == params$top_n,
+  "a top feature is missing from the feature matrix" = all(top$feature %in% names(fm)),
+  "gene missing from the feature matrix" = GENE %in% fm$symbol,
+  "gene has more than one transcript in the matrix" = sum(fm$symbol == GENE, na.rm = TRUE) == 1,
+  "target set has no ensembl_gene column" = "ensembl_gene" %in% names(targets),
+  # gene-keyed set against a transcript-keyed matrix: one transcript per gene, so no double counting
+  "a target gene has more than one transcript in the matrix" =
+    !anyDuplicated(fm$gene_id_clean[is_target]),
+  "fewer than half the target set is in the feature matrix" = sum(is_target) > 0.5 * nrow(targets)
+)
+cat("eIF3d targets:", nrow(targets), "in set,", sum(is_target), "in the", CELL_LABEL, "feature matrix\n")
+
+# Internal consistency: each log2 length must be log2(raw length + 1), its definition in
+# predictive_modeling/01_feature_extraction.Rmd, for every transcript
+for (r in c("utr5", "cds", "utr3", "total")) {
+  dev <- max(abs(fm[[paste0("log2_", r, "_length")]] - log2(fm[[paste0(r, "_length")]] + 1)), na.rm = TRUE)
+  stopifnot("log2 length is not log2(raw length + 1)" = dev < 1e-9)
+}
+
+# Outside the matrix: CDS length must equal (protein length + stop) x 3, protein lengths from
+# UniProt (RAC1 P63000, PFN1 P07737). Only genes listed here are checked.
+uniprot_aa <- c(RAC1 = 192, PFN1 = 140)
+g <- fm %>% filter(symbol == GENE)
+if (GENE %in% names(uniprot_aa)) {
+  cat(GENE, g$transcript_id_clean, "CDS", g$cds_length, "nt; UniProt", uniprot_aa[[GENE]], "aa\n")
+  stopifnot("CDS length does not match the UniProt protein length" =
+              g$cds_length == (uniprot_aa[[GENE]] + 1) * 3)
+}
+```
+
+# Percentiles
+
+```{r percentiles}
+pct_of <- function(x, v) {
+  x <- x[!is.na(x)]
+  if (is.na(v)) return(NA_real_)
+  100 * (sum(x < v) + 0.5 * sum(x == v)) / length(x)
+}
+
+# Every transcript's mid-rank percentile in one pass: average rank r = (n below) + (n tied + 1)/2,
+# so 100 * (r - 0.5) / n is the same quantity pct_of() computes for a single value
+pct_all <- function(x) 100 * (rank(x, ties.method = "average", na.last = "keep") - 0.5) / sum(!is.na(x))
+
+# Targets' own percentiles against the same background
+tgt_pct_of <- function(f) { p <- pct_all(fm[[f]])[is_target]; p[!is.na(p)] }
+
+# The gene's value and percentile on each feature, plus the targets' centre (median: where do
+# targets sit?) and spread (quartiles: is the gene target-like?). Used for both feature lists.
+summarise_features <- function(tbl) {
+  tbl %>%
+    mutate(n_tx       = map_int(feature, ~ sum(!is.na(fm[[.x]]))),
+           median     = map_dbl(feature, ~ median(fm[[.x]], na.rm = TRUE)),
+           value      = map_dbl(feature, ~ g[[.x]]),
+           pct        = map2_dbl(feature, value, ~ pct_of(fm[[.x]], .y)),
+           symbol = GENE, transcript_id_clean = g$transcript_id_clean,
+           tgt_n      = map_int(feature, ~ length(tgt_pct_of(.x))),
+           tgt_q25    = map_dbl(feature, ~ quantile(tgt_pct_of(.x), 0.25)),
+           tgt_median = map_dbl(feature, ~ median(tgt_pct_of(.x))),
+           tgt_q75    = map_dbl(feature, ~ quantile(tgt_pct_of(.x), 0.75)))
+}
+
+check_features <- function(tbl) {
+  stopifnot("percentile outside 0-100" = all(between(tbl$pct, 0, 100), na.rm = TRUE),
+            "pct_all disagrees with pct_of for the gene" =
+              all(abs(map_dbl(tbl$feature, ~ pct_all(fm[[.x]])[fm$symbol %in% GENE]) - tbl$pct) < 1e-9,
+                  na.rm = TRUE),
+            "target quartiles outside 0-100, or median not between them" =
+              all(between(tbl$tgt_q25, 0, 100) & tbl$tgt_q25 <= tbl$tgt_median &
+                  tbl$tgt_median <= tbl$tgt_q75))
+  invisible(tbl)
+}
+
+res <- check_features(summarise_features(top))
+
+# A random draw of n transcripts has median percentile ~ 50 +/- 100 * 0.5 / sqrt(n), the
+# reference scale for how far a target median sits from the middle
+cat("Null sd of the median percentile for", sum(is_target), "random transcripts:",
+    round(100 * 0.5 / sqrt(sum(is_target)), 2), "points\n")
+cat("Values not measured for", GENE, ":", sum(is.na(res$value)), "\n")
+
+knitr::kable(res %>% dplyr::select(rank, feature, family, mean_abs_shap, value, pct, median, n_tx),
+             digits = c(0, 0, 0, 4, 3, 1, 3, 0),
+             caption = paste0(GENE, ": top ", params$top_n, " features by mean |SHAP| (MDA-MB-231 model), ",
+                              "percentile among ", CELL_LABEL, " transcripts"))
+
+if (params$save_plots) {
+  out_csv <- file.path(O, sprintf("%s_%s_%s.csv", OUT_STEM, CELL, GENE))
+  write_csv(res, out_csv)
+  cat("Saved", out_csv, "\n")
+}
+```
+
+# Figure
+
+```{r figure, fig.width = 9, fig.height = fig_h(params$top_n)}
+fmt <- function(f, v) {
+  case_when(is.na(v) ~ "not measured",
+            # log2 lengths read more easily with the nucleotide count beside them; formatC, not
+            # format: format() picks one style for the whole vector and goes scientific
+            str_detect(f, "^log2_.*_length$") ~ sprintf("%.2f (%s nt)", v, formatC(round(2^v - 1), format = "d", big.mark = ",")),
+            abs(v) >= 100 ~ formatC(round(v), format = "d", big.mark = ","),
+            TRUE ~ as.character(signif(v, 3)))
+}
+VAL_X <- 108
+
+# Row 1 at the top
+make_plot_df <- function(tbl) tbl %>% mutate(y = rev(seq_len(n()))[rank], txt = fmt(feature, value))
+
+base_plot <- function(plot_df, title, subtitle) {
+  ggplot(plot_df) +
+    geom_segment(aes(x = 0, xend = 100, y = y, yend = y), colour = "grey80", linewidth = 0.6) +
+    geom_point(data = plot_df %>% crossing(q = c(25, 75)), aes(x = q, y = y),
+               shape = 124, size = 2.5, colour = "grey60") +
+    geom_point(aes(x = 50, y = y), shape = 124, size = 3.5, colour = "grey30") +
+    geom_point(data = plot_df %>% filter(!is.na(pct)), aes(x = pct, y = y), colour = GENE_COL, size = 3) +
+    geom_text(aes(x = VAL_X, y = y, label = txt), colour = GENE_COL, size = 3.2, hjust = 0) +
+    annotate("text", x = VAL_X, y = nrow(plot_df) + 0.9, label = "Value", size = 3.4,
+             hjust = 0, fontface = "bold") +
+    # the axis line spans the 0-100 scale only, not the value column to its right
+    annotate("segment", x = 0, xend = 100, y = -Inf, yend = -Inf, linewidth = 0.5) +
+    scale_y_continuous(breaks = plot_df$y, labels = plot_df$feature, expand = expansion(add = c(0.6, 1.4))) +
+    scale_x_continuous(breaks = c(0, 25, 50, 75, 100), limits = c(-1, VAL_X + 28),
+                       expand = expansion(add = c(0, 0))) +
+    coord_cartesian(clip = "off") +
+    labs(x = paste0("Percentile among ", CELL_LABEL, " transcripts"), y = NULL,
+         title = title, subtitle = subtitle) +
+    theme_classic(base_size = 12) +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(), axis.line.x = element_blank(),
+          axis.text.y = element_text(size = 10, colour = "black"),
+          plot.title.position = "plot",   # align with the feature labels so the title is not clipped
+          plot.title = element_text(face = "bold", size = 13),
+          plot.subtitle = element_text(size = 10),
+          plot.margin = margin(10, 10, 10, 10))
+}
+
+model_title <- paste0(GENE, ": top features for eIF3d regulation in hypoxia, ", CELL_LABEL, " transcriptome")
+model_sub   <- paste0("Top ", params$top_n, " features by SHAP importance in the MDA-MB-231 ",
+                      "si3d hypoxia 1hr ", MODEL_DESC, ".")
+plot_df <- make_plot_df(res)
+p <- base_plot(plot_df, model_title, model_sub)
+p
+
+if (params$save_plots) {
+  out <- here("plots", sprintf("%s_%s_%s.pdf", OUT_STEM, CELL, GENE))
+  ggsave(out, p, width = 9, height = fig_h(params$top_n))
+  cat("Saved", out, "\n")
+}
+```
+
+# Figure with the eIF3d target median
+
+The green tick is the eIF3d target median, on the same transcriptome percentile scale as the
+gene: where targets sit as a group. Random draws of the same size have a median at
+50 +/- ~1.3 points, so a median well off the grey 50 tick means targets are shifted on that
+feature.
+
+This is the targets' centre, not their spread. Their 25th-75th percentile range spans 40-54
+points (60 for the tied CLIP count), against exactly 50 for the transcriptome, so a gene off
+the median can still be a typical target; the quartiles are in the results CSV
+(`tgt_q25` / `tgt_q75`).
+
+```{r figure-target-median, fig.width = 9, fig.height = fig_h(params$top_n)}
+# base_plot's layers are, in order: grey line, 25/75 ticks, 50 tick, gene point, value text,
+# header, axis. Target layers go above the grey line and ticks but below the gene point; the
+# spread bar is translucent so the grey line shows through.
+add_target_layers <- function(p, plot_df, spread) {
+  stopifnot("base_plot's layer order changed - update the insertion point" =
+              inherits(p$layers[[4]]$geom, "GeomPoint") && inherits(p$layers[[5]]$geom, "GeomText"))
+  new <- list(geom_segment(data = plot_df,
+                           aes(x = tgt_median, xend = tgt_median, y = y - 0.3, yend = y + 0.3),
+                           colour = TARGET_COL, linewidth = 0.9))
+  if (spread)
+    new <- c(list(geom_rect(data = plot_df,
+                            aes(xmin = tgt_q25, xmax = tgt_q75, ymin = y - 0.16, ymax = y + 0.16),
+                            fill = TARGET_COL, alpha = 0.25)), new)
+  p$layers <- c(p$layers[1:3], new, p$layers[-(1:3)])
+  p
+}
+
+p_median <- add_target_layers(p, plot_df, spread = FALSE) +
+  labs(subtitle = paste0(model_sub, "\nGreen tick: median of ", CELL_LABEL,
+                         " eIF3d targets (n = ", sum(is_target), ")."))
+p_median
+
+if (params$save_plots) {
+  out <- here("plots", sprintf("%s_targetmedian_%s_%s.pdf", OUT_STEM, CELL, GENE))
+  ggsave(out, p_median, width = 9, height = fig_h(params$top_n))
+  cat("Saved", out, "\n")
+}
+```
+
+# Figure with the eIF3d target median and spread
+
+The same median tick, plus a faded green bar from the 25th to the 75th percentile of eIF3d
+targets: their spread. A gene inside the bar is target-like on that feature. If targets were a
+random draw from the transcriptome, the bar would sit on the grey 25/75 ticks.
+
+```{r figure-target-spread, fig.width = 9, fig.height = fig_h(params$top_n)}
+spread_sub <- paste0(model_sub, "\nGreen: ", CELL_LABEL, " eIF3d targets (n = ", sum(is_target),
+                     "); tick = median, bar = 25th-75th percentile.")
+p_spread <- add_target_layers(p, plot_df, spread = TRUE) + labs(subtitle = spread_sub)
+p_spread
+
+if (params$save_plots) {
+  out <- here("plots", sprintf("%s_targetspread_%s_%s.pdf", OUT_STEM, CELL, GENE))
+  ggsave(out, p_spread, width = 9, height = fig_h(params$top_n))
+  cat("Saved", out, "\n")
+}
+```
+
+# Features ranked by the gene's own SHAP
+
+The figures above use the model's overall top features, the same list for every gene. This one
+picks the `gene_top_n` features with the largest |SHAP| **for this gene**, from all modelled
+features, and orders the rows by it: the features that moved this gene's prediction most. The
+SHAP values set the order only; the plot itself is the median-and-spread figure.
+
+- **In-sample when the gene was a training gene.** SHAP is exact for the forest's prediction
+  for this gene, but if the forest was fit on the gene, that prediction is pulled toward the
+  gene's true TE change, so the ranking partly reflects what the forest learned about the gene
+  itself. The split is printed below and stated in the subtitle.
+- **SHAP always comes from the MDA-MB-231 model and that cell line's isoform**, whichever
+  `cell_line` sets the percentile background.
+
+```{r gene-shap}
+rf <- readRDS(model_file)
+md <- readRDS(file.path(O, paste0("rfreg_model_data_", params$rank_from, ".rds")))
+stopifnot("the saved model data does not belong to rank_from's model" =
+            identical(md$suffix, params$rank_from),
+          "this is not a regression forest - treeshap cannot explain a probability forest" =
+            rf$treetype == "Regression")
+feature_cols <- md$feature_cols
+
+gene_row <- bind_rows(md$train %>% mutate(split = "train"), md$test %>% mutate(split = "test")) %>%
+  filter(gene_id_clean == g$gene_id_clean)
+stopifnot("gene is not in the model's data, or is in it more than once" = nrow(gene_row) == 1)
+
+# Exact TreeSHAP on the saved forest, as in 11_shap_regression.Rmd. Column order re-imposed:
+# treeshap returns $shaps in its own order.
+unified  <- ranger.unify(rf, as.data.frame(md$train[, feature_cols]))
+gene_x   <- as.data.frame(gene_row)[, feature_cols]
+gene_sv  <- treeshap(unified, gene_x, interactions = FALSE, verbose = FALSE)$shaps[, feature_cols]
+pred     <- predict(rf, data = gene_x)$predictions
+baseline <- mean(predict(rf, data = as.data.frame(md$train[, feature_cols]))$predictions)
+cat(sprintf("%s: %s gene | TE change %.3f | forest prediction %.3f | baseline %.3f | sum of SHAP %.3f\n",
+            GENE, gene_row$split, gene_row$y, pred, baseline, sum(gene_sv)))
+stopifnot("SHAP does not add up to the forest's prediction for this gene" =
+            abs(pred - sum(gene_sv) - baseline) < 1e-6)
+
+gene_top <- tibble(feature = feature_cols, shap = as.numeric(gene_sv[1, ])) %>%
+  arrange(desc(abs(shap))) %>%
+  slice_head(n = params$gene_top_n) %>%
+  mutate(rank = row_number())
+stopifnot("a feature is missing from the feature matrix" = all(gene_top$feature %in% names(fm)))
+
+gene_res <- check_features(summarise_features(gene_top))
+cat("Also in the model-wide top", params$top_n, ":", sum(gene_top$feature %in% top$feature),
+    "of", params$gene_top_n, "\n")
+knitr::kable(gene_res %>% dplyr::select(rank, feature, shap, value, pct, tgt_median),
+             digits = c(0, 0, 4, 3, 1, 1),
+             caption = paste0(GENE, ": top ", params$gene_top_n, " features by its own |SHAP|"))
+
+if (params$save_plots) {
+  out_csv <- file.path(O, sprintf("%s_geneshap_%s_%s.csv", OUT_STEM, CELL, GENE))
+  write_csv(gene_res %>% mutate(split = gene_row$split), out_csv)
+  cat("Saved", out_csv, "\n")
+}
+```
+
+```{r figure-gene-shap, fig.width = 9, fig.height = fig_h(params$gene_top_n)}
+gene_plot_df <- make_plot_df(gene_res)
+p_gene <- base_plot(gene_plot_df,
+                    paste0(GENE, ": its top features for eIF3d regulation in hypoxia, ",
+                           CELL_LABEL, " transcriptome"),
+                    paste0("Top ", params$gene_top_n, " features by ", GENE, "'s own SHAP in the ",
+                           "MDA-MB-231 si3d hypoxia 1hr ", MODEL_DESC, ".\n", GENE, " was a ",
+                           c(train = "training", test = "held-out")[[gene_row$split]], " gene. Green: ",
+                           CELL_LABEL, " eIF3d targets (n = ", sum(is_target),
+                           "); tick = median, bar = 25th-75th percentile."))
+p_gene <- add_target_layers(p_gene, gene_plot_df, spread = TRUE)
+p_gene
+
+if (params$save_plots) {
+  out <- here("plots", sprintf("%s_geneshap_%s_%s.pdf", OUT_STEM, CELL, GENE))
+  ggsave(out, p_gene, width = 9, height = fig_h(params$gene_top_n))
+  cat("Saved", out, "\n")
+}
+```

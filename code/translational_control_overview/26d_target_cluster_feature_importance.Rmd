@@ -1,0 +1,768 @@
+---
+title: "`r paste0('Which features matter for ', params$set_word, ', overall and per cluster: ', params$label)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  set_label: "eIF3d promoted"
+  set_word: "eIF3d targets"
+  profile: "features, normalized"
+  k: 3
+  n_rep: 20
+  n_fold: 5
+  n_boot: 200
+  n_top: 12
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "26d_target_cluster_feature_importance.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-27: identify the features that matter most for the `r params$set_word`, overall
+and per SHAP cluster, and which features matter more in one cluster than another.
+`26b_target_subtypes_features.Rmd` clusters the targets; this notebook only reads its result.
+
+- **SHAP is reused, not recomputed.** Each gene's SHAP comes from `23_shap_gene_clustering.Rmd`'s
+  out-of-fold run of the intrinsic regression forest (predicting TE change, log2(sictrl / si3d),
+  on all modelled genes); each gene is explained by a forest that never trained on it.
+- **Clusters** are `26b_`'s `r params$profile` k = `r params$k` clustering, re-derived here and
+  asserted equal to its saved CSV.
+
+**Terms used below.**
+
+- **Share**: a feature's |SHAP| divided by the gene's total |SHAP| over all features, averaged
+  over a group of genes. "What fraction of the model's explanation of these genes goes through
+  this feature." This is the scale the clustering used.
+- **Absolute**: mean |SHAP| in TE-change units. Shares are zero-sum within a gene - if one family
+  dominates a cluster, every other feature's share there shrinks - so a difference in share alone
+  can come from *other* features. A difference present on both scales is a real one.
+- **Family**: SHAP is additive, so a family's SHAP is the exact sum of its members' signed SHAP.
+  Correlated features (the GC columns, the length columns) split credit; the family level does not.
+- **Direction**: Spearman rho between a feature's value and its own SHAP within the targets.
+  Positive = a higher value pushes predicted TE change up (more eIF3d-dependent).
+- **Held-out labels (cross-fitting)**: the targets are split into `r params$n_fold` folds; for each
+  fold, k-means is fitted on the other folds, its centres are matched to the reported clusters,
+  and the fold's genes are assigned to the nearest centre. Every gene gets a label it did not help
+  define. Repeated `r params$n_rep` times with different splits.
+- **Sign consistency**: in each repeat, the difference is recomputed on a bootstrap resample of
+  genes under that repeat's held-out labels. The count of repeats (of `r params$n_rep`) whose sign
+  matches the original difference. It is graded, not a filter; the random-label control in
+  section 3 says what count pure noise reaches.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(patchwork) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+K <- as.integer(params$k)
+ptag <- sub("_lfc.*$", "", sub("^eif33d_promotes_", "", params$suffix))
+lab_set <- paste(params$label, params$set_word)
+div <- c("#0072B2", "white", "#D55E00")
+```
+
+# 1. Targets, SHAP and clusters
+
+```{r load}
+oof <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+fc <- colnames(oof$S)
+ann <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+fam <- setNames(ann$family[match(fc, ann$feature)], fc)
+stopifnot("a feature has no family" = !anyNA(fam),
+          "SHAP rows and genes out of step" = identical(rownames(oof$S), oof$genes$gene_id_clean))
+fam_cols <- setNames(colorRampPalette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+                                        "#D55E00", "#CC79A7", "grey50"))(n_distinct(fam)), sort(unique(fam)))
+rows <- fc[order(fam, fc)]                 # same row order as 26b_'s heatmaps
+fams <- sort(unique(fam))
+
+norm_rows <- function(M) M / pmax(rowSums(abs(M)), 1e-12)
+tg <- oof$genes$set == params$set_label
+genes <- oof$genes[tg, ]
+S <- oof$S[tg, , drop = FALSE]
+Sn <- norm_rows(S)
+# family SHAP = exact sum of members' signed SHAP
+famsum <- function(M) sapply(fams, function(f) rowSums(M[, fam == f, drop = FALSE]))
+Sf <- famsum(S); Sfn <- norm_rows(Sf)
+stopifnot("normalized rows do not sum to 1" = all(abs(rowSums(abs(Sn)) - 1) < 1e-9),
+          "family sums do not reproduce the gene total" = max(abs(rowSums(Sf) - rowSums(S))) < 1e-9)
+
+# Re-derive 26b_'s clustering exactly as it does it, then assert against its saved CSV
+stopifnot("only the normalized profile is clustered on Sn here" = params$profile == "features, normalized")
+set.seed(9); km <- kmeans(Sn, centers = K, nstart = 25, iter.max = 50)
+relab <- match(seq_len(K), as.integer(names(sort(table(km$cluster), decreasing = TRUE))))
+cl <- relab[km$cluster]                                       # largest = 1, as in 26b_
+C_ref <- km$centers[order(relab), , drop = FALSE]             # row j = centre of cluster j
+saved <- read_csv(file.path(O, paste0("target_shap_feature_clusters_", params$suffix, ".csv")), show_col_types = FALSE) %>%
+  filter(profile == params$profile, k == K)
+stopifnot("saved clustering missing - knit 26b_ first" = nrow(saved) == nrow(genes),
+          "clusters differ from 26b_'s saved CSV" =
+            identical(as.integer(saved$cluster[match(genes$gene_id_clean, saved$gene_id_clean)]), as.integer(cl)),
+          "relabelled centres do not reproduce the clusters" =
+            identical(max.col(-sapply(seq_len(K), function(j) rowSums(sweep(Sn, 2, C_ref[j, ])^2))), as.integer(cl)))
+n_cl <- table(cl)
+cat(sprintf("%d targets of %d modelled genes | %d features in %d families | cluster sizes %s\n",
+            nrow(genes), nrow(oof$genes), length(fc), length(fams), paste(n_cl, collapse = " / ")))
+
+# Feature values for direction, unimputed, as in 26b_
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "targets missing from the matrix" = !anyNA(match(genes$gene_id_clean, fm$gene_id_clean)))
+X <- fm[match(genes$gene_id_clean, fm$gene_id_clean), fc] %>%
+  mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>% as.matrix()
+```
+
+# 2. Overall: the most important features for the targets
+
+Ranked by share within the targets. The interval is the 5-95% range over `r params$n_boot`
+bootstrap resamples of the targets, for both the share and the rank. Non-target share is the same
+quantity over every other modelled gene, so `target - non-target` says which features carry more
+of the explanation for targets than for a typical gene.
+
+```{r overall}
+dir_rho <- function(Xm, Sm) sapply(colnames(Sm), function(f) {
+  x <- Xm[, f]; if (sum(!is.na(x)) < 10 || sd(x, na.rm = TRUE) == 0) NA_real_ else
+    suppressWarnings(cor(x, Sm[, f], method = "spearman", use = "complete.obs")) })
+Snt <- norm_rows(oof$S[!tg, , drop = FALSE]); Sfnt <- norm_rows(famsum(oof$S[!tg, , drop = FALSE]))
+
+set.seed(9); boots <- replicate(params$n_boot, sample(nrow(genes), replace = TRUE), simplify = FALSE)
+summ_level <- function(An, A, Ant, Xm, Sm, ids) {
+  sh <- colMeans(abs(An))
+  bs <- sapply(boots, function(i) colMeans(abs(An[i, , drop = FALSE])))
+  br <- apply(bs, 2, function(v) rank(-v))
+  rho <- if (is.null(Xm)) NULL else dir_rho(Xm, Sm)
+  brho <- if (is.null(Xm)) NULL else sapply(boots[seq_len(min(50, length(boots)))], function(i) dir_rho(Xm[i, , drop = FALSE], Sm[i, , drop = FALSE]))
+  tibble(name = ids, share = sh, share_lo = apply(bs, 1, quantile, 0.05), share_hi = apply(bs, 1, quantile, 0.95),
+         rank = rank(-sh), rank_lo = apply(br, 1, quantile, 0.05), rank_hi = apply(br, 1, quantile, 0.95),
+         absolute = colMeans(abs(A)), share_nontargets = colMeans(abs(Ant)),
+         target_minus_nontarget = sh - colMeans(abs(Ant)),
+         direction_rho = if (is.null(rho)) NA_real_ else rho,
+         direction_sign_kept = if (is.null(rho)) NA_real_ else rowMeans(sign(brho) == sign(rho), na.rm = TRUE)) %>%
+    arrange(rank)
+}
+ov_feat <- summ_level(Sn, S, Snt, X, S, fc) %>% mutate(family = fam[name], .after = name)
+ov_fam <- summ_level(Sfn, Sf, Sfnt, NULL, NULL, fams) %>% mutate(family = name, .after = name)
+stopifnot("feature shares do not sum to 1" = abs(sum(ov_feat$share) - 1) < 1e-9,
+          "family shares do not sum to 1" = abs(sum(ov_fam$share) - 1) < 1e-9,
+          "direction outside [-1, 1]" = all(abs(ov_feat$direction_rho) <= 1, na.rm = TRUE))
+ov_feat <- ov_feat %>% mutate(direction = case_when(is.na(direction_rho) ~ "n/a",
+                                                    direction_sign_kept < 0.9 ~ "unclear",
+                                                    direction_rho > 0 ~ "higher value -> higher TE change",
+                                                    TRUE ~ "higher value -> lower TE change"))
+cat("Families:\n")
+knitr::kable(ov_fam %>% dplyr::select(family, share, share_lo, share_hi, rank, rank_lo, rank_hi, share_nontargets, target_minus_nontarget) %>%
+               mutate(across(starts_with("share") | target_minus_nontarget, ~ 100 * .x)), digits = 1,
+             caption = "family share of the explanation, % (targets vs non-targets)")
+knitr::kable(ov_feat %>% head(20) %>% dplyr::select(name, family, share, share_lo, share_hi, rank, rank_lo, rank_hi,
+                                                     target_minus_nontarget, direction_rho, direction) %>%
+               mutate(across(c(share, share_lo, share_hi, target_minus_nontarget), ~ 100 * .x)), digits = c(0, 0, 2, 2, 2, 0, 0, 0, 2, 2, 0),
+             caption = "top 20 features by share, % (direction 'unclear' = sign kept in < 90% of 50 bootstraps)")
+```
+
+```{r fig_overall, fig.width = 13, fig.height = 10}
+p_ov <- function(d, title, ylab_txt) {
+  d <- d %>% mutate(name = fct_reorder(name, share))
+  ggplot(d, aes(y = name)) +
+    geom_errorbarh(aes(xmin = 100 * share_lo, xmax = 100 * share_hi), height = 0, colour = "grey40") +
+    geom_point(aes(x = 100 * share_nontargets), shape = 1, colour = "grey50", size = 1.8) +
+    geom_point(aes(x = 100 * share, colour = family), size = 2.2) +
+    scale_colour_manual(values = fam_cols) +
+    labs(x = "share of the explanation (%)", y = NULL, title = title) +
+    theme_classic(base_size = 12) + theme(axis.text.y = element_text(size = if (nrow(d) > 20) 7 else 10))
+}
+p_all <- (p_ov(ov_feat, "features", "") + theme(legend.position = "none")) + p_ov(ov_fam, "families", "") +
+  plot_layout(widths = c(1, 0.8)) +
+  plot_annotation(title = sprintf("%s: what the model's explanation of the targets goes through", lab_set),
+                  subtitle = sprintf("filled = targets (n = %s), bar = 5-95%% over %d bootstraps; open grey = all other modelled genes (n = %s)\nshare = |SHAP| / gene's total |SHAP|, averaged over genes; family = exact sum of members' SHAP",
+                                     scales::comma(nrow(genes)), params$n_boot, scales::comma(sum(!tg))))
+p_all
+if (SAVE) ggsave(here("plots", paste0("26d_target_feature_importance_overall_", ptag, ".pdf")), p_all, width = 13, height = 10)
+```
+
+# 3. Per cluster: which features matter more in one cluster than another
+
+Each comparison is a difference in group means: a cluster vs the other targets, and every pair of
+clusters. Positive = matters more in the first-named group. Shown on both scales; the
+held-out interval and sign consistency come from the cross-fitted labels with gene resampling
+(section 1 terms).
+
+```{r crossfit}
+perms <- function(v) if (length(v) <= 1) list(v) else
+  do.call(c, lapply(seq_along(v), function(i) lapply(perms(v[-i]), function(p) c(v[i], p))))
+P <- perms(seq_len(K))
+nearest <- function(M, C) max.col(-sapply(seq_len(nrow(C)), function(j) rowSums(sweep(M, 2, C[j, ])^2)), ties.method = "first")
+set.seed(9)
+cf <- lapply(seq_len(params$n_rep), function(r) {
+  fold <- sample(rep_len(seq_len(params$n_fold), nrow(Sn)))
+  lab <- integer(nrow(Sn))
+  for (f in seq_len(params$n_fold)) {
+    kmf <- kmeans(Sn[fold != f, , drop = FALSE], centers = K, nstart = 25, iter.max = 50)
+    # match the fold's centres to the reported ones (exhaustive over K! orderings)
+    cost <- sapply(P, function(p) sum((kmf$centers[p, , drop = FALSE] - C_ref)^2))
+    Cm <- kmf$centers[P[[which.min(cost)]], , drop = FALSE]    # row j now = reported cluster j
+    lab[fold == f] <- nearest(Sn[fold == f, , drop = FALSE], Cm)
+  }
+  list(lab = lab, boot = sample(nrow(Sn), replace = TRUE))
+})
+agree <- map_dbl(cf, ~ mean(.x$lab == cl))
+stopifnot("every gene needs a held-out label" = all(map_lgl(cf, ~ all(.x$lab %in% seq_len(K)))),
+          # a broken centre matching scrambles labels and agreement collapses towards 1/K
+          "held-out labels barely agree with the clusters - centre matching failed" = median(agree) > 0.6)
+cat(sprintf("held-out label agreement with the reported clusters: median %.3f, range %.3f-%.3f over %d repeats\n",
+            median(agree), min(agree), max(agree), params$n_rep))
+
+comps <- c(setNames(as.list(seq_len(K)), sprintf("cluster %d vs rest", seq_len(K))),
+           { pr <- combn(K, 2, simplify = FALSE); setNames(pr, map_chr(pr, ~ sprintf("cluster %d vs %d", .x[1], .x[2]))) })
+diff_mat <- function(A, lab) sapply(comps, function(cp) {
+  if (length(cp) == 1) colMeans(A[lab == cp, , drop = FALSE]) - colMeans(A[lab != cp, , drop = FALSE])
+  else colMeans(A[lab == cp[1], , drop = FALSE]) - colMeans(A[lab == cp[2], , drop = FALSE]) })
+scales_list <- list(feature = list(share = abs(Sn), absolute = abs(S)), family = list(share = abs(Sfn), absolute = abs(Sf)))
+
+run_diffs <- function(A, lab_fun) {
+  D0 <- diff_mat(A, cl)
+  Dr <- lapply(seq_along(cf), function(r) { i <- cf[[r]]$boot; diff_mat(A[i, , drop = FALSE], lab_fun(r)[i]) })
+  arr <- simplify2array(Dr)
+  list(D0 = D0, med = apply(arr, 1:2, median), lo = apply(arr, 1:2, quantile, 0.05), hi = apply(arr, 1:2, quantile, 0.95),
+       kept = apply(sweep(sign(arr), 1:2, sign(D0), "=="), 1:2, sum))
+}
+long_of <- function(res, level, scale) {
+  tl <- function(M, v) as_tibble(M, rownames = "name") %>% pivot_longer(-name, names_to = "comparison", values_to = v)
+  reduce(list(tl(res$D0, "diff"), tl(res$med, "diff_heldout"), tl(res$lo, "diff_lo"), tl(res$hi, "diff_hi"), tl(res$kept, "sign_kept")),
+         left_join, by = c("name", "comparison")) %>% mutate(level = level, scale = scale, .before = 1)
+}
+cd <- imap_dfr(scales_list, function(sl, lev) imap_dfr(sl, ~ long_of(run_diffs(.x, function(r) cf[[r]]$lab), lev, .y)))
+
+# Random-label control: same procedure, but each repeat's labels are a size-preserving shuffle.
+# It says what sign consistency a difference with no cluster information behind it reaches.
+set.seed(9); shuf <- lapply(seq_len(params$n_rep), function(r) sample(cl))
+ctrl <- run_diffs(abs(Sn), function(r) shuf[[r]])$kept
+thr <- as.integer(ceiling(quantile(ctrl, 0.95)))
+stopifnot("random labels look informative - check the control" = median(ctrl) <= 0.7 * params$n_rep)
+cat(sprintf("random-label control (feature shares): sign kept median %d, 95th percentile %d of %d -> 'stable' = kept in >= %d\n",
+            as.integer(median(ctrl)), thr, params$n_rep, min(thr + 1L, params$n_rep)))
+thr_stable <- min(thr + 1L, params$n_rep)
+cd <- cd %>% mutate(family = if_else(level == "feature", fam[name], name), .after = name,
+                    stable = sign_kept >= thr_stable,
+                    both_scales = NA)
+# a difference counts on both scales when it is stable with the same sign on share and absolute
+both <- cd %>% dplyr::select(level, name, comparison, scale, diff, stable) %>%
+  pivot_wider(names_from = scale, values_from = c(diff, stable)) %>%
+  transmute(level, name, comparison, both_scales = stable_share & stable_absolute & sign(diff_share) == sign(diff_absolute))
+cd <- cd %>% dplyr::select(-both_scales) %>% left_join(both, by = c("level", "name", "comparison"))
+stopifnot("every feature x comparison x scale present" =
+            nrow(cd) == 2 * length(comps) * (length(fc) + length(fams)))
+```
+
+```{r cluster_tables}
+grp_share <- sapply(seq_len(K), function(g) colMeans(abs(Sn[cl == g, , drop = FALSE])))
+colnames(grp_share) <- paste("cluster", seq_len(K))
+fmt <- function(d) d %>% mutate(diff_pp = 100 * diff, heldout_pp = 100 * diff_heldout,
+                                interval = sprintf("%.2f to %.2f", 100 * diff_lo, 100 * diff_hi))
+for (g in seq_len(K)) {
+  cmp <- sprintf("cluster %d vs rest", g)
+  d <- cd %>% filter(level == "feature", scale == "share", comparison == cmp) %>% fmt() %>%
+    mutate(share_in_cluster = 100 * grp_share[name, g]) %>% arrange(desc(diff))
+  print(knitr::kable(bind_rows(head(d, 8), tail(d, 5)) %>%
+                       dplyr::select(name, family, share_in_cluster, diff_pp, heldout_pp, interval, sign_kept, both_scales),
+                     digits = 2, caption = sprintf("%s (n = %d): most over- and under-used features, share difference in percentage points", cmp, n_cl[g])))
+}
+knitr::kable(cd %>% filter(level == "family", scale == "share") %>% fmt() %>%
+               dplyr::select(comparison, name, diff_pp, interval, sign_kept, both_scales) %>%
+               pivot_wider(id_cols = name, names_from = comparison, values_from = diff_pp), digits = 1,
+             caption = "family share differences, percentage points (stability in the CSV)")
+```
+
+```{r fig_dot, fig.width = 9, fig.height = 11}
+dot <- bind_rows(tibble(name = fc, group = "all targets", share = colMeans(abs(Sn)), diff = NA_real_, stable = FALSE),
+                 map_dfr(seq_len(K), function(g) cd %>% filter(level == "feature", scale == "share", comparison == sprintf("cluster %d vs rest", g)) %>%
+                           transmute(name, group = sprintf("cluster %d", g), share = grp_share[name, g], diff, stable = both_scales))) %>%
+  mutate(group = factor(group, levels = c("all targets", paste("cluster", seq_len(K)))),
+         name = factor(name, levels = rev(rows)))
+lab_n <- setNames(c(sprintf("all targets\n(n = %s)", scales::comma(nrow(genes))), sprintf("cluster %d\n(n = %d)", seq_len(K), n_cl)),
+                  levels(dot$group))
+dcap <- max(abs(dot$diff), na.rm = TRUE)
+fam_strip <- tibble(name = factor(rows, levels = rev(rows)), family = fam[rows])
+p_strip <- ggplot(fam_strip, aes(x = 1, y = name, fill = family)) + geom_tile() + scale_fill_manual(values = fam_cols) +
+  theme_void() + theme(legend.position = "left")
+p_dot <- ggplot(dot, aes(group, name)) +
+  geom_point(aes(size = 100 * share, fill = 100 * diff, stroke = if_else(stable, 0.9, 0.2)), shape = 21, colour = "black") +
+  scale_fill_gradient2(low = div[1], mid = div[2], high = div[3], limits = c(-100 * dcap, 100 * dcap), na.value = "grey80",
+                       name = "cluster vs other\ntargets (pp)") +
+  scale_size_area(max_size = 6, name = "share (%)") + scale_x_discrete(labels = lab_n) +
+  labs(x = NULL, y = NULL) + theme_classic(base_size = 12) + theme(axis.text.y = element_text(size = 7))
+p_dotc <- (p_strip + p_dot + plot_layout(widths = c(0.04, 1))) +
+  plot_annotation(title = sprintf("%s: feature share per cluster (normalized SHAP, k = %d)", lab_set, K),
+                  subtitle = sprintf("size = share of the explanation; color = cluster minus the other targets\nthick outline = stable on both share and absolute scales (sign kept in >= %d of %d held-out repeats)",
+                                     thr_stable, params$n_rep))
+p_dotc
+if (SAVE) ggsave(here("plots", paste0("26d_target_feature_share_by_cluster_", ptag, "_k", K, ".pdf")), p_dotc, width = 9, height = 11)
+```
+
+```{r fig_pairwise, fig.width = 14, fig.height = 11, results = "asis"}
+tile_plot <- function(d, sc, ord, unit_mult, unit_lab, fmt_txt) {
+  d <- d %>% filter(scale == sc) %>% mutate(name = factor(name, levels = rev(ord)), comparison = factor(comparison, levels = names(comps)),
+                                            v = unit_mult * diff)
+  cap <- max(abs(d$v))
+  ggplot(d, aes(comparison, name)) +
+    geom_tile(aes(fill = v, alpha = stable), colour = "white") +
+    geom_text(aes(label = sprintf(fmt_txt, v)), size = if (length(ord) > 20) 1.9 else 3, colour = "grey15") +
+    scale_fill_gradient2(low = div[1], mid = div[2], high = div[3], limits = c(-cap, cap), name = unit_lab) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.3), guide = "none") +
+    labs(x = NULL, y = NULL, title = sc) + theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1), axis.text.y = element_text(size = if (length(ord) > 20) 6.5 else 10))
+}
+for (lev in c("feature", "family")) {
+  d <- cd %>% filter(level == lev); ord <- if (lev == "feature") rows else fams
+  p <- tile_plot(d, "share", ord, 100, "difference\n(pp of share)", "%.1f") +
+    tile_plot(d, "absolute", ord, 1000, "difference\n(mean |SHAP| x 1000)", "%.1f") +
+    plot_annotation(title = sprintf("%s: which %s matter more in one cluster than another (k = %d)", lab_set,
+                                  if (lev == "feature") "features" else "families", K),
+                    subtitle = sprintf("positive (orange) = more in the first-named group; faded = sign kept in < %d of %d held-out repeats\ncluster sizes %s; share = fraction of each gene's |SHAP|, absolute = mean |SHAP| in TE LFC units",
+                                       thr_stable, params$n_rep, paste(sprintf("%d: n = %d", seq_len(K), n_cl), collapse = ", ")))
+  cat("\n\n## ", lev, "s\n\n", sep = ""); print(p)
+  if (SAVE) ggsave(here("plots", paste0("26d_target_", lev, "_cluster_differences_", ptag, "_k", K, ".pdf")), p,
+                   width = 14, height = if (lev == "feature") 11 else 5.5)
+}
+```
+
+# 4. Feature values per gene for the top SHAP features
+
+`26b_`'s per-gene feature-value heatmap (section 6b), cut down to the `r params$n_top` features
+with the largest overall share in section 2, in rank order (most important at the top). Drawn
+twice: genes grouped by the **normalized** SHAP clusters and by the **raw** SHAP clusters (raw =
+SHAP not divided by the gene's total, so clusters also reflect how strongly a gene was called),
+both at k = `r params$k`. The same 12 rows in both, so the two groupings can be compared.
+Values are z-scores against all modelled genes, (gene value - all-gene mean) / all-gene sd,
+unimputed and capped at +/-2.5; grey = missing.
+
+```{r top_value_heatmaps, fig.width = 14, fig.height = 5.5, results = "asis"}
+top <- ov_feat$name[seq_len(params$n_top)]
+Xall <- fm[match(oof$genes$gene_id_clean, fm$gene_id_clean), top] %>%
+  mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>% as.matrix()
+mu_all <- colMeans(Xall, na.rm = TRUE); sd_all <- apply(Xall, 2, sd, na.rm = TRUE)
+stopifnot("a top feature has no variance" = all(sd_all > 0))
+Ztg <- sweep(sweep(Xall[tg, , drop = FALSE], 2, mu_all), 2, sd_all, "/")
+stopifnot("target rows out of step" = identical(oof$genes$gene_id_clean[tg], genes$gene_id_clean))
+saved_all <- read_csv(file.path(O, paste0("target_shap_feature_clusters_", params$suffix, ".csv")), show_col_types = FALSE)
+# cross-check: per-cluster means of these z-scores must reproduce 26b_'s saved mean panel
+zsaved <- read_csv(file.path(O, paste0("target_feature_cor_and_mean_", params$suffix, ".csv")), show_col_types = FALSE)
+zs <- as.matrix(zsaved[match(top, zsaved$feature), paste0("z_cluster ", seq_len(K))])
+stopifnot("26b_'s saved means are for a different clustering - knit 26b_ with report_profile = features, normalized" =
+            max(abs(sapply(seq_len(K), function(g) colMeans(Ztg[cl == g, , drop = FALSE], na.rm = TRUE)) - zs)) < 1e-9)
+sym <- function(x, cap = 1.5) { x <- pmin(pmax(x, -cap), cap); x[c(which.min(x), which.max(x))] <- c(-cap, cap); x }
+cl_cols <- c("#0072B2", "#CC79A7", "#009E73", "#F0E442", "#D55E00", "#56B4E9", "grey40", "#882255")
+lfc_label <- "LFC sictrl/si3d (cap 1.5)"
+zc <- 2.5
+# Each feature's direction (section 2): sign of rho(value, own SHAP) within the targets, as a row
+# annotation so a colour can be read as helping or hurting (Kate, 2026-10-27)
+dir_lab <- setNames(ov_feat$direction[match(top, ov_feat$name)], top)
+dir_cols <- c("higher value -> higher TE change" = "#D55E00", "higher value -> lower TE change" = "#0072B2",
+              "unclear" = "grey70", "n/a" = "white")
+row_ann <- function(rl) data.frame(direction = dir_lab[rl], family = fam[rl], row.names = rl)
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  clp <- as.integer(a$cluster[match(genes$gene_id_clean, a$gene_id_clean)])
+  stopifnot("clustering missing from 26b_'s CSV" = nrow(a) == nrow(genes), !anyNA(clp))
+  if (pr == params$profile) stopifnot("normalized clusters differ from section 1" = identical(clp, as.integer(cl)))
+  ord <- order(clp, -genes$y)
+  H <- t(Ztg[ord, , drop = FALSE]); colnames(H) <- genes$gene_id_clean[ord]
+  H <- pmin(pmax(H, -zc), zc)
+  rownames(H) <- top
+  acol <- data.frame(cluster = factor(clp[ord]), lfc = sym(genes$y[ord]), check.names = FALSE, row.names = colnames(H))
+  names(acol)[2] <- lfc_label
+  acols <- list(cluster = setNames(cl_cols[seq_len(K)], seq_len(K)), lfc_tmp = colorRampPalette(div)(51), family = fam_cols[sort(unique(fam[top]))])
+  names(acols)[names(acols) == "lfc_tmp"] <- lfc_label
+  acols$direction <- dir_cols[unique(dir_lab)]
+  # Two row layouts: rank order, and grouped by family (families in order of their best-ranked
+  # member, rank order within a family, a gap between families)
+  fam_ord <- unique(fam[top])
+  layouts <- list(rank = top, family = top[order(match(fam[top], fam_ord), seq_along(top))])
+  for (lay in names(layouts)) {
+    rl <- layouts[[lay]]
+    gaps_r <- if (lay == "family") head(cumsum(table(factor(fam[rl], levels = fam_ord))), -1) else NULL
+    hm <- pheatmap::pheatmap(H[rl, , drop = FALSE], cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
+                   color = colorRampPalette(div)(101), breaks = seq(-zc, zc, length.out = 102), na_col = "grey85",
+                   annotation_col = acol, annotation_row = row_ann(rl),
+                   annotation_colors = acols, gaps_col = cumsum(table(clp))[-K], gaps_row = gaps_r, fontsize_row = 9,
+                   main = sprintf("%s (n = %d genes; cluster sizes %s)\ntop %d SHAP features (by share), %s | genes grouped by %s SHAP clusters, k = %d\ncolor = z-score vs all modelled genes (n = %s; orange higher, blue lower, capped at +/-2.5); grey = missing",
+                                  lab_set, nrow(genes), paste(table(clp), collapse = "/"), params$n_top,
+                                  if (lay == "family") "rows grouped by family" else "rows in rank order",
+                                  sub("features, ", "", pr), K, scales::comma(nrow(oof$genes))), fontsize = 9, silent = TRUE)
+    cat("\n\n## ", pr, ", rows by ", lay, "\n\n", sep = ""); grid::grid.newpage(); grid::grid.draw(hm$gtable)
+    if (SAVE) {
+      pdf(here("plots", paste0("26d_target_top", params$n_top, "_feature_values_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K,
+                               if (lay == "family") "_by_family" else "", ".pdf")), width = 14, height = 5.5)
+      grid::grid.newpage(); grid::grid.draw(hm$gtable); dev.off()
+    }
+  }
+}
+```
+
+The same feature values, **aligned to direction** (Kate, 2026-10-27): each feature's z-score is
+multiplied by the sign of its direction rho (section 2), so for every row orange means the gene's
+value sits on the side that pushes predicted TE change up (towards more eIF3d-dependent) and blue
+the side that pushes it down. Rows whose sign was flipped (higher value -> lower TE change, e.g.
+CDS GC) are marked "(flipped)": there, orange = a *low* value. Colour is still the feature value,
+not SHAP, so a cell can be orange while the forest gave that gene little credit for the feature.
+
+```{r top_aligned_heatmaps, fig.width = 14, fig.height = 5.5, results = "asis"}
+sgn <- sign(ov_feat$direction_rho[match(top, ov_feat$name)]); names(sgn) <- top
+stopifnot("a top feature has no direction" = !anyNA(sgn), all(sgn != 0))
+cat(sprintf("\n\nflipped (higher value -> lower TE change): %s\n", paste(top[sgn < 0], collapse = ", ")))
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  clp <- as.integer(a$cluster[match(genes$gene_id_clean, a$gene_id_clean)])
+  ord <- order(clp, -genes$y)
+  H <- t(sweep(Ztg[ord, , drop = FALSE], 2, sgn, "*")); colnames(H) <- genes$gene_id_clean[ord]
+  H <- pmin(pmax(H, -zc), zc)
+  acol <- data.frame(cluster = factor(clp[ord]), lfc = sym(genes$y[ord]), check.names = FALSE, row.names = colnames(H))
+  names(acol)[2] <- lfc_label
+  acols <- list(cluster = setNames(cl_cols[seq_len(K)], seq_len(K)), lfc_tmp = colorRampPalette(div)(51), family = fam_cols[sort(unique(fam[top]))])
+  names(acols)[names(acols) == "lfc_tmp"] <- lfc_label
+  acols$direction <- dir_cols[unique(dir_lab)]
+  fam_ord <- unique(fam[top])
+  layouts <- list(rank = top, family = top[order(match(fam[top], fam_ord), seq_along(top))])
+  for (lay in names(layouts)) {
+    rl <- layouts[[lay]]
+    gaps_r <- if (lay == "family") head(cumsum(table(factor(fam[rl], levels = fam_ord))), -1) else NULL
+    hm <- pheatmap::pheatmap(H[rl, , drop = FALSE], cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
+                   color = colorRampPalette(div)(101), breaks = seq(-zc, zc, length.out = 102), na_col = "grey85",
+                   annotation_col = acol, annotation_row = row_ann(rl),
+                   labels_row = ifelse(sgn[rl] < 0, paste0(rl, " (flipped)"), rl),
+                   annotation_colors = acols, gaps_col = cumsum(table(clp))[-K], gaps_row = gaps_r, fontsize_row = 9,
+                   main = sprintf("%s (n = %d genes; cluster sizes %s)\ntop %d SHAP features (by share), %s | genes grouped by %s SHAP clusters, k = %d\ncolor = z-score x direction sign (orange = value on the side that raises predicted TE change, blue = lowers; cap +/-2.5)",
+                                  lab_set, nrow(genes), paste(table(clp), collapse = "/"), params$n_top,
+                                  if (lay == "family") "rows grouped by family" else "rows in rank order",
+                                  sub("features, ", "", pr), K), fontsize = 9, silent = TRUE)
+    cat("\n\n## Direction-aligned values, ", pr, ", rows by ", lay, "\n\n", sep = ""); grid::grid.newpage(); grid::grid.draw(hm$gtable)
+    if (SAVE) {
+      pdf(here("plots", paste0("26d_target_top", params$n_top, "_feature_values_aligned_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K,
+                               if (lay == "family") "_by_family" else "", ".pdf")), width = 14, height = 5.5)
+      grid::grid.newpage(); grid::grid.draw(hm$gtable); dev.off()
+    }
+  }
+}
+```
+
+The same heatmaps coloured by each gene's **signed SHAP** instead of its feature value (Kate,
+2026-10-27). SHAP has direction: orange means that feature pushed the gene's predicted TE change
+(log2(sictrl / si3d)) **up**, towards more eIF3d-dependent; blue means it pushed it down. Each
+clustering is shown in the units it was clustered on: the raw clustering in raw SHAP (log2 TE
+change units), the normalized clustering in signed share (SHAP / the gene's total |SHAP|, so a
+row's absolute values sum to 1 across all 57 features). The colour cap is the 99th percentile of
+|SHAP| over these 12 features in the targets. Genes, clusters and row order match the value
+heatmaps above, so the two can be read side by side.
+
+```{r top_shap_heatmaps, fig.width = 14, fig.height = 5.5, results = "asis"}
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  clp <- as.integer(a$cluster[match(genes$gene_id_clean, a$gene_id_clean)])
+  ord <- order(clp, -genes$y)
+  M <- if (pr == "features, raw") S else Sn
+  cap <- signif(quantile(abs(M[, top]), 0.99), 2)
+  H <- t(M[ord, top, drop = FALSE]); colnames(H) <- genes$gene_id_clean[ord]
+  H <- pmin(pmax(H, -cap), cap)
+  acol <- data.frame(cluster = factor(clp[ord]), lfc = sym(genes$y[ord]), check.names = FALSE, row.names = colnames(H))
+  names(acol)[2] <- lfc_label
+  acols <- list(cluster = setNames(cl_cols[seq_len(K)], seq_len(K)), lfc_tmp = colorRampPalette(div)(51), family = fam_cols[sort(unique(fam[top]))])
+  names(acols)[names(acols) == "lfc_tmp"] <- lfc_label
+  fam_ord <- unique(fam[top])
+  layouts <- list(rank = top, family = top[order(match(fam[top], fam_ord), seq_along(top))])
+  unit_txt <- if (pr == "features, raw") "raw SHAP, log2 TE change units" else "signed SHAP / gene total |SHAP|"
+  cat(sprintf("\n\n%s: %s, capped at +/-%s; %.0f%% of the 12 x %d cells are positive\n",
+              pr, unit_txt, cap, 100 * mean(M[, top] > 0), nrow(genes)))
+  for (lay in names(layouts)) {
+    rl <- layouts[[lay]]
+    gaps_r <- if (lay == "family") head(cumsum(table(factor(fam[rl], levels = fam_ord))), -1) else NULL
+    hm <- pheatmap::pheatmap(H[rl, , drop = FALSE], cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE,
+                   color = colorRampPalette(div)(101), breaks = seq(-cap, cap, length.out = 102),
+                   annotation_col = acol, annotation_row = data.frame(family = fam[rl], row.names = rl),
+                   annotation_colors = acols, gaps_col = cumsum(table(clp))[-K], gaps_row = gaps_r, fontsize_row = 9,
+                   main = sprintf("%s (n = %d genes; cluster sizes %s)\ntop %d SHAP features (by share), %s | genes grouped by %s SHAP clusters, k = %d\ncolor = %s (orange pushes predicted TE change up, blue down; cap +/-%s)",
+                                  lab_set, nrow(genes), paste(table(clp), collapse = "/"), params$n_top,
+                                  if (lay == "family") "rows grouped by family" else "rows in rank order",
+                                  sub("features, ", "", pr), K, unit_txt, cap), fontsize = 9, silent = TRUE)
+    cat("\n\n## Signed SHAP, ", pr, ", rows by ", lay, "\n\n", sep = ""); grid::grid.newpage(); grid::grid.draw(hm$gtable)
+    if (SAVE) {
+      pdf(here("plots", paste0("26d_target_top", params$n_top, "_signed_shap_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K,
+                               if (lay == "family") "_by_family" else "", ".pdf")), width = 14, height = 5.5)
+      grid::grid.newpage(); grid::grid.draw(hm$gtable); dev.off()
+    }
+  }
+}
+```
+
+The matching correlation panels: `26b_`'s section 6 correlation panel for the same 12 features,
+in the same order, once per clustering. Each cell is the Spearman rho between the feature's value
+and TE change (log2(sictrl / si3d)). The first column is every modelled gene; the rest are within
+the targets, where TE change is already truncated at > 0.5, so those correlations are weaker by
+construction and ask which features track *how strongly* a target depends on eIF3d.
+
+```{r top_cor_panels, fig.width = 7, fig.height = 5.5}
+suppressPackageStartupMessages({ library(ComplexHeatmap); library(circlize) })
+yall <- oof$genes$y
+rho_of <- function(w) apply(Xall[w, , drop = FALSE], 2, function(x)
+  if (sum(!is.na(x)) < 10 || sd(x, na.rm = TRUE) == 0) NA_real_ else cor(x, yall[w], method = "spearman", use = "complete.obs"))
+cor_panels <- list()
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  clp_all <- a$cluster[match(oof$genes$gene_id_clean, a$gene_id_clean)]     # NA for non-targets
+  grp <- c(list(all = rep(TRUE, nrow(oof$genes)), targets = tg),
+           setNames(lapply(seq_len(K), function(g) tg & !is.na(clp_all) & clp_all == g), paste("cluster", seq_len(K))))
+  n_of <- map_int(grp, sum)
+  stopifnot("cluster sizes do not add up to the targets" = sum(n_of[-(1:2)]) == sum(tg))
+  rho <- sapply(grp, rho_of)
+  stopifnot("correlation outside [-1, 1]" = all(abs(rho) <= 1, na.rm = TRUE))
+  # cross-check against 26b_'s saved panel, which was drawn for the normalized clustering
+  if (pr == params$profile) stopifnot("rho does not reproduce 26b_'s saved correlation panel" =
+    max(abs(rho - as.matrix(zsaved[match(top, zsaved$feature), c("rho_all", "rho_targets", paste0("rho_cluster ", seq_len(K)))])), na.rm = TRUE) < 1e-9)
+  colnames(rho) <- c(sprintf("all modelled genes\n(n = %s)", scales::comma(n_of[["all"]])),
+                     sprintf("all targets\n(n = %s)", scales::comma(n_of[["targets"]])),
+                     sprintf("cluster %d\n(n = %d)", seq_len(K), n_of[paste("cluster", seq_len(K))]))
+  cor_panels[[pr]] <- rho
+}
+rcap <- max(abs(unlist(cor_panels)), na.rm = TRUE)    # one scale for both panels
+for (pr in names(cor_panels)) {
+  # same two row layouts as the value heatmaps above (`layouts`, `fam_ord`)
+  for (lay in names(layouts)) {
+    rho <- cor_panels[[pr]][layouts[[lay]], , drop = FALSE]
+    rl <- rownames(rho)
+    ht <- Heatmap(rho, name = "Spearman rho\nwith TE change",
+                  left_annotation = rowAnnotation(family = fam[rl], col = list(family = fam_cols[sort(unique(fam[rl]))]),
+                                                  show_annotation_name = FALSE),
+                  col = colorRamp2(c(-rcap, 0, rcap), div), na_col = "grey85",
+                  cluster_rows = FALSE, cluster_columns = FALSE, row_names_gp = gpar(fontsize = 9),
+                  row_split = if (lay == "family") factor(fam[rl], levels = fam_ord) else NULL,
+                  row_title = NULL, row_gap = unit(1.5, "mm"),
+                  column_names_rot = 45, column_names_gp = gpar(fontsize = 9),
+                  cell_fun = function(j, i, x, y, w, h, fill)
+                    if (!is.na(rho[i, j])) grid.text(sprintf("%.2f", rho[i, j]), x, y, gp = gpar(fontsize = 8, col = "grey20")),
+                  column_title = "Spearman rho with LFC sictrl/si3d", column_title_gp = gpar(fontsize = 10))
+    ttl <- sprintf("%s\n%s SHAP clusters, k = %d: top %d SHAP features%s", lab_set, sub("features, ", "", pr), K, params$n_top,
+                   if (lay == "family") ", by family" else "")
+    draw_it <- function() draw(ht, column_title = ttl, merge_legend = TRUE, column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+                               padding = unit(c(2, 14, 2, 2), "mm"))   # room for the rotated first column label
+    draw_it()
+    if (SAVE) {
+      pdf(here("plots", paste0("26d_target_top", params$n_top, "_feature_cor_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K,
+                               if (lay == "family") "_by_family" else "", ".pdf")), width = 7, height = 5.5)
+      draw_it(); dev.off()
+    }
+  }
+}
+```
+
+# 5. Correlation with TE change for every feature, by mRNA region
+
+The section 4 correlation panel for **all `r length(fc)` features**, grouped by where on the mRNA
+each feature is measured, 5' to 3', and by family within a region (families in order of their
+best-ranked member, features in rank order within a family). Region assignment, by name and
+family:
+
+- **5'UTR + start context**: anything measured on the 5'UTR (`*_utr5`, `cap_proximal`,
+  `aug_context`) and the `initiation` family (Kozak and Noderer scores span the start codon).
+- **CDS**: everything measured on the CDS, including `polya_track` (runs of lysine codons) and
+  `nascent_peptide`.
+- **stop + 3'UTR**: anything measured on the 3'UTR (`*_utr3`) and the `termination` family
+  (stop codon, +4 nucleotide, readthrough, the window around the stop).
+- **whole transcript**: `log2_total_length`, `transcript_gc`.
+
+```{r region_cor_panels, fig.width = 8, fig.height = 13}
+region_of <- function(f) case_when(
+  f %in% c("log2_total_length", "transcript_gc") ~ "whole transcript",
+  grepl("utr5|cap_proximal|aug_context", f) | fam[f] == "initiation" ~ "5'UTR + start context",
+  grepl("utr3", f) | fam[f] == "termination" ~ "stop + 3'UTR",
+  TRUE ~ "CDS")
+reg_lev <- c("5'UTR + start context", "CDS", "stop + 3'UTR", "whole transcript")
+reg <- setNames(region_of(fc), fc)
+fam_ord_all <- unique(fam[ov_feat$name])                                    # families by best-ranked member
+rl_all <- ov_feat$name[order(match(reg[ov_feat$name], reg_lev), match(fam[ov_feat$name], fam_ord_all), ov_feat$rank)]
+stopifnot("every feature needs a region" = all(reg %in% reg_lev), "row order lost features" = setequal(rl_all, fc),
+          # spot checks of the name rules
+          reg[["log2_utr5_length"]] == reg_lev[1], reg[["kozak_pwm_score_v2"]] == reg_lev[1],
+          reg[["max_consecutive_aaa"]] == "CDS", reg[["tco_struct_accessibility_stop_proximal_cds"]] == "CDS",
+          reg[["term_stop_TAA"]] == reg_lev[3], reg[["g4mer_mean_utr3"]] == reg_lev[3])
+print(table(region = factor(reg, levels = reg_lev)))
+
+Xfull <- fm[match(oof$genes$gene_id_clean, fm$gene_id_clean), fc] %>%
+  mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>% as.matrix()
+reg_cols <- setNames(c("grey20", "grey50", "grey75", "grey92"), reg_lev)
+rho_full <- list()
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  clp_all <- a$cluster[match(oof$genes$gene_id_clean, a$gene_id_clean)]
+  grp <- c(list(all = rep(TRUE, nrow(oof$genes)), targets = tg),
+           setNames(lapply(seq_len(K), function(g) tg & !is.na(clp_all) & clp_all == g), paste("cluster", seq_len(K))))
+  n_of <- map_int(grp, sum)
+  rho <- sapply(grp, function(w) apply(Xfull[w, rl_all, drop = FALSE], 2, function(x)
+    if (sum(!is.na(x)) < 10 || sd(x, na.rm = TRUE) == 0) NA_real_ else cor(x, yall[w], method = "spearman", use = "complete.obs")))
+  stopifnot("correlation outside [-1, 1]" = all(abs(rho) <= 1, na.rm = TRUE),
+            "top-12 rows disagree with section 4" = max(abs(rho[top, ] - cor_panels[[pr]][top, ]), na.rm = TRUE) < 1e-12)
+  colnames(rho) <- c(sprintf("all modelled genes\n(n = %s)", scales::comma(n_of[["all"]])),
+                     sprintf("all targets\n(n = %s)", scales::comma(n_of[["targets"]])),
+                     sprintf("cluster %d\n(n = %d)", seq_len(K), n_of[paste("cluster", seq_len(K))]))
+  rho_full[[pr]] <- rho
+}
+rcap_full <- max(abs(unlist(rho_full)), na.rm = TRUE)
+for (pr in names(rho_full)) {
+  rho <- rho_full[[pr]]
+  split_f <- factor(paste(reg[rl_all], fam[rl_all], sep = " | "), levels = unique(paste(reg[rl_all], fam[rl_all], sep = " | ")))
+  sl_reg <- sub(" [|].*", "", levels(split_f))
+  gaps <- unit(ifelse(head(sl_reg, -1) != tail(sl_reg, -1), 4, 1), "mm")    # wide gap between regions, narrow between families
+  ht <- Heatmap(rho, name = "Spearman rho\nwith TE change",
+                left_annotation = rowAnnotation(region = reg[rl_all], family = fam[rl_all],
+                                                col = list(region = reg_cols, family = fam_cols),
+                                                annotation_legend_param = list(region = list(at = reg_lev)),
+                                                gp = gpar(col = NA), show_annotation_name = FALSE),
+                col = colorRamp2(c(-rcap_full, 0, rcap_full), div), na_col = "grey85",
+                cluster_rows = FALSE, cluster_columns = FALSE, row_split = split_f, row_title = NULL, row_gap = gaps,
+                row_names_gp = gpar(fontsize = 7.5), column_names_rot = 45, column_names_gp = gpar(fontsize = 9),
+                cell_fun = function(j, i, x, y, w, h, fill)
+                  if (!is.na(rho[i, j])) grid.text(sprintf("%.2f", rho[i, j]), x, y, gp = gpar(fontsize = 6.5, col = "grey20")),
+                column_title = "Spearman rho with LFC sictrl/si3d", column_title_gp = gpar(fontsize = 10))
+  ttl <- sprintf("%s\n%s SHAP clusters, k = %d: all %d features, 5' to 3' by region, then family",
+                 lab_set, sub("features, ", "", pr), K, length(fc))
+  draw_it <- function() draw(ht, column_title = ttl, merge_legend = TRUE, column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+                             padding = unit(c(2, 14, 2, 2), "mm"))
+  draw_it()
+  if (SAVE) {
+    pdf(here("plots", paste0("26d_target_all_feature_cor_by_region_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K, ".pdf")),
+        width = 8, height = 13)
+    draw_it(); dev.off()
+  }
+}
+```
+
+# 6. CDS length vs 5'UTR length, per group
+
+One panel per group: all modelled genes, all non-targets, all targets, and each cluster. Every
+panel has all modelled genes in grey behind it, so each group reads against the same background.
+Axes are the model's own columns, log2(length + 1). Unimputed values;
+genes missing either length are dropped and the n in each panel is the n plotted. The line is a
+linear fit within the group.
+
+```{r length_scatter, fig.width = 13, fig.height = 8.5}
+len <- fm[match(oof$genes$gene_id_clean, fm$gene_id_clean), c("log2_cds_length", "log2_utr5_length", "log2_utr3_length", "log2_total_length")] %>%
+  mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>%
+  mutate(gene_id_clean = oof$genes$gene_id_clean, target = tg)
+stopifnot("length columns out of range" = all(len$log2_cds_length > 0, na.rm = TRUE) && all(len$log2_utr5_length >= 0, na.rm = TRUE))
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  lp <- len %>% mutate(cluster = a$cluster[match(gene_id_clean, a$gene_id_clean)])
+  stopifnot("clusters cover exactly the targets" = identical(!is.na(lp$cluster), lp$target))
+  grp_lev <- c("all modelled genes", "all non-targets", "all targets", paste("cluster", seq_len(K)))
+  pts <- bind_rows(lp %>% mutate(group = grp_lev[1]),
+                   lp %>% filter(!target) %>% mutate(group = grp_lev[2]),
+                   lp %>% filter(target) %>% mutate(group = grp_lev[3]),
+                   lp %>% filter(target) %>% mutate(group = paste("cluster", cluster))) %>%
+    filter(!is.na(log2_cds_length), !is.na(log2_utr5_length)) %>%
+    mutate(group = factor(group, levels = grp_lev))
+  st <- pts %>% group_by(group) %>%
+    summarise(n = n(), rho = cor(log2_cds_length, log2_utr5_length, method = "spearman"),
+              med_cds = median(2^log2_cds_length - 1), med_utr5 = median(2^log2_utr5_length - 1), .groups = "drop") %>%
+    mutate(lab = sprintf("Spearman rho = %.2f, n = %s\nmedian CDS %s nt, 5'UTR %s nt", rho, scales::comma(n),
+                         scales::comma(round(med_cds)), scales::comma(round(med_utr5))))
+  print(knitr::kable(st %>% dplyr::select(-lab), digits = 3, caption = pr))
+  bg <- pts %>% filter(group == grp_lev[1]) %>% dplyr::select(-group)
+  g_cols <- setNames(c("grey40", "grey70", "#E69F00", cl_cols[seq_len(K)]), grp_lev)
+  p_len <- ggplot(pts, aes(log2_cds_length, log2_utr5_length)) +
+    geom_point(data = bg, colour = "grey88", size = 0.3) +
+    geom_point(aes(colour = group), size = 0.5, alpha = 0.5) +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "black", linewidth = 0.6, se = FALSE) +
+    geom_text(data = st, aes(x = -Inf, y = Inf, label = lab), hjust = -0.05, vjust = 1.3, size = 3.1, inherit.aes = FALSE) +
+    facet_wrap(~ group, nrow = 2) +
+    scale_colour_manual(values = g_cols, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.18))) +
+    labs(x = "log2 CDS length", y = "log2 5'UTR length",
+         title = sprintf("%s: log2 CDS length vs log2 5'UTR length", lab_set),
+         subtitle = sprintf("clusters = targets grouped by %s SHAP profile, k = %d; grey = all modelled genes in every panel; line = linear fit",
+                            sub("features, ", "", pr), K)) +
+    theme_classic(base_size = 12)
+  print(p_len)
+  if (SAVE) ggsave(here("plots", paste0("26d_cds_vs_utr5_length_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K, ".pdf")),
+                   p_len, width = 13, height = 8.5)
+}
+```
+
+# 7. Length densities: each group vs all other genes
+
+The four length features (5'UTR, CDS, 3'UTR, total), 5' to 3', as unfilled densities. Each panel is one group against **every other
+modelled gene** (its complement), so "all targets" is compared with the non-targets and
+"cluster 2" with the non-targets plus clusters 1 and 3. All non-targets is not drawn: against
+its complement it is the "all targets" panel with the colours swapped. Dashed lines = medians. Wilcoxon
+rank-sum p, group vs the rest; n = genes with a value.
+
+```{r length_density, fig.width = 12.5, fig.height = 11}
+vars <- c(log2_utr5_length = "log2 5'UTR length", log2_cds_length = "log2 CDS length",
+          log2_utr3_length = "log2 3'UTR length", log2_total_length = "log2 total length")
+for (pr in c("features, normalized", "features, raw")) {
+  a <- saved_all %>% filter(profile == pr, k == K)
+  lp <- len %>% mutate(cluster = a$cluster[match(gene_id_clean, a$gene_id_clean)])
+  grp_def <- c(list(`all targets` = lp$target),
+               setNames(lapply(seq_len(K), function(g) lp$target & lp$cluster %in% g), paste("cluster", seq_len(K))))
+  grp_lev <- names(grp_def)
+  dens <- imap_dfr(grp_def, function(w, gname) bind_rows(
+    lp[w, ] %>% mutate(side = "group"), lp[!w, ] %>% mutate(side = "all other genes")) %>%
+      mutate(panel = gname)) %>%
+    pivot_longer(names(vars), names_to = "var", values_to = "value") %>% filter(!is.na(value)) %>%
+    mutate(panel = factor(panel, levels = grp_lev), var = factor(vars[var], levels = vars))
+  stopifnot("each panel must cover every modelled gene once" =
+              all(dplyr::count(dens %>% filter(var == vars[["log2_cds_length"]]), panel)$n == sum(!is.na(len$log2_cds_length))))
+  st <- dens %>% group_by(var, panel) %>%
+    summarise(n_g = sum(side == "group"), n_o = sum(side != "group"),
+              p = wilcox.test(value[side == "group"], value[side != "group"])$p.value, .groups = "drop") %>%
+    mutate(lab = sprintf("Wilcoxon p = %s\nn = %s vs %s", format.pval(p, digits = 2, eps = 1e-300),
+                         scales::comma(n_g), scales::comma(n_o)))
+  meds <- dens %>% group_by(var, panel, side) %>% summarise(m = median(value), .groups = "drop")
+  pcol <- setNames(c("#E69F00", cl_cols[seq_len(K)]), grp_lev)
+  dens <- dens %>% mutate(col_key = if_else(side == "group", as.character(panel), "all other genes"))
+  meds <- meds %>% mutate(col_key = if_else(side == "group", as.character(panel), "all other genes"))
+  cols_all <- c(pcol, `all other genes` = "black")
+  p_den <- ggplot(dens, aes(value, colour = col_key, linetype = side)) +
+    geom_density(fill = NA, linewidth = 0.8) +
+    geom_vline(data = meds, aes(xintercept = m, colour = col_key), linetype = 2, linewidth = 0.4) +
+    geom_text(data = st, aes(x = Inf, y = Inf, label = lab), hjust = 1.1, vjust = 1.4, size = 3, inherit.aes = FALSE) +
+    facet_grid(var ~ panel, scales = "free") +
+    scale_colour_manual(values = cols_all, guide = "none") +
+    scale_linetype_manual(values = c(group = "solid", `all other genes` = "solid"), guide = "none") +
+    labs(x = NULL, y = "density",
+         title = sprintf("%s: each group (colour) vs all other modelled genes (black)", lab_set),
+         subtitle = sprintf("clusters = targets grouped by %s SHAP profile, k = %d; dashed = medians; n = group vs rest",
+                            sub("features, ", "", pr), K)) +
+    theme_classic(base_size = 12)
+  print(p_den)
+  if (SAVE) ggsave(here("plots", paste0("26d_length_density_vs_rest_", ptag, "_", gsub("[ ,]+", "_", pr), "_k", K, ".pdf")),
+                   p_den, width = 12.5, height = 11)
+}
+```
+
+```{r save}
+if (SAVE) {
+  write_csv(bind_rows(ov_feat %>% mutate(level = "feature", .before = 1), ov_fam %>% mutate(level = "family", .before = 1)),
+            file.path(O, paste0("target_feature_importance_overall_", params$suffix, ".csv")))
+  write_csv(cd, file.path(O, paste0("target_feature_importance_cluster_diffs_", params$suffix, "_k", K, ".csv")))
+}
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,504 @@
+---
+title: "Do eIF3d targets need a long 5'UTR OR a short CDS / 3'UTR? Length-only models"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  matrix_rds: "feature_matrix_tco.rds"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  set_label: "eIF3d promoted"
+  n_bins: 5
+  n_bins_fine: 10
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "37_utr_cds_length_models.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-27: the length densities (`26d_target_cluster_feature_importance.Rmd` section 7)
+show eIF3d targets with longer 5'UTRs and shorter CDSs and 3'UTRs. Question: does a gene need a
+long 5'UTR **or** a short CDS / 3'UTR (either route suffices), or do the lengths simply add up?
+
+**Predictors** (the matrix's own columns, log2(length + 1)): 5'UTR, CDS and 3'UTR length. Total
+length is left out: it is close to their sum, so it would make the coefficients unstable.
+
+**Models**, each fitted twice:
+
+- **linear**: outcome = log2 TE change, log2(sictrl / si3d), every modelled gene. Uses the size
+  of each gene's response, no cut-off.
+- **logistic**: outcome = eIF3d target yes / no (log2 TE change > 0.5 and padj < 0.05), the
+  question as asked.
+
+| model | terms |
+|---|---|
+| each length alone | 3 models, 1 term each |
+| each pair, additive | 5'UTR + CDS, 5'UTR + 3'UTR, CDS + 3'UTR |
+| all three, additive | 5'UTR + CDS + 3'UTR |
+| all three, multiplicative | 5'UTR x CDS x 3'UTR: the three lengths, the three pairwise products and the triple product |
+
+**Reading the multiplicative model for OR.** In an additive model each length shifts the outcome
+by a fixed amount whatever the others are. Under OR, a gene that already qualifies by one route
+gains little from the other, so the interaction between a favourable 5'UTR (long) and a
+favourable CDS (short) is **sub-additive**. Long 5'UTR raises the outcome and long CDS lowers it,
+so OR shows up as a **positive 5'UTR x CDS coefficient**: the benefit of a long 5'UTR shrinks as
+the CDS gets shorter. Predictors are centred on their means before multiplying, so the main
+effects in that model are the slopes at an average gene.
+
+**Section 4** is the model-free version: genes binned into length quintiles, the fraction that are
+targets in each cell, and how far each cell sits from what the additive logistic model predicts.
+
+**Same genes in every model**: modelled genes with all three lengths, so fits are comparable.
+Fit is reported as adjusted R² (linear) or AUC (logistic), both in-sample and 10-fold
+cross-validated; the cross-validated numbers are out-of-sample and not adjusted.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(patchwork) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+div <- c("#0072B2", "white", "#D55E00")
+```
+
+# 1. Data and checks
+
+```{r data}
+oof <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+# Direction: the siRNA depletes its own target, so EIF3D mRNA must be strongly positive under log2(sictrl / si3d)
+kd <- de$rna_lfc[de$symbol == "EIF3D"]
+stopifnot("EIF3D not found once" = length(kd) == 1,
+          "EIF3D rna_lfc not strongly positive: direction flipped or wrong knockdown" = kd > 1,
+          "modelled genes missing from the DE file" = all(oof$genes$gene_id_clean %in% de$gene_id_clean),
+          "outcome differs from the DE file's te_lfc" =
+            max(abs(oof$genes$y - de$te_lfc[match(oof$genes$gene_id_clean, de$gene_id_clean)])) < 1e-12)
+cat(sprintf("EIF3D rna_lfc %+.2f -> log2(sictrl / si3d) confirmed; outcome = %s te_lfc\n", kd, params$de_file))
+
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean))
+len_cols <- c(utr5 = "log2_utr5_length", cds = "log2_cds_length", utr3 = "log2_utr3_length")
+d0 <- oof$genes %>% transmute(gene_id_clean, symbol, te_lfc = y, te_padj = y_padj, target = set == params$set_label) %>%
+  bind_cols(fm[match(oof$genes$gene_id_clean, fm$gene_id_clean), unname(len_cols)] %>%
+              mutate(across(everything(), ~ as.numeric(unlist(.x)))) %>% setNames(names(len_cols)))
+stopifnot("target label does not follow its rule" = identical(d0$target, d0$te_lfc > 0.5 & d0$te_padj < 0.05 & !is.na(d0$te_padj)),
+          "lengths out of range" = all(d0$cds > 0, na.rm = TRUE) && all(d0$utr5 >= 0, na.rm = TRUE) && all(d0$utr3 >= 0, na.rm = TRUE),
+          "ACTB CDS is not 1,128 nt" = abs(2^d0$cds[d0$symbol == "ACTB"] - 1 - 1128) < 1e-6)
+d <- d0 %>% filter(!is.na(utr5), !is.na(cds), !is.na(utr3)) %>% arrange(gene_id_clean)   # fixed order for CV folds
+cat(sprintf("modelled genes %s; with all three lengths %s (dropped %d missing a length); targets %d\n",
+            scales::comma(nrow(d0)), scales::comma(nrow(d)), nrow(d0) - nrow(d), sum(d$target)))
+knitr::kable(tibble(length = names(len_cols),
+                    rho_with_log2_te_change = map_dbl(names(len_cols), ~ cor(d[[.x]], d$te_lfc, method = "spearman")),
+                    median_nt_targets = map_dbl(names(len_cols), ~ median(2^d[[.x]][d$target] - 1)),
+                    median_nt_others = map_dbl(names(len_cols), ~ median(2^d[[.x]][!d$target] - 1))),
+             digits = 3, caption = "each length: Spearman rho with log2 TE change, and median length (nt)")
+knitr::kable(round(cor(d[, names(len_cols)], method = "spearman"), 3), caption = "Spearman rho between the lengths")
+```
+
+# 2. The models
+
+```{r fit}
+# centred copies, so main effects in the multiplicative model are slopes at an average gene
+dc <- d %>% mutate(across(all_of(names(len_cols)), ~ .x - mean(.x)))
+forms <- c("5'UTR alone" = "utr5", "CDS alone" = "cds", "3'UTR alone" = "utr3",
+           "5'UTR + CDS" = "utr5 + cds", "5'UTR + 3'UTR" = "utr5 + utr3", "CDS + 3'UTR" = "cds + utr3",
+           "5'UTR + CDS + 3'UTR" = "utr5 + cds + utr3",
+           "5'UTR x CDS x 3'UTR" = "utr5 * cds * utr3")
+auc <- function(score, y) { r <- rank(score); n1 <- sum(y); n0 <- sum(!y); (sum(r[y]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+set.seed(9); fold <- sample(rep(1:10, length.out = nrow(dc)))
+fit_one <- function(rhs) {
+  f_lin <- as.formula(paste("te_lfc ~", rhs)); f_log <- as.formula(paste("target ~", rhs))
+  m_lin <- lm(f_lin, data = dc); m_log <- glm(f_log, data = dc, family = binomial)
+  cv_lin <- cv_log <- numeric(nrow(dc))
+  for (k in 1:10) {
+    tr <- dc[fold != k, ]; te <- dc[fold == k, ]
+    cv_lin[fold == k] <- predict(lm(f_lin, data = tr), te)
+    cv_log[fold == k] <- predict(glm(f_log, data = tr, family = binomial), te)   # link scale is enough for AUC
+  }
+  list(lin = m_lin, log = m_log,
+       row = tibble(n_terms = length(coef(m_lin)) - 1,
+                    adj_r2 = summary(m_lin)$adj.r.squared,
+                    cv_r2 = 1 - sum((dc$te_lfc - cv_lin)^2) / sum((dc$te_lfc - mean(dc$te_lfc))^2),
+                    aic_linear = AIC(m_lin),
+                    auc = auc(predict(m_log), dc$target), cv_auc = auc(cv_log, dc$target),
+                    aic_logistic = AIC(m_log)))
+}
+fits <- map(forms, fit_one)
+tab <- imap_dfr(fits, ~ .x$row %>% mutate(model = .y, .before = 1))
+stopifnot("in-sample R2 must not fall when a term is added to a nested model" =
+            tab$adj_r2[tab$model == "5'UTR x CDS x 3'UTR"] >= tab$adj_r2[tab$model == "5'UTR + CDS + 3'UTR"] - 0.001,
+          "AUC outside [0, 1]" = all(between(tab$auc, 0, 1)),
+          "single-length R2 must equal r^2" =
+            abs(summary(fits[["CDS alone"]]$lin)$r.squared - cor(dc$cds, dc$te_lfc)^2) < 1e-10)
+knitr::kable(tab, digits = c(0, 0, 4, 4, 0, 3, 3, 0),
+             caption = sprintf("fit of each model, n = %s genes (%d targets). Linear: log2 TE change. Logistic: target yes/no.",
+                               scales::comma(nrow(dc)), sum(dc$target)))
+```
+
+## Does each length add to the others? (nested tests)
+
+```{r nested}
+nest <- tribble(~smaller, ~larger,
+  "5'UTR + CDS", "5'UTR + CDS + 3'UTR", "5'UTR + 3'UTR", "5'UTR + CDS + 3'UTR", "CDS + 3'UTR", "5'UTR + CDS + 3'UTR",
+  "5'UTR + CDS + 3'UTR", "5'UTR x CDS x 3'UTR")
+nest_tab <- nest %>% mutate(
+  adds = c("3'UTR", "CDS", "5'UTR", "the four interaction terms"),
+  adj_r2_gain = map2_dbl(smaller, larger, ~ tab$adj_r2[tab$model == .y] - tab$adj_r2[tab$model == .x]),
+  F_p_linear = map2_dbl(smaller, larger, ~ anova(fits[[.x]]$lin, fits[[.y]]$lin)$`Pr(>F)`[2]),
+  cv_auc_gain = map2_dbl(smaller, larger, ~ tab$cv_auc[tab$model == .y] - tab$cv_auc[tab$model == .x]),
+  LRT_p_logistic = map2_dbl(smaller, larger, ~ anova(fits[[.x]]$log, fits[[.y]]$log, test = "LRT")$`Pr(>Chi)`[2]))
+knitr::kable(nest_tab, digits = c(0, 0, 0, 4, 300, 4, 300))
+```
+
+## Coefficients: additive and multiplicative
+
+Linear coefficients are the change in log2 TE change per doubling of that length (predictors
+are log2, so one unit = a doubling); logistic coefficients are the change in log-odds of being a
+target per doubling. In the multiplicative model, main effects are at the average of the other
+lengths (centred predictors).
+
+```{r coefs}
+coef_tab <- function(m, kind) {
+  s <- summary(m)$coefficients; ci <- suppressMessages(confint.default(m))
+  tibble(term = rownames(s), estimate = s[, 1], lo = ci[, 1], hi = ci[, 2], p = s[, 4]) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(term = str_replace_all(term, c("utr5" = "5'UTR", "cds" = "CDS", "utr3" = "3'UTR", ":" = " x ")),
+           model = kind)
+}
+coefs <- bind_rows(coef_tab(fits[["5'UTR + CDS + 3'UTR"]]$lin, "linear, additive"),
+                   coef_tab(fits[["5'UTR x CDS x 3'UTR"]]$lin, "linear, multiplicative"),
+                   coef_tab(fits[["5'UTR + CDS + 3'UTR"]]$log, "logistic, additive"),
+                   coef_tab(fits[["5'UTR x CDS x 3'UTR"]]$log, "logistic, multiplicative"))
+knitr::kable(coefs %>% dplyr::select(model, everything()), digits = c(0, 0, 4, 4, 4, 300))
+ix <- coefs %>% filter(term == "5'UTR x CDS")
+cat(sprintf("5'UTR x CDS interaction: linear %+.4f (p = %.2g) | logistic %+.4f (p = %.2g). Positive = sub-additive = the OR pattern.\n",
+            ix$estimate[1], ix$p[1], ix$estimate[2], ix$p[2]))
+if (SAVE) {
+  write_csv(tab, file.path(O, "length_models_fit_hypoxia_1hr.csv"))
+  write_csv(coefs, file.path(O, "length_models_coefficients_hypoxia_1hr.csv"))
+}
+```
+
+## Figure: fit and coefficients
+
+Left: how much of log2 TE change each model explains. Right: each linear model's coefficients,
+the change in log2 TE change per **doubling** of that length (predictors are log2), with 95%
+confidence intervals. In the multiplicative model these are the main effects at an average gene
+(centred predictors); its interaction terms are in the coefficient table above.
+
+```{r fig_models, fig.width = 13, fig.height = 5.5}
+tl <- tab %>% dplyr::select(model, adj_r2, cv_r2) %>% mutate(model = factor(model, levels = rev(names(forms))))
+p_r2 <- ggplot(tl, aes(y = model)) +
+  geom_col(aes(x = adj_r2), fill = "grey75", width = 0.6) +
+  geom_point(aes(x = cv_r2), colour = "black", size = 2) +
+  labs(x = "adjusted R² (bar); 10-fold CV R² (point)", y = NULL, title = "fit: log2 TE change") +
+  theme_classic(base_size = 12)
+term_lab <- c(utr5 = "5'UTR", cds = "CDS", utr3 = "3'UTR")
+betas <- imap_dfr(fits, function(f, nm) {
+  s <- summary(f$lin)$coefficients; ci <- confint(f$lin)
+  tibble(model = nm, term = rownames(s), estimate = s[, 1], lo = ci[, 1], hi = ci[, 2])
+}) %>% filter(term %in% names(term_lab)) %>%
+  mutate(term = factor(term_lab[term], levels = term_lab),
+         model = factor(model, levels = levels(tl$model)))
+p_beta <- ggplot(betas, aes(estimate, model, colour = term)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.6), size = 0.3) +
+  scale_colour_manual(values = c(`5'UTR` = "#009E73", CDS = "#0072B2", `3'UTR` = "#CC79A7"), name = "length") +
+  scale_y_discrete(drop = FALSE) +
+  labs(x = "coefficient: change in log2 TE change per doubling (95% CI)", y = NULL, title = "linear coefficients") +
+  theme_classic(base_size = 12) + theme(axis.text.y = element_blank())
+p_mod <- p_r2 + p_beta + plot_annotation(
+  title = sprintf("%s: how much do the three lengths explain log2 TE change?", params$label),
+  subtitle = sprintf("log2 5'UTR, CDS and 3'UTR length; n = %s genes",
+                     scales::comma(nrow(dc))))
+p_mod
+if (SAVE) ggsave(here("plots", "37_length_models_fit_hypoxia_1hr.pdf"), p_mod, width = 13, height = 5.5)
+```
+
+# 3. The model-free check: target fraction across length quintiles
+
+Each pair of lengths, genes binned into `r params$n_bins` equal-count bins on each axis
+(quintiles of all modelled genes), giving `r params$n_bins^2` cells.
+
+- **Left:** fraction of the cell's genes that are targets (and n).
+- **Right:** that fraction minus the mean prediction of the **additive** logistic model (all three
+  lengths) for the same genes, in percentage points. An additive model fits this cell where it
+  is white. Under OR, the corner where both lengths are favourable sits **below** the additive
+  prediction (blue): having both adds less than additive odds expect.
+
+Overall target fraction: `r sprintf("%.1f%%", 100 * mean(d$target))`.
+
+```{r grid, fig.width = 13, fig.height = 5.5, results = "asis"}
+dc$pred_add <- predict(fits[["5'UTR + CDS + 3'UTR"]]$log, type = "response")
+q_lab <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%s-%s", scales::comma(round(2^head(br, -1) - 1)), scales::comma(round(2^br[-1] - 1))))
+}
+lab_nt <- c(utr5 = "5'UTR length (nt)", cds = "CDS length (nt)", utr3 = "3'UTR length (nt)")
+grid_tabs <- list()
+for (pp in list(c("cds", "utr5"), c("cds", "utr3"), c("utr3", "utr5"))) {
+  gx <- pp[1]; gy <- pp[2]
+  g <- d %>% mutate(bx = q_lab(.data[[gx]], params$n_bins), by = q_lab(.data[[gy]], params$n_bins), pred = dc$pred_add) %>%
+    group_by(bx, by) %>% summarise(n = n(), frac = mean(target), expected = mean(pred), .groups = "drop") %>%
+    mutate(diff_pp = 100 * (frac - expected))
+  stopifnot("cells do not add up to the genes" = sum(g$n) == nrow(d))
+  grid_tabs[[paste(gy, "vs", gx)]] <- g %>% mutate(x = gx, y = gy)
+  lim <- max(abs(g$diff_pp))
+  p1 <- ggplot(g, aes(bx, by, fill = 100 * frac)) + geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%.0f%%\nn = %d", 100 * frac, n)), size = 2.8) +
+    scale_fill_gradient(low = "white", high = "#E69F00", name = "targets (%)") +
+    labs(x = sprintf("log2 bins: %s", lab_nt[gx]), y = sprintf("log2 bins: %s", lab_nt[gy]), title = "observed target fraction") +
+    theme_classic(base_size = 11) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  p2 <- ggplot(g, aes(bx, by, fill = diff_pp)) + geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%+.1f", diff_pp)), size = 3) +
+    scale_fill_gradient2(low = div[1], mid = div[2], high = div[3], limits = c(-lim, lim), name = "observed -\nadditive (pp)") +
+    labs(x = sprintf("log2 bins: %s", lab_nt[gx]), y = NULL, title = "observed minus additive-model prediction") +
+    theme_classic(base_size = 11) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  p <- p1 + p2 + plot_annotation(
+    title = sprintf("%s: eIF3d targets by %s and %s", params$label, sub(" [(]nt[)]", "", lab_nt[gy]), sub(" [(]nt[)]", "", lab_nt[gx])),
+    subtitle = sprintf("quintile bins of all modelled genes (n = %s, %d targets, %.1f%% overall); additive model = logistic on all three log2 lengths",
+                       scales::comma(nrow(d)), sum(d$target), 100 * mean(d$target)))
+  cat("\n\n## ", sub(" [(]nt[)]", "", lab_nt[gy]), " vs ", sub(" [(]nt[)]", "", lab_nt[gx]), "\n\n", sep = ""); print(p)
+  if (SAVE) ggsave(here("plots", sprintf("37_target_fraction_grid_%s_vs_%s_hypoxia_1hr.pdf", gy, gx)), p, width = 13, height = 5.5)
+}
+if (SAVE) write_csv(bind_rows(grid_tabs), file.path(O, "length_grid_target_fraction_hypoxia_1hr.csv"))
+```
+
+## 5'UTR x CDS at finer resolution
+
+The observed target fraction for 5'UTR vs CDS length alone, in `r params$n_bins_fine` equal-count
+bins per axis (deciles of all modelled genes), so roughly `r round(nrow(d) / params$n_bins_fine^2)`
+genes per cell. Cells this small are noisy: at a 14% base rate and n = 100 a cell's standard
+error is about 3.5 percentage points.
+
+```{r grid_fine, fig.width = 11, fig.height = 9}
+gf <- d %>% mutate(bx = q_lab(cds, params$n_bins_fine), by = q_lab(utr5, params$n_bins_fine)) %>%
+  group_by(bx, by) %>% summarise(n = n(), frac = mean(target), .groups = "drop")
+stopifnot("cells do not add up to the genes" = sum(gf$n) == nrow(d),
+          "decile bins collapsed - tied lengths" = n_distinct(gf$bx) == params$n_bins_fine && n_distinct(gf$by) == params$n_bins_fine)
+p_fine <- ggplot(gf, aes(bx, by, fill = 100 * frac)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.0f%%\nn = %d", 100 * frac, n)), size = 2.6) +
+  scale_fill_gradient(low = "white", high = "#E69F00", name = "targets (%)") +
+  labs(x = "CDS length (nt), decile bins", y = "5'UTR length (nt), decile bins",
+       title = sprintf("%s: eIF3d targets by 5'UTR and CDS length", params$label),
+       subtitle = sprintf("observed fraction of targets per cell; deciles of all modelled genes (n = %s, %d targets, %.1f%% overall)",
+                          scales::comma(nrow(d)), sum(d$target), 100 * mean(d$target))) +
+  theme_classic(base_size = 12) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_fine
+if (SAVE) ggsave(here("plots", sprintf("37_target_fraction_grid_utr5_vs_cds_%dbins_hypoxia_1hr.pdf", params$n_bins_fine)),
+                 p_fine, width = 11, height = 9)
+```
+
+## GC3 x CDS at the same resolution
+
+The same plot with **GC3** in place of 5'UTR length: `gc3_internal`, GC at the third codon
+position with the start and stop codons removed (the corrected variant the model uses). Same
+genes, same CDS deciles.
+
+```{r grid_fine_gc3, fig.width = 11, fig.height = 9}
+d$gc3 <- as.numeric(unlist(fm$gc3_internal[match(d$gene_id_clean, fm$gene_id_clean)]))
+stopifnot("GC3 outside [0, 100]" = all(d$gc3 >= 0 & d$gc3 <= 100, na.rm = TRUE),
+          "GC3 median outside 40-65%" = between(median(d$gc3, na.rm = TRUE), 40, 65))
+dg <- d %>% filter(!is.na(gc3))
+q_lab_pct <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%.1f-%.1f", head(br, -1), br[-1]))
+}
+gg <- dg %>% mutate(bx = q_lab(cds, params$n_bins_fine), by = q_lab_pct(gc3, params$n_bins_fine)) %>%
+  group_by(bx, by) %>% summarise(n = n(), frac = mean(target), .groups = "drop")
+stopifnot("cells do not add up to the genes" = sum(gg$n) == nrow(dg),
+          "decile bins collapsed" = n_distinct(gg$bx) == params$n_bins_fine && n_distinct(gg$by) == params$n_bins_fine)
+cat(sprintf("genes with GC3: %s of %s; Spearman rho(GC3, log2 CDS length) = %.3f\n", scales::comma(nrow(dg)),
+            scales::comma(nrow(d)), cor(dg$gc3, dg$cds, method = "spearman")))
+p_gc3 <- ggplot(gg, aes(bx, by, fill = 100 * frac)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.0f%%\nn = %d", 100 * frac, n)), size = 2.6) +
+  scale_fill_gradient(low = "white", high = "#E69F00", name = "targets (%)") +
+  labs(x = "CDS length (nt), decile bins", y = "GC3 (%), decile bins",
+       title = sprintf("%s: eIF3d targets by GC3 and CDS length", params$label),
+       subtitle = sprintf("observed fraction of targets per cell; deciles of all modelled genes (n = %s, %d targets, %.1f%% overall)",
+                          scales::comma(nrow(dg)), sum(dg$target), 100 * mean(dg$target))) +
+  theme_classic(base_size = 12) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_gc3
+if (SAVE) ggsave(here("plots", sprintf("37_target_fraction_grid_gc3_vs_cds_%dbins_hypoxia_1hr.pdf", params$n_bins_fine)),
+                 p_gc3, width = 11, height = 9)
+```
+
+# 4. Lengths plus GC
+
+Kate, 2026-10-27: the three log2 lengths plus GC of each region (5'UTR, CDS, 3'UTR) and GC3
+(`gc3_internal`), seven predictors, outcome log2 TE change. Fitted two ways:
+
+- **additive**: 7 terms.
+- **multiplicative**: all seven multiplied together, i.e. every interaction up to the seven-way
+  product, 127 terms. Cross-validated R² shows whether that many terms overfit.
+
+The lengths-only models from section 2 and a GC-only model (four GC terms, additive) are refit
+here as reference rows. Same genes and the same 10 folds as section 2.
+
+**Predictors are z-scored** (mean 0, SD 1) in this section, so coefficients on GC (%) and on log2
+length share one scale: change in log2 TE change **per SD** of the predictor. In the
+multiplicative model these are main effects at an average gene.
+
+**CDS GC and GC3 are near-duplicates** (Spearman rho 0.93), and 3'UTR GC tracks both (~0.75).
+Their individual coefficients are unstable and split credit between them; the variance inflation
+factors below say how much. Read the GC block's coefficients together, not one at a time.
+
+```{r gc_models}
+pred7 <- c(utr5 = "log2 5'UTR length", cds = "log2 CDS length", utr3 = "log2 3'UTR length",
+           utr5_gc = "5'UTR GC", cds_gc = "CDS GC", utr3_gc = "3'UTR GC", gc3 = "GC3")
+dz <- d %>% mutate(utr5_gc = as.numeric(unlist(fm$utr5_gc[match(gene_id_clean, fm$gene_id_clean)])),
+                   cds_gc = as.numeric(unlist(fm$cds_gc[match(gene_id_clean, fm$gene_id_clean)])),
+                   utr3_gc = as.numeric(unlist(fm$utr3_gc[match(gene_id_clean, fm$gene_id_clean)])))
+stopifnot("a predictor has missing values on the section 2 genes" = !anyNA(dz[, names(pred7)]),
+          "GC outside [0, 100]" = all(as.matrix(dz[, c("utr5_gc", "cds_gc", "utr3_gc", "gc3")]) >= 0 &
+                                        as.matrix(dz[, c("utr5_gc", "cds_gc", "utr3_gc", "gc3")]) <= 100),
+          "ACTB CDS GC outside 50-70%" = between(dz$cds_gc[dz$symbol == "ACTB"], 50, 70),
+          "genes or order differ from section 2, so the folds would not match" = identical(dz$gene_id_clean, dc$gene_id_clean))
+dz <- dz %>% mutate(across(all_of(names(pred7)), ~ as.numeric(scale(.x))))
+
+# variance inflation: 1 / (1 - R2 of each predictor on the other six)
+vif <- sapply(names(pred7), function(p) 1 / (1 - summary(lm(reformulate(setdiff(names(pred7), p), p), data = dz))$r.squared))
+knitr::kable(tibble(predictor = pred7, VIF = vif), digits = 2,
+             caption = "variance inflation factor (1 = independent of the others; > 5 = coefficient poorly determined)")
+
+forms_gc <- c("3 lengths, additive" = "utr5 + cds + utr3",
+              "3 lengths, multiplicative" = "utr5 * cds * utr3",
+              "4 GC, additive" = "utr5_gc + cds_gc + utr3_gc + gc3",
+              "lengths + GC, additive" = paste(names(pred7), collapse = " + "),
+              "lengths + GC, multiplicative" = paste(names(pred7), collapse = " * "))
+fit_lin_cv <- function(rhs) {
+  f <- as.formula(paste("te_lfc ~", rhs)); m <- lm(f, data = dz)
+  cv <- numeric(nrow(dz))
+  for (k in 1:10) cv[fold == k] <- predict(lm(f, data = dz[fold != k, ]), dz[fold == k, ])
+  list(m = m, row = tibble(n_terms = length(coef(m)) - 1, adj_r2 = summary(m)$adj.r.squared,
+                           cv_r2 = 1 - sum((dz$te_lfc - cv)^2) / sum((dz$te_lfc - mean(dz$te_lfc))^2), aic = AIC(m)))
+}
+fits_gc <- map(forms_gc, fit_lin_cv)
+tab_gc <- imap_dfr(fits_gc, ~ .x$row %>% mutate(model = .y, .before = 1))
+stopifnot("multiplicative model should have 127 terms" = tab_gc$n_terms[tab_gc$model == "lengths + GC, multiplicative"] == 127,
+          "lengths-only rows must reproduce section 2 (z-scoring does not change fit)" =
+            abs(tab_gc$adj_r2[1] - tab$adj_r2[tab$model == "5'UTR + CDS + 3'UTR"]) < 1e-10 &&
+            abs(tab_gc$cv_r2[2] - tab$cv_r2[tab$model == "5'UTR x CDS x 3'UTR"]) < 1e-10)
+knitr::kable(tab_gc, digits = c(0, 0, 4, 4, 0), caption = sprintf("log2 TE change, n = %s genes, same 10 folds", scales::comma(nrow(dz))))
+
+nest_gc <- tribble(~smaller, ~larger, ~adds,
+  "3 lengths, additive", "lengths + GC, additive", "the four GC terms, to the lengths",
+  "4 GC, additive", "lengths + GC, additive", "the three lengths, to GC",
+  "lengths + GC, additive", "lengths + GC, multiplicative", "all 120 interaction terms") %>%
+  mutate(adj_r2_gain = map2_dbl(smaller, larger, ~ tab_gc$adj_r2[tab_gc$model == .y] - tab_gc$adj_r2[tab_gc$model == .x]),
+         cv_r2_gain = map2_dbl(smaller, larger, ~ tab_gc$cv_r2[tab_gc$model == .y] - tab_gc$cv_r2[tab_gc$model == .x]),
+         F_p = map2_dbl(smaller, larger, ~ anova(fits_gc[[.x]]$m, fits_gc[[.y]]$m)$`Pr(>F)`[2]))
+knitr::kable(nest_gc, digits = c(0, 0, 0, 4, 4, 300))
+
+coef_gc <- bind_rows(
+  imap_dfr(fits_gc[c("lengths + GC, additive", "lengths + GC, multiplicative")], function(f, nm) {
+    s <- summary(f$m)$coefficients; ci <- confint(f$m)
+    tibble(model = nm, term = rownames(s), estimate = s[, 1], lo = ci[, 1], hi = ci[, 2], t = s[, 3], p = s[, 4])
+  })) %>% filter(term != "(Intercept)")
+knitr::kable(coef_gc %>% filter(term %in% names(pred7)) %>% mutate(term = pred7[term]), digits = c(0, 0, 4, 4, 4, 1, 300),
+             caption = "main effects, change in log2 TE change per SD")
+knitr::kable(coef_gc %>% filter(model == "lengths + GC, multiplicative", !term %in% names(pred7)) %>%
+               arrange(desc(abs(t))) %>% head(10) %>%
+               mutate(term = map_chr(strsplit(term, ":", fixed = TRUE), ~ paste(pred7[.x], collapse = " x "))),
+             digits = c(0, 0, 4, 4, 4, 1, 300), caption = "the 10 largest interaction terms by |t| (of 120)")
+if (SAVE) {
+  write_csv(tab_gc, file.path(O, "length_gc_models_fit_hypoxia_1hr.csv"))
+  write_csv(coef_gc, file.path(O, "length_gc_models_coefficients_hypoxia_1hr.csv"))
+}
+```
+
+```{r fig_gc_models, fig.width = 13, fig.height = 5.5}
+tg_ <- tab_gc %>% mutate(model = factor(model, levels = rev(names(forms_gc))))
+p_r2g <- ggplot(tg_, aes(y = model)) +
+  geom_col(aes(x = adj_r2), fill = "grey75", width = 0.6) +
+  geom_point(aes(x = cv_r2), colour = "black", size = 2) +
+  geom_text(aes(x = adj_r2, label = sprintf("%d terms", n_terms)), hjust = -0.15, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.3))) +
+  labs(x = "adjusted R² (bar); cross-validated R², 10-fold (point)", y = NULL, title = "fit: log2 TE change") +
+  theme_classic(base_size = 12)
+bg <- coef_gc %>% filter(term %in% names(pred7)) %>%
+  mutate(term = factor(pred7[term], levels = rev(pred7)),
+         model = recode(model, "lengths + GC, additive" = "additive", "lengths + GC, multiplicative" = "multiplicative (main effects)"))
+p_bg <- ggplot(bg, aes(estimate, term, colour = model)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.5), size = 0.3) +
+  scale_colour_manual(values = c(additive = "black", `multiplicative (main effects)` = "#CC79A7"), name = NULL) +
+  labs(x = "coefficient: change in log2 TE change per SD (95% CI)", y = NULL, title = "lengths + GC: coefficients") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_gcm <- p_r2g + p_bg + plot_annotation(
+  title = sprintf("%s: log2 TE change on lengths and GC", params$label),
+  subtitle = sprintf("log2 5'UTR, CDS and 3'UTR length; GC of each region; GC3. Predictors z-scored; n = %s genes", scales::comma(nrow(dz))))
+p_gcm
+if (SAVE) ggsave(here("plots", "37_length_gc_models_hypoxia_1hr.pdf"), p_gcm, width = 13, height = 5.5)
+```
+
+# 5. Scatters: GC3, 5'UTR length and their ratio against TE change
+
+Kate, 2026-10-27. Every modelled gene with a GC3 and a 5'UTR length, y = log2 TE change
+(log2(sictrl / si3d)), all genes in grey with no target colouring. The black
+line is a least-squares linear fit over all genes (95% CI band); the stats are Spearman rho, the fitted slope and adjusted R2. Three x axes:
+
+- **GC3** (`gc3_internal`, %).
+- **log2 5'UTR length** (log2(nt + 1), as stored in the matrix).
+- **log2(GC3 / 5'UTR length)** = log2 GC3 - log2(5'UTR nt + 1). The two point in opposite
+  directions (higher GC3 -> lower TE change, longer 5'UTR -> higher), so a low ratio should mark
+  the most eIF3d-dependent genes. Taken on the log2 scale because the raw ratio is dominated by
+  1 / length: 5'UTR length spans ~1,000-fold, GC3 about 3-fold.
+
+Targets are not coloured: they are defined by TE change > 0.5, so colouring them only marks a
+horizontal band by construction; the trend is in the whole cloud.
+
+```{r te_scatters, fig.width = 7, fig.height = 6, results = "asis"}
+ds <- d0 %>% mutate(gc3 = as.numeric(unlist(fm$gc3_internal[match(gene_id_clean, fm$gene_id_clean)])),
+                    ratio = log2(gc3) - utr5) %>%
+  filter(!is.na(gc3), !is.na(utr5))
+stopifnot("GC3 outside [0, 100]" = all(ds$gc3 >= 0 & ds$gc3 <= 100),
+          "GC3 of 0 makes the ratio infinite" = all(is.finite(ds$ratio)))
+xs <- list(gc3   = list(lab = "GC3 (%)", file = "gc3"),
+           utr5  = list(lab = "log2 5'UTR length", file = "utr5_length"),
+           ratio = list(lab = "log2(GC3 / 5'UTR length)", file = "gc3_over_utr5_length"))
+# y zoomed to the central 99.8% of genes so a handful of extreme genes do not flatten the cloud;
+# the fit and rho still use every gene (coord_cartesian does not drop data)
+ylim <- quantile(ds$te_lfc, c(0.001, 0.999))
+n_off <- sum(ds$te_lfc < ylim[1] | ds$te_lfc > ylim[2])
+for (v in names(xs)) {
+  rho <- cor(ds[[v]], ds$te_lfc, method = "spearman")
+  fit <- summary(lm(ds$te_lfc ~ ds[[v]]))
+  cat(sprintf("\n\n%s: slope %.4f, adjusted R2 %.3f; y zoomed, %d genes off-scale (still in the fit)\n",
+              xs[[v]]$lab, coef(fit)[2, 1], fit$adj.r.squared, n_off))
+  p <- ggplot(ds, aes(.data[[v]], te_lfc)) +
+    geom_point(colour = "grey70", size = 0.5, alpha = 0.4) +
+    geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "black", linewidth = 0.8, se = TRUE) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.6,
+             label = sprintf("Spearman rho = %.3f\nn = %s genes", rho, scales::comma(nrow(ds)))) +
+    labs(x = xs[[v]]$lab, y = "log2 TE change (sictrl / si3d)",
+         title = params$label, subtitle = "all modelled genes; line = linear fit (95% CI)") +
+    coord_cartesian(ylim = ylim) +
+    theme_classic(base_size = 12)
+  cat("\n\n## ", xs[[v]]$lab, "\n\n", sep = ""); print(p)
+  if (SAVE) ggsave(here("plots", sprintf("37_te_change_vs_%s_hypoxia_1hr.pdf", xs[[v]]$file)), p, width = 7, height = 6)
+}
+```
+
+```{r session}
+sessionInfo()
+```
