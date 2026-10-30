@@ -1,0 +1,208 @@
+---
+title: "Clustering eIF3d targets on GC3, CDS length and 5'UTR length only"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  set_label: "eIF3d promoted"
+  k: 3
+  k_range: [2, 3, 4, 5, 6]
+  n_perm: 100
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "40_target_clusters_gc3_length.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-28: cluster the eIF3d targets (hypoxia 1hr) on **three features only** - GC3
+(`gc3_internal`, %), log2 CDS length and log2 5'UTR length - instead of on their SHAP profiles,
+and see what the groups look like.
+
+- **Targets**: the `r params$set_label` genes of the SHAP explain set (TE change sictrl vs si3d
+  > 0.5, padj < 0.05), with all three features.
+- **Scaling**: each feature z-scored *within the targets*, so the clusters split the targets
+  rather than separating them from other genes. Values are reported in natural units and as
+  z-scores against all modelled genes.
+- **Method**: k-means (`nstart = 25`, `set.seed(9)`), clusters relabelled largest = 1. These are
+  called **feature clusters** here to keep them apart from the SHAP clusters of `26b_`.
+- **Is there structure?** Three continuous features can always be cut into k groups, so the
+  silhouette is compared against a null: each feature permuted independently across targets
+  (destroys how the three co-occur, keeps every marginal), `r params$n_perm` permutations,
+  standardised within each k as in `03_subgroup_null.R`.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(patchwork); library(cluster) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+K <- as.integer(params$k)
+ks <- as.integer(unlist(params$k_range))
+cl_cols <- c("#0072B2", "#CC79A7", "#009E73", "#D55E00", "#F0E442", "grey40")
+feat <- c(gc3 = "GC3 (%)", cds = "log2 CDS length", utr5 = "log2 5'UTR length")
+```
+
+# 1. Targets and features
+
+```{r data}
+oof <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+kd <- de$rna_lfc[de$symbol == "EIF3D"]
+stopifnot("EIF3D rna_lfc not strongly positive: direction flipped" = length(kd) == 1 && kd > 1,
+          "outcome differs from the DE file's te_lfc" =
+            max(abs(oof$genes$y - de$te_lfc[match(oof$genes$gene_id_clean, de$gene_id_clean)])) < 1e-12)
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean))
+num <- function(col) as.numeric(unlist(fm[[col]][match(oof$genes$gene_id_clean, fm$gene_id_clean)]))
+all_g <- oof$genes %>% transmute(gene_id_clean, symbol, te_lfc = y, target = set == params$set_label) %>%
+  mutate(gc3 = num("gc3_internal"), cds = num("log2_cds_length"), utr5 = num("log2_utr5_length")) %>%
+  filter(!is.na(gc3), !is.na(cds), !is.na(utr5))
+stopifnot("GC3 outside [0, 100]" = all(all_g$gc3 >= 0 & all_g$gc3 <= 100),
+          "lengths out of range" = all(all_g$cds > 0) && all(all_g$utr5 >= 0))
+tg <- all_g %>% filter(target) %>% arrange(gene_id_clean)
+X <- scale(as.matrix(tg[, names(feat)]))
+cat(sprintf("targets with all three features: %s of %s; all modelled genes with all three: %s\n",
+            scales::comma(nrow(tg)), scales::comma(sum(oof$genes$set == params$set_label)), scales::comma(nrow(all_g))))
+knitr::kable(round(cor(tg[, names(feat)], method = "spearman"), 3), caption = "Spearman rho between the features, within targets")
+```
+
+# 2. Is there cluster structure? Silhouette vs a permutation null
+
+```{r null, fig.width = 7, fig.height = 4.5}
+D <- dist(X)
+sil_of <- function(M, Dm, k) { set.seed(9); km <- kmeans(M, k, nstart = 25, iter.max = 50); mean(silhouette(km$cluster, Dm)[, 3]) }
+obs <- sapply(ks, function(k) sil_of(X, D, k))
+set.seed(9); perms <- lapply(seq_len(params$n_perm), function(i) apply(X, 2, sample))
+nul <- sapply(perms, function(P) { Dp <- dist(P); sapply(ks, function(k) sil_of(P, Dp, k)) })
+sil_tab <- tibble(k = ks, observed = obs, null_median = apply(nul, 1, median), null_max = apply(nul, 1, max),
+                  z = (obs - rowMeans(nul)) / apply(nul, 1, sd), p = (rowSums(nul >= obs) + 1) / (params$n_perm + 1))
+knitr::kable(sil_tab, digits = c(0, 4, 4, 4, 2, 4),
+             caption = sprintf("mean silhouette; null = each feature permuted independently across targets, %d permutations", params$n_perm))
+nb <- tibble(k = rep(ks, params$n_perm), sil = as.vector(nul))
+p_null <- ggplot() +
+  geom_jitter(data = nb, aes(k, sil), width = 0.12, height = 0, colour = "grey70", size = 0.6) +
+  geom_line(data = sil_tab, aes(k, observed), colour = "#E69F00") +
+  geom_point(data = sil_tab, aes(k, observed), colour = "#E69F00", size = 2.5) +
+  labs(x = "number of clusters (k)", y = "mean silhouette",
+       title = "targets clustered on GC3, CDS and 5'UTR length",
+       subtitle = sprintf("orange = observed; grey = %d permutations\n(features shuffled independently); n = %s targets",
+                          params$n_perm, scales::comma(nrow(tg)))) +
+  theme_classic(base_size = 12)
+p_null
+if (SAVE) ggsave(here("plots", "40_target_feature_clusters_silhouette_null_hypoxia_1hr.pdf"), p_null, width = 7, height = 4.5)
+```
+
+# 3. The clusters at k = `r params$k`
+
+```{r clusters}
+set.seed(9); km <- kmeans(X, K, nstart = 25, iter.max = 50)
+relab <- match(seq_len(K), as.integer(names(sort(table(km$cluster), decreasing = TRUE))))
+tg$fcl <- factor(relab[km$cluster])
+mu <- colMeans(all_g[, names(feat)]); sdv <- sapply(all_g[, names(feat)], sd)
+# Per-gene z-scores vs all modelled genes, raw sign (higher = longer / more GC3); read by 43_
+if (SAVE) write_csv(all_g %>% transmute(gene_id_clean, symbol, te_lfc, target, gc3, cds, utr5,
+                                        z_gc3 = (gc3 - mu["gc3"]) / sdv["gc3"], z_cds = (cds - mu["cds"]) / sdv["cds"],
+                                        z_utr5 = (utr5 - mu["utr5"]) / sdv["utr5"]),
+                    file.path(O, "gene_feature_zscores_gc3_length_hypoxia_1hr.csv"))
+prof <- tg %>% group_by(fcl) %>%
+  summarise(n = n(), median_gc3 = median(gc3), median_cds_nt = median(2^cds - 1), median_utr5_nt = median(2^utr5 - 1),
+            z_gc3 = mean((gc3 - mu["gc3"]) / sdv["gc3"]), z_cds = mean((cds - mu["cds"]) / sdv["cds"]),
+            z_utr5 = mean((utr5 - mu["utr5"]) / sdv["utr5"]), median_te_lfc = median(te_lfc), .groups = "drop")
+ref <- all_g %>% summarise(fcl = "all modelled genes", n = n(), median_gc3 = median(gc3), median_cds_nt = median(2^cds - 1),
+                           median_utr5_nt = median(2^utr5 - 1), z_gc3 = 0, z_cds = 0, z_utr5 = 0, median_te_lfc = median(te_lfc))
+knitr::kable(bind_rows(prof %>% mutate(fcl = as.character(fcl)), ref), digits = c(0, 0, 1, 0, 0, 2, 2, 2, 3),
+             caption = "feature clusters: medians in natural units; z = mean z-score vs all modelled genes")
+kw <- kruskal.test(te_lfc ~ fcl, data = tg)
+cat(sprintf("TE change differs between feature clusters? Kruskal-Wallis p = %.2g\n", kw$p.value))
+if (SAVE) write_csv(tg %>% dplyr::select(gene_id_clean, symbol, te_lfc, gc3, cds, utr5, feature_cluster = fcl),
+                    file.path(O, sprintf("target_gc3_length_clusters_hypoxia_1hr_k%d.csv", K)))
+```
+
+## Where the clusters sit (targets coloured, all other genes grey)
+
+```{r scatters, fig.width = 14, fig.height = 5}
+pr <- list(c("cds", "gc3"), c("utr5", "gc3"), c("cds", "utr5"))
+bg <- all_g %>% filter(!target)
+pl <- map(pr, function(v) ggplot() +
+  geom_point(data = bg, aes(.data[[v[1]]], .data[[v[2]]]), colour = "grey85", size = 0.3) +
+  geom_point(data = tg, aes(.data[[v[1]]], .data[[v[2]]], colour = fcl), size = 0.6, alpha = 0.7) +
+  scale_colour_manual(values = cl_cols, name = "feature\ncluster") +
+  labs(x = feat[v[1]], y = feat[v[2]]) + theme_classic(base_size = 12))
+p_sc <- wrap_plots(pl, nrow = 1, guides = "collect") +
+  plot_annotation(title = sprintf("%s eIF3d targets clustered on GC3, CDS and 5'UTR length (k = %d)", params$label, K),
+                  subtitle = sprintf("targets coloured by feature cluster (sizes %s); grey = all other modelled genes (n = %s)",
+                                     paste(table(tg$fcl), collapse = "/"), scales::comma(nrow(bg))))
+p_sc
+if (SAVE) ggsave(here("plots", sprintf("40_target_feature_clusters_scatter_hypoxia_1hr_k%d.pdf", K)), p_sc, width = 14, height = 5)
+```
+
+## Feature profile and TE change per cluster
+
+```{r profile, fig.width = 12, fig.height = 4.5}
+zl <- prof %>% dplyr::select(fcl, n, z_gc3, z_cds, z_utr5) %>%
+  pivot_longer(starts_with("z_"), names_to = "feature", values_to = "z") %>%
+  mutate(feature = factor(feat[sub("z_", "", feature)], levels = feat))
+p_z <- ggplot(zl, aes(feature, fcl, fill = z)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%+.2f", z)), size = 3.5) +
+  scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0, name = "mean z\nvs all genes") +
+  scale_y_discrete(limits = rev, labels = function(x) sprintf("%s (n = %d)", x, prof$n[match(x, prof$fcl)])) +
+  labs(x = NULL, y = "feature cluster", title = "feature profile") + theme_classic(base_size = 12)
+p_te <- ggplot(tg, aes(fcl, te_lfc, colour = fcl)) +
+  geom_boxplot(outlier.size = 0.4) +
+  scale_colour_manual(values = cl_cols, guide = "none") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.5, label = sprintf("Kruskal-Wallis p = %.2g", kw$p.value)) +
+  coord_cartesian(ylim = c(0.4, quantile(tg$te_lfc, 0.99))) +   # zoom; the test uses every target
+  labs(x = "feature cluster", y = "log2 TE change (sictrl / si3d)", title = "TE change within targets",
+       subtitle = "y zoomed to the lowest 99% of targets") +
+  theme_classic(base_size = 12)
+p_prof <- p_z + p_te + plot_layout(widths = c(1.3, 1)) +
+  plot_annotation(title = sprintf("%s eIF3d targets: feature clusters on GC3, CDS and 5'UTR length (k = %d, n = %s)",
+                                  params$label, K, scales::comma(nrow(tg))))
+p_prof
+if (SAVE) ggsave(here("plots", sprintf("40_target_feature_clusters_profile_hypoxia_1hr_k%d.pdf", K)), p_prof, width = 12, height = 4.5)
+```
+
+# 4. Agreement with the SHAP clusters
+
+Cross-tabulation against `26b_`'s k = 3 SHAP clusters (normalized and raw). The adjusted Rand
+index is 0 for chance agreement and 1 for identical partitions.
+
+```{r vs_shap}
+ari <- function(a, b) {
+  t <- table(a, b); n <- sum(t); s <- function(x) sum(choose(x, 2))
+  e <- s(rowSums(t)) * s(colSums(t)) / choose(n, 2); (s(t) - e) / ((s(rowSums(t)) + s(colSums(t))) / 2 - e)
+}
+sc <- read_csv(file.path(O, paste0("target_shap_feature_clusters_", params$suffix, ".csv")), show_col_types = FALSE) %>% filter(k == 3)
+for (pf in c("features, normalized", "features, raw")) {
+  a <- sc %>% filter(profile == pf)
+  shp <- a$cluster[match(tg$gene_id_clean, a$gene_id_clean)]
+  stopifnot("a target has no SHAP cluster" = !anyNA(shp))
+  cat(sprintf("\n\nSHAP %s clusters vs feature clusters: adjusted Rand index %.3f\n", sub("features, ", "", pf), ari(shp, tg$fcl)))
+  print(table(`SHAP cluster` = shp, `feature cluster` = tg$fcl))
+}
+```
+
+```{r session}
+sessionInfo()
+```

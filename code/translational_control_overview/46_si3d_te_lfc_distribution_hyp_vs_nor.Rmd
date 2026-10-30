@@ -1,0 +1,134 @@
+---
+title: "eIF3d knockdown TE change: hypoxia vs normoxia distributions"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-30. The full distribution of the TE change on eIF3d knockdown, hypoxia overlaid on
+normoxia, one plot per cell line. Every gene with a TE change in that contrast is included (no
+feature-matrix filter, no gene-set filter).
+
+- **Direction:** every value is log2(sictrl / si3d), so positive = the knockdown lowers TE =
+  eIF3d **promotes** translation.
+- **MDA-MB-231:** hypoxia `output/translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv`; normoxia
+  is the **time-regressed 1+4hr** contrast, `translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv`
+  (Kate's standing choice for MDA-MB-231 normoxia, 2026-10-30). The filenames state the ratio
+  backwards; the DESeq2 coefficient is sictrl vs si3d.
+- **MCF7-SIX1:** `output/translation_categories_si3d_vs_sictrl_mcf7six1_{hypoxia,normoxia}_1hr.csv`
+  (1hr is the only MCF7-SIX1 timepoint),
+  written by `10m_mcf7six1_outcome_prep.Rmd`, which negates the source log2(si3d / sictrl) once so
+  that positive = promotes, as in MDA-MB-231.
+- **The two cell lines are on different scales.** MDA-MB-231 is spike-in normalized, so its
+  distributions need not centre on 0. MCF7-SIX1 is not spike-in normalized and is `lfcShrink`-shrunk.
+  Compare hypoxia with normoxia within a cell line, not across.
+- **Colors:** hypoxia Okabe-Ito vermillion `#D55E00`, normoxia bluish green `#009E73`.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+SAVE <- isTRUE(params$save_plots)
+TOL <- 1e-12
+cond_cols <- c(hypoxia = "#D55E00", normoxia = "#009E73")
+# Legend wording per contrast
+cond_lab <- c(`MDA-MB-231.hypoxia` = "hypoxia 1hr", `MDA-MB-231.normoxia` = "normoxia 1+4hr (time-regressed)",
+              `MCF7-SIX1.hypoxia` = "hypoxia 1hr", `MCF7-SIX1.normoxia` = "normoxia 1hr")
+files <- tribble(~cell, ~condition, ~file,
+  "MDA-MB-231", "hypoxia",  "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "MDA-MB-231", "normoxia", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "MCF7-SIX1",  "hypoxia",  "translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv",
+  "MCF7-SIX1",  "normoxia", "translation_categories_si3d_vs_sictrl_mcf7six1_normoxia_1hr.csv")
+```
+
+# 1. Data and direction checks
+
+- **MDA-MB-231:** EIF3D's own `rna_lfc` must be strongly positive (the siRNA depletes it).
+- **MCF7-SIX1:** these files have no `rna_lfc`, so that check cannot run. Instead: `te_lfc` must be
+  exactly the negated source `log2FoldChange` carried in the same file, and each condition must
+  correlate positively with the matched MDA-MB-231 contrast (the independent ruler in `10m_`).
+- EIF3D's own **TE** change is printed but not asserted: it is not a direction ruler. In
+  MDA-MB-231 it is -1.26 in hypoxia but +0.92 in normoxia 1hr and +0.27 in normoxia 1+4hr, so
+  its sign varies by contrast.
+
+```{r data}
+te <- pmap_dfr(files, function(cell, condition, file) {
+  x <- read_csv(here("output", file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+  stopifnot("duplicate genes" = !anyDuplicated(x$gene_id_clean), "symbol column missing" = "symbol" %in% names(x))
+  if (cell == "MDA-MB-231") {
+    kd <- x$rna_lfc[x$symbol %in% "EIF3D"]
+    stopifnot("EIF3D rna_lfc not > 1: wrong file or flipped direction" = length(kd) == 1 && kd > 1)
+    cat(sprintf("%s %s: EIF3D rna_lfc %+.2f\n", cell, condition, kd))
+  } else {
+    stopifnot("MCF7-SIX1 te_lfc is not the negated source LFC" =
+                max(abs(x$te_lfc + x$source_log2FoldChange), na.rm = TRUE) < TOL &&
+                identical(is.na(x$te_lfc), is.na(x$source_log2FoldChange)))
+  }
+  x %>% filter(!is.na(te_lfc)) %>% transmute(cell, condition, gene_id_clean, symbol, te_lfc)
+})
+stopifnot("log fold changes not finite" = all(is.finite(te$te_lfc)))
+e3d <- te %>% filter(symbol == "EIF3D")
+print(e3d)
+stopifnot("EIF3D missing from a contrast" = nrow(e3d) == 4)
+
+xcell <- te %>% dplyr::select(-symbol) %>% pivot_wider(names_from = cell, values_from = te_lfc) %>%
+  filter(!is.na(`MDA-MB-231`), !is.na(`MCF7-SIX1`)) %>% group_by(condition) %>%
+  summarise(n = n(), rho = cor(`MDA-MB-231`, `MCF7-SIX1`, method = "spearman"))
+knitr::kable(xcell, digits = 3, caption = "Spearman of TE change, MCF7-SIX1 vs MDA-MB-231, per condition (shared genes)")
+stopifnot("MCF7-SIX1 does not agree in direction with MDA-MB-231" = all(xcell$rho > 0.1))
+
+summ <- te %>% group_by(cell, condition) %>%
+  summarise(n = n(), median = median(te_lfc), mean = mean(te_lfc), sd = sd(te_lfc),
+            q01 = quantile(te_lfc, 0.01), q99 = quantile(te_lfc, 0.99), min = min(te_lfc), max = max(te_lfc), .groups = "drop")
+knitr::kable(summ, digits = 3, caption = "TE change on eIF3d knockdown, log2(sictrl / si3d), every tested gene")
+```
+
+# 2. Distributions
+
+One plot per cell line. The x axis is zoomed to the central 99.8% of values (the extremes reach
+-14 and +10, which would squash the peaks into a spike); the densities and medians still use every
+gene. Densities use every gene tested in that condition (n in the legend).
+Dashed lines mark each condition's median. The median per-gene shift (hypoxia - normoxia, genes
+tested in both) is printed above each plot.
+
+```{r density, fig.width = 7, fig.height = 5, results = "asis"}
+for (cl in c("MDA-MB-231", "MCF7-SIX1")) {
+  dc <- te %>% filter(cell == cl)
+  sc <- summ %>% filter(cell == cl)
+  pr <- dc %>% dplyr::select(condition, gene_id_clean, te_lfc) %>% pivot_wider(names_from = condition, values_from = te_lfc) %>%
+    filter(!is.na(hypoxia), !is.na(normoxia))
+  med_shift <- median(pr$hypoxia - pr$normoxia)
+  stopifnot("summary n does not match the plotted genes" = all(sc$n == as.integer(table(dc$condition)[sc$condition])))
+  xl <- quantile(dc$te_lfc, c(0.001, 0.999)); n_off <- sum(dc$te_lfc < xl[1] | dc$te_lfc > xl[2])
+  lab <- setNames(sprintf("%s (n = %s, median %+.2f)", cond_lab[paste(cl, sc$condition, sep = ".")], scales::comma(sc$n), sc$median), sc$condition)
+  p <- ggplot(dc, aes(te_lfc, color = condition)) +
+    geom_density(linewidth = 0.8) +
+    geom_vline(xintercept = 0, color = "grey40", linewidth = 0.3) +
+    geom_vline(data = sc, aes(xintercept = median, color = condition), linetype = "dashed", linewidth = 0.6, show.legend = FALSE) +
+    scale_color_manual(values = cond_cols, labels = lab, name = NULL) +
+    labs(x = "log2 TE change, sictrl vs si3d (positive = eIF3d promotes)", y = "density",
+         title = cl) +
+    coord_cartesian(xlim = xl) +
+    theme_classic(base_size = 12) + theme(legend.position = "bottom", legend.direction = "vertical")
+  cat(sprintf("\n\n## %s\n\nmedian per-gene shift (hyp - nor) %+.3f; n = %s genes in both; x zoomed, %d gene-conditions off-scale (still in the density)\n\n",
+              cl, med_shift, scales::comma(nrow(pr)), n_off)); print(p)
+  if (SAVE) ggsave(here("plots", sprintf("46_si3d_te_lfc_density_hyp_vs_nor_%s.pdf",
+                                         if (cl == "MDA-MB-231") "mda231_hyp1hr_nor1and4hr" else "mcf7six1_1hr")), p, width = 7, height = 5)
+}
+```
+
+```{r session}
+sessionInfo()
+```

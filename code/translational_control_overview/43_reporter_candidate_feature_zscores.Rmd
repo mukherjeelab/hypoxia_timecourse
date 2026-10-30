@@ -1,0 +1,296 @@
+---
+title: "Reporter candidates: where every mRNA sits on 5'UTR length, CDS length and GC3"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  zscore_csv: "gene_feature_zscores_gc3_length_hypoxia_1hr.csv"
+  geneset_csv: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "43_reporter_candidate_feature_zscores.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-30: first step towards picking reporter mRNAs for eIF3d-dependent translation in
+hypoxia. The three features judged important for that regulation are 5'UTR length, CDS length
+and GC3 (`gc3_internal`: third codon positions, initiator and stop removed). This notebook places
+every mRNA on all three on one shared z-score axis.
+
+- **Which genes:** every gene in the hypoxia 1hr eIF3d model (`r params$suffix`) that has a value
+  for all three features. No other filter.
+- **The z-score is the heatmap's z-score**, not a new one: the per-gene values of
+  `40_target_clusters_gc3_length.Rmd` (the three-feature cluster notebook), z = (gene - mean) / sd
+  over the same genes, uncapped. They are **imported** from `r params$zscore_csv` and
+  **recomputed here independently** from the feature matrix; the notebook stops if the two differ.
+- **Orientation:** CDS length and GC3 are **negated** (-z), so higher = more eIF3d-favorable in
+  every column: long 5'UTR, short CDS, AU-rich third positions. The direction is not assumed - it
+  is asserted against the observed TE change in section 3.
+- **Not a combined score.** No weighting or summing yet; candidate selection comes after the plots.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+TOL <- 1e-12
+feat_lab <- c(utr5 = "log2 5'UTR length (z)", cds = "CDS length (-z)", gc3 = "GC3 (-z)")
+grp_cols <- c("All genes" = "grey70", "Negative controls" = "black", "eIF3d hypoxia targets" = "#E69F00")
+```
+
+# 1. Inputs and checks
+
+```{r load}
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+stopifnot("DE table has duplicate genes" = !anyDuplicated(de$gene_id_clean))
+kd <- de$rna_lfc[de$symbol %in% "EIF3D"]
+stopifnot("EIF3D not found once" = length(kd) == 1,
+          "EIF3D rna_lfc not > 1: wrong file or flipped direction" = kd > 1)
+cat(sprintf("%s: EIF3D rna_lfc %+.2f -> columns are log2(sictrl / si3d), positive = eIF3d promotes\n", params$de_file, kd))
+
+oof <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+mg <- oof$genes
+stopifnot("model genes duplicated" = !anyDuplicated(mg$gene_id_clean),
+          "model TE differs from the DE file" =
+            max(abs(mg$y - de$te_lfc[match(mg$gene_id_clean, de$gene_id_clean)])) < TOL,
+          "unexpected model sets" = setequal(unique(mg$set), c("eIF3d promoted", "negative control", "other")))
+
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "model genes missing from the matrix" = all(mg$gene_id_clean %in% fm$gene_id_clean),
+          "feature columns missing" = all(c("gc3_internal", "log2_cds_length", "log2_utr5_length",
+                                            "cds_length", "utr5_length") %in% names(fm)))
+num <- function(col) as.numeric(unlist(fm[[col]][match(mg$gene_id_clean, fm$gene_id_clean)]))
+raw <- mg %>% transmute(gene_id_clean, symbol, te_lfc = y, te_padj = y_padj, set,
+                        gc3 = num("gc3_internal"), cds = num("log2_cds_length"), utr5 = num("log2_utr5_length"),
+                        cds_nt = num("cds_length"), utr5_nt = num("utr5_length"))
+stopifnot("log2 5'UTR length is not log2(nt + 1)" = max(abs(raw$utr5 - log2(raw$utr5_nt + 1))) < TOL,
+          "log2 CDS length is not log2(nt + 1)" = max(abs(raw$cds - log2(raw$cds_nt + 1))) < TOL,
+          "lengths missing" = !anyNA(raw$cds) && !anyNA(raw$utr5))
+# The only missing feature is GC3, and only where the CDS is not a complete reading frame
+stopifnot("a gene lacks GC3 but has an in-frame CDS that is not flagged" =
+            all(is.na(raw$gc3) | raw$cds_nt %% 3 == 0))
+a <- raw %>% filter(!is.na(gc3))
+stopifnot("GC3 outside [0, 100]" = all(a$gc3 >= 0 & a$gc3 <= 100),
+          "GC3 median outside 40-65%" = between(median(a$gc3), 40, 65),
+          "lengths out of range" = all(a$cds_nt > 0) && all(a$utr5_nt >= 1),
+          "a kept gene has an out-of-frame CDS" = all(a$cds_nt %% 3 == 0))
+cat(sprintf("model genes %s; with all three features %s (dropped %d without GC3)\n",
+            scales::comma(nrow(raw)), scales::comma(nrow(a)), nrow(raw) - nrow(a)))
+```
+
+## Gene groups
+
+```{r groups}
+gs <- sub("[.].*", "", read_csv(here("output", "genesets", params$geneset_csv), show_col_types = FALSE)$ensembl_gene)
+a <- a %>% mutate(target = set == "eIF3d promoted", negctrl = set == "negative control")
+stopifnot("targets differ from the saved gene-set CSV" = setequal(a$gene_id_clean[a$target], intersect(gs, a$gene_id_clean)),
+          "targets not TE LFC > 0.5, padj < 0.05" = all(a$te_lfc[a$target] > 0.5 & a$te_padj[a$target] < 0.05),
+          "negative controls not |TE LFC| < 0.5, padj > 0.3" =
+            all(abs(a$te_lfc[a$negctrl]) < 0.5 & a$te_padj[a$negctrl] > 0.3),
+          "a gene is both target and negative control" = !any(a$target & a$negctrl))
+cat(sprintf("eIF3d hypoxia targets %s; negative controls %s (|TE LFC| range %.2f, min padj %.2f); other %s\n",
+            scales::comma(sum(a$target)), scales::comma(sum(a$negctrl)), max(abs(a$te_lfc[a$negctrl])),
+            min(a$te_padj[a$negctrl]), scales::comma(sum(!a$target & !a$negctrl))))
+```
+
+# 2. Z-scores: imported and recomputed
+
+```{r zscores}
+zi <- read_csv(file.path(O, params$zscore_csv), show_col_types = FALSE)
+stopifnot("imported z table has duplicate genes" = !anyDuplicated(zi$gene_id_clean),
+          "imported z table covers different genes" = setequal(zi$gene_id_clean, a$gene_id_clean))
+zi <- zi[match(a$gene_id_clean, zi$gene_id_clean), ]
+stopifnot("imported raw values differ from the matrix" =
+            max(abs(zi$gc3 - a$gc3), abs(zi$cds - a$cds), abs(zi$utr5 - a$utr5)) < TOL,
+          "imported target labels differ" = identical(zi$target, a$target),
+          "imported TE differs" = max(abs(zi$te_lfc - a$te_lfc)) < TOL)
+
+# Independent recomputation, written out longhand rather than with scale()
+zr <- function(x) (x - sum(x) / length(x)) / sqrt(sum((x - mean(x))^2) / (length(x) - 1))
+a <- a %>% mutate(z_gc3 = zr(gc3), z_cds = zr(cds), z_utr5 = zr(utr5))
+dev <- c(gc3 = max(abs(a$z_gc3 - zi$z_gc3)), cds = max(abs(a$z_cds - zi$z_cds)), utr5 = max(abs(a$z_utr5 - zi$z_utr5)))
+print(signif(dev, 3))
+stopifnot("recomputed z differs from the imported heatmap z" = all(dev < TOL))
+zs <- a[, c("z_gc3", "z_cds", "z_utr5")]
+stopifnot("z not mean 0" = all(abs(colMeans(zs)) < 1e-9), "z not sd 1" = all(abs(sapply(zs, sd) - 1) < 1e-9))
+
+# Hand check on named genes: z from the gene's raw value and the background mean / sd
+for (s in c("ACTB", "GAPDH", "TSPAN6")) {
+  i <- which(a$symbol == s); stopifnot("hand-check gene not found once" = length(i) == 1)
+  stopifnot("hand-computed z wrong" = abs((a$gc3[i] - mean(a$gc3)) / sd(a$gc3) - zi$z_gc3[i]) < TOL,
+            "hand-computed z wrong" = abs((a$cds[i] - mean(a$cds)) / sd(a$cds) - zi$z_cds[i]) < TOL)
+}
+# Extremes land at the ends
+stopifnot("shortest CDS does not have the lowest CDS z" = a$z_cds[which.min(a$cds_nt)] == min(a$z_cds),
+          "longest 5'UTR does not have the highest 5'UTR z" = a$z_utr5[which.max(a$utr5_nt)] == max(a$z_utr5),
+          "highest GC3 does not have the highest GC3 z" = a$z_gc3[which.max(a$gc3)] == max(a$z_gc3))
+
+# Orient: higher = more eIF3d-favorable (short CDS, AU-rich GC3)
+a <- a %>% mutate(o_utr5 = z_utr5, o_cds = -z_cds, o_gc3 = -z_gc3)
+cat(sprintf("z vs %s genes; max |deviation| imported vs recomputed %.1e\n", scales::comma(nrow(a)), max(dev)))
+```
+
+# 3. Do the oriented z-scores agree with eIF3d-dependent TE change in hypoxia?
+
+Every oriented column should rise with TE change (sictrl vs si3d), sit above zero for the
+targets, and hold more targets in its most favorable tenth than in its least favorable tenth.
+
+```{r spot_checks}
+oc <- c(utr5 = "o_utr5", cds = "o_cds", gc3 = "o_gc3")
+chk <- imap_dfr(oc, function(v, f) {
+  dec <- ntile(a[[v]], 10)
+  tibble(feature = f,
+         spearman_vs_te = cor(a[[v]], a$te_lfc, method = "spearman"),
+         mean_z_targets = mean(a[[v]][a$target]), mean_z_other = mean(a[[v]][!a$target]),
+         wilcox_p = wilcox.test(a[[v]][a$target], a[[v]][!a$target])$p.value,
+         target_rate_least = mean(a$target[dec == 1]), target_rate_most = mean(a$target[dec == 10]))
+})
+knitr::kable(chk, digits = c(0, 3, 3, 3, 1, 3, 3), caption = sprintf("oriented z vs TE change, n = %s genes", scales::comma(nrow(a))))
+stopifnot("an oriented z does not rise with TE change" = all(chk$spearman_vs_te > 0),
+          "targets are not on the favorable side" = all(chk$mean_z_targets > 0 & chk$mean_z_targets > chk$mean_z_other),
+          "targets vs other not significant" = all(chk$wilcox_p < 0.05),
+          "most favorable tenth does not hold more targets" = all(chk$target_rate_most > chk$target_rate_least))
+
+# Known biology. Ribosomal-protein mRNAs (TOP mRNAs): very short CDS and very short 5'UTR
+rp <- a %>% filter(str_detect(symbol, "^RP[LS][0-9]+[A-Z]?[0-9]*$"))
+cat(sprintf("ribosomal proteins n = %d: median oriented z  5'UTR %+.2f  CDS %+.2f  GC3 %+.2f; median TE change %+.2f\n",
+            nrow(rp), median(rp$o_utr5), median(rp$o_cds), median(rp$o_gc3), median(rp$te_lfc)))
+stopifnot("too few ribosomal proteins matched" = nrow(rp) > 50,
+          "ribosomal proteins do not score favorable on CDS (short)" = median(rp$o_cds) > 0,
+          "ribosomal proteins do not score unfavorable on 5'UTR (short)" = median(rp$o_utr5) < 0)
+# ACTB: GC-rich third positions and essentially no TE change
+actb <- a %>% filter(symbol == "ACTB")
+cat(sprintf("ACTB: GC3 %.1f%% (oriented z %+.2f), TE change %+.2f\n", actb$gc3, actb$o_gc3, actb$te_lfc))
+stopifnot("ACTB GC3 not GC-rich" = actb$o_gc3 < 0, "ACTB has a large TE change" = abs(actb$te_lfc) < 0.5)
+```
+
+**Ribosomal-protein mRNAs are strong eIF3d targets that the 5'UTR column scores as unfavorable**,
+because their 5'UTRs are very short. The features do not capture TOP mRNAs.
+
+## The 5'UTR effect is a floor, not a trend
+
+The z-score rewards every extra nucleotide equally. The target rate does not: it is depressed for
+very short 5'UTRs and roughly flat above ~50 nt.
+
+```{r utr5_shape}
+utab <- a %>% mutate(`5'UTR length (nt)` = cut(utr5_nt, c(0, 25, 50, 100, 200, 400, Inf),
+                                                labels = c("<=25", "26-50", "51-100", "101-200", "201-400", ">400"))) %>%
+  group_by(`5'UTR length (nt)`) %>%
+  summarise(n = n(), target_rate = mean(target), median_te_change = median(te_lfc), .groups = "drop")
+knitr::kable(utab, digits = c(0, 0, 3, 3))
+stopifnot("every 5'UTR bin populated" = nrow(utab) == 6 && all(utab$n > 100))
+```
+
+# 4. The plot
+
+EIF3D is left off the figure: the siRNA depletes its own mRNA, so its TE change is not eIF3d
+biology. It stays in the background used for the z-scores, which are the heatmap's.
+
+```{r plot_data}
+pd_all <- a %>% filter(symbol != "EIF3D") %>%
+  pivot_longer(c(o_utr5, o_cds, o_gc3), names_to = "feature", values_to = "z") %>%
+  mutate(feature = factor(feat_lab[sub("o_", "", feature)], levels = feat_lab))
+n_bg <- n_distinct(pd_all$gene_id_clean); n_t <- sum(a$target & a$symbol != "EIF3D"); n_n <- sum(a$negctrl & a$symbol != "EIF3D")
+stopifnot("EIF3D not removed exactly once" = n_bg == nrow(a) - 1,
+          "every column must hold one dot per gene" = all(table(pd_all$feature) == n_bg),
+          "plotted z differs from oriented z" =
+            max(abs(pd_all$z[pd_all$feature == feat_lab["cds"]] + a$z_cds[a$symbol != "EIF3D"])) < TOL)
+sub_txt <- function(groups) paste0(
+  sprintf("z-score vs all %s genes with all three features; CDS length and GC3 negated (-z) so higher = more eIF3d-favorable in every column\n",
+          scales::comma(nrow(a))),
+  paste(c(sprintf("grey = all genes, n = %s", scales::comma(n_bg)),
+          if ("n" %in% groups) sprintf("black = negative controls, n = %s", scales::comma(n_n)),
+          if ("t" %in% groups) sprintf("orange = eIF3d hypoxia targets (TE LFC sictrl vs si3d > 0.5, padj < 0.05), n = %s", scales::comma(n_t))),
+        collapse = "; "))
+```
+
+## Version 1: eIF3d hypoxia targets
+
+```{r plot_v1, fig.width = 9, fig.height = 6.5}
+set.seed(9)
+p1 <- ggplot(pd_all, aes(feature, z)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_jitter(color = grp_cols[["All genes"]], width = 0.3, height = 0, size = 0.3, alpha = 0.3) +
+  geom_jitter(data = filter(pd_all, target), color = grp_cols[["eIF3d hypoxia targets"]],
+              width = 0.3, height = 0, size = 0.5, alpha = 0.6) +
+  labs(x = NULL, y = "z-score (higher = more eIF3d-favorable)",
+       title = sprintf("%s: 5'UTR length, CDS length and GC3 of every mRNA", params$label),
+       subtitle = sub_txt("t")) +
+  theme_classic(base_size = 12) + theme(plot.subtitle = element_text(size = 8))
+p1
+if (SAVE) ggsave(here("plots", "43_reporter_feature_zscores_targets.pdf"), p1, width = 9, height = 6.5)
+```
+
+## Version 2: eIF3d hypoxia targets and negative controls
+
+Within each feature the three groups are drawn side by side (all genes, negative controls,
+eIF3d targets last) so that the black dots do not hide the orange ones.
+
+```{r plot_v2, fig.width = 11, fig.height = 6.5}
+pd2 <- bind_rows(pd_all %>% mutate(group = "All genes"),
+                 pd_all %>% filter(negctrl) %>% mutate(group = "Negative controls"),
+                 pd_all %>% filter(target) %>% mutate(group = "eIF3d hypoxia targets")) %>%
+  mutate(group = factor(group, levels = names(grp_cols)))
+grp_n <- c("All genes" = n_bg, "Negative controls" = n_n, "eIF3d hypoxia targets" = n_t)
+stopifnot("group counts wrong" = all(table(pd2$group)[names(grp_n)] == grp_n * 3))
+grp_lab <- sprintf("%s (n = %s)", names(grp_n), scales::comma(grp_n))
+set.seed(9)
+p2 <- ggplot(pd2, aes(feature, z, color = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(position = position_jitterdodge(jitter.width = 0.25, jitter.height = 0, dodge.width = 0.85),
+             size = 0.4, alpha = 0.4) +
+  scale_color_manual(values = grp_cols, name = NULL, labels = grp_lab) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(x = NULL, y = "z-score (higher = more eIF3d-favorable)",
+       title = sprintf("%s: 5'UTR length, CDS length and GC3 of every mRNA", params$label),
+       subtitle = sub_txt(c("t", "n"))) +
+  theme_classic(base_size = 12) + theme(plot.subtitle = element_text(size = 8), legend.position = "bottom")
+p2
+if (SAVE) ggsave(here("plots", "43_reporter_feature_zscores_targets_negctrl.pdf"), p2, width = 11, height = 6.5)
+```
+
+## Version 2 as violins
+
+The same groups and order; the line in each violin is the group median.
+
+```{r plot_v2_violin, fig.width = 11, fig.height = 6.5}
+p2v <- ggplot(pd2, aes(feature, z, fill = group, color = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_violin(position = position_dodge(width = 0.85), width = 0.8, alpha = 0.35, linewidth = 0.5,
+              draw_quantiles = 0.5, scale = "width") +
+  scale_fill_manual(values = grp_cols, name = NULL, labels = grp_lab) +
+  scale_color_manual(values = grp_cols, name = NULL, labels = grp_lab) +
+  labs(x = NULL, y = "z-score (higher = more eIF3d-favorable)",
+       title = sprintf("%s: 5'UTR length, CDS length and GC3 of every mRNA", params$label),
+       subtitle = paste0(sub_txt(c("t", "n")), "\nviolins scaled to equal width; line = median")) +
+  theme_classic(base_size = 12) + theme(plot.subtitle = element_text(size = 8), legend.position = "bottom")
+p2v
+if (SAVE) ggsave(here("plots", "43_reporter_feature_zscores_targets_negctrl_violin.pdf"), p2v, width = 11, height = 6.5)
+```
+
+```{r session}
+sessionInfo()
+```

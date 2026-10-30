@@ -1,0 +1,255 @@
+---
+title: "Upstream ORFs in eIF3d-promoted mRNAs, from sequence"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  experiments: "MDA-MB-231 3d normoxia 1+4hr, MDA-MB-231 3d hypoxia 1hr, MCF7-SIX1 3d normoxia 1hr, MCF7-SIX1 3d hypoxia 1hr"
+  set_rule: "significant"  # "significant" = LFC > lfc_min and padj < padj_max; "top_n" = top N by LFC, as in 41_
+  top_n: 500
+  lfc_min: 0.5
+  padj_max: 0.05
+  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;_helatx_=feature_matrix_tco_hela.rds;_hektx_=feature_matrix_tco_dhx29.rds;_manetx_=feature_matrix_tco_mane.rds;=feature_matrix_tco.rds"
+  out_tag: "_own_data"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "42_uorf_sequence_promoted.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this asks
+
+Do eIF3d-promoted mRNAs carry more upstream ORFs in their 5'UTR than the rest of the transcriptome,
+and is that more than their longer 5'UTRs would give by chance?
+
+**Why from sequence.** The only ribo-seq uORF calls we have (ORFquant, MDA-MB-231 siCTRL normoxia
+1hr, `orfquant_analysis.Rmd`) detect a translated uORF in 274 of 10,186 genes (2.7%). A blank there
+mostly means "not detected", so it cannot say which mRNAs *lack* one. Sequence covers every
+transcript, at the cost of saying nothing about whether the uORF is translated. Section 4 compares
+the two.
+
+**Definitions** (every upstream ATG, uATG, is classified by scanning in its own frame for the first
+stop codon - TAA, TAG or TGA):
+
+- **uORF** - the stop falls inside the 5'UTR: a self-contained upstream ORF.
+- **oORF (overlapping)** - no stop inside the 5'UTR and the uATG is *out of frame* with the main
+  start codon, so the ORF runs into the CDS and overlaps the main start. ATF4's uORF2 is the
+  textbook case.
+- **N-extension** - no stop inside the 5'UTR and the uATG is *in frame* with the main start, so it
+  extends the main protein instead. Counted separately and not called a uORF.
+- **any uORF** = at least one uORF or oORF.
+
+ATG starts only; near-cognate starts (CTG, GTG, ...) are not counted. A uORF must have at least one
+codon after the ATG (ATG immediately followed by a stop is a "start-stop" and still counts - it is
+a known regulatory element).
+
+**Length is the obvious confounder.** Promoted mRNAs have longer 5'UTRs in all four contrasts
+(`41_`), and a longer 5'UTR contains more ATGs by chance. So every comparison is reported twice:
+raw, and from a logistic regression `has ~ promoted + log2(5'UTR length)` whose odds ratio is the
+**length-adjusted** effect.
+
+**Sets.** Same experiments and same promoted-set rule as `41_`: each experiment's own transcripts,
+promoted set = `r if (params$set_rule == "significant") sprintf("LFC > %s and padj < %s", params$lfc_min, params$padj_max) else paste("top", params$top_n, "by LFC")`,
+rest = every other modelled gene.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(Biostrings); library(GenomicFeatures)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+})
+O <- here("output", "translational_control_overview")
+cond_colors <- c(normoxia = "#009E73", hypoxia = "#D55E00")
+```
+
+# 1. Experiments and promoted sets
+
+```{r experiments}
+src <- parse(here("code", "translational_control_overview", "15b_render_all_celllines.R"))
+keep <- vapply(src, function(e) is.call(e) && identical(e[[1]], as.name("<-")) &&
+                 as.character(e[[2]]) %in% c("T", "mk"), logical(1))
+env15 <- new.env(); env15$with_capbind <- TRUE
+for (e in src[keep]) eval(e, env15)
+parts <- str_split(env15$mk("_intrinsic"), ";")[[1]]
+all_exps <- tibble(label = str_replace(parts, "=.*$", ""), suffix = str_replace(parts, "^[^=]*=", ""))
+want <- str_trim(str_split(params$experiments, ",")[[1]])
+stopifnot("an experiment label is not a column of 15b_" = all(want %in% all_exps$label))
+exps <- all_exps[match(want, all_exps$label), ] %>% mutate(label = factor(label, levels = label))
+
+mmap <- tibble(part = str_trim(str_split(params$matrix_map, ";")[[1]])) %>% filter(nzchar(part)) %>%
+  transmute(key = str_replace(part, "=.*$", ""), val = str_replace(part, "^[^=]*=", ""))
+exps$matrix_rds <- map_chr(exps$suffix, function(s) (mmap %>% filter(key == "" | str_detect(s, fixed(key))))$val[1])
+matrices <- set_names(unique(exps$matrix_rds)) %>%
+  map(~ readRDS(file.path(O, .x)) %>% dplyr::select(gene_id_clean, transcript_id_clean, symbol, log2_utr5_length))
+walk(matrices, ~ stopifnot("a feature matrix is not one transcript per gene" = !any(duplicated(.x$gene_id_clean))))
+
+dat <- pmap_dfr(list(as.character(exps$label), exps$suffix, exps$matrix_rds), function(label, suffix, matrix_rds) {
+  md <- readRDS(file.path(O, paste0("rfreg_model_data_", suffix, ".rds")))
+  g <- bind_rows(md$train, md$test) %>% dplyr::select(gene_id_clean, y, y_padj)
+  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(g$gene_id_clean)))
+  if (params$set_rule == "significant") {
+    top <- g %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > params$lfc_min)
+  } else {
+    N <- as.integer(params$top_n)
+    top <- g %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > 0) %>% arrange(desc(y)) %>% slice_head(n = N)
+    if (nrow(top) < N) top <- bind_rows(top, g %>% filter(!gene_id_clean %in% top$gene_id_clean) %>%
+                                          arrange(desc(y)) %>% slice_head(n = N - nrow(top)))
+  }
+  stopifnot("empty promoted set" = nrow(top) > 0)
+  g %>% inner_join(matrices[[matrix_rds]], by = "gene_id_clean") %>%
+    mutate(experiment = label, top = gene_id_clean %in% top$gene_id_clean)
+}) %>% mutate(experiment = factor(experiment, levels = levels(exps$label)),
+              condition = if_else(str_detect(experiment, "hypoxia"), "hypoxia", "normoxia"),
+              cell_line = str_remove(experiment, " 3d .*$"))
+dat %>% group_by(experiment) %>% summarise(genes = n(), promoted = sum(top), .groups = "drop") %>% knitr::kable()
+```
+
+# 2. 5'UTR sequences and uORF calls
+
+```{r sequences}
+all_tx <- unique(dat$transcript_id_clean)
+seq_cache <- file.path(O, "uorf_cache_utr5_seqs.rds")
+utr5 <- if (file.exists(seq_cache)) readRDS(seq_cache) else NULL
+if (is.null(utr5) || !all(all_tx %in% names(utr5))) {
+  txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+  grl <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+  names(grl) <- sub("[.].*", "", names(grl))
+  utr5 <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38, grl[names(grl) %in% all_tx])
+  saveRDS(utr5, seq_cache)
+}
+utr5 <- utr5[names(utr5) %in% all_tx]
+cat("transcripts with an annotated 5'UTR:", length(utr5), "of", length(all_tx), "\n")
+
+# The sequences must reproduce the matrices' 5'UTR length (stored as log2(length + 1)).
+m <- match(dat$transcript_id_clean, names(utr5))
+len_ok <- abs(log2(width(utr5)[m] + 1) - dat$log2_utr5_length) < 1e-6
+cat(sprintf("5'UTR length matches the matrix for %.4f of transcripts with both\n", mean(len_ok, na.rm = TRUE)))
+stopifnot("extracted 5'UTRs do not reproduce the matrix lengths" = mean(len_ok, na.rm = TRUE) > 0.99)
+```
+
+```{r call_uorfs}
+stops <- c("TAA", "TAG", "TGA")
+# For one 5'UTR: every ATG, classified by the first in-frame stop.
+classify_utr <- function(s) {
+  L <- nchar(s)
+  starts <- as.integer(gregexpr("(?=ATG)", s, perl = TRUE)[[1]])
+  if (L < 3 || starts[1] == -1) return(c(uatg = 0L, uorf = 0L, oorf = 0L, next_ = 0L))
+  type <- vapply(starts, function(p) {
+    n_cod <- (L - p + 1) %/% 3
+    cod <- substring(s, p + 3 * (seq_len(n_cod) - 1), p + 3 * seq_len(n_cod) - 1)
+    if (any(cod[-1] %in% stops)) return("uorf")           # stop inside the 5'UTR (codon 1 is the ATG)
+    if ((L - p + 1) %% 3 == 0) "next" else "oorf"         # in frame with the main AUG, or not
+  }, character(1))
+  c(uatg = length(starts), uorf = sum(type == "uorf"), oorf = sum(type == "oorf"), next_ = sum(type == "next"))
+}
+calls <- t(vapply(as.character(utr5), classify_utr, integer(4)))
+calls <- as_tibble(calls) %>% mutate(transcript_id_clean = names(utr5), utr5_len = width(utr5)) %>%
+  dplyr::rename(n_uatg = uatg, n_uorf = uorf, n_oorf = oorf, n_next = next_)
+
+stopifnot("counts must be non-negative" = all(calls$n_uatg >= 0),
+          "every uATG must get exactly one class" = all(calls$n_uorf + calls$n_oorf + calls$n_next == calls$n_uatg))
+
+# Hand-checkable unit cases, then the textbook gene.
+unit <- rbind(classify_utr("ATGTAA"),         # start-stop: one uORF
+              classify_utr("CCATGCCCTAGCC"),  # ATG CCC TAG inside: uORF
+              classify_utr("GATGCC"),         # ATG then "CC" left: no stop, (6-2+1) %% 3 = 2 -> oORF
+              classify_utr("CATGCC"),         # (6-2+1) = 5 -> oORF
+              classify_utr("ATGCCC"))         # 6 nt from the ATG to the main AUG -> in frame: N-extension
+stopifnot("unit cases misclassified" =
+            identical(unname(unit[, "uorf"]), c(1L, 1L, 0L, 0L, 0L)),
+            identical(unname(unit[, "oorf"]), c(0L, 0L, 1L, 1L, 0L)),
+            identical(unname(unit[, "next_"]), c(0L, 0L, 0L, 0L, 1L)))
+# ATF4: uORF1 is self-contained, uORF2 overlaps the main start out of frame (Vattem & Wek 2004).
+atf4 <- calls %>% filter(transcript_id_clean %in% (dat %>% filter(symbol == "ATF4") %>% pull(transcript_id_clean)))
+print(atf4)
+stopifnot("ATF4 is not called with both a uORF and an overlapping uORF" = nrow(atf4) > 0 && all(atf4$n_uorf >= 1 & atf4$n_oorf >= 1))
+```
+
+# 3. Promoted vs rest
+
+```{r compare}
+d <- dat %>% left_join(calls %>% dplyr::select(-utr5_len), by = "transcript_id_clean") %>%
+  mutate(across(c(n_uatg, n_uorf, n_oorf, n_next), ~ replace_na(.x, 0L)),   # no annotated 5'UTR -> nothing upstream
+         has_uorf = n_uorf > 0, has_oorf = n_oorf > 0, has_any = n_uorf + n_oorf > 0,
+         set = if_else(top, "Promoted", "Rest of transcriptome"))
+
+types <- c(has_any = "any uORF", has_uorf = "uORF (stop in 5'UTR)", has_oorf = "overlapping uORF")
+res <- map_dfr(names(types), function(v) d %>% group_by(experiment, condition) %>% group_modify(function(x, k) {
+  tab <- table(factor(x$top, c(FALSE, TRUE)), factor(x[[v]], c(FALSE, TRUE)))
+  fit <- glm(reformulate(c("top", "log2_utr5_length"), v), data = x, family = binomial)
+  ci <- suppressMessages(confint.default(fit)["topTRUE", ])
+  tibble(type = types[[v]], n_promoted = sum(x$top), n_rest = sum(!x$top),
+         pct_promoted = 100 * mean(x[[v]][x$top]), pct_rest = 100 * mean(x[[v]][!x$top]),
+         fisher_p = fisher.test(tab)$p.value,
+         adj_or = exp(coef(fit)[["topTRUE"]]), adj_lo = exp(ci[1]), adj_hi = exp(ci[2]),
+         adj_p = summary(fit)$coefficients["topTRUE", 4])
+})) %>% ungroup() %>% mutate(type = factor(type, levels = types))
+knitr::kable(res, digits = 3, caption = "Fraction with an upstream ORF; raw Fisher test and length-adjusted odds ratio")
+```
+
+```{r plot_fraction, fig.width = 10, fig.height = 7}
+pct <- d %>% pivot_longer(c(has_any, has_uorf, has_oorf), names_to = "v", values_to = "has") %>%
+  mutate(type = factor(types[v], levels = types)) %>%
+  group_by(experiment, condition, type, set) %>% summarise(pct = 100 * mean(has), n = n(), .groups = "drop") %>%
+  mutate(fill = if_else(set == "Promoted", condition, "rest"))
+lab <- res %>% mutate(lab = sprintf("raw p %s\nadj. OR %.2f, p %s", signif(fisher_p, 2), adj_or, signif(adj_p, 2)))
+p1 <- ggplot(pct, aes(type, pct, fill = fill, group = set)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_text(data = lab, aes(type, Inf, label = lab), inherit.aes = FALSE, vjust = 1.2, size = 2.6) +
+  facet_wrap(~ experiment, ncol = 2) +
+  scale_fill_manual(values = c(cond_colors, rest = "grey70"),
+                    breaks = c("normoxia", "hypoxia", "rest"),
+                    labels = c("Promoted, normoxia", "Promoted, hypoxia", "Rest of transcriptome")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.35))) +
+  labs(x = NULL, y = "% of mRNAs with at least one", fill = NULL,
+       title = "Upstream ORFs in eIF3d-promoted mRNAs",
+       caption = sprintf("n promoted / rest per panel in the table. adj. OR = odds ratio from has ~ promoted + log2 5'UTR length.")) +
+  theme_classic(base_size = 12) + theme(legend.position = "top", axis.text.x = element_text(angle = 20, hjust = 1))
+p1
+if (isTRUE(params$save_plots)) ggsave(here("plots", paste0("42_uorf_fraction", params$out_tag, ".pdf")), p1, width = 10, height = 7)
+```
+
+```{r plot_adjusted, fig.width = 8, fig.height = 4.5}
+p2 <- ggplot(res, aes(adj_or, fct_rev(experiment), colour = condition)) +
+  geom_vline(xintercept = 1, colour = "grey70") +
+  geom_pointrange(aes(xmin = adj_lo, xmax = adj_hi)) +
+  facet_wrap(~ type, ncol = 3) +
+  scale_colour_manual(values = cond_colors, breaks = c("normoxia", "hypoxia")) + scale_x_log10() +
+  labs(x = "Odds ratio, promoted vs rest, adjusted for log2 5'UTR length (95% CI)", y = NULL, colour = NULL) +
+  theme_classic(base_size = 12) + theme(legend.position = "top")
+p2
+if (isTRUE(params$save_plots)) ggsave(here("plots", paste0("42_uorf_adjusted_or", params$out_tag, ".pdf")), p2, width = 8, height = 4.5)
+```
+
+# 4. Agreement with the ribo-seq uORF calls
+
+ORFquant on MDA-MB-231 siCTRL normoxia 1hr. A gene with a *translated* uORF there should usually
+have a uORF or overlapping uORF in sequence; the reverse is not expected (most uORFs are not
+detected).
+
+```{r orfquant}
+oq <- read_csv(here("output", "predictive_modeling", "orfquant_orf_types_normoxia_siCTRL.csv"), show_col_types = FALSE)
+# Transcripts are per cell line, not per contrast, so one MDA-MB-231 experiment covers them all.
+cmp <- d %>% filter(experiment == levels(d$experiment)[str_detect(levels(d$experiment), "MDA-MB-231")][1]) %>%
+  inner_join(oq %>% dplyr::select(gene_id_clean, orfquant_uORF, orfquant_overl_uORF), by = "gene_id_clean") %>%
+  mutate(orfquant_any = orfquant_uORF + orfquant_overl_uORF > 0)
+cmp %>% group_by(orfquant_any) %>% summarise(genes = n(), pct_with_sequence_uorf = 100 * mean(has_any), .groups = "drop") %>%
+  knitr::kable(digits = 1, caption = "Sequence uORF rate by ORFquant detection (MDA-MB-231 transcripts)")
+stopifnot("ORFquant-detected genes are not enriched for sequence uORFs - the calls or the join are wrong" =
+            mean(cmp$has_any[cmp$orfquant_any]) > mean(cmp$has_any[!cmp$orfquant_any]))
+```

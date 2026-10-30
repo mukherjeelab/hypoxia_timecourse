@@ -1,0 +1,214 @@
+---
+title: "Which Hallmark, KEGG and C2 gene sets have short or long CDSs?"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  matrix_rds: "feature_matrix_tco.rds"
+  padj_cut: 0.05
+  min_gs: 10
+  max_gs: 500
+  n_show: 20
+  n_violin: 30
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "26f_pathway_cds_length.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-29: are short CDSs usually associated with certain pathways? A descriptive,
+transcriptome-wide question with no gene set of ours involved. It is the baseline for reading the
+pathway enrichment of the SHAP clusters (`26e_target_cluster_pathway_ora.Rmd`), whose clusters
+differ strongly in CDS length.
+
+- **Genes**: every gene in `r params$matrix_rds` (the modelled genes), with `log2_cds_length`
+  measured on each gene's own dominant isoform, the length the model saw.
+- **Pathways**: the msigdbr Hallmark and KEGG sets used in `26e_`/`27_` (KEGG = C2 subcategories
+  containing "KEGG", i.e. `CP:KEGG_LEGACY` + `CP:KEGG_MEDICUS`), plus all of C2, restricted to sets with
+  `r params$min_gs`-`r params$max_gs` members among the modelled genes, as the ORA does.
+- **Test**: for each pathway, its members' log2 CDS length vs all other modelled genes,
+  two-sided Wilcoxon rank-sum, FDR within each collection. **Shift** = pathway median minus the
+  median of the other genes, in log2 units (-1 = half as long).
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(msigdbr) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+```
+
+# 1. Genes and CDS lengths
+
+Pathways are defined by gene symbol. A symbol carried by more than one modelled gene ID is kept
+once (first gene ID in sort order), so no gene is counted twice in a pathway.
+
+```{r genes}
+fm <- readRDS(file.path(O, params$matrix_rds))
+g <- tibble(gene_id_clean = fm$gene_id_clean, symbol = fm$symbol,
+            log2_cds_length = as.numeric(unlist(fm$log2_cds_length))) %>%
+  filter(!is.na(symbol), !is.na(log2_cds_length)) %>% arrange(gene_id_clean)
+n_dup <- sum(duplicated(g$symbol))
+g <- g %>% distinct(symbol, .keep_all = TRUE)
+stopifnot("CDS lengths not finite" = all(is.finite(g$log2_cds_length)),
+          "CDS length should be positive" = all(g$log2_cds_length > 0),
+          "symbols not unique" = !anyDuplicated(g$symbol))
+cat(sprintf("%d modelled genes | %d with a symbol and CDS length after dropping %d duplicate symbols | median CDS %s nt (log2 %.2f)\n",
+            nrow(fm), nrow(g), n_dup, scales::comma(round(2^median(g$log2_cds_length))), median(g$log2_cds_length)))
+```
+
+# 2. Pathways
+
+```{r gene_sets}
+hallmark <- suppressWarnings(msigdbr(species = "Homo sapiens", category = "H")) %>% dplyr::select(gs_name, gene_symbol)
+c2 <- suppressWarnings(msigdbr(species = "Homo sapiens", category = "C2"))
+kegg <- c2 %>% filter(grepl("KEGG", gs_subcat, ignore.case = TRUE)) %>% dplyr::select(gs_name, gene_symbol)
+stopifnot("Hallmark should have 50 sets" = n_distinct(hallmark$gs_name) == 50, "no KEGG sets found" = nrow(kegg) > 0)
+cat("msigdbr", as.character(packageVersion("msigdbr")), "| Hallmark sets:", n_distinct(hallmark$gs_name),
+    "| KEGG sets:", n_distinct(kegg$gs_name), "| C2 sets:", n_distinct(c2$gs_name), "\n")
+# All of C2 (Kate, 2026-10-29): chemical/genetic perturbation signatures (CGP) as well as canonical
+# pathways (CP:*), so each C2 set's subcategory is carried into the labels. KEGG is a subset of C2
+# and is kept as its own collection; FDR is computed within each collection.
+c2_subcat <- c2 %>% distinct(gs_name, gs_subcat) %>% { setNames(.$gs_subcat, .$gs_name) }
+c2 %>% distinct(gs_name, gs_subcat) %>% dplyr::count(gs_subcat) %>% knitr::kable()
+sets <- bind_rows(Hallmark = hallmark, KEGG = kegg, C2 = c2 %>% dplyr::select(gs_name, gene_symbol), .id = "collection") %>%
+  distinct() %>% filter(gene_symbol %in% g$symbol)
+```
+
+# 3. Test
+
+```{r test}
+len <- setNames(g$log2_cds_length, g$symbol)
+res <- sets %>% group_by(collection, pathway = gs_name) %>%
+  summarise(members = list(gene_symbol), n = n(), .groups = "drop") %>%
+  filter(n >= params$min_gs, n <= params$max_gs) %>%
+  mutate(stats = map(members, function(m) {
+    x <- len[m]; y <- len[!names(len) %in% m]
+    tibble(median_log2_cds = median(x), q25 = unname(quantile(x, 0.25)), q75 = unname(quantile(x, 0.75)),
+           shift = median(x) - median(y), pvalue = wilcox.test(x, y)$p.value) })) %>%
+  unnest(stats) %>% dplyr::select(-members) %>%
+  group_by(collection) %>% mutate(p.adjust = p.adjust(pvalue, method = "fdr")) %>% ungroup() %>%
+  mutate(direction = case_when(p.adjust >= params$padj_cut ~ "not significant",
+                               shift < 0 ~ "shorter CDS", TRUE ~ "longer CDS"),
+         subcat = ifelse(collection == "Hallmark", NA_character_, c2_subcat[pathway]))
+stopifnot("p-values out of range" = all(res$pvalue >= 0 & res$pvalue <= 1),
+          "set sizes outside the filter" = all(between(res$n, params$min_gs, params$max_gs)))
+res %>% dplyr::count(collection, direction) %>% pivot_wider(names_from = direction, values_from = n, values_fill = 0) %>%
+  left_join(res %>% dplyr::count(collection, name = "tested"), by = "collection") %>% knitr::kable()
+stopifnot("a C2/KEGG set has no subcategory" = !anyNA(res$subcat[res$collection != "Hallmark"]))
+if (SAVE) write_csv(res %>% arrange(collection, shift), file.path(O, "pathway_cds_length_hallmark_kegg_c2.csv"))
+```
+
+## Shortest and longest pathways
+
+Ranked by shift; significant pathways only.
+
+```{r tables, results = "asis"}
+for (cn in unique(res$collection)) for (dr in c("shorter CDS", "longer CDS")) {
+  d <- res %>% filter(collection == cn, direction == dr) %>% arrange(if (dr == "shorter CDS") shift else -shift)
+  cat("\n\n### ", cn, ", ", dr, " (", nrow(d), " significant)\n\n", sep = "")
+  if (!nrow(d)) { cat("none\n"); next }
+  print(knitr::kable(d %>% head(params$n_show) %>%
+          transmute(pathway, subcat, n, median_cds_nt = round(2^median_log2_cds), shift = round(shift, 2),
+                    p.adjust = signif(p.adjust, 2))))
+}
+```
+
+# 4. Figure
+
+Each significant pathway's members: median (point) and interquartile range (bar) of log2 CDS
+length, against the median of all modelled genes (dashed line). Hallmark shows every significant
+set; KEGG and C2 show the `r params$n_show` shortest and `r params$n_show` longest.
+
+```{r figure, fig.width = 9, fig.height = 10, results = "asis"}
+med_all <- median(g$log2_cds_length)
+dir_cols <- c("shorter CDS" = "#CC79A7", "longer CDS" = "#0072B2")
+for (cn in unique(res$collection)) {
+  d <- res %>% filter(collection == cn, direction != "not significant")
+  if (cn != "Hallmark") d <- bind_rows(d %>% filter(shift < 0) %>% slice_min(shift, n = params$n_show),
+                                       d %>% filter(shift > 0) %>% slice_max(shift, n = params$n_show))
+  if (!nrow(d)) { cat("\n\n**", cn, ":** no significant pathways\n", sep = ""); next }
+  d <- d %>% mutate(label = sprintf("%s (n = %d)", sub("^(HALLMARK|KEGG)_", "", pathway), n),
+                    label = fct_reorder(label, -median_log2_cds))
+  p <- ggplot(d, aes(y = label, x = median_log2_cds, colour = direction)) +
+    geom_vline(xintercept = med_all, linetype = "dashed", colour = "grey40") +
+    geom_errorbarh(aes(xmin = q25, xmax = q75), height = 0, linewidth = 0.8) +
+    geom_point(size = 2) +
+    scale_colour_manual(values = dir_cols, name = NULL) +
+    labs(x = "log2 CDS length", y = NULL,
+         title = sprintf("%s pathways with shorter or longer CDSs than the transcriptome", cn),
+         subtitle = sprintf("point = median, bar = IQR; dashed = median of all %s modelled genes; FDR < %.2f, Wilcoxon vs other genes%s",
+                            scales::comma(nrow(g)), params$padj_cut,
+                            if (cn != "Hallmark") sprintf("\n%d shortest and %d longest by shift shown", params$n_show, params$n_show) else "")) +
+    theme_classic(base_size = 12) + theme(axis.text.y = element_text(size = 7), legend.position = "top",
+                                          plot.subtitle = element_text(size = 9))
+  cat("\n\n## ", cn, "\n\n", sep = ""); print(p)
+  if (SAVE) ggsave(here("plots", paste0("26f_pathway_cds_length_", tolower(cn), ".pdf")), p,
+                   width = 9, height = 2 + 0.16 * nrow(d))
+}
+```
+
+## Violins: full distributions
+
+Each pathway as a violin of its members' log2 CDS length, ordered by median, with all modelled
+genes on the left for reference. Not coloured by direction; `*` marks FDR < `r params$padj_cut`.
+Hallmark shows all 50 sets. C2 has too many to show, so it shows the `r params$n_violin` significant
+sets with the largest absolute shift (shorter or longer), labelled with their C2 subcategory.
+
+```{r violins, fig.width = 14, fig.height = 8, results = "asis"}
+ref_lab <- sprintf("ALL MODELLED GENES (n = %s)", scales::comma(nrow(g)))
+make_violin <- function(cn, keep, title, sub_extra = "") {
+  rr <- res %>% filter(collection == cn, pathway %in% keep)
+  vd <- sets %>% filter(collection == cn, gs_name %in% rr$pathway) %>%
+    transmute(pathway = gs_name, log2_cds_length = len[gene_symbol]) %>%
+    left_join(rr %>% dplyr::select(pathway, subcat, n, median_log2_cds, p.adjust), by = "pathway") %>%
+    mutate(name = sub("^HALLMARK_", "", pathway),
+           name = ifelse(is.na(subcat), name, sprintf("%s [%s]", str_trunc(name, 55), sub("^CP:", "", subcat))),
+           label = sprintf("%s (n = %d)%s", name, n, ifelse(p.adjust < params$padj_cut, " *", "")))
+  stopifnot("violin n does not match the test" = all(table(vd$pathway)[rr$pathway] == rr$n),
+            "two pathways share a label" = n_distinct(vd$label) == nrow(rr))
+  vd <- bind_rows(vd, tibble(label = ref_lab, log2_cds_length = g$log2_cds_length, median_log2_cds = -Inf)) %>%
+    mutate(label = fct_reorder(label, median_log2_cds))
+  ggplot(vd, aes(x = label, y = log2_cds_length)) +
+    geom_hline(yintercept = med_all, linetype = "dashed", colour = "grey40") +
+    geom_violin(fill = "grey80", colour = "grey30", linewidth = 0.3, scale = "width") +
+    stat_summary(fun = median, geom = "point", size = 1.2) +
+    labs(y = "log2 CDS length", x = NULL, title = title,
+         subtitle = sprintf("ordered by median (point); dashed = median of all %s modelled genes\n* FDR < %.2f, Wilcoxon vs other modelled genes%s",
+                            scales::comma(nrow(g)), params$padj_cut, sub_extra)) +
+    theme_classic(base_size = 12) + theme(axis.text.x = element_text(size = 7, angle = 60, hjust = 1), plot.subtitle = element_text(size = 9),
+                                          plot.margin = margin(5.5, 5.5, 5.5, 120))
+}
+p_h <- make_violin("Hallmark", res$pathway[res$collection == "Hallmark"], "Hallmark pathways: CDS length of members")
+c2_top <- res %>% filter(collection == "C2", p.adjust < params$padj_cut) %>% slice_max(abs(shift), n = params$n_violin, with_ties = FALSE)
+p_c2 <- make_violin("C2", c2_top$pathway, sprintf("C2 gene sets: the %d with the most different CDS length", nrow(c2_top)),
+                    sprintf("; of %d significant C2 sets, the %d with the largest |median shift|; [ ] = C2 subcategory",
+                            sum(res$collection == "C2" & res$p.adjust < params$padj_cut), nrow(c2_top)))
+cat("\n\n### Hallmark\n\n"); print(p_h)
+cat("\n\n### C2\n\n"); print(p_c2)
+if (SAVE) {
+  ggsave(here("plots", "26f_pathway_cds_length_hallmark_violin.pdf"), p_h, width = 14, height = 7)
+  ggsave(here("plots", "26f_pathway_cds_length_c2_violin.pdf"), p_c2, width = 12, height = 9)
+}
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,373 @@
+---
+title: "Do eIF3d targets need all three? GC3 x CDS length grids split by 5'UTR length"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  zscore_csv: "gene_feature_zscores_gc3_length_hypoxia_1hr.csv"
+  geneset_csv: "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"   # "" if no saved set; targets are always defined inline
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  cond_word: "hypoxia"        # in "eIF3d <cond_word> targets"
+  tag: "hypoxia_1hr"          # output filename tag; required to differ per TE source
+  lfc: 0.5                    # target: te_lfc > lfc and te_padj < padj
+  padj: 0.05
+  grid_color: "#D55E00"      # all heatmaps (mean TE and target share): vermillion = hypoxia, bluish green #009E73 = normoxia (as in 37_ / 38_)
+  n_bins: 5                 # equal-count bins per axis for GC3 and CDS length
+  n_utr5: 3                 # equal-count 5'UTR groups (panels)
+  utr5_floor_nt: 50         # second split: 5'UTR <= this vs longer (the floor seen in 43_)
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "44_gc3_cds_grids_by_utr5.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-30. The reporter z-score plots (`43_reporter_candidate_feature_zscores.Rmd`)
+suggest that an eIF3d target needs a long enough 5'UTR, a short CDS **and** AU-rich third codon
+positions. This notebook asks whether that is really an "all three" rule or whether the three
+simply add up.
+
+- **The grid** is the GC3 x CDS length heatmap of `37_utr_cds_length_models.Rmd` /
+  `38_normoxia_gc3_length_te.Rmd`, drawn once per 5'UTR length group so that 5'UTR becomes the
+  third axis. Each cell shows the mean TE change (sictrl vs si3d) of every gene in
+  it, and separately the fraction that are eIF3d targets.
+- **Bins are set once on all genes**, not within each panel, so the same cell means the same GC3
+  and CDS range in every panel and the panels can be compared cell by cell. All panels share one
+  color scale.
+- **How to read it.** If the features add up, color changes smoothly and the contours run
+  diagonally: a gene can make up for a long CDS by being very AU3-rich. If eIF3d really needs all
+  three, only the corner with short CDS, low GC3 and a long 5'UTR lights up, as a rectangle.
+- **TE source is a parameter** (`de_file`). Genes, features, z-scores and bins are the same in
+  every run (all from the hypoxia 1hr model's gene list and the feature matrix); only the TE
+  outcome and the targets change, as in `38_`. This run: **`r params$label`**, TE from
+  `output/`r params$de_file``.
+- **Genes:** the 10,054 modelled genes with all three features (the same set as the z-score
+  plots), minus EIF3D, whose own TE change is a knockdown artefact. 37_'s grids use 10,038,
+  because they also require a 3'UTR length.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+TOL <- 1e-12
+NB <- as.integer(params$n_bins); NU <- as.integer(params$n_utr5)
+stopifnot("n_bins must be >= 2" = NB >= 2, "n_utr5 must be >= 2" = NU >= 2)
+```
+
+# 1. Data and checks
+
+```{r data}
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+kd <- de$rna_lfc[de$symbol %in% "EIF3D"]
+stopifnot("duplicate genes in the DE file" = !anyDuplicated(de$gene_id_clean),
+          "EIF3D not found once" = length(kd) == 1,
+          "EIF3D rna_lfc not > 1: wrong file or flipped direction" = kd > 1)
+cat(sprintf("%s: EIF3D rna_lfc %+.2f -> log2(sictrl / si3d), positive = eIF3d promotes\n", params$de_file, kd))
+
+# The model supplies the gene list only; TE and targets come from de_file
+mg <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))$genes
+stopifnot("model genes missing from the DE file" = all(mg$gene_id_clean %in% de$gene_id_clean),
+          "tag must name the TE source" = nzchar(params$tag))
+same_te_as_model <- max(abs(mg$y - de$te_lfc[match(mg$gene_id_clean, de$gene_id_clean)])) < TOL
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "model genes missing from the matrix" = all(mg$gene_id_clean %in% fm$gene_id_clean))
+num <- function(col) as.numeric(unlist(fm[[col]][match(mg$gene_id_clean, fm$gene_id_clean)]))
+d <- mg %>% transmute(gene_id_clean, symbol, model_target = set == "eIF3d promoted",
+                      te_lfc = de$te_lfc[match(gene_id_clean, de$gene_id_clean)],
+                      te_padj = de$te_padj[match(gene_id_clean, de$gene_id_clean)],
+                      gc3 = num("gc3_internal"), cds = num("log2_cds_length"), utr5 = num("log2_utr5_length"),
+                      cds_nt = num("cds_length"), utr5_nt = num("utr5_length")) %>%
+  filter(!is.na(gc3), !is.na(cds), !is.na(utr5))
+stopifnot("log2 lengths are not log2(nt + 1)" =
+            max(abs(d$cds - log2(d$cds_nt + 1)), abs(d$utr5 - log2(d$utr5_nt + 1))) < TOL,
+          "GC3 outside [0, 100]" = all(d$gc3 >= 0 & d$gc3 <= 100),
+          "GC3 median outside 40-65%" = between(median(d$gc3), 40, 65),
+          "TE missing for a modelled gene" = !anyNA(d$te_lfc),
+          "log fold changes not finite" = all(is.finite(d$te_lfc)))
+d <- d %>% mutate(target = !is.na(te_padj) & te_lfc > params$lfc & te_padj < params$padj)
+# When the TE source is the model's own, the inline targets must be the model's targets
+if (same_te_as_model) stopifnot("inline targets differ from the model's" = identical(d$target, d$model_target))
+cat(sprintf("TE source is %s the hypoxia 1hr model's own outcome\n", if (same_te_as_model) "" else "NOT"))
+
+# Same genes as the z-score plots
+zg <- read_csv(file.path(O, params$zscore_csv), show_col_types = FALSE)$gene_id_clean
+stopifnot("gene set differs from the z-score plots" = setequal(zg, d$gene_id_clean))
+if (nzchar(params$geneset_csv)) {
+  gs <- sub("[.].*", "", read_csv(here("output", "genesets", params$geneset_csv), show_col_types = FALSE)$ensembl_gene)
+  stopifnot("targets differ from the saved gene-set CSV" = setequal(d$gene_id_clean[d$target], intersect(gs, d$gene_id_clean)))
+}
+# Favorable = long 5'UTR, short CDS, low GC3 was read off hypoxia 1hr; check it holds for this TE source
+rho <- c(utr5 = cor(d$utr5, d$te_lfc, method = "spearman"), cds = cor(d$cds, d$te_lfc, method = "spearman"),
+         gc3 = cor(d$gc3, d$te_lfc, method = "spearman"))
+print(round(rho, 3))
+stopifnot("a feature's direction differs for this TE source - 'favorable' would be mislabelled" =
+            rho[["utr5"]] > 0 && rho[["cds"]] < 0 && rho[["gc3"]] < 0)
+
+d <- d %>% filter(symbol != "EIF3D")
+stopifnot("EIF3D not removed exactly once" = nrow(d) == length(zg) - 1)
+cat(sprintf("genes %s; eIF3d %s targets %s (%.1f%%); mean TE change %+.3f\n",
+            scales::comma(nrow(d)), params$cond_word, scales::comma(sum(d$target)), 100 * mean(d$target), mean(d$te_lfc)))
+```
+
+## Bins
+
+```{r bins}
+# Equal-count bins on all genes, labelled in natural units (as in 37_ / 38_)
+q_lab <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%s-%s", scales::comma(round(2^head(br, -1) - 1)), scales::comma(round(2^br[-1] - 1))))
+}
+q_lab_pct <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%.1f-%.1f", head(br, -1), br[-1]))
+}
+d <- d %>% mutate(bx = q_lab(cds, NB), by = q_lab_pct(gc3, NB), bu = q_lab(utr5, NU),
+                  bf = factor(if_else(utr5_nt <= params$utr5_floor_nt,
+                                      sprintf("<= %d nt", params$utr5_floor_nt), sprintf("> %d nt", params$utr5_floor_nt)),
+                              levels = sprintf(c("<= %d nt", "> %d nt"), params$utr5_floor_nt)))
+stopifnot("CDS bins collapsed" = nlevels(d$bx) == NB, "GC3 bins collapsed" = nlevels(d$by) == NB,
+          "5'UTR groups collapsed" = nlevels(d$bu) == NU, "a gene is unbinned" = !anyNA(d[, c("bx", "by", "bu", "bf")]),
+          "bins out of order" = all(diff(tapply(d$cds, d$bx, median)) > 0) && all(diff(tapply(d$gc3, d$by, median)) > 0) &&
+            all(diff(tapply(d$utr5, d$bu, median)) > 0))
+# Equal count up to ties: every bin within 10% of n / bins
+eq <- function(f, k) all(abs(table(f) - nrow(d) / k) / (nrow(d) / k) < 0.10)
+stopifnot("CDS bins not equal-count" = eq(d$bx, NB), "GC3 bins not equal-count" = eq(d$by, NB))
+print(table(`5'UTR group` = d$bu)); print(table(`5'UTR floor split` = d$bf))
+```
+
+# 2. The grids
+
+```{r grid_fun}
+grid_cells <- function(dd, panel) dd %>% group_by(panel = .data[[panel]], bx, by) %>%
+  summarise(n = n(), lfc = mean(te_lfc), frac = mean(target), .groups = "drop")
+
+# Independent recomputation of every cell with base R, and a pooling check against the unsplit grid
+check_cells <- function(gc, dd, panel) {
+  key <- paste(dd[[panel]], dd$bx, dd$by)
+  m <- tapply(dd$te_lfc, key, mean); f <- tapply(dd$target, key, mean); k <- paste(gc$panel, gc$bx, gc$by)
+  stopifnot("cell means differ from base-R recomputation" = max(abs(gc$lfc - m[k])) < TOL,
+            "cell fractions differ from base-R recomputation" = max(abs(gc$frac - f[k])) < TOL,
+            "cells do not add up to the genes" = sum(gc$n) == nrow(dd),
+            "every panel must have every cell" = nrow(gc) == nlevels(dd[[panel]]) * NB^2)
+  pooled <- gc %>% group_by(bx, by) %>% summarise(lfc = sum(lfc * n) / sum(n), .groups = "drop")
+  flat <- dd %>% group_by(bx, by) %>% summarise(lfc = mean(te_lfc), .groups = "drop")
+  stopifnot("panels do not pool back to the unsplit grid" = max(abs(pooled$lfc - flat$lfc)) < 1e-10)
+}
+
+plot_grid <- function(gc, what, panel_title, file_tag) {
+  val <- if (what == "lfc") gc$lfc else 100 * gc$frac
+  lab <- if (what == "lfc") sprintf("%+.2f\nn = %d", gc$lfc, gc$n) else sprintf("%.0f%%\nn = %d", 100 * gc$frac, gc$n)
+  lim <- range(val)
+  stopifnot("shared scale must cover every panel" = all(val >= lim[1] & val <= lim[2]))
+  pn <- gc %>% group_by(panel) %>% summarise(n = sum(n), .groups = "drop")
+  gc <- gc %>% mutate(val = val, lab = lab,
+                      panel = factor(sprintf("%s %s (n = %s)", panel_title, panel, scales::comma(pn$n[match(panel, pn$panel)])),
+                                     levels = sprintf("%s %s (n = %s)", panel_title, pn$panel, scales::comma(pn$n))))
+  p <- ggplot(gc, aes(bx, by, fill = val)) + geom_tile(color = "white") +
+    geom_text(aes(label = lab), size = if (NB > 5) 2.1 else 2.6) +
+    facet_wrap(~ panel, nrow = 1) +
+    scale_fill_gradient(low = "white", high = params$grid_color, limits = lim,
+                        name = if (what == "lfc") "mean log2 TE\nsictrl vs si3d" else "targets (%)") +
+    labs(x = sprintf("CDS length (nt), %d equal-count bins", NB), y = sprintf("GC3 (%%), %d equal-count bins", NB),
+         title = sprintf("%s: %s by GC3 and CDS length, split by 5'UTR length", params$label,
+                         if (what == "lfc") "mean TE change" else "eIF3d target fraction"),
+         subtitle = sprintf("%s; bins set on all %s genes so cells match across panels; one color scale for all panels; overall %s",
+                            if (what == "lfc") "mean log2(sictrl / si3d) of every gene in the cell" else
+                              sprintf("share of the cell's genes that are eIF3d %s targets (TE LFC > %s, padj < %s)", params$cond_word, params$lfc, params$padj),
+                            scales::comma(nrow(d)),
+                            if (what == "lfc") sprintf("mean %+.3f", mean(d$te_lfc)) else sprintf("%.1f%% targets", 100 * mean(d$target)))) +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1), plot.subtitle = element_text(size = 8),
+          strip.background = element_blank(), strip.text = element_text(face = "bold"))
+  print(p)
+  if (SAVE) ggsave(here("plots", sprintf("44_%s_grid_gc3_vs_cds_by_utr5_%s_%dbins_%s.pdf",
+                                         if (what == "lfc") "mean_lfc" else "target_fraction", file_tag, NB, params$tag)),
+                   p, width = 5.2 * NB / 5 * nlevels(gc$panel) + 1.5, height = 6 * max(1, NB / 7))
+}
+```
+
+## 5'UTR in equal-count groups
+
+```{r grid_tertiles, fig.width = 3.4 * NB + 1.5, fig.height = 6 * max(1, NB / 7)}
+gu <- grid_cells(d, "bu"); check_cells(gu, d, "bu")
+plot_grid(gu, "lfc", "5'UTR", paste0("utr5_", NU, "groups"))
+plot_grid(gu, "frac", "5'UTR", paste0("utr5_", NU, "groups"))
+```
+
+## 5'UTR split at the floor (<= `r params$utr5_floor_nt` nt vs longer)
+
+The z-score plots showed the 5'UTR effect is a floor: very short 5'UTRs are under-targeted and
+the rate is flat above ~50 nt. The short group is small (cells hold few genes), so read the
+gradient rather than single cells.
+
+```{r grid_floor, fig.width = 2.1 * NB + 1.5, fig.height = 6 * max(1, NB / 7)}
+gf <- grid_cells(d, "bf"); check_cells(gf, d, "bf")
+plot_grid(gf, "lfc", "5'UTR", "utr5_floor")
+plot_grid(gf, "frac", "5'UTR", "utr5_floor")
+```
+
+## The corners in numbers
+
+The favorable corner is the shortest-CDS, lowest-GC3 cell; the unfavorable corner is the
+longest-CDS, highest-GC3 cell. If the features add up, the gap between the corners should be about
+the same in every 5'UTR panel, with the whole grid shifted up for longer 5'UTRs. If all three are
+needed, the gap should open up only in the long-5'UTR panel.
+
+```{r corners}
+corner <- gu %>% filter((bx == levels(d$bx)[1] & by == levels(d$by)[1]) | (bx == levels(d$bx)[NB] & by == levels(d$by)[NB])) %>%
+  mutate(corner = if_else(bx == levels(d$bx)[1], "favorable", "unfavorable")) %>%
+  dplyr::select(panel, corner, n, lfc, frac) %>%
+  pivot_wider(names_from = corner, values_from = c(n, lfc, frac)) %>%
+  mutate(lfc_gap = lfc_favorable - lfc_unfavorable, frac_gap = frac_favorable - frac_unfavorable)
+knitr::kable(corner, digits = 3, caption = "corner cells per 5'UTR group: mean TE change and target fraction")
+# Direction sanity: in every 5'UTR panel the favorable corner must beat the unfavorable one
+stopifnot("favorable corner not above unfavorable corner in some 5'UTR panel" = all(corner$lfc_gap > 0))
+```
+
+# 3. Staircase: target rate by number of favorable features
+
+Each gene is scored favorable or not on each feature using the oriented z-scores from the
+z-score plots (CDS length and GC3 negated, so favorable = long 5'UTR, short CDS, AU-rich GC3):
+
+- **z > 0**: above the mean of all genes on that feature (roughly half the genes);
+- **top third**: in the most favorable third of genes on that feature (stricter).
+
+The shape of the staircase is the test: even steps = the features add up; flat then a jump at 3 =
+all three needed; a jump at 1 then flat = any one is enough.
+
+```{r staircase_data}
+zi <- read_csv(file.path(O, params$zscore_csv), show_col_types = FALSE)
+zi <- zi[match(d$gene_id_clean, zi$gene_id_clean), ]
+stopifnot("z table out of step with the genes" = identical(zi$gene_id_clean, d$gene_id_clean),
+          "z table raw values differ from the matrix" = max(abs(zi$gc3 - d$gc3), abs(zi$cds - d$cds), abs(zi$utr5 - d$utr5)) < TOL)
+d <- d %>% mutate(o_utr5 = zi$z_utr5, o_cds = -zi$z_cds, o_gc3 = -zi$z_gc3)
+# z > 0 must be the same as being on the favorable side of the background mean (the z background is d + EIF3D)
+bg_mean <- function(v) mean(c(d[[v]], read_csv(file.path(O, params$zscore_csv), show_col_types = FALSE) %>%
+                                filter(!gene_id_clean %in% d$gene_id_clean) %>% pull(v)))
+stopifnot("z > 0 is not utr5 above its mean" = identical(d$o_utr5 > 0, d$utr5 > bg_mean("utr5")),
+          "-z > 0 is not cds below its mean" = identical(d$o_cds > 0, d$cds < bg_mean("cds")),
+          "-z > 0 is not gc3 below its mean" = identical(d$o_gc3 > 0, d$gc3 < bg_mean("gc3")))
+cut_rules <- list(`z > 0` = function(x) x > 0, `top third` = function(x) x > quantile(x, 2 / 3))
+fav <- imap_dfr(cut_rules, function(f, rule) d %>%
+  transmute(gene_id_clean, target, te_lfc, rule = rule,
+            utr5_fav = f(o_utr5), cds_fav = f(o_cds), gc3_fav = f(o_gc3)) %>%
+  mutate(n_fav = utr5_fav + cds_fav + gc3_fav))
+fav$rule <- factor(fav$rule, levels = names(cut_rules))
+fav %>% group_by(rule) %>% summarise(utr5 = mean(utr5_fav), cds = mean(cds_fav), gc3 = mean(gc3_fav)) %>%
+  knitr::kable(digits = 3, caption = "share of genes favorable on each feature")
+stopifnot("every gene scored under both rules" = all(table(fav$rule) == nrow(d)))
+```
+
+```{r staircase_plot, fig.width = 10, fig.height = 4.8}
+# Wilson 95% interval for a proportion
+wilson <- function(k, n, z = 1.96) { p <- k / n; c0 <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  h <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n); cbind(lo = c0 - h, hi = c0 + h) }
+st <- fav %>% group_by(rule, n_fav) %>%
+  summarise(n = n(), k = sum(target), rate = mean(target), lfc = mean(te_lfc), .groups = "drop")
+st <- bind_cols(st, as_tibble(wilson(st$k, st$n)))
+stopifnot("staircase counts do not add up" = all(tapply(st$n, st$rule, sum) == nrow(d)),
+          "staircase targets do not add up" = all(tapply(st$k, st$rule, sum) == sum(d$target)),
+          "all-favorable rate not above none-favorable" = all(st$rate[st$n_fav == 3] > st$rate[st$n_fav == 0]))
+knitr::kable(st, digits = 3)
+p_st <- ggplot(st, aes(factor(n_fav), 100 * rate)) +
+  geom_hline(yintercept = 100 * mean(d$target), linetype = "dashed", color = "grey40") +
+  geom_col(fill = "#E69F00", width = 0.7) +
+  geom_errorbar(aes(ymin = 100 * lo, ymax = 100 * hi), width = 0.2) +
+  geom_text(aes(y = 100 * hi, label = sprintf("%.1f%%\nn = %s", 100 * rate, scales::comma(n))), vjust = -0.3, size = 3) +
+  facet_wrap(~ rule, labeller = labeller(rule = function(x) paste("favorable =", x))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = "number of favorable features (long 5'UTR, short CDS, AU-rich GC3)", y = sprintf("eIF3d %s targets (%%)", params$cond_word),
+       title = sprintf("%s: eIF3d target rate by number of favorable features", params$label),
+       subtitle = sprintf("bars = share of genes that are targets, 95%% Wilson CI; dashed = overall %.1f%%; n = %s genes, %s targets",
+                          100 * mean(d$target), scales::comma(nrow(d)), scales::comma(sum(d$target)))) +
+  theme_classic(base_size = 12) + theme(plot.subtitle = element_text(size = 8), strip.background = element_blank())
+p_st
+if (SAVE) ggsave(here("plots", paste0("44_staircase_target_rate_by_n_favorable_", params$tag, ".pdf")), p_st, width = 10, height = 4.8)
+```
+
+## Which features? All eight combinations against an additive expectation
+
+The staircase pools, for example, "short CDS only" with "AU-rich only". Splitting it into the
+eight combinations asks which features carry the rate, and in particular whether a gene needs
+**a short CDS or AU-rich GC3** (either one being enough) rather than both.
+
+Black points are what an **additive model** predicts for each combination: a logistic
+regression of target status on the three favorable/unfavorable flags with no interaction terms,
+so each feature multiplies the odds by the same amount whatever the others are. Bars above the
+point mean the combination does better than the features add up to; bars below mean worse.
+
+- **"Either is enough"** predicts CDS-only and GC3-only each close to CDS + GC3, with CDS + GC3
+  *below* its additive point (adding the second gains less than expected).
+- **"All three needed"** predicts the all-favorable bar *above* its point and the rest near the floor.
+
+```{r combos, fig.width = 12, fig.height = 5.5}
+lr <- list(); cb <- list()
+for (r in levels(fav$rule)) {
+  fr <- fav %>% filter(rule == r)
+  m_add <- glm(target ~ utr5_fav + cds_fav + gc3_fav, family = binomial, data = fr)
+  m_full <- glm(target ~ utr5_fav * cds_fav * gc3_fav, family = binomial, data = fr)
+  fr$pred_add <- fitted(m_add); fr$pred_full <- fitted(m_full)
+  lt <- anova(m_add, m_full, test = "LRT")
+  lr[[r]] <- tibble(rule = r, interaction_df = lt$Df[2], deviance = lt$Deviance[2], p = lt$`Pr(>Chi)`[2])
+  co <- coef(m_full)
+  cb[[r]] <- fr %>% group_by(rule, utr5_fav, cds_fav, gc3_fav, n_fav) %>%
+    summarise(n = n(), k = sum(target), rate = mean(target), additive = mean(pred_add), saturated = mean(pred_full), .groups = "drop")
+  lr[[r]]$cds_x_gc3 <- co[["cds_favTRUE:gc3_favTRUE"]]
+}
+cb <- bind_rows(cb); lr <- bind_rows(lr)
+# Fitting check: the saturated model reproduces every observed combination rate exactly
+stopifnot("saturated logistic does not reproduce the observed rates" = max(abs(cb$saturated - cb$rate)) < 1e-8,
+          "every rule has all eight combinations" = all(table(cb$rule) == 8),
+          "combination counts do not add up" = all(tapply(cb$n, cb$rule, sum) == nrow(d)))
+cb <- bind_cols(cb, as_tibble(wilson(cb$k, cb$n))) %>%
+  mutate(combo = pmap_chr(list(utr5_fav, cds_fav, gc3_fav), function(u, c, g) {
+           s <- c(if (u) "5'UTR", if (c) "CDS", if (g) "GC3"); if (length(s)) paste(s, collapse = " + ") else "none" }))
+lev <- c("none", "5'UTR", "CDS", "GC3", "5'UTR + CDS", "5'UTR + GC3", "CDS + GC3", "5'UTR + CDS + GC3")
+cb$combo <- factor(cb$combo, levels = lev)
+stopifnot("unexpected combination label" = !anyNA(cb$combo))
+knitr::kable(cb %>% dplyr::select(rule, combo, n, k, rate, additive, lo, hi), digits = 3,
+             caption = "observed target rate per combination vs the additive (no-interaction) logistic model")
+knitr::kable(lr, digits = 4, caption = "do interactions improve on the additive model? (likelihood-ratio test, 4 df); cds_x_gc3 = CDS x GC3 log-odds interaction in the full model (negative = either is enough)")
+p_cb <- ggplot(cb, aes(combo, 100 * rate)) +
+  geom_hline(yintercept = 100 * mean(d$target), linetype = "dashed", color = "grey40") +
+  geom_col(aes(fill = factor(n_fav)), width = 0.7) +
+  geom_errorbar(aes(ymin = 100 * lo, ymax = 100 * hi), width = 0.2) +
+  geom_point(aes(y = 100 * additive), color = "black", size = 2.2, shape = 18) +
+  geom_text(aes(y = 0, label = sprintf("n = %s", scales::comma(n))), vjust = 1.5, size = 2.6) +
+  facet_wrap(~ rule, ncol = 1, labeller = labeller(rule = function(x) paste("favorable =", x))) +
+  scale_fill_manual(values = c("0" = "grey85", "1" = "#F5D9A6", "2" = "#EEBB5C", "3" = "#E69F00"), name = "favorable\nfeatures") +
+  scale_y_continuous(expand = expansion(mult = c(0.12, 0.05))) +
+  labs(x = "which features are favorable", y = sprintf("eIF3d %s targets (%%)", params$cond_word),
+       title = sprintf("%s: eIF3d target rate by combination of favorable features", params$label),
+       subtitle = sprintf("bars = observed, 95%% Wilson CI; black diamonds = additive logistic model (no interactions); dashed = overall %.1f%%; n = %s genes",
+                          100 * mean(d$target), scales::comma(nrow(d)))) +
+  theme_classic(base_size = 12) + theme(plot.subtitle = element_text(size = 8), strip.background = element_blank())
+p_cb
+if (SAVE) ggsave(here("plots", paste0("44_combination_target_rate_vs_additive_", params$tag, ".pdf")), p_cb, width = 12, height = 7.5)
+```
+
+```{r session}
+sessionInfo()
+```

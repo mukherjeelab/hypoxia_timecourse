@@ -1,0 +1,471 @@
+---
+title: "Hypoxia TE change in control cells by GC3, CDS length and 5'UTR length"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  dataset: "mda231"         # "mda231" | "mcf7six1"; each uses its own TE file and its own-isoform feature matrix
+  n_bins: 5                 # equal-count bins per axis
+  n_utr5: 3                 # equal-count 5'UTR groups (panels) in the split grid
+  utr5_floor_nt: 50         # second split: 5'UTR <= this vs longer (as in 44_)
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "45_hypoxia_te_grids_sictrl.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-30. The same heatmaps as `44_gc3_cds_grids_by_utr5.Rmd` (GC3 x CDS length, split by
+5'UTR length) and `37_utr_cds_length_models.Rmd` (GC3 x CDS length, GC3 x 5'UTR length), but the
+outcome is the **hypoxia response of control cells** instead of the eIF3d knockdown effect:
+
+- **Outcome:** log2 TE change, 1hr hypoxia vs normoxia, in siCTRL cells. Positive = TE goes
+  **up** in hypoxia. No knockdown is involved, so there are no eIF3d targets and no
+  "favorable" direction. Each cell shows the mean TE change of the genes in it.
+- **MDA-MB-231:** `output/translation_categories_1hr.csv` (`rna_ribo_te_analysis.Rmd`,
+  `deFunction(mode = "TE", control = normoxia, test = hypoxia)`, spike-in normalized).
+- **MCF7-SIX1:** `counts/all_norm_to_hyp_changes.csv`, column `LFC_te_sictrl`, in the
+  2024_eIF3e_hypoxia repo (`5_hypoxicresponse.Rmd`, interaction coefficient with normoxia and
+  RNA as the reference levels, `lfcShrink`-shrunk, not spike-in normalized). The two cell lines'
+  values are on different scales, so compare patterns, not numbers.
+- **Features come from each cell line's own dominant transcript:** `feature_matrix_tco.rds` for
+  MDA-MB-231 and `feature_matrix_tco_mcf7six1.rds` for MCF7-SIX1.
+- **Genes:** every gene in that matrix with all three features (GC3, CDS length, 5'UTR length) and
+  a TE change. Bins are set once on those genes, so a cell means the same range in every panel.
+- **Color:** each cell's mean can be either sign, so the scale is diverging and centred on 0:
+  Okabe-Ito dark blue `#0072B2` (TE down in hypoxia) to white to vermillion `#D55E00` (TE up in
+  hypoxia). The limits are symmetric and shared by every panel of a figure.
+
+This run: **`r params$dataset`**.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+TOL <- 1e-12
+NB <- as.integer(params$n_bins); NU <- as.integer(params$n_utr5)
+stopifnot("n_bins must be >= 2" = NB >= 2, "n_utr5 must be >= 2" = NU >= 2,
+          "unknown dataset" = params$dataset %in% c("mda231", "mcf7six1"))
+eif3_repo <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+cfg <- list(
+  mda231 = list(label = "MDA-MB-231 siCTRL 1hr hypoxia vs normoxia", tag = "mda231_sictrl_hyp_vs_nor_1hr",
+                matrix_rds = "feature_matrix_tco.rds"),
+  mcf7six1 = list(label = "MCF7-SIX1 siCTRL 1hr hypoxia vs normoxia", tag = "mcf7six1_sictrl_hyp_vs_nor_1hr",
+                  matrix_rds = "feature_matrix_tco_mcf7six1.rds"))[[params$dataset]]
+```
+
+# 1. Data and direction checks
+
+Both files are read in every run, because the direction check below compares the two cell lines.
+
+```{r data}
+te_231 <- read_csv(here("output", "translation_categories_1hr.csv"), show_col_types = FALSE) %>%
+  transmute(gene_id_clean = sub("[.].*", "", gene_id), te_lfc, te_padj, rna_lfc)
+te_mcf <- read_csv(file.path(eif3_repo, "counts", "all_norm_to_hyp_changes.csv"), show_col_types = FALSE) %>%
+  transmute(gene_id_clean = sub("[.].*", "", gene_id), te_lfc = LFC_te_sictrl, te_padj = padj_te_sictrl, rna_lfc = LFC_rna_sictrl)
+stopifnot("duplicate genes in the MDA-MB-231 TE file" = !anyDuplicated(te_231$gene_id_clean),
+          "duplicate genes in the MCF7-SIX1 TE file" = !anyDuplicated(te_mcf$gene_id_clean),
+          "log fold changes not finite" = all(is.finite(c(te_231$te_lfc, te_mcf$te_lfc)[!is.na(c(te_231$te_lfc, te_mcf$te_lfc))])))
+cat(sprintf("MDA-MB-231: %s genes, median TE change %+.3f | MCF7-SIX1: %s genes, median %+.3f\n",
+            scales::comma(nrow(te_231)), median(te_231$te_lfc, na.rm = TRUE),
+            scales::comma(nrow(te_mcf)), median(te_mcf$te_lfc, na.rm = TRUE)))
+```
+
+## Direction: positive must mean higher in hypoxia
+
+Three rulers, all asserted:
+
+1. **The producing code**, parsed from source rather than retyped. MDA-MB-231's TE call has
+   `control_condition = "normoxia"` and `test_condition = "hypoxia"`. MCF7-SIX1 relevels
+   `condition` to `ref = "normoxia"` and `library` to `ref = "rna"`, and takes coefficient [4]
+   of `~condition + library + condition:library` (the hypoxia x ribo interaction, i.e.
+   log2 TE hypoxia / normoxia), which is the result saved as `LFC_te_sictrl`.
+2. **Canonical HIF-1 targets gain mRNA within 1hr in MDA-MB-231** (ADM, ANKRD37, PDK1, NDRG1;
+   RNA leg of the same DESeq2 run). I looked at these values while writing this check, so it
+   confirms orientation rather than testing a prediction. MCF7-SIX1 has no comparable early
+   RNA induction of these genes (all within +/-0.03), so this ruler is applied to MDA-MB-231 only.
+3. **The two cell lines agree:** Spearman of TE change across shared genes must be positive.
+   A flip in only one file would make it negative.
+
+```{r direction}
+src_231 <- readLines(here("code", "rna_ribo_te_analysis.Rmd"))
+te_chunk <- src_231[seq(grep("^```\\{r te_analysis_1hr\\}", src_231), length.out = 12)]
+stopifnot("MDA-MB-231 TE call is not normoxia -> hypoxia" =
+            any(grepl('control_condition = "normoxia"', te_chunk)) && any(grepl('test_condition = "hypoxia"', te_chunk)) &&
+            any(grepl('mode = "TE"', te_chunk)),
+          "translation_categories_1hr.csv is not written from the 1hr results" =
+            any(grepl('write_csv\\(categorized_with_padj_1hr, here\\("output", "translation_categories_1hr.csv"\\)\\)', src_231)))
+src_mcf <- readLines(file.path(eif3_repo, "code", "5_hypoxicresponse.Rmd"))
+stopifnot("MCF7-SIX1 condition reference is not normoxia" =
+            any(grepl('metadata_acute_sictrl\\$condition <- relevel\\(factor\\(metadata_acute_sictrl\\$condition\\), ref = "normoxia"\\)', src_mcf)),
+          "MCF7-SIX1 library reference is not rna" =
+            any(grepl('metadata_acute_sictrl\\$library <- relevel\\(factor\\(metadata_acute_sictrl\\$library\\), ref = "rna"\\)', src_mcf)),
+          "MCF7-SIX1 coefficient is not the interaction" =
+            any(grepl("results\\(ddsMat_acute_sictrl, name=resultsNames\\(ddsMat_acute_sictrl\\)\\[4\\]", src_mcf)),
+          "LFC_te_sictrl is not taken from res_acute_sictrl" =
+            any(grepl("sictrl_te <- res_acute_sictrl", src_mcf)) && any(grepl('colnames\\(sictrl_te\\)\\[3\\] ="LFC_te_sictrl"', src_mcf)))
+
+anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"), col_names = FALSE, show_col_types = FALSE)
+hif <- c("ADM", "ANKRD37", "PDK1", "NDRG1")
+hif_rna <- te_231$rna_lfc[match(sub("[.].*", "", anno$X1[match(hif, anno$X2)]), te_231$gene_id_clean)]
+print(setNames(round(hif_rna, 2), hif))
+stopifnot("a HIF-1 target is missing" = !anyNA(hif_rna),
+          "HIF-1 targets do not gain mRNA in hypoxia: MDA-MB-231 direction flipped" = all(hif_rna > 0.3))
+
+j <- inner_join(te_231, te_mcf, by = "gene_id_clean", suffix = c("_231", "_mcf")) %>% filter(!is.na(te_lfc_231), !is.na(te_lfc_mcf))
+rho_x <- cor(j$te_lfc_231, j$te_lfc_mcf, method = "spearman")
+cat(sprintf("Spearman TE change MDA-MB-231 vs MCF7-SIX1 = %+.3f, n = %s shared genes\n", rho_x, scales::comma(nrow(j))))
+stopifnot("cell lines disagree in direction" = rho_x > 0.2)
+```
+
+## Genes and features
+
+```{r genes}
+te <- if (params$dataset == "mda231") te_231 else te_mcf
+fm <- readRDS(file.path(O, cfg$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "feature columns missing" = all(c("gc3_internal", "log2_cds_length", "log2_utr5_length", "cds_length", "utr5_length") %in% names(fm)),
+          "outcome must not be a matrix column" = !"LFC_te_sictrl" %in% names(fm))
+num <- function(col) as.numeric(unlist(fm[[col]]))
+d <- tibble(gene_id_clean = fm$gene_id_clean, symbol = fm$symbol,
+            gc3 = num("gc3_internal"), cds = num("log2_cds_length"), utr5 = num("log2_utr5_length"),
+            cds_nt = num("cds_length"), utr5_nt = num("utr5_length")) %>%
+  mutate(te_lfc = te$te_lfc[match(gene_id_clean, te$gene_id_clean)])
+n_mat <- nrow(d)
+d <- d %>% filter(!is.na(gc3), !is.na(cds), !is.na(utr5), !is.na(te_lfc))
+stopifnot("log2 lengths are not log2(nt + 1)" =
+            max(abs(d$cds - log2(d$cds_nt + 1)), abs(d$utr5 - log2(d$utr5_nt + 1))) < TOL,
+          "GC3 outside [0, 100]" = all(d$gc3 >= 0 & d$gc3 <= 100),
+          "GC3 median outside 40-65%" = between(median(d$gc3), 40, 65),
+          "ACTB missing" = "ACTB" %in% d$symbol,
+          "ACTB GC3 not above median (ACTB is GC3-rich)" = d$gc3[d$symbol == "ACTB"] > median(d$gc3))
+cat(sprintf("%s: %s of %s matrix genes have all three features and a TE change; mean TE change %+.3f\n",
+            cfg$label, scales::comma(nrow(d)), scales::comma(n_mat), mean(d$te_lfc)))
+rho <- c(utr5 = cor(d$utr5, d$te_lfc, method = "spearman"), cds = cor(d$cds, d$te_lfc, method = "spearman"),
+         gc3 = cor(d$gc3, d$te_lfc, method = "spearman"))
+knitr::kable(t(round(rho, 3)), caption = sprintf("Spearman of each feature with TE change (hypoxia vs normoxia), n = %s", scales::comma(nrow(d))))
+```
+
+## Bins
+
+```{r bins}
+# Equal-count bins on all genes, labelled in natural units (as in 37_ / 44_)
+q_lab <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%s-%s", scales::comma(round(2^head(br, -1) - 1)), scales::comma(round(2^br[-1] - 1))))
+}
+q_lab_pct <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%.1f-%.1f", head(br, -1), br[-1]))
+}
+d <- d %>% mutate(bx = q_lab(cds, NB), by = q_lab_pct(gc3, NB), bxu = q_lab(utr5, NB), bu = q_lab(utr5, NU),
+                  bf = factor(if_else(utr5_nt <= params$utr5_floor_nt,
+                                      sprintf("<= %d nt", params$utr5_floor_nt), sprintf("> %d nt", params$utr5_floor_nt)),
+                              levels = sprintf(c("<= %d nt", "> %d nt"), params$utr5_floor_nt)))
+stopifnot("CDS bins collapsed" = nlevels(d$bx) == NB, "GC3 bins collapsed" = nlevels(d$by) == NB,
+          "5'UTR bins collapsed" = nlevels(d$bxu) == NB, "5'UTR groups collapsed" = nlevels(d$bu) == NU,
+          "a gene is unbinned" = !anyNA(d[, c("bx", "by", "bxu", "bu", "bf")]),
+          "bins out of order" = all(diff(tapply(d$cds, d$bx, median)) > 0) && all(diff(tapply(d$gc3, d$by, median)) > 0) &&
+            all(diff(tapply(d$utr5, d$bxu, median)) > 0) && all(diff(tapply(d$utr5, d$bu, median)) > 0))
+# Equal count up to ties: every bin within 10% of n / bins
+eq <- function(f, k) all(abs(table(f) - nrow(d) / k) / (nrow(d) / k) < 0.10)
+stopifnot("CDS bins not equal-count" = eq(d$bx, NB), "GC3 bins not equal-count" = eq(d$by, NB),
+          "5'UTR bins not equal-count" = eq(d$bxu, NB))
+print(table(`5'UTR group` = d$bu)); print(table(`5'UTR floor split` = d$bf))
+```
+
+# 2. The grids
+
+```{r grid_fun}
+# One grid: x bins, y bins (GC3 unless given), optional panel factor ("all" = unsplit)
+grid_cells <- function(xcol, panel = NULL, ycol = "by") {
+  dd <- d %>% mutate(bxx = .data[[xcol]], by = .data[[ycol]])
+  dd$panel <- if (is.null(panel)) factor(rep("all", nrow(d))) else dd[[panel]]
+  gc <- dd %>% group_by(panel, bx = bxx, by) %>% summarise(n = n(), lfc = mean(te_lfc), .groups = "drop")
+  # Independent recomputation of every cell with base R, and a pooling check against the unsplit grid
+  key <- paste(dd$panel, dd$bxx, dd$by); m <- tapply(dd$te_lfc, key, mean)
+  stopifnot("cell means differ from base-R recomputation" = max(abs(gc$lfc - m[paste(gc$panel, gc$bx, gc$by)])) < TOL,
+            "cells do not add up to the genes" = sum(gc$n) == nrow(d),
+            "every panel must have every cell" = nrow(gc) == nlevels(dd$panel) * NB^2)
+  pooled <- gc %>% group_by(bx, by) %>% summarise(lfc = sum(lfc * n) / sum(n), .groups = "drop")
+  flat <- dd %>% group_by(bx = bxx, by) %>% summarise(lfc = mean(te_lfc), .groups = "drop")
+  stopifnot("panels do not pool back to the unsplit grid" = max(abs(pooled$lfc - flat$lfc)) < 1e-10)
+  gc
+}
+
+plot_grid <- function(gc, xlab, what, file_tag, panel_title = "", ylab = "GC3 (%)") {
+  lim <- c(-1, 1) * max(abs(gc$lfc))
+  pn <- gc %>% group_by(panel) %>% summarise(n = sum(n), .groups = "drop")
+  gc <- gc %>% mutate(panel = factor(sprintf("%s %s (n = %s)", panel_title, panel, scales::comma(pn$n[match(panel, pn$panel)])),
+                                     levels = sprintf("%s %s (n = %s)", panel_title, pn$panel, scales::comma(pn$n))))
+  np <- nlevels(gc$panel)
+  p <- ggplot(gc, aes(bx, by, fill = lfc)) + geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%+.2f\nn = %d", lfc, n)), size = if (NB > 5) 2.1 else 2.6) +
+    scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0, limits = lim,
+                         name = "mean log2 TE\nhypoxia vs\nnormoxia") +
+    labs(x = sprintf("%s, %d equal-count bins", xlab, NB), y = sprintf("%s, %d equal-count bins", ylab, NB),
+         title = sprintf("%s: mean TE change by %s", cfg$label, what),
+         subtitle = sprintf("mean log2(TE hypoxia / TE normoxia) of every gene in the cell, siCTRL; bins set on all %s genes%s; overall mean %+.3f",
+                            scales::comma(nrow(d)), if (np > 1) "; one color scale for all panels" else "", mean(d$te_lfc))) +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1), plot.subtitle = element_text(size = 8),
+          strip.background = element_blank(), strip.text = element_text(face = "bold"))
+  if (np > 1) p <- p + facet_wrap(~ panel, nrow = 1)
+  print(p)
+  w <- if (np > 1) 5.2 * NB / 5 * np + 1.5 else 11 * max(0.65, NB / 10)
+  h <- if (np > 1) 6 * max(1, NB / 7) else 9 * max(0.65, NB / 10)
+  if (SAVE) ggsave(here("plots", sprintf("45_mean_lfc_grid_%s_%dbins_%s.pdf", file_tag, NB, cfg$tag)), p, width = w, height = h)
+}
+```
+
+## GC3 x CDS length, split by 5'UTR length (equal-count groups)
+
+```{r grid_tertiles, fig.width = 3.4 * NB + 1.5, fig.height = 6 * max(1, NB / 7)}
+gu <- grid_cells("bx", "bu")
+plot_grid(gu, "CDS length (nt)", "GC3 and CDS length, split by 5'UTR length", paste0("gc3_vs_cds_by_utr5_", NU, "groups"), "5'UTR")
+```
+
+## GC3 x CDS length, split at the 5'UTR floor (<= `r params$utr5_floor_nt` nt vs longer)
+
+The `r params$utr5_floor_nt` nt split was set on the eIF3d knockdown in hypoxia (where very short
+5'UTRs were under-targeted). It is kept here so the two outcomes can be compared on the same panels;
+it is not a property of this outcome.
+
+```{r grid_floor, fig.width = 2.1 * NB + 1.5, fig.height = 6 * max(1, NB / 7)}
+gf <- grid_cells("bx", "bf")
+plot_grid(gf, "CDS length (nt)", "GC3 and CDS length, split by 5'UTR length", "gc3_vs_cds_by_utr5_floor", "5'UTR")
+```
+
+## GC3 x CDS length
+
+```{r grid_cds, fig.width = 11 * max(0.65, NB / 10), fig.height = 9 * max(0.65, NB / 10)}
+gcds <- grid_cells("bx")
+plot_grid(gcds, "CDS length (nt)", "GC3 and CDS length", "gc3_vs_cds")
+```
+
+## GC3 x 5'UTR length
+
+```{r grid_utr5, fig.width = 11 * max(0.65, NB / 10), fig.height = 9 * max(0.65, NB / 10)}
+gutr <- grid_cells("bxu")
+plot_grid(gutr, "5'UTR length (nt)", "GC3 and 5'UTR length", "gc3_vs_utr5")
+```
+
+## 5'UTR length x CDS length
+
+The same bins as above: CDS length on x (as in the GC3 x CDS grid), 5'UTR length on y (the bins
+used on x in the GC3 x 5'UTR grid).
+
+```{r grid_utr5_cds, fig.width = 11 * max(0.65, NB / 10), fig.height = 9 * max(0.65, NB / 10)}
+guc <- grid_cells("bx", ycol = "bxu")
+stopifnot("y axis is not the 5'UTR bins" = identical(levels(guc$by), levels(d$bxu)))
+cat(sprintf("Spearman rho(log2 5'UTR length, log2 CDS length) = %+.3f, n = %s\n",
+            cor(d$utr5, d$cds, method = "spearman"), scales::comma(nrow(d))))
+plot_grid(guc, "CDS length (nt)", "5'UTR length and CDS length", "utr5_vs_cds", ylab = "5'UTR length (nt)")
+```
+
+## The corners in numbers
+
+Mean TE change in the short-CDS / low-GC3 corner and the long-CDS / high-GC3 corner of each 5'UTR
+panel. No direction is asserted, because nothing here predicts one.
+
+```{r corners}
+corner <- gu %>% filter((bx == levels(d$bx)[1] & by == levels(d$by)[1]) | (bx == levels(d$bx)[NB] & by == levels(d$by)[NB])) %>%
+  mutate(corner = if_else(bx == levels(d$bx)[1], "short_cds_low_gc3", "long_cds_high_gc3")) %>%
+  dplyr::select(panel, corner, n, lfc) %>%
+  pivot_wider(names_from = corner, values_from = c(n, lfc)) %>%
+  mutate(gap = lfc_short_cds_low_gc3 - lfc_long_cds_high_gc3)
+stopifnot("corner table incomplete" = nrow(corner) == NU && !anyNA(corner))
+knitr::kable(corner, digits = 3, caption = "corner cells per 5'UTR group: mean TE change, hypoxia vs normoxia")
+```
+
+# 3. TE change against each feature
+
+The scatters of `37_utr_cds_length_models.Rmd`, redrawn for this outcome: every gene in the grids,
+one point each, with a linear fit (95% CI). The y axis is zoomed to the central 99.8% of genes so a
+few extreme genes do not flatten the cloud; the fit and rho still use every gene.
+
+```{r te_scatters, fig.width = 7, fig.height = 6, results = "asis"}
+xs <- list(gc3  = list(lab = "GC3 (%)", file = "gc3"),
+           utr5 = list(lab = "log2 5'UTR length", file = "utr5_length"),
+           cds  = list(lab = "log2 CDS length", file = "cds_length"))
+ylim <- quantile(d$te_lfc, c(0.001, 0.999))
+n_off <- sum(d$te_lfc < ylim[1] | d$te_lfc > ylim[2])
+for (v in names(xs)) {
+  r <- cor(d[[v]], d$te_lfc, method = "spearman")
+  stopifnot("rho differs from the Spearman table above" = abs(r - rho[[v]]) < TOL)
+  fit <- summary(lm(d$te_lfc ~ d[[v]]))
+  cat(sprintf("\n\n## %s\n\nslope %.4f, adjusted R2 %.3f; y zoomed, %d genes off-scale (still in the fit)\n\n",
+              xs[[v]]$lab, coef(fit)[2, 1], fit$adj.r.squared, n_off))
+  p <- ggplot(d, aes(.data[[v]], te_lfc)) +
+    geom_point(color = "grey70", size = 0.5, alpha = 0.4) +
+    geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
+    geom_smooth(method = "lm", formula = y ~ x, color = "black", linewidth = 0.8, se = TRUE) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.6,
+             label = sprintf("Spearman rho = %.3f\nn = %s genes", r, scales::comma(nrow(d)))) +
+    labs(x = xs[[v]]$lab, y = "log2 TE change (hypoxia / normoxia)",
+         title = cfg$label, subtitle = "siCTRL; all genes in the grids; line = linear fit (95% CI)") +
+    coord_cartesian(ylim = ylim) +
+    theme_classic(base_size = 12)
+  print(p)
+  if (SAVE) ggsave(here("plots", sprintf("45_te_change_vs_%s_%s.pdf", xs[[v]]$file, cfg$tag)), p, width = 7, height = 6)
+}
+```
+
+# 4. Hypoxia response vs eIF3d dependence, colored by CDS length (MDA-MB-231 only)
+
+Kate, 2026-10-30. One point per gene:
+
+- **x:** TE change in hypoxia, control cells (log2 TE hypoxia / normoxia, siCTRL, 1hr), as above.
+- **y:** TE change on eIF3d knockdown in hypoxia 1hr, log2(sictrl / si3d) from
+  `translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv` (the filename states the ratio
+  backwards; positive = eIF3d promotes).
+- **color:** CDS length z-score, the same z as the reporter z-score plots
+  (`gene_feature_zscores_gc3_length_hypoxia_1hr.csv`), **raw sign**: positive = longer CDS than
+  average. Not negated here. The color is capped at +/-2.5 so a few very long CDSs do not wash out
+  the rest; the points are drawn with the most extreme z on top.
+- EIF3D is dropped: its TE change on knockdown is an artefact of depleting it.
+
+```{r scatter_3d_vs_hyp, eval = params$dataset == "mda231", fig.width = 7.5, fig.height = 6.5}
+de3 <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("[.].*", "", gene_id))
+kd <- de3$rna_lfc[de3$symbol %in% "EIF3D"]
+stopifnot("duplicate genes in the si3d file" = !anyDuplicated(de3$gene_id_clean),
+          "EIF3D rna_lfc not > 1: wrong file or flipped direction" = length(kd) == 1 && kd > 1)
+cat(sprintf("si3d file: EIF3D rna_lfc %+.2f -> log2(sictrl / si3d), positive = eIF3d promotes\n", kd))
+
+zc <- read_csv(file.path(O, "gene_feature_zscores_gc3_length_hypoxia_1hr.csv"), show_col_types = FALSE)
+stopifnot("z table genes differ from this notebook's genes" = setequal(zc$gene_id_clean, d$gene_id_clean),
+          "z table CDS length differs from the matrix" =
+            max(abs(zc$cds - d$cds[match(zc$gene_id_clean, d$gene_id_clean)])) < TOL,
+          "z_cds is not (x - mean) / sd over the z table's genes" =
+            max(abs(zc$z_cds - (zc$cds - mean(zc$cds)) / sd(zc$cds))) < 1e-10)
+
+sc <- d %>% transmute(gene_id_clean, symbol, hyp_te = te_lfc,
+                      kd_te = de3$te_lfc[match(gene_id_clean, de3$gene_id_clean)],
+                      z_cds = zc$z_cds[match(gene_id_clean, zc$gene_id_clean)]) %>%
+  filter(symbol != "EIF3D", !is.na(kd_te))
+stopifnot("z missing for a gene" = !anyNA(sc$z_cds), "log fold changes not finite" = all(is.finite(sc$kd_te)),
+          "longest-CDS gene does not have the highest z" = sc$z_cds[which.max(d$cds[match(sc$gene_id_clean, d$gene_id_clean)])] == max(sc$z_cds))
+rho_xy <- cor(sc$hyp_te, sc$kd_te, method = "spearman")
+cat(sprintf("genes plotted %s; Spearman(hypoxia TE change, eIF3d TE change) = %+.3f; Spearman(z_cds, eIF3d TE change) = %+.3f; Spearman(z_cds, hypoxia TE change) = %+.3f\n",
+            scales::comma(nrow(sc)), rho_xy, cor(sc$z_cds, sc$kd_te, method = "spearman"), cor(sc$z_cds, sc$hyp_te, method = "spearman")))
+
+ZCAP <- 2.5
+lx <- quantile(sc$hyp_te, c(0.001, 0.999)); ly <- quantile(sc$kd_te, c(0.001, 0.999))
+n_off <- sum(sc$hyp_te < lx[1] | sc$hyp_te > lx[2] | sc$kd_te < ly[1] | sc$kd_te > ly[2])
+p_sc <- ggplot(sc %>% arrange(abs(z_cds)), aes(hyp_te, kd_te, color = pmax(pmin(z_cds, ZCAP), -ZCAP))) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) + geom_vline(xintercept = 0, color = "grey40", linewidth = 0.3) +
+  geom_point(size = 0.7, alpha = 0.7) +
+  scale_color_gradient2(low = "#0072B2", mid = "grey85", high = "#D55E00", midpoint = 0, limits = c(-ZCAP, ZCAP),
+                         name = "CDS length\nz-score\n(+ = longer)") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.6,
+           label = sprintf("Spearman rho = %.3f\nn = %s genes", rho_xy, scales::comma(nrow(sc)))) +
+  coord_cartesian(xlim = lx, ylim = ly) +
+  labs(x = "log2 TE change, hypoxia vs normoxia (siCTRL, 1hr)", y = "log2 TE change, sictrl vs si3d (hypoxia 1hr)",
+       title = "MDA-MB-231: hypoxia response vs eIF3d dependence",
+       subtitle = sprintf("n = %s genes; CDS length z raw sign, capped at +/-%.1f", scales::comma(nrow(sc)), ZCAP)) +
+  theme_classic(base_size = 12) + theme(plot.subtitle = element_text(size = 7))
+p_sc
+if (SAVE) ggsave(here("plots", "45_te_hypoxia_sictrl_vs_te_si3d_hypoxia_colored_by_cds_z_mda231_1hr.pdf"), p_sc, width = 7.5, height = 6.5)
+```
+
+## eIF3d TE change minus hypoxia TE change, against CDS length
+
+Kate, 2026-10-30. Same genes, no color:
+
+- **x:** CDS length z-score (raw sign, + = longer), not capped.
+- **y:** the y axis above minus the x axis above, per gene: log2 TE change sictrl vs si3d
+  (hypoxia 1hr) - log2 TE change hypoxia vs normoxia (siCTRL 1hr). Positive = the gene depends on
+  eIF3d more than its TE moves with hypoxia in control cells. The two are different contrasts on the same
+  log2 scale, so the difference is a plain subtraction of LFCs.
+
+```{r diff_vs_cds_z, eval = params$dataset == "mda231", fig.width = 7, fig.height = 6}
+sc <- sc %>% mutate(diff_te = kd_te - hyp_te)
+stopifnot("difference not finite" = all(is.finite(sc$diff_te)),
+          "difference is not y - x of the scatter above" =
+            max(abs(sc$diff_te - (de3$te_lfc[match(sc$gene_id_clean, de3$gene_id_clean)] -
+                                    te_231$te_lfc[match(sc$gene_id_clean, te_231$gene_id_clean)]))) < TOL)
+rho_d <- cor(sc$z_cds, sc$diff_te, method = "spearman")
+fit_d <- summary(lm(diff_te ~ z_cds, data = sc))
+ld <- quantile(sc$diff_te, c(0.001, 0.999)); nd_off <- sum(sc$diff_te < ld[1] | sc$diff_te > ld[2])
+cat(sprintf("Spearman(z_cds, difference) = %+.3f; slope %.4f per SD; adjusted R2 %.3f; n = %s; y zoomed, %d genes off-scale (still in the fit)\n",
+            rho_d, coef(fit_d)[2, 1], fit_d$adj.r.squared, scales::comma(nrow(sc)), nd_off))
+p_d <- ggplot(sc, aes(z_cds, diff_te)) +
+  geom_point(color = "grey70", size = 0.5, alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "black", linewidth = 0.8, se = TRUE) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.6,
+           label = sprintf("Spearman rho = %.3f\nn = %s genes", rho_d, scales::comma(nrow(sc)))) +
+  coord_cartesian(ylim = ld) +
+  labs(x = "CDS length z-score (+ = longer)",
+       y = "log2 TE change sictrl vs si3d (hypoxia)\nminus log2 TE change hypoxia vs normoxia (siCTRL)",
+       title = "MDA-MB-231: eIF3d TE change minus hypoxia TE change, by CDS length",
+       subtitle = sprintf("n = %s genes; CDS length z raw sign; line = linear fit (95%% CI)", scales::comma(nrow(sc)))) +
+  theme_classic(base_size = 12)
+p_d
+if (SAVE) ggsave(here("plots", "45_te_si3d_minus_te_hypoxia_sictrl_vs_cds_z_mda231_1hr.pdf"), p_d, width = 7, height = 6)
+```
+
+## Is eIF3d's short-CDS preference just the hypoxia response?
+
+Kate, 2026-10-30. The difference plot above cannot answer this: both TE changes fall with CDS
+length by similar amounts, so subtracting cancels the slopes, and its height is set by the two
+contrasts' different centres, not by biology. The direct test is a regression:
+
+- **unadjusted:** eIF3d TE change ~ CDS length z
+- **adjusted:** eIF3d TE change ~ CDS length z + hypoxia TE change (siCTRL)
+
+If the short-CDS effect on eIF3d dependence were the hypoxia response, the CDS slope would shrink
+toward 0 once hypoxia TE change is in the model.
+
+```{r cds_adjusted, eval = params$dataset == "mda231", fig.width = 6.5, fig.height = 3.8}
+m0 <- lm(kd_te ~ z_cds, data = sc); m1 <- lm(kd_te ~ z_cds + hyp_te, data = sc)
+co <- bind_rows(
+  as_tibble(summary(m0)$coefficients, rownames = "term") %>% mutate(model = "unadjusted", adj_r2 = summary(m0)$adj.r.squared),
+  as_tibble(summary(m1)$coefficients, rownames = "term") %>% mutate(model = "adjusted for hypoxia TE change", adj_r2 = summary(m1)$adj.r.squared)) %>%
+  dplyr::rename(estimate = Estimate, se = `Std. Error`, t = `t value`, p = `Pr(>|t|)`) %>% filter(term != "(Intercept)")
+# The unadjusted slope is the ordinary least-squares slope, recomputed longhand
+stopifnot("unadjusted slope differs from cov / var" =
+            abs(coef(m0)[["z_cds"]] - cov(sc$z_cds, sc$kd_te) / var(sc$z_cds)) < 1e-10,
+          "model n differs from the plotted genes" = nobs(m0) == nrow(sc) && nobs(m1) == nrow(sc))
+knitr::kable(co %>% dplyr::select(model, term, estimate, se, t, p, adj_r2), digits = 4,
+             caption = sprintf("eIF3d TE change (sictrl vs si3d, hypoxia 1hr) regressed on CDS length z, n = %s genes; z_cds slope is per SD", scales::comma(nrow(sc))))
+cat(sprintf("Pearson(eIF3d TE change, hypoxia TE change) = %+.3f; Pearson(z_cds, hypoxia TE change) = %+.3f\n",
+            cor(sc$kd_te, sc$hyp_te), cor(sc$z_cds, sc$hyp_te)))
+cat(sprintf("CDS slope retained after adjustment: %.0f%%\n", 100 * coef(m1)[["z_cds"]] / coef(m0)[["z_cds"]]))
+
+cc <- co %>% filter(term == "z_cds") %>% mutate(model = factor(model, levels = c("unadjusted", "adjusted for hypoxia TE change")))
+p_cc <- ggplot(cc, aes(estimate, model)) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.3) +
+  geom_errorbarh(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), height = 0.15) +
+  geom_point(size = 2.5, color = "#E69F00") +
+  geom_text(aes(label = sprintf("%+.4f (t = %.1f)", estimate, t)), vjust = -1.2, size = 3.2) +
+  labs(x = "CDS length z slope on eIF3d TE change (log2 per SD, 95% CI)", y = NULL,
+       title = "MDA-MB-231: CDS length effect on eIF3d dependence, hypoxia 1hr",
+       subtitle = sprintf("n = %s genes", scales::comma(nrow(sc)))) +
+  theme_classic(base_size = 12)
+p_cc
+if (SAVE) ggsave(here("plots", "45_cds_z_slope_on_te_si3d_adjusted_for_hypoxia_te_mda231_1hr.pdf"), p_cc, width = 6.5, height = 3.8)
+```
+
+```{r session}
+sessionInfo()
+```

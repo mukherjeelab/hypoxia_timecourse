@@ -1,0 +1,169 @@
+---
+title: "`r paste0('Pathway over-representation (Hallmark, KEGG) in the SHAP clusters of ', params$set_word, ': ', params$label)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  set_label: "eIF3d promoted"
+  set_word: "eIF3d targets"
+  profile: "features, raw"
+  k: 3
+  padj_cut: 0.05
+  min_gs: 10
+  max_gs: 500
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "26e_target_cluster_pathway_ora.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-29: Hallmark and KEGG over-representation analysis (ORA) of the `r params$k` SHAP
+clusters of the `r params$set_word` shown in `26d_target_cluster_feature_importance.Rmd`'s
+top-feature heatmaps (`r params$profile` SHAP profile, k = `r params$k`). The clusters are read
+from `26b_target_subtypes_features.Rmd`'s saved CSV, not re-derived.
+
+The method is `27_ora_shap_groups.Rmd`'s, unchanged: `clusterProfiler::enricher` on gene symbols,
+msigdbr Hallmark (`category = "H"`) and KEGG (C2 sets whose subcategory contains "KEGG", i.e.
+`CP:KEGG_LEGACY` and `CP:KEGG_MEDICUS`), FDR, gene-set size `r params$min_gs`-`r params$max_gs`,
+significant at adjusted p < `r params$padj_cut`.
+
+**Universe: all modelled genes** (the genes the SHAP forest explained), so each cluster is asked
+what it carries relative to the transcriptome (Kate, 2026-10-29). A pathway enriched in every
+cluster is therefore likely a property of the target set as a whole, not of any one cluster.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(msigdbr); library(clusterProfiler); library(pheatmap); library(grid) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+K <- as.integer(params$k)
+ptag <- sub("_lfc.*$", "", sub("^eif33d_promotes_", "", params$suffix))
+ftag <- paste0(ptag, "_", gsub("[ ,]+", "_", params$profile), "_k", K)
+```
+
+# 1. Gene sets
+
+```{r gene_sets}
+hallmark <- suppressWarnings(msigdbr(species = "Homo sapiens", category = "H")) %>% dplyr::select(gs_name, gene_symbol)
+c2 <- suppressWarnings(msigdbr(species = "Homo sapiens", category = "C2"))
+kegg <- c2 %>% filter(grepl("KEGG", gs_subcat, ignore.case = TRUE)) %>% dplyr::select(gs_name, gene_symbol)
+cat("msigdbr", as.character(packageVersion("msigdbr")), "| Hallmark sets:", n_distinct(hallmark$gs_name),
+    "| KEGG sets:", n_distinct(kegg$gs_name), "from", paste(unique(c2$gs_subcat[grepl("KEGG", c2$gs_subcat)]), collapse = " + "), "\n")
+stopifnot("Hallmark should have 50 sets" = n_distinct(hallmark$gs_name) == 50, "no KEGG sets found" = nrow(kegg) > 0)
+collections <- list(Hallmark = hallmark, KEGG = kegg)
+```
+
+# 2. The clusters
+
+```{r clusters}
+oof <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))
+all_genes <- oof$genes
+tg <- all_genes %>% filter(set == params$set_label)
+a <- read_csv(file.path(O, paste0("target_shap_feature_clusters_", params$suffix, ".csv")), show_col_types = FALSE) %>%
+  filter(profile == params$profile, k == K)
+stopifnot("clustering missing from 26b_'s CSV - knit 26b_ with this profile and k" = nrow(a) > 0,
+          "clusters do not cover exactly the targets" = setequal(a$gene_id_clean, tg$gene_id_clean),
+          "a gene is in more than one cluster" = !anyDuplicated(a$gene_id_clean),
+          "cluster labels are not 1..k" = setequal(a$cluster, seq_len(K)),
+          "modelled genes are not unique" = !anyDuplicated(all_genes$gene_id_clean))
+sym <- setNames(all_genes$symbol, all_genes$gene_id_clean)
+cat(sprintf("%d %s of %d modelled genes | %s, k = %d | cluster sizes %s | %d modelled genes without a symbol\n",
+            nrow(tg), params$set_word, nrow(all_genes), params$profile, K,
+            paste(table(a$cluster), collapse = " / "), sum(is.na(sym))))
+universes <- list(`all modelled genes` = all_genes$gene_id_clean)
+groups <- setNames(lapply(seq_len(K), function(g) a$gene_id_clean[a$cluster == g]), paste("cluster", seq_len(K)))
+```
+
+# 3. ORA
+
+```{r ora}
+run_one <- function(ids, group, universe_is, coll_name) {
+  g <- unique(na.omit(sym[ids])); u <- unique(na.omit(sym[universes[[universe_is]]]))
+  r <- tryCatch(enricher(gene = g, universe = u, TERM2GENE = collections[[coll_name]], pAdjustMethod = "fdr",
+                         pvalueCutoff = 1, qvalueCutoff = 1, minGSSize = params$min_gs, maxGSSize = params$max_gs),
+                error = function(e) NULL)
+  if (is.null(r) || !nrow(r@result)) return(NULL)
+  r@result %>% as_tibble() %>%
+    transmute(collection = coll_name, universe_is, group, n_group = length(ids),
+              pathway = ID, GeneRatio, BgRatio, Count, pvalue, p.adjust,
+              # (k / n) / (M / N): both denominators count only genes annotated in this collection,
+              # exactly as clusterProfiler's GeneRatio and BgRatio do.
+              fold_enrichment = (as.numeric(sub("/.*", "", GeneRatio)) / as.numeric(sub(".*/", "", GeneRatio))) /
+                                (as.numeric(sub("/.*", "", BgRatio)) / as.numeric(sub(".*/", "", BgRatio))),
+              genes = geneID)
+}
+ora <- crossing(collection = names(collections), universe_is = names(universes), group = names(groups)) %>%
+  pmap_dfr(function(collection, universe_is, group) run_one(groups[[group]], group, universe_is, collection))
+stopifnot("ORA returned nothing" = nrow(ora) > 0, "fold enrichment not finite" = all(is.finite(ora$fold_enrichment)))
+sig <- ora %>% filter(p.adjust < params$padj_cut)
+ora %>% group_by(collection, universe_is, group) %>% summarise(tested = n(), significant = sum(p.adjust < params$padj_cut), .groups = "drop") %>%
+  knitr::kable()
+if (SAVE) write_csv(ora, file.path(O, paste0("ora_target_clusters_hallmark_kegg_", ftag, ".csv")))
+```
+
+## Significant pathways
+
+```{r sig_table}
+if (nrow(sig)) {
+  sig %>% arrange(collection, universe_is, group, p.adjust) %>%
+    transmute(collection, universe_is, group, pathway, GeneRatio, BgRatio, fold_enrichment = round(fold_enrichment, 2),
+              p.adjust = signif(p.adjust, 2)) %>% knitr::kable()
+} else cat("No pathway reaches adjusted p <", params$padj_cut, "in any cluster, collection or universe.\n")
+```
+
+# 4. Figures
+
+One heatmap per universe and collection: fold enrichment for every pathway significant in at
+least one cluster, `*` where adjusted p < `r params$padj_cut`. A blank cell means the pathway had
+no genes in that cluster (fold enrichment 0).
+
+```{r heatmaps, fig.width = 9, fig.height = 7, results = "asis"}
+for (ui in names(universes)) for (cn in names(collections)) {
+  d <- ora %>% filter(universe_is == ui, collection == cn)
+  sp <- d %>% filter(p.adjust < params$padj_cut) %>% pull(pathway) %>% unique()
+  if (!length(sp)) { cat("\n\n**", cn, ", universe ", ui, ":** no significant pathways\n", sep = ""); next }
+  W <- d %>% filter(pathway %in% sp) %>% dplyr::select(pathway, group, fold_enrichment) %>%
+    pivot_wider(names_from = group, values_from = fold_enrichment, values_fill = 0) %>% column_to_rownames("pathway")
+  for (cc in setdiff(names(groups), colnames(W))) W[[cc]] <- 0
+  W <- as.matrix(W[, names(groups), drop = FALSE])
+  S <- d %>% filter(pathway %in% sp) %>% mutate(s = ifelse(p.adjust < params$padj_cut, "*", "")) %>%
+    dplyr::select(pathway, group, s) %>% pivot_wider(names_from = group, values_from = s, values_fill = "") %>% column_to_rownames("pathway")
+  for (cc in setdiff(names(groups), colnames(S))) S[[cc]] <- ""
+  S <- as.matrix(S[rownames(W), names(groups), drop = FALSE])
+  colnames(W) <- paste0(names(groups), " (n = ", lengths(groups), ")")
+  hm <- pheatmap(W, cluster_rows = nrow(W) > 2, cluster_cols = FALSE, color = colorRampPalette(c("white", "#F4B183", "#D55E00"))(100),
+                 breaks = seq(0, max(W, 1), length.out = 101), display_numbers = S, number_color = "black", fontsize_number = 11,
+                 fontsize_row = 7, angle_col = 45, cellwidth = 34,
+                 main = sprintf("%s %s, %s SHAP clusters (k = %d): %s ORA\nfold enrichment; * adjusted p < %.2f; universe: %s (n = %s)",
+                                params$label, params$set_word, sub("features, ", "", params$profile), K, cn,
+                                params$padj_cut, ui, scales::comma(length(universes[[ui]]))), silent = TRUE)
+  cat("\n\n## ", cn, ", universe: ", ui, "\n\n", sep = ""); grid.newpage(); grid.draw(hm$gtable)
+  if (SAVE) {
+    f <- here("plots", paste0("26e_ora_", tolower(cn), "_", ftag, "_universe_", gsub("[^A-Za-z0-9]+", "_", ui), ".pdf"))
+    pdf(f, width = 9, height = 2.5 + 0.17 * nrow(W)); grid.newpage(); grid.draw(hm$gtable); dev.off() }
+}
+```
+
+```{r session}
+sessionInfo()
+```

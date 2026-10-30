@@ -1,0 +1,308 @@
+---
+title: "eIF3d-promoted mRNAs vs the rest of the transcriptome"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  feature: "log2_cds_length"   # log2_cds_length | gc3_internal | log2_utr5_length | log2_utr3_length
+  matrix_map: "_mcf7tx_=feature_matrix_tco_mcf7six1.rds;_helatx_=feature_matrix_tco_hela.rds;_hektx_=feature_matrix_tco_dhx29.rds;_manetx_=feature_matrix_tco_mane.rds;=feature_matrix_tco.rds"
+  experiments: ""          # comma-separated panel labels; "" = every eIF3d column (12)
+  set_rule: "top_n"        # "top_n" = top N by LFC (filled by LFC alone if too few pass); "significant" = every gene with LFC > lfc_min and padj < padj_max
+  top_n: 200
+  lfc_min: 0.5             # used by set_rule = "significant" only
+  padj_max: 0.05
+  out_tag: ""              # appended to the plot filename; required when experiments or set_rule changes
+  ncol: 4                  # panels per row
+  plot_types: "density"    # comma-separated: density and/or ecdf
+  te_bins: 0               # > 0 splits the promoted set into this many equal-count bins of TE change, within each experiment (6 = rainbow); 0 = one colour per condition
+  bin_palette: "rainbow"   # "rainbow" (Okabe-Ito, te_bins = 6 only) or "reds" (dark = largest TE change, any te_bins >= 2)
+  xlim: ""                 # "lo,hi" zooms the x axis (coord_cartesian, so no gene is dropped from the curves or tests); "" = full range
+  difference_panel: FALSE  # TRUE adds a third column: top-set minus rest density, normoxia and hypoxia overlaid. Needs ncol = 2, each row = one cell line's normoxia then hypoxia
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "41_top200_3d_feature_densities.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Plan
+
+For each eIF3d experiment, compare its promoted mRNAs (the **top set**) against every other mRNA
+in that experiment, one feature at a time, as unfilled density curves.
+
+1. **CDS length**, then GC3, 5'UTR length and 3'UTR length - one render per feature (`feature` param).
+2. Next features - to be decided after looking at 1.
+
+**Decisions**
+
+- **Experiments** = every eIF3d column of the intrinsic SHAP heatmap (`15b_render_all_celllines.R`,
+  with cap binding): MDA-MB-231 hypoxia 1/4/24hr and normoxia 1+4hr, MCF7-SIX1 hypoxia and
+  normoxia 1hr, HeLa no stress (Herrmannova), and the five HEK293T eIF3d cap-binding columns.
+  Read from `15b_` itself so the list cannot drift.
+- **Top set**, chosen by `set_rule`:
+  - `"top_n"` - the same rule as the top-N feature-means heatmap (`17_`) and motif notebook
+    (`31_`): the top `top_n` genes by LFC among those with padj < `padj_max` and LFC > 0, filled
+    by LFC alone when fewer pass. Sets are equal-sized but, where few genes are significant, mostly
+    not significant.
+  - `"significant"` - every gene with LFC > `lfc_min` and padj < `padj_max` (the project's gene-set
+    definition). Sets differ in size between experiments.
+- **This render:** set rule `r params$set_rule`` r if (params$set_rule == "top_n") paste0(", N = ", params$top_n) else paste0(", LFC > ", params$lfc_min, ", padj < ", params$padj_max)`; experiments `r if (nzchar(params$experiments)) params$experiments else "all 12"`.
+- **Rest of the transcriptome** = every other gene in that experiment's modelled set, on that
+  dataset's own transcripts (each run's saved model data).
+- **Feature values come from each experiment's own feature matrix, not the model data.** The
+  model data is the imputed split, so a transcript with no 3'UTR or an incomplete CDS (no GC3)
+  carries an imputed value there. Those genes are dropped instead, so n can differ by feature;
+  the top set is still chosen on every modelled gene. GC3 is `gc3_internal` (initiator and stop
+  codons removed), the corrected member of the GC3 variant pair.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+```
+
+# 1. Experiments and top sets
+
+```{r experiments}
+src <- parse(here("code", "translational_control_overview", "15b_render_all_celllines.R"))
+keep <- vapply(src, function(e) is.call(e) && identical(e[[1]], as.name("<-")) &&
+                 as.character(e[[2]]) %in% c("T", "mk"), logical(1))
+env15 <- new.env(); env15$with_capbind <- TRUE
+for (e in src[keep]) eval(e, env15)
+parts <- str_split(env15$mk("_intrinsic"), ";")[[1]]
+exps <- tibble(label = str_replace(parts, "=.*$", ""), suffix = str_replace(parts, "^[^=]*=", "")) %>%
+  filter(str_starts(suffix, "eif33d_"))
+stopifnot("expected 12 eIF3d experiments" = nrow(exps) == 12)
+if (nzchar(params$experiments)) {
+  want <- str_trim(str_split(params$experiments, ",")[[1]])
+  stopifnot("an experiment label is not an eIF3d column of 15b_" = all(want %in% exps$label))
+  exps <- exps[match(want, exps$label), ]
+}
+exps <- exps %>% mutate(label = factor(label, levels = label))
+stopifnot("set_rule must be top_n or significant" = params$set_rule %in% c("top_n", "significant"))
+feat_labs <- c(log2_cds_length = "log2 CDS length", gc3_internal = "GC3 (%)",
+               log2_utr5_length = "log2 5'UTR length", log2_utr3_length = "log2 3'UTR length")
+feat_tags <- c(log2_cds_length = "cds_length", gc3_internal = "gc3",
+               log2_utr5_length = "utr5_length", log2_utr3_length = "utr3_length")
+stopifnot("unknown feature" = params$feature %in% names(feat_labs))
+feat <- params$feature; feat_lab <- feat_labs[[feat]]; feat_tag <- feat_tags[[feat]]
+mmap <- tibble(part = str_trim(str_split(params$matrix_map, ";")[[1]])) %>% filter(nzchar(part)) %>%
+  transmute(key = str_replace(part, "=.*$", ""), val = str_replace(part, "^[^=]*=", ""))
+exps$matrix_rds <- map_chr(exps$suffix, function(s) (mmap %>% filter(key == "" | str_detect(s, fixed(key))))$val[1])
+matrices <- set_names(unique(exps$matrix_rds)) %>%
+  map(~ readRDS(file.path(O, .x)) %>% dplyr::select(gene_id_clean, value = all_of(feat)))
+walk(matrices, ~ stopifnot("a feature matrix is not one transcript per gene" = !any(duplicated(.x$gene_id_clean))))
+
+dat <- pmap_dfr(list(as.character(exps$label), exps$suffix, exps$matrix_rds), function(label, suffix, matrix_rds) {
+  md <- readRDS(file.path(O, paste0("rfreg_model_data_", suffix, ".rds")))
+  g <- bind_rows(md$train, md$test) %>% dplyr::select(gene_id_clean, y, y_padj, imputed = all_of(feat)) %>%
+    left_join(matrices[[matrix_rds]], by = "gene_id_clean")
+  # Right matrix for this column: wherever the matrix has a value, the model data must match it.
+  stopifnot("model data does not match its feature matrix" =
+              isTRUE(all.equal(g$imputed[!is.na(g$value)], g$value[!is.na(g$value)])))
+  stopifnot("a gene appears twice in a column's model data" = !any(duplicated(g$gene_id_clean)))
+  if (params$set_rule == "significant") {
+    top <- g %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > params$lfc_min)
+    stopifnot("no significant genes in a column" = nrow(top) > 0)
+  } else {
+    N <- as.integer(params$top_n)
+    top <- g %>% filter(!is.na(y_padj), y_padj < params$padj_max, y > 0) %>% arrange(desc(y)) %>% slice_head(n = N)
+    if (nrow(top) < N) top <- bind_rows(top, g %>% filter(!gene_id_clean %in% top$gene_id_clean) %>%
+                                          arrange(desc(y)) %>% slice_head(n = N - nrow(top)))
+    stopifnot("could not fill the top set" = nrow(top) == N)
+  }
+  g %>% mutate(experiment = label, top = gene_id_clean %in% top$gene_id_clean)
+}) %>% mutate(experiment = factor(experiment, levels = levels(exps$label)))
+
+if (params$set_rule == "top_n")
+  stopifnot("every experiment needs exactly top_n top genes" = all(table(dat$experiment[dat$top]) == params$top_n))
+if (feat == "gc3_internal") stopifnot("GC3 outside 0-100%" = all(dat$value >= 0 & dat$value <= 100, na.rm = TRUE))
+dat %>% group_by(experiment) %>%
+  # no_value_* first: summarise() evaluates in order, so `top = sum(top)` would overwrite the logical.
+  summarise(no_value_top = sum(top & is.na(value)), no_value_rest = sum(!top & is.na(value)),
+            genes = n(), top = sum(top), .groups = "drop") %>%
+  knitr::kable(caption = paste("Genes per experiment; no_value = no", feat_lab, "on its transcript, dropped from the plot"))
+dat <- dat %>% filter(!is.na(value))
+```
+
+# 2. `r feat_lab`
+
+```{r feature_plot, fig.width = 12, fig.height = 9}
+top_lab <- "Promoted"
+set_title <- if (params$set_rule == "top_n") paste("Top", params$top_n, "eIF3d-promoted mRNAs") else
+  sprintf("eIF3d-promoted mRNAs (LFC > %s, padj < %s)", params$lfc_min, params$padj_max)
+# Promoted curves coloured by condition: Okabe-Ito bluish green = normoxia, vermillion = hypoxia;
+# columns that are neither (HeLa, cap binding) keep the eIF3d orange.
+cond_colors <- c(normoxia = "#009E73", hypoxia = "#D55E00", other = "#E69F00")
+pd <- dat %>% mutate(condition = case_when(str_detect(experiment, "hypoxia") ~ "hypoxia",
+                                           str_detect(experiment, "normoxia") ~ "normoxia", TRUE ~ "other"),
+                     set = if_else(top, paste0(top_lab, if_else(condition == "other", "", paste0(", ", condition))),
+                                   "Rest of transcriptome"))
+set_colors <- c(setNames(cond_colors, paste0(top_lab, c(", normoxia", ", hypoxia", ""))),
+                "Rest of transcriptome" = "grey70")
+set_colors <- set_colors[names(set_colors) %in% pd$set]
+pd <- pd %>% mutate(set = factor(set, levels = names(set_colors)))
+nb <- as.integer(params$te_bins)
+if (nb > 0) {
+  # Equal-count bins of TE change within each experiment's promoted set, bin nb = largest change.
+  # Okabe-Ito hues in rainbow order, red = largest TE change.
+  stopifnot("bin_palette must be rainbow or reds" = params$bin_palette %in% c("rainbow", "reds"),
+            "the rainbow palette is defined for te_bins = 6 only" = params$bin_palette != "rainbow" || nb == 6,
+            "te_bins needs at least 2 bins" = nb >= 2,
+            "te_bins replaces the condition colours, so no difference panel" = !isTRUE(params$difference_panel))
+  # reds: ColorBrewer Reds, darkest = largest TE change.
+  bin_hues <- if (params$bin_palette == "rainbow") c("#D55E00", "#E69F00", "#F0E442", "#009E73", "#0072B2", "#CC79A7") else
+    colorRampPalette(c("#67000D", "#CB181D", "#FC9272"))(nb)
+  bin_labs <- paste0("TE change bin ", nb:1, c(" (largest)", rep("", nb - 2), " (smallest)"))
+  pd <- pd %>% group_by(experiment) %>%
+    mutate(bin = if_else(top, nb + 1L - ntile(if_else(top, y, NA_real_), nb), NA_integer_)) %>% ungroup() %>%
+    mutate(set = factor(if_else(top, bin_labs[bin], "Rest of transcriptome"),
+                        levels = c(bin_labs, "Rest of transcriptome")))
+  set_colors <- c(setNames(bin_hues, bin_labs), "Rest of transcriptome" = "grey70")
+  bin_tab <- pd %>% filter(top) %>% group_by(experiment, set) %>%
+    summarise(n = n(), te_change_min = min(y), te_change_max = max(y), median_value = median(value), .groups = "drop")
+  stopifnot("every experiment needs all bins populated" = all(table(bin_tab$experiment) == nb))
+}
+# One panel: n (and each bin's TE-change range) can go in the legend, since nothing else shares it.
+legend_labs <- setNames(names(set_colors), names(set_colors))
+if (nlevels(pd$experiment) == 1) {
+  n_set <- pd %>% dplyr::count(set) %>% { setNames(.$n, as.character(.$set)) }
+  legend_labs[] <- sprintf("%s, n = %d", names(legend_labs), n_set[names(legend_labs)])
+  if (nb > 0) legend_labs[bin_labs] <- sprintf("%s\n  TE change %.2f-%.2f", legend_labs[bin_labs],
+                                               bin_tab$te_change_min[match(bin_labs, bin_tab$set)],
+                                               bin_tab$te_change_max[match(bin_labs, bin_tab$set)])
+}
+
+stats <- pd %>% group_by(experiment) %>%
+  summarise(p = wilcox.test(value[top], value[!top])$p.value,
+            med_top = median(value[top]), med_rest = median(value[!top]),
+            n_top = sum(top), n_rest = sum(!top), .groups = "drop") %>%
+  mutate(lab = sprintf("Wilcoxon p %s\nn = %d vs %d", if_else(p < 2.2e-16, "< 2.2e-16", paste("=", signif(p, 2))), n_top, n_rest))
+if (nb > 0) {
+  # Does the feature keep moving with TE change inside the promoted set? Spearman on the unbinned values.
+  trend <- pd %>% filter(top) %>% group_by(experiment) %>%
+    summarise(rho = cor(y, value, method = "spearman"),
+              p_rho = cor.test(y, value, method = "spearman", exact = FALSE)$p.value, .groups = "drop")
+  stats <- stats %>% left_join(trend, by = "experiment") %>%
+    mutate(lab_trend = sprintf("TE change vs value,\nwithin promoted:\nrho = %.2f\np = %s", rho, signif(p_rho, 2)))
+}
+knitr::kable(stats %>% dplyr::select(-starts_with("lab")), digits = 3,
+             caption = paste("Median", feat_lab, "top set vs rest"))
+if (nb > 0) knitr::kable(bin_tab, digits = 3, caption = paste("TE change bins within the promoted set; median", feat_lab, "per bin"))
+
+n_col <- min(as.integer(params$ncol), nlevels(pd$experiment)); n_row <- ceiling(nlevels(pd$experiment) / n_col)
+plot_types <- str_trim(str_split(params$plot_types, ",")[[1]])
+stopifnot("plot_types must be density and/or ecdf" = all(plot_types %in% c("density", "ecdf")))
+set_tag <- if (params$set_rule == "top_n") paste0("top", params$top_n) else paste0("sig_lfc", params$lfc_min)
+
+if (isTRUE(params$difference_panel)) {
+  stopifnot("difference_panel needs ncol = 2" = n_col == 2)
+  rows <- tibble(experiment = levels(pd$experiment)) %>%
+    mutate(cell_line = str_remove(experiment, " 3d .*$"),
+           condition = if_else(str_detect(experiment, "hypoxia"), "hypoxia", "normoxia"),
+           row = (row_number() + 1) %/% 2)
+  stopifnot("each row must be one cell line's normoxia then hypoxia" =
+              all(rows %>% group_by(row) %>% summarise(ok = n_distinct(cell_line) == 1 &&
+                    identical(condition, c("normoxia", "hypoxia"))) %>% pull(ok)))
+  shift <- stats %>% mutate(experiment = as.character(experiment)) %>% left_join(rows, by = "experiment") %>%
+    mutate(d = med_top - med_rest) %>% dplyr::select(cell_line, condition, d) %>%
+    pivot_wider(names_from = condition, values_from = d) %>%
+    mutate(cell_line = factor(cell_line, levels = unique(rows$cell_line)),
+           lab = sprintf("median shift, top - rest\nnormoxia %+.2f\nhypoxia %+.2f", normoxia, hypoxia))
+}
+
+# Per cell line: top set minus rest, for normoxia and hypoxia on one axis, evaluated on a grid
+# shared within each experiment so the subtraction is pointwise.
+#   density: same kernel and bandwidth rule as geom_density (Gaussian, bw.nrd0, per group).
+#            Above zero = lengths enriched in the top set.
+#   ecdf:    ECDF(top) - ECDF(rest). Above zero = the top set has reached that length sooner, i.e.
+#            is shorter; the peak is the two-sample KS statistic.
+difference_curves <- function(type) {
+  pd %>% group_by(experiment) %>% group_modify(function(d, k) {
+    lo <- min(d$value); hi <- max(d$value)
+    if (type == "density") {
+      dt <- density(d$value[d$top],  bw = "nrd0", from = lo, to = hi, n = 512)
+      dr <- density(d$value[!d$top], bw = "nrd0", from = lo, to = hi, n = 512)
+      tibble(x = dt$x, diff = dt$y - dr$y)
+    } else {
+      x <- seq(lo, hi, length.out = 512)
+      tibble(x = x, diff = ecdf(d$value[d$top])(x) - ecdf(d$value[!d$top])(x))
+    }
+  }) %>% ungroup() %>% left_join(rows, by = "experiment") %>%
+    mutate(cell_line = factor(cell_line, levels = unique(rows$cell_line)),
+           condition = factor(condition, levels = c("normoxia", "hypoxia")))
+}
+
+x_lim <- if (nzchar(params$xlim)) as.numeric(str_split(params$xlim, ",")[[1]]) else NULL
+stopifnot("xlim must be two numbers, lo,hi" = is.null(x_lim) || (length(x_lim) == 2 && !anyNA(x_lim)))
+make_plots <- function(type) {
+  geom_main <- if (type == "density") geom_density(fill = NA, linewidth = 0.8) else stat_ecdf(linewidth = 0.8)
+  # ECDF rises left to right, so its empty corner is top-left; the density's is top-right.
+  txt <- if (type == "density") list(x = Inf, hjust = 1.1) else list(x = -Inf, hjust = -0.1)
+  p_main <- ggplot(pd, aes(value, colour = set)) +
+    geom_main +
+    geom_text(data = stats, aes(x = txt$x, y = Inf, label = lab), inherit.aes = FALSE,
+              hjust = txt$hjust, vjust = 1.4, size = 3) +
+    facet_wrap(~ experiment, ncol = n_col) +
+    scale_colour_manual(values = set_colors, labels = legend_labs) +
+    coord_cartesian(xlim = x_lim) +
+    # ECDF's other empty corner is bottom-right; the binned trend goes there.
+    (if (nb > 0) geom_text(data = stats, aes(x = Inf, y = -Inf, label = lab_trend), inherit.aes = FALSE,
+                           hjust = 1.05, vjust = -0.3, size = 3)) +
+    labs(x = feat_lab, y = if (type == "density") "Density" else "Cumulative fraction",
+         colour = NULL, title = set_title,
+         caption = if (any(grepl("*", levels(pd$experiment), fixed = TRUE)))
+           "* features on the MANE Select transcript; all other panels use each dataset's own most abundant transcript") +
+    theme_classic(base_size = 12) + theme(legend.position = if (nb > 0) "right" else "top",
+                                             legend.key.spacing.y = unit(if (nb > 0) 4 else 0, "pt"))
+  out <- list(main = p_main)
+  if (isTRUE(params$difference_panel)) {
+    # density difference is positive left of the crossover and the ECDF difference peaks mid-range,
+    # so the label goes where each leaves room: top-right vs top-left.
+    lab_pos <- if (type == "density") list(x = Inf, hjust = 1.05) else list(x = -Inf, hjust = -0.05)
+    p_diff <- ggplot(difference_curves(type), aes(x, diff, colour = condition)) +
+      geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.4) +
+      geom_line(linewidth = 0.8) +
+      geom_text(data = shift, aes(x = lab_pos$x, y = Inf, label = lab), inherit.aes = FALSE,
+                hjust = lab_pos$hjust, vjust = 1.2, size = 3) +
+      facet_wrap(~ cell_line, ncol = 1) +
+      scale_colour_manual(values = cond_colors[c("normoxia", "hypoxia")]) +
+      labs(x = feat_lab, colour = NULL,
+           y = if (type == "density") "Density difference (top set - rest)" else "ECDF difference (top set - rest)") +
+      theme_classic(base_size = 12) + theme(legend.position = "none")   # colours explained by the main legend
+    out$combined <- patchwork::wrap_plots(p_main, p_diff, widths = c(2, 1))
+  }
+  out
+}
+
+if (isTRUE(params$difference_panel))
+  knitr::kable(shift %>% dplyr::select(-lab), digits = 3,
+               caption = paste("Median", feat_lab, "top set minus rest, per condition"))
+for (type in plot_types) {
+  pl <- make_plots(type)
+  for (nm in names(pl)) {
+    print(pl[[nm]])
+    single <- nlevels(pd$experiment) == 1
+    w <- if (nm == "combined") 4.5 * n_col else if (single) 8.5 else 3 * n_col + if (nb > 0) 2.5 else 0
+    h <- if (single) 5 else 3 * n_row + 0.6
+    if (isTRUE(params$save_plots))
+      ggsave(here("plots", paste0("41_", set_tag, "_3d_", feat_tag, "_", type, params$out_tag,
+                                  if (nm == "combined") "_with_difference" else "", ".pdf")),
+             pl[[nm]], width = w, height = h)
+  }
+}
+```

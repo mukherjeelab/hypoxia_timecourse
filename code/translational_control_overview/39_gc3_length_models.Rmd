@@ -1,0 +1,176 @@
+---
+title: "`r sprintf('Linear models of TE change (sictrl vs si3d) on GC3, CDS and 5%sUTR length: %s', intToUtf8(39), params$label)`"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  de_file: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  label: "MDA-MB-231 si3d hypoxia 1hr"
+  tag: "hypoxia_1hr"
+  te_word: "hypoxia 1hr"
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "39_gc3_length_models.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-28: linear models of **log2 TE change, sictrl vs si3d** (`te_lfc` =
+log2(sictrl / si3d), positive = eIF3d promotes) on three predictors only: **GC3**
+(`gc3_internal`, %), **log2 CDS length** and **log2 5'UTR length** (log2(nt + 1)). Same model
+set as `37_utr_cds_length_models.Rmd`, with GC3 in place of 3'UTR length: each predictor alone,
+each pair additive, all three additive, all three multiplicative (all interactions).
+
+Run once per TE contrast with `39_render_contrasts.R`:
+
+- **hypoxia 1hr**: `output/translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv`
+- **normoxia 1+4hr, time-regressed**: `output/translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv`,
+  from `code/eif3e_eif3d_normoxia_and_hypoxia.Rmd` (`deFunction_time_normalized`, normoxia,
+  `hours %in% c(1, 4)` as a factor covariate, control = si3d, test = sictrl).
+
+This run: **`r params$label`**, TE from `output/`r params$de_file``.
+
+Genes: the modelled gene set (the SHAP explain set, 10,172), so the two contrasts are fitted on
+the same genes and only the outcome differs. Predictors are **z-scored** (mean 0, sd 1) so the
+three coefficients are on one scale (change in log2 TE change per SD) and main effects in the
+multiplicative model are slopes at an average gene. R² does not depend on the scaling.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here); library(patchwork) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+```
+
+# 1. Data and checks
+
+```{r data}
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+kd <- de$rna_lfc[de$symbol == "EIF3D"]
+stopifnot("EIF3D not found once" = length(kd) == 1,
+          "EIF3D rna_lfc not strongly positive: direction flipped or wrong knockdown" = kd > 1,
+          "duplicate genes in the DE file" = !anyDuplicated(de$gene_id_clean))
+cat(sprintf("TE source: output/%s\nEIF3D rna_lfc %+.2f -> log2(sictrl / si3d) confirmed\n", params$de_file, kd))
+
+genes <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))$genes$gene_id_clean
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "modelled genes missing from the DE file" = all(genes %in% de$gene_id_clean))
+num <- function(col) as.numeric(unlist(fm[[col]][match(genes, fm$gene_id_clean)]))
+d <- tibble(gene_id_clean = genes, te_lfc = de$te_lfc[match(genes, de$gene_id_clean)],
+            gc3 = num("gc3_internal"), cds = num("log2_cds_length"), utr5 = num("log2_utr5_length")) %>%
+  filter(!is.na(te_lfc), !is.na(gc3), !is.na(cds), !is.na(utr5)) %>% arrange(gene_id_clean)   # fixed order for CV folds
+stopifnot("log fold changes not finite" = all(is.finite(d$te_lfc)),
+          "GC3 outside [0, 100]" = all(d$gc3 >= 0 & d$gc3 <= 100),
+          "GC3 median outside 40-65%" = between(median(d$gc3), 40, 65),
+          "lengths out of range" = all(d$cds > 0) && all(d$utr5 >= 0))
+sds <- sapply(d[, c("gc3", "cds", "utr5")], sd)
+cat(sprintf("genes %s of %s modelled; median te_lfc %.3f\nSD used for scaling: GC3 %.1f points, log2 CDS length %.2f, log2 5'UTR length %.2f\n",
+            scales::comma(nrow(d)), scales::comma(length(genes)), median(d$te_lfc), sds["gc3"], sds["cds"], sds["utr5"]))
+knitr::kable(round(cor(d[, c("gc3", "cds", "utr5")], method = "spearman"), 3), caption = "Spearman rho between the predictors")
+```
+
+# 2. The models
+
+```{r fit}
+dz <- d %>% mutate(across(c(gc3, cds, utr5), ~ (.x - mean(.x)) / sd(.x)))
+forms <- c("GC3 alone" = "gc3", "CDS alone" = "cds", "5'UTR alone" = "utr5",
+           "GC3 + CDS" = "gc3 + cds", "GC3 + 5'UTR" = "gc3 + utr5", "CDS + 5'UTR" = "cds + utr5",
+           "GC3 + CDS + 5'UTR" = "gc3 + cds + utr5",
+           "GC3 x CDS x 5'UTR" = "gc3 * cds * utr5")
+set.seed(9); fold <- sample(rep(1:10, length.out = nrow(dz)))
+fit_one <- function(rhs) {
+  f <- as.formula(paste("te_lfc ~", rhs)); m <- lm(f, data = dz)
+  cv <- numeric(nrow(dz))
+  for (k in 1:10) cv[fold == k] <- predict(lm(f, data = dz[fold != k, ]), dz[fold == k, ])
+  list(m = m, row = tibble(n_terms = length(coef(m)) - 1, adj_r2 = summary(m)$adj.r.squared,
+                           cv_r2 = 1 - sum((dz$te_lfc - cv)^2) / sum((dz$te_lfc - mean(dz$te_lfc))^2)))
+}
+fits <- map(forms, fit_one)
+tab <- imap_dfr(fits, ~ .x$row %>% mutate(model = .y, .before = 1))
+stopifnot("single-predictor R2 must equal r^2" =
+            abs(summary(fits[["GC3 alone"]]$m)$r.squared - cor(dz$gc3, dz$te_lfc)^2) < 1e-10)
+knitr::kable(tab, digits = c(0, 0, 4, 4),
+             caption = sprintf("%s: log2 TE change (sictrl vs si3d), n = %s genes", params$label, scales::comma(nrow(dz))))
+```
+
+## Does each predictor add to the other two? (nested F tests)
+
+```{r nested}
+nest <- tribble(~smaller, ~larger, ~adds,
+  "CDS + 5'UTR", "GC3 + CDS + 5'UTR", "GC3",
+  "GC3 + 5'UTR", "GC3 + CDS + 5'UTR", "CDS",
+  "GC3 + CDS", "GC3 + CDS + 5'UTR", "5'UTR",
+  "GC3 + CDS + 5'UTR", "GC3 x CDS x 5'UTR", "the four interaction terms") %>%
+  mutate(adj_r2_gain = map2_dbl(smaller, larger, ~ tab$adj_r2[tab$model == .y] - tab$adj_r2[tab$model == .x]),
+         cv_r2_gain = map2_dbl(smaller, larger, ~ tab$cv_r2[tab$model == .y] - tab$cv_r2[tab$model == .x]),
+         F_p = map2_dbl(smaller, larger, ~ anova(fits[[.x]]$m, fits[[.y]]$m)$`Pr(>F)`[2]))
+knitr::kable(nest, digits = c(0, 0, 0, 4, 4, 300))
+```
+
+## Coefficients
+
+Change in log2 TE change (sictrl vs si3d) per SD of each predictor, 95% CI.
+
+```{r coefs}
+term_lab <- c(gc3 = "GC3", cds = "CDS", utr5 = "5'UTR")
+coefs <- imap_dfr(fits, function(f, nm) {
+  s <- summary(f$m)$coefficients; ci <- confint(f$m)
+  tibble(model = nm, term = rownames(s), estimate = s[, 1], lo = ci[, 1], hi = ci[, 2], p = s[, 4])
+}) %>% filter(term != "(Intercept)") %>%
+  mutate(term = str_replace_all(term, c(gc3 = "GC3", cds = "CDS", utr5 = "5'UTR", ":" = " x ")))
+knitr::kable(coefs %>% filter(model %in% c("GC3 + CDS + 5'UTR", "GC3 x CDS x 5'UTR")), digits = c(0, 0, 4, 4, 4, 300))
+if (SAVE) {
+  write_csv(tab, file.path(O, sprintf("gc3_length_models_fit_%s.csv", params$tag)))
+  write_csv(coefs, file.path(O, sprintf("gc3_length_models_coefficients_%s.csv", params$tag)))
+}
+```
+
+## Figure: fit and coefficients
+
+```{r fig_models, fig.width = 13, fig.height = 5.5}
+tl <- tab %>% mutate(model = factor(model, levels = rev(names(forms))))
+p_r2 <- ggplot(tl, aes(y = model)) +
+  geom_col(aes(x = adj_r2), fill = "grey75", width = 0.6) +
+  geom_point(aes(x = cv_r2), colour = "black", size = 2) +
+  labs(x = "adjusted R² (bar); 10-fold CV R² (point)", y = NULL, title = "fit: log2 TE change, sictrl vs si3d") +
+  theme_classic(base_size = 12)
+betas <- coefs %>% filter(term %in% term_lab) %>%
+  mutate(term = factor(term, levels = term_lab), model = factor(model, levels = levels(tl$model)))
+p_beta <- ggplot(betas, aes(estimate, model, colour = term)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.6), size = 0.3) +
+  scale_colour_manual(values = c(GC3 = "#CC79A7", CDS = "#0072B2", `5'UTR` = "#009E73"), name = NULL) +
+  scale_y_discrete(drop = FALSE) +
+  labs(x = "coefficient: change in log2 TE change per SD (95% CI)", y = NULL, title = "linear coefficients") +
+  theme_classic(base_size = 12) + theme(axis.text.y = element_blank())
+p_mod <- p_r2 + p_beta + plot_annotation(
+  title = sprintf("%s: TE change (sictrl vs si3d) explained by GC3, CDS length and 5'UTR length", params$label),
+  subtitle = sprintf("TE from %s; GC3, log2 CDS length, log2 5'UTR length, z-scored; n = %s genes",
+                     params$te_word, scales::comma(nrow(dz))))
+p_mod
+if (SAVE) ggsave(here("plots", sprintf("39_gc3_length_models_fit_%s.pdf", params$tag)), p_mod, width = 13, height = 5.5)
+```
+
+```{r session}
+sessionInfo()
+```

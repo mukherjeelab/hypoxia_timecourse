@@ -1,0 +1,193 @@
+---
+title: "GC3 and mRNA region lengths vs eIF3d TE change in NORMOXIA (si3d, 1+4hr time-regressed)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  de_file: "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"
+  suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg_intrinsic_corrected_both_clipaggregate_yraw"
+  matrix_rds: "feature_matrix_tco.rds"
+  label: "MDA-MB-231 si3d normoxia 1+4hr (time-regressed)"
+  lfc: 0.5
+  padj: 0.05
+  n_bins_fine: 10
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(
+    here::here("code", "translational_control_overview", "38_normoxia_gc3_length_te.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this notebook does
+
+Kate, 2026-10-28: the GC3 / length scatters and target-fraction grids from
+`37_utr_cds_length_models.Rmd` (sections 3 and 5), redrawn with **normoxia** TE change in place
+of hypoxia 1hr. Nothing else changes: same genes, same features, same plots.
+
+**TE source (normoxia).** `output/translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv`,
+written by `code/eif3e_eif3d_normoxia_and_hypoxia.Rmd` (section "1+4hr (time-regressed)"):
+
+- samples: normoxia, sictrl and si3d, `hours %in% c(1, 4)`, with `hours` as a factor;
+- `deFunction_time_normalized(..., control_condition = "si3d", test_condition = "sictrl", mode = "TE")`,
+  design `~ hours + Condition + SeqType + Condition:SeqType`, spike-in size factors;
+- so `te_lfc` is **log2(sictrl / si3d)** with the 1hr vs 4hr difference regressed out as a
+  covariate. Positive = eIF3d promotes. (The filename says si3d_vs_sictrl; the coefficient is
+  sictrl_vs_si3d, checked below on EIF3D's own `rna_lfc`.)
+
+**Genes.** The same modelled genes as the hypoxia notebook (the SHAP explain set, 10,172), so
+only the TE outcome differs between the two notebooks.
+
+**Targets (normoxia).** `te_lfc > 0.5` and `te_padj < 0.05` in this file. There are far fewer
+than in hypoxia 1hr, so the grids have only a few targets per cell and are noisier.
+
+**Features.** From `feature_matrix_tco.rds`: `log2_utr5_length`, `log2_cds_length` (log2(nt + 1))
+and `gc3_internal` (GC at the third codon position, initiator and stop removed).
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+SAVE <- isTRUE(params$save_plots)
+nb <- params$n_bins_fine
+te_lab <- "log2 TE change, normoxia 1+4hr (sictrl / si3d)"
+```
+
+# 1. Data and checks
+
+```{r data}
+de <- read_csv(here("output", params$de_file), show_col_types = FALSE) %>% mutate(gene_id_clean = sub("[.].*", "", gene_id))
+kd <- de$rna_lfc[de$symbol == "EIF3D"]
+stopifnot("EIF3D not found once" = length(kd) == 1,
+          "EIF3D rna_lfc not strongly positive: direction flipped or wrong knockdown" = kd > 1,
+          "duplicate genes in the DE file" = !anyDuplicated(de$gene_id_clean))
+cat(sprintf("TE source: output/%s\nEIF3D rna_lfc %+.2f, te_lfc %+.2f -> log2(sictrl / si3d) confirmed\n",
+            params$de_file, kd, de$te_lfc[de$symbol == "EIF3D"]))
+
+genes <- readRDS(file.path(O, paste0("shap_oof_", params$suffix, ".rds")))$genes$gene_id_clean
+fm <- readRDS(file.path(O, params$matrix_rds))
+stopifnot("matrix has duplicate genes" = !anyDuplicated(fm$gene_id_clean),
+          "modelled genes missing from the normoxia DE file" = all(genes %in% de$gene_id_clean))
+num <- function(col) as.numeric(unlist(fm[[col]][match(genes, fm$gene_id_clean)]))
+d0 <- tibble(gene_id_clean = genes,
+             te_lfc = de$te_lfc[match(genes, de$gene_id_clean)],
+             te_padj = de$te_padj[match(genes, de$gene_id_clean)],
+             utr5 = num("log2_utr5_length"), cds = num("log2_cds_length"), gc3 = num("gc3_internal")) %>%
+  mutate(target = !is.na(te_padj) & te_lfc > params$lfc & te_padj < params$padj)
+stopifnot("normoxia te_lfc missing for a modelled gene" = !anyNA(d0$te_lfc),
+          "log fold changes not finite" = all(is.finite(d0$te_lfc)),
+          "GC3 outside [0, 100]" = all(d0$gc3 >= 0 & d0$gc3 <= 100, na.rm = TRUE),
+          "GC3 median outside 40-65%" = between(median(d0$gc3, na.rm = TRUE), 40, 65),
+          "lengths out of range" = all(d0$cds > 0, na.rm = TRUE) && all(d0$utr5 >= 0, na.rm = TRUE))
+d <- d0 %>% filter(!is.na(utr5), !is.na(cds), !is.na(gc3))
+cat(sprintf("modelled genes %s; with 5'UTR, CDS and GC3 %s; normoxia targets %d (%.1f%%); median te_lfc %.3f\n",
+            scales::comma(nrow(d0)), scales::comma(nrow(d)), sum(d$target), 100 * mean(d$target), median(d$te_lfc)))
+```
+
+# 2. Scatters against normoxia TE change
+
+All modelled genes in grey; black line = least-squares linear fit with 95% CI; Spearman rho and n
+on each plot. The y axis is zoomed to the central 99.8% of genes; the off-scale genes stay in the
+fit and in rho. Ratios and the product are taken on the log2 scale (log2 GC3 -/+ log2 length),
+as in `37_`.
+
+```{r te_scatters, fig.width = 7, fig.height = 6, results = "asis"}
+ds <- d %>% mutate(ratio = log2(gc3) - utr5, ratio_cds = log2(gc3) - cds, prod_cds = log2(gc3) + cds)
+stopifnot("GC3 of 0 makes a ratio infinite" = all(is.finite(ds$ratio)))
+xs <- list(gc3       = list(lab = "GC3 (%)", file = "gc3"),
+           utr5      = list(lab = "log2 5'UTR length", file = "utr5_length"),
+           ratio     = list(lab = "log2(GC3 / 5'UTR length)", file = "gc3_over_utr5_length"),
+           cds       = list(lab = "log2 CDS length", file = "cds_length"),
+           ratio_cds = list(lab = "log2(GC3 / CDS length)", file = "gc3_over_cds_length"),
+           prod_cds  = list(lab = "log2(GC3 x CDS length)", file = "gc3_times_cds_length"))
+ylim <- quantile(ds$te_lfc, c(0.001, 0.999))
+n_off <- sum(ds$te_lfc < ylim[1] | ds$te_lfc > ylim[2])
+stats <- list()
+for (v in names(xs)) {
+  rho <- cor(ds[[v]], ds$te_lfc, method = "spearman")
+  fit <- summary(lm(ds$te_lfc ~ ds[[v]]))
+  stats[[v]] <- tibble(x = xs[[v]]$lab, spearman_rho = rho, slope = coef(fit)[2, 1], adj_r2 = fit$adj.r.squared, n = nrow(ds))
+  p <- ggplot(ds, aes(.data[[v]], te_lfc)) +
+    geom_point(colour = "grey70", size = 0.5, alpha = 0.4) +
+    geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "black", linewidth = 0.8, se = TRUE) +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.4, size = 3.6,
+             label = sprintf("Spearman rho = %.3f\nn = %s genes", rho, scales::comma(nrow(ds)))) +
+    labs(x = xs[[v]]$lab, y = te_lab, title = params$label,
+         subtitle = "TE from normoxia; all modelled genes; line = linear fit (95% CI)") +
+    coord_cartesian(ylim = ylim) +
+    theme_classic(base_size = 12)
+  cat("\n\n## ", xs[[v]]$lab, "\n\n", sep = ""); print(p)
+  if (SAVE) ggsave(here("plots", sprintf("38_normoxia_te_change_vs_%s_1and4hr.pdf", xs[[v]]$file)), p, width = 7, height = 6)
+}
+cat(sprintf("\n\ny zoomed, %d genes off-scale (still in the fit)\n\n", n_off))
+knitr::kable(bind_rows(stats), digits = 4, caption = "normoxia 1+4hr TE change: each x alone")
+```
+
+# 3. Target-fraction grids (deciles)
+
+Each grid twice: the observed fraction of normoxia targets per cell, and the **mean normoxia log2
+TE change** per cell (all genes in the cell, not just targets; white = lowest cell, Okabe-Ito bluish green = highest; hypoxia uses vermillion). The
+mean uses every gene, so it is much less noisy than the target fraction here. Observed fraction of normoxia targets per cell; bins are deciles of all modelled genes with all
+three values. With few normoxia targets each cell holds only a handful, so read the gradient
+across cells rather than any single cell.
+
+```{r grids, fig.width = 11, fig.height = 9, results = "asis"}
+q_lab <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%s-%s", scales::comma(round(2^head(br, -1) - 1)), scales::comma(round(2^br[-1] - 1))))
+}
+q_lab_pct <- function(x, n) {
+  br <- unique(quantile(x, seq(0, 1, length.out = n + 1)))
+  cut(x, br, include.lowest = TRUE, labels = sprintf("%.1f-%.1f", head(br, -1), br[-1]))
+}
+grids <- list(
+  list(x = "cds",  y = "utr5", xl = "CDS length (nt)",   yl = "5'UTR length (nt)", yb = q_lab,     file = "utr5_vs_cds",  t = "5'UTR length and CDS length"),
+  list(x = "cds",  y = "gc3",  xl = "CDS length (nt)",   yl = "GC3 (%)",           yb = q_lab_pct, file = "gc3_vs_cds",   t = "GC3 and CDS length"),
+  list(x = "utr5", y = "gc3",  xl = "5'UTR length (nt)", yl = "GC3 (%)",           yb = q_lab_pct, file = "gc3_vs_utr5",  t = "GC3 and 5'UTR length"))
+for (g in grids) {
+  gg <- d %>% mutate(bx = q_lab(.data[[g$x]], nb), by = g$yb(.data[[g$y]], nb)) %>%
+    group_by(bx, by) %>% summarise(n = n(), frac = mean(target), lfc = mean(te_lfc), .groups = "drop")
+  stopifnot("cells do not add up to the genes" = sum(gg$n) == nrow(d),
+            "decile bins collapsed" = n_distinct(gg$bx) == nb && n_distinct(gg$by) == nb)
+  p <- ggplot(gg, aes(bx, by, fill = 100 * frac)) + geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%.0f%%\nn = %d", 100 * frac, n)), size = 2.6) +
+    scale_fill_gradient(low = "white", high = "#E69F00", name = "targets (%)") +
+    labs(x = paste0(g$xl, ", decile bins"), y = paste0(g$yl, ", decile bins"),
+         title = sprintf("%s: normoxia eIF3d targets by %s", params$label, g$t),
+         subtitle = sprintf("TE from normoxia 1+4hr; observed fraction of targets per cell; n = %s genes, %d targets, %.1f%% overall",
+                            scales::comma(nrow(d)), sum(d$target), 100 * mean(d$target))) +
+    theme_classic(base_size = 12) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  cat("\n\n## ", g$t, "\n\n", sep = ""); print(p)
+  if (SAVE) ggsave(here("plots", sprintf("38_normoxia_target_fraction_grid_%s_%dbins_1and4hr.pdf", g$file, nb)), p, width = 11, height = 9)
+  # same cells coloured by mean normoxia TE change (Kate, 2026-10-28)
+  p2 <- ggplot(gg, aes(bx, by, fill = lfc)) + geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%+.2f\nn = %d", lfc, n)), size = 2.6) +
+    scale_fill_gradient(low = "white", high = "#009E73", name = "mean log2 TE\nsictrl vs si3d") +
+    labs(x = paste0(g$xl, ", decile bins"), y = paste0(g$yl, ", decile bins"),
+         title = sprintf("%s: mean TE change by %s", params$label, g$t),
+         subtitle = sprintf("TE from normoxia 1+4hr; mean log2(sictrl / si3d) per cell; n = %s genes, overall mean %+.3f",
+                            scales::comma(nrow(d)), mean(d$te_lfc))) +
+    theme_classic(base_size = 12) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  cat("\n\n## ", g$t, ": mean TE change\n\n", sep = ""); print(p2)
+  if (SAVE) ggsave(here("plots", sprintf("38_normoxia_mean_lfc_grid_%s_%dbins_1and4hr.pdf", g$file, nb)), p2, width = 11, height = 9)
+}
+```
+
+```{r session}
+sessionInfo()
+```
