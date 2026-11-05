@@ -1,0 +1,341 @@
+---
+title: "m6A sites (HEK293T, Mukhopadhyay 2023) in eIF3d-promoted mRNAs"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  contrasts: "hypoxia_1hr,hypoxia_4hr,hypoxia_24hr,normoxia_1and4hr"  # one row of panels each
+  lfc_min: 0.5           # target set: te_lfc > lfc_min and te_padj < padj_max (the gene-set definition)
+  padj_max: 0.05
+  site_set: "all"        # "all" = every site in Table S3; "regulated" = the paper's ISR/eIF3d-regulated sites (Fig. 4C)
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "48_m6a_sites_eif3d_targets.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Plan
+
+Do eIF3d-promoted mRNAs carry more m6A sites than other expressed mRNAs, in the 5'UTR, the
+CDS or the 3'UTR? Answered with cumulative distribution (CDF) plots and no model.
+
+**Data.** Mukhopadhyay, Amodeo & Lee 2023, *Mol Cell* 83:3303 ("eIF3d controls the persistent
+integrated stress response"), Table S3 = `accessories/NIHMS1925721-supplement-4_ISR.xlsx`.
+m6A-eCLIP in **HEK293T**, not MDA-MB-231: the paper has no 231 data. 6,589 sites, one row per
+site, with the paper's region call (`5utr` / `cds` / `3utr` / `ncRNA`) and the methylation level
+at that site (reads at the site per million mapped reads) in three lines: untreated WT eIF3d,
+WT + thapsigargin (Tg, chronic ER stress) and phosphomimetic ("DD") eIF3d + Tg.
+
+**Decisions**
+
+- **Why no model.** Only ~15% of the feature matrix's genes appear in Table S3, and the
+  regression drops any feature more than half missing, so the features would never have entered
+  the forest. Distributions over the genes that *are* in the table answer the question directly.
+- **Missing vs zero.** A gene in Table S3 gets a count in every region, 0 where it has no site
+  there. A gene not in Table S3 is **NA**, not 0: absence can mean "not expressed in HEK293T",
+  which says nothing about methylation. So every CDF is drawn over genes in the table only.
+  Whether targets are *in* the table at all is reported separately (section 4), because that
+  mostly measures HEK expression.
+- **Sites map to genes, not to our transcripts.** The column Table S3 calls `ensembl_gene_id`
+  holds versioned **transcript** IDs. They are mapped to genes through GENCODE v49, with gene
+  symbol as a fallback for IDs v49 no longer carries. HEK isoforms are not our 231 isoforms,
+  so the paper's own region call is kept rather than re-assigned onto our transcripts.
+- **ncRNA sites are excluded from the counts** (they include 773 mitochondrial sites), but a gene
+  whose only sites are ncRNA is still *in the table*, so it gets 0 in all three regions.
+- **Counts and density.** Raw counts rise with region length, and CDS length is the strongest
+  single feature separating eIF3d targets, so a count difference could be length alone. Each
+  region is therefore also shown as **sites per kb** of that region. The length is that of the
+  paper's transcript (GENCODE v49), taking the gene's transcript with the most sites.
+- **Target set** = te_lfc > `r params$lfc_min` and te_padj < `r params$padj_max` in each contrast,
+  computed from the `translation_categories_*` file rather than a gene-set CSV, because no CSV
+  exists for normoxia 1+4hr. For hypoxia 1hr this is asserted to reproduce
+  `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`. MDA-MB-231 normoxia is the 1+4hr time-regressed
+  contrast, never plain 1hr.
+- **Comparator** = every other gene DESeq2 tested in that contrast (non-NA te_padj): a typical
+  expressed mRNA, not the screened negative-control set (which is selected for having no effect).
+- **This render:** site set = `r params$site_set`.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse); library(here); library(GenomicFeatures); library(AnnotationDbi)
+})
+O <- here("output", "translational_control_overview")
+dir.create(here("plots"), showWarnings = FALSE)
+kd_colors <- c("si3d" = "#E69F00")
+stopifnot("site_set must be all or regulated" = params$site_set %in% c("all", "regulated"))
+```
+
+# 1. Load Table S3 and reproduce the paper
+
+```{r load_sites}
+s3 <- readxl::read_excel(here("accessories", "NIHMS1925721-supplement-4_ISR.xlsx"))
+expected_cols <- c("chr", "m6A_site", "ensembl_gene_id", "hgnc_symbol", "strand", "location",
+                   "WT_eIF3d (avg TPM)", "WT_TG_eIF3d (avg TPM)", "DD_TG_eIF3d (avg TPM)")
+stopifnot("Table S3 columns changed" = identical(names(s3), expected_cols))
+sites <- s3 %>%
+  dplyr::rename(tx_versioned = ensembl_gene_id, symbol_s3 = hgnc_symbol,
+                wt = `WT_eIF3d (avg TPM)`, wt_tg = `WT_TG_eIF3d (avg TPM)`,
+                dd_tg = `DD_TG_eIF3d (avg TPM)`) %>%
+  mutate(tx = sub("\\..*", "", tx_versioned))
+
+# Range checks: methylation levels are non-negative and finite; regions are the four the paper uses.
+stopifnot(
+  "paper reports 6,590 sites; S3 should hold 6,589-6,590 rows" = between(nrow(sites), 6589, 6590),
+  "methylation level negative or non-finite" =
+    all(is.finite(c(sites$wt, sites$wt_tg, sites$dd_tg)) & c(sites$wt, sites$wt_tg, sites$dd_tg) >= 0),
+  "unexpected region label" = all(sites$location %in% c("5utr", "cds", "3utr", "ncRNA")),
+  "ID column is not transcript IDs" = all(str_starts(sites$tx, "ENST"))
+)
+
+# The paper's ISR/eIF3d-regulated site (Fig. 4C legend): >= 1.5-fold more methylation in BOTH
+# untreated WT and Tg-treated DD than in Tg-treated WT. A tiny pseudocount keeps sites that are
+# 0 in WT+Tg (fully demethylated) in the regulated set instead of dividing by zero.
+pc <- 0.01
+sites <- sites %>%
+  mutate(regulated = (wt + pc) / (wt_tg + pc) >= 1.5 & (dd_tg + pc) / (wt_tg + pc) >= 1.5)
+```
+
+Two published results this table must reproduce before anything is joined to it.
+
+```{r reproduce_paper}
+# Fig. 4C: regulated sites are "strikingly enriched" in the 5'UTR relative to unregulated ones.
+utr5_share <- sites %>% filter(location != "ncRNA") %>%
+  group_by(regulated) %>% summarise(n = n(), utr5_share = mean(location == "5utr"))
+print(utr5_share)
+sh_reg   <- utr5_share$utr5_share[utr5_share$regulated]
+sh_unreg <- utr5_share$utr5_share[!utr5_share$regulated]
+cat(sprintf("5'UTR share of mRNA sites: regulated %.1f%% vs unregulated %.1f%% (%.1f-fold)\n",
+            100 * sh_reg, 100 * sh_unreg, sh_reg / sh_unreg))
+stopifnot("Fig. 4C 5'UTR enrichment of regulated sites not reproduced" = sh_reg / sh_unreg > 2)
+
+# Text + Fig. 4F: "three m6A sites in ATF4, including one in the 5' UTR ... that undergoes
+# ISR/eIF3d-dependent demethylation".
+atf4 <- sites %>% filter(symbol_s3 == "ATF4")
+print(atf4 %>% dplyr::select(location, wt, wt_tg, dd_tg, regulated))
+stopifnot(
+  "ATF4 should carry three sites" = nrow(atf4) == 3,
+  "ATF4's 5'UTR site should be the regulated one" =
+    identical(atf4$regulated[atf4$location == "5utr"], TRUE) && !any(atf4$regulated[atf4$location != "5utr"])
+)
+```
+
+**Not reproduced, and recorded rather than forced:** the text gives 5,061 / 3,001 / 1,575 sites
+in DD + Tg / untreated WT / WT + Tg. No cutoff on these columns returns those numbers (level
+> 0 gives 6,515 / 6,150 / 5,679), so the per-condition site calls are not recoverable from
+Table S3. GEO GSE236188 deposits per-condition site files (`GSE236188_*_m6A_sites.txt.gz`) that
+probably hold them. This notebook only uses which sites exist and where, so it does not depend
+on that call.
+
+# 2. Map sites to genes
+
+```{r map_genes}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+txlen <- transcriptLengths(txdb, with.cds_len = TRUE, with.utr5_len = TRUE, with.utr3_len = TRUE) %>%
+  as_tibble() %>%
+  transmute(tx = sub("\\..*", "", tx_name), gene_id_clean = sub("\\..*", "", gene_id),
+            utr5_len, cds_len, utr3_len)
+stopifnot("txdb transcript IDs not unique" = !any(duplicated(txlen$tx)))
+
+# Fallback: symbol -> gene, only for symbols that name exactly one gene in the v49 annotation.
+anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                 col_names = c("gene_id", "symbol", "biotype", "species", "release"),
+                 show_col_types = FALSE) %>%
+  filter(species == "human") %>% distinct(gene_id, symbol) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  group_by(symbol) %>% filter(n_distinct(gene_id_clean) == 1) %>% ungroup() %>%
+  distinct(symbol, gene_id_clean)
+
+sites <- sites %>%
+  left_join(txlen, by = "tx") %>%
+  mutate(map = if_else(is.na(gene_id_clean), "symbol", "transcript"),
+         gene_id_clean = coalesce(gene_id_clean, anno$gene_id_clean[match(symbol_s3, anno$symbol)]))
+print(dplyr::count(sites, map, mapped = !is.na(gene_id_clean)))
+stopifnot("more than 2% of sites unmapped" = mean(is.na(sites$gene_id_clean)) < 0.02)
+sites <- sites %>% filter(!is.na(gene_id_clean))
+
+# Restrict to the chosen site set AFTER deciding which genes are in the table: a gene with only
+# unregulated sites is still in the table (count 0 regulated), not missing.
+genes_in_table <- unique(sites$gene_id_clean)
+counted <- sites %>% filter(location != "ncRNA", params$site_set == "all" | regulated)
+
+# Per gene and region: number of sites, and that region's length on the gene's most-sited
+# transcript (sites mapped by symbol carry no length and do not choose it).
+rep_tx <- sites %>% filter(!is.na(cds_len) | !is.na(utr5_len)) %>%
+  dplyr::count(gene_id_clean, tx, utr5_len, cds_len, utr3_len, name = "n_sites") %>%
+  arrange(gene_id_clean, desc(n_sites), tx) %>% distinct(gene_id_clean, .keep_all = TRUE)
+
+region_labs <- c(utr5 = "5'UTR", cds = "CDS", utr3 = "3'UTR")
+m6a <- expand_grid(gene_id_clean = genes_in_table, region = names(region_labs)) %>%
+  left_join(counted %>% mutate(region = recode(location, `5utr` = "utr5", `3utr` = "utr3")) %>%
+              dplyr::count(gene_id_clean, region, name = "n_sites"),
+            by = c("gene_id_clean", "region")) %>%
+  mutate(n_sites = replace_na(n_sites, 0L)) %>%
+  left_join(rep_tx %>% dplyr::select(gene_id_clean, utr5 = utr5_len, cds = cds_len, utr3 = utr3_len) %>%
+              pivot_longer(-gene_id_clean, names_to = "region", values_to = "region_len"),
+            by = c("gene_id_clean", "region")) %>%
+  mutate(sites_per_kb = if_else(!is.na(region_len) & region_len > 0, n_sites / (region_len / 1000), NA_real_))
+
+stopifnot(
+  "site counts must be non-negative integers" = all(m6a$n_sites >= 0 & m6a$n_sites == round(m6a$n_sites)),
+  "density must be finite and non-negative" = all(is.finite(m6a$sites_per_kb[!is.na(m6a$sites_per_kb)]) &
+                                                    m6a$sites_per_kb[!is.na(m6a$sites_per_kb)] >= 0),
+  "one row per gene x region" = !any(duplicated(m6a[, c("gene_id_clean", "region")])),
+  "counted sites lost in aggregation" = sum(m6a$n_sites) == nrow(counted)
+)
+cat(length(genes_in_table), "genes in Table S3;", nrow(counted), "counted", params$site_set, "mRNA-region sites\n")
+m6a %>% group_by(region) %>%
+  summarise(genes_with_site = sum(n_sites > 0), sites = sum(n_sites),
+            median_len = median(region_len, na.rm = TRUE)) %>% print()
+```
+
+# 3. Target sets per contrast
+
+```{r targets}
+contrasts <- str_trim(str_split(params$contrasts, ",")[[1]])
+lfc_min <- as.numeric(params$lfc_min); padj_max <- as.numeric(params$padj_max)
+
+groups <- map_dfr(contrasts, function(ct) {
+  f <- here("output", paste0("translation_categories_si3d_vs_sictrl_", ct, ".csv"))
+  stopifnot("translation_categories file missing" = file.exists(f))
+  tc <- read_csv(f, show_col_types = FALSE) %>% mutate(gene_id_clean = sub("\\..*", "", gene_id))
+  # Direction: the columns are log2(sictrl / si3d) despite the filename, so the siRNA's own
+  # target must have strongly POSITIVE rna_lfc. A negative value means the direction flipped.
+  eif3d_rna <- tc$rna_lfc[tc$symbol == "EIF3D"]
+  stopifnot("EIF3D rna_lfc should be strongly positive (knockdown)" = length(eif3d_rna) == 1 && eif3d_rna > 1)
+  stopifnot("gene appears twice in a contrast" = !any(duplicated(tc$gene_id_clean)))
+  tc %>% filter(!is.na(te_padj)) %>%
+    transmute(contrast = ct, gene_id_clean, symbol,
+              group = if_else(te_lfc > lfc_min & te_padj < padj_max, "target", "rest"))
+})
+
+# The inline definition must reproduce the committed gene set where one exists.
+if ("hypoxia_1hr" %in% contrasts && lfc_min == 0.5 && padj_max == 0.05) {
+  gs <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"), show_col_types = FALSE)
+  ours <- groups %>% filter(contrast == "hypoxia_1hr", group == "target") %>% pull(gene_id_clean)
+  stopifnot("inline target set does not reproduce hypoxia_3d_promotes_TE_1hr_lfc0.5.csv" =
+              setequal(ours, gs$ensembl_gene))
+  cat("hypoxia 1hr target set reproduces the gene-set CSV (", length(ours), "genes )\n")
+}
+dplyr::count(groups, contrast, group) %>% pivot_wider(names_from = group, values_from = n) %>% print()
+```
+
+# 4. Are targets in the table at all?
+
+This is **not** an m6A result. A gene is in Table S3 only if it was expressed enough in HEK293T
+to call a site, so this row mostly measures HEK expression. It is shown so the CDFs below can be
+read knowing which fraction of each group they describe.
+
+```{r presence}
+presence <- groups %>% mutate(in_table = gene_id_clean %in% genes_in_table) %>%
+  group_by(contrast) %>%
+  group_modify(function(d, k) {
+    tab <- table(factor(d$group, c("target", "rest")), factor(d$in_table, c(TRUE, FALSE)))
+    ft <- fisher.test(tab)
+    tibble(n_target = sum(tab["target", ]), target_in_table = tab["target", "TRUE"] / sum(tab["target", ]),
+           n_rest = sum(tab["rest", ]), rest_in_table = tab["rest", "TRUE"] / sum(tab["rest", ]),
+           odds_ratio = unname(ft$estimate), p = ft$p.value)
+  }) %>% ungroup()
+knitr::kable(presence, digits = 3)
+```
+
+# 5. CDFs: sites per region, targets vs other expressed mRNAs
+
+Genes in Table S3 only. Each panel prints its n and a two-sided Wilcoxon p. Because most genes
+have 0 or 1 site in a region, the readable number is also the **fraction with at least one site**,
+tested with Fisher's exact test, in the table after the plots.
+
+```{r plot_data}
+pd <- groups %>% inner_join(m6a, by = "gene_id_clean", relationship = "many-to-many") %>%
+  mutate(region = factor(region_labs[region], levels = region_labs),
+         contrast = factor(contrast, levels = contrasts),
+         group = factor(group, levels = c("target", "rest")))
+stopifnot("every grouped gene in the table should have three regions" =
+            all(dplyr::count(pd, contrast, gene_id_clean)$n == 3))
+
+group_cols <- c(target = kd_colors[["si3d"]], rest = "grey70")
+group_labs <- c(target = "eIF3d promoted (si3d)", rest = "Other expressed mRNAs")
+
+squish_for_plot <- function(d, value_col) {
+  lims <- d %>% group_by(region) %>% summarise(hi = quantile(.data[[value_col]], 0.99, na.rm = TRUE), .groups = "drop")
+  d %>% left_join(lims, by = "region") %>% mutate(plot_x = pmin(.data[[value_col]], hi))
+}
+ecdf_panel <- function(value_col, xlab, tag) {
+  d <- pd %>% filter(!is.na(.data[[value_col]]))
+  stats <- d %>% group_by(contrast, region) %>%
+    summarise(n_t = sum(group == "target"), n_r = sum(group == "rest"),
+              p = if (n_t > 0 && n_r > 0) wilcox.test(.data[[value_col]][group == "target"],
+                                                      .data[[value_col]][group == "rest"])$p.value else NA_real_,
+              .groups = "drop") %>%
+    mutate(lab = sprintf("Wilcoxon p = %s\nn = %d targets, %d other", signif(p, 2), n_t, n_r))
+  write_csv(stats %>% dplyr::select(-lab),
+            file.path(O, paste0("m6a_wilcoxon_", tag, "_", params$site_set, ".csv")))
+  d <- squish_for_plot(d, value_col)
+  p <- ggplot(d, aes(x = plot_x, colour = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    geom_text(data = stats, aes(x = Inf, y = -Inf, label = lab), inherit.aes = FALSE,
+              hjust = 1.05, vjust = -0.4, size = 2.8) +
+    facet_grid(contrast ~ region, scales = "free_x") +
+    scale_colour_manual(values = group_cols, labels = group_labs, name = NULL) +
+    labs(x = paste0(xlab, " (values above each region's 99th percentile drawn at it)"),
+         y = "Cumulative fraction of genes",
+         title = paste0("m6A sites (HEK293T m6A-eCLIP, ", params$site_set, " sites) by region"),
+         subtitle = "Genes present in Mukhopadhyay 2023 Table S3 only; targets = TE log2(sictrl / si3d) > 0.5, padj < 0.05") +
+    theme_classic(base_size = 12) + theme(legend.position = "bottom")
+  if (isTRUE(params$save_plots))
+    ggsave(here("plots", paste0("48_m6a_", tag, "_ecdf_", params$site_set, ".pdf")), p,
+           width = 10, height = 2.6 * length(contrasts) + 1.2)
+  p
+}
+```
+
+## Sites per gene
+
+```{r ecdf_counts, fig.width=10, fig.height=2.6 * length(str_split(params$contrasts, ",")[[1]]) + 1.2}
+ecdf_panel("n_sites", "m6A sites in region", "sites")
+```
+
+## Sites per kb of region
+
+Removes the length difference between targets and other mRNAs. Genes with no annotated region
+(e.g. no 5'UTR) or mapped by symbol only have no length and are dropped from this view, so n is
+smaller than above.
+
+```{r ecdf_density, fig.width=10, fig.height=2.6 * length(str_split(params$contrasts, ",")[[1]]) + 1.2}
+ecdf_panel("sites_per_kb", "m6A sites per kb of region", "density")
+```
+
+## Fraction of genes with at least one site
+
+```{r any_site}
+any_site <- pd %>% group_by(contrast, region) %>%
+  group_modify(function(d, k) {
+    tab <- table(factor(d$group, c("target", "rest")), factor(d$n_sites > 0, c(TRUE, FALSE)))
+    ft <- fisher.test(tab)
+    tibble(n_target = sum(tab["target", ]), target_with_site = tab["target", "TRUE"] / sum(tab["target", ]),
+           n_rest = sum(tab["rest", ]), rest_with_site = tab["rest", "TRUE"] / sum(tab["rest", ]),
+           odds_ratio = unname(ft$estimate), p = ft$p.value)
+  }) %>% ungroup() %>%
+  mutate(p_adj_BH = p.adjust(p, "BH"))
+knitr::kable(any_site, digits = 3)
+write_csv(any_site, file.path(O, paste0("m6a_any_site_by_region_", params$site_set, ".csv")))
+```
+
+```{r session}
+sessionInfo()
+```

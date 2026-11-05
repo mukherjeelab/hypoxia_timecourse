@@ -1,0 +1,483 @@
+---
+title: "CDS reporter design 03 - fluorophore-P2A-NanoLuc fusions vs MDA-MB-231"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+`01_` placed the NanoLuc construct alone in the MDA-MB-231 CDS landscape. This
+notebook does the same for the three bicistronic constructs actually being
+cloned - eGFP-P2A-NanoLuc, mCherry-P2A-NanoLuc and TagRFP-P2A-NanoLuc - with
+NanoLuc alone kept as the reference line to read them against.
+
+**MDA-MB-231 only.** The MCF7-SIX1 counterpart would be `02_`'s background; the
+GC3 result points the opposite way there, so the two must not be read off one
+panel.
+
+All parts are imported from `accessories/cds seq.xlsx` and assembled here. The
+assembly is the part that can go wrong silently, so section 2 states the rules and
+section 3 asserts every one of them.
+
+**The whole fusion is one ORF and is measured as one CDS.** P2A is a
+ribosome-skipping peptide, not a stop: the ribosome translates straight through
+and the two proteins separate co-translationally. So the mRNA carries a single
+~1.4 kb coding sequence, and that is what a scanning or elongating ribosome
+traverses - which is the quantity these panels are about. The NanoLuc portion
+keeps its junction + PEST tail, as in `01_`.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+cat("lfc_cutoff =", lfc_cutoff, "| padj_cutoff =", padj_cutoff, "\n")
+```
+
+# 1. Import the Parts
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+stopifnot("Expected 'construct' and 'cds' columns" =
+            all(c("construct", "cds") %in% names(parts_tbl)))
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+
+needed <- c("egfp", "mcherry", "tag_rfp", "p2a", "nanoluc")
+stopifnot("A required part is missing from cds seq.xlsx" =
+            all(needed %in% parts$part))
+
+pseq <- setNames(parts$seq, parts$part)
+
+# Every part must be clean DNA and in frame before anything is joined.
+stopifnot(
+  "A part contains non-ACGT characters" =
+    all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" =
+    all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+part_summary <- tibble(
+  part   = needed,
+  nt     = nchar(pseq[needed]),
+  codons = nchar(pseq[needed]) %/% 3,
+  starts_atg = substr(pseq[needed], 1, 3) == "ATG",
+  ends_stop  = map_lgl(pseq[needed],
+                       ~ codon_split(.x)[nchar(.x) %/% 3] %in% STOP_CODONS),
+  internal_stop = map_lgl(pseq[needed], function(s) {
+    cd <- codon_split(s); any(cd[-length(cd)] %in% STOP_CODONS)
+  })
+)
+print(part_summary)
+
+stopifnot("A part has an internal stop codon" = !any(part_summary$internal_stop))
+```
+
+# 2. Assembly Rules
+
+Three things about the parts as supplied govern how they are joined, and each is
+applied explicitly rather than assumed:
+
+1. **mCherry and TagRFP carry terminal stop codons; eGFP does not.** A stop
+   upstream of P2A would end translation before NanoLuc, so the terminal stop is
+   stripped from any upstream part that has one. This is forced by the biology,
+   not a choice.
+2. **TagRFP has no initiator ATG.** As supplied it begins `GTG TCT AAG` =
+   VSKGEE..., where TagRFP is MVSKGEE... An `ATG` is prepended so the fusion
+   starts correctly, matching the other two. This is the one edit made to a
+   supplied sequence, and it is asserted below.
+3. **NanoLuc is 3'-most and keeps its stop**, along with its junction + PEST tail.
+   The stop is stripped only at the end, when CDS metrics are computed, so genes
+   and constructs share a stop-free basis.
+
+The P2A supplied is the bare 19-aa ATNFSLLKQAGDVEENPGP, with no GSG linker in
+front of it. That is used as given.
+
+```{r assemble}
+P2A_AA <- "ATNFSLLKQAGDVEENPGP"
+stopifnot("The p2a part does not encode the expected 19-aa P2A peptide" =
+            as.character(translate(DNAString(pseq[["p2a"]]))) == P2A_AA)
+
+strip_terminal_stop <- function(s) {
+  cd <- codon_split(s)
+  if (cd[length(cd)] %in% STOP_CODONS) substr(s, 1, nchar(s) - 3) else s
+}
+
+# The upstream fluorophore, made fusion-ready: ATG prepended where absent, any
+# terminal stop removed.
+prep_upstream <- function(s, name) {
+  added_atg <- substr(s, 1, 3) != "ATG"
+  if (added_atg) s <- paste0("ATG", s)
+  had_stop <- codon_split(s)[nchar(s) %/% 3] %in% STOP_CODONS
+  s <- strip_terminal_stop(s)
+  cat(sprintf("  %-9s ATG prepended: %-5s terminal stop stripped: %-5s -> %d nt\n",
+              name, added_atg, had_stop, nchar(s)))
+  stopifnot(
+    "Prepared upstream part does not start with ATG" = substr(s, 1, 3) == "ATG",
+    "Prepared upstream part still ends in a stop codon" =
+      !codon_split(s)[nchar(s) %/% 3] %in% STOP_CODONS
+  )
+  s
+}
+
+cat("Preparing upstream parts:\n")
+up <- list(
+  egfp    = prep_upstream(pseq[["egfp"]],    "eGFP"),
+  mcherry = prep_upstream(pseq[["mcherry"]], "mCherry"),
+  tag_rfp = prep_upstream(pseq[["tag_rfp"]], "TagRFP")
+)
+
+# Only TagRFP should have needed an ATG; if another part suddenly does, the
+# spreadsheet changed and that should be looked at rather than silently fixed.
+stopifnot(
+  "eGFP unexpectedly needed an ATG prepended"    =
+    substr(pseq[["egfp"]], 1, 3) == "ATG",
+  "mCherry unexpectedly needed an ATG prepended" =
+    substr(pseq[["mcherry"]], 1, 3) == "ATG",
+  "TagRFP unexpectedly already had an ATG"       =
+    substr(pseq[["tag_rfp"]], 1, 3) != "ATG"
+)
+
+# Biological spot-check: each fluorophore's N-terminus, after preparation.
+stopifnot(
+  "eGFP N-terminus is not MVSKGEELFTG" =
+    startsWith(as.character(translate(DNAString(up$egfp))), "MVSKGEELFTG"),
+  "mCherry N-terminus is not MVSKGEEDNMAIIK" =
+    startsWith(as.character(translate(DNAString(up$mcherry))), "MVSKGEEDNMAIIK"),
+  "TagRFP N-terminus is not MVSKGEELIKENMHM" =
+    startsWith(as.character(translate(DNAString(up$tag_rfp))), "MVSKGEELIKENMHM")
+)
+cat("All three fluorophore N-termini match their expected sequences\n")
+```
+
+# 3. Build and Verify the Fusions
+
+```{r nanoluc}
+nl <- load_nanoluc_construct()
+```
+
+```{r build_fusions}
+fuse <- function(up_seq) paste0(up_seq, pseq[["p2a"]], nl$full)
+
+fusions <- list(
+  "eGFP-P2A-NanoLuc"    = fuse(up$egfp),
+  "mCherry-P2A-NanoLuc" = fuse(up$mcherry),
+  "TagRFP-P2A-NanoLuc"  = fuse(up$tag_rfp)
+)
+
+# nl$full is already stop-free, so each fusion is a stop-free ORF on the same
+# basis as the gene CDS sequences. check_orf enforces exactly that.
+cat("Fusion ORF validation:\n")
+iwalk(fusions, ~ check_orf(.x, .y))
+
+nl_aa_full <- as.character(translate(DNAString(nl$full)))
+
+for (nm in names(fusions)) {
+  f  <- fusions[[nm]]
+  aa <- as.character(translate(DNAString(f)))
+
+  stopifnot(
+    # Length is additive: nothing was dropped or duplicated in the join.
+    "Fusion length is not the sum of its parts" =
+      nchar(f) == nchar(up[[match(nm, names(fusions))]]) +
+      nchar(pseq[["p2a"]]) + nchar(nl$full),
+    # The P2A peptide must appear exactly once and in frame.
+    "P2A peptide not found exactly once in the fusion protein" =
+      lengths(gregexpr(P2A_AA, aa, fixed = TRUE)) == 1,
+    # The fusion must end with the complete NanoLuc construct protein, PEST
+    # included. This is the check that would catch a frame slip at either join:
+    # a shifted frame changes every downstream residue.
+    "Fusion does not end with the full NanoLuc + PEST protein" =
+      endsWith(aa, nl_aa_full),
+    # And the NanoLuc DNA must be bit-identical, not merely translate the same.
+    "NanoLuc portion of the fusion is not bit-identical to the construct" =
+      substr(f, nchar(f) - nchar(nl$full) + 1, nchar(f)) == nl$full
+  )
+}
+cat("All", length(fusions), "fusions: length additive, single in-frame P2A,",
+    "C-terminal NanoLuc+PEST bit-identical\n")
+```
+
+```{r fusion_table}
+fusion_df <- tibble(
+  reporter   = names(fusions),
+  cds_length = map_int(fusions, nchar),
+  gc_pct     = map_dbl(fusions, orf_gc_pct),
+  gc3_pct    = map_dbl(fusions, orf_gc3_pct)
+)
+
+nl_row <- tibble(
+  reporter   = "NanoLuc alone",
+  cds_length = nchar(nl$full),
+  gc_pct     = orf_gc_pct(nl$full),
+  gc3_pct    = orf_gc3_pct(nl$full)
+)
+
+ref_df <- bind_rows(nl_row, fusion_df)
+
+stopifnot(
+  "Reporter GC% out of range"  = all(ref_df$gc_pct  >= 0 & ref_df$gc_pct  <= 100),
+  "Reporter GC3% out of range" = all(ref_df$gc3_pct >= 0 & ref_df$gc3_pct <= 100),
+  "A fusion is not longer than NanoLuc alone" =
+    all(fusion_df$cds_length > nchar(nl$full))
+)
+
+print(ref_df %>% mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# Only the three fusions are drawn. NanoLuc alone stays in ref_df, so it is still
+# in the exported percentile table as a reference value, but it is not a
+# construct being built and would otherwise read as a fourth candidate.
+#
+# Colours avoid the density-curve hues (grey70 / #E69F00) and the two reserved
+# factor hues (#E69F00 eIF3d, #56B4E9 eIF3e), so no reference line reads as a
+# gene group or a knockdown.
+ref_plot_df <- fusion_df %>%
+  mutate(color    = c("#009E73", "#D55E00", "#CC79A7"),
+         linetype = "solid")
+
+stopifnot("NanoLuc alone must not be drawn as a reference line" =
+            !"NanoLuc alone" %in% ref_plot_df$reporter)
+cat("Reference lines drawn:", paste(ref_plot_df$reporter, collapse = ", "), "\n")
+```
+
+# 4. MDA-MB-231 Background and Gene Set
+
+Identical to `01_`, so the panels are directly comparable to it.
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target; if it is negative the direction has flipped.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes:", nrow(promotes), "\n")
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes with a transcript:", nrow(tx_promotes), "\n")
+```
+
+```{r build_metrics}
+metrics_all <- build_cds_metrics(
+  here("accessories", "human", "txdb.gencode49.sqlite"))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+if (nrow(actb) == 1) {
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+  cat("ACTB CDS GC%:", round(actb$gc_pct, 2),
+      "| GC3%:", round(actb$gc3_pct, 2), "\n")
+}
+```
+
+# 5. Density Panels
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, P2A fusion constructs",
+  outfile = "cds_reporter_03_density_cds_length_fusions.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 6
+)
+```
+
+```{r panel_gc, fig.width=9.5, fig.height=5.5}
+p_gc <- plot_density_luc(
+  expressed, promoted, "gc_pct",
+  xlab    = "CDS GC content (%)",
+  title   = "CDS GC content, MDA-MB-231, P2A fusion constructs",
+  outfile = "cds_reporter_03_density_cds_gc_fusions.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols
+)
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, P2A fusion constructs",
+  outfile = "cds_reporter_03_density_cds_gc3_fusions.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols
+)
+```
+
+# 6. Percentiles and Part Contributions
+
+```{r percentiles}
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+print(pct_tbl)
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+
+write_csv(pct_tbl,
+          here("output", "cds_reporter_design",
+               "03_fusion_percentiles_vs_231.csv"))
+cat("Exported: output/cds_reporter_design/03_fusion_percentiles_vs_231.csv\n")
+```
+
+Each part's own composition, to show which component moves a fusion where.
+
+```{r part_contributions}
+part_df <- tibble(
+  part = c("eGFP", "mCherry", "TagRFP", "P2A", "NanoLuc ORF",
+           "junction + PEST", "NanoLuc construct"),
+  seq  = c(up$egfp, up$mcherry, up$tag_rfp, pseq[["p2a"]],
+           nl$core, nl$pest, nl$full)
+) %>%
+  transmute(part,
+            nt      = nchar(seq),
+            codons  = nchar(seq) %/% 3,
+            gc_pct  = map_dbl(seq, gc_pct_of),
+            gc3_pct = map_dbl(seq, compute_gc3_pct)) %>%
+  mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1)))
+
+print(part_df)
+
+write_csv(part_df,
+          here("output", "cds_reporter_design", "03_part_composition.csv"))
+cat("Exported: output/cds_reporter_design/03_part_composition.csv\n")
+```
+
+```{r export_sequences}
+# The assembled constructs, so the sequences that were measured are recoverable
+# without re-running the assembly.
+seq_out <- tibble(
+  reporter = names(fusions),
+  length_nt_stop_free = map_int(fusions, nchar),
+  gc_pct  = round(map_dbl(fusions, orf_gc_pct), 3),
+  gc3_pct = round(map_dbl(fusions, orf_gc3_pct), 3),
+  bases   = unlist(fusions, use.names = FALSE)
+)
+write_csv(seq_out,
+          here("output", "cds_reporter_design",
+               "03_fusion_assembled_sequences.csv"))
+cat("Exported: output/cds_reporter_design/03_fusion_assembled_sequences.csv\n")
+```
+
+# 7. Summary
+
+```{r summary}
+cat("=== P2A fusion constructs vs MDA-MB-231 ===\n\n")
+
+cat("Assembly: <fluorophore, no stop> + P2A (19 aa) + NanoLuc + junction/PEST\n")
+cat("TagRFP had ATG prepended; mCherry and TagRFP had terminal stops stripped.\n\n")
+
+for (i in seq_len(nrow(ref_df))) {
+  cat(sprintf("%-22s %5d nt (%3d codons)  GC %.1f%%  GC3 %.1f%%\n",
+              ref_df$reporter[i], ref_df$cds_length[i],
+              ref_df$cds_length[i] / 3, ref_df$gc_pct[i], ref_df$gc3_pct[i]))
+}
+
+cat(sprintf("\nMDA-MB-231 medians: all expressed %.0f nt / GC3 %.1f%% | promoted %.0f nt / GC3 %.1f%%\n",
+            median(expressed$cds_length), median(expressed$gc3_pct),
+            median(promoted$cds_length),  median(promoted$gc3_pct)))
+
+cat("\nPercentile of each construct:\n")
+for (i in seq_len(nrow(pct_tbl))) {
+  cat(sprintf("  %-22s %-11s %7.1f  ->  %5.1f pct expressed, %5.1f pct promoted\n",
+              pct_tbl$reporter[i], pct_tbl$metric[i], pct_tbl$reporter_value[i],
+              pct_tbl$pct_expressed[i], pct_tbl$pct_promoted[i]))
+}
+```

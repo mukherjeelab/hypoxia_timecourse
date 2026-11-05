@@ -1,0 +1,435 @@
+---
+title: "CDS reporter design 01 - where NanoLuc sits in the MDA-MB-231 CDS landscape"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Where does the NanoLuc reporter construct fall in the distribution of CDS length,
+CDS GC%, and CDS GC3% across (a) the whole expressed MDA-MB-231 transcriptome and
+(b) the mRNAs translationally promoted by eIF3d in hypoxia (1hr, `te_lfc > 0.5`,
+`te_padj < 0.05`)? This is the baseline for choosing or recoding a reporter CDS.
+
+`02_` is the MCF7-SIX1 counterpart. Everything cell-line agnostic lives in
+`reporter_helpers.R`, which both notebooks source.
+
+Adapted from `code/predictive_modeling/62_cds_length_gc_hypoxia_promotes.Rmd`, with
+three deliberate changes:
+
+1. **The NanoLuc sequence is imported, not transcribed.** It is read from
+   `accessories/cds seq.xlsx` and asserted equal to the string notebook 62
+   hard-codes.
+2. **The comparator is the expressed transcriptome, not the screened negative set.**
+   The reporter-design question is "where does NanoLuc sit relative to a typical 231
+   mRNA", not "relative to an eIF3d-protected one". The negative control set is
+   genes selected for having no eIF3d effect, which makes it a contrast, not a
+   background; notebook 62 carries that version.
+3. **Only the NanoLuc reference lines are drawn.** Renilla and Firefly live in
+   notebook 62.
+
+All CDS metrics, genes and reporters alike, are computed on **stop-codon-free
+ORFs**, and the junction + PEST tail counts as part of the reporter CDS because it
+is part of what was cloned.
+
+Nothing here writes to `output/predictive_modeling/`; outputs go to
+`output/cds_reporter_design/` and `plots/`.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+# The construct is NanoLuc + a 41-aa junction/ODC PEST tail. The full construct
+# is what the ribosome traverses and is the line plotted. Set TRUE to also draw
+# the 171-codon catalytic domain alone; its numbers print either way.
+show_nanoluc_core <- FALSE
+
+cat("lfc_cutoff =", lfc_cutoff, "| padj_cutoff =", padj_cutoff,
+    "| show_nanoluc_core =", show_nanoluc_core, "\n")
+```
+
+# NanoLuc Construct: Import and Verify
+
+```{r read_nanoluc}
+nl <- load_nanoluc_construct()
+```
+
+```{r nanoluc_table}
+nl_df <- tibble(
+  reporter   = c("NanoLuc construct", "NanoLuc ORF only", "Junction + PEST tag"),
+  cds_length = c(nchar(nl$full), nchar(nl$core), nchar(nl$pest)),
+  gc_pct     = c(orf_gc_pct(nl$full), gc_pct_of(nl$core), gc_pct_of(nl$pest)),
+  gc3_pct    = c(orf_gc3_pct(nl$full), compute_gc3_pct(nl$core),
+                 compute_gc3_pct(nl$pest))
+)
+
+stopifnot(
+  "Reporter GC% out of range"  = all(nl_df$gc_pct  >= 0 & nl_df$gc_pct  <= 100),
+  "Reporter GC3% out of range" = all(nl_df$gc3_pct >= 0 & nl_df$gc3_pct <= 100)
+)
+
+print(nl_df %>% mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# Lines drawn in the main panels. Colours avoid the density-curve hues
+# (grey70 / #E69F00) or a reference line would read as a gene group.
+luc_df <- nl_df %>%
+  filter(reporter %in% c("NanoLuc construct",
+                         if (show_nanoluc_core) "NanoLuc ORF only")) %>%
+  mutate(color = c("#0072B2", "#CC79A7")[seq_len(n())],
+         linetype = "solid")
+
+cat("Reference lines drawn:", paste(luc_df$reporter, collapse = ", "), "\n")
+```
+
+# eIF3d Hypoxia-Promoted Gene Set
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE
+)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = sictrl >
+# si3d = knockdown reduces it = eIF3d promotes. EIF3D's own rna_lfc must be
+# strongly positive, because the siRNA depletes its target; if it is negative the
+# direction has flipped and the gene set below is upside down.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2),
+    "(positive = knockdown depletes its target, as expected)\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes (te_lfc >", lfc_cutoff,
+    ", te_padj <", padj_cutoff, "):", nrow(promotes), "\n")
+```
+
+# Transcript Selection
+
+Most abundant isoform per gene, taken from the pre-computed feature matrix
+(MDA-MB-231 siCTRL normoxia). Promoted genes absent from that matrix fall back to
+their most abundant isoform in the 1hr hypoxia siCTRL samples.
+
+```{r load_feature_matrix}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+
+tx_all <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+cat("All expressed genes in feature matrix:", nrow(tx_all), "\n")
+cat("Promoted genes found in feature matrix:", nrow(tx_promotes),
+    "of", nrow(promotes), "\n")
+```
+
+```{r hypoxia_fallback}
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean
+]
+cat("Promoted genes not in feature matrix:", length(missing_gene_ids), "\n")
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"),
+  col_types = "cc"
+) %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(
+    transcript_id_clean = sub("\\..*", "", transcript_id),
+    gene_id_clean       = sub("\\..*", "", gene_id)
+  )
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples
+)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+hyp_tpm <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>%
+    dplyr::select(Name, TPM) %>%
+    mutate(sample = s)
+}) %>%
+  group_by(Name) %>%
+  summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name))
+
+extra_tx_df <- hyp_tpm %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+n_extra         <- nrow(extra_tx_df)
+n_still_missing <- length(missing_gene_ids) - n_extra
+cat("Extra transcripts from 1hr hypoxia siCTRL:", n_extra, "\n")
+cat("Genes with zero hypoxia TPM (excluded):   ", n_still_missing, "\n")
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes after fallback:", nrow(tx_promotes), "\n")
+```
+
+# CDS Sequences, Lengths, GC and GC3
+
+```{r build_metrics}
+metrics_all <- build_cds_metrics(
+  here("accessories", "human", "txdb.gencode49.sqlite"))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>%
+  filter(cds_length > 0)
+
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>%
+  filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "of", nrow(tx_all), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "of", nrow(tx_promotes), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+# Biological spot-check: ACTB CDS GC% expected 50-70%.
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+if (nrow(actb) == 1) {
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+  cat("ACTB CDS GC%:", round(actb$gc_pct, 2),
+      "| GC3%:", round(actb$gc3_pct, 2), "\n")
+}
+```
+
+# Density Panels with the NanoLuc Reference Line
+
+The grey curve is the whole expressed transcriptome, including the promoted genes,
+because "where does NanoLuc sit among 231 mRNAs" is a question about the full
+population. The Wilcoxon test is run against the transcriptome **excluding** the
+promoted set, so the two samples being compared are disjoint, and is reported to
+the console rather than annotated on the panel.
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231",
+  outfile = "cds_reporter_01_density_cds_length.pdf",
+  luc_tbl = luc_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 6
+)
+```
+
+```{r panel_gc, fig.width=9.5, fig.height=5.5}
+p_gc <- plot_density_luc(
+  expressed, promoted, "gc_pct",
+  xlab    = "CDS GC content (%)",
+  title   = "CDS GC content, MDA-MB-231",
+  outfile = "cds_reporter_01_density_cds_gc.pdf",
+  luc_tbl = luc_df, group_cols = group_cols
+)
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231",
+  outfile = "cds_reporter_01_density_cds_gc3.pdf",
+  luc_tbl = luc_df, group_cols = group_cols
+)
+```
+
+# Designed NanoLuc Variants
+
+The codon-adapted, anti-adapted, and GC3-matched negative control NanoLuc
+sequences designed in `code/predictive_modeling/64_nanoluc_codon_adaptation.Rmd`,
+added as reference lines alongside the parent.
+
+Notebook 64 designed and exported these as **513 nt ORFs**, but each was cloned
+with the junction + PEST tail attached, and that tail was **not** recoded for GC3.
+So the sequence that actually exists, and the one the ribosome traverses, is the
+recoded ORF followed by the unmodified 123 nt tail. These panels therefore plot
+the **full 636 nt constructs**, on the same basis as the panels above. The ORF-only
+values notebook 64 reports are kept alongside in the printed table.
+
+The unmodified tail is not a bookkeeping detail: at GC3 51.2% it pulls both
+extremes back toward the middle, so it **caps how far a construct can actually be
+pushed**. The adapted ORF is GC3 3.5% but the cloned construct is 12.7%; the
+anti-adapted ORF is 100% but the construct is 90.6%. Any design target should be
+set on the construct, not the ORF.
+
+The variants are **purely synonymous**, so all four constructs are the same length
+and encode the same protein. The length panel is included for completeness, but
+all four lines coincide there by construction. GC and GC3 are where they separate.
+
+```{r load_designed_variants}
+var_df <- load_nanoluc_variants(nl)
+
+cat("\nORF as designed vs construct as cloned:\n")
+print(var_df %>%
+        dplyr::select(reporter, n_codons_changed,
+                      orf_length, gc3_orf, cds_length, gc_pct, gc3_pct) %>%
+        mutate(across(c(gc3_orf, gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# The negative control is GC3-matched to the parent by design, so its line falls
+# exactly on the parent's. Report the collision and draw it dashed, or it would
+# be hidden underneath and read as absent.
+gc3_collision <-
+  var_df$gc3_pct[var_df$reporter == "3d-negative control"] ==
+  var_df$gc3_pct[var_df$reporter == "NanoLuc parent"]
+cat("Negative control GC3 identical to parent:", gc3_collision,
+    "(drawn dashed so both remain visible)\n")
+
+# Colours avoid the density-curve hues (grey70 / #E69F00) and the two reserved
+# factor hues (#E69F00 eIF3d, #56B4E9 eIF3e), so no reference line reads as a
+# gene group or a knockdown.
+var_plot_df <- var_df %>%
+  dplyr::select(reporter, cds_length, gc_pct, gc3_pct) %>%
+  mutate(
+    color    = c("#0072B2", "#009E73", "#CC79A7", "black"),
+    linetype = c("solid",   "solid",   "solid",   "22")
+  )
+```
+
+```{r panel_variants_length, fig.width=9.5, fig.height=5.5}
+p_len_var <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, NanoLuc constructs",
+  outfile = "cds_reporter_01_density_cds_length_variants.pdf",
+  luc_tbl = var_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 6
+)
+```
+
+```{r panel_variants_gc, fig.width=9.5, fig.height=5.5}
+p_gc_var <- plot_density_luc(
+  expressed, promoted, "gc_pct",
+  xlab    = "CDS GC content (%)",
+  title   = "CDS GC content, MDA-MB-231, NanoLuc constructs",
+  outfile = "cds_reporter_01_density_cds_gc_variants.pdf",
+  luc_tbl = var_plot_df, group_cols = group_cols
+)
+```
+
+```{r panel_variants_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3_var <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, NanoLuc constructs",
+  outfile = "cds_reporter_01_density_cds_gc3_variants.pdf",
+  luc_tbl = var_plot_df, group_cols = group_cols
+)
+```
+
+# Where NanoLuc Falls: Percentiles
+
+```{r percentiles}
+# Every reference line drawn anywhere in this notebook, on the full-construct
+# basis. "NanoLuc construct" and "NanoLuc parent" are the same 636 nt sequence
+# reached by two routes, so both are kept and asserted equal above.
+ref_all <- bind_rows(
+  luc_df      %>% dplyr::select(reporter, cds_length, gc_pct, gc3_pct),
+  var_plot_df %>% dplyr::select(reporter, cds_length, gc_pct, gc3_pct)
+)
+
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_all)
+print(pct_tbl)
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+
+write_csv(pct_tbl,
+          here("output", "cds_reporter_design",
+               "01_nanoluc_percentiles_vs_231.csv"))
+cat("Exported: output/cds_reporter_design/01_nanoluc_percentiles_vs_231.csv\n")
+```
+
+```{r group_medians}
+medians_df <- tibble(
+  group = c("All expressed mRNAs", "eIF3d hypoxia promotes"),
+  n     = c(nrow(expressed), nrow(promoted)),
+  median_len_kb  = c(median(expressed$cds_length), median(promoted$cds_length)) / 1000,
+  median_gc_pct  = c(median(expressed$gc_pct),  median(promoted$gc_pct)),
+  median_gc3_pct = c(median(expressed$gc3_pct), median(promoted$gc3_pct))
+) %>%
+  mutate(across(starts_with("median"), ~ round(.x, 2)))
+
+print(medians_df)
+
+write_csv(medians_df,
+          here("output", "cds_reporter_design", "01_group_medians_cds_gc.csv"))
+cat("Exported: output/cds_reporter_design/01_group_medians_cds_gc.csv\n")
+```
+
+# Summary
+
+```{r summary}
+cat("=== CDS reporter design: NanoLuc vs MDA-MB-231 ===\n\n")
+
+cat("NanoLuc construct (stop-free):", nchar(nl$full), "nt |",
+    nchar(nl$full) / 3, "codons\n")
+cat("  GC%  =", round(gc_pct_of(nl$full), 1),
+    "| GC3% =", round(compute_gc3_pct(nl$full), 1), "\n")
+cat("  = NanoLuc ORF", nchar(nl$core), "nt (GC3",
+    round(compute_gc3_pct(nl$core), 1), ") + junction/PEST",
+    nchar(nl$pest), "nt (GC3", round(compute_gc3_pct(nl$pest), 1), ")\n\n")
+
+for (i in seq_len(nrow(medians_df))) {
+  cat(sprintf("%-24s n = %-6s  median length %.2f kb | GC %.1f%% | GC3 %.1f%%\n",
+              medians_df$group[i], fmt_n(medians_df$n[i]),
+              medians_df$median_len_kb[i], medians_df$median_gc_pct[i],
+              medians_df$median_gc3_pct[i]))
+}
+cat("\n")
+
+for (i in seq_len(nrow(pct_tbl))) {
+  cat(sprintf("%-20s %-11s %8.1f  ->  %5.1f pct of expressed, %5.1f pct of promoted\n",
+              pct_tbl$reporter[i], pct_tbl$metric[i], pct_tbl$reporter_value[i],
+              pct_tbl$pct_expressed[i], pct_tbl$pct_promoted[i]))
+}
+```

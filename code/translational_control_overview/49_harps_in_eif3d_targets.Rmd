@@ -1,0 +1,192 @@
+---
+title: "Hyperacute response proteins (Saleme 2025) in eIF3d-promoted mRNAs, hypoxia 1hr"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  contrast: "hypoxia_1hr"
+  lfc_min: 0.5           # target set: te_lfc > lfc_min and te_padj < padj_max (the gene-set definition)
+  padj_max: 0.05
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview", "49_harps_in_eif3d_targets.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Plan
+
+Are the proteins a cancer cell makes within 20 min of acute stress, without any change in their
+mRNA, also eIF3d-promoted mRNAs in MDA-MB-231 at hypoxia 1hr?
+
+**Data.** Saleme et al. 2025, *Cell Reports* 44:115871 ("Hyperacute response proteins
+synthesized on γ-tubulin-FTO-MARK4 translation microdomains regulate cancer's acute stress
+response"), supplement `accessories/saleme2025_cellrep_mmc2.pdf`, Figure S3C (page 28). The
+paper calls these **HARPs** (hyperacute response proteins): "proteins upregulated post stress
+without significant mRNA level changes", from AHA labeling (AHA is a methionine analog, so only
+proteins made during the 20 min are captured) after UV in **A549** lung cancer cells. The figure
+gives a gene symbol and the % decrease with the FTO inhibitor DAC51 for each, nothing else.
+
+**Decisions**
+
+- **Parse the list from the PDF, never retype it.** Words are read with their page coordinates
+  and each % value in the list column is paired with the gene symbol on the same line.
+- **Universe** = every gene DESeq2 tested in the contrast (non-NA te_padj). A HARP that is not
+  tested cannot be a target, so counting it would deflate the overlap.
+- **Target set** = te_lfc > `r params$lfc_min` and te_padj < `r params$padj_max`, asserted to
+  reproduce `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` at the defaults.
+- **Two questions, two tests.** Overlap with the target set (Fisher's exact test), and, since a
+  gene set of ~40 cannot show much overlap, whether HARPs as a group have shifted TE change
+  (Wilcoxon against every other tested gene), which uses every HARP rather than a cutoff.
+- **Different cell, stress and time scale** (A549, UV, 20 min vs MDA-MB-231, hypoxia, 1hr), so a
+  null result says little about whether the mechanisms are related.
+
+```{r libraries}
+suppressPackageStartupMessages({ library(tidyverse); library(here) })
+O <- here("output", "translational_control_overview")
+dir.create(here("plots"), showWarnings = FALSE)
+kd_colors <- c("si3d" = "#E69F00")
+harp_col  <- "#CC79A7"   # Okabe-Ito reddish purple; orange and sky blue are reserved for si3d / si3e
+```
+
+# 1. Parse the HARP list (Figure S3C)
+
+```{r parse_harps}
+pdf_path <- here("accessories", "saleme2025_cellrep_mmc2.pdf")
+stopifnot("supplement PDF not in accessories/" = file.exists(pdf_path))
+words <- pdftools::pdf_data(pdf_path)[[28]]
+
+# The list is a two-column table headed "Gene" / "Decrease with DAC". Its header sits at the
+# left edge of the page; the % values sit in a narrow column just right of the gene names.
+hdr <- words %>% filter(text == "Gene")
+stopifnot("expected one 'Gene' header on page 28" = nrow(hdr) == 1)
+pct <- words %>% filter(str_detect(text, "^[0-9]{1,3}\\.[0-9]$"), x > hdr$x, x < hdr$x + 150, y > hdr$y)
+gene_tok <- words %>% filter(x < hdr$x + 30, y > hdr$y, str_detect(text, "^[A-Z][A-Z0-9]{1,9}$"))
+
+# Pair each % value with the gene token on the same line (y within 2 pt).
+harps <- pct %>% rowwise() %>%
+  mutate(symbol = { g <- gene_tok$text[abs(gene_tok$y - y) <= 2]; if (length(g) == 1) g else NA_character_ }) %>%
+  ungroup() %>% transmute(symbol, dac_pct_decrease = as.numeric(text))
+
+stopifnot(
+  "a % value had no unique gene on its line" = !any(is.na(harps$symbol)),
+  "duplicate HARP symbol" = !anyDuplicated(harps$symbol),
+  "% decrease must lie in [0, 100]" = all(between(harps$dac_pct_decrease, 0, 100))
+)
+cat(nrow(harps), "HARPs parsed\n")
+```
+
+Two things the paper states about this list, checked before using it.
+
+```{r reproduce_paper}
+# Text: p53, ATF4 and SRSF7 are HARPs validated by immunoblot (Fig. 3D-G).
+stopifnot("TP53, ATF4 and SRSF7 should all be on the list" = all(c("TP53", "ATF4", "SRSF7") %in% harps$symbol))
+# Text: "Approximately 73% of HARPs were also responsive to some degree to DAC inhibition,
+# with a range between 20% and 100% inhibition".
+frac_resp <- mean(harps$dac_pct_decrease > 0)
+cat(sprintf("Responsive to DAC (> 0%% decrease): %d / %d = %.1f%% (paper: ~73%%)\n",
+            sum(harps$dac_pct_decrease > 0), nrow(harps), 100 * frac_resp))
+stopifnot("DAC-responsive fraction does not match the paper's ~73%" = abs(frac_resp - 0.73) < 0.02)
+knitr::kable(harps %>% arrange(desc(dac_pct_decrease)))
+```
+
+The paper's 20% lower bound does not hold exactly: three responsive HARPs fall below it
+(IMPA1 12.5, OCIAD2 10.0, TXNDC5 8.3), so the stated range is approximate. The 73% matches.
+
+# 2. Target set and universe
+
+```{r targets}
+lfc_min <- as.numeric(params$lfc_min); padj_max <- as.numeric(params$padj_max)
+tc <- read_csv(here("output", paste0("translation_categories_si3d_vs_sictrl_", params$contrast, ".csv")),
+               show_col_types = FALSE) %>% mutate(gene_id_clean = sub("\\..*", "", gene_id))
+# Direction: columns are log2(sictrl / si3d) despite the filename, so EIF3D's own rna_lfc must be
+# strongly positive (the siRNA depletes it).
+stopifnot("EIF3D rna_lfc should be strongly positive" = tc$rna_lfc[tc$symbol == "EIF3D"] > 1)
+tested <- tc %>% filter(!is.na(te_padj)) %>%
+  mutate(target = te_lfc > lfc_min & te_padj < padj_max)
+stopifnot("gene tested twice" = !anyDuplicated(tested$gene_id_clean))
+
+if (params$contrast == "hypoxia_1hr" && lfc_min == 0.5 && padj_max == 0.05) {
+  gs <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"), show_col_types = FALSE)
+  stopifnot("inline target set does not reproduce hypoxia_3d_promotes_TE_1hr_lfc0.5.csv" =
+              setequal(tested$gene_id_clean[tested$target], gs$ensembl_gene))
+}
+cat(nrow(tested), "genes tested;", sum(tested$target), "eIF3d-promoted targets\n")
+
+# Where is each HARP: tested, in the file but untested (NA padj), or absent?
+harp_status <- harps %>%
+  left_join(tc %>% dplyr::select(symbol, gene_id_clean, te_lfc, te_padj, rna_lfc, rna_padj), by = "symbol") %>%
+  mutate(status = case_when(is.na(gene_id_clean) ~ "symbol not in contrast file",
+                            is.na(te_padj)        ~ "not tested (NA padj)",
+                            te_lfc > lfc_min & te_padj < padj_max ~ "eIF3d target",
+                            TRUE ~ "tested, not a target"))
+stopifnot("a HARP symbol matched two genes" = !anyDuplicated(harp_status$symbol))
+dplyr::count(harp_status, status) %>% knitr::kable()
+```
+
+# 3. Are HARPs eIF3d targets?
+
+```{r overlap}
+in_univ <- tested$symbol %in% harps$symbol
+tab <- table(HARP = factor(in_univ, c(TRUE, FALSE)), target = factor(tested$target, c(TRUE, FALSE)))
+ft <- fisher.test(tab)
+print(tab)
+cat(sprintf("HARPs that are targets: %d of %d tested (%.1f%%) vs %.1f%% of all tested genes\nFisher OR = %.2f (95%% CI %.2f-%.2f), p = %s\n",
+            tab["TRUE", "TRUE"], sum(tab["TRUE", ]), 100 * tab["TRUE", "TRUE"] / sum(tab["TRUE", ]),
+            100 * mean(tested$target), ft$estimate, ft$conf.int[1], ft$conf.int[2], signif(ft$p.value, 3)))
+```
+
+```{r harp_table}
+harp_status %>% arrange(desc(te_lfc)) %>%
+  mutate(across(c(te_lfc, rna_lfc), ~ round(.x, 2)), across(c(te_padj, rna_padj), ~ signif(.x, 2))) %>%
+  dplyr::select(symbol, status, te_lfc, te_padj, rna_lfc, rna_padj, dac_pct_decrease) %>%
+  knitr::kable()
+write_csv(harp_status, file.path(O, paste0("harps_saleme2025_vs_si3d_", params$contrast, ".csv")))
+```
+
+# 4. Is TE change shifted for HARPs as a group?
+
+Uses every tested HARP rather than a cutoff, so it can detect a shift that the 0.5 threshold
+hides. Positive TE log2(sictrl / si3d) = eIF3d promotes.
+
+```{r te_shift, fig.width=6.5, fig.height=4.5}
+pd <- tested %>% mutate(group = factor(if_else(symbol %in% harps$symbol, "HARP", "Other tested genes"),
+                                       levels = c("HARP", "Other tested genes")))
+w <- wilcox.test(te_lfc ~ group, data = pd)
+n_h <- sum(pd$group == "HARP"); n_o <- sum(pd$group != "HARP")
+med <- pd %>% group_by(group) %>% summarise(median_te_lfc = median(te_lfc), .groups = "drop")
+print(med)
+
+p <- ggplot(pd, aes(te_lfc, colour = group)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = lfc_min, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.4, size = 3.2,
+           label = sprintf("Wilcoxon p = %s\nn = %d HARPs, %d other", signif(w$p.value, 2), n_h, n_o)) +
+  scale_colour_manual(values = c("HARP" = harp_col, "Other tested genes" = "grey70"), name = NULL) +
+  labs(x = "TE log2(sictrl / si3d), hypoxia 1hr", y = "Cumulative fraction of genes",
+       title = "HARPs (Saleme 2025, A549 UV 20 min) vs other genes",
+       subtitle = paste0("Dashed line = target cutoff (", lfc_min, ")")) +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", paste0("49_harps_te_lfc_ecdf_", params$contrast, ".pdf")), p, width = 6.5, height = 4.5)
+p
+```
+
+```{r session}
+sessionInfo()
+```

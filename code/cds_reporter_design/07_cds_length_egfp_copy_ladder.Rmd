@@ -1,0 +1,684 @@
+---
+title: "CDS reporter design 07 - SmBiT-P2A-FLAG eGFP copy ladder vs MDA-MB-231"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  max_gfp_copies: 3
+  linker_between_copies: TRUE
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below. Both
+# guards test `knitr.in.progress`, so a knit is never touched.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    max_gfp_copies        = 3,     # rungs are 0..max_gfp_copies eGFP copies
+    linker_between_copies = TRUE   # TRUE: a Waldo linker before every copy
+                                   # FALSE: one linker at the FLAG junction only
+  )
+}
+```
+
+# Overview
+
+An **eGFP copy-number ladder** on the SmBiT-P2A-FLAG backbone from `06_`, used as
+a length series. **MDA-MB-231 only**, same background and gene set as `01_`,
+`03_`, `04_` and `06_`.
+
+The 36 nt Waldo folding-reporter linker (`GSAGSAAGSGEF`) precedes **every** eGFP
+copy: after the FLAG tag, and again between each pair of fluorophores. The repeat
+unit is therefore linker + eGFP = 759 nt. At the default settings:
+
+| construct | eGFP copies | nt |
+|---|---|---|
+| SmBiT-P2A-FLAG | 0 | 117 |
+| SmBiT-P2A-FLAG-link-1xeGFP | 1 | 876 |
+| SmBiT-P2A-FLAG-link-2xeGFP | 2 | 1,635 |
+| SmBiT-P2A-FLAG-link-3xeGFP | 3 | 2,394 |
+
+`max_gfp_copies` and `linker_between_copies` are parameters and the output
+filenames carry both, so a different ladder does not overwrite this one.
+
+**`linker_between_copies` is kept as a parameter because the alternative is a
+reasonable reading of the same design.** `TRUE` (the default) is the arrangement
+above. `FALSE` places a single linker at the FLAG-eGFP junction only, after which
+the eGFP copies are fused directly to one another, and each rung gains 723 nt
+rather than 759. Directly fused tandem fluorophores are the folding problem the
+Waldo linker was designed to relieve, which is why `TRUE` is the default; it also
+dilutes GC3 slightly further (3x: 93.0% against 94.6%), so it is better on both
+counts. The 0-copy rung never carries a linker under either setting, since there
+is no eGFP for it to join.
+
+Either way the rungs above 0 are an exactly uniform ladder; only the step size
+differs. Section 2 asserts the uniformity rather than assuming it.
+
+**The linker ends in an in-frame EcoRI site.** `GAATTC` encodes Glu-Phe at its
+C terminus, which is how folding-reporter constructs are built, but it leaves
+internal EcoRI sites in the ORF - one per linker. Section 2 counts them.
+
+**This ladder is the mirror image of the FLAG ladder in `05_`.** The FLAG ladder
+held GC3 still (1.6-1.9 points) while total GC drifted badly (7.6-9.3 points),
+because it stacked a short GC-poor epitope. This one stacks a long GC3-extreme
+protein, so **both** GC and GC3 are nearly fixed above 1 copy - the construct is
+asymptotically just eGFP - but they are fixed at the wrong value. Section 6
+reports both drifts rather than asserting one and ignoring the other.
+
+**The composition problem does not improve with more copies; it gets worse.** At
+1 copy the construct is GC3 93.2%, already the 99.7th percentile of the expressed
+transcriptome. Every further copy pushes it toward eGFP's own 96.7%. So this is a
+clean length series *only* if the experiment can tolerate running along the far
+GC3 tail for its whole range. If GC3 is a variable of interest rather than a
+nuisance, a codon-shuffled eGFP is the version to build - the same recoding
+machinery `64_` used for NanoLuc - and this notebook is the baseline it would be
+compared against.
+
+**Tandem identical repeats are a real construction risk.** 2x and 3x carry 723 nt
+and 1,446 nt of exactly repeated sequence, which recombines in *E. coli* and is
+hard to sequence through. Section 3 reports the longest exact repeat per
+construct. The standard fix is to use codon-divergent eGFP copies, which would
+also let each copy's GC3 be chosen independently.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params_chunk}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+gfp_copies <- 0:params$max_gfp_copies
+ladder_tag <- paste0("upto", params$max_gfp_copies, "x",
+                     if (params$linker_between_copies) "_linkeach" else "_link1")
+
+stopifnot(
+  "max_gfp_copies must be at least 1" = params$max_gfp_copies >= 1,
+  "linker_between_copies must be TRUE or FALSE" =
+    is.logical(params$linker_between_copies) &&
+      !is.na(params$linker_between_copies),
+  "gfp_copies must be strictly increasing" = all(diff(gfp_copies) > 0),
+  "gfp_copies must be a uniform ladder"    =
+    length(unique(diff(gfp_copies))) == 1
+)
+cat("lfc_cutoff =", lfc_cutoff, "| padj_cutoff =", padj_cutoff, "\n")
+cat("eGFP copies:", paste(gfp_copies, collapse = ", "),
+    "| linker_between_copies =", params$linker_between_copies,
+    "| ladder_tag =", ladder_tag, "\n")
+```
+
+# 1. Import and Verify the Parts
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts$part)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("smbit n", "p2a", "flag3x", "egfp", "waldo linker")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+smbit_n <- pseq[["smbit n"]]
+p2a     <- pseq[["p2a"]]
+flag3x  <- pseq[["flag3x"]]
+egfp    <- pseq[["egfp"]]
+waldo   <- pseq[["waldo linker"]]
+
+SMBIT_AA  <- "VTGYRLFEEIL"
+P2A_AA    <- "ATNFSLLKQAGDVEENPGP"
+FLAG_AA   <- "DYKDDDDK"
+FLAG3X_AA <- "DYKDHDGDYKDHDIDYKDDDDK"
+WALDO_AA  <- "GSAGSAAGSGEF"
+
+aa_of <- function(s) as.character(translate(DNAString(s)))
+rc_aa <- function(s) as.character(translate(reverseComplement(DNAString(s))))
+
+flag1x  <- substr(flag3x, 43, 66)
+EGFP_AA <- aa_of(egfp)
+
+stopifnot(
+  "smBit n does not encode Met + the SmBiT peptide" =
+    aa_of(smbit_n) == paste0("M", SMBIT_AA),
+  "p2a does not encode the expected 19-aa P2A peptide" = aa_of(p2a) == P2A_AA,
+  "flag3x does not encode the canonical 3xFLAG peptide" = aa_of(flag3x) == FLAG3X_AA,
+  "1xFLAG is not the 24 nt C-terminal repeat of flag3x" =
+    nchar(flag1x) == 24 && endsWith(flag3x, flag1x),
+  "1xFLAG does not encode the DYKDDDDK epitope" = aa_of(flag1x) == FLAG_AA,
+  "egfp is not 723 nt"           = nchar(egfp) == 723,
+  "egfp does not start with ATG" = substr(egfp, 1, 3) == "ATG",
+  # The GFP chromophore. avGFP numbers it T65-Y66-G67, but eGFP carries an extra
+  # Val at position 2, so it sits at 66-68 here. The position and context matter:
+  # TYG also occurs at residue 39, so a motif-presence check would pass on a
+  # sequence with no chromophore in place.
+  "egfp protein does not carry the TYG chromophore at residues 66-68" =
+    substr(EGFP_AA, 66, 68) == "TYG",
+  "egfp chromophore is not in the expected LTYGVQCF context" =
+    substr(EGFP_AA, 65, 72) == "LTYGVQCF",
+  "waldo linker is not 36 nt"    = nchar(waldo) == 36,
+  "waldo linker is not in frame" = nchar(waldo) %% 3 == 0,
+  "waldo linker does not encode GSAGSAAGSGEF" = aa_of(waldo) == WALDO_AA,
+  # The EcoRI site must be in frame at the linker's 3' end, or the Glu-Phe it
+  # encodes would not be the two residues the design expects.
+  "waldo linker does not end with an in-frame GAATTC EcoRI site" =
+    endsWith(waldo, "GAATTC") && (nchar(waldo) - 6) %% 3 == 0
+)
+
+# A sequence can be in frame, the right length, and still be backwards, so each
+# orientation check is paired with the assertion that the reverse complement
+# does NOT encode the same peptide.
+stopifnot(
+  "Both orientations encode SmBiT: the check is not discriminative" =
+    rc_aa(smbit_n) != paste0("M", SMBIT_AA),
+  "Both orientations encode P2A: the check is not discriminative" =
+    rc_aa(p2a) != P2A_AA,
+  "Both orientations encode FLAG: the check is not discriminative" =
+    rc_aa(flag1x) != FLAG_AA,
+  "Both orientations encode eGFP: the check is not discriminative" =
+    rc_aa(egfp) != EGFP_AA,
+  "Both orientations encode the Waldo linker: the check is not discriminative" =
+    rc_aa(waldo) != WALDO_AA
+)
+
+stopifnot("A part carries a stop codon" =
+            !any(map_lgl(list(smbit_n, p2a, flag1x, egfp, waldo),
+                         ~ any(codon_split(.x) %in% STOP_CODONS))))
+
+cat("Parts verified:\n")
+for (p in list(c("SmBiT (ATG + 11 aa)", smbit_n), c("P2A", p2a),
+               c("FLAG (1x)", flag1x), c("Waldo linker", waldo),
+               c("eGFP", egfp))) {
+  cat(sprintf("  %-20s %3d nt (%3d codons)  GC %.1f%%  GC3 %.1f%%\n",
+              p[1], nchar(p[2]), nchar(p[2]) %/% 3,
+              gc_pct_of(p[2]), compute_gc3_pct(p[2])))
+}
+```
+
+# 2. Build the Ladder
+
+The backbone is `06_`'s SmBiT-P2A-FLAG, unchanged. The Waldo linker joins it to
+eGFP, which is then appended as **exact tandem copies** of the supplied 723 nt,
+keeping each copy's own `ATG`. Under the default (`linker_between_copies =
+FALSE`) the copies after the first are fused directly, so those junctions read
+`...MDELYKGT | M VSKGEE...` with an internal Met; under `TRUE` every junction
+carries a linker instead. That differs from `05_`, which repeats a short epitope;
+here the repeat unit is a whole protein.
+
+```{r build_ladder}
+backbone <- paste0(smbit_n, p2a, flag1x)
+stopifnot("Backbone is not the 06_ SmBiT-P2A-FLAG construct" =
+            nchar(backbone) == nchar(smbit_n) + nchar(p2a) + nchar(flag1x),
+          "Backbone protein does not end with the FLAG epitope" =
+            endsWith(aa_of(backbone), FLAG_AA))
+
+# The repeat unit: linker + eGFP when every copy gets one, eGFP alone otherwise
+# (in which case a single linker is placed once, before the first copy).
+unit     <- if (params$linker_between_copies) paste0(waldo, egfp) else egfp
+lead_in  <- if (params$linker_between_copies) "" else waldo
+step_nt  <- nchar(unit)
+
+build_rung <- function(n) {
+  if (n == 0) backbone else paste0(backbone, lead_in, strrep(unit, n))
+}
+constructs <- map(gfp_copies, build_rung)
+names(constructs) <- ifelse(
+  gfp_copies == 0, "SmBiT-P2A-FLAG",
+  sprintf("SmBiT-P2A-FLAG-link-%dxeGFP", gfp_copies))
+
+cat("Repeat unit:", step_nt, "nt",
+    if (params$linker_between_copies) "(linker + eGFP)" else "(eGFP only)",
+    "| lead-in:", nchar(lead_in), "nt\n")
+
+cat("Assembled ORF validation:\n")
+iwalk(constructs, ~ check_orf(.x, .y))
+
+walk2(constructs, gfp_copies, function(cs, n) {
+  aa <- aa_of(cs)
+  stopifnot(
+    "Construct length is not backbone + lead-in + n * unit" =
+      nchar(cs) == nchar(backbone) +
+        (if (n == 0) 0 else nchar(lead_in)) + n * step_nt,
+    "Construct does not start with the backbone" = startsWith(cs, backbone),
+    # One linker per eGFP copy under TRUE, exactly one under FALSE, none at 0.
+    "Waldo linker count does not match the design" =
+      str_count(cs, fixed(waldo)) ==
+        (if (n == 0) 0 else if (params$linker_between_copies) n else 1),
+    # The linker must sit immediately after the FLAG tag in both arrangements,
+    # which is the placement that was actually asked for.
+    "Linker does not immediately follow the FLAG tag" =
+      (n == 0) || startsWith(cs, paste0(backbone, waldo)),
+    # The copy count itself, asserted on DNA and on protein. If strrep were
+    # given the wrong n, or a copy were truncated, this is what fires.
+    "eGFP DNA does not appear exactly n times" =
+      (if (n == 0) !str_detect(cs, fixed(egfp))
+       else length(gregexpr(egfp, cs, fixed = TRUE)[[1]]) == n),
+    "eGFP protein does not appear exactly n times" =
+      (if (n == 0) !str_detect(aa, fixed(EGFP_AA))
+       else length(gregexpr(EGFP_AA, aa, fixed = TRUE)[[1]]) == n),
+    "P2A peptide not found exactly once" =
+      length(gregexpr(P2A_AA, aa, fixed = TRUE)[[1]]) == 1,
+    "Construct protein does not start with Met + SmBiT" =
+      startsWith(aa, paste0("M", SMBIT_AA)),
+    "Construct protein does not end where it should" =
+      endsWith(aa, if (n == 0) FLAG_AA else EGFP_AA)
+  )
+})
+cat("All", length(constructs), "constructs: length additive, exact copy counts,",
+    "single in-frame P2A\n")
+
+# The rungs above 0 must be an exactly uniform ladder, which is the property that
+# makes this a length series rather than four unrelated constructs.
+len <- map_int(constructs, nchar)
+gfp_len <- len[gfp_copies > 0]
+stopifnot("eGFP rungs are not spaced by exactly one repeat unit" =
+            length(unique(diff(gfp_len))) == 1 &&
+            unique(diff(gfp_len)) == step_nt)
+cat("Rung spacing:", unique(diff(gfp_len)), "nt (one repeat unit)\n")
+
+# Internal EcoRI sites, which the Waldo linker introduces by design. Reported
+# rather than asserted away: a property of the linker, not a defect, but it has
+# to be visible before anyone picks cloning enzymes.
+ecori <- map_int(constructs, ~ str_count(.x, fixed("GAATTC")))
+stopifnot(
+  "EcoRI site count does not match the linker count" =
+    all(ecori == map_int(constructs, ~ str_count(.x, fixed(waldo)))),
+  # Discriminative: the 0-copy rung has no linker, so it must have no site.
+  "The linker-free rung carries an EcoRI site" = ecori[gfp_copies == 0] == 0
+)
+cat("Internal EcoRI sites per rung:", paste(ecori, collapse = ", "), "\n")
+
+# No construct may carry a stop codon: the metrics basis is stop-free, but each
+# plasmid still needs one appended.
+iwalk(constructs, function(cs, nm) {
+  stopifnot("Assembled construct unexpectedly carries a terminal stop" =
+              !tail(codon_split(cs), 1) %in% STOP_CODONS)
+})
+cat("No construct carries a stop codon; add one per plasmid (+3 nt not counted)\n")
+```
+
+Tandem identical sequence is the construction risk, so it is measured rather than
+mentioned. The longest exact internal repeat is reported per construct.
+
+```{r repeat_risk}
+rep_tbl <- tibble(
+  construct   = names(constructs),
+  gfp_copies  = gfp_copies,
+  nt          = len,
+  # With n exact tandem copies of the repeat unit, the longest repeated block is
+  # (n - 1) * unit: the first n-1 copies recur as the last n-1 copies. This
+  # holds under both linker arrangements, since the unit is what repeats.
+  longest_exact_repeat_nt = pmax(0, (gfp_copies - 1)) * step_nt
+)
+print(rep_tbl)
+
+stopifnot(
+  "Repeat length does not match the copy count" =
+    all(rep_tbl$longest_exact_repeat_nt ==
+          pmax(0, rep_tbl$gfp_copies - 1) * step_nt),
+  # Discriminative: the single-copy construct must have NO internal repeat, or
+  # the measure is counting something other than the tandem array.
+  "The 1x construct should carry no exact internal repeat" =
+    rep_tbl$longest_exact_repeat_nt[rep_tbl$gfp_copies == 1] == 0
+)
+
+risky <- rep_tbl %>% filter(longest_exact_repeat_nt > 0)
+if (nrow(risky)) {
+  cat("\nWARNING: tandem identical repeats present. These recombine in E. coli\n")
+  cat("and are hard to sequence through. Codon-divergent eGFP copies remove the\n")
+  cat("repeat and would let each copy's GC3 be chosen independently.\n")
+  for (i in seq_len(nrow(risky))) {
+    cat(sprintf("  %-24s %s nt of exactly repeated sequence\n",
+                risky$construct[i], fmt_n(risky$longest_exact_repeat_nt[i])))
+  }
+}
+```
+
+```{r construct_table}
+ref_df <- tibble(
+  reporter   = names(constructs),
+  gfp_copies = gfp_copies,
+  cds_length = len,
+  gc_pct     = map_dbl(constructs, orf_gc_pct),
+  gc3_pct    = map_dbl(constructs, orf_gc3_pct)
+)
+
+stopifnot(
+  "Reporter GC% out of range"  = all(ref_df$gc_pct  >= 0 & ref_df$gc_pct  <= 100),
+  "Reporter GC3% out of range" = all(ref_df$gc3_pct >= 0 & ref_df$gc3_pct <= 100)
+)
+print(ref_df %>% mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# A ladder is ordinal, so the copies get a single-hue ramp rather than
+# categorical colours. Dark blue here, against 05_'s reddish-purple ladder, so
+# the two ladders are not confusable. Both avoid the density-curve hues
+# (grey70 / #E69F00) and the reserved factor hues (#E69F00 eIF3d, #56B4E9 eIF3e).
+ref_plot_df <- ref_df %>%
+  mutate(color    = colorRampPalette(c("#A6CEE3", "#0072B2", "#03314D"))(n()),
+         linetype = "solid",
+         reporter = factor(reporter, levels = reporter))
+```
+
+# 3. MDA-MB-231 Background and Gene Set
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes:", nrow(promotes), "\n")
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes with a transcript:", nrow(tx_promotes), "\n")
+```
+
+```{r build_metrics}
+metrics_all <- build_cds_metrics(
+  here("accessories", "human", "txdb.gencode49.sqlite"))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+if (nrow(actb) == 1) {
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+  cat("ACTB CDS GC%:", round(actb$gc_pct, 2),
+      "| GC3%:", round(actb$gc3_pct, 2), "\n")
+}
+```
+
+# 4. Density Panels
+
+Every legend entry carries the number it stands for: each density curve shows its
+group median, each reference line its own value. Units follow the metric, not the
+axis - the length axis is drawn in kb because kb ticks are readable, but a
+construct is specified in nt, so the labels say nt.
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+
+# NanoLuc is not a reference line here. Asserted rather than assumed.
+stopifnot(
+  "NanoLuc should not be among the plotted reference lines" =
+    !any(str_detect(tolower(as.character(ref_plot_df$reporter)), "nanoluc|nluc")),
+  "Expected one reference line per rung" =
+    nrow(ref_plot_df) == length(gfp_copies)
+)
+cat("Reference lines plotted:",
+    paste(as.character(ref_plot_df$reporter), collapse = ", "), "\n")
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, eGFP copy ladder",
+  outfile = paste0("cds_reporter_07_density_cds_length_egfp_ladder_",
+                   ladder_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 6
+)
+```
+
+The 0-copy construct is 117 nt and sits on the y axis at this scale. The zoomed
+panel is the readable version; the densities are unchanged, only the visible
+range differs.
+
+```{r panel_length_zoom, fig.width=9.5, fig.height=5.5}
+p_len_zoom <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  # Same title as the wide panel: the zoom is a view of the same data, and the
+  # axis shows the range. The filename carries the distinction.
+  title   = "CDS length, MDA-MB-231, eGFP copy ladder",
+  outfile = paste0("cds_reporter_07_density_cds_length_egfp_ladder_",
+                   ladder_tag, "_zoom3kb.pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 3
+)
+```
+
+```{r panel_gc, fig.width=9.5, fig.height=5.5}
+p_gc <- plot_density_luc(
+  expressed, promoted, "gc_pct",
+  xlab    = "CDS GC content (%)",
+  title   = "CDS GC content, MDA-MB-231, eGFP copy ladder",
+  outfile = paste0("cds_reporter_07_density_cds_gc_egfp_ladder_",
+                   ladder_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols
+)
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, eGFP copy ladder",
+  outfile = paste0("cds_reporter_07_density_cds_gc3_egfp_ladder_",
+                   ladder_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols
+)
+```
+
+# 5. Percentiles
+
+```{r percentiles}
+pct_tbl <- reporter_percentiles(expressed, promoted,
+                                ref_df %>% dplyr::select(-gfp_copies))
+print(pct_tbl)
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+
+write_csv(pct_tbl,
+          here("output", "cds_reporter_design",
+               paste0("07_egfp_ladder_percentiles_vs_231_", ladder_tag, ".csv")))
+cat("Exported: 07_egfp_ladder_percentiles_vs_231_", ladder_tag, ".csv\n", sep = "")
+```
+
+# 6. What the Ladder Holds Still, and What It Does Not
+
+`05_` held GC3 still while total GC drifted. This ladder does the opposite of
+that failure mode and a new one of its own: above 1 copy **both** GC and GC3 are
+nearly fixed, because the construct is asymptotically just eGFP - but they are
+fixed far out on the GC3 tail. Both drifts are reported; neither is assumed.
+
+```{r drift}
+gfp_only <- ref_df %>% filter(gfp_copies > 0)
+
+drift <- tibble(
+  metric = c("cds_length", "gc_pct", "gc3_pct"),
+  range_all = c(diff(range(ref_df$cds_length)), diff(range(ref_df$gc_pct)),
+                diff(range(ref_df$gc3_pct))),
+  range_gfp_rungs = c(diff(range(gfp_only$cds_length)),
+                      diff(range(gfp_only$gc_pct)),
+                      diff(range(gfp_only$gc3_pct))),
+  gene_iqr = c(IQR(expressed$cds_length), IQR(expressed$gc_pct),
+               IQR(expressed$gc3_pct))
+) %>%
+  mutate(pct_of_iqr_all  = round(100 * range_all / gene_iqr, 1),
+         pct_of_iqr_gfp  = round(100 * range_gfp_rungs / gene_iqr, 1),
+         across(c(range_all, range_gfp_rungs, gene_iqr), ~ round(.x, 1)))
+print(drift)
+
+len_share <- drift$pct_of_iqr_gfp[drift$metric == "cds_length"]
+gc3_share <- drift$pct_of_iqr_gfp[drift$metric == "gc3_pct"]
+gc_share  <- drift$pct_of_iqr_gfp[drift$metric == "gc_pct"]
+
+stopifnot(
+  # The property that makes this a length series: across the eGFP rungs, length
+  # must move far more than composition does, in distribution units.
+  "Across the eGFP rungs, length does not dominate composition" =
+    len_share > 5 * max(gc3_share, gc_share)
+)
+cat(sprintf("\nAcross the eGFP rungs: length moves %.1f%% of the expressed IQR,\n",
+            len_share))
+cat(sprintf("GC %.1f%% and GC3 %.1f%%. Length dominates by %.0fx.\n",
+            gc_share, gc3_share, len_share / max(gc3_share, gc_share)))
+
+# The level, not the drift, is the problem. Reported as a warning rather than an
+# assertion, because it is a property of eGFP, not a defect in the ladder.
+gc3_pcts <- pct_tbl %>% filter(metric == "gc3_pct")
+cat("\nWARNING: the ladder is composition-stable but sits on the GC3 tail.\n")
+for (i in seq_len(nrow(gc3_pcts))) {
+  cat(sprintf("  %-24s GC3 %5.1f%%  = %5.1f pct of expressed, %5.1f pct of promoted\n",
+              gc3_pcts$reporter[i], gc3_pcts$reporter_value[i],
+              gc3_pcts$pct_expressed[i], gc3_pcts$pct_promoted[i]))
+}
+cat("A codon-shuffled eGFP would keep the lengths and move GC3 to any target.\n")
+
+write_csv(drift,
+          here("output", "cds_reporter_design",
+               paste0("07_egfp_ladder_drift_", ladder_tag, ".csv")))
+```
+
+```{r export_sequences}
+seq_out <- tibble(
+  reporter = names(constructs),
+  gfp_copies = gfp_copies,
+  length_nt_stop_free = len,
+  gc_pct   = round(map_dbl(constructs, orf_gc_pct), 3),
+  gc3_pct  = round(map_dbl(constructs, orf_gc3_pct), 3),
+  longest_exact_repeat_nt = rep_tbl$longest_exact_repeat_nt,
+  bases    = unlist(constructs, use.names = FALSE)
+)
+write_csv(seq_out,
+          here("output", "cds_reporter_design",
+               paste0("07_egfp_ladder_assembled_sequences_", ladder_tag, ".csv")))
+cat("Exported: 07_egfp_ladder_assembled_sequences_", ladder_tag, ".csv and ",
+    "07_egfp_ladder_drift_", ladder_tag, ".csv\n", sep = "")
+```
+
+# 7. Summary
+
+```{r summary}
+cat("=== SmBiT-P2A-FLAG eGFP copy ladder vs MDA-MB-231 ===\n\n")
+cat("Backbone: smBit n (ATG + SmBiT) + P2A + 1xFLAG =", nchar(backbone), "nt\n")
+cat("Waldo linker (", nchar(waldo), " nt, ", WALDO_AA, ") joins FLAG to eGFP; ",
+    if (params$linker_between_copies) "one per copy.\n" else
+      "one in total.\n", sep = "")
+cat("Each rung appends one exact tandem copy of the", step_nt,
+    "nt repeat unit,\nkeeping eGFP's own ATG, so each junction carries an internal Met.\n")
+cat("No construct has a stop codon; each plasmid needs one appended.\n\n")
+
+for (i in seq_len(nrow(ref_df))) {
+  cat(sprintf("%-24s %d copies  %5d nt (%4d codons)  GC %.1f%%  GC3 %.1f%%\n",
+              ref_df$reporter[i], ref_df$gfp_copies[i], ref_df$cds_length[i],
+              ref_df$cds_length[i] / 3, ref_df$gc_pct[i], ref_df$gc3_pct[i]))
+}
+
+cat(sprintf("\nMDA-MB-231 medians: all expressed %.0f nt / GC %.1f%% / GC3 %.1f%%\n",
+            median(expressed$cds_length), median(expressed$gc_pct),
+            median(expressed$gc3_pct)))
+cat(sprintf("                    promoted      %.0f nt / GC %.1f%% / GC3 %.1f%%\n",
+            median(promoted$cds_length), median(promoted$gc_pct),
+            median(promoted$gc3_pct)))
+
+cat("\nLength percentiles:\n")
+lp <- pct_tbl %>% filter(metric == "cds_length")
+for (i in seq_len(nrow(lp))) {
+  cat(sprintf("  %-24s %5.0f nt  ->  %5.1f pct expressed, %5.1f pct promoted\n",
+              lp$reporter[i], lp$reporter_value[i],
+              lp$pct_expressed[i], lp$pct_promoted[i]))
+}
+```

@@ -1,0 +1,476 @@
+---
+title: "CDS reporter design 05 - FLAG copy-number ladder vs MDA-MB-231"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  flag_step: 20
+  n_rungs: 6
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below. Both
+# guards test `knitr.in.progress`, so a knit is never touched.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    flag_step = 20,   # copies added per rung after 1x
+    n_rungs   = 6     # how many rungs in total
+  )
+}
+```
+
+# Overview
+
+A FLAG copy-number ladder - 1x, then every 10 copies - placed in the MDA-MB-231
+CDS landscape. **MDA-MB-231 only**, same background and gene set as `01_`, `03_`
+and `04_`. The rungs are a parameter; see `flag_copies` below.
+
+The appeal of a FLAG ladder is that it should move **length while holding
+composition still**. Section 6 measures that instead of assuming it, and the
+answer is split, with the figures for the current rungs computed there:
+
+- **GC3 does hold.** It barely moves across the ladder, a few percent of the
+  transcriptome's IQR against a length change of roughly half of its IQR. On the
+  GC3 axis this really is a pure length series.
+- **Total GC does not.** The FLAG epitope is GC-poor (the 1x tag is 40.7% GC
+  against NanoLuc's 53.9%), so every copy dilutes the construct's GC, and over a
+  long ladder that drift becomes comparable, in distribution units, to the length
+  change the ladder exists to produce.
+
+So a long FLAG ladder **confounds length with GC**, and the longer it is the worse
+that gets. It is a clean length series with respect to GC3 and wobble-position
+effects, and a poor one if total GC is the variable in question. The assertion in
+section 6 holds GC3 to that standard and prints the GC drift rather than letting
+it pass unnoticed.
+
+**The repeat unit here is the canonical FLAG epitope, DYKDDDDK, tandemly
+repeated** - 24 nt per copy, so the ladder is exactly linear. This differs from
+`04_`, whose 3x used your three *distinct* repeats (DYKDHDG / DYKDHDI /
+DYKDDDDK, 66 nt). Beyond 3 copies there is nothing left to nest, so a uniform unit
+is the only way to make a regular ladder, and it keeps every rung comparable. The
+codons are still taken from your `flag3x`, never retyped. `04_`'s 3x and a 3x on
+this scheme would differ by 6 nt; nothing else here depends on that.
+
+As in `03_`/`04_`, the whole fusion is one ORF measured as one CDS, NanoLuc keeps
+its junction + PEST tail, and an ATG is prepended.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+# The rungs of the ladder: 1x, then every `flag_step` copies, `n_rungs` in all.
+# Both are YAML params, so a step size is a re-knit rather than an edit, and the
+# output filenames carry the step so different ladders do not overwrite each
+# other. Section 5 reports where each target length is crossed, independently of
+# which rungs were chosen.
+flag_copies <- c(1, 1 + params$flag_step * seq_len(params$n_rungs - 1))
+ladder_tag  <- paste0("step", params$flag_step)
+
+stopifnot(
+  "flag_copies must be strictly increasing" = all(diff(flag_copies) > 0),
+  "flag_copies must be a uniform ladder after the 1x rung" =
+    length(unique(diff(flag_copies))) == 1
+)
+
+cat("Ladder:", ladder_tag, "|", params$n_rungs, "rungs\n")
+
+cat("FLAG copy numbers:", paste0(flag_copies, "x", collapse = ", "), "\n")
+cat("lfc_cutoff =", lfc_cutoff, "| padj_cutoff =", padj_cutoff, "\n")
+```
+
+# 1. Import the FLAG Epitope
+
+```{r read_parts}
+parts_tbl <- read_excel(here("accessories", "cds seq.xlsx"))
+names(parts_tbl)[1] <- "construct"
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("flag3x", "p2a", "nanoluc")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+flag3x <- pseq[["flag3x"]]
+FLAG3X_AA <- "DYKDHDGDYKDHDIDYKDDDDK"
+
+# Orientation, asserted the same way as 04_: this row was once pasted as the
+# reverse complement, which is 66 nt and in frame and so passes every length and
+# composition check while translating to nonsense.
+stopifnot(
+  "flag3x is not 66 nt" = nchar(flag3x) == 66,
+  "flag3x does not encode the canonical 3xFLAG peptide" =
+    as.character(translate(DNAString(flag3x))) == FLAG3X_AA,
+  "Both orientations encode 3xFLAG: the orientation check is not discriminative" =
+    as.character(translate(reverseComplement(DNAString(flag3x)))) != FLAG3X_AA
+)
+cat("flag3x verified:", nchar(flag3x), "nt ->", FLAG3X_AA, "\n")
+
+# The repeat unit is the third repeat of the supplied sequence, which is the
+# canonical FLAG epitope. Taken from the spreadsheet, not written here.
+FLAG_UNIT <- substr(flag3x, 43, 66)
+stopifnot(
+  "The repeat unit is not 24 nt"   = nchar(FLAG_UNIT) == 24,
+  "The repeat unit is not DYKDDDDK" =
+    as.character(translate(DNAString(FLAG_UNIT))) == "DYKDDDDK"
+)
+cat("Repeat unit:", FLAG_UNIT, "->",
+    as.character(translate(DNAString(FLAG_UNIT))), "(24 nt)\n")
+```
+
+# 2. Build the Ladder
+
+```{r build_ladder}
+P2A_AA <- "ATNFSLLKQAGDVEENPGP"
+stopifnot("The p2a part does not encode the expected 19-aa P2A peptide" =
+            as.character(translate(DNAString(pseq[["p2a"]]))) == P2A_AA)
+
+nl <- load_nanoluc_construct()
+
+make_tag <- function(n) paste0("ATG", strrep(FLAG_UNIT, n))
+tags    <- set_names(map(flag_copies, make_tag), paste0(flag_copies, "xFLAG"))
+fusions <- map(tags, ~ paste0(.x, pseq[["p2a"]], nl$full))
+names(fusions) <- paste0(names(tags), "-P2A-NanoLuc")
+
+cat("Fusion ORF validation:\n")
+iwalk(fusions, ~ check_orf(.x, .y))
+
+nl_aa_full <- as.character(translate(DNAString(nl$full)))
+
+walk2(fusions, flag_copies, function(f, n) {
+  aa <- as.character(translate(DNAString(f)))
+  stopifnot(
+    "Fusion length is not base + n * 24" =
+      nchar(f) == 3 + 24 * n + nchar(pseq[["p2a"]]) + nchar(nl$full),
+    # The epitope must appear exactly n times, in frame. A tandem repeat is
+    # exactly where an off-by-one or a dropped copy would hide.
+    "FLAG epitope copy number does not match the rung" =
+      lengths(gregexpr("DYKDDDDK", aa, fixed = TRUE)) == n,
+    "P2A peptide not found exactly once in the fusion protein" =
+      lengths(gregexpr(P2A_AA, aa, fixed = TRUE)) == 1,
+    # A frame slip anywhere upstream changes every downstream residue.
+    "Fusion does not end with the full NanoLuc + PEST protein" =
+      endsWith(aa, nl_aa_full),
+    "NanoLuc portion is not bit-identical to the construct" =
+      substr(f, nchar(f) - nchar(nl$full) + 1, nchar(f)) == nl$full
+  )
+})
+cat("All", length(fusions), "rungs: copy number exact, single in-frame P2A,",
+    "C-terminal NanoLuc+PEST bit-identical\n")
+
+# The ladder must be exactly linear in copy number.
+len <- map_int(fusions, nchar)
+stopifnot("Ladder spacing is not 24 nt per FLAG copy" =
+            all(diff(len) == 24 * diff(flag_copies)))
+cat("Ladder lengths:", paste(len, collapse = " / "), "nt\n")
+```
+
+```{r ladder_table}
+ref_df <- tibble(
+  reporter    = names(fusions),
+  flag_copies = flag_copies,
+  cds_length  = map_int(fusions, nchar),
+  gc_pct      = map_dbl(fusions, orf_gc_pct),
+  gc3_pct     = map_dbl(fusions, orf_gc3_pct)
+)
+
+stopifnot(
+  "Reporter GC% out of range"  = all(ref_df$gc_pct  >= 0 & ref_df$gc_pct  <= 100),
+  "Reporter GC3% out of range" = all(ref_df$gc3_pct >= 0 & ref_df$gc3_pct <= 100)
+)
+
+print(ref_df %>% mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# An ordered series needs an ordered colour ramp, which categorical Okabe-Ito
+# cannot express. A purple ramp avoids the two reserved factor hues (#E69F00
+# eIF3d, #56B4E9 eIF3e) and the density-curve greys.
+ref_plot_df <- ref_df %>%
+  mutate(color = colorRampPalette(c("#EBC6DA", "#CC79A7", "#5C2443"))(n()),
+         linetype = "solid",
+         reporter = factor(reporter, levels = reporter))
+```
+
+# 3. MDA-MB-231 Background and Gene Set
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes:", nrow(promotes), "\n")
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes with a transcript:", nrow(tx_promotes), "\n")
+```
+
+```{r build_metrics}
+metrics_all <- build_cds_metrics(
+  here("accessories", "human", "txdb.gencode49.sqlite"))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+if (nrow(actb) == 1) {
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+  cat("ACTB CDS GC%:", round(actb$gc_pct, 2), "\n")
+}
+```
+
+# 4. Length Panel
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, FLAG copy-number ladder",
+  outfile = paste0("cds_reporter_05_density_cds_length_flag_ladder_",
+                   ladder_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 6
+)
+```
+
+# 5. Where Each Rung Lands
+
+```{r percentiles}
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+
+len_pct <- pct_tbl %>%
+  filter(metric == "cds_length") %>%
+  dplyr::select(reporter, cds_length = reporter_value,
+                pct_expressed, pct_promoted)
+print(len_pct)
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+
+write_csv(pct_tbl,
+          here("output", "cds_reporter_design",
+               paste0("05_flag_ladder_percentiles_vs_231_", ladder_tag, ".csv")))
+cat("Exported: 05_flag_ladder_percentiles_vs_231_", ladder_tag, ".csv\n", sep = "")
+```
+
+The design question a ladder answers is how many copies it takes to reach a given
+part of the distribution. Solved directly from the 24 nt-per-copy spacing rather
+than read off the panel.
+
+```{r copies_to_reach}
+base_len <- 3 + nchar(pseq[["p2a"]]) + nchar(nl$full)   # ATG + P2A + NanoLuc
+stopifnot("Base length does not match the 1x rung" =
+            base_len + 24 == ref_df$cds_length[ref_df$flag_copies == 1])
+
+targets <- tribble(
+  ~target,                          ~value,
+  "eIF3d promoted median",          median(promoted$cds_length),
+  "expressed transcriptome median", median(expressed$cds_length),
+  "eIF3d promoted 75th pct",        quantile(promoted$cds_length, 0.75),
+  "expressed 75th pct",             quantile(expressed$cds_length, 0.75)
+) %>%
+  mutate(copies_needed = ceiling((value - base_len) / 24),
+         length_at_that_copy = base_len + 24 * copies_needed,
+         value = round(value))
+
+print(targets)
+
+write_csv(targets,
+          here("output", "cds_reporter_design",
+               "05_flag_copies_to_reach_targets.csv"))
+cat("Exported: output/cds_reporter_design/05_flag_copies_to_reach_targets.csv\n")
+```
+
+# 6. Does the Ladder Actually Hold Composition Still?
+
+The premise is that FLAG copies move length without moving composition. That is
+a claim about these specific codons, so it is measured rather than assumed - and
+it holds for GC3 but **not** for total GC, because the FLAG epitope is GC-poor.
+
+```{r composition_drift}
+drift <- ref_df %>%
+  mutate(d_gc  = gc_pct  - gc_pct[flag_copies == 1],
+         d_gc3 = gc3_pct - gc3_pct[flag_copies == 1]) %>%
+  dplyr::select(flag_copies, cds_length, gc_pct, d_gc, gc3_pct, d_gc3) %>%
+  mutate(across(c(gc_pct, d_gc, gc3_pct, d_gc3), ~ round(.x, 2)))
+print(drift)
+
+iqr_gc  <- IQR(expressed$gc_pct)
+iqr_gc3 <- IQR(expressed$gc3_pct)
+cat(sprintf("\nAcross the whole ladder: GC moves %.2f points (%.1f%% of the expressed IQR, %.1f)\n",
+            diff(range(ref_df$gc_pct)),
+            100 * diff(range(ref_df$gc_pct)) / iqr_gc, iqr_gc))
+cat(sprintf("                        GC3 moves %.2f points (%.1f%% of the expressed IQR, %.1f)\n",
+            diff(range(ref_df$gc3_pct)),
+            100 * diff(range(ref_df$gc3_pct)) / iqr_gc3, iqr_gc3))
+cat(sprintf("                        length moves %d nt (%.0f%% of the expressed IQR, %.0f)\n",
+            diff(range(ref_df$cds_length)),
+            100 * diff(range(ref_df$cds_length)) / IQR(expressed$cds_length),
+            IQR(expressed$cds_length)))
+
+# In IQR units, how each axis moves across the ladder.
+len_share <- diff(range(ref_df$cds_length)) / IQR(expressed$cds_length)
+gc3_share <- diff(range(ref_df$gc3_pct))    / iqr_gc3
+gc_share  <- diff(range(ref_df$gc_pct))     / iqr_gc
+
+stopifnot("GC3 drift is not small relative to the length change: not a clean length ladder on GC3" =
+            gc3_share < len_share / 5)
+cat(sprintf("\nIn IQR units: length %.3f | GC3 %.3f | GC %.3f\n",
+            len_share, gc3_share, gc_share))
+cat("GC3 drift is >5x smaller than the length change: clean on the GC3 axis.\n")
+
+# GC is a different story, and the point is to surface it, not to fail on it.
+# FLAG is GC-poor, so copies dilute GC nearly as fast, in distribution units, as
+# they extend length. A ladder used to test a length effect would confound it
+# with GC unless that is controlled for.
+if (gc_share > len_share / 5) {
+  cat(sprintf("WARNING: GC drifts %.2f points (%.0f%% of the GC IQR) across the ladder,\n",
+              diff(range(ref_df$gc_pct)), 100 * gc_share))
+  cat(sprintf("         against a length change of %.0f%% of the length IQR.\n",
+              100 * len_share))
+  cat("         This ladder confounds length with GC. It is a length series with\n")
+  cat("         respect to GC3 only.\n")
+}
+```
+
+```{r export_sequences}
+seq_out <- tibble(
+  reporter = names(fusions),
+  flag_copies = flag_copies,
+  length_nt_stop_free = map_int(fusions, nchar),
+  gc_pct  = round(map_dbl(fusions, orf_gc_pct), 3),
+  gc3_pct = round(map_dbl(fusions, orf_gc3_pct), 3),
+  bases   = unlist(fusions, use.names = FALSE)
+)
+write_csv(seq_out,
+          here("output", "cds_reporter_design",
+               paste0("05_flag_ladder_assembled_sequences_", ladder_tag, ".csv")))
+cat("Exported: 05_flag_ladder_assembled_sequences_", ladder_tag, ".csv\n", sep = "")
+```
+
+# 7. Summary
+
+```{r summary}
+cat("=== FLAG copy-number ladder vs MDA-MB-231 ===\n\n")
+cat("Unit: DYKDDDDK, 24 nt, tandem. Base (ATG + P2A + NanoLuc+PEST):",
+    base_len, "nt\n\n")
+
+for (i in seq_len(nrow(ref_df))) {
+  cat(sprintf("%3dx FLAG  %5d nt (%3.0f codons)  GC %.1f%%  GC3 %.1f%%  ->  %4.1f pct expressed, %4.1f pct promoted\n",
+              ref_df$flag_copies[i], ref_df$cds_length[i],
+              ref_df$cds_length[i] / 3, ref_df$gc_pct[i], ref_df$gc3_pct[i],
+              len_pct$pct_expressed[i], len_pct$pct_promoted[i]))
+}
+
+cat(sprintf("\nMDA-MB-231 medians: all expressed %.0f nt | promoted %.0f nt\n",
+            median(expressed$cds_length), median(promoted$cds_length)))
+
+cat("\nCopies needed to reach:\n")
+for (i in seq_len(nrow(targets))) {
+  cat(sprintf("  %-32s %5.0f nt  ->  %3d copies (%d nt)\n",
+              targets$target[i], targets$value[i],
+              targets$copies_needed[i], targets$length_at_that_copy[i]))
+}
+```

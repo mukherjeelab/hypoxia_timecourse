@@ -1,0 +1,783 @@
+---
+title: "CDS reporter design 06 - SmBiT-P2A-tag constructs vs MDA-MB-231"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Three SmBiT-P2A constructs placed in the MDA-MB-231 CDS landscape, assembled from
+the `smBit n`, `p2a`, `HA`, `flag3x` and `egfp` rows of
+`accessories/cds seq.xlsx`:
+
+- **SmBiT-P2A-HA**, 120 nt
+- **SmBiT-P2A-FLAG**, 117 nt (1x FLAG = the `DYKDDDDK` repeat of `flag3x`)
+- **SmBiT-P2A-FLAG-link-eGFP**, 876 nt (the 36 nt Waldo linker sits between the
+  FLAG tag and eGFP)
+
+**MDA-MB-231 only**, same background and gene set as `01_`, `03_` and `04_`, so
+the panels are directly comparable. Section 5 draws each panel three times: the
+HA construct alone, HA + FLAG, and all three.
+
+**NanoLuc is deliberately absent from every panel**, as in `03_` and `04_`.
+Section 5 asserts that absence rather than relying on it having been left out.
+
+**Adding eGFP is what moves this family onto the distribution.** The two bare-tag
+constructs are ~120 nt, below the 1st percentile of the expressed transcriptome;
+they are not points inside the distribution and their reference lines sit on the
+y axis, which is why the length panel is also drawn zoomed to 2 kb. FLAG-link-eGFP
+at 876 nt is the first construct here that lands inside the gene curves. The
+percentiles in section 6 are the numbers to quote for the short pair.
+
+**eGFP also decides the composition**, as it did for the fusions in `03_`. It is
+723 of the 876 nt and is GC3 96.7%, so it pulls the whole construct to a GC3 the
+bare-tag versions never approach. The Waldo linker pulls very slightly the other
+way (GC3 41.7% over 12 codons) but cannot offset it. Section 6 reports both.
+
+**The Waldo linker ends in an in-frame EcoRI site.** `GAATTC` encodes Glu-Phe at
+the linker's C terminus, which is how the folding-reporter constructs are built,
+but it means the assembled ORF carries an internal EcoRI site. Section 1 counts
+`GAATTC` occurrences per construct so that is visible before anyone picks cloning
+enzymes.
+
+**Two design consequences follow from the parts.** They are stated here because
+the length numbers alone hide them:
+
+- **No assembled ORF here has a terminal stop codon.** All the parts are
+  stop-free, which is the correct basis for these metrics - every gene CDS here
+  is stop-stripped too. But each plasmid needs a stop appended after the final
+  part, and that is 3 nt this notebook does not count. Section 3 asserts the
+  absence rather than leaving it implicit.
+- **P2A separates the two halves, so the tag is on the downstream product, not on
+  SmBiT.** 2A skipping happens between the final Gly and Pro of P2A, so every
+  construct here makes the same 30-aa upstream product (SmBiT + 18 aa of P2A
+  remnant) and a downstream product that differs: 10 aa for HA, 9 for FLAG, and
+  **250 aa (~27.5 kDa) for FLAG-link-eGFP**. That last one is the only one of the
+  three with enough mass to resolve on a gel - the bare FLAG and HA peptides work
+  as a concept for "the second cistron was translated" but not as western
+  targets. Section 3 reports every product so the choice is explicit.
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+cat("lfc_cutoff =", lfc_cutoff, "| padj_cutoff =", padj_cutoff, "\n")
+```
+
+# 1. Import and Verify the Parts
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts$part)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("smbit n", "p2a", "ha", "flag3x", "egfp", "waldo linker", "nanoluc")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+smbit_n <- pseq[["smbit n"]]
+p2a     <- pseq[["p2a"]]
+ha      <- pseq[["ha"]]
+flag3x  <- pseq[["flag3x"]]
+egfp    <- pseq[["egfp"]]
+waldo   <- pseq[["waldo linker"]]
+
+cat("Parts read from the spreadsheet:\n")
+for (p in c("smbit n", "p2a", "ha", "flag3x", "waldo linker", "egfp")) {
+  s <- pseq[[p]]
+  cat(sprintf("  %-10s %3d nt (%3d codons)  %s\n", p, nchar(s), nchar(s) %/% 3,
+              if (nchar(s) <= 90) as.character(translate(DNAString(s)))
+              else paste0(substr(as.character(translate(DNAString(s))), 1, 30),
+                          "...")))
+}
+```
+
+The 1x FLAG tag is cut from the C-terminal `DYKDDDDK` repeat of the supplied
+`flag3x`, the same boundary `04_` and `05_` use, so the codons come from the
+spreadsheet rather than being written here. No `ATG` is prepended to any tag:
+unlike the FLAG fusions in `04_`, these tags sit downstream of P2A, not at the N
+terminus.
+
+```{r build_flag1x}
+FLAG3X_AA <- "DYKDHDGDYKDHDIDYKDDDDK"
+flag1x    <- substr(flag3x, 43, 66)
+
+stopifnot(
+  "flag3x does not encode the canonical 3xFLAG peptide" =
+    as.character(translate(DNAString(flag3x))) == FLAG3X_AA,
+  "1xFLAG is not 24 nt" = nchar(flag1x) == 24,
+  "1xFLAG is not the C-terminal repeat of flag3x" = endsWith(flag3x, flag1x)
+)
+cat("1xFLAG cut from flag3x [43:66]:", flag1x, "\n")
+```
+
+eGFP is used exactly as supplied: 723 nt, its own `ATG` start, no stop codon. The
+initiator is **kept**, so the FLAG-link-eGFP protein reads `...DYKDDDDK-M-VSKGEE...`
+with a Met between tag and fluorophore. That is the ordinary N-terminal tagging
+arrangement and costs one residue; `03_` uses the same eGFP sequence unchanged.
+
+```{r verify_egfp}
+EGFP_AA <- as.character(translate(DNAString(egfp)))
+stopifnot(
+  "egfp is not 723 nt"            = nchar(egfp) == 723,
+  "egfp does not start with ATG"  = substr(egfp, 1, 3) == "ATG",
+  "egfp carries a stop codon"     = !any(codon_split(egfp) %in% STOP_CODONS),
+  # Biological spot-check: the GFP chromophore. avGFP numbers it T65-Y66-G67,
+  # but eGFP carries an extra Val at position 2, so it sits at 66-68 here. The
+  # position matters: TYG also occurs at residue 39, so asserting the motif is
+  # merely present would pass on a sequence with no chromophore in place.
+  "egfp protein does not carry the TYG chromophore at residues 66-68" =
+    substr(EGFP_AA, 66, 68) == "TYG",
+  "egfp chromophore is not in the expected LTYGVQCF context" =
+    substr(EGFP_AA, 65, 72) == "LTYGVQCF",
+  "egfp protein does not start with MVSKGEELFTG" =
+    startsWith(EGFP_AA, "MVSKGEELFTG")
+)
+cat("eGFP:", nchar(egfp), "nt,", nchar(EGFP_AA), "aa, chromophore TYG at 66-68\n")
+```
+
+The Waldo folding-reporter linker joins the FLAG tag to eGFP. It ends in an
+in-frame `GAATTC` EcoRI site, which is how these constructs are built but leaves
+an internal EcoRI site in the ORF - counted below rather than discovered later.
+
+```{r verify_waldo}
+WALDO_AA <- "GSAGSAAGSGEF"
+stopifnot(
+  "waldo linker is not 36 nt"  = nchar(waldo) == 36,
+  "waldo linker is not in frame" = nchar(waldo) %% 3 == 0,
+  "waldo linker does not encode GSAGSAAGSGEF" =
+    as.character(translate(DNAString(waldo))) == WALDO_AA,
+  "waldo linker carries a stop codon" =
+    !any(codon_split(waldo) %in% STOP_CODONS),
+  # The EcoRI site must be in frame at the linker's 3' end, or the Glu-Phe it
+  # encodes would not be the two residues the design expects.
+  "waldo linker does not end with an in-frame GAATTC EcoRI site" =
+    endsWith(waldo, "GAATTC") && (nchar(waldo) - 6) %% 3 == 0
+)
+cat("Waldo linker:", nchar(waldo), "nt,", WALDO_AA,
+    "| GC3", round(compute_gc3_pct(waldo), 1), "%\n")
+cat("Ends in an in-frame EcoRI site (GAATTC -> EF)\n")
+```
+
+The expected peptides are asserted, and in each case the reverse complement is
+asserted **not** to encode them. A tag sequence can be in frame, the right
+length, and still be backwards - that happened to the `flag3x` row - so an
+orientation check that only confirmed the forward reading would pass either way
+and tell us nothing.
+
+```{r verify_peptides}
+SMBIT_AA <- "VTGYRLFEEIL"   # NanoBiT small fragment, 11 aa
+P2A_AA   <- "ATNFSLLKQAGDVEENPGP"
+HA_AA    <- "YPYDVPDYA"
+FLAG_AA  <- "DYKDDDDK"
+
+aa_of <- function(s) as.character(translate(DNAString(s)))
+rc_aa <- function(s) as.character(translate(reverseComplement(DNAString(s))))
+
+stopifnot(
+  "smBit n does not start with ATG" = substr(smbit_n, 1, 3) == "ATG",
+  "smBit n does not encode Met + the SmBiT peptide" =
+    aa_of(smbit_n) == paste0("M", SMBIT_AA),
+  "p2a does not encode the expected 19-aa P2A peptide" = aa_of(p2a) == P2A_AA,
+  "HA does not encode the YPYDVPDYA epitope"           = aa_of(ha)  == HA_AA,
+  "1xFLAG does not encode the DYKDDDDK epitope"        = aa_of(flag1x) == FLAG_AA
+)
+cat("Peptides confirmed: M+SmBiT, P2A, HA, 1xFLAG, eGFP\n")
+
+stopifnot(
+  "Both orientations encode SmBiT: the orientation check is not discriminative" =
+    rc_aa(smbit_n) != paste0("M", SMBIT_AA),
+  "Both orientations encode P2A: the orientation check is not discriminative" =
+    rc_aa(p2a) != P2A_AA,
+  "Both orientations encode HA: the orientation check is not discriminative" =
+    rc_aa(ha) != HA_AA,
+  "Both orientations encode FLAG: the orientation check is not discriminative" =
+    rc_aa(flag1x) != FLAG_AA,
+  "Both orientations encode eGFP: the orientation check is not discriminative" =
+    rc_aa(egfp) != EGFP_AA
+)
+cat("No reverse complement encodes its own peptide, so the checks discriminate\n")
+
+# No part may carry a stop codon, or the assembled ORF would terminate partway
+# through.
+stopifnot("A part carries a stop codon" =
+            !any(map_lgl(list(smbit_n, p2a, ha, flag1x, egfp),
+                         ~ any(codon_split(.x) %in% STOP_CODONS))))
+cat("No part carries a stop codon\n")
+```
+
+# 2. SmBiT vs the NanoLuc C-terminus
+
+SmBiT is derived from NanoLuc's C-terminal beta strand, so the two sequences are
+similar but **not** identical, and the difference is the whole point of the
+NanoBiT split. Pinning the relationship numerically means a change to either row
+of the spreadsheet fires this check instead of the two drifting apart silently.
+
+```{r smbit_vs_nanoluc}
+nl <- load_nanoluc_construct()
+nl_core_aa <- aa_of(nl$core)
+
+# The aligned window: NanoLuc's catalytic ORF ends ...VTGWRLCERILA, so the 11-mer
+# that lines up against SmBiT is the one ending one residue before the C terminus.
+nl_window <- substr(nl_core_aa, nchar(nl_core_aa) - 11, nchar(nl_core_aa) - 1)
+stopifnot("NanoLuc window is not 11 aa" = nchar(nl_window) == nchar(SMBIT_AA))
+
+mism <- which(strsplit(nl_window, "")[[1]] != strsplit(SMBIT_AA, "")[[1]])
+cat("NanoLuc C-terminal window:", nl_window, "\n")
+cat("SmBiT                    :", SMBIT_AA, "\n")
+cat("Mismatches:", length(mism), "at positions", paste(mism, collapse = ", "),
+    sprintf("(%s)\n", paste(
+      sprintf("%s%d%s",
+              substring(nl_window, mism, mism), mism,
+              substring(SMBIT_AA, mism, mism)), collapse = " ")))
+
+stopifnot(
+  # If this became 0, SmBiT would be the plain NanoLuc C-terminus and the split
+  # reporter would not be a split reporter.
+  "SmBiT is identical to the NanoLuc C-terminal window" = length(mism) > 0,
+  "SmBiT differs from the NanoLuc C-terminal window by other than 3 residues" =
+    length(mism) == 3,
+  "SmBiT peptide is a substring of the NanoLuc protein" =
+    !str_detect(nl_core_aa, fixed(SMBIT_AA))
+)
+
+# The codons differ too, not just the residues, so SmBiT was not cut out of this
+# NanoLuc sequence.
+cat("SmBiT DNA present in the NanoLuc construct:",
+    str_detect(nl$full, fixed(substr(smbit_n, 4, nchar(smbit_n)))), "\n")
+```
+
+# 3. Assemble the Constructs
+
+```{r assemble}
+# Everything downstream of P2A, per construct. The Waldo linker sits between the
+# FLAG tag and eGFP; eGFP keeps its own ATG.
+tags <- list("HA"             = ha,
+             "FLAG"           = flag1x,
+             "FLAG-link-eGFP" = paste0(flag1x, waldo, egfp))
+tag_aa <- list("HA"             = HA_AA,
+               "FLAG"           = FLAG_AA,
+               "FLAG-link-eGFP" = paste0(FLAG_AA, WALDO_AA, EGFP_AA))
+
+stopifnot(
+  "FLAG-link-eGFP tag is not FLAG + linker + eGFP" =
+    tags[["FLAG-link-eGFP"]] == paste0(flag1x, waldo, egfp),
+  "FLAG-link-eGFP tag length is not 24 + 36 + 723" =
+    nchar(tags[["FLAG-link-eGFP"]]) ==
+      nchar(flag1x) + nchar(waldo) + nchar(egfp),
+  # The order matters and is asserted on the peptide: FLAG, then the linker,
+  # then eGFP's initiator Met. Concatenating in the wrong order would still give
+  # the right length and the right GC, so length alone cannot catch it.
+  "FLAG-link-eGFP peptide does not read DYKDDDDK then the linker then Met" =
+    str_detect(tag_aa[["FLAG-link-eGFP"]],
+               fixed(paste0(FLAG_AA, WALDO_AA, "MVSKGEE")))
+)
+
+constructs <- map(tags, ~ paste0(smbit_n, p2a, .x))
+names(constructs) <- paste0("SmBiT-P2A-", names(tags))
+
+cat("Assembled ORF validation:\n")
+iwalk(constructs, ~ check_orf(.x, .y))
+
+iwalk(constructs, function(cs, nm) {
+  tag_key <- sub("^SmBiT-P2A-", "", nm)
+  tg      <- tags[[tag_key]]
+  aa      <- aa_of(cs)
+  stopifnot(
+    "Construct length is not the sum of its parts" =
+      nchar(cs) == nchar(smbit_n) + nchar(p2a) + nchar(tg),
+    "Construct does not begin with the SmBiT part" = startsWith(cs, smbit_n),
+    "Construct does not end with its tag part"     = endsWith(cs, tg),
+    "P2A part is not bit-identical inside the construct" =
+      substr(cs, nchar(smbit_n) + 1, nchar(smbit_n) + nchar(p2a)) == p2a,
+    "P2A peptide not found exactly once in the construct protein" =
+      lengths(gregexpr(P2A_AA, aa, fixed = TRUE)) == 1,
+    # A frame slip at either join changes every downstream residue, so asserting
+    # the protein ends in the tag peptide is what catches it.
+    "Construct protein does not end with its tag peptide" =
+      endsWith(aa, tag_aa[[tag_key]]),
+    "Construct protein does not start with Met + SmBiT" =
+      startsWith(aa, paste0("M", SMBIT_AA))
+  )
+})
+cat("All", length(constructs),
+    "constructs: length additive, single in-frame P2A, tag at the C terminus\n")
+
+# Stated, not assumed: the assembled ORFs are stop-free, which matches the
+# stop-stripped gene CDS basis but means each plasmid still needs a stop.
+iwalk(constructs, function(cs, nm) {
+  lc <- tail(codon_split(cs), 1)
+  stopifnot("Assembled construct unexpectedly carries a terminal stop" =
+              !lc %in% STOP_CODONS)
+  cat(sprintf("  %-22s terminal codon %s (%s) - no stop; add one in the plasmid\n",
+              nm, lc, substring(aa_of(cs), nchar(aa_of(cs)))))
+})
+
+# The constructs share the SmBiT + P2A head, so every length difference between
+# them must be exactly the tag length difference.
+head_nt <- nchar(smbit_n) + nchar(p2a)
+stopifnot("A construct's length is not its tag length plus the shared head" =
+            all(map_int(constructs, nchar) ==
+                  head_nt + map_int(tags[sub("^SmBiT-P2A-", "",
+                                             names(constructs))], nchar)))
+cat("Shared SmBiT+P2A head:", head_nt, "nt; constructs differ only by the tag\n")
+
+for (nm in names(constructs)) {
+  cat("\n", nm, " (", nchar(constructs[[nm]]), " nt / ",
+      nchar(aa_of(constructs[[nm]])), " aa )\n", sep = "")
+}
+```
+
+P2A skipping happens between the final Gly and Pro of the P2A peptide, so the
+ribosome makes two products from each ORF. Reporting both is the only way the
+tag's position is explicit.
+
+```{r p2a_products}
+prod_tbl <- imap_dfr(constructs, function(cs, nm) {
+  aa      <- aa_of(cs)
+  tag_key <- sub("^SmBiT-P2A-", "", nm)
+  skip_at <- str_locate(aa, fixed(P2A_AA))[1, "start"] + nchar(P2A_AA) - 2
+
+  upstream   <- substr(aa, 1, skip_at)
+  downstream <- substr(aa, skip_at + 1, nchar(aa))
+
+  stopifnot(
+    "P2A product split does not reconstitute the protein" =
+      paste0(upstream, downstream) == aa,
+    "Upstream product does not end at the P2A Gly-Pro junction" =
+      endsWith(upstream, "EENPG"),
+    "Downstream product is not Pro + the tag peptide" =
+      downstream == paste0("P", tag_aa[[tag_key]])
+  )
+
+  tibble(construct = nm,
+         product   = c("upstream (SmBiT + P2A remnant)",
+                       paste0("downstream (Pro + ", tag_key, ")")),
+         aa        = c(nchar(upstream), nchar(downstream)),
+         approx_kda = round(c(nchar(upstream), nchar(downstream)) * 0.11, 1))
+})
+print(prod_tbl)
+
+# The upstream product is identical for all three constructs: the tag is entirely
+# downstream of the skip, so it cannot affect the SmBiT half.
+up <- prod_tbl %>% filter(str_starts(product, "upstream"))
+stopifnot("Upstream products differ between constructs" = n_distinct(up$aa) == 1)
+cat("\nAll constructs make the identical", up$aa[1],
+    "aa upstream product; the tag is only on the downstream peptide.\n")
+
+# Only the eGFP construct's downstream product has enough mass to run on a gel.
+big <- prod_tbl %>% filter(str_starts(product, "downstream"), aa >= 50)
+cat("Downstream products large enough to resolve on a gel (>= 50 aa):",
+    if (nrow(big)) paste(big$construct, collapse = ", ") else "none", "\n")
+```
+
+```{r construct_table}
+ref_df <- tibble(
+  reporter   = names(constructs),
+  cds_length = map_int(constructs, nchar),
+  gc_pct     = map_dbl(constructs, orf_gc_pct),
+  gc3_pct    = map_dbl(constructs, orf_gc3_pct)
+)
+
+stopifnot(
+  "Reporter GC% out of range"  = all(ref_df$gc_pct  >= 0 & ref_df$gc_pct  <= 100),
+  "Reporter GC3% out of range" = all(ref_df$gc3_pct >= 0 & ref_df$gc3_pct <= 100)
+)
+print(ref_df %>% mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# Okabe-Ito dark blue / bluish green / reddish purple: avoid the density-curve
+# hues (grey70 / #E69F00) and the two reserved factor hues (#E69F00 eIF3d,
+# #56B4E9 eIF3e).
+ref_plot_df <- ref_df %>%
+  mutate(color    = c("#0072B2", "#009E73", "#CC79A7")[
+           match(reporter, names(constructs))],
+         linetype = "solid")
+```
+
+# 4. MDA-MB-231 Background and Gene Set
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes:", nrow(promotes), "\n")
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes with a transcript:", nrow(tx_promotes), "\n")
+```
+
+```{r build_metrics}
+metrics_all <- build_cds_metrics(
+  here("accessories", "human", "txdb.gencode49.sqlite"))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+if (nrow(actb) == 1) {
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+  cat("ACTB CDS GC%:", round(actb$gc_pct, 2),
+      "| GC3%:", round(actb$gc3_pct, 2), "\n")
+}
+
+cat(sprintf("\nShortest expressed CDS: %s nt\n", fmt_n(min(expressed$cds_length))))
+for (i in seq_len(nrow(ref_df))) {
+  cat(sprintf("  %-22s %4d nt | expressed shorter: %s of %s\n",
+              ref_df$reporter[i], ref_df$cds_length[i],
+              fmt_n(sum(expressed$cds_length < ref_df$cds_length[i])),
+              fmt_n(nrow(expressed))))
+}
+```
+
+# 5. Density Panels
+
+Every legend entry carries the number it stands for: each density curve shows its
+group median, each reference line its own value. Units follow the metric, not the
+axis - the length axis is drawn in kb because kb ticks are readable, but a
+construct is specified in nt, so the labels say nt.
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+
+# NanoLuc is deliberately not a reference line here. Asserted rather than
+# assumed, so re-adding it to ref_plot_df without updating the prose fires.
+stopifnot(
+  "NanoLuc should not be among the plotted reference lines" =
+    !any(str_detect(tolower(ref_plot_df$reporter), "nanoluc|nluc")),
+  "Expected exactly three reference lines" = nrow(ref_plot_df) == 3
+)
+
+# Three cumulative views. Keeping the earlier ones means a figure made from this
+# notebook before the eGFP construct existed can still be regenerated.
+views <- list(
+  list(key = "smbit_p2a_ha",
+       reporters = "SmBiT-P2A-HA",
+       title = "SmBiT-P2A-HA"),
+  list(key = "smbit_p2a_ha_flag",
+       reporters = c("SmBiT-P2A-HA", "SmBiT-P2A-FLAG"),
+       title = "SmBiT-P2A-HA and -FLAG"),
+  # Named generically rather than listing all three: spelling them out overruns
+  # the plot width at 9.5 in and the title is clipped. The legend names them.
+  list(key = "smbit_p2a_all",
+       reporters = c("SmBiT-P2A-HA", "SmBiT-P2A-FLAG", "SmBiT-P2A-FLAG-link-eGFP"),
+       title = "SmBiT-P2A constructs")
+)
+stopifnot("A view names a reporter that does not exist" =
+            all(unlist(map(views, "reporters")) %in% ref_plot_df$reporter))
+```
+
+```{r panels, fig.width=9.5, fig.height=5.5, results='hold'}
+for (v in views) {
+  rp <- ref_plot_df %>% filter(reporter %in% v$reporters)
+  stopifnot("View selected the wrong number of reference lines" =
+              nrow(rp) == length(v$reporters))
+
+  plot_density_luc(
+    expressed, promoted, "cds_length",
+    xlab    = "CDS length (kb)",
+    title   = paste0("CDS length, MDA-MB-231, ", v$title),
+    outfile = paste0("cds_reporter_06_density_cds_length_", v$key, ".pdf"),
+    luc_tbl = rp, group_cols = group_cols, xscale = 1000, xmax = 6)
+
+  # The bare-tag constructs land at ~0.12 kb, 2% of the way across the panel
+  # above, where they sit on the axis. The zoom is the readable version; the
+  # densities are unchanged, only the visible range differs.
+  plot_density_luc(
+    expressed, promoted, "cds_length",
+    xlab    = "CDS length (kb)",
+    # Same title as the wide panel: the zoom is a view of the same data, and the
+    # axis shows the range. The filename carries the distinction.
+    title   = paste0("CDS length, MDA-MB-231, ", v$title),
+    outfile = paste0("cds_reporter_06_density_cds_length_", v$key,
+                     "_zoom2kb.pdf"),
+    luc_tbl = rp, group_cols = group_cols, xscale = 1000, xmax = 2)
+
+  plot_density_luc(
+    expressed, promoted, "gc_pct",
+    xlab    = "CDS GC content (%)",
+    title   = paste0("CDS GC content, MDA-MB-231, ", v$title),
+    outfile = paste0("cds_reporter_06_density_cds_gc_", v$key, ".pdf"),
+    luc_tbl = rp, group_cols = group_cols)
+
+  plot_density_luc(
+    expressed, promoted, "gc3_pct",
+    xlab    = "CDS GC3 content (%)",
+    title   = paste0("CDS GC3 content, MDA-MB-231, ", v$title),
+    outfile = paste0("cds_reporter_06_density_cds_gc3_", v$key, ".pdf"),
+    luc_tbl = rp, group_cols = group_cols)
+}
+```
+
+# 6. Percentiles, Part Contributions and How Little the Bare Tags Separate
+
+```{r percentiles}
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+print(pct_tbl)
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+
+write_csv(pct_tbl,
+          here("output", "cds_reporter_design", "06_smbit_percentiles_vs_231.csv"))
+cat("Exported: output/cds_reporter_design/06_smbit_percentiles_vs_231.csv\n")
+```
+
+The two bare-tag constructs are one point for this analysis; FLAG-link-eGFP is not.
+Quantifying both spreads is the honest version of what the overlapping reference
+lines show.
+
+```{r spread}
+spread_of <- function(d, label) {
+  tibble(
+    set    = label,
+    metric = c("cds_length", "gc_pct", "gc3_pct"),
+    min    = c(min(d$cds_length), min(d$gc_pct), min(d$gc3_pct)),
+    max    = c(max(d$cds_length), max(d$gc_pct), max(d$gc3_pct))
+  ) %>%
+    mutate(
+      construct_range = max - min,
+      # How much of each gene distribution's own spread that range covers. A tiny
+      # fraction means the constructs are, for this analysis, one point.
+      gene_iqr_expressed = c(IQR(expressed$cds_length), IQR(expressed$gc_pct),
+                             IQR(expressed$gc3_pct)),
+      pct_of_gene_iqr = round(100 * construct_range / gene_iqr_expressed, 1),
+      across(c(min, max, construct_range, gene_iqr_expressed), ~ round(.x, 1))
+    )
+}
+
+spread <- bind_rows(
+  spread_of(ref_df %>% filter(reporter != "SmBiT-P2A-FLAG-link-eGFP"), "bare tags"),
+  spread_of(ref_df, "all three")
+)
+print(spread)
+
+# Discriminative: adding eGFP must widen the length spread by far more than the
+# bare pair's own range, or the two sets would not be worth reporting apart.
+bare_len <- spread$construct_range[spread$set == "bare tags" &
+                                     spread$metric == "cds_length"]
+all_len  <- spread$construct_range[spread$set == "all three" &
+                                     spread$metric == "cds_length"]
+stopifnot("Adding eGFP did not widen the length spread" = all_len > 10 * bare_len)
+
+write_csv(spread,
+          here("output", "cds_reporter_design", "06_smbit_construct_spread.csv"))
+```
+
+```{r part_contributions}
+part_df <- tibble(
+  part = c("SmBiT (ATG + 11 aa)", "P2A", "HA (1x)", "FLAG (1x)",
+           "Waldo linker", "eGFP", names(constructs)),
+  seq  = c(smbit_n, p2a, ha, flag1x, waldo, egfp,
+           unlist(constructs, use.names = FALSE))
+) %>%
+  transmute(part,
+            nt      = nchar(seq),
+            codons  = nchar(seq) %/% 3,
+            gc_pct  = map_dbl(seq, gc_pct_of),
+            gc3_pct = map_dbl(seq, compute_gc3_pct)) %>%
+  mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1)))
+print(part_df)
+
+getnt <- function(p) part_df$nt[part_df$part == p]
+stopifnot(
+  "HA part table does not sum to the construct length" =
+    getnt("SmBiT (ATG + 11 aa)") + getnt("P2A") + getnt("HA (1x)") ==
+      getnt("SmBiT-P2A-HA"),
+  "FLAG part table does not sum to the construct length" =
+    getnt("SmBiT (ATG + 11 aa)") + getnt("P2A") + getnt("FLAG (1x)") ==
+      getnt("SmBiT-P2A-FLAG"),
+  "FLAG-link-eGFP part table does not sum to the construct length" =
+    getnt("SmBiT (ATG + 11 aa)") + getnt("P2A") + getnt("FLAG (1x)") +
+      getnt("Waldo linker") + getnt("eGFP") ==
+        getnt("SmBiT-P2A-FLAG-link-eGFP")
+)
+
+# Internal EcoRI sites, which the Waldo linker introduces by design. Reported
+# rather than asserted away: it is a property of the linker, not a defect, but
+# it has to be visible before anyone picks cloning enzymes.
+ecori <- tibble(
+  construct = names(constructs),
+  n_ecori   = map_int(constructs, ~ str_count(.x, fixed("GAATTC")))
+)
+print(ecori)
+stopifnot(
+  "The linker-bearing construct should carry exactly one EcoRI site" =
+    ecori$n_ecori[ecori$construct == "SmBiT-P2A-FLAG-link-eGFP"] == 1,
+  # Discriminative: the bare-tag constructs have no linker, so they must have
+  # no EcoRI site, or the count is picking up something other than the linker.
+  "A construct without the linker carries an EcoRI site" =
+    all(ecori$n_ecori[ecori$construct != "SmBiT-P2A-FLAG-link-eGFP"] == 0)
+)
+
+write_csv(part_df,
+          here("output", "cds_reporter_design", "06_smbit_part_composition.csv"))
+
+# eGFP's share of the eGFP construct, which is why that construct's composition
+# is eGFP's composition.
+egfp_share <- 100 * nchar(egfp) / nchar(constructs[["SmBiT-P2A-FLAG-link-eGFP"]])
+cat(sprintf("\neGFP is %.1f%% of SmBiT-P2A-FLAG-link-eGFP by length, at GC3 %.1f%%;\n",
+            egfp_share, compute_gc3_pct(egfp)))
+cat(sprintf("the assembled construct lands at GC3 %.1f%% against a transcriptome median of %.1f%%\n",
+            ref_df$gc3_pct[ref_df$reporter == "SmBiT-P2A-FLAG-link-eGFP"],
+            median(expressed$gc3_pct)))
+
+seq_out <- tibble(
+  reporter = names(constructs),
+  length_nt_stop_free = map_int(constructs, nchar),
+  gc_pct   = round(map_dbl(constructs, orf_gc_pct), 3),
+  gc3_pct  = round(map_dbl(constructs, orf_gc3_pct), 3),
+  protein  = map_chr(constructs, aa_of),
+  bases    = unlist(constructs, use.names = FALSE)
+)
+write_csv(seq_out,
+          here("output", "cds_reporter_design",
+               "06_smbit_assembled_sequences.csv"))
+cat("Exported: 06_smbit_part_composition.csv, 06_smbit_construct_spread.csv,",
+    "06_smbit_assembled_sequences.csv\n")
+```
+
+# 7. Summary
+
+```{r summary}
+cat("=== SmBiT-P2A-tag constructs vs MDA-MB-231 ===\n\n")
+cat("Assembly: smBit n (ATG + SmBiT) + P2A (19 aa) + tag, all from the\n")
+cat("spreadsheet's own codons. 1xFLAG is cut from flag3x [43:66] (DYKDDDDK);\n")
+cat("eGFP is used as supplied, keeping its own ATG. No ATG on the tags: they\n")
+cat("sit downstream of P2A, not at the N terminus. No NanoLuc anywhere.\n\n")
+
+for (i in seq_len(nrow(ref_df))) {
+  cat(sprintf("%-22s %4d nt (%3d codons)  GC %.1f%%  GC3 %.1f%%\n",
+              ref_df$reporter[i], ref_df$cds_length[i],
+              ref_df$cds_length[i] / 3, ref_df$gc_pct[i], ref_df$gc3_pct[i]))
+}
+cat(sprintf("  shared head: %d nt (SmBiT %d + P2A %d); none has a stop codon\n",
+            head_nt, nchar(smbit_n), nchar(p2a)))
+
+cat(sprintf("\nMDA-MB-231 medians: all expressed %.0f nt / GC %.1f%% / GC3 %.1f%%\n",
+            median(expressed$cds_length), median(expressed$gc_pct),
+            median(expressed$gc3_pct)))
+cat(sprintf("                    promoted      %.0f nt / GC %.1f%% / GC3 %.1f%%\n",
+            median(promoted$cds_length), median(promoted$gc_pct),
+            median(promoted$gc3_pct)))
+
+cat("\nPercentiles:\n")
+for (i in seq_len(nrow(pct_tbl))) {
+  cat(sprintf("  %-22s %-11s %7.1f  ->  %5.1f pct expressed, %5.1f pct promoted\n",
+              pct_tbl$reporter[i], pct_tbl$metric[i], pct_tbl$reporter_value[i],
+              pct_tbl$pct_expressed[i], pct_tbl$pct_promoted[i]))
+}
+
+cat("\nSpread, as a share of the transcriptome IQR:\n")
+for (i in seq_len(nrow(spread))) {
+  cat(sprintf("  %-10s %-11s range %6.1f  = %5.1f%% of the expressed IQR (%.1f)\n",
+              spread$set[i], spread$metric[i], spread$construct_range[i],
+              spread$pct_of_gene_iqr[i], spread$gene_iqr_expressed[i]))
+}
+
+cat("\nP2A products:\n")
+for (i in seq_len(nrow(prod_tbl))) {
+  cat(sprintf("  %-22s %-34s %3d aa (~%5.1f kDa)\n", prod_tbl$construct[i],
+              prod_tbl$product[i], prod_tbl$aa[i], prod_tbl$approx_kda[i]))
+}
+```

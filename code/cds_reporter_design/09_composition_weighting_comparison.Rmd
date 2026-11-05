@@ -1,0 +1,468 @@
+---
+title: "CDS reporter design 09 - how the composition target depends on weighting"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  weight_condition: "normoxia"
+  weight_hours: [1, 4]
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below. Both
+# guards test `knitr.in.progress`, so a knit is never touched.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    weight_condition = "normoxia",  # "normoxia" | "hypoxia"
+    weight_hours     = list(1, 4)   # timepoints pooled for the weights
+  )
+}
+```
+
+# Summary
+
+**"Match the 231 transcriptome" is not one number - it depends on how you
+average across transcripts, and GC3 spans 3.5 points across five defensible
+ways of doing it.** Counting each transcript once gives 57.2%; weighting by mRNA
+abundance gives 59.4%, because abundant mRNAs are codon-optimal and GC3-rich.
+The *within-class* split is nearly indifferent: G:(G+C) moves only from 0.494 to
+0.514 across all five.
+
+**The ribosome-weighted answer lands on the unweighted one, not on the mRNA one
+- 57.3% against 57.2%, a 0.05-point difference.** That was not the expected
+result. It means the per-transcript target `08_` recodes against is also, to
+within a rounding error, the composition the translation machinery in these
+cells actually encounters, and that **mRNA weighting is the outlier** of the
+three biologically meaningful summaries rather than the more realistic one.
+Abundance and translation diverge enough that weighting by the former
+overstates GC3 by 2.2 points.
+
+**No change to `08_` follows.** The decision taken was per-transcript,
+unweighted, for consistency with every density panel and percentile in this
+folder; this notebook now also supplies a second, independent reason to keep it.
+The tRNA-competition objection - that unexpressed transcripts compete for
+nothing - is the one that would have argued for reweighting, and the riboseq
+answer defuses it.
+
+**A methodological finding came out of this, in section 3b: transcript-level
+riboseq quantification is unusable here.** At transcript level 48 of 86
+ribosomal protein transcripts carry exactly zero footprint TPM; summed to gene
+level the same genes sit 92-fold above the median. Footprints cover the CDS
+only, so isoforms differing in their UTRs are not separable and salmon's EM
+scatters their reads. RNA-seq passes the same check at transcript level, which
+is what pins the cause on footprints rather than on the isoform picks. **Any
+future notebook weighting by riboseq must aggregate to gene level first.**
+
+# 1. Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+
+BASES <- c("A", "C", "G", "T")
+```
+
+# 2. The Same Transcripts `08_` Uses
+
+```{r build}
+cds_seqs <- build_cds_seqs(here("accessories", "human", "txdb.gencode49.sqlite"))
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+# Internal codons: initiator and stop removed, both conditionally, matching the
+# modelling gc3_internal basis the reporter design now uses throughout.
+cds_int   <- Biostrings::DNAStringSet(trim_internal(as.character(cds_seqs)))
+names(cds_int) <- names(cds_seqs)
+expr_seqs <- cds_int[names(cds_int) %in% fm$transcript_id_clean]
+stopifnot("Expressed CDS subset is empty" = length(expr_seqs) > 0)
+cat("Expressed transcripts:", fmt_n(length(expr_seqs)), "\n")
+
+# Third-base counts per transcript. step = 3 counts codons in frame 0.
+cf <- trinucleotideFrequency(expr_seqs, step = 3)
+stopifnot("trinucleotideFrequency lost its codon column names" =
+            !is.null(colnames(cf)))
+b3_col <- str_sub(colnames(cf), 3, 3)
+n3 <- sapply(setNames(BASES, BASES),
+             function(b) rowSums(cf[, b3_col == b, drop = FALSE]))
+rownames(n3) <- names(expr_seqs)
+pct3 <- 100 * n3 / rowSums(n3)
+
+stopifnot("Per-transcript third-base percentages do not sum to 100" =
+            all(abs(rowSums(pct3) - 100) < 1e-9))
+```
+
+# 3. Two Sets of Weights: mRNA and Ribosomes
+
+Two different biological weightings, both from **siCTRL 231 cells in normoxia** -
+the untreated baseline, and the same state the feature matrix used to pick each
+gene's representative transcript:
+
+- **mRNA abundance** (RNA-seq TPM) - the composition of codons *present* in the
+  cell.
+- **Ribosome occupancy** (riboseq TPM) - the composition of codons actually
+  being *decoded*.
+
+Normoxia is pooled over the **1hr and 4hr** timepoints, following the project's
+convention that MDA-MB-231 normoxia means 1+4hr rather than 1hr alone. That
+convention was written for si3d contrasts and this is an abundance average, not
+a contrast, so it does not strictly bind - but pooling doubles the libraries
+behind each weight at no cost. `weight_condition` and `weight_hours` are
+parameters if a single timepoint or hypoxia is wanted instead.
+
+Sample IDs come from the metadata by condition rather than being typed in here,
+so a change to the design cannot leave this notebook quietly reading the wrong
+libraries.
+
+```{r pick_samples}
+meta <- read_csv(here("accessories", "metadata_231_timecourse.csv"),
+                 show_col_types = FALSE)
+names(meta)[1] <- "id"                       # strip the UTF-8 BOM on the header
+
+want_hours <- unlist(params$weight_hours)
+stopifnot(
+  "weight_condition must be normoxia or hypoxia" =
+    params$weight_condition %in% c("normoxia", "hypoxia"),
+  "weight_hours must name timepoints present in the metadata" =
+    all(want_hours %in% meta$hours)
+)
+
+pick <- function(seqtype) {
+  ids <- meta %>%
+    filter(type == seqtype, treatment == "siCTRL",
+           condition == params$weight_condition, hours %in% want_hours) %>%
+    pull(id)
+  stopifnot("Expected three replicates per timepoint for this library type" =
+              length(ids) == 3 * length(want_hours))
+  ids
+}
+rna_ids  <- pick("Input_Ribo_RNAseq")
+ribo_ids <- pick("RiboSeq")
+
+stopifnot("RNA and riboseq sample sets overlap" =
+            !length(intersect(rna_ids, ribo_ids)))
+wt_label <- sprintf("siCTRL %s %s", params$weight_condition,
+                    paste0(paste(want_hours, collapse = "+"), "hr"))
+cat("Weights from", wt_label, "\n")
+cat("  RNA :", paste(rna_ids,  collapse = ", "), "\n")
+cat("  Ribo:", paste(ribo_ids, collapse = ", "), "\n")
+```
+
+**Both weights are summed to gene level before use, and for riboseq that is not
+optional.** Footprints cover the CDS only, so isoforms of one gene that differ
+in their UTRs are nearly indistinguishable to the aligner and salmon's EM
+scatters the reads among them - often onto a different isoform than the one the
+feature matrix picked from RNA-seq. Section 3b measures how badly: at transcript
+level **48 of 86 ribosomal protein transcripts carry exactly zero** footprint
+TPM, while at gene level the same genes sit 92-fold above the median. RNA is
+summed the same way so the two weightings differ only in the assay.
+
+```{r tpm}
+load_tpm <- function(ids) {
+  f <- file.path(here("2025_MDAcells_riboseq", "salmon"), ids, "quant.sf.gz")
+  stopifnot("A salmon quant file is missing" = all(file.exists(f)))
+  map_dfr(f, ~ read_tsv(.x, col_types = "cdddd",
+            col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+            skip = 1) %>%
+      transmute(transcript_id_clean = sub("\\..*", "", Name), TPM)) %>%
+    group_by(transcript_id_clean) %>%
+    summarise(tpm = mean(TPM), .groups = "drop")
+}
+
+tx2gene <- read_tsv(here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+                    col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+# Sum every isoform's TPM onto its gene, then hand that gene total to whichever
+# transcript represents the gene in the count matrix.
+rep_gene <- tibble(transcript_id_clean = rownames(n3)) %>%
+  left_join(fm %>% dplyr::select(transcript_id_clean, gene_id_clean),
+            by = "transcript_id_clean")
+stopifnot("A representative transcript has no gene" =
+            !any(is.na(rep_gene$gene_id_clean)))
+
+gene_weights <- function(ids) {
+  g <- load_tpm(ids) %>%
+    inner_join(tx2gene, by = "transcript_id_clean") %>%
+    group_by(gene_id_clean) %>% summarise(tpm = sum(tpm), .groups = "drop")
+  v <- rep_gene %>% left_join(g, by = "gene_id_clean") %>%
+    mutate(tpm = replace_na(tpm, 0))
+  stopifnot("Weights are not aligned with the count matrix" =
+              identical(v$transcript_id_clean, rownames(n3)))
+  v$tpm
+}
+w_rna  <- gene_weights(rna_ids)
+w_ribo <- gene_weights(ribo_ids)
+
+stopifnot("A weight vector is empty" =
+            sum(w_rna > 0) > 0 && sum(w_ribo > 0) > 0)
+cat("Genes with TPM > 0 - RNA:", fmt_n(sum(w_rna > 0)),
+    "| ribo:", fmt_n(sum(w_ribo > 0)), "of", fmt_n(nrow(n3)), "\n")
+
+# Biological spot-check: ribosomal protein mRNAs are both abundant and heavily
+# translated, so they must beat the median gene under BOTH weightings. This is
+# the check that caught the transcript-level problem, so it is load-bearing
+# rather than decorative.
+is_rp <- rownames(n3) %in%
+  (fm %>% filter(str_detect(symbol, "^RP[LS][0-9]")) %>%
+     pull(transcript_id_clean))
+stopifnot(
+  "Ribosomal protein mRNAs are not more abundant than the median gene" =
+    median(w_rna[is_rp])  > median(w_rna[w_rna > 0]),
+  "Ribosomal protein mRNAs are not more translated than the median gene" =
+    median(w_ribo[is_rp]) > median(w_ribo[w_ribo > 0])
+)
+cat("Median TPM, ribosomal proteins vs all expressed - RNA:",
+    round(median(w_rna[is_rp]), 1), "vs", round(median(w_rna[w_rna > 0]), 1),
+    "| ribo:", round(median(w_ribo[is_rp]), 1), "vs",
+    round(median(w_ribo[w_ribo > 0]), 1), "\n")
+
+# The two weightings must not be near-identical, or comparing them says nothing.
+both <- w_rna > 0 & w_ribo > 0
+rho  <- cor(log2(w_rna[both]), log2(w_ribo[both]), method = "spearman")
+stopifnot("RNA and ribosome weights are effectively the same vector" = rho < 0.95)
+cat("Spearman correlation of log2 RNA and ribo TPM:", round(rho, 3),
+    "( n =", fmt_n(sum(both)), ")\n")
+```
+
+## 3b. Why gene level, measured
+
+The transcript-level version of the same weights, kept as a worked
+counter-example. Nothing downstream uses it.
+
+```{r transcript_level_failure}
+tx_weights <- function(ids) {
+  v <- rep_gene %>% left_join(load_tpm(ids), by = "transcript_id_clean") %>%
+    mutate(tpm = replace_na(tpm, 0))
+  v$tpm
+}
+w_ribo_tx <- tx_weights(ribo_ids)
+w_rna_tx  <- tx_weights(rna_ids)
+
+cmp <- tibble(
+  level  = c("transcript", "gene"),
+  rp_median_rna  = c(median(w_rna_tx[is_rp]),  median(w_rna[is_rp])),
+  rp_median_ribo = c(median(w_ribo_tx[is_rp]), median(w_ribo[is_rp])),
+  rp_zeros_ribo  = c(sum(w_ribo_tx[is_rp] == 0), sum(w_ribo[is_rp] == 0)),
+  n_rp           = sum(is_rp)
+)
+print(cmp %>% mutate(across(where(is.double), ~ round(.x, 2))))
+
+# The counter-example has to actually fail, or "use gene level" is unmotivated.
+stopifnot(
+  "Transcript-level riboseq no longer fails on ribosomal proteins: the reason for summing to gene level has gone" =
+    median(w_ribo_tx[is_rp]) <= median(w_ribo_tx[w_ribo_tx > 0]),
+  "Gene-level riboseq does not rescue ribosomal proteins" =
+    median(w_ribo[is_rp]) > median(w_ribo[w_ribo > 0]),
+  # RNA survives transcript level, which is what pins the cause on footprints
+  # being CDS-only rather than on the isoform choice being wrong in general.
+  "RNA also fails at transcript level: the cause is not specific to footprints" =
+    median(w_rna_tx[is_rp]) > median(w_rna_tx[w_rna_tx > 0])
+)
+cat("\nTranscript-level riboseq fails the ribosomal protein check;",
+    "gene-level passes; RNA passes at both.\n")
+cat("That asymmetry is the evidence: footprints cover CDS only, so UTR-distinct\n")
+cat("isoforms of one gene are not separable and the EM scatters their reads.\n")
+```
+
+**Why both weightings use the same formula.** Writing `n3` for a transcript's
+codon counts, `L` for its length and `p` for its fractional composition,
+`n3 = L * p`. Weighting by RNA TPM gives `sum(L * p * [mRNA])` - codons present,
+since TPM is a molar concentration. Riboseq TPM is proportional to
+`ribosomes / L`, so weighting by it gives `sum(ribosomes * p)` - the composition
+of codons under a ribosome. Different questions, identical line of code.
+
+Salmon on footprint reads is an approximation - its effective-length model is
+built for RNA fragments, not 28-30 nt footprints - but it is adequate for a
+composition summary, which is all it is used for here.
+
+# 4. Four Ways to Average
+
+Each row is the same underlying data summarised differently. **Expression
+weighting multiplies each transcript's codon counts by its TPM**, so the result
+is the composition of the codons actually present in the cell - TPM is a molar
+concentration, so a long abundant transcript contributes more codons than a
+short one at the same TPM.
+
+```{r weightings}
+wt_levels <- c("Per transcript, median", "Per transcript, mean",
+               "Pooled over codons", "mRNA weighted (RNA-seq)",
+               "Ribosome weighted (riboseq)")
+
+pooled_pct <- function(counts) 100 * colSums(counts) / sum(counts)
+
+comp <- bind_rows(
+  tibble(weighting = wt_levels[1], base = BASES, pct = apply(pct3, 2, median)),
+  tibble(weighting = wt_levels[2], base = BASES, pct = colMeans(pct3)),
+  tibble(weighting = wt_levels[3], base = BASES, pct = pooled_pct(n3)),
+  tibble(weighting = wt_levels[4], base = BASES, pct = pooled_pct(n3 * w_rna)),
+  tibble(weighting = wt_levels[5], base = BASES, pct = pooled_pct(n3 * w_ribo))
+) %>% mutate(weighting = factor(weighting, levels = wt_levels))
+
+# GC3 is normalised by the row's own total rather than taken as G + C. Every row
+# but the first is already a composition summing to 100; a median taken per base
+# is not, since median(G%) + median(C%) is not median(G% + C%). Without this the
+# median row's GC3 reads ~0.8 points low against the others purely as an
+# artefact of how it was summarised.
+summary_tbl <- comp %>%
+  pivot_wider(names_from = base, values_from = pct) %>%
+  mutate(total    = A + C + G + `T`,
+         gc3      = 100 * (G + C) / total,
+         g_of_gc  = G / (G + C),
+         a_of_at  = A / (A + `T`))
+
+# For the record, the statistic 08_ actually targets: the median across
+# transcripts of each transcript's own GC3. It is not any row of this table,
+# but it must sit within a point of the normalised median row or the two
+# notebooks are not describing the same population.
+target_gc3_used <- median(100 * (n3[, "G"] + n3[, "C"]) / rowSums(n3))
+stopifnot("The GC3 target used by 08_ disagrees with the median row here" =
+            abs(target_gc3_used -
+                  summary_tbl$gc3[summary_tbl$weighting == wt_levels[1]]) < 1)
+cat(sprintf("GC3 target used by 08_: %.2f%% (median of per-transcript GC3)\n",
+            target_gc3_used))
+
+stopifnot(
+  "A weighting other than the median does not sum to 100" =
+    all(abs(summary_tbl$total[-1] - 100) < 1e-6),
+  "A base percentage is out of range" = all(comp$pct >= 0 & comp$pct <= 100)
+)
+
+print(summary_tbl %>% mutate(across(where(is.double), ~ round(.x, 2))))
+
+gc3_spread      <- diff(range(summary_tbl$gc3))
+gc_ratio_spread <- diff(range(summary_tbl$g_of_gc))
+
+gc3_of <- function(lbl) summary_tbl$gc3[summary_tbl$weighting == lbl]
+d_chosen_rna  <- gc3_of(wt_levels[4]) - gc3_of(wt_levels[1])
+d_chosen_ribo <- gc3_of(wt_levels[5]) - gc3_of(wt_levels[1])
+d_rna_ribo    <- gc3_of(wt_levels[5]) - gc3_of(wt_levels[4])
+
+cat(sprintf("\nGC3 spans %.2f points across the five weightings.\n", gc3_spread))
+cat(sprintf("G:(G+C) spans %.3f - about %.1f codons in a 241-codon eGFP.\n",
+            gc_ratio_spread, gc_ratio_spread * 241))
+cat(sprintf("\nAgainst the chosen per-transcript target (%.2f%%):\n", gc3_of(wt_levels[1])))
+cat(sprintf("  mRNA weighted     %+.2f points\n", d_chosen_rna))
+cat(sprintf("  ribosome weighted %+.2f points\n", d_chosen_ribo))
+cat(sprintf("  ribosome vs mRNA  %+.2f points\n", d_rna_ribo))
+
+# The finding, asserted: the level is sensitive and the split is not. If this
+# ever flips, the recommendation in the summary no longer follows.
+stopifnot(
+  "GC3 is no longer sensitive to weighting: the finding has changed" =
+    gc3_spread > 2,
+  "The G:C split is no longer insensitive to weighting" =
+    gc_ratio_spread < 0.05
+)
+```
+
+# 5. The Figures
+
+The level is what moves, so it is shown against the spread it has to be judged
+against: a 3.2-point difference is small next to a 28.6-point IQR.
+
+```{r plot_gc3, fig.width=7.5, fig.height=4.5}
+tx_gc3 <- 100 * (n3[, "G"] + n3[, "C"]) / rowSums(n3)
+
+# The chosen target is black; the alternatives take Okabe-Ito hues that are not
+# reserved for eIF3d (#E69F00) or eIF3e (#56B4E9).
+# The chosen target in black, the two statistical alternatives in greys, and the
+# two biological weightings in colour, so the figure separates "a different way
+# of averaging" from "a different question".
+wt_cols <- setNames(c("black", "grey55", "grey75", "#0072B2", "#CC79A7"),
+                    wt_levels)
+
+gc3_lines <- summary_tbl %>%
+  dplyr::select(weighting, gc3) %>%
+  mutate(lab = sprintf("%s (%.1f%%)", weighting, gc3))
+
+p_gc3 <- ggplot(tibble(gc3 = tx_gc3), aes(x = gc3)) +
+  geom_density(fill = "grey70", color = "grey40", alpha = 0.15,
+               linewidth = 0.8) +
+  geom_vline(data = gc3_lines,
+             aes(xintercept = gc3, color = lab), linewidth = 0.8) +
+  scale_color_manual(values = setNames(wt_cols[as.character(gc3_lines$weighting)],
+                                       gc3_lines$lab)) +
+  labs(x = "CDS GC3 content (%)", y = "Density", color = NULL,
+       title = paste0("Where the GC3 target lands, by weighting (n = ",
+                      fmt_n(length(tx_gc3)), ")"),
+       subtitle = sprintf("Spread across weightings %.1f points; IQR of the distribution %.1f points",
+                          gc3_spread, IQR(tx_gc3))) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+print(p_gc3)
+ggsave(here("plots", "cds_reporter_09_gc3_target_by_weighting.pdf"),
+       p_gc3, width = 7.5, height = 4.5)
+```
+
+The split, by contrast, is indifferent: the four weightings sit almost on top of
+one another at every base.
+
+```{r plot_bases, fig.width=7.5, fig.height=4.5}
+# The legend is where the figure is read, so each entry says what the weighting
+# actually counts rather than just naming it. Short keys stay on the data and in
+# the exported table; these labels are display only. No em dashes - they render
+# as "..." in PDF output.
+wt_desc <- setNames(
+  c("Per transcript median: every mRNA counts once (the target 08_ uses)",
+    "Per transcript mean: every mRNA counts once, averaged not ranked",
+    "Pooled over codons: every codon counts once, so long CDS weigh more",
+    "mRNA weighted: by RNA-seq TPM, the codons present in the cell",
+    "Ribosome weighted: by riboseq TPM, the codons being decoded"),
+  wt_levels)
+
+p_base <- ggplot(comp, aes(x = base, y = pct, color = weighting)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.6) +
+  scale_color_manual(values = wt_cols, labels = wt_desc) +
+  expand_limits(y = 0) +
+  # The title carries "third codon position", so the x axis names only what its
+  # ticks show (A/C/G/T) rather than repeating the same phrase twice.
+  labs(x = "Base", y = "Percent of codons", color = NULL,
+       title = "Third codon position, by weighting") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+print(p_base)
+ggsave(here("plots", "cds_reporter_09_third_base_by_weighting.pdf"),
+       p_base, width = 7.5, height = 4.5)
+```
+
+# 6. Output
+
+```{r write_outputs}
+write_csv(summary_tbl, here("output", "cds_reporter_design",
+                            "09_composition_by_weighting.csv"))
+cat("Exported: 09_composition_by_weighting.csv\n")
+```
+
+A **riboseq-weighted** version would be the "what is actually being translated"
+answer rather than "what mRNA is present", and is the same code with footprint
+counts in place of `tpm`. It is not built here because the decision above did not
+turn on it, but it is the next weighting to try if the question becomes about
+decoding.
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

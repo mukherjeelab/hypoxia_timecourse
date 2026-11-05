@@ -1,0 +1,494 @@
+---
+title: "CDS reporter design 04 - FLAG-P2A-NanoLuc fusions vs MDA-MB-231"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+The FLAG counterpart to `03_`: 1xFLAG-, 2xFLAG- and 3xFLAG-P2A-NanoLuc placed in
+the MDA-MB-231 CDS landscape. **MDA-MB-231 only**, same background and gene set as
+`01_` and `03_`, so all three notebooks' panels are directly comparable.
+
+As in `03_`, the whole fusion is one ORF and is measured as one CDS: P2A is
+ribosome skipping, not termination. NanoLuc keeps its junction + PEST tail.
+
+**The three constructs differ by only 21 nt per tag copy**, so they are 720, 741
+and 762 nt. On a density axis that spans the whole transcriptome those three lines
+sit essentially on top of one another; section 6 reports the separation
+numerically, which is the only place it is readable. The GC3 panel separates them
+slightly better than length does, but not by much. These panels answer "where does
+a FLAG-NanoLuc reporter sit", not "how do 1x, 2x and 3x differ from each other".
+
+# Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+cat("lfc_cutoff =", lfc_cutoff, "| padj_cutoff =", padj_cutoff, "\n")
+```
+
+# 1. Import and Verify the FLAG Tag
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("flag3x", "p2a", "nanoluc", "gfp3xflagdestab")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+flag3x   <- pseq[["flag3x"]]
+FLAG3X_AA <- "DYKDHDGDYKDHDIDYKDDDDK"
+
+cat("flag3x:", nchar(flag3x), "nt,", nchar(flag3x) %/% 3, "codons\n")
+cat("  translates to:", as.character(translate(DNAString(flag3x))), "\n")
+
+stopifnot(
+  "flag3x is not 66 nt" = nchar(flag3x) == 66,
+  "flag3x does not encode the canonical 3xFLAG peptide" =
+    as.character(translate(DNAString(flag3x))) == FLAG3X_AA
+)
+```
+
+An earlier version of this row was pasted as the **reverse complement**, which is
+in frame and 66 nt and so passes a length check while translating to nonsense.
+That is exactly the failure a range check cannot catch, so the orientation is
+asserted two ways: the peptide must be 3xFLAG, and it must agree with the 3xFLAG
+already embedded in the `gfp3xflagdestab` row.
+
+```{r verify_orientation}
+# Independent confirmation from a second sequence in the same sheet. Compared at
+# the PEPTIDE level, not the DNA level: the two copies differ by one synonymous
+# base (GGC here vs GGT in gfp3xflagdestab) at the Gly of the first repeat.
+gfp3x_aa <- as.character(translate(DNAString(pseq[["gfp3xflagdestab"]])))
+stopifnot("3xFLAG peptide not found in gfp3xflagdestab" =
+            str_detect(gfp3x_aa, fixed(FLAG3X_AA)))
+cat("3xFLAG peptide confirmed inside gfp3xflagdestab\n")
+
+# And the reverse complement must NOT encode 3xFLAG, or the check above would
+# pass in either orientation and tell us nothing.
+flag_rc <- as.character(reverseComplement(DNAString(flag3x)))
+stopifnot("Both orientations encode 3xFLAG: the orientation check is not discriminative" =
+            as.character(translate(DNAString(flag_rc))) != FLAG3X_AA)
+cat("Reverse complement does NOT encode 3xFLAG, so the check discriminates\n")
+
+# Locate the 3xFLAG peptide in the GFP construct's protein, map back to the
+# nucleotides that encode it, and compare base by base with flag3x.
+aa_start <- str_locate(gfp3x_aa, fixed(FLAG3X_AA))[1, "start"]
+nt_start <- (aa_start - 1) * 3 + 1
+gfp3x_dna <- substr(pseq[["gfp3xflagdestab"]], nt_start, nt_start + 65)
+
+stopifnot("Mapped nucleotides do not re-encode 3xFLAG" =
+            as.character(translate(DNAString(gfp3x_dna))) == FLAG3X_AA)
+
+n_syn <- sum(strsplit(flag3x, "")[[1]] != strsplit(gfp3x_dna, "")[[1]])
+cat("Synonymous base differences vs the gfp3xflagdestab copy:", n_syn,
+    "(same peptide, so the tags agree)\n")
+```
+
+# 2. Build the Nested 1x / 2x / 3x Tags
+
+The 3xFLAG is three **different** repeats, not three copies of one epitope, so 1x
+and 2x are cut from the C-terminal end of the supplied sequence. The three tags
+are then nested: 1x is a suffix of 2x is a suffix of 3x, and all three use the
+codons from the spreadsheet rather than any written here.
+
+An `ATG` is prepended to each, because FLAG is N-terminal in these fusions and the
+supplied tag starts `GAC` (Asp) with no initiator.
+
+```{r build_tags}
+# Repeat boundaries: DYKDHDG (7 aa) | DYKDHDI (7 aa) | DYKDDDDK (8 aa).
+rep1 <- substr(flag3x,  1, 21)
+rep2 <- substr(flag3x, 22, 42)
+rep3 <- substr(flag3x, 43, 66)
+
+stopifnot(
+  "Repeat split does not reconstitute flag3x" =
+    paste0(rep1, rep2, rep3) == flag3x,
+  "Repeat 1 is not DYKDHDG"  =
+    as.character(translate(DNAString(rep1))) == "DYKDHDG",
+  "Repeat 2 is not DYKDHDI"  =
+    as.character(translate(DNAString(rep2))) == "DYKDHDI",
+  "Repeat 3 is not DYKDDDDK" =
+    as.character(translate(DNAString(rep3))) == "DYKDDDDK"
+)
+cat("3xFLAG splits cleanly into DYKDHDG / DYKDHDI / DYKDDDDK\n")
+
+tags <- list(
+  "1xFLAG" = paste0("ATG", rep3),
+  "2xFLAG" = paste0("ATG", rep2, rep3),
+  "3xFLAG" = paste0("ATG", rep1, rep2, rep3)
+)
+
+# Nesting, asserted on the DNA. If a tag were rebuilt from a retyped epitope
+# rather than cut from the supplied sequence, this is what would fail.
+stopifnot(
+  "2xFLAG does not end with the 1xFLAG tag body" =
+    endsWith(tags$`2xFLAG`, rep3),
+  "3xFLAG does not end with the 2xFLAG tag body" =
+    endsWith(tags$`3xFLAG`, paste0(rep2, rep3)),
+  "3xFLAG tag body is not the supplied flag3x" =
+    tags$`3xFLAG` == paste0("ATG", flag3x),
+  "A tag does not start with ATG" =
+    all(map_lgl(tags, ~ substr(.x, 1, 3) == "ATG")),
+  "A tag is not in frame" = all(map_int(tags, nchar) %% 3 == 0)
+)
+
+tag_tbl <- tibble(
+  tag    = names(tags),
+  nt     = map_int(tags, nchar),
+  codons = map_int(tags, ~ nchar(.x) %/% 3),
+  peptide = map_chr(tags, ~ as.character(translate(DNAString(.x))))
+)
+print(tag_tbl)
+
+stopifnot(
+  "1xFLAG peptide is not MDYKDDDDK" =
+    tag_tbl$peptide[tag_tbl$tag == "1xFLAG"] == "MDYKDDDDK",
+  "2xFLAG peptide is not MDYKDHDIDYKDDDDK" =
+    tag_tbl$peptide[tag_tbl$tag == "2xFLAG"] == "MDYKDHDIDYKDDDDK",
+  "3xFLAG peptide is not M + 3xFLAG" =
+    tag_tbl$peptide[tag_tbl$tag == "3xFLAG"] == paste0("M", FLAG3X_AA)
+)
+```
+
+# 3. Assemble and Verify the Fusions
+
+```{r nanoluc}
+nl <- load_nanoluc_construct()
+```
+
+```{r build_fusions}
+P2A_AA <- "ATNFSLLKQAGDVEENPGP"
+stopifnot("The p2a part does not encode the expected 19-aa P2A peptide" =
+            as.character(translate(DNAString(pseq[["p2a"]]))) == P2A_AA)
+
+fusions <- map(tags, ~ paste0(.x, pseq[["p2a"]], nl$full))
+names(fusions) <- paste0(names(tags), "-P2A-NanoLuc")
+
+cat("Fusion ORF validation:\n")
+iwalk(fusions, ~ check_orf(.x, .y))
+
+nl_aa_full <- as.character(translate(DNAString(nl$full)))
+
+iwalk(fusions, function(f, nm) {
+  aa <- as.character(translate(DNAString(f)))
+  tag_nt <- tags[[sub("-P2A-NanoLuc", "", nm)]]
+  stopifnot(
+    "Fusion length is not the sum of its parts" =
+      nchar(f) == nchar(tag_nt) + nchar(pseq[["p2a"]]) + nchar(nl$full),
+    "P2A peptide not found exactly once in the fusion protein" =
+      lengths(gregexpr(P2A_AA, aa, fixed = TRUE)) == 1,
+    # A frame slip at either join changes every downstream residue, so this is
+    # the check that catches it.
+    "Fusion does not end with the full NanoLuc + PEST protein" =
+      endsWith(aa, nl_aa_full),
+    "NanoLuc portion of the fusion is not bit-identical to the construct" =
+      substr(f, nchar(f) - nchar(nl$full) + 1, nchar(f)) == nl$full,
+    "Fusion does not begin with its FLAG tag" = startsWith(f, tag_nt)
+  )
+})
+cat("All", length(fusions), "fusions: length additive, single in-frame P2A,",
+    "C-terminal NanoLuc+PEST bit-identical\n")
+
+# The three fusions must differ by exactly one repeat each, which is the only
+# thing that distinguishes them.
+len <- map_int(fusions, nchar)
+stopifnot(
+  "1x -> 2x is not one 21 nt repeat" = len[2] - len[1] == 21,
+  "2x -> 3x is not one 21 nt repeat" = len[3] - len[2] == 21
+)
+cat("Fusion lengths:", paste(len, collapse = " / "), "nt (21 nt apart)\n")
+```
+
+```{r fusion_table}
+ref_df <- tibble(
+  reporter   = names(fusions),
+  cds_length = map_int(fusions, nchar),
+  gc_pct     = map_dbl(fusions, orf_gc_pct),
+  gc3_pct    = map_dbl(fusions, orf_gc3_pct)
+)
+
+stopifnot(
+  "Reporter GC% out of range"  = all(ref_df$gc_pct  >= 0 & ref_df$gc_pct  <= 100),
+  "Reporter GC3% out of range" = all(ref_df$gc3_pct >= 0 & ref_df$gc3_pct <= 100),
+  "A fusion is not longer than NanoLuc alone" =
+    all(ref_df$cds_length > nchar(nl$full))
+)
+
+print(ref_df %>% mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1))))
+
+# Colours avoid the density-curve hues (grey70 / #E69F00) and the two reserved
+# factor hues (#E69F00 eIF3d, #56B4E9 eIF3e).
+ref_plot_df <- ref_df %>%
+  mutate(color    = c("#0072B2", "#009E73", "#CC79A7"),
+         linetype = "solid")
+```
+
+# 4. MDA-MB-231 Background and Gene Set
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia-promoted genes:", nrow(promotes), "\n")
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat("Promoted genes with a transcript:", nrow(tx_promotes), "\n")
+```
+
+```{r build_metrics}
+metrics_all <- build_cds_metrics(
+  here("accessories", "human", "txdb.gencode49.sqlite"))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+if (nrow(actb) == 1) {
+  stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+  cat("ACTB CDS GC%:", round(actb$gc_pct, 2),
+      "| GC3%:", round(actb$gc3_pct, 2), "\n")
+}
+```
+
+# 5. Density Panels
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, FLAG-P2A-NanoLuc",
+  outfile = "cds_reporter_04_density_cds_length_flag.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = 6
+)
+```
+
+```{r panel_gc, fig.width=9.5, fig.height=5.5}
+p_gc <- plot_density_luc(
+  expressed, promoted, "gc_pct",
+  xlab    = "CDS GC content (%)",
+  title   = "CDS GC content, MDA-MB-231, FLAG-P2A-NanoLuc",
+  outfile = "cds_reporter_04_density_cds_gc_flag.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols
+)
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, FLAG-P2A-NanoLuc",
+  outfile = "cds_reporter_04_density_cds_gc3_flag.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols
+)
+```
+
+# 6. Percentiles and How Little the Tags Separate
+
+```{r percentiles}
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+print(pct_tbl)
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+
+write_csv(pct_tbl,
+          here("output", "cds_reporter_design", "04_flag_percentiles_vs_231.csv"))
+cat("Exported: output/cds_reporter_design/04_flag_percentiles_vs_231.csv\n")
+```
+
+The three constructs span a small range on every axis. Quantifying that spread is
+the honest version of what the overlapping reference lines show.
+
+```{r spread}
+spread <- tibble(
+  metric = c("cds_length", "gc_pct", "gc3_pct"),
+  min    = c(min(ref_df$cds_length), min(ref_df$gc_pct), min(ref_df$gc3_pct)),
+  max    = c(max(ref_df$cds_length), max(ref_df$gc_pct), max(ref_df$gc3_pct))
+) %>%
+  mutate(
+    construct_range = max - min,
+    # How much of each gene distribution's own spread that range covers. A tiny
+    # fraction means the three constructs are, for this analysis, one point.
+    gene_iqr_expressed = c(IQR(expressed$cds_length), IQR(expressed$gc_pct),
+                           IQR(expressed$gc3_pct)),
+    pct_of_gene_iqr = round(100 * construct_range / gene_iqr_expressed, 1),
+    across(c(min, max, construct_range, gene_iqr_expressed), ~ round(.x, 1))
+  )
+print(spread)
+
+write_csv(spread,
+          here("output", "cds_reporter_design", "04_flag_construct_spread.csv"))
+cat("Exported: output/cds_reporter_design/04_flag_construct_spread.csv\n")
+```
+
+```{r part_contributions}
+part_df <- tibble(
+  part = c("1xFLAG tag (ATG+)", "2xFLAG tag (ATG+)", "3xFLAG tag (ATG+)",
+           "P2A", "NanoLuc construct"),
+  seq  = c(tags$`1xFLAG`, tags$`2xFLAG`, tags$`3xFLAG`,
+           pseq[["p2a"]], nl$full)
+) %>%
+  transmute(part,
+            nt      = nchar(seq),
+            codons  = nchar(seq) %/% 3,
+            gc_pct  = map_dbl(seq, gc_pct_of),
+            gc3_pct = map_dbl(seq, compute_gc3_pct)) %>%
+  mutate(across(c(gc_pct, gc3_pct), ~ round(.x, 1)))
+print(part_df)
+
+write_csv(part_df,
+          here("output", "cds_reporter_design", "04_flag_part_composition.csv"))
+
+seq_out <- tibble(
+  reporter = names(fusions),
+  length_nt_stop_free = map_int(fusions, nchar),
+  gc_pct  = round(map_dbl(fusions, orf_gc_pct), 3),
+  gc3_pct = round(map_dbl(fusions, orf_gc3_pct), 3),
+  bases   = unlist(fusions, use.names = FALSE)
+)
+write_csv(seq_out,
+          here("output", "cds_reporter_design",
+               "04_flag_assembled_sequences.csv"))
+cat("Exported: 04_flag_part_composition.csv, 04_flag_assembled_sequences.csv\n")
+```
+
+# 7. Summary
+
+```{r summary}
+cat("=== FLAG-P2A-NanoLuc constructs vs MDA-MB-231 ===\n\n")
+cat("Assembly: ATG + <nested FLAG tag> + P2A (19 aa) + NanoLuc + junction/PEST\n")
+cat("Tags cut from the C-terminal end of the supplied flag3x, so 1x is nested\n")
+cat("inside 2x inside 3x, all using the spreadsheet's own codons.\n\n")
+
+for (i in seq_len(nrow(ref_df))) {
+  cat(sprintf("%-24s %5d nt (%3d codons)  GC %.1f%%  GC3 %.1f%%\n",
+              ref_df$reporter[i], ref_df$cds_length[i],
+              ref_df$cds_length[i] / 3, ref_df$gc_pct[i], ref_df$gc3_pct[i]))
+}
+
+cat(sprintf("\nMDA-MB-231 medians: all expressed %.0f nt / GC3 %.1f%% | promoted %.0f nt / GC3 %.1f%%\n",
+            median(expressed$cds_length), median(expressed$gc3_pct),
+            median(promoted$cds_length),  median(promoted$gc3_pct)))
+
+cat("\nSpread across the three constructs, as a share of the transcriptome IQR:\n")
+for (i in seq_len(nrow(spread))) {
+  cat(sprintf("  %-11s range %7.1f  = %.1f%% of the expressed IQR (%.1f)\n",
+              spread$metric[i], spread$construct_range[i],
+              spread$pct_of_gene_iqr[i], spread$gene_iqr_expressed[i]))
+}
+
+cat("\nPercentile of each construct:\n")
+for (i in seq_len(nrow(pct_tbl))) {
+  cat(sprintf("  %-24s %-11s %7.1f  ->  %5.1f pct expressed, %5.1f pct promoted\n",
+              pct_tbl$reporter[i], pct_tbl$metric[i], pct_tbl$reporter_value[i],
+              pct_tbl$pct_expressed[i], pct_tbl$pct_promoted[i]))
+}
+```
