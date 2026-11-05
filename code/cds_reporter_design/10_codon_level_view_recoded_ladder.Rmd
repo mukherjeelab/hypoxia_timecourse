@@ -1,0 +1,768 @@
+---
+title: "CDS reporter design 10 - codon-level view of the recoded eGFP ladder"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  run_tag: "upto3x_expressed"
+  max_gfp_copies: 3
+  codons_per_line: 60
+  min_codon_prop: 0.08
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below. Both
+# guards test `knitr.in.progress`, so a knit is never touched.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    run_tag         = "upto3x_expressed",
+    max_gfp_copies  = 3,
+    codons_per_line = 60,
+    min_codon_prop  = 0.08
+  )
+}
+```
+
+# Overview
+
+The recode notebook reports the ladder as **composition**: GC, GC3, third-base
+percentages, percentiles against the expressed background. Those numbers are
+what the design was matched on, but they are not what gets ordered, and they
+cannot answer "which codon sits at position 412, and did we change it?" The
+assembled sequences exist only as a single flat string per construct in
+`08_recoded_assembled_sequences_*.csv`. This notebook is the codon-level
+reading of those same strings.
+
+Two things are shown, and a third is checked on the way:
+
+1. **Where every codon is, and which ones were touched.** A tile map of all
+   four rungs at codon resolution, colored by third base, plus the same grid
+   colored by whether the codon was recoded, left alone, or structurally
+   unable to change. Then the sequences printed out codon by codon with the
+   same coloring, as a lab reference to read against a synthesis order.
+2. **Whether the chosen codons track MDA-MB-231 usage.** The recoder samples
+   each position's codon in proportion to the pooled synonymous usage of the
+   expressed transcriptome, but only *after* the third base has been forced by
+   the GC3 target. Those two steps pull in different directions, so this is
+   measured in two panels: raw, which shows the composition constraint's
+   footprint, and within each (amino acid, third base) cell, which isolates the
+   sampler from the constraint.
+
+**This notebook re-derives the originals rather than reading them.** Showing
+*changed vs unchanged* needs the pre-recode sequences and *free vs fixed* needs
+the part boundaries, and neither is in the exported files. So the parts are
+re-imported from `cds seq.xlsx` and the original ladder is rebuilt here, the
+same way `08_` builds it, then diffed against the exported recoded sequences.
+That is a benefit rather than a cost: the diff is an independent check that the
+exported sequences really are synonymous with the originals, run outside the
+notebook that produced them.
+
+Nothing here is random. The recoding already happened; this reads its output.
+
+# 1. Load Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(readxl)
+library(Biostrings)
+library(scales)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 7)
+
+indir  <- here("output", "cds_reporter_design")
+outdir <- indir
+```
+
+# 2. Import and Verify the Parts
+
+Identical import and verification to `07_` and `08_`, so all three notebooks
+are provably building from the same parts.
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts$part)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("smbit n", "p2a", "flag3x", "egfp", "waldo linker")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+smbit_n <- pseq[["smbit n"]]
+p2a     <- pseq[["p2a"]]
+flag3x  <- pseq[["flag3x"]]
+egfp    <- pseq[["egfp"]]
+waldo   <- pseq[["waldo linker"]]
+flag1x  <- substr(flag3x, 43, 66)
+
+aa_of <- function(s) as.character(translate(DNAString(s)))
+
+stopifnot(
+  "smBit n does not encode Met + the SmBiT peptide" =
+    aa_of(smbit_n) == "MVTGYRLFEEIL",
+  "p2a does not encode the expected 19-aa P2A peptide" =
+    aa_of(p2a) == "ATNFSLLKQAGDVEENPGP",
+  "1xFLAG does not encode the DYKDDDDK epitope" = aa_of(flag1x) == "DYKDDDDK",
+  "egfp is not 723 nt" = nchar(egfp) == 723,
+  "egfp protein does not carry the TYG chromophore at residues 66-68" =
+    substr(aa_of(egfp), 66, 68) == "TYG",
+  "waldo linker does not encode GSAGSAAGSGEF" = aa_of(waldo) == "GSAGSAAGSGEF"
+)
+cat("Parts verified.\n")
+```
+
+## The original ladder, rebuilt
+
+```{r rebuild_originals}
+gfp_copies <- 0:params$max_gfp_copies
+originals  <- {
+  bb <- paste0(smbit_n, p2a, flag1x)
+  map_chr(gfp_copies, function(n)
+    if (n == 0) bb else paste0(bb, strrep(paste0(waldo, egfp), n)))
+}
+names(originals) <- ifelse(gfp_copies == 0, "SmBiT-P2A-FLAG",
+                           sprintf("SmBiT-P2A-FLAG-link-%dxeGFP", gfp_copies))
+cat("Rebuilt", length(originals), "original rungs:",
+    paste(nchar(originals), collapse = ", "), "nt\n")
+```
+
+## The part layout, in codons
+
+Every construct is the same four-part backbone followed by *k* repeats of
+linker + eGFP. Only FLAG and the eGFP copies were free to change: SmBiT, P2A
+and the Waldo linker are held fixed by `08_`, the linker because it carries the
+in-frame EcoRI site the cloning depends on.
+
+```{r part_layout}
+n_cod <- function(s) nchar(s) %/% 3L
+
+# One row per contiguous stretch of codons, in order along the construct.
+layout_for <- function(k) {
+  base <- tibble(
+    part  = c("SmBiT", "P2A", "FLAG"),
+    ncod  = c(n_cod(smbit_n), n_cod(p2a), n_cod(flag1x)),
+    state = c("fixed", "fixed", "free")
+  )
+  if (k == 0) return(base)
+  reps <- map_dfr(seq_len(k), ~ tibble(
+    part  = c("linker", sprintf("eGFP copy %d", .x)),
+    ncod  = c(n_cod(waldo), n_cod(egfp)),
+    state = c("fixed", "free")
+  ))
+  bind_rows(base, reps)
+}
+
+layout_tbl <- map_dfr(set_names(gfp_copies, names(originals)), layout_for,
+                      .id = "construct") %>%
+  group_by(construct) %>%
+  mutate(end = cumsum(ncod), start = end - ncod + 1L) %>%
+  ungroup()
+
+stopifnot(
+  "Part layout does not account for every codon in a construct" =
+    all((layout_tbl %>% group_by(construct) %>%
+           summarise(tot = sum(ncod), .groups = "drop") %>%
+           arrange(match(construct, names(originals))))$tot ==
+          map_int(originals, n_cod))
+)
+print(layout_tbl %>% filter(construct == names(originals)[length(originals)]) %>%
+        dplyr::select(part, state, start, end) %>% as.data.frame())
+```
+
+# 3. Read the Recoded Sequences
+
+```{r read_recoded}
+seq_csv <- file.path(indir,
+             paste0("08_recoded_assembled_sequences_", params$run_tag, ".csv"))
+use_csv <- file.path(indir,
+             paste0("08_codon_usage_231_", params$run_tag, ".csv"))
+stopifnot(
+  "Recoded sequences not found: knit 08_ first" = file.exists(seq_csv),
+  "Codon usage table not found: re-knit 08_, which now exports it" =
+    file.exists(use_csv)
+)
+
+rec_tbl <- read_csv(seq_csv, show_col_types = FALSE)
+recoded <- setNames(rec_tbl$cds, rec_tbl$construct)
+
+stopifnot(
+  "Recoded CSV does not hold the expected rungs" =
+    identical(sort(names(recoded)), sort(names(originals))),
+  "A recoded sequence contains non-ACGT characters" =
+    all(!grepl("[^ACGT]", recoded))
+)
+recoded <- recoded[names(originals)]          # same order as the originals
+cat("Read", length(recoded), "recoded rungs with tag", params$run_tag, "\n")
+```
+
+## Independent check that the recoding is synonymous
+
+`08_` asserts this on the objects it just built. Re-asserting it here on the
+*exported file*, with the originals rebuilt from the spreadsheet, closes the
+gap between what was validated and what will be ordered.
+
+```{r validate_exported}
+walk2(recoded, originals, function(new, old) {
+  stopifnot(
+    "An exported rung differs in length from the original" =
+      nchar(new) == nchar(old),
+    "An exported rung changed the protein" = aa_of(new) == aa_of(old),
+    "An exported rung carries a stop codon" =
+      !any(codon_split(new) %in% STOP_CODONS)
+  )
+})
+cat("Every exported rung is synonymous with its original.\n")
+
+# Discriminative companion: the files must actually differ from the originals.
+# A pipeline that exported its input would pass every assertion above.
+n_changed <- map2_int(recoded, originals,
+                      ~ sum(codon_split(.x) != codon_split(.y)))
+stopifnot(
+  "An exported rung is identical to the original: nothing was recoded" =
+    all(n_changed > 0),
+  # as.integer on both sides: read_csv returns doubles, so identical() would
+  # fail on storage type even when every count agrees.
+  "Exported codons-changed counts disagree with the 08_ summary column" =
+    identical(as.integer(unname(n_changed)),
+              as.integer(rec_tbl$codons_changed[match(names(recoded),
+                                                      rec_tbl$construct)]))
+)
+cat("Codons changed per rung:", paste(n_changed, collapse = ", "),
+    "of", paste(map_int(recoded, ~ length(codon_split(.x))), collapse = ", "),
+    "\n")
+
+# The fixed parts must be byte-identical, not merely synonymous. If SmBiT, P2A
+# or a linker had drifted, the construct would still translate correctly and
+# every check above would pass.
+fixed_ok <- map_lgl(names(recoded), function(nm) {
+  rows <- layout_tbl %>% filter(construct == nm, state == "fixed")
+  cv_n <- codon_split(recoded[[nm]]); cv_o <- codon_split(originals[[nm]])
+  all(pmap_lgl(rows, function(start, end, ...)
+    identical(cv_n[start:end], cv_o[start:end])))
+})
+stopifnot("A codon inside a fixed part was changed" = all(fixed_ok))
+cat("Fixed parts (SmBiT, P2A, every linker) are byte-identical to the input.\n")
+```
+
+# 4. The Per-Codon Table
+
+One row per codon per construct: where it is, what it was, what it became, and
+why. This table is what both figures and the printout are drawn from, and it is
+exported so the sequences can be read codon by codon outside R.
+
+`status` has four levels, and the distinction between the last two matters when
+reading the figures:
+
+- **fixed** - inside SmBiT, P2A or a linker. Never offered to the recoder.
+- **changed** - the recoder picked a different synonymous codon.
+- **unchanged** - offered to the recoder, which picked the original codon back.
+- **no synonym** - Met or Trp, the two amino acids with a single codon. These
+  *cannot* change, so counting them as "unchanged" would overstate how often
+  the recoder left a free choice alone.
+
+```{r codon_table}
+NOSYN_AA <- c("M", "W")   # the only amino acids with exactly one codon
+
+codon_tbl <- map_dfr(names(recoded), function(nm) {
+  cv_n <- codon_split(recoded[[nm]])
+  cv_o <- codon_split(originals[[nm]])
+  rows <- layout_tbl %>% filter(construct == nm)
+  tibble(
+    construct = nm,
+    pos       = seq_along(cv_n),
+    part      = rep(rows$part,  rows$ncod),
+    state     = rep(rows$state, rows$ncod),
+    codon_old = cv_o,
+    codon_new = cv_n,
+    aa        = GENETIC_CODE[cv_n],
+    base3     = str_sub(cv_n, 3, 3)
+  )
+}) %>%
+  mutate(
+    status = case_when(
+      state == "fixed"       ~ "fixed",
+      aa %in% NOSYN_AA       ~ "no synonym",
+      codon_new != codon_old ~ "changed",
+      TRUE                   ~ "unchanged"
+    ),
+    status = factor(status,
+                    levels = c("fixed", "no synonym", "unchanged", "changed")),
+    base3  = factor(base3, levels = c("G", "C", "A", "T")),
+    gc3    = base3 %in% c("G", "C")
+  )
+
+stopifnot(
+  "Codon table lost rows relative to the sequences" =
+    nrow(codon_tbl) == sum(map_int(recoded, ~ length(codon_split(.x)))),
+  "A codon in the table does not translate as recorded" =
+    all(codon_tbl$aa == GENETIC_CODE[codon_tbl$codon_new]),
+  "Recoded and original codons disagree on the amino acid" =
+    all(GENETIC_CODE[codon_tbl$codon_old] == codon_tbl$aa),
+  "A status was not assigned" = !any(is.na(codon_tbl$status)),
+  "Changed codons were found inside a fixed part" =
+    !any(codon_tbl$state == "fixed" & codon_tbl$status == "changed")
+)
+
+cat("Codons by status and construct:\n")
+print(codon_tbl %>% dplyr::count(construct, status) %>%
+        pivot_wider(names_from = status, values_from = n, values_fill = 0) %>%
+        as.data.frame())
+```
+
+The free codons the recoder left alone are worth separating out, because
+"unchanged" is the only one of the four that is a *choice*:
+
+```{r free_summary}
+free_sum <- codon_tbl %>% filter(state == "free", !aa %in% NOSYN_AA) %>%
+  group_by(construct) %>%
+  summarise(free_choices = n(),
+            changed      = sum(status == "changed"),
+            pct_changed  = 100 * mean(status == "changed"),
+            .groups = "drop")
+print(free_sum %>% mutate(pct_changed = round(pct_changed, 1)) %>% as.data.frame())
+```
+
+# 5. Where Every Codon Is
+
+Both panels share one geometry: `r params$codons_per_line` codons per row,
+reading left to right and top to bottom, one facet per rung. Because the ladder
+is nested, each facet begins with the whole of the facet above it, so a column
+of tiles at the same grid position is the same codon in every construct that is
+long enough to have it.
+
+```{r grid_coords}
+CPL <- params$codons_per_line
+grid_tbl <- codon_tbl %>%
+  mutate(row = (pos - 1L) %/% CPL + 1L,
+         col = (pos - 1L) %%  CPL + 1L,
+         construct = factor(construct, levels = names(recoded)))
+```
+
+## Third base, hue by class and shade within it
+
+Blues are the GC-ending codons and purples the AT-ending ones, so GC3 is
+readable as the blue fraction of the panel. Within each class the darker shade
+is the purine (G, A).
+
+```{r plot_tile_base3, fig.height=8}
+base_cols <- c(G = "#03314D", C = "#0072B2",     # GC class: blues
+               A = "#7D3C62", T = "#CC79A7")     # AT class: purples
+
+p_base3 <- ggplot(grid_tbl, aes(col, -row, fill = base3)) +
+  geom_tile(width = 0.95, height = 0.85) +
+  facet_wrap(~ construct, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = base_cols, name = "Third base",
+                    breaks = c("G", "C", "A", "T")) +
+  labs(x = paste("Codon position within row (", CPL, "codons per row )"),
+       y = NULL,
+       title = "Third base of every codon in the recoded ladder",
+       caption = paste("Blue = GC-ending, purple = AT-ending, so GC3 is the",
+                       "blue fraction.\nRows read left to right, top to",
+                       "bottom; the ladder is nested, so each panel starts",
+                       "with the one above it.")) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(), panel.spacing = unit(0.6, "lines"),
+        legend.position = "top")
+print(p_base3)
+ggsave(here("plots", paste0("cds_reporter_10_codon_map_base3_",
+                            params$run_tag, ".pdf")),
+       p_base3, width = 10, height = 8)
+```
+
+## What the recoder touched
+
+Same grid, colored by status. The fixed backbone is grey, so the free regions
+stand out as the colored blocks, and within them the dark tiles are the codons
+that actually changed.
+
+```{r plot_tile_status, fig.height=8}
+status_cols <- c("fixed"      = "grey85",
+                 "no synonym" = "grey55",
+                 "unchanged"  = "#A6CEE3",
+                 "changed"    = "#0072B2")
+
+p_status <- ggplot(grid_tbl, aes(col, -row, fill = status)) +
+  geom_tile(width = 0.95, height = 0.85) +
+  facet_wrap(~ construct, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = status_cols, name = NULL, drop = FALSE) +
+  labs(x = paste("Codon position within row (", CPL, "codons per row )"),
+       y = NULL,
+       title = "Which codons the recoder changed",
+       caption = paste("Grey = fixed part (SmBiT, P2A, linker), never offered.",
+                       "Dark grey = Met or Trp,\nwhich have no synonym and so",
+                       "cannot change. Pale blue = offered but the original",
+                       "codon\nwas picked back. Dark blue = recoded.")) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(), panel.spacing = unit(0.6, "lines"),
+        legend.position = "top")
+print(p_status)
+ggsave(here("plots", paste0("cds_reporter_10_codon_map_status_",
+                            params$run_tag, ".pdf")),
+       p_status, width = 10, height = 8)
+```
+
+# 6. The Sequences, Printed Codon by Codon
+
+The lab reference: every construct written out in codons, `r params$codons_per_line`
+per line, with the same four states as the figure above. Colored text is
+HTML-only and will not appear in a PDF render of this notebook.
+
+```{r print_setup}
+# Inline CSS per codon rather than classes, so a single copied block of HTML
+# keeps its coloring when pasted elsewhere.
+span_of <- function(codon, status, b3) {
+  style <- switch(as.character(status),
+    "fixed"      = "color:#9a9a9a;",
+    "no synonym" = "color:#555555;text-decoration:underline;",
+    "unchanged"  = "color:#222222;",
+    "changed"    = paste0("color:", base_cols[[as.character(b3)]],
+                          ";font-weight:700;")
+  )
+  paste0('<span style="', style, '">', codon, '</span>')
+}
+
+render_construct <- function(nm) {
+  d <- codon_tbl %>% filter(construct == nm)
+  spans <- pmap_chr(d %>% dplyr::select(codon_new, status, base3),
+                    function(codon_new, status, base3)
+                      span_of(codon_new, status, base3))
+  lines <- split(seq_len(nrow(d)), (seq_len(nrow(d)) - 1L) %/% CPL)
+  body <- map_chr(lines, function(ix) {
+    paste0('<span style="color:#bbbbbb;">',
+           formatC(d$pos[ix[1]], width = 5), '</span>  ',
+           paste(spans[ix], collapse = " "))
+  })
+  paste0("<h3>", nm, "</h3>",
+         '<pre style="font-family:ui-monospace,Menlo,Consolas,monospace;',
+         'font-size:11px;line-height:1.55;white-space:pre-wrap;',
+         'word-break:break-all;background:#fcfcfc;border:1px solid #eee;',
+         'padding:10px 12px;">',
+         paste(body, collapse = "\n"), "</pre>")
+}
+
+legend_html <- paste0(
+  '<p style="font-family:ui-monospace,Menlo,monospace;font-size:12px;">',
+  '<span style="color:#9a9a9a;">GCT</span> fixed part &nbsp;|&nbsp; ',
+  '<span style="color:#555;text-decoration:underline;">ATG</span> no synonym ',
+  '(Met, Trp) &nbsp;|&nbsp; ',
+  '<span style="color:#222;">GCT</span> offered, original kept &nbsp;|&nbsp; ',
+  '<span style="color:#03314D;font-weight:700;">GGG</span>/',
+  '<span style="color:#0072B2;font-weight:700;">GCC</span>/',
+  '<span style="color:#7D3C62;font-weight:700;">GAA</span>/',
+  '<span style="color:#CC79A7;font-weight:700;">GAT</span> recoded, ',
+  'colored by third base (G/C/A/T)</p>')
+```
+
+```{r print_sequences, results='asis'}
+cat(legend_html)
+cat(paste(map_chr(names(recoded), render_construct), collapse = "\n"))
+```
+
+# 7. Do the Chosen Codons Track MDA-MB-231 Usage?
+
+The recoder picks a codon in two steps. The third base is decided first, by the
+composition target: how many codons must end in each of A, C, G and T. Only
+then is a codon drawn from the amino acid's options *with that third base*, in
+proportion to the pooled synonymous usage of the expressed transcriptome.
+
+Those two steps pull in different directions, so comparing the chosen codons
+against raw usage conflates them. Both views are shown.
+
+```{r read_usage}
+usage <- read_csv(use_csv, show_col_types = FALSE)
+stopifnot(
+  "Codon usage table is missing expected columns" =
+    all(c("codon", "aa", "count", "prop") %in% names(usage)),
+  "Synonymous proportions do not sum to 1 within every amino acid" =
+    all(abs((usage %>% group_by(aa) %>%
+               summarise(s = sum(prop), .groups = "drop"))$s - 1) < 1e-9)
+)
+# Biological spot-check, same one 08_ makes, so a wrong file cannot slip in.
+stopifnot("CTG is not the most-used Leu codon: wrong or corrupt usage table" =
+            (usage %>% filter(aa == "L") %>% slice_max(prop, n = 1))$codon == "CTG")
+cat("Usage table: ", nrow(usage), " sense codons. CTG share of Leu: ",
+    round(100 * usage$prop[usage$codon == "CTG"], 1), "%\n", sep = "")
+```
+
+The chosen codons are the **free** positions only, and the longest rung only.
+Pooling the nested rungs would count eGFP copy 1 three times and copy 3 once,
+weighting the sample by how often a copy happens to recur rather than by the
+design.
+
+```{r chosen_codons}
+longest <- names(recoded)[length(recoded)]
+chosen <- codon_tbl %>%
+  filter(construct == longest, state == "free", !aa %in% NOSYN_AA)
+cat("Scoring", nrow(chosen), "freely chosen codons from", longest, "\n")
+```
+
+## How much choice is left once the third base is fixed
+
+Before comparing anything, this has to be established, because it bounds what
+the comparison can possibly show. The menu is rebuilt here exactly as `08_`
+builds it: codons below the `min_codon_prop` usage floor are dropped, unless
+dropping them would leave a third base with no codon at all, in which case that
+base keeps its most-used one.
+
+```{r rebuild_menu}
+menu_tbl <- usage %>%
+  mutate(base3 = str_sub(codon, 3, 3)) %>%
+  group_by(aa, base3) %>%
+  mutate(keep = prop >= params$min_codon_prop,
+         keep = if (any(keep)) keep else prop == max(prop)) %>%
+  filter(keep) %>%
+  mutate(exp_within = prop / sum(prop), n_opts = n()) %>%
+  ungroup()
+
+dropped <- usage %>% anti_join(menu_tbl, by = "codon")
+cat("Codons below the", params$min_codon_prop, "floor and dropped from the menu:",
+    if (nrow(dropped)) paste(dropped$codon, collapse = ", ") else "none", "\n")
+
+cells <- menu_tbl %>% dplyr::count(aa, base3, name = "n_opts")
+cat("(amino acid, third base) cells:", nrow(cells),
+    "| determined, one option only:", sum(cells$n_opts == 1),
+    "| with a real choice:", sum(cells$n_opts > 1), "\n\n")
+print(menu_tbl %>% filter(n_opts > 1) %>%
+        group_by(aa, base3) %>%
+        summarise(options = paste(codon, collapse = " / "),
+                  usage_split = paste(round(100 * exp_within), collapse = " / "),
+                  .groups = "drop") %>% as.data.frame())
+```
+
+**Fixing the third base determines the codon outright in `r sum(cells$n_opts == 1)`
+of `r nrow(cells)` cells.** A choice survives in only `r sum(cells$n_opts > 1)`,
+and all of them sit in the three six-codon families - Leu, Arg and Ser - which
+are exactly the amino acids whose *first* base is also free. Everywhere else,
+naming the third base names the codon.
+
+So the usage-weighted sampler has very little to do, and the honest version of
+"do the chosen codons track 231 usage?" splits in two: the raw comparison below
+is dominated by the composition target, and the sampler itself can only be
+judged on those `r sum(cells$n_opts > 1)` cells.
+
+```{r floor_check}
+# Nothing outside the rebuilt menu should appear in the construct. This is the
+# check that would fire if the floor applied here drifted from the one 08_ used.
+stopifnot("A chosen codon is not on the reconstructed menu: floor mismatch with 08_" =
+            all(chosen$codon_new %in% menu_tbl$codon))
+cat("Every chosen codon is on the menu 08_ drew from.\n")
+```
+
+## Raw: chosen proportion against transcriptome usage
+
+Deviation here is **expected and by design**. The GC3 target is below eGFP's
+native GC3, so AT-ending codons are deliberately over-represented relative to
+their transcriptome share.
+
+```{r plot_usage_raw}
+obs_raw <- chosen %>% dplyr::count(aa, codon = codon_new, name = "n") %>%
+  group_by(aa) %>% mutate(obs = n / sum(n)) %>% ungroup() %>%
+  inner_join(usage %>% dplyr::select(codon, exp = prop), by = "codon") %>%
+  mutate(base3 = factor(str_sub(codon, 3, 3), levels = c("G", "C", "A", "T")))
+
+rho_raw <- cor(obs_raw$exp, obs_raw$obs, method = "spearman")
+
+p_raw <- ggplot(obs_raw, aes(exp, obs, color = base3)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  geom_point(size = 2.6, alpha = 0.9) +
+  scale_color_manual(values = base_cols, name = "Third base",
+                     breaks = c("G", "C", "A", "T")) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = "Share of its amino acid in the MDA-MB-231 transcriptome",
+       y = "Share among the chosen codons",
+       title = "Chosen codons vs transcriptome usage, raw",
+       subtitle = sprintf("Spearman rho = %.3f, n = %d codons",
+                          rho_raw, nrow(obs_raw)),
+       caption = paste("Points above the diagonal are over-used relative to",
+                       "the transcriptome. The purple\nshift is the GC3 target",
+                       "at work, not a sampler artifact: see the next panel.")) +
+  theme_classic(base_size = 12) + theme(legend.position = "top")
+print(p_raw)
+ggsave(here("plots", paste0("cds_reporter_10_chosen_vs_usage_raw_",
+                            params$run_tag, ".pdf")),
+       p_raw, width = 8, height = 6.5)
+```
+
+## Within each (amino acid, third base) cell: the sampler alone
+
+Once the third base is fixed, the remaining choice is free, and *this* is where
+usage should be reproduced. Expected proportions are renormalized within each
+cell of the **rebuilt menu**, which is exactly the distribution the recoder
+samples from. Using the unfiltered usage table here would be wrong: Leu's CTA
+is below the floor and never offered, so A-ending Leu is forced to TTA, and
+scoring it against CTA's transcriptome share would report a 45-point
+"deviation" for a position that had no alternative.
+
+Cells with a single option are dropped: they carry no choice and would sit
+trivially at (1, 1).
+
+```{r plot_usage_within}
+obs_within <- chosen %>%
+  dplyr::count(aa, base3, codon = codon_new, name = "n") %>%
+  group_by(aa, base3) %>% mutate(obs_within = n / sum(n), n_cell = sum(n)) %>%
+  ungroup() %>%
+  inner_join(menu_tbl %>% dplyr::select(codon, exp_within, n_opts),
+             by = "codon") %>%
+  filter(n_opts > 1)
+
+stopifnot("No multi-option cells to score: the comparison is vacuous" =
+            nrow(obs_within) > 0)
+
+rho_w <- cor(obs_within$exp_within, obs_within$obs_within, method = "spearman")
+mad_w <- mean(abs(obs_within$obs_within - obs_within$exp_within))
+
+# The cells are small - a few codons each - so the question is not whether the
+# observed split sits ON the diagonal but whether it sits as close as a correct
+# usage-weighted draw of that size would. There is no closed form worth
+# deriving here, so the null is simulated: redraw each cell from its own
+# expectation, the same multinomial the recoder samples, and read off how far a
+# correct sampler scatters. A fixed tolerance would be a guess; this is not.
+set.seed(9)
+sim_mad <- replicate(2000, {
+  s <- obs_within %>% group_by(aa, base3) %>%
+    group_modify(function(d, ...) {
+      dr <- stats::rmultinom(1, d$n_cell[1], d$exp_within)[, 1]
+      d$sim <- dr / sum(dr); d
+    }) %>% ungroup()
+  mean(abs(s$sim - s$exp_within))
+})
+p_mad <- (sum(sim_mad >= mad_w) + 1) / (length(sim_mad) + 1)
+cat("Mean absolute within-cell deviation:", round(100 * mad_w, 1), "pp\n")
+cat("Simulated under a correct sampler - median",
+    round(100 * median(sim_mad), 1), "pp, 95th pct",
+    round(100 * quantile(sim_mad, 0.95), 1), "pp\n")
+cat("Empirical p that a correct sampler deviates at least this much:",
+    round(p_mad, 3), "\n")
+
+p_within <- ggplot(obs_within, aes(exp_within, obs_within, color = base3)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  geom_point(aes(size = n_cell), alpha = 0.85) +
+  scale_color_manual(values = base_cols, name = "Third base",
+                     breaks = c("G", "C", "A", "T")) +
+  scale_size_area(max_size = 7, name = "Codons in cell") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = "Expected share within its (amino acid, third base) cell",
+       y = "Observed share among the chosen codons",
+       title = "Chosen codons vs usage, with the third base held fixed",
+       subtitle = sprintf(paste("%d codons in %d cells. Mean deviation %.1f pp",
+                                "vs %.1f pp expected of a correct sampler",
+                                "(p = %.2f)"),
+                          nrow(obs_within),
+                          n_distinct(paste(obs_within$aa, obs_within$base3)),
+                          100 * mad_w, 100 * median(sim_mad), p_mad),
+       caption = paste("This is the only step the recoder actually samples;",
+                       "everywhere else the third base\ndetermines the codon.",
+                       "Point size is how many codons the cell held. Cells are",
+                       "small,\nso the reference is the simulated spread of a",
+                       "correct draw, not the diagonal itself.")) +
+  theme_classic(base_size = 12) + theme(legend.position = "top")
+print(p_within)
+ggsave(here("plots", paste0("cds_reporter_10_chosen_vs_usage_within_",
+                            params$run_tag, ".pdf")),
+       p_within, width = 8, height = 6.5)
+```
+
+```{r usage_checks}
+# The observed deviation must be consistent with a correct usage-weighted draw.
+# Two-sided in spirit but only the upper tail matters: a sampler that ignored
+# `prob` would scatter further than the null, not closer.
+stopifnot(
+  "Within-cell deviation exceeds what a correct usage-weighted sampler produces" =
+    p_mad > 0.01
+)
+
+# How much could this test actually detect? A sampler that drew uniformly
+# instead of by usage is the realistic alternative, so its deviation is
+# simulated too and asked against the same null. This is a POWER calculation,
+# not a check that passes: it reports what the comparison can and cannot see.
+set.seed(9)
+sim_unif <- replicate(2000, {
+  s <- obs_within %>% group_by(aa, base3) %>%
+    group_modify(function(d, ...) {
+      dr <- stats::rmultinom(1, d$n_cell[1], rep(1 / nrow(d), nrow(d)))[, 1]
+      d$sim <- dr / sum(dr); d
+    }) %>% ungroup()
+  mean(abs(s$sim - s$exp_within))
+})
+p_unif <- (sum(sim_mad >= median(sim_unif)) + 1) / (length(sim_mad) + 1)
+cat("A uniform sampler would deviate", round(100 * median(sim_unif), 1),
+    "pp (median) vs", round(100 * median(sim_mad), 1),
+    "pp for a usage-weighted one.\n")
+cat("The null assigns that uniform median p =", round(p_unif, 3),
+    "- so this test CANNOT reject uniform sampling at these cell sizes.\n")
+
+# The direction must at least be right: uniform has to scatter further from the
+# usage expectation than a usage-weighted draw does, or the two alternatives are
+# not even ordered and the panel is measuring nothing.
+stopifnot(
+  "A uniform sampler is not distinguishable from a usage-weighted one here" =
+    median(sim_unif) > median(sim_mad)
+)
+if (p_unif > 0.05)
+  cat("NOTE: underpowered by design, not a defect.", sum(cells$n_opts > 1),
+      "cells hold", sum(obs_within$n_cell) / 2,
+      "codons between them;\n  a usage-weighted and a uniform draw of that size",
+      "overlap heavily. The sampler's correctness\n  rests on reading",
+      "`recode_codons` in 08_, which passes USE[opts] to sample(), not on this",
+      "panel.\n")
+
+cat("\nLargest within-cell deviations:\n")
+print(obs_within %>%
+        mutate(dev_pp = 100 * (obs_within - exp_within)) %>%
+        arrange(desc(abs(dev_pp))) %>%
+        dplyr::select(aa, codon, base3, n_cell, exp_within, obs_within, dev_pp) %>%
+        mutate(across(c(exp_within, obs_within), ~ round(100 * .x, 1)),
+               dev_pp = round(dev_pp, 1)) %>%
+        head(10) %>% as.data.frame())
+```
+
+# 8. Outputs
+
+```{r write_outputs}
+write_csv(codon_tbl, file.path(outdir,
+          paste0("10_codon_table_", params$run_tag, ".csv")))
+write_csv(obs_raw, file.path(outdir,
+          paste0("10_chosen_vs_usage_raw_", params$run_tag, ".csv")))
+write_csv(obs_within, file.path(outdir,
+          paste0("10_chosen_vs_usage_within_", params$run_tag, ".csv")))
+write_csv(free_sum, file.path(outdir,
+          paste0("10_free_choice_summary_", params$run_tag, ".csv")))
+cat("Exported four tables with tag:", params$run_tag, "\n")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

@@ -19,6 +19,8 @@ Nothing here writes to `output/predictive_modeling/`. Outputs go to
 | `06_cds_length_smbit_p2a_ha.Rmd` | MDA-MB-231 only: SmBiT-P2A-1xHA (120 nt), -1xFLAG (117 nt) and -FLAG-eGFP (840 nt), no NanoLuc; three cumulative views of each panel, and the length panel is also drawn zoomed because ~120 nt is unreadable on the standard 6 kb axis |
 | `07_cds_length_egfp_copy_ladder.Rmd` | MDA-MB-231 only: an eGFP copy ladder on `06_`'s SmBiT-P2A-FLAG backbone, Waldo linker included (0/1/2/3 copies = 117/876/1,599/2,322 nt by default); `max_gfp_copies` and `linker_between_copies` are parameters and the output filenames carry both |
 | `08_gc_matched_recode_egfp_ladder.Rmd` | the same four rungs as `07_`, with the FLAG tag and every eGFP copy **recoded synonymously** onto the 231 composition: GC3 93% to 59%, GC 61% to 50%, protein unchanged. Copies are recoded independently, which also removes `07_`'s tandem repeat |
+| `09_composition_weighting_comparison.Rmd` | what "the transcriptome's composition" means: the same background summarised five ways (per-transcript median and mean, codon-pooled, mRNA-weighted, ribosome-weighted) and the GC3 target each one implies |
+| `10_codon_level_view_recoded_ladder.Rmd` | the codon-level reading of `08_`'s exported sequences: a tile map of all four rungs at codon resolution, the sequences printed codon by codon with the recoded positions colored, and whether the chosen codons track 231 usage. Run `08_` first; it reads `08_recoded_assembled_sequences_*.csv` and `08_codon_usage_231_*.csv` |
 
 **The FLAG ladder confounds length with GC.** It is a clean length series on the
 GC3 axis - GC3 moves 1.6 points across 1x to 51x, 5% of the transcriptome IQR,
@@ -463,3 +465,78 @@ asserts that it fails.
 `median(G% + C%)`, so the median row's four bases sum to 98.65 rather than 100.
 GC3 is normalised by each row's own total, or that row reads ~0.8 points low
 against the others as a pure artefact of how it was summarised.
+
+## Reading the ladder as codons (`10_`)
+
+`08_` reports the design as composition. `10_` reports it as codons: which
+codon sits at each position, which were changed, and which could never change.
+It reads `08_`'s exported sequences rather than rebuilding them, and re-imports
+the parts to rebuild the **originals**, because showing changed-vs-unchanged
+needs the pre-recode sequences and free-vs-fixed needs the part boundaries and
+neither is in the exported files. That makes its diff an independent check that
+the exported sequences are synonymous with the input, run outside the notebook
+that produced them. It also asserts the fixed parts are **byte-identical**, not
+merely synonymous: SmBiT, P2A or a linker could have drifted to another
+synonymous codon and every protein-level check would still pass.
+
+The recoder changes about **60% of the codons it is offered** (5 of 8 in FLAG,
+59-61% in each eGFP copy). "Unchanged" is reported separately from "no synonym":
+Met and Trp have a single codon each and cannot change, so folding them into
+"unchanged" would overstate how often a free choice was left alone.
+
+**Fixing the third base determines the codon outright in 50 of 55 (amino acid,
+third base) cells.** A choice survives in only five - Leu/G (CTG/TTG), Arg/A
+(AGA/CGA), Arg/G (CGG/AGG), Ser/C (AGC/TCC) and Ser/T (TCT/AGT) - all in the
+three six-codon families, which are exactly the amino acids whose *first* base
+is also free. Everywhere else, naming the third base names the codon. So the
+GC3 target does nearly all the work and the usage-weighted sampler does very
+little, which bounds what a usage comparison can show:
+
+- Against **raw** transcriptome usage, the chosen codons deviate systematically,
+  **by design** - the GC3 target is below eGFP's native GC3, so AT-ending codons
+  are deliberately over-represented. That panel measures the constraint, not the
+  sampler.
+- Within each (amino acid, third base) cell, the sampler is all that is left.
+  Observed mean deviation is 16.8 pp against 15.5 pp for a correct
+  usage-weighted draw of the same cell sizes (empirical p = 0.40), so the
+  sampler is consistent with its own null.
+
+**That within-cell test is underpowered, and the notebook says so rather than
+claiming a pass.** Five cells hold ~40 codons between them, and a *uniform*
+sampler would deviate 19.0 pp - which the null assigns p = 0.24, so the test
+cannot reject uniform sampling either. The sampler's correctness rests on
+`recode_codons` in `08_` passing `USE[opts]` to `sample()`, not on this panel.
+
+**The expectation must come from the floor-filtered menu, not the usage table.**
+`08_` drops codons below `min_codon_prop` (0.08), which removes **CTA**, leaving
+TTA as the only A-ending Leu. Scored against CTA's raw transcriptome share that
+looks like a 45-point deviation at a position that had no alternative. `TCG` is
+below the floor too but survives as the only G-ending Ser, since emptying a
+third base would change which compositions the protein can reach. `10_` rebuilds
+the menu with the same rule and asserts every chosen codon is on it.
+
+### Is a GC3 = 0% FLAG translatable?
+
+The recoded 1xFLAG is `GAT TAT AAA GAT GAT GAT GAT AAA` - **GC3 = 0%**, every
+codon A/T-ending. That is forced, not chosen: Asp and Tyr can only end C or T
+and Lys only A or G, so with GC3 driven down the five Asp and one Tyr all go to
+T and only the two Lys can supply A. Checked against the expressed background
+rather than from the literature:
+
+- **51.0% of expressed transcripts (5,124 of 10,054) contain at least one run of
+  8 consecutive codons at GC3 = 0%**, 83,691 such runs in total.
+- Carrying one has **no detectable effect on translation**: median riboseq TPM
+  0.787 with such a run vs 0.789 without, and 100% of both groups are translated.
+  Heavily translated examples include TXN (644 TPM), RPS25 (550), HNRNPA1 (543),
+  EEF1B2 (12 runs, 250) and NPM1 (26 runs, 223).
+- Runs far longer than 8 are common: 2,423 transcripts reach 12 codons, 857
+  reach 16, and the longest is **46** (KMT2E).
+- The closest natural analogue is **ATAD2**, which carries `GAT x8` - eight
+  consecutive A/T-ending Asp codons at GC3 = 0%, inside a 14-residue poly-Asp
+  stretch - and is translated above the median (riboseq TPM 2.0 vs 0.79).
+
+GC3 = 0% over 8 codons is not a rare-codon problem. Each of GAT, TAT and AAA is
+the minor synonym of a two-codon family split roughly 45/55, so all three are
+~42-46% of their family genome-wide; none is rare. The construct's longest
+homopolymer is `AAA` (3 nt), well inside the 6-nt bound `08_` enforces and far
+short of the 8-12 consecutive A's associated with poly(A) ribosome stalling.
