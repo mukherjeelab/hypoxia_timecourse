@@ -1,0 +1,265 @@
+---
+title: "CDS reporter design 11 - GC and GC3 of each part"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  run_tag: "upto3x_expressed"
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below. Both
+# guards test `knitr.in.progress`, so a knit is never touched.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(run_tag = "upto3x_expressed")
+}
+```
+
+# Overview
+
+Two bar plots: GC% and GC3% of each **part** on its own - the 1xFLAG tag and
+each recoded eGFP copy - rather than of the assembled constructs. Every other
+notebook in this folder reports whole constructs, where the fixed SmBiT/P2A
+backbone and the linkers are mixed in. This is the per-part view, which is what
+goes into a synthesis order.
+
+Each part is shown **before and after recoding**, against the MDA-MB-231
+expressed median as a reference line, because the single number by itself does
+not say whether it is on target.
+
+Both are read from already-exported tables; nothing is recomputed from the
+genome, so this notebook is fast.
+
+# 1. Load Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(readxl)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7.5, fig.height = 5)
+
+indir <- here("output", "cds_reporter_design")
+```
+
+# 2. The Recoded Parts
+
+```{r read_recoded}
+parts_csv <- file.path(indir,
+               paste0("08_recoded_parts_", params$run_tag, ".csv"))
+stopifnot("Recoded parts table not found: knit 08_ first" =
+            file.exists(parts_csv))
+
+rec <- read_csv(parts_csv, show_col_types = FALSE) %>%
+  mutate(part = str_remove(part, ",\\s*recoded$"))
+stopifnot(
+  "Recoded parts table is missing expected columns" =
+    all(c("part", "nt", "gc_pct", "gc3_pct") %in% names(rec)),
+  "Expected one FLAG part and at least one eGFP copy" =
+    sum(rec$part == "FLAG (1x)") == 1 && sum(str_detect(rec$part, "^eGFP")) >= 1
+)
+print(rec %>% dplyr::select(-cds) %>%
+        mutate(across(where(is.double), ~ round(.x, 1))) %>% as.data.frame())
+```
+
+# 3. The Same Parts Before Recoding
+
+The originals come from the parts spreadsheet, so this notebook does not depend
+on `08_` having exported them. Every eGFP copy starts from the same native
+sequence, so the three "original" eGFP bars are by definition the same number -
+the copies only diverge once they are recoded.
+
+```{r read_originals}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+ptb <- read_excel(parts_xlsx)
+names(ptb)[1] <- "construct"
+pseq <- ptb %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+pseq <- setNames(pseq$seq, pseq$part)
+
+egfp   <- pseq[["egfp"]]
+flag1x <- substr(pseq[["flag3x"]], 43, 66)
+stopifnot(
+  "1xFLAG does not encode the DYKDDDDK epitope" =
+    as.character(translate(DNAString(flag1x))) == "DYKDDDDK",
+  "egfp is not 723 nt" = nchar(egfp) == 723
+)
+
+orig_of <- function(p) if (p == "FLAG (1x)") flag1x else egfp
+orig <- rec %>%
+  transmute(part,
+            nt      = map_int(part, ~ nchar(orig_of(.x))),
+            gc_pct  = map_dbl(part, ~ gc_pct_of(orig_of(.x))),
+            gc3_pct = map_dbl(part, ~ compute_gc3_pct(orig_of(.x))))
+
+stopifnot(
+  "Recoding changed a part's length" = all(orig$nt == rec$nt),
+  "Original and recoded GC3 are identical: nothing was recoded" =
+    !isTRUE(all.equal(orig$gc3_pct, rec$gc3_pct))
+)
+print(orig %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+```
+
+# 4. The Background Reference
+
+```{r read_background}
+med_csv <- file.path(indir, "01_group_medians_cds_gc.csv")
+stopifnot("Background medians not found: knit 01_ first" = file.exists(med_csv))
+
+meds <- read_csv(med_csv, show_col_types = FALSE) %>%
+  filter(group == "All expressed mRNAs")
+stopifnot("Expected exactly one 'All expressed mRNAs' row" = nrow(meds) == 1)
+
+BG_GC  <- meds$median_gc_pct
+BG_GC3 <- meds$median_gc3_pct
+cat("MDA-MB-231 expressed median - GC:", BG_GC, "% | GC3:", BG_GC3,
+    "% (n =", format(meds$n, big.mark = ","), ")\n")
+```
+
+# 5. The Plots
+
+```{r assemble}
+bar_tbl <- bind_rows(orig %>% mutate(version = "Original"),
+                     rec  %>% dplyr::select(part, nt, gc_pct, gc3_pct) %>%
+                       mutate(version = "Recoded")) %>%
+  mutate(part    = factor(part, levels = rec$part),
+         version = factor(version, levels = c("Original", "Recoded")))
+
+ver_cols <- c("Original" = "grey70", "Recoded" = "#0072B2")
+
+bar_plot <- function(yvar, bg, ylab, title, caption) {
+  ggplot(bar_tbl, aes(part, .data[[yvar]], fill = version)) +
+    geom_col(position = position_dodge(width = 0.78), width = 0.72) +
+    geom_hline(yintercept = bg, linetype = 2, color = "grey25") +
+    annotate("text", x = 0.55, y = bg, vjust = -0.6, hjust = 0, size = 3.1,
+             color = "grey25",
+             label = paste0("MDA-MB-231 expressed median, ",
+                            round(bg, 1), "%")) +
+    geom_text(aes(label = sprintf("%.1f", .data[[yvar]])),
+              position = position_dodge(width = 0.78),
+              vjust = -0.45, size = 3.1, color = "grey20") +
+    scale_fill_manual(values = ver_cols, name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+    labs(x = NULL, y = ylab, title = title, caption = caption) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top",
+          axis.text.x = element_text(angle = 20, hjust = 1))
+}
+```
+
+## GC content
+
+```{r plot_gc}
+p_gc <- bar_plot(
+  "gc_pct", BG_GC, "GC (%)",
+  "GC content of each part, before and after recoding",
+  paste("Parts on their own, not the assembled constructs: the fixed",
+        "SmBiT/P2A backbone\nand the linkers are excluded."))
+print(p_gc)
+ggsave(here("plots", paste0("cds_reporter_11_part_gc_", params$run_tag, ".pdf")),
+       p_gc, width = 7.5, height = 5)
+```
+
+## GC3
+
+```{r plot_gc3}
+p_gc3 <- bar_plot(
+  "gc3_pct", BG_GC3, "GC3 (%)",
+  "GC3 of each part, before and after recoding",
+  paste("FLAG reaches 0% by constraint, not by choice: its five Asp and one",
+        "Tyr can only end\nC or T, and its two Lys only A or G, so pulling GC3",
+        "down forces every codon to A or T."))
+print(p_gc3)
+ggsave(here("plots", paste0("cds_reporter_11_part_gc3_", params$run_tag, ".pdf")),
+       p_gc3, width = 7.5, height = 5)
+```
+
+# 6. What the Two Panels Say
+
+```{r summary}
+summ <- bar_tbl %>%
+  dplyr::select(part, version, gc_pct, gc3_pct) %>%
+  pivot_longer(c(gc_pct, gc3_pct), names_to = "metric", values_to = "value") %>%
+  pivot_wider(names_from = version, values_from = value) %>%
+  mutate(metric = recode(metric, gc_pct = "GC", gc3_pct = "GC3"),
+         target = if_else(metric == "GC", BG_GC, BG_GC3),
+         delta  = Recoded - Original,
+         miss   = Recoded - target) %>%
+  arrange(metric, part)
+print(summ %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+```
+
+**The three eGFP copies are indistinguishable on GC3 and nearly so on GC.** All
+three land on exactly the same GC3, because the recoder is given a third-base
+*count* per block and the copies all get the same count; they differ in which
+codons realise it, not in how many. The small GC difference on copy 3 is first-
+and second-base divergence in the Leu, Arg and Ser positions, which is the
+composition-level trace of the fact that the copies are not a tandem repeat.
+
+**FLAG is not on target and cannot be.** Eight codons is far too few to pull
+anything onto a transcriptome median, and the epitope's own composition sets a
+hard floor: with GC3 driven down, Asp and Tyr can only end C or T and Lys only
+A or G, so GC3 goes to 0%. That is why the bare SmBiT-P2A-FLAG rung sits off
+the background on A/T balance while still matching on GC3 once the fixed
+backbone is included. An 8-codon acidic tag at GC3 = 0% is not a translation
+problem: 51% of expressed MDA-MB-231 transcripts carry a run of 8 consecutive
+GC3 = 0% codons, with no difference in riboseq TPM (see the README).
+
+```{r checks}
+# The recoding must move eGFP toward the background on GC3 and must not have
+# moved it past the target by more than it started away from it.
+egfp_rows <- summ %>% filter(metric == "GC3", str_detect(part, "^eGFP"))
+stopifnot(
+  "Recoding did not lower eGFP GC3" = all(egfp_rows$delta < 0),
+  "Recoded eGFP GC3 is further from the target than the original was" =
+    all(abs(egfp_rows$miss) < abs(egfp_rows$Original - egfp_rows$target))
+)
+cat("eGFP GC3 moved", round(mean(egfp_rows$Original), 1), "% ->",
+    round(mean(egfp_rows$Recoded), 1), "% against a target of",
+    round(BG_GC3, 1), "%\n")
+
+# FLAG is expected to MISS, and saying so is the point. Assert the direction
+# rather than the magnitude, so this does not become a check that passes by
+# accident if the epitope changes.
+flag_gc3 <- summ %>% filter(metric == "GC3", part == "FLAG (1x)")
+stopifnot("FLAG GC3 is not at the floor its amino acids impose" =
+            flag_gc3$Recoded == 0)
+cat("FLAG GC3:", flag_gc3$Original, "% ->", flag_gc3$Recoded,
+    "% (floor imposed by DYKDDDDK, not a target)\n")
+```
+
+# 7. Outputs
+
+```{r write_outputs}
+write_csv(summ, file.path(indir,
+          paste0("11_part_composition_", params$run_tag, ".csv")))
+cat("Exported 11_part_composition_", params$run_tag, ".csv\n", sep = "")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
