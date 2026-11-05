@@ -382,8 +382,18 @@ build_cds_metrics <- function(txdb_path) {
 # expressed / promoted: data frames carrying transcript_id_clean,
 # gene_id_clean and the three metric columns.
 plot_density_luc <- function(expressed, promoted, xvar, xlab, title, outfile,
-                             luc_tbl, group_cols,
+                             luc_tbl = NULL, group_cols,
                              xscale = 1, xmax = NULL) {
+  # luc_tbl = NULL draws the gene distributions alone, with no reference lines.
+  # An empty table is built with the columns the code below expects rather than
+  # branching around every use of it, so the no-reference case walks the same
+  # path as the normal one instead of being a second implementation.
+  if (is.null(luc_tbl) || nrow(luc_tbl) == 0) {
+    luc_tbl <- tibble::tibble(reporter = character(0),
+                              color    = character(0),
+                              linetype = character(0))
+    luc_tbl[[xvar]] <- numeric(0)
+  }
   df <- dplyr::bind_rows(
     expressed %>% dplyr::mutate(group = names(group_cols)[1]),
     promoted  %>% dplyr::mutate(group = names(group_cols)[2])
@@ -442,11 +452,17 @@ plot_density_luc <- function(expressed, promoted, xvar, xlab, title, outfile,
                                         linetype = group_lab)) +
     ggplot2::geom_density(fill = NA, linewidth = 1, trim = TRUE,
                           key_glyph = "path") +
+    # With no reference lines the vline layer draws nothing, but it still
+    # contributes a vertical stroke to every legend key, turning each group's
+    # line glyph into a cross. Suppressing the layer's legend in that case
+    # leaves the keys as plain horizontal lines. NA is ggplot's default, so the
+    # annotated panels are unaffected.
     ggplot2::geom_vline(
       data = luc_plot,
       ggplot2::aes(xintercept = .x, color = reporter_lab,
                    linetype = reporter_lab),
-      linewidth = 0.9) +
+      linewidth = 0.9,
+      show.legend = if (nrow(luc_plot) == 0) FALSE else NA) +
     ggplot2::scale_color_manual(
       values = c(cols_lab, luc_cols_use),
       breaks = c(names(cols_lab), names(luc_cols_use)), name = NULL) +
