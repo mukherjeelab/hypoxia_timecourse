@@ -61,6 +61,61 @@ fmt_n <- function(x) format(x, big.mark = ",", trim = TRUE)
 
 
 # ---------------------------------------------------------------------------
+# Linkers built from a repeated peptide
+# ---------------------------------------------------------------------------
+
+# Longest substring that occurs more than once anywhere in `s`, in nt. This is
+# the assembly-relevant measure for a linker made of a repeated peptide such as
+# (GGGGS)x3: the hazard there is not GC content or homopolymers but exact
+# internal repeats, which recombine in E. coli and misprime during assembly.
+# Repeated k-mers are monotone in k - a repeated (k+1)-mer contains a repeated
+# k-mer - so the scan stops at the first k with no duplicate.
+max_internal_repeat <- function(s) {
+  n    <- nchar(s)
+  last <- 0L
+  for (k in seq_len(max(n - 1L, 1L))) {
+    starts <- seq_len(n - k + 1L)
+    if (anyDuplicated(substring(s, starts, starts + k - 1L)) == 0L) break
+    last <- k
+  }
+  as.integer(last)
+}
+
+# The naive encoding of a peptide: every residue given the single most-used
+# codon for its amino acid in `usage` (a table with columns aa, codon, prop).
+# This is what a plain codon optimizer returns, and on a repeated peptide it
+# returns an exact tandem repeat - so it serves both as the pre-recode state a
+# designed linker is measured against and as the discriminative companion for
+# max_internal_repeat(), which must report a long repeat here or it is not
+# detecting anything.
+#
+# Derived once and shared rather than written out per notebook, so the recode
+# notebook that designs a linker and the codon-level notebook that rebuilds its
+# "before" independently cannot drift apart. Ties are broken on the codon
+# alphabetically so the answer does not depend on row order, and a tie among
+# the amino acids actually used is an error rather than a silent coin flip.
+naive_encoding <- function(aa_string, usage) {
+  aas <- strsplit(aa_string, "")[[1]]
+  stopifnot(
+    "usage must have columns aa, codon and prop" =
+      all(c("aa", "codon", "prop") %in% names(usage)),
+    "An amino acid in the peptide is absent from the usage table" =
+      all(aas %in% usage$aa)
+  )
+  top <- usage %>%
+    dplyr::filter(aa %in% aas) %>%
+    dplyr::group_by(aa) %>%
+    dplyr::arrange(dplyr::desc(prop), codon, .by_group = TRUE) %>%
+    dplyr::mutate(tied = dplyr::n() > 1L & prop == dplyr::nth(prop, 2L)) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+  stopifnot("Two codons tie for most-used: the naive encoding is ambiguous" =
+              !any(top$tied))
+  paste0(stats::setNames(top$codon, top$aa)[aas], collapse = "")
+}
+
+
+# ---------------------------------------------------------------------------
 # NanoLuc construct: import and verify
 # ---------------------------------------------------------------------------
 

@@ -13,6 +13,9 @@ params:
   target_group: "expressed"
   min_codon_prop: 0.08
   max_homopolymer: 6
+  gs_repeats: 3
+  gs_max_repeat: 6
+  gs_max_homopolymer: 4
   seed: 9
 ---
 
@@ -36,6 +39,9 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     target_group    = "expressed",# "expressed" | "promoted" - whose medians to match
     min_codon_prop  = 0.08,       # drop codons used less than this within their AA
     max_homopolymer = 6,          # longest run of one base allowed
+    gs_repeats      = 3,          # GGGGS units in the linker upstream of P2A
+    gs_max_repeat   = 6,          # longest exact repeat allowed inside it (nt)
+    gs_max_homopolymer = 4,       # tighter homopolymer cap inside it
     seed            = 9           # project standard
   )
 }
@@ -45,9 +51,28 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
 
 `07_` built an eGFP copy ladder whose length series is clean but whose
 composition is wrong: GC3 91-93% against an expressed-transcriptome median of
-57.5%. This notebook recodes the **FLAG tag and every eGFP copy synonymously**
-so each rung sits on the MDA-MB-231 composition instead. The protein is
-unchanged at every position.
+57.5%. This notebook recodes the **FLAG tag, the GS linker and every eGFP copy
+synonymously** so each rung sits on the MDA-MB-231 composition instead. The
+protein is unchanged at every position.
+
+**A (GGGGS)x3 linker sits between SmBiT and P2A.** P2A works by ribosomal
+skipping of its own Gly-Pro bond, so everything upstream of it stays attached to
+the SmBiT product: SmBiT is an 11-residue peptide that has to find LgBiT while
+carrying the whole P2A-derived tail on its C-terminus. A flexible spacer is the
+standard fix - a 3-residue GSG spacer is routinely put in front of P2A for the
+same reason - and 15 residues of Gly/Ser gives SmBiT room from the P2A-derived
+tail without adding anything structured. It is new in this notebook: the
+spreadsheet of parts has no GS linker row, so its peptide is specified here and
+its DNA is designed rather than imported.
+
+**The linker is the one part where repeats matter more than composition.**
+Encoding (GGGGS)x3 the way a codon optimizer would - most-used codon per
+residue - gives an exact 45 nt tandem repeat of one 15 nt unit, which
+recombines in *E. coli* and misassembles. So the linker carries two constraints
+the other free parts do not: the three GGGGS units must be pairwise distinct,
+and no substring longer than `gs_max_repeat` nt may occur twice inside it.
+Section 7 measures both, against the naive encoding as the companion that must
+fail them.
 
 **The whole design is one number: how many codons end in G or C.** Synonymous
 choice moves only the third base of a codon (and the first base for Leu, Arg and
@@ -80,10 +105,12 @@ makes the three eGFP copies diverge from one another - which removes `07_`'s
 fixed, so rung *k* is still rung *k-1* plus one linker and one eGFP copy. Adding
 a copy never forces a re-synthesis.
 
-**The bare 117 nt rung cannot quite reach the target.** SmBiT and P2A are 31 of
-its 39 codons at GC3 74.2%, so even driving FLAG to 0% third-position GC floors
-it at 59.0%. That is 1.5 points above target and the notebook reports it rather
-than pretending otherwise.
+**The GS linker is also what lets the bare rung reach the target.** Before it
+was added, SmBiT and P2A were 31 of the bare rung's 39 codons at GC3 74.2%, so
+even driving FLAG's 8 codons to 0% third-position GC left the rung above target
+- the notebook reported the miss rather than pretending otherwise. Glycine and
+serine both offer all four third bases, so the linker adds 15 fully free codons
+to a rung that had 8. Section 9 reports where it now lands.
 
 # 1. Load Libraries
 
@@ -113,7 +140,16 @@ stopifnot(
   # codon can sit only slightly above 1/6.
   "min_codon_prop must be in (0, 1/6)" =
     params$min_codon_prop > 0 && params$min_codon_prop < 1 / 6,
-  "max_homopolymer must be at least 4" = params$max_homopolymer >= 4
+  "max_homopolymer must be at least 4" = params$max_homopolymer >= 4,
+  "gs_repeats must be at least 2 for the repeat checks to mean anything" =
+    params$gs_repeats >= 2,
+  # A bound at or above the unit length would be satisfied by the naive tandem
+  # repeat, which is the thing the linker is designed away from.
+  "gs_max_repeat must be below the 15 nt GGGGS unit length" =
+    params$gs_max_repeat >= 3 && params$gs_max_repeat < 15,
+  "gs_max_homopolymer must not exceed the construct-wide cap" =
+    params$gs_max_homopolymer >= 4 &&
+    params$gs_max_homopolymer <= params$max_homopolymer
 )
 set.seed(params$seed)
 cat("target_group =", params$target_group,
@@ -502,8 +538,10 @@ split_class <- function(av, pair, n_first) {
 # GC3 66.7% when GC3 59.0% was available at the *same* total deviation, because
 # FLAG's Asp and Tyr can only end C or T while its Lys can only end A or G.
 # Staging makes the priority structural rather than a tie-break.
-assign_third_bases <- function(aas, need, max_try = 50) {
-  avail <- AVAIL[aas]
+# `avail` is the third bases allowed AT EACH POSITION, not per amino acid, so a
+# block can narrow the menu at particular positions - see `gs_menus` in
+# section 6, where the GS linker's glycines give up GGG.
+assign_third_bases <- function(avail, need, max_try = 50) {
   gc_ok <- map_lgl(avail, ~ any(.x %in% c("G", "C")))
   at_ok <- map_lgl(avail, ~ any(.x %in% c("A", "T")))
   n_gc  <- need[["G"]] + need[["C"]]
@@ -518,7 +556,7 @@ assign_third_bases <- function(aas, need, max_try = 50) {
     if (n_more > 0)
       is_gc[if (n_more == length(free)) free else sample(free, n_more)] <- TRUE
 
-    out <- character(length(aas))
+    out <- character(length(avail))
     out[is_gc]  <- split_class(avail[is_gc],  c("G", "C"), need[["G"]])
     out[!is_gc] <- split_class(avail[!is_gc], c("A", "T"), need[["A"]])
 
@@ -531,15 +569,20 @@ assign_third_bases <- function(aas, need, max_try = 50) {
   best
 }
 
-# cv   : the codons to recode (the protein is read off these)
-# need : how many of them must end in each of A, C, G, T
-recode_codons <- function(cv, need) {
-  aas <- AA[cv]
-  b3  <- assign_third_bases(aas, need)
+# cv    : the codons to recode (the protein is read off these)
+# need  : how many of them must end in each of A, C, G, T
+# menus : one entry per position, each the codon options grouped by third base.
+#         Defaults to the construct-wide MENU for that position's amino acid; a
+#         block passes its own to drop a codon at some positions and not
+#         others, which a menu keyed by amino acid cannot express.
+recode_codons <- function(cv, need, menus = NULL) {
+  if (is.null(menus)) menus <- MENU[AA[cv]]
+  stopifnot("menus must have one entry per codon" = length(menus) == length(cv))
+  b3 <- assign_third_bases(map(menus, names), need)
   # The third base is now fixed, so the remaining choice is between codons that
   # share it and differ only in positions 1-2. Weighted by 231 usage.
-  map2_chr(aas, b3, function(a, b) {
-    opts <- MENU[[a]][[b]]
+  map2_chr(menus, b3, function(m, b) {
+    opts <- m[[b]]
     if (length(opts) == 1) opts else sample(opts, 1, prob = USE[opts])
   })
 }
@@ -580,11 +623,20 @@ is_clean <- function(seq_str, n_linkers) {
     !str_detect(seq_str, paste0("(A|C|G|T)\\1{", params$max_homopolymer, ",}"))
 }
 
-# Redraw the block until the assembled construct passes both motif checks.
-draw_clean_block <- function(cv, need, prefix, n_linkers, max_try = 200) {
+# Redraw the block until the assembled construct passes both motif checks, and
+# any block-specific constraint `extra_ok` adds.
+#
+# `assemble` places the drawn block into the construct instead of a prefix to
+# paste it after, because the GS linker sits *upstream* of the fixed P2A rather
+# than at the end of what is already built. Checking motifs on the wrong
+# assembly order would test junctions the construct does not have.
+draw_clean_block <- function(cv, need, assemble, n_linkers,
+                             extra_ok = function(block) TRUE, menus = NULL,
+                             max_try = 200) {
   for (i in seq_len(max_try)) {
-    block <- recode_codons(cv, need)
-    full  <- paste0(c(prefix, block), collapse = "")
+    block <- recode_codons(cv, need, menus = menus)
+    if (!extra_ok(block)) next
+    full <- paste0(assemble(block), collapse = "")
     if (is_clean(full, n_linkers)) return(list(block = block, tries = i))
   }
   stop("No clean draw after ", max_try, " attempts")
@@ -596,6 +648,54 @@ draw_clean_block <- function(cv, need, prefix, n_linkers, max_try = 200) {
 Each rung is built with the previous rung held fixed, so rung *k* is still rung
 *k-1* plus one linker and one eGFP copy.
 
+## The GS linker, and its pre-recode state
+
+The linker's peptide is specified here because no part in the spreadsheet
+encodes it. Its **pre-recode** state is the naive encoding - the most-used codon
+per residue in this same 231 usage table - and that is not a placeholder chosen
+for convenience: it is what a synthesis vendor's optimizer returns, it is what
+the pre-recode density panels in section 10 should therefore show, and it is the
+exact tandem repeat the recoding has to break. `naive_encoding()` lives in
+`reporter_helpers.R` so the codon-level notebook can rebuild the same "before"
+from the exported usage table without a second implementation.
+
+```{r gs_linker}
+GS_UNIT_AA <- "GGGGS"
+GS_UNIT_NT <- 3L * nchar(GS_UNIT_AA)
+
+gs_aa    <- strrep(GS_UNIT_AA, params$gs_repeats)
+gs_naive <- naive_encoding(gs_aa, usage)
+
+# The three units of a linker sequence, as strings.
+gs_units <- function(linker)
+  substring(linker,
+            seq(1L, by = GS_UNIT_NT, length.out = params$gs_repeats),
+            seq(GS_UNIT_NT, by = GS_UNIT_NT, length.out = params$gs_repeats))
+
+longest_homopolymer <- function(s)
+  max(nchar(str_extract_all(s, "(A+|C+|G+|T+)")[[1]]))
+
+stopifnot(
+  "The naive GS linker does not encode the GGGGS repeat" =
+    aa_of(gs_naive) == gs_aa,
+  "The naive GS linker is not 3 nt per residue" =
+    nchar(gs_naive) == 3L * nchar(gs_aa),
+  # The reason this part is treated differently from FLAG and eGFP. If a usage
+  # table ever made the naive encoding non-repetitive, the constraints below
+  # would be solving a problem that no longer exists and should be revisited
+  # rather than silently kept.
+  "The naive GS linker is not a tandem repeat: the repeat constraint has no motivation" =
+    length(unique(gs_units(gs_naive))) == 1L
+)
+cat("Naive GS linker (", params$gs_repeats, "x", GS_UNIT_AA, "): ",
+    gs_naive, "\n  longest internal repeat ",
+    max_internal_repeat(gs_naive), " nt, longest homopolymer ",
+    longest_homopolymer(gs_naive), " nt, GC3 ",
+    round(compute_gc3_pct(gs_naive), 1), "%\n", sep = "")
+```
+
+## The rungs
+
 ```{r build_ladder}
 set.seed(params$seed)
 
@@ -604,21 +704,70 @@ p2a_cv   <- codon_split(p2a)
 waldo_cv <- codon_split(waldo)
 flag_cv  <- codon_split(flag1x)
 egfp_cv  <- codon_split(egfp)
+gs_cv    <- codon_split(gs_naive)
+n_gs     <- length(gs_cv)
 
-# Rung 0. SmBiT and P2A are fixed, so only FLAG's 8 codons are free - far too
-# few to pull a 39-codon construct onto target, as the overview says. It still
-# gets the closest assignment those 8 codons allow.
+# What a drawn GS linker has to satisfy on top of the construct-wide motif
+# checks. Pairwise-distinct units is implied by the repeat bound - identical
+# units would put a repeat of at least GS_UNIT_NT in the linker - but it is the
+# constraint the design is actually about, so it is stated rather than inferred.
+gs_ok <- function(block) {
+  linker <- paste0(block[seq_len(n_gs)], collapse = "")
+  anyDuplicated(gs_units(linker)) == 0L &&
+    max_internal_repeat(linker) <= params$gs_max_repeat &&
+    longest_homopolymer(linker) <= params$gs_max_homopolymer
+}
+
+# Rung 0. SmBiT and P2A are fixed; the free codons are the GS linker's 15 plus
+# FLAG's 8. They are drawn as ONE 23-codon assignment rather than two blocks,
+# because the third-base target is a count over the whole construct and
+# splitting it between them would need an arbitrary allocation. The two
+# stretches need not be contiguous for this: `assign_third_bases` reads amino
+# acids off a plain vector and never looks at position.
 bb_fixed <- c(smbit_cv, p2a_cv)
-flag_new <- draw_clean_block(flag_cv, block_needs(length(flag_cv), bb_fixed),
-                             prefix = bb_fixed, n_linkers = 0)$block
+free_cv  <- c(gs_cv, flag_cv)
+need0    <- block_needs(length(free_cv), bb_fixed)
 
-rungs    <- list(c(bb_fixed, flag_new))
+# Glycine's only G-ending codon is GGG, and inside a polyglycine run it is
+# always followed by another GG, so picking it puts a 5 nt G run in the linker -
+# which is what the first version of this design did, twice in 45 nt. The
+# construct-wide menu cannot say "not here", so the linker's glycine positions
+# give up G and the G-ending codons the target needs go to the linker's serines
+# (TCG) or FLAG's lysines (AAG) instead. Five positions can take G; the target
+# asks for three.
+gs_menus <- map(MENU[AA[gs_cv]], function(m)
+  if (identical(m[["G"]], "GGG")) m[names(m) != "G"] else m)
+free_menus <- c(gs_menus, MENU[AA[flag_cv]])
+stopifnot(
+  "The GS menu restriction did not remove GGG" =
+    !any(map_lgl(gs_menus, ~ "GGG" %in% unlist(.x))),
+  # Dropping a base can make the target unreachable rather than just harder, so
+  # the positions that can still take G must cover what it asks for.
+  "Too few positions can end in G once the linker's glycines give it up" =
+    sum(map_lgl(free_menus, ~ "G" %in% names(.x))) >= need0[["G"]]
+)
+
+# max_try is raised well above the eGFP default: the GS constraints reject most
+# draws (a 45 nt Gly/Ser stretch is repetitive almost by construction), so the
+# search needs room. It is a search budget, not a tolerance.
+drawn0 <- draw_clean_block(
+  free_cv, need0,
+  assemble  = function(b) c(smbit_cv, b[seq_len(n_gs)], p2a_cv, b[-seq_len(n_gs)]),
+  n_linkers = 0, extra_ok = gs_ok, menus = free_menus, max_try = 5000)
+
+gs_new   <- drawn0$block[seq_len(n_gs)]
+flag_new <- drawn0$block[-seq_len(n_gs)]
+cat(sprintf("  GS linker + FLAG need A %d, C %d, G %d, T %d - clean on draw %d\n",
+            need0[["A"]], need0[["C"]], need0[["G"]], need0[["T"]], drawn0$tries))
+
+rungs    <- list(c(smbit_cv, gs_new, p2a_cv, flag_new))
 copy_cvs <- list()
 
 for (k in seq_len(params$max_gfp_copies)) {
   prefix <- c(rungs[[k]], waldo_cv)
   need   <- block_needs(length(egfp_cv), prefix)
-  drawn  <- draw_clean_block(egfp_cv, need, prefix = prefix, n_linkers = k)
+  drawn  <- draw_clean_block(egfp_cv, need,
+                             assemble = function(b) c(prefix, b), n_linkers = k)
   rungs[[k + 1]] <- c(prefix, drawn$block)
   copy_cvs[[k]]  <- drawn$block
   cat(sprintf("  eGFP copy %d needs A %d, C %d, G %d, T %d - clean on draw %d\n",
@@ -626,8 +775,11 @@ for (k in seq_len(params$max_gfp_copies)) {
 }
 
 recoded <- map_chr(rungs, ~ paste0(.x, collapse = ""))
-names(recoded) <- ifelse(gfp_copies == 0, "SmBiT-P2A-FLAG",
-                         sprintf("SmBiT-P2A-FLAG-link-%dxeGFP", gfp_copies))
+# The names carry GS now that the linker is part of every rung: a construct name
+# that omitted a 45 nt insert would misdescribe every table and figure legend
+# this notebook exports.
+names(recoded) <- ifelse(gfp_copies == 0, "SmBiT-GS-P2A-FLAG",
+                         sprintf("SmBiT-GS-P2A-FLAG-link-%dxeGFP", gfp_copies))
 cat("Built", length(recoded), "rungs:", paste(nchar(recoded), collapse = ", "),
     "nt\n")
 
@@ -646,7 +798,7 @@ produced it.
 
 ```{r validate_protein}
 originals <- {
-  bb <- paste0(smbit_n, p2a, flag1x)
+  bb <- paste0(smbit_n, gs_naive, p2a, flag1x)
   map_chr(gfp_copies, function(n)
     if (n == 0) bb else paste0(bb, strrep(paste0(waldo, egfp), n)))
 }
@@ -703,6 +855,48 @@ stopifnot("A rung carries a homopolymer longer than max_homopolymer" =
             all(max_run <= params$max_homopolymer))
 cat("Longest homopolymer per rung:", paste(max_run, collapse = ", "),
     "nt (cap", params$max_homopolymer, ")\n")
+```
+
+The GS linker is the one part whose constraint is about repeats rather than
+composition, so it is checked separately - and checked against the naive
+encoding, which must **fail** the same measures. Without that companion the
+repeat bound would pass on a measure that never finds a repeat at all.
+
+```{r validate_gs_linker}
+gs_seq <- paste0(gs_new, collapse = "")
+
+gs_stats <- tibble(
+  version = c("Naive (most-used codon)", "Recoded"),
+  seq     = c(gs_naive, gs_seq),
+  n_units = map_int(seq, ~ length(unique(gs_units(.x)))),
+  repeat_nt = map_int(seq, max_internal_repeat),
+  homo_nt   = map_int(seq, longest_homopolymer),
+  gc3_pct   = map_dbl(seq, compute_gc3_pct)
+)
+print(gs_stats %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+
+stopifnot(
+  "The recoded GS linker changed the peptide" = aa_of(gs_seq) == gs_aa,
+  "The recoded GS linker changed length" = nchar(gs_seq) == nchar(gs_naive),
+  "Two GGGGS units in the recoded linker are identical" =
+    length(unique(gs_units(gs_seq))) == params$gs_repeats,
+  "The recoded GS linker still carries a long internal repeat" =
+    max_internal_repeat(gs_seq) <= params$gs_max_repeat,
+  "The recoded GS linker exceeds its homopolymer cap" =
+    longest_homopolymer(gs_seq) <= params$gs_max_homopolymer,
+  # Discriminative companions: both measures must fire on the naive encoding.
+  # A tandem repeat of n units has a repeated substring of all but the last
+  # unit, so that is the bound to expect rather than a guessed number.
+  "The repeat measure does not detect the naive tandem repeat" =
+    max_internal_repeat(gs_naive) >= nchar(gs_naive) - GS_UNIT_NT,
+  "The naive encoding passes the unit-distinctness check: it is not discriminative" =
+    length(unique(gs_units(gs_naive))) < params$gs_repeats
+)
+cat("GS linker recoded: longest internal repeat ",
+    max_internal_repeat(gs_naive), " nt -> ", max_internal_repeat(gs_seq),
+    " nt (cap ", params$gs_max_repeat, ")\n  ", gs_seq, "\n  units: ",
+    paste(gs_units(gs_seq), collapse = " "), "\n", sep = "")
 ```
 
 `07_` carried 723 nt and 1,446 nt of exactly repeated sequence, which recombines
@@ -783,7 +977,9 @@ print(ratios %>% dplyr::select(reporter, gc_ratio, gc_ratio_expressed,
 
 The eGFP rungs are assigned base by base, so their counts are exact by
 construction; what is asserted is that the construction worked. The bare rung is
-excluded for the reason section 3 gives - 31 of its 39 codons are fixed.
+left out of the assertion: 31 of its 54 codons are the fixed SmBiT and P2A, so
+whether its 23 free codons can absorb their GC3 excess is a measurement, not
+something the construction guarantees. Section 9 reports the result.
 
 ```{r nuc3_checks}
 egfp_rungs <- names(recoded)[gfp_copies > 0]
@@ -884,9 +1080,16 @@ stopifnot(
           100 / (comp_tbl$cds_length[gfp_copies > 0] / 3))
 )
 cat("Every eGFP rung is within one codon of the GC3 target\n")
-cat(sprintf("The bare rung sits %.1f points above target, its floor with SmBiT",
-            comp_tbl$d_gc3[gfp_copies == 0]))
-cat(" and P2A fixed\n")
+# Reported, not asserted, and with the sign shown: the bare rung's free codons
+# went from 8 (FLAG alone) to 23 once the GS linker was added, and whether that
+# is enough to absorb the fixed SmBiT/P2A excess is exactly what this number
+# answers. Asserting a bound here would be asserting the answer.
+cat(sprintf("The bare rung sits %+.2f points from target (%.1f%% GC3 vs %.1f%%),\n",
+            comp_tbl$d_gc3[gfp_copies == 0], comp_tbl$gc3_pct[gfp_copies == 0],
+            TARGET_GC3))
+cat(sprintf("  with %d of its %d codons free - the GS linker's %d plus FLAG's %d\n",
+            n_gs + length(flag_cv), comp_tbl$cds_length[gfp_copies == 0] %/% 3,
+            n_gs, length(flag_cv)))
 ```
 
 ```{r percentiles}
@@ -1015,15 +1218,19 @@ write_csv(comp_tbl, file.path(outdir,
 write_csv(pct_tbl, file.path(outdir,
           paste0("08_recoded_percentiles_vs_231_", run_tag, ".csv")))
 
-# The recoded parts on their own, which is what actually gets ordered.
+# The recoded parts on their own, which is what actually gets ordered. In
+# construct order, so the table reads along the ORF: GS linker, FLAG, then the
+# eGFP copies.
 flag_seq <- paste0(flag_new, collapse = "")
+part_seqs <- c(gs_seq, flag_seq, copy_seq)
 part_tbl <- tibble(
-  part    = c("FLAG (1x), recoded",
+  part    = c(sprintf("GS linker (%dx%s), recoded", params$gs_repeats, GS_UNIT_AA),
+              "FLAG (1x), recoded",
               sprintf("eGFP copy %d, recoded", seq_along(copy_seq))),
-  nt      = c(nchar(flag_seq), nchar(copy_seq)),
-  gc_pct  = c(gc_pct_of(flag_seq), map_dbl(copy_seq, gc_pct_of)),
-  gc3_pct = c(compute_gc3_pct(flag_seq), map_dbl(copy_seq, compute_gc3_pct)),
-  cds     = c(flag_seq, copy_seq)
+  nt      = nchar(part_seqs),
+  gc_pct  = map_dbl(part_seqs, gc_pct_of),
+  gc3_pct = map_dbl(part_seqs, compute_gc3_pct),
+  cds     = part_seqs
 )
 write_csv(part_tbl, file.path(outdir,
           paste0("08_recoded_parts_", run_tag, ".csv")))

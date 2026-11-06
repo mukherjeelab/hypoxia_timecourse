@@ -13,6 +13,7 @@ params:
   max_gfp_copies: 3
   codons_per_line: 60
   min_codon_prop: 0.08
+  gs_repeats: 3
 ---
 
 ```{r}
@@ -30,7 +31,8 @@ if (!isTRUE(getOption("knitr.in.progress"))) {
     run_tag         = "upto3x_expressed",
     max_gfp_copies  = 3,
     codons_per_line = 60,
-    min_codon_prop  = 0.08
+    min_codon_prop  = 0.08,
+    gs_repeats      = 3
   )
 }
 ```
@@ -138,27 +140,86 @@ stopifnot(
 cat("Parts verified.\n")
 ```
 
+## The 231 codon usage table
+
+Read here rather than in section 7, where it is used for the usage comparison,
+because the GS linker's pre-recode state is derived from it: see below.
+
+```{r read_usage}
+use_csv <- file.path(indir,
+             paste0("08_codon_usage_231_", params$run_tag, ".csv"))
+stopifnot("Codon usage table not found: knit 08_ first" = file.exists(use_csv))
+
+usage <- read_csv(use_csv, show_col_types = FALSE)
+stopifnot(
+  "Codon usage table is missing expected columns" =
+    all(c("codon", "aa", "count", "prop") %in% names(usage)),
+  "Synonymous proportions do not sum to 1 within every amino acid" =
+    all(abs((usage %>% group_by(aa) %>%
+               summarise(s = sum(prop), .groups = "drop"))$s - 1) < 1e-9)
+)
+# Biological spot-check, same one 08_ makes, so a wrong file cannot slip in.
+stopifnot("CTG is not the most-used Leu codon: wrong or corrupt usage table" =
+            (usage %>% filter(aa == "L") %>% slice_max(prop, n = 1))$codon == "CTG")
+cat("Usage table: ", nrow(usage), " sense codons. CTG share of Leu: ",
+    round(100 * usage$prop[usage$codon == "CTG"], 1), "%\n", sep = "")
+```
+
+## The GS linker's pre-recode state
+
+The (GGGGS)x3 linker upstream of P2A has no row in the parts spreadsheet - it is
+designed in `08_`, not imported - so "the original" has to mean something
+explicit. It means the **naive encoding**: the most-used codon per residue in
+the table just read, which is what a vendor's codon optimizer returns and which
+on a repeated peptide is an exact tandem repeat. `naive_encoding()` is the same
+function `08_` calls, so the two notebooks cannot disagree about the before.
+
+```{r gs_naive}
+GS_UNIT_AA <- "GGGGS"
+gs_aa      <- strrep(GS_UNIT_AA, params$gs_repeats)
+gs_naive   <- naive_encoding(gs_aa, usage)
+
+stopifnot(
+  "The naive GS linker does not encode the GGGGS repeat" =
+    aa_of(gs_naive) == gs_aa,
+  # The property that makes it the right "before" to plot and the right
+  # companion for the repeat check in 08_.
+  "The naive GS linker is not an exact tandem repeat" =
+    max_internal_repeat(gs_naive) >= nchar(gs_naive) - 3L * nchar(GS_UNIT_AA)
+)
+cat("Naive GS linker: ", gs_naive, " (", nchar(gs_naive),
+    " nt, longest internal repeat ", max_internal_repeat(gs_naive), " nt)\n",
+    sep = "")
+```
+
 ## The original ladder, rebuilt
 
 ```{r rebuild_originals}
 gfp_copies <- 0:params$max_gfp_copies
 originals  <- {
-  bb <- paste0(smbit_n, p2a, flag1x)
+  bb <- paste0(smbit_n, gs_naive, p2a, flag1x)
   map_chr(gfp_copies, function(n)
     if (n == 0) bb else paste0(bb, strrep(paste0(waldo, egfp), n)))
 }
-names(originals) <- ifelse(gfp_copies == 0, "SmBiT-P2A-FLAG",
-                           sprintf("SmBiT-P2A-FLAG-link-%dxeGFP", gfp_copies))
+names(originals) <- ifelse(gfp_copies == 0, "SmBiT-GS-P2A-FLAG",
+                           sprintf("SmBiT-GS-P2A-FLAG-link-%dxeGFP", gfp_copies))
 cat("Rebuilt", length(originals), "original rungs:",
     paste(nchar(originals), collapse = ", "), "nt\n")
 ```
 
 ## The part layout, in codons
 
-Every construct is the same four-part backbone followed by *k* repeats of
-linker + eGFP. Only FLAG and the eGFP copies were free to change: SmBiT, P2A
-and the Waldo linker are held fixed by `08_`, the linker because it carries the
-in-frame EcoRI site the cloning depends on.
+Every construct is the same backbone - SmBiT, the GS linker, P2A, FLAG -
+followed by *k* repeats of Waldo linker + eGFP. The GS linker, FLAG and the eGFP
+copies were free to change; SmBiT, P2A and the Waldo linker are held fixed by
+`08_`, the Waldo linker because it carries the in-frame EcoRI site the cloning
+depends on.
+
+The GS linker is free in the same sense as the others - every codon was chosen
+by the recoder - but under two extra constraints the others do not carry: its
+three GGGGS units must be pairwise distinct and no 7-mer may occur twice inside
+it. That is why its pre-recode codons are all identical and its recoded ones are
+not, which the status grid below shows directly.
 
 ```{r part_layout}
 n_cod <- function(s) nchar(s) %/% 3L
@@ -166,13 +227,13 @@ n_cod <- function(s) nchar(s) %/% 3L
 # One row per contiguous stretch of codons, in order along the construct.
 layout_for <- function(k) {
   base <- tibble(
-    part  = c("SmBiT", "P2A", "FLAG"),
-    ncod  = c(n_cod(smbit_n), n_cod(p2a), n_cod(flag1x)),
-    state = c("fixed", "fixed", "free")
+    part  = c("SmBiT", "GS linker", "P2A", "FLAG"),
+    ncod  = c(n_cod(smbit_n), n_cod(gs_naive), n_cod(p2a), n_cod(flag1x)),
+    state = c("fixed", "free", "fixed", "free")
   )
   if (k == 0) return(base)
   reps <- map_dfr(seq_len(k), ~ tibble(
-    part  = c("linker", sprintf("eGFP copy %d", .x)),
+    part  = c("Waldo linker", sprintf("eGFP copy %d", .x)),
     ncod  = c(n_cod(waldo), n_cod(egfp)),
     state = c("fixed", "free")
   ))
@@ -201,13 +262,7 @@ print(layout_tbl %>% filter(construct == names(originals)[length(originals)]) %>
 ```{r read_recoded}
 seq_csv <- file.path(indir,
              paste0("08_recoded_assembled_sequences_", params$run_tag, ".csv"))
-use_csv <- file.path(indir,
-             paste0("08_codon_usage_231_", params$run_tag, ".csv"))
-stopifnot(
-  "Recoded sequences not found: knit 08_ first" = file.exists(seq_csv),
-  "Codon usage table not found: re-knit 08_, which now exports it" =
-    file.exists(use_csv)
-)
+stopifnot("Recoded sequences not found: knit 08_ first" = file.exists(seq_csv))
 
 rec_tbl <- read_csv(seq_csv, show_col_types = FALSE)
 recoded <- setNames(rec_tbl$cds, rec_tbl$construct)
@@ -280,7 +335,8 @@ exported so the sequences can be read codon by codon outside R.
 `status` has four levels, and the distinction between the last two matters when
 reading the figures:
 
-- **fixed** - inside SmBiT, P2A or a linker. Never offered to the recoder.
+- **fixed** - inside SmBiT, P2A or the Waldo linker. Never offered to the
+  recoder.
 - **changed** - the recoder picked a different synonymous codon.
 - **unchanged** - offered to the recoder, which picked the original codon back.
 - **no synonym** - Met or Trp, the two amino acids with a single codon. These
@@ -416,7 +472,7 @@ p_status <- ggplot(grid_tbl, aes(col, -row, fill = status)) +
   labs(x = paste("Codon position within row (", CPL, "codons per row )"),
        y = NULL,
        title = "Which codons the recoder changed",
-       caption = paste("Grey = fixed part (SmBiT, P2A, linker), never offered.",
+       caption = paste("Grey = fixed part (SmBiT, P2A, Waldo linker), never offered.",
                        "Dark grey = Met or Trp,\nwhich have no synonym and so",
                        "cannot change. Pale blue = offered but the original",
                        "codon\nwas picked back. Dark blue = recoded.")) +
@@ -497,21 +553,8 @@ proportion to the pooled synonymous usage of the expressed transcriptome.
 Those two steps pull in different directions, so comparing the chosen codons
 against raw usage conflates them. Both views are shown.
 
-```{r read_usage}
-usage <- read_csv(use_csv, show_col_types = FALSE)
-stopifnot(
-  "Codon usage table is missing expected columns" =
-    all(c("codon", "aa", "count", "prop") %in% names(usage)),
-  "Synonymous proportions do not sum to 1 within every amino acid" =
-    all(abs((usage %>% group_by(aa) %>%
-               summarise(s = sum(prop), .groups = "drop"))$s - 1) < 1e-9)
-)
-# Biological spot-check, same one 08_ makes, so a wrong file cannot slip in.
-stopifnot("CTG is not the most-used Leu codon: wrong or corrupt usage table" =
-            (usage %>% filter(aa == "L") %>% slice_max(prop, n = 1))$codon == "CTG")
-cat("Usage table: ", nrow(usage), " sense codons. CTG share of Leu: ",
-    round(100 * usage$prop[usage$codon == "CTG"], 1), "%\n", sep = "")
-```
+The usage table is already loaded, in section 2, because the GS linker's
+pre-recode state is derived from it.
 
 The chosen codons are the **free** positions only, and the longest rung only.
 Pooling the nested rungs would count eGFP copy 1 three times and copy 3 once,

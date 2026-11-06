@@ -10,7 +10,7 @@ Nothing here writes to `output/predictive_modeling/`. Outputs go to
 
 | Notebook | Role |
 |---|---|
-| `reporter_helpers.R` | shared, cell-line agnostic machinery: reporter sequence import and verification, CDS metrics, the density plotter, percentiles |
+| `reporter_helpers.R` | shared, cell-line agnostic machinery: reporter sequence import and verification, CDS metrics, the density plotter, percentiles, and the two repeated-peptide-linker helpers (`naive_encoding`, `max_internal_repeat`) that `08_`/`10_`/`11_` all define the GS linker's pre-recode state through |
 | `01_cds_length_gc3_distributions.Rmd` | MDA-MB-231: CDS length, GC% and GC3% densities for the expressed transcriptome and the eIF3d hypoxia-promoted set, with NanoLuc reference lines and percentiles |
 | `02_cds_length_gc3_distributions_mcf7six1.Rmd` | the MCF7-SIX1 counterpart; also writes the two-cell-line medians table. Run `01_` first, since section 8 reads its exported medians |
 | `03_cds_length_gc3_fusion_constructs.Rmd` | MDA-MB-231 only: the eGFP / mCherry / TagRFP -P2A-NanoLuc fusions assembled from parts, with NanoLuc alone as the reference |
@@ -18,9 +18,10 @@ Nothing here writes to `output/predictive_modeling/`. Outputs go to
 | `05_cds_length_flag_copy_ladder.Rmd` | MDA-MB-231 only: a FLAG copy-number ladder as a length series; the step size is the `flag_step` parameter and the output filenames carry it |
 | `06_cds_length_smbit_p2a_ha.Rmd` | MDA-MB-231 only: SmBiT-P2A-1xHA (120 nt), -1xFLAG (117 nt) and -FLAG-eGFP (840 nt), no NanoLuc; three cumulative views of each panel, and the length panel is also drawn zoomed because ~120 nt is unreadable on the standard 6 kb axis |
 | `07_cds_length_egfp_copy_ladder.Rmd` | MDA-MB-231 only: an eGFP copy ladder on `06_`'s SmBiT-P2A-FLAG backbone, Waldo linker included (0/1/2/3 copies = 117/876/1,599/2,322 nt by default); `max_gfp_copies` and `linker_between_copies` are parameters and the output filenames carry both |
-| `08_gc_matched_recode_egfp_ladder.Rmd` | the same four rungs as `07_`, with the FLAG tag and every eGFP copy **recoded synonymously** onto the 231 composition: GC3 93% to 59%, GC 61% to 50%, protein unchanged. Copies are recoded independently, which also removes `07_`'s tandem repeat |
+| `08_gc_matched_recode_egfp_ladder.Rmd` | the same four rungs as `07_` plus a **(GGGGS)x3 linker upstream of P2A**, with that linker, the FLAG tag and every eGFP copy **recoded synonymously** onto the 231 composition: GC3 93% to 57%, GC 62% to 49%, protein unchanged. Copies are recoded independently, which also removes `07_`'s tandem repeat; the GS linker additionally carries a repeat bound, since the naive encoding of a repeated peptide is a tandem repeat |
 | `09_composition_weighting_comparison.Rmd` | what "the transcriptome's composition" means: the same background summarised five ways (per-transcript median and mean, codon-pooled, mRNA-weighted, ribosome-weighted) and the GC3 target each one implies |
 | `10_codon_level_view_recoded_ladder.Rmd` | the codon-level reading of `08_`'s exported sequences: a tile map of all four rungs at codon resolution, the sequences printed codon by codon with the recoded positions colored, and whether the chosen codons track 231 usage. Run `08_` first; it reads `08_recoded_assembled_sequences_*.csv` and `08_codon_usage_231_*.csv` |
+| `11_part_composition_bars.Rmd` | GC and GC3 of each recoded **part** on its own - GS linker, FLAG, each eGFP copy - before and after recoding, against the expressed median. Reads `08_`'s exported tables and `01_`'s medians; no txdb, so it is fast |
 
 **The FLAG ladder confounds length with GC.** It is a clean length series on the
 GC3 axis - GC3 moves 1.6 points across 1x to 51x, 5% of the transcriptome IQR,
@@ -376,27 +377,31 @@ Delivered, against a target of GC3 57.3% (background n = 10,054):
 
 | rung | nt | GC3 before | GC3 after | GC3 pctile | GC after | GC pctile | length pctile |
 |---|---|---|---|---|---|---|---|
-| SmBiT-P2A-FLAG | 117 | 71.0 | 57.9 | 51.0 | 50.4 | 46.5 | 0.3 |
-| + link-1xeGFP | 876 | 91.1 | 57.4 | 50.1 | 48.7 | 40.8 | 31.2 |
-| + link-2xeGFP | 1,635 | 92.5 | 57.4 | 50.0 | 48.6 | 40.4 | 63.7 |
-| + link-3xeGFP | 2,394 | 93.0 | 57.3 | 50.0 | 48.7 | 40.6 | 81.2 |
+| SmBiT-GS-P2A-FLAG | 162 | 79.3 | 56.6 | 48.9 | 58.0 | 72.1 | 0.9 |
+| + link-1xeGFP | 921 | 91.5 | 57.2 | 49.8 | 50.6 | 47.1 | 33.2 |
+| + link-2xeGFP | 1,680 | 92.7 | 57.3 | 49.9 | 49.7 | 43.9 | 65.1 |
+| + link-3xeGFP | 2,439 | 93.1 | 57.3 | 49.9 | 49.3 | 42.9 | 81.8 |
 
-**All four rungs sit at the GC3 median while length spans the 0.3rd to 81st
+**All four rungs sit at the GC3 median while length spans the 0.9th to 82nd
 percentile.** That separation is the whole point: the ladder varies length
 against a fixed, ordinary composition. All four third bases sit between the 20th
 and 80th percentile on every eGFP rung.
 
-**The bare 117 nt rung is effectively matched too, which the full-CDS basis hid.**
-It reads 57.9% against the 57.3% target - 0.6 points, the 51st percentile. On
-the old basis the same construct read 59.0% against 57.5%, and the gap was
-attributed to SmBiT and P2A being 31 of its 39 codons. Most of it was really the
-initiator ATG counted in a 39-codon denominator, where one codon is 2.6%. The
-rung is still the one with least freedom, but it is not off target.
+**The bare rung is matched on GC3 and off on total GC, and the GS linker is why
+both are true.** On GC3 it reads 56.6% against 57.3% - 0.7 points, the 49th
+percentile - because the linker's 15 Gly/Ser codons all offer every third base
+and nearly tripled the rung's free codons, from 8 to 23. On total GC it reads
+58.0%, the 72nd percentile, because the same codons are GG- and TC-/AG- at
+positions 1 and 2 whatever is done to position 3. A 162 nt construct is 0.9th
+percentile on length in any case, so it was never going to read as a typical
+mRNA; what it is for is the no-eGFP arm of the ladder.
 
-**Total GC lands at 48.7%, about 2.8 points below the 51.5% median**, and no
-recoding can close it: eGFP's amino acids do not carry enough G/C in codon
-positions 1 and 2. Against a GC IQR of ~14 points that is ~0.2 IQR. Reported,
-not optimized.
+**Total GC on the eGFP rungs lands at 49-51%, within ~2 points of the 51.5%
+median**, and no recoding can close the rest: eGFP's amino acids do not carry
+enough G/C in codon positions 1 and 2. Against a GC IQR of ~14 points that is
+~0.15 IQR. Reported, not optimized. The GS linker moved this *closer* to the
+median (48.7% to 49.3% on the 3x rung) as a side effect of being GC-rich at
+positions 1-2.
 
 **Stage the assignment, or GC3 quietly loses to the base balance.** An earlier
 version assigned all four bases at once by swapping to reduce the *total*
@@ -417,6 +422,61 @@ re-synthesis.
 linker's `GAATTC` must stay the only EcoRI site and homopolymers are capped at
 6. A fresh draw is cheap and cannot distort the composition the way an in-place
 repair can.
+
+### The (GGGGS)x3 linker upstream of P2A
+
+**Why it is there.** P2A works by ribosomal skipping of its own Gly-Pro bond, so
+everything upstream of P2A stays attached to the SmBiT product: an 11-residue
+peptide that has to find LgBiT while carrying the whole P2A-derived tail on its
+C-terminus. A flexible spacer is the standard fix - a 3-residue GSG spacer is
+routinely put in front of P2A for the same reason - and 15 Gly/Ser residues give
+SmBiT room without adding anything structured.
+
+**It is designed here, not imported.** `accessories/cds seq.xlsx` has no GS
+linker row, so its peptide is specified in `08_` and its DNA is drawn by the
+same recoder that handles FLAG and eGFP.
+
+**"Before" therefore has to be defined, and the definition is the naive
+encoding** - the most-used codon per residue in the same 231 usage table. That
+is what a vendor's optimizer returns, and on a repeated peptide it is an exact
+tandem repeat: `GGCGGCGGCGGCAGC` three times, 45 nt, GC3 100%, with a 30 nt
+substring occurring twice. `naive_encoding()` lives in `reporter_helpers.R` so
+`08_` (which designs the linker), `10_` (which rebuilds the pre-recode ladder
+independently) and `11_` (which plots before-vs-after) cannot disagree about it.
+
+**The linker is the one part whose binding constraint is repeats, not
+composition.** It carries two bounds the other free parts do not: the three
+GGGGS units must be pairwise distinct, and no 7-mer may occur twice inside the
+45 nt. Delivered: `GGAGGTGGAGGATCG GGCGGCGGAGGTTCG GGAGGAGGCGGATCG`, three
+distinct units, longest internal repeat **6 nt** against the naive encoding's
+30, longest homopolymer 3 nt, GC3 40%. Both measures are asserted against the
+naive encoding as the companion that must **fail** them - a repeat bound that
+passes on a measure finding no repeats anywhere is worth nothing.
+
+**Glycine gives up GGG inside the linker, and that needed a change to the
+recoder.** GGG is glycine's only G-ending codon, and in a polyglycine run it is
+always followed by another GG, so choosing it puts a 5 nt G run in the linker -
+which the first version of this design did, twice in 45 nt. A menu keyed by
+amino acid cannot express "not at these positions", so `recode_codons()` now
+takes an optional **per-position** menu and `assign_third_bases()` takes
+per-position availability rather than amino acids. The G-ending codons the
+target asks for (three) go to the linker's serines (TCG) or FLAG's lysines (AAG)
+instead; five positions can take them, and that coverage is asserted, because
+dropping a base can make a target unreachable rather than merely harder.
+
+**The linker and FLAG are drawn as one 23-codon assignment**, not two blocks.
+The third-base target is a count over the whole construct, so splitting it
+between them would need an arbitrary allocation. They need not be contiguous for
+this: `assign_third_bases()` reads amino acids off a plain vector and never
+looks at position. What it does need is an `assemble` argument, because the GS
+linker sits *upstream* of the fixed P2A rather than at the end of the prefix, and
+checking motifs on the wrong assembly order tests junctions the construct does
+not have.
+
+**The search budget is 5,000 draws, not 200.** The GS constraints reject most
+draws - a 45 nt Gly/Ser stretch is repetitive almost by construction - and the
+delivered linker came up on draw 90. That is a budget, not a tolerance: there is
+no bound on how far a draw may miss, only on whether it is accepted.
 
 **The skew check carries a discriminative companion.** Asserting all four bases
 sit between the 20th and 80th percentile is worth something only if a skewed
@@ -476,13 +536,15 @@ needs the pre-recode sequences and free-vs-fixed needs the part boundaries and
 neither is in the exported files. That makes its diff an independent check that
 the exported sequences are synonymous with the input, run outside the notebook
 that produced them. It also asserts the fixed parts are **byte-identical**, not
-merely synonymous: SmBiT, P2A or a linker could have drifted to another
+merely synonymous: SmBiT, P2A or the Waldo linker could have drifted to another
 synonymous codon and every protein-level check would still pass.
 
-The recoder changes about **60% of the codons it is offered** (5 of 8 in FLAG,
-59-61% in each eGFP copy). "Unchanged" is reported separately from "no synonym":
-Met and Trp have a single codon each and cannot change, so folding them into
-"unchanged" would overstate how often a free choice was left alone.
+The recoder changes about **60% of the codons it is offered** (12 of 15 in the GS
+linker, 7 of 8 in FLAG, 58-61% in each eGFP copy). "Unchanged" is reported
+separately from "no synonym": Met and Trp have a single codon each and cannot
+change, so folding them into "unchanged" would overstate how often a free choice
+was left alone. The GS linker's pre-recode codons are all identical, so its row
+in the status grid is the clearest picture of what the recoding did.
 
 **Fixing the third base determines the codon outright in 50 of 55 (amino acid,
 third base) cells.** A choice survives in only five - Leu/G (CTG/TTG), Arg/A
@@ -517,11 +579,15 @@ the menu with the same rule and asserts every chosen codon is on it.
 
 ### Is a GC3 = 0% FLAG translatable?
 
-The recoded 1xFLAG is `GAT TAT AAA GAT GAT GAT GAT AAA` - **GC3 = 0%**, every
-codon A/T-ending. That is forced, not chosen: Asp and Tyr can only end C or T
-and Lys only A or G, so with GC3 driven down the five Asp and one Tyr all go to
-T and only the two Lys can supply A. Checked against the expressed background
-rather than from the literature:
+**No longer the current design, kept because the question will recur.** Before
+the GS linker existed, the bare rung's only free codons were FLAG's 8, so every
+one of them had to go A/T-ending and the recoded 1xFLAG came out as
+`GAT TAT AAA GAT GAT GAT GAT AAA` - **GC3 = 0%**. Asp and Tyr can only end C or
+T and Lys only A or G, so with GC3 driven down the five Asp and one Tyr all went
+to T and only the two Lys could supply A. The GS linker's 15 free codons now
+absorb most of that burden and FLAG sits at GC3 25%. The evidence below stands
+and says the 0% version would have been fine, so a future rung with few free
+codons need not re-derive it:
 
 - **51.0% of expressed transcripts (5,124 of 10,054) contain at least one run of
   8 consecutive codons at GC3 = 0%**, 83,691 such runs in total.
