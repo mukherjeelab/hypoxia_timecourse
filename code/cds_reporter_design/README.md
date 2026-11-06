@@ -18,10 +18,20 @@ Nothing here writes to `output/predictive_modeling/`. Outputs go to
 | `05_cds_length_flag_copy_ladder.Rmd` | MDA-MB-231 only: a FLAG copy-number ladder as a length series; the step size is the `flag_step` parameter and the output filenames carry it |
 | `06_cds_length_smbit_p2a_ha.Rmd` | MDA-MB-231 only: SmBiT-P2A-1xHA (120 nt), -1xFLAG (117 nt) and -FLAG-eGFP (840 nt), no NanoLuc; three cumulative views of each panel, and the length panel is also drawn zoomed because ~120 nt is unreadable on the standard 6 kb axis |
 | `07_cds_length_egfp_copy_ladder.Rmd` | MDA-MB-231 only: an eGFP copy ladder on `06_`'s SmBiT-P2A-FLAG backbone, Waldo linker included (0/1/2/3 copies = 117/876/1,599/2,322 nt by default); `max_gfp_copies` and `linker_between_copies` are parameters and the output filenames carry both |
-| `08_gc_matched_recode_egfp_ladder.Rmd` | the same four rungs as `07_` plus a **(GGGGS)x3 linker upstream of P2A**, with that linker, the FLAG tag and every eGFP copy **recoded synonymously** onto the 231 composition: GC3 93% to 57%, GC 62% to 49%, protein unchanged. Copies are recoded independently, which also removes `07_`'s tandem repeat; the GS linker additionally carries a repeat bound, since the naive encoding of a repeated peptide is a tandem repeat |
+| `08_gc_matched_recode_egfp_ladder.Rmd` | the ladder as it now stands: **HiBiT** in place of SmBiT, plus a **(GGGGS)x3 linker upstream of P2A**, with that linker, the FLAG tag and every eGFP copy **recoded synonymously** onto the 231 composition: GC3 93% to 57%, GC 62% to 49%, protein unchanged. Copies are recoded independently, which also removes `07_`'s tandem repeat; the GS linker additionally carries a repeat bound, since the naive encoding of a repeated peptide is a tandem repeat |
 | `09_composition_weighting_comparison.Rmd` | what "the transcriptome's composition" means: the same background summarised five ways (per-transcript median and mean, codon-pooled, mRNA-weighted, ribosome-weighted) and the GC3 target each one implies |
 | `10_codon_level_view_recoded_ladder.Rmd` | the codon-level reading of `08_`'s exported sequences: a tile map of all four rungs at codon resolution, the sequences printed codon by codon with the recoded positions colored, and whether the chosen codons track 231 usage. Run `08_` first; it reads `08_recoded_assembled_sequences_*.csv` and `08_codon_usage_231_*.csv` |
 | `11_part_composition_bars.Rmd` | GC and GC3 of each recoded **part** on its own - GS linker, FLAG, each eGFP copy - before and after recoding, against the expressed median. Reads `08_`'s exported tables and `01_`'s medians; no txdb, so it is fast |
+
+**`06_` and `07_` are the earlier SmBiT pass and are deliberately not updated.**
+The ladder of record is `08_` -> `10_`/`11_`, and it has moved twice since: a
+(GGGGS)x3 linker upstream of P2A, and **HiBiT in place of SmBiT**. `07_` is still
+the un-recoded length series for the SmBiT-P2A-FLAG backbone it names, and `06_`
+is still the SmBiT-P2A-HA-vs-FLAG comparison its filename describes. Everything
+either of them reports is correct for the construct it builds; neither is the
+construct being synthesised. Bringing them forward would rename `06_` and
+invalidate its written-up HA-vs-FLAG and P2A-product results, so it is left as a
+separate decision.
 
 **The FLAG ladder confounds length with GC.** It is a clean length series on the
 GC3 axis - GC3 moves 1.6 points across 1x to 51x, 5% of the transcriptome IQR,
@@ -377,9 +387,9 @@ Delivered, against a target of GC3 57.3% (background n = 10,054):
 
 | rung | nt | GC3 before | GC3 after | GC3 pctile | GC after | GC pctile | length pctile |
 |---|---|---|---|---|---|---|---|
-| SmBiT-GS-P2A-FLAG | 162 | 79.3 | 56.6 | 48.9 | 58.0 | 72.1 | 0.9 |
-| + link-1xeGFP | 921 | 91.5 | 57.2 | 49.8 | 50.6 | 47.1 | 33.2 |
-| + link-2xeGFP | 1,680 | 92.7 | 57.3 | 49.9 | 49.7 | 43.9 | 65.1 |
+| HiBiT-GS-P2A-FLAG | 162 | 79.3 | 56.6 | 48.9 | 57.4 | 70.0 | 0.9 |
+| + link-1xeGFP | 921 | 91.5 | 57.2 | 49.8 | 50.1 | 45.3 | 33.2 |
+| + link-2xeGFP | 1,680 | 92.7 | 57.2 | 49.9 | 49.5 | 43.4 | 65.1 |
 | + link-3xeGFP | 2,439 | 93.1 | 57.3 | 49.9 | 49.3 | 42.9 | 81.8 |
 
 **All four rungs sit at the GC3 median while length spans the 0.9th to 82nd
@@ -391,7 +401,7 @@ and 80th percentile on every eGFP rung.
 both are true.** On GC3 it reads 56.6% against 57.3% - 0.7 points, the 49th
 percentile - because the linker's 15 Gly/Ser codons all offer every third base
 and nearly tripled the rung's free codons, from 8 to 23. On total GC it reads
-58.0%, the 72nd percentile, because the same codons are GG- and TC-/AG- at
+57.4%, the 70th percentile, because the same codons are GG- and TC-/AG- at
 positions 1 and 2 whatever is done to position 3. A 162 nt construct is 0.9th
 percentile on length in any case, so it was never going to read as a typical
 mRNA; what it is for is the no-eGFP arm of the ladder.
@@ -402,6 +412,25 @@ enough G/C in codon positions 1 and 2. Against a GC IQR of ~14 points that is
 ~0.15 IQR. Reported, not optimized. The GS linker moved this *closer* to the
 median (48.7% to 49.3% on the 3x rung) as a side effect of being GC-rich at
 positions 1-2.
+
+**Swapping SmBiT for HiBiT moved almost nothing in composition, which is worth
+measuring rather than assuming.** Both peptides are 11 residues, so every
+length is identical, and both are encoded at GC3 90.9%, so the fixed prefix the
+recoder works against is unchanged on the one quantity the design targets.
+HiBiT's DNA is ~3 points lower in total GC (57.6% vs 60.6%), which is the whole
+of the difference in the table above: the bare rung went 58.0% to 57.4% GC and
+the 3x rung did not move at all. The GS linker and FLAG sequences *did* change,
+because the third-base counts they are asked for shifted by a codon or two and
+the draw is seeded - not because the recoder behaves differently.
+
+**HiBiT has no "n" row in the spreadsheet.** `hibit` is the bare 11-residue
+peptide, 33 nt, the same form as `smbit c`; `smBit n` had the initiator built in.
+So `08_` and `10_` prepend `ATG` themselves. That is a design decision rather
+than a transcription, and it is asserted as a product - 36 nt, `MVSGWRLFKKIS`,
+starts `ATG`, ends with the spreadsheet row - plus a check that the row read is
+**not** the SmBiT peptide, since both are in the same file at the same length
+and the wrong row would give a construct that is in frame, stop-free and
+entirely wrong.
 
 **Stage the assignment, or GC3 quietly loses to the base balance.** An earlier
 version assigned all four bases at once by swapping to reduce the *total*
@@ -447,9 +476,9 @@ independently) and `11_` (which plots before-vs-after) cannot disagree about it.
 **The linker is the one part whose binding constraint is repeats, not
 composition.** It carries two bounds the other free parts do not: the three
 GGGGS units must be pairwise distinct, and no 7-mer may occur twice inside the
-45 nt. Delivered: `GGAGGTGGAGGATCG GGCGGCGGAGGTTCG GGAGGAGGCGGATCG`, three
+45 nt. Delivered: `GGAGGAGGTGGATCG GGTGGTGGAGGCTCG GGCGGAGGCGGATCA`, three
 distinct units, longest internal repeat **6 nt** against the naive encoding's
-30, longest homopolymer 3 nt, GC3 40%. Both measures are asserted against the
+30, longest homopolymer 3 nt, GC3 33%. Both measures are asserted against the
 naive encoding as the companion that must **fail** them - a repeat bound that
 passes on a measure finding no repeats anywhere is worth nothing.
 
@@ -475,7 +504,7 @@ not have.
 
 **The search budget is 5,000 draws, not 200.** The GS constraints reject most
 draws - a 45 nt Gly/Ser stretch is repetitive almost by construction - and the
-delivered linker came up on draw 90. That is a budget, not a tolerance: there is
+delivered linker came up on draw 92. That is a budget, not a tolerance: there is
 no bound on how far a draw may miss, only on whether it is accepted.
 
 **The skew check carries a discriminative companion.** Asserting all four bases
@@ -540,7 +569,7 @@ merely synonymous: SmBiT, P2A or the Waldo linker could have drifted to another
 synonymous codon and every protein-level check would still pass.
 
 The recoder changes about **60% of the codons it is offered** (12 of 15 in the GS
-linker, 7 of 8 in FLAG, 58-61% in each eGFP copy). "Unchanged" is reported
+linker, 6 of 8 in FLAG, 55-63% in each eGFP copy). "Unchanged" is reported
 separately from "no synonym": Met and Trp have a single codon each and cannot
 change, so folding them into "unchanged" would overstate how often a free choice
 was left alone. The GS linker's pre-recode codons are all identical, so its row
@@ -585,7 +614,8 @@ one of them had to go A/T-ending and the recoded 1xFLAG came out as
 `GAT TAT AAA GAT GAT GAT GAT AAA` - **GC3 = 0%**. Asp and Tyr can only end C or
 T and Lys only A or G, so with GC3 driven down the five Asp and one Tyr all went
 to T and only the two Lys could supply A. The GS linker's 15 free codons now
-absorb most of that burden and FLAG sits at GC3 25%. The evidence below stands
+absorb most of that burden and FLAG sits at GC3 37.5%
+(`GAC TAT AAA GAT GAC GAC GAT AAA`). The evidence below stands
 and says the 0% version would have been fine, so a future rung with few free
 codons need not re-derive it:
 
