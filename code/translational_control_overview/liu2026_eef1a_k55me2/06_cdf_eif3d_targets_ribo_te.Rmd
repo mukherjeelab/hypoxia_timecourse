@@ -1,0 +1,266 @@
+---
+title: "Liu 2026 eEF1A K55me2: ribo and TE change on METTL13 loss in eIF3d-promoted mRNAs (CDF)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  # Gene sets of the classifier run whose seed-9 draw is used (same as 02_cdf_eif3d_targets).
+  model_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tco_corrected_both_clipaggregate"
+  matrix_rds: "feature_matrix_tco.rds"
+  neg_seed: 9
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "06_cdf_eif3d_targets_ribo_te.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+})
+```
+
+# Plan
+
+Do mRNAs whose translation eIF3d promotes in MDA-MB-231 at hypoxia 1hr change in ribosome
+occupancy or TE when METTL13 (the eEF1A K55 dimethyltransferase) is knocked out in T3M4 cells?
+
+**Groups.**
+
+- **eIF3d-promoted** (orange): the classifier's 1,436 positives. TE log2(sictrl / si3d) > 0.5,
+  padj < 0.05, hypoxia 1hr.
+- **Negative control** (black): the classifier's size-matched seed-9 draw of 1,436 genes from
+  `negative_control_genes.csv`. A screened set, chosen for having no eIF3d effect.
+- **All other measured genes** (grey): every other gene in the Liu results.
+
+**Readouts**, from `05_riboseq_deseq2.Rmd`, both **log2(sgControl / sgMETTL13), positive =
+METTL13 promotes**:
+
+- **(A) Ribo LFC as saved** (apeglm-shrunken). The reliable readout in this dataset.
+- **(B) TE LFC, unshrunken.** Shrunken TE is ~0 for nearly every gene, because the RNA arm
+  does not replicate (`05_` replicate-concordance section). Treat (B) as a noisy ranking.
+
+# Load the Liu ribo-seq results
+
+```{r load_liu}
+liu_csv <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2",
+                "translation_categories_sgcontrol_vs_sgmettl13_liu2026.csv")
+if (!file.exists(liu_csv)) stop("Run 05_riboseq_deseq2.Rmd first: ", liu_csv, " not found")
+liu <- read_csv(liu_csv, show_col_types = FALSE)
+
+stopifnot(all(c("gene_id", "ribo_lfc", "te_lfc_mle") %in% names(liu)),
+          !anyDuplicated(liu$gene_id),
+          all(is.finite(liu$ribo_lfc)), all(is.finite(liu$te_lfc_mle)))
+
+# Direction: METTL13 is knocked out, so it must be positive in log2(sgControl / sgMETTL13)
+mettl13_ribo <- liu$ribo_lfc[liu$gene_id == "METTL13"]
+cat("Genes:", nrow(liu), "| METTL13 ribo_lfc:", round(mettl13_ribo, 2), "\n")
+stopifnot("METTL13 ribo_lfc not positive - Liu contrast direction flipped" = mettl13_ribo > 1)
+```
+
+# Load the classifier's gene sets
+
+```{r load_sets}
+out_tco  <- here("output", "translational_control_overview")
+sets_csv <- file.path(out_tco, paste0("rf_model_gene_sets_", params$model_suffix, ".csv"))
+stopifnot("model gene-set CSV not found - knit 02_rf_model.Rmd with these params" =
+            file.exists(sets_csv))
+model_sets <- read_csv(sets_csv, show_col_types = FALSE)
+
+pos_genes <- model_sets$gene_id_clean[model_sets$eif3d_target == "promotes"]
+neg_genes <- model_sets$gene_id_clean[model_sets$eif3d_target == "does_not_promote"]
+stopifnot(length(pos_genes) == 1436L, length(neg_genes) == 1436L,
+          length(intersect(pos_genes, neg_genes)) == 0,
+          !anyNA(model_sets$symbol), !anyDuplicated(model_sets$symbol))
+```
+
+## Check: the saved negatives are the seed-9 draw
+
+Rebuilt exactly as `02_rf_model.Rmd`'s `create_target` chunk does.
+
+```{r rederive_draw}
+matrix_genes <- readRDS(file.path(out_tco, params$matrix_rds))$gene_id_clean
+pos_csv  <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+pos_in <- pos_csv %>% filter(ensembl_gene %in% matrix_genes)
+pool   <- neg_pool %>% filter(gene_id_clean %in% matrix_genes, !gene_id_clean %in% pos_in$ensembl_gene)
+
+set.seed(params$neg_seed)
+redrawn <- sample(pool$gene_id_clean, min(nrow(pos_in), nrow(pool)))
+
+stopifnot("positives are not the gene-set CSV intersected with the matrix" =
+            setequal(pos_in$ensembl_gene, pos_genes),
+          "re-derived seed-9 draw does not reproduce the saved negatives" =
+            setequal(redrawn, neg_genes))
+cat("Seed", params$neg_seed, "draw reproduced: all", length(neg_genes), "negatives match\n")
+```
+
+## Check: direction of the eIF3d contrast
+
+The MDA-MB-231 TE files are log2(sictrl / si3d) despite their filename. EIF3D's own RNA must be
+strongly positive, every positive must have TE LFC > 0.5, and every negative |TE LFC| < 0.5.
+
+```{r direction}
+te <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+               show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+eif3d_rna <- te$rna_lfc[te$symbol == "EIF3D"]
+cat("EIF3D rna_lfc at hypoxia 1hr:", round(eif3d_rna, 2), "\n")
+stopifnot("EIF3D rna_lfc not strongly positive - contrast direction flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+
+te_pos <- te %>% filter(gene_id_clean %in% pos_genes)
+te_neg <- te %>% filter(gene_id_clean %in% neg_genes)
+stopifnot(nrow(te_pos) == length(pos_genes), nrow(te_neg) == length(neg_genes),
+          all(te_pos$te_lfc > 0.5), all(te_pos$te_padj < 0.05),
+          all(abs(te_neg$te_lfc) < 0.5))
+```
+
+# Match set genes to Liu genes
+
+Liu's genes are RefSeq symbols; ours carry GENCODE v49 symbols. Match on symbol. An alias
+fallback (`org.Hs.eg.db` aliases of unmatched set genes) was tested and rescued **no**
+genes: the unmatched ones (e.g. BMAL2/ARNTL2, RIGI/DDX58, NHERF2/SLC9A3R2) are absent from
+Liu's file under both names, and a loose alias rule instead produced false matches to other
+real genes (PHF1 to PHF2, MRPL23 to RPL23). So symbol matching only.
+
+```{r match}
+sets <- model_sets %>%
+  mutate(group = if_else(eif3d_target == "promotes", "eIF3d-promoted", "Negative control")) %>%
+  dplyr::select(gene_id_clean, symbol, group)
+
+raw_genes <- read.delim(here("accessories", "liu2026_GSE335287_raw_counts.txt"))$geneID
+
+sets %>%
+  group_by(group) %>%
+  summarise(n_set = n(),
+            in_liu_results    = sum(symbol %in% liu$gene_id),
+            removed_by_filter = sum(symbol %in% raw_genes & !symbol %in% liu$gene_id),
+            absent_from_file  = sum(!symbol %in% raw_genes),
+            fraction_in_liu   = mean(symbol %in% liu$gene_id)) %>%
+  knitr::kable(digits = 3)
+
+matched <- sets %>% filter(symbol %in% liu$gene_id) %>% dplyr::rename(liu_gene = symbol)
+```
+
+The negative controls are less often measured in T3M4 than the promoted set (more fall below
+the expression filter), so the plotted groups are no longer size-matched. That is reported,
+not corrected.
+
+# CDFs
+
+```{r cdf_function}
+grp_levels <- c("eIF3d-promoted", "Negative control", "All other genes")
+grp_colors <- c("eIF3d-promoted" = "#E69F00", "Negative control" = "black",
+                "All other genes" = "grey70")
+
+plot_df <- liu %>%
+  left_join(matched %>% dplyr::select(liu_gene, group), by = c("gene_id" = "liu_gene")) %>%
+  mutate(group = factor(replace_na(group, "All other genes"), levels = grp_levels))
+
+cdf_plot <- function(col, xlab, title) {
+  x  <- split(plot_df[[col]], plot_df$group)
+  n  <- lengths(x)[grp_levels]
+  w  <- list(pn = wilcox.test(x[["eIF3d-promoted"]],   x[["Negative control"]]),
+             po = wilcox.test(x[["eIF3d-promoted"]],   x[["All other genes"]]),
+             no = wilcox.test(x[["Negative control"]], x[["All other genes"]]))
+  labs_n <- setNames(sprintf("%s (n = %s)", grp_levels, trimws(format(n, big.mark = ","))), grp_levels)
+  stats <- tibble(comparison = c("promoted vs neg ctrl", "promoted vs other", "neg ctrl vs other"),
+                  wilcoxon_p = map_dbl(w, "p.value"))
+  meds  <- map_dbl(x, median)[grp_levels]
+
+  p <- ggplot(plot_df, aes(.data[[col]], colour = group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    stat_ecdf(linewidth = 0.8) +
+    coord_cartesian(xlim = quantile(plot_df[[col]], c(0.005, 0.995))) +
+    scale_colour_manual(values = grp_colors, labels = labs_n, breaks = grp_levels, name = NULL) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.6, size = 3.2,
+             label = sprintf("promoted vs neg ctrl: Wilcoxon p = %s\nmedian %.3f vs %.3f",
+                             format.pval(w$pn$p.value, digits = 2),
+                             meds[["eIF3d-promoted"]], meds[["Negative control"]])) +
+    labs(x = xlab, y = "Cumulative fraction", title = title,
+         subtitle = "Groups: eIF3d TE, MDA-MB-231 hypoxia 1hr") +
+    theme_classic(base_size = 12) +
+    theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+          legend.background = element_blank())
+  list(plot = p, stats = stats, medians = meds)
+}
+```
+
+## (A) Ribo LFC (shrunken, as saved)
+
+```{r cdf_ribo, fig.width = 6.5, fig.height = 4.5}
+cdf_ribo <- cdf_plot("ribo_lfc",
+                     "Ribo log2(sgControl / sgMETTL13), positive = METTL13 promotes",
+                     "METTL13 KO ribosome occupancy (Liu 2026, T3M4)")
+cdf_ribo$plot
+knitr::kable(cdf_ribo$stats, digits = 4)
+knitr::kable(enframe(cdf_ribo$medians, "group", "median_ribo_lfc"), digits = 3)
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_06_cdf_ribo_eif3d_promoted_hypoxia_1hr.pdf"), cdf_ribo$plot,
+         width = 6.5, height = 4.5)
+```
+
+## (B) TE LFC (unshrunken)
+
+```{r cdf_te, fig.width = 6.5, fig.height = 4.5}
+cdf_te <- cdf_plot("te_lfc_mle",
+                   "TE log2(sgControl / sgMETTL13), unshrunken; positive = METTL13 promotes",
+                   "METTL13 KO TE (Liu 2026, T3M4)")
+cdf_te$plot
+knitr::kable(cdf_te$stats, digits = 4)
+knitr::kable(enframe(cdf_te$medians, "group", "median_te_lfc_mle"), digits = 3)
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_06_cdf_te_unshrunken_eif3d_promoted_hypoxia_1hr.pdf"), cdf_te$plot,
+         width = 6.5, height = 4.5)
+```
+
+## (C) TE LFC (shrunken, as saved)
+
+apeglm shrinks the TE LFC to ~0 for nearly every gene (the Liu RNA arm does not replicate), so
+nearly every gene sits within about +/-5e-6. The axis is zoomed to that range; these
+differences are far too small to mean anything biologically. Shown for comparison with (B).
+
+```{r cdf_te_shrunken, fig.width = 6.5, fig.height = 4.5}
+cat("Genes with |shrunken TE LFC| < 0.01:", sum(abs(plot_df$te_lfc) < 0.01), "of", nrow(plot_df), "\n")
+cdf_te_shr <- cdf_plot("te_lfc",
+                       "TE log2(sgControl / sgMETTL13), shrunken; positive = METTL13 promotes",
+                       "METTL13 KO TE, shrunken (Liu 2026, T3M4)")
+# Shrunken values sit within about +/-5e-6 (99% of genes); zoom there, axis in units of 1e-6
+cdf_te_shr$plot <- cdf_te_shr$plot +
+  coord_cartesian(xlim = c(-6e-6, 6e-6)) +
+  scale_x_continuous(labels = function(x) x * 1e6) +
+  labs(x = "TE log2(sgControl / sgMETTL13), shrunken, x 1e-6\npositive = METTL13 promotes")
+cdf_te_shr$plot
+knitr::kable(cdf_te_shr$stats, digits = 4)
+knitr::kable(enframe(cdf_te_shr$medians, "group", "median_te_lfc_shrunken"), digits = 5)
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_06_cdf_te_shrunken_eif3d_promoted_hypoxia_1hr.pdf"), cdf_te_shr$plot, width = 6.5, height = 4.5)
+```
+
+```{r session}
+sessionInfo()
+```

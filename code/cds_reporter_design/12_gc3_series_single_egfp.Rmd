@@ -1,0 +1,1191 @@
+---
+title: "CDS reporter design 12 - a GC3 series on the single-eGFP HiBiT reporter"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  gc3_targets: !r c(35, 45, 70)
+  target_group: "expressed"
+  min_codon_prop: 0.08
+  max_homopolymer: 6
+  gs_repeats: 3
+  gs_max_repeat: 6
+  gs_max_homopolymer: 4
+  seed: 9
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below. Both
+# guards test `knitr.in.progress`, so a knit is never touched.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    gc3_targets     = c(35, 45, 70),  # the NEW targets; the median rung is added
+    target_group    = "expressed",    # "expressed" | "promoted" - whose median
+    min_codon_prop  = 0.08,           # drop codons used less than this within AA
+    max_homopolymer = 6,              # longest run of one base allowed
+    gs_repeats      = 3,              # GGGGS units in the linker upstream of P2A
+    gs_max_repeat   = 6,              # longest exact repeat allowed inside it
+    gs_max_homopolymer = 4,           # tighter homopolymer cap inside it
+    seed            = 9               # project standard
+  )
+}
+```
+
+# Overview
+
+`08_` built a four-rung eGFP **copy-number** ladder: length varies, composition
+is held at the expressed-transcriptome GC3 median. This notebook holds the
+construct fixed at the **single-eGFP** rung and varies the other axis instead.
+One reporter, four synonymous variants, four GC3 levels.
+
+**What "variant" means here.** All four encode the identical 307-residue
+protein - HiBiT, (GGGGS)x3, P2A, 1xFLAG, the Waldo linker, one eGFP - and all
+four are 921 nt. They differ only in which synonymous codon sits at each
+recodable position. Nothing about the construct's parts, order or length
+changes; a variant is a different spelling of the same protein.
+
+**Only the parts `08_` already recodes are touched.** Of the construct's 307
+codons, **43 are fixed and 264 are free**:
+
+| block | codons | status |
+|---|---|---|
+| initiator ATG | 1 | fixed |
+| HiBiT | 11 | fixed - the published 11-mer, kept bit-identical |
+| (GGGGS)x3 linker | 15 | **free** |
+| P2A | 19 | fixed - the skipping peptide, kept bit-identical |
+| 1xFLAG | 8 | **free** |
+| Waldo linker | 12 | fixed - carries the single EcoRI site the cloning needs |
+| eGFP | 241 | **free** |
+
+The fixed 42 non-initiator codons sit at GC3 64.3% and cannot move, so every
+target is reached by the 264 free ones alone. That is the whole constraint: at
+the low end the free codons have to pull the construct down past a GC3-rich
+fixed core, and at the high end they are already most of the way there.
+
+**The targets.** `35 / 45 / 57 / 70`. The 57 rung is the expressed-transcriptome
+median and is **not drawn again** - it is `08_`'s existing single-eGFP construct,
+reproduced here bit-for-bit as a gate (section 6) and then used as exported. The
+other three are new. 45 sits just below the eIF3d hypoxia-promoted median
+(50.0%), 35 and 70 reach into the tails without leaving the range real mRNAs
+occupy.
+
+**Why not wider.** Measured on this protein under the 8% rare-codon floor, the
+construct can reach GC3 **11.1% to 95.1%**. Feasibility is not the binding
+constraint - codon realism is. Past roughly 30% and 75% the recoder is forced
+onto codons that are rare in MDA-MB-231, and the variant stops being "a typical
+mRNA that differs in GC3" and becomes "an mRNA with unusual codons". Section 10
+measures that drift per variant rather than asserting it is small.
+
+**One recoder, not two.** The machinery lives in `recoder.R`, ported from
+section 5 of `08_` with the GC3 target made an argument. `08_` is the design of
+record and keeps its inline copy untouched; section 6 here gates the port by
+rebuilding `08_`'s single-eGFP construct and asserting it is **bit-identical** to
+the exported one. A port that drifted would fail that gate rather than quietly
+produce a different ladder.
+
+# 1. Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+source(here("code", "cds_reporter_design", "recoder.R"))
+```
+
+```{r params_chunk}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+run_tag <- paste0("gc3series_", params$target_group)
+
+stopifnot(
+  "gc3_targets must hold at least two targets" = length(params$gc3_targets) >= 2,
+  "gc3_targets must be percentages in (0, 100)" =
+    all(params$gc3_targets > 0 & params$gc3_targets < 100),
+  "gc3_targets must be distinct" = !any(duplicated(params$gc3_targets)),
+  "target_group must be 'expressed' or 'promoted'" =
+    params$target_group %in% c("expressed", "promoted"),
+  # A floor above 1/6 would empty the 6-fold families, since their most-used
+  # codon can sit only slightly above 1/6.
+  "min_codon_prop must be in (0, 1/6)" =
+    params$min_codon_prop > 0 && params$min_codon_prop < 1 / 6,
+  "max_homopolymer must be at least 4" = params$max_homopolymer >= 4,
+  "gs_repeats must be at least 2 for the repeat checks to mean anything" =
+    params$gs_repeats >= 2,
+  "gs_max_repeat must be below the 15 nt GGGGS unit length" =
+    params$gs_max_repeat >= 3 && params$gs_max_repeat < 15,
+  "gs_max_homopolymer must not exceed the construct-wide cap" =
+    params$gs_max_homopolymer >= 4 &&
+    params$gs_max_homopolymer <= params$max_homopolymer
+)
+cat("GC3 targets (new):", paste(params$gc3_targets, collapse = ", "),
+    "| target_group =", params$target_group,
+    "| seed =", params$seed, "\n")
+```
+
+# 2. Import and Verify the Parts
+
+Identical import and verification to `08_`, on the same spreadsheet. It is
+repeated rather than inherited because this notebook must be able to fail on a
+changed part file on its own, and because the fixed/free split above is only
+meaningful if each part is the sequence it claims to be.
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts$part)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("hibit", "p2a", "flag3x", "egfp", "waldo linker")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+p2a    <- pseq[["p2a"]]
+flag3x <- pseq[["flag3x"]]
+egfp   <- pseq[["egfp"]]
+waldo  <- pseq[["waldo linker"]]
+
+# The spreadsheet's `hibit` row is the bare 11-residue peptide with no
+# initiator. This construct puts it at the N terminus of the ORF, so the
+# initiator is prepended here - a design decision rather than a transcription,
+# asserted below on both length and translated product.
+hibit   <- pseq[["hibit"]]
+hibit_n <- paste0("ATG", hibit)
+
+HIBIT_AA  <- "VSGWRLFKKIS"
+P2A_AA    <- "ATNFSLLKQAGDVEENPGP"
+FLAG_AA   <- "DYKDDDDK"
+FLAG3X_AA <- "DYKDHDGDYKDHDIDYKDDDDK"
+WALDO_AA  <- "GSAGSAAGSGEF"
+
+aa_of <- function(s) as.character(translate(DNAString(s)))
+rc_aa <- function(s) as.character(translate(reverseComplement(DNAString(s))))
+
+flag1x  <- substr(flag3x, 43, 66)
+EGFP_AA <- aa_of(egfp)
+
+stopifnot(
+  "hibit does not encode the 11-residue HiBiT peptide" = aa_of(hibit) == HIBIT_AA,
+  "hibit is not 33 nt" = nchar(hibit) == 33,
+  "hibit_n is not the initiator plus HiBiT" =
+    nchar(hibit_n) == 36 && aa_of(hibit_n) == paste0("M", HIBIT_AA) &&
+    substr(hibit_n, 1, 3) == "ATG" && endsWith(hibit_n, hibit),
+  # The spreadsheet carries SmBiT as well, and the two peptides are both 11
+  # residues. Reading the wrong row would give a construct that is the right
+  # length, in frame, stop-free and entirely wrong.
+  "the HiBiT row encodes the SmBiT peptide: the wrong row was read" =
+    aa_of(hibit) != "VTGYRLFEEIL",
+  "p2a does not encode the expected 19-aa P2A peptide" = aa_of(p2a) == P2A_AA,
+  "flag3x does not encode the canonical 3xFLAG peptide" = aa_of(flag3x) == FLAG3X_AA,
+  "1xFLAG is not the 24 nt C-terminal repeat of flag3x" =
+    nchar(flag1x) == 24 && endsWith(flag3x, flag1x),
+  "1xFLAG does not encode the DYKDDDDK epitope" = aa_of(flag1x) == FLAG_AA,
+  "egfp is not 723 nt"           = nchar(egfp) == 723,
+  "egfp does not start with ATG" = substr(egfp, 1, 3) == "ATG",
+  # The GFP chromophore. avGFP numbers it T65-Y66-G67, but eGFP carries an extra
+  # Val at position 2, so it sits at 66-68 here. TYG also occurs at residue 39,
+  # so a motif-presence check would pass on a sequence with no chromophore.
+  "egfp protein does not carry the TYG chromophore at residues 66-68" =
+    substr(EGFP_AA, 66, 68) == "TYG",
+  "egfp chromophore is not in the expected LTYGVQCF context" =
+    substr(EGFP_AA, 65, 72) == "LTYGVQCF",
+  "waldo linker is not 36 nt" = nchar(waldo) == 36,
+  "waldo linker does not encode GSAGSAAGSGEF" = aa_of(waldo) == WALDO_AA,
+  "waldo linker does not end with an in-frame GAATTC EcoRI site" =
+    endsWith(waldo, "GAATTC") && (nchar(waldo) - 6) %% 3 == 0
+)
+
+# A sequence can be in frame, the right length, and still be backwards, so each
+# orientation check is paired with the assertion that the reverse complement
+# does NOT encode the same peptide.
+stopifnot(
+  "Both orientations encode HiBiT: the check is not discriminative" =
+    rc_aa(hibit_n) != paste0("M", HIBIT_AA),
+  "Both orientations encode P2A: the check is not discriminative" =
+    rc_aa(p2a) != P2A_AA,
+  "Both orientations encode eGFP: the check is not discriminative" =
+    rc_aa(egfp) != EGFP_AA
+)
+stopifnot("A part carries a stop codon" =
+            !any(map_lgl(list(hibit_n, p2a, flag1x, egfp, waldo),
+                         ~ any(codon_split(.x) %in% STOP_CODONS))))
+cat("Parts verified.\n")
+```
+
+# 3. MDA-MB-231 Background and the Median Target
+
+The background the variants are plotted against, and the median rung's target,
+are **computed from the same transcript set the density panels draw** - never
+typed in. This is the same derivation as `08_` section 3.
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+```
+
+```{r build_metrics}
+# One extraction, used for both the metrics and the codon usage table in
+# section 4, so the target and the usage describe the same transcripts.
+cds_seqs    <- build_cds_seqs(here("accessories", "human", "txdb.gencode49.sqlite"))
+cds_int     <- DNAStringSet(trim_internal(as.character(cds_seqs)))
+names(cds_int) <- names(cds_seqs)
+
+cds_nostop  <- subseq(cds_seqs, start = 1L,
+                      end = BiocGenerics::width(cds_seqs) - 3L)
+metrics_all <- tibble(
+  transcript_id_clean = names(cds_seqs),
+  cds_length = BiocGenerics::width(cds_nostop),
+  gc_pct  = as.numeric(letterFrequency(cds_nostop, letters = "GC",
+                                       as.prob = TRUE)) * 100,
+  gc3_pct = sapply(as.character(cds_int), compute_gc3_pct, USE.NAMES = FALSE)
+)
+stopifnot("Internal CDS lost frame" =
+            all(BiocGenerics::width(cds_int) %% 3 == 0))
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+cat("Expressed transcriptome - valid CDS:", nrow(expressed), "\n")
+cat("eIF3d promoted        - valid CDS:", nrow(promoted), "\n")
+
+stopifnot(
+  "GC% out of range"  = all(expressed$gc_pct  >= 0 & expressed$gc_pct  <= 100),
+  "GC3% out of range" = all(expressed$gc3_pct >= 0 & expressed$gc3_pct <= 100),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+cat("ACTB CDS GC%:", round(actb$gc_pct, 2),
+    "| GC3%:", round(actb$gc3_pct, 2), "\n")
+```
+
+```{r target}
+target_df  <- if (params$target_group == "expressed") expressed else promoted
+MEDIAN_GC3 <- median(target_df$gc3_pct)
+
+cat(sprintf("Median rung target from the %s group (n = %s): GC3 %.2f%%\n",
+            params$target_group, fmt_n(nrow(target_df)), MEDIAN_GC3))
+
+# The new targets must not collide with the median rung, which is imported
+# rather than drawn: two rungs at the same target would be two spellings of the
+# same specification and would make the series' labels ambiguous.
+stopifnot(
+  "A new GC3 target coincides with the median rung" =
+    all(abs(params$gc3_targets - MEDIAN_GC3) > 0.5)
+)
+```
+
+# 4. Codon Usage of the Expressed Transcriptome
+
+Each position needs a real codon, not just a third-base class. The choice is
+weighted by the pooled synonymous usage of the **same expressed transcripts**
+that set the median target, computed here rather than taken from a published
+table. The usage weights do **not** change between variants - only the
+third-base target does - so a difference between variants is a difference in
+GC3, not in which codon table they were drawn from.
+
+```{r codon_usage}
+GEN <- GENETIC_CODE
+# as.character() drops the codon names and every lookup below indexes by codon,
+# so they are restored explicitly: without them a lookup silently returns NA.
+AA <- setNames(as.character(GEN), names(GEN))
+stopifnot("Codon-to-amino-acid lookup lost its names" =
+            identical(names(AA), names(GEN)))
+
+sense <- names(GEN)[AA != "*"]
+
+expr_seqs <- cds_int[names(cds_int) %in% expressed$transcript_id_clean]
+stopifnot("Expressed CDS subset is empty" = length(expr_seqs) > 0)
+
+cf <- trinucleotideFrequency(expr_seqs, step = 3)
+stopifnot("trinucleotideFrequency lost its codon column names" =
+            !is.null(colnames(cf)) && all(names(GEN) %in% colnames(cf)))
+
+usage <- tibble(codon = colnames(cf), count = colSums(cf)) %>%
+  filter(AA[codon] != "*") %>%
+  mutate(aa = AA[codon]) %>%
+  group_by(aa) %>% mutate(prop = count / sum(count)) %>% ungroup()
+
+stopifnot(
+  "Synonymous proportions do not sum to 1 within every amino acid" =
+    all(abs((usage %>% group_by(aa) %>% summarise(s = sum(prop)))$s - 1) < 1e-9),
+  "A sense codon is missing from the usage table" = setequal(usage$codon, sense)
+)
+
+# Biological spot-check: CTG is the dominant Leu codon in human.
+leu <- usage %>% filter(aa == "L") %>% dplyr::slice_max(prop, n = 1)
+stopifnot("CTG is not the most-used Leu codon: usage table may be misaligned" =
+            leu$codon == "CTG")
+cat("CTG share of Leu codons:", round(100 * leu$prop, 1), "%\n")
+
+USE   <- setNames(usage$prop, usage$codon)
+BASES <- c("A", "C", "G", "T")
+
+pick_list <- function(cods) {
+  keep <- cods[USE[cods] >= params$min_codon_prop]
+  if (!length(keep)) cods[which.max(USE[cods])] else keep
+}
+MENU <- map(split(sense, AA[sense]), function(cods) {
+  by_base <- map(setNames(BASES, BASES), ~ cods[str_sub(cods, 3, 3) == .x])
+  map(by_base[lengths(by_base) > 0], pick_list)
+})
+AVAIL <- map(MENU, names)
+```
+
+```{r base_ratios}
+# Per-transcript third-base percentages, the same matrix section 9 reports
+# against. R_G and R_A are the within-class splits and are held CONSTANT across
+# every GC3 target: a variant changes how many third bases are G or C, not how
+# the G/C and A/T classes are divided internally. Letting them float per target
+# would confound GC3 with a second compositional change.
+b3_col  <- str_sub(colnames(cf), 3, 3)
+tx_n3   <- sapply(setNames(BASES, BASES),
+                  function(b) rowSums(cf[, b3_col == b, drop = FALSE]))
+tx_pct3 <- 100 * tx_n3 / rowSums(tx_n3)
+
+med3 <- apply(tx_pct3, 2, median)
+R_G <- med3[["G"]] / (med3[["G"]] + med3[["C"]])   # share of GC-enders that are G
+R_A <- med3[["A"]] / (med3[["A"]] + med3[["T"]])   # share of AT-enders that are A
+
+stopifnot(
+  "Per-transcript third-base percentages do not sum to 100" =
+    all(abs(rowSums(tx_pct3) - 100) < 1e-9),
+  "Third-base split ratios are out of range" =
+    between(R_G, 0, 1) && between(R_A, 0, 1),
+  # The ratios and MEDIAN_GC3 must come from the same statistic, or the median
+  # rung's target is two populations stitched together. This holds for the
+  # median rung only; the other targets deliberately depart from it, which is
+  # what the series is.
+  "Split ratios and the median GC3 disagree: they are not the same statistic" =
+    abs((med3[["G"]] + med3[["C"]]) / sum(med3) * 100 - MEDIAN_GC3) < 1
+)
+
+cat("Expressed transcriptome, per-transcript median third base:",
+    paste(sprintf("%s %.1f%%", BASES, med3), collapse = "  "), "\n")
+cat(sprintf("G:(G+C) = %.3f   A:(A+T) = %.3f (held fixed across targets)\n",
+            R_G, R_A))
+```
+
+# 5. How Far This Protein Can Go
+
+The reachable GC3 range, measured rather than assumed, before any variant is
+drawn. It is what makes "35 and 70 are inside the feasible range" a statement
+about this construct instead of a guess.
+
+```{r feasible_range}
+hibit_cv <- codon_split(hibit_n)
+p2a_cv   <- codon_split(p2a)
+waldo_cv <- codon_split(waldo)
+flag_cv  <- codon_split(flag1x)
+egfp_cv  <- codon_split(egfp)
+
+GS_UNIT_AA <- "GGGGS"
+GS_UNIT_NT <- 3L * nchar(GS_UNIT_AA)
+gs_aa      <- strrep(GS_UNIT_AA, params$gs_repeats)
+gs_naive   <- naive_encoding(gs_aa, usage)
+gs_cv      <- codon_split(gs_naive)
+n_gs       <- length(gs_cv)
+
+# The free codons, in the order they sit in the construct.
+free_aa <- AA[c(gs_cv, flag_cv, egfp_cv)]
+fixed_cv <- c(hibit_cv, p2a_cv, waldo_cv)
+n_total  <- length(c(hibit_cv, gs_cv, p2a_cv, flag_cv, waldo_cv, egfp_cv))
+
+stopifnot(
+  "Construct is not 307 codons" = n_total == 307,
+  "Free/fixed codon counts do not add up" =
+    length(free_aa) + length(fixed_cv) == n_total
+)
+
+# A free position can end G/C if any menu codon does, and MUST end G/C if every
+# menu codon does. Summing those over the free positions, plus the fixed core,
+# gives the construct's floor and ceiling on the internal basis.
+can_gc  <- map_lgl(MENU[free_aa], ~ any(names(.x) %in% c("G", "C")))
+must_gc <- map_lgl(MENU[free_aa], ~ all(names(.x) %in% c("G", "C")))
+
+fixed_gc3_n <- sum(str_sub(fixed_cv[-1], 3, 3) %in% c("G", "C"))
+basis_n     <- n_total - 1L   # the initiator is excluded, as in block_needs
+
+gc3_floor   <- 100 * (fixed_gc3_n + sum(must_gc)) / basis_n
+gc3_ceiling <- 100 * (fixed_gc3_n + sum(can_gc))  / basis_n
+
+cat(sprintf("Fixed core: %d of %d non-initiator codons, GC3 %.1f%%\n",
+            length(fixed_cv) - 1L, basis_n,
+            100 * fixed_gc3_n / (length(fixed_cv) - 1L)))
+cat(sprintf("Construct GC3 reachable range: %.1f%% to %.1f%%\n",
+            gc3_floor, gc3_ceiling))
+
+stopifnot(
+  "A requested GC3 target is outside what this protein can reach" =
+    all(params$gc3_targets > gc3_floor & params$gc3_targets < gc3_ceiling),
+  "The median rung's target is outside the reachable range" =
+    MEDIAN_GC3 > gc3_floor && MEDIAN_GC3 < gc3_ceiling
+)
+```
+
+# 6. Gate: the Port Reproduces `08_`
+
+`recoder.R` is a port. Before it is trusted to draw three new variants, it has
+to rebuild the one construct whose answer is already known. This runs the same
+two-stage build `08_` does - the GS linker and FLAG together, then the eGFP
+copy - at the **median** target, and asserts the result is bit-identical to the
+exported single-eGFP sequence.
+
+The RNG makes this a strict test rather than a loose one: `08_` seeds once at
+the start of its ladder and the single-eGFP rung is the second draw, so an
+identical sequence means identical third-base assignments, identical codon
+sampling and an identical number of rejected draws. A port that changed the
+order of a single `sample()` call would fail here.
+
+```{r build_fn}
+# What a drawn GS linker has to satisfy on top of the construct-wide motif
+# checks. Pairwise-distinct units is implied by the repeat bound, but it is the
+# constraint the design is actually about, so it is stated rather than inferred.
+gs_units <- function(linker)
+  substring(linker,
+            seq(1L, by = GS_UNIT_NT, length.out = params$gs_repeats),
+            seq(GS_UNIT_NT, by = GS_UNIT_NT, length.out = params$gs_repeats))
+
+longest_homopolymer <- function(s)
+  max(nchar(str_extract_all(s, "(A+|C+|G+|T+)")[[1]]))
+
+gs_ok <- function(block) {
+  linker <- paste0(block[seq_len(n_gs)], collapse = "")
+  anyDuplicated(gs_units(linker)) == 0L &&
+    max_internal_repeat(linker) <= params$gs_max_repeat &&
+    longest_homopolymer(linker) <= params$gs_max_homopolymer
+}
+
+# Glycine's only G-ending codon is GGG, and inside a polyglycine run it is
+# always followed by another GG, so picking it puts a 5 nt G run in the linker.
+# The construct-wide menu cannot say "not here", so the linker's glycine
+# positions give up G and the G-ending codons the target needs go to the
+# linker's serines (TCG) or FLAG's lysines (AAG) instead.
+gs_menus   <- map(MENU[AA[gs_cv]], function(m)
+  if (identical(m[["G"]], "GGG")) m[names(m) != "G"] else m)
+free_menus <- c(gs_menus, MENU[AA[flag_cv]])
+stopifnot("The GS menu restriction did not remove GGG" =
+            !any(map_lgl(gs_menus, ~ "GGG" %in% unlist(.x))))
+
+# A `need` vector built from a chosen GC count, keeping the transcriptome's
+# within-class splits. Used only by the fallback below; the primary path takes
+# its need from `block_needs`, exactly as `08_` does.
+needs_from_ngc <- function(n_block, n_gc) {
+  n_at <- n_block - n_gc
+  g <- round(n_gc * R_G); a <- round(n_at * R_A)
+  c(A = a, C = n_gc - g, G = g, T = n_at - a)[BASES]
+}
+
+# Build the single-eGFP construct at one GC3 target, in the two stages `08_`
+# uses. Returns the assembled codon vector plus the two recoded blocks, so the
+# per-part panels later can report each part on its own rather than re-cutting
+# the assembled string by coordinates.
+#
+# Stage 1 draws the GS linker and FLAG as ONE 23-codon assignment rather than
+# two blocks, because the third-base target is a count over the whole construct
+# and splitting it between them would need an arbitrary allocation.
+#
+# **Stage 1 can be asked for something the linker cannot encode.** `block_needs`
+# hands it the whole construct-wide shortfall, clamped to its 23 codons. At
+# GC3 35 that clamp asks for ZERO GC-ending codons out of 23, which restricts
+# the linker's 12 glycines to GGA and GGT - two codons sharing GG, from which no
+# 45 nt arrangement satisfies the 6 nt internal-repeat bound. The draw then
+# fails after thousands of attempts rather than returning a repetitive linker,
+# which is the right failure but not a usable one.
+#
+# So stage 1 asks for its `block_needs` share first and, when no clean draw
+# exists, walks outward to neighbouring GC counts and takes the first that does.
+# The construct still lands on target: stage 2's `need` is recomputed against
+# the prefix ACTUALLY built, and eGFP's 241 codons have ample room to absorb
+# whatever the 23 gave up. What is given up is only the claim that the GS+FLAG
+# stretch itself sits at the construct's GC3 - which section 11 reports rather
+# than assumes.
+#
+# The median target reaches a clean draw on the first candidate, so this leaves
+# the section 6 gate untouched: the fallback changes nothing unless it fires.
+build_variant <- function(target_gc3, seed = params$seed,
+                          max_try0 = 5000, max_try_alt = 2000) {
+  R <- make_recoder(target_gc3, R_G, R_A, MENU, USE, AA, params$max_homopolymer)
+  set.seed(seed)
+
+  n_block <- length(c(gs_cv, flag_cv))
+  need0   <- R$block_needs(n_block, c(hibit_cv, p2a_cv))
+  n_gc0   <- need0[["G"]] + need0[["C"]]
+  n_g_cap <- sum(map_lgl(free_menus, ~ "G" %in% names(.x)))
+
+  # Candidate GC counts, nearest to the block_needs share first.
+  cand <- c(n_gc0, n_gc0 + unlist(map(seq_len(n_block), ~ c(.x, -.x))))
+  cand <- cand[cand >= 0 & cand <= n_block]
+
+  drawn0 <- NULL; n_gc_used <- NA_integer_
+  for (g in cand) {
+    nd <- if (g == n_gc0) need0 else needs_from_ngc(n_block, g)
+    # Dropping GGG from the linker's glycines caps how many G-enders exist.
+    if (nd[["G"]] > n_g_cap) next
+    drawn0 <- tryCatch(
+      R$draw_clean_block(
+        c(gs_cv, flag_cv), nd,
+        assemble  = function(b) c(hibit_cv, b[seq_len(n_gs)], p2a_cv,
+                                  b[-seq_len(n_gs)]),
+        n_linkers = 0, extra_ok = gs_ok, menus = free_menus,
+        max_try   = if (g == n_gc0) max_try0 else max_try_alt),
+      error = function(e) NULL)
+    if (!is.null(drawn0)) { need0 <- nd; n_gc_used <- g; break }
+  }
+  stopifnot(
+    "No clean GS+FLAG draw exists at any GC count for this target" =
+      !is.null(drawn0)
+  )
+
+  gs_new   <- drawn0$block[seq_len(n_gs)]
+  flag_new <- drawn0$block[-seq_len(n_gs)]
+  prefix   <- c(hibit_cv, gs_new, p2a_cv, flag_new, waldo_cv)
+
+  need1  <- R$block_needs(length(egfp_cv), prefix)
+  drawn1 <- R$draw_clean_block(egfp_cv, need1,
+                               assemble = function(b) c(prefix, b),
+                               n_linkers = 1)
+
+  cat(sprintf("  target %.1f%%: GS+FLAG %d GC-enders of %d (block_needs asked %d%s), draw %d; ",
+              target_gc3, n_gc_used, n_block, n_gc0,
+              if (n_gc_used == n_gc0) "" else " - FALLBACK", drawn0$tries))
+  cat(sprintf("eGFP need A %d C %d G %d T %d, draw %d\n",
+              need1[["A"]], need1[["C"]], need1[["G"]], need1[["T"]],
+              drawn1$tries))
+
+  list(cv        = c(prefix, drawn1$block),
+       gs        = paste0(gs_new,       collapse = ""),
+       flag      = paste0(flag_new,     collapse = ""),
+       egfp      = paste0(drawn1$block, collapse = ""),
+       n_gc_used = n_gc_used,
+       n_gc_ask  = n_gc0)
+}
+```
+
+```{r gate_reproduce_08}
+ref_path <- here("output", "cds_reporter_design",
+                 "08_recoded_assembled_sequences_upto3x_expressed.csv")
+stopifnot(
+  "08_ has not been knit: its exported sequences are missing. Run 08_ first." =
+    file.exists(ref_path)
+)
+ref08 <- read_csv(ref_path, show_col_types = FALSE) %>% filter(gfp_copies == 1)
+stopifnot("08_'s export has no single-eGFP rung" = nrow(ref08) == 1)
+
+cat("Rebuilding 08_'s single-eGFP construct at the median target:\n")
+median_rebuild <- build_variant(MEDIAN_GC3)
+median_seq     <- paste0(median_rebuild$cv, collapse = "")
+
+stopifnot(
+  "The ported recoder does NOT reproduce 08_'s single-eGFP construct" =
+    identical(median_seq, ref08$cds[[1]]),
+  "Rebuilt construct is not 921 nt" = nchar(median_seq) == 921
+)
+cat("Gate passed: the port reproduces 08_'s 921 nt construct bit-for-bit.\n")
+
+# Discriminative companion. A gate that can only pass is not a gate: the same
+# comparison must FAIL on a construct drawn at a different target, or it would
+# be testing that two strings exist rather than that they agree.
+probe <- paste0(build_variant(MEDIAN_GC3 - 10)$cv, collapse = "")
+stopifnot(
+  "A 10-point-lower target reproduces the same sequence: the gate is not discriminative" =
+    !identical(probe, ref08$cds[[1]]),
+  "The probe changed the protein, so it is the wrong companion" =
+    aa_of(probe) == aa_of(median_seq)
+)
+cat("Companion check: a construct drawn 10 points lower differs, as it must.\n")
+```
+
+# 7. Build the Series
+
+Three new variants, each an independent build from the same seed at its own
+target. The median rung is `08_`'s exported sequence, used as it stands.
+
+```{r build_series}
+cat("Drawing the new variants:\n")
+new_variants <- map(set_names(params$gc3_targets,
+                              sprintf("%g", params$gc3_targets)),
+                    build_variant)
+
+# The median rung enters from 08_'s export rather than from `median_rebuild`.
+# They are bit-identical - section 6 asserted exactly that - so this is about
+# provenance: the mid rung of this series IS the construct already reviewed and
+# built elsewhere, not a copy this notebook happened to redraw.
+median_variant     <- median_rebuild
+median_variant$cv  <- codon_split(ref08$cds[[1]])
+
+variants <- c(new_variants, list(median_variant))
+targets  <- c(params$gc3_targets, MEDIAN_GC3)
+ord      <- order(targets)
+variants <- variants[ord]
+targets  <- targets[ord]
+is_median <- abs(targets - MEDIAN_GC3) < 1e-9
+
+names(variants) <- sprintf("HiBiT-GS-P2A-FLAG-link-1xeGFP GC3 %.0f%%",
+                           targets)
+stopifnot("Two variants share a name" = !any(duplicated(names(variants))))
+
+seqs <- map_chr(variants, ~ paste0(.x$cv, collapse = ""))
+
+cat("\nSeries built:\n")
+walk2(names(variants), seqs, ~ cat(sprintf("  %-46s %d nt, GC3 %.1f%%\n",
+                                           .x, nchar(.y),
+                                           compute_gc3_pct(.y))))
+```
+
+# 8. Validation
+
+A synonymous series is only legitimate if the protein is untouched and every
+variant is genuinely a different spelling. Both are measured on DNA translated
+independently, not on the bookkeeping that produced it.
+
+```{r validate_protein}
+# The protein every variant must encode, assembled from the imported parts.
+expected_aa <- aa_of(paste0(hibit_n, gs_naive, p2a, flag1x, waldo, egfp))
+
+walk2(names(seqs), seqs, function(nm, s) {
+  stopifnot(
+    "A variant is not 921 nt" = nchar(s) == 921,
+    "A variant lost frame"    = nchar(s) %% 3 == 0,
+    "A variant changed the protein" = aa_of(s) == expected_aa,
+    "A variant carries an internal stop codon" =
+      !any(codon_split(s) %in% STOP_CODONS),
+    "A variant does not begin with the initiator" = substr(s, 1, 3) == "ATG"
+  )
+})
+cat("All", length(seqs), "variants: 921 nt, in frame, stop-free,",
+    "identical", nchar(expected_aa), "residue protein\n")
+
+# The fixed blocks must be bit-identical across the series, which is the
+# notebook's central claim - only the already-recoded parts changed.
+walk2(names(seqs), seqs, function(nm, s) {
+  cv <- codon_split(s)
+  stopifnot(
+    "HiBiT is not bit-identical across variants" =
+      paste0(cv[seq_along(hibit_cv)], collapse = "") == hibit_n,
+    "P2A is not bit-identical across variants" =
+      paste0(cv[length(hibit_cv) + n_gs + seq_along(p2a_cv)],
+             collapse = "") == p2a,
+    "The Waldo linker is not bit-identical across variants" =
+      paste0(cv[length(hibit_cv) + n_gs + length(p2a_cv) + length(flag_cv) +
+                  seq_along(waldo_cv)], collapse = "") == waldo
+  )
+})
+cat("Fixed blocks (HiBiT, P2A, Waldo linker) bit-identical in every variant\n")
+
+# Discriminative companion: the FREE blocks must NOT be identical across
+# variants, or the series is four copies of one construct under four labels.
+stopifnot(
+  "Two variants are the same sequence: the series has no spread" =
+    !any(duplicated(seqs)),
+  "The recoded eGFP blocks are identical across variants" =
+    !any(duplicated(map_chr(variants, "egfp")))
+)
+cat("eGFP differs between every pair of variants, as it must\n")
+
+# The GS+FLAG stretch is a different matter, and two variants COULD share it.
+# It is 23 codons drawn from one seed, so two targets that end up asking it for
+# the same number of GC-enders would get the same draw. That nearly happens at
+# 35 and 45, which both land on 2 GC-enders and therefore show identical
+# per-part GC and GC3 in section 11 - but the sequences still differ, because
+# the 35 variant reaches 2 through the fallback, having already spent 5,000
+# rejected draws on the count `block_needs` asked for, so its RNG state differs
+# when the accepted draw is made.
+#
+# That makes per-part composition an unreliable way to tell these apart, which
+# is the reason this check compares SEQUENCES rather than reading the numbers
+# off section 11. If a future target did produce a genuinely shared stretch it
+# would not be a defect - construct-wide GC3 would still separate the variants,
+# and eGFP is 241 of the 264 free codons - but a reader comparing two sequences
+# by eye would see an identical 69 nt run and suspect one, so it is named.
+# Checked per part, not on the concatenation: FLAG is 8 codons of D/Y/K, and at
+# GC3 0 every one of them has a single AT-ending codon (GAT, TAT, AAA), so a
+# FLAG drawn at 0% is not one encoding among many - it is the ONLY one. Any two
+# variants whose FLAG lands at 0% therefore share it by arithmetic rather than
+# by coincidence, and a check on `paste0(gs, flag)` would miss that whenever the
+# GS linker differs.
+walk(c("gs", "flag", "egfp"), function(part) {
+  v <- map_chr(variants, part)
+  dup <- which(duplicated(v) | duplicated(v, fromLast = TRUE))
+  if (length(dup)) {
+    grp <- split(names(variants)[dup], v[dup])
+    walk(grp, ~ cat(sprintf("  %-5s identical in: %s\n", part,
+                            paste(.x, collapse = " | "))))
+  } else {
+    cat(sprintf("  %-5s differs in every variant\n", part))
+  }
+})
+stopifnot(
+  # eGFP is the part the series actually turns on; it must never repeat.
+  "Two variants share an eGFP block" =
+    !any(duplicated(map_chr(variants, "egfp")))
+)
+```
+
+```{r validate_motifs}
+ec <- map_int(seqs, ~ str_count(.x, fixed("GAATTC")))
+stopifnot("A variant does not carry exactly one EcoRI site" = all(ec == 1))
+cat("Internal EcoRI sites per variant:", paste(ec, collapse = ", "),
+    "(one per Waldo linker, as designed)\n")
+
+max_run <- map_int(seqs, ~ max(nchar(str_extract_all(.x, "(A+|C+|G+|T+)")[[1]])))
+stopifnot("A variant carries a homopolymer longer than max_homopolymer" =
+            all(max_run <= params$max_homopolymer))
+cat("Longest homopolymer per variant:", paste(max_run, collapse = ", "),
+    "nt (cap", params$max_homopolymer, ")\n")
+```
+
+The GS linker is the one part whose constraint is about repeats rather than
+composition, so it is checked separately in every variant - and checked against
+the naive encoding, which must **fail** the same measures. Without that
+companion the repeat bound would pass on a measure that never finds a repeat.
+
+```{r validate_gs_linker}
+gs_tbl <- tibble(
+  variant   = names(variants),
+  seq       = map_chr(variants, "gs"),
+  n_units   = map_int(seq, ~ length(unique(gs_units(.x)))),
+  repeat_nt = map_int(seq, max_internal_repeat),
+  homo_nt   = map_int(seq, longest_homopolymer),
+  gc3_pct   = map_dbl(seq, compute_gc3_pct)
+)
+print(gs_tbl %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+
+walk(gs_tbl$seq, function(s) {
+  stopifnot(
+    "A recoded GS linker changed the peptide" = aa_of(s) == gs_aa,
+    "A recoded GS linker changed length" = nchar(s) == nchar(gs_naive),
+    "Two GGGGS units in a recoded linker are identical" =
+      length(unique(gs_units(s))) == params$gs_repeats,
+    "A recoded GS linker still carries a long internal repeat" =
+      max_internal_repeat(s) <= params$gs_max_repeat,
+    "A recoded GS linker exceeds its homopolymer cap" =
+      longest_homopolymer(s) <= params$gs_max_homopolymer
+  )
+})
+stopifnot(
+  # Discriminative companions: both measures must fire on the naive encoding.
+  # A tandem repeat of n units has a repeated substring of all but the last
+  # unit, so that is the bound to expect rather than a guessed number.
+  "The repeat measure does not detect the naive tandem repeat" =
+    max_internal_repeat(gs_naive) >= nchar(gs_naive) - GS_UNIT_NT,
+  "The naive encoding passes the unit-distinctness check: not discriminative" =
+    length(unique(gs_units(gs_naive))) < params$gs_repeats
+)
+cat("GS linker: distinct units and repeat bound hold in every variant;",
+    "the naive encoding fails both\n")
+```
+
+# 9. Where Each Variant Landed
+
+```{r composition}
+comp_tbl <- tibble(
+  variant    = names(variants),
+  gc3_target = targets,
+  source     = ifelse(is_median, "08_ (imported)", "drawn here"),
+  cds_length = map_int(seqs, nchar),
+  gc_pct     = map_dbl(seqs, orf_gc_pct),
+  gc3_pct    = map_dbl(seqs, orf_gc3_pct),
+  # Did the GS+FLAG stage get the share block_needs asked for, or did the
+  # fallback hold it back so the linker stayed cloneable? Carried into the
+  # exported table because it is the one place the two stages differ.
+  gs_flag_gc_enders = map_int(variants, ~ as.integer(.x$n_gc_used)),
+  gs_flag_gc_asked  = map_int(variants, ~ as.integer(.x$n_gc_ask))
+) %>%
+  mutate(d_gc3 = gc3_pct - gc3_target,
+         stage1 = ifelse(gs_flag_gc_enders == gs_flag_gc_asked,
+                         "full share", "fallback"))
+
+print(comp_tbl %>% mutate(across(where(is.double), ~ round(.x, 2))) %>%
+        as.data.frame())
+
+stopifnot(
+  "A variant missed its GC3 target by more than 1 point" =
+    all(abs(comp_tbl$d_gc3) <= 1),
+  "The series is not monotone in GC3" =
+    !is.unsorted(comp_tbl$gc3_pct),
+  "Variants differ in length: the series is not synonymous" =
+    length(unique(comp_tbl$cds_length)) == 1
+)
+cat(sprintf("\nAll %d variants within 1 point of target, all %d nt.\n",
+            nrow(comp_tbl), comp_tbl$cds_length[1]))
+cat(sprintf("GC3 spread %.1f points; total GC spread %.1f points.\n",
+            diff(range(comp_tbl$gc3_pct)), diff(range(comp_tbl$gc_pct))))
+
+fb <- comp_tbl %>% filter(stage1 == "fallback")
+if (nrow(fb)) {
+  cat(sprintf("Stage-1 fallback fired on %d of %d variants (%s): the GS+FLAG\n",
+              nrow(fb), nrow(comp_tbl), paste(sprintf("%.0f%%", fb$gc3_target),
+                                              collapse = ", ")))
+  cat("  stretch was held back from its full share so the linker stayed",
+      "cloneable;\n  eGFP absorbed the remainder. Section 11 shows where",
+      "each part landed.\n")
+} else {
+  cat("Stage-1 fallback did not fire: every variant got its full share.\n")
+}
+# The median rung must never reach the fallback - if it did, it would no longer
+# be the construct section 6 reproduced.
+stopifnot("The median rung used the stage-1 fallback" =
+            comp_tbl$stage1[is_median] == "full share")
+```
+
+**Total GC is not controlled and is not expected to be flat.** Positions 1 and 2
+are fixed by the protein, so the only lever is the third base; moving GC3 moves
+total GC with it, at roughly a third of the rate. The GC panel in section 10
+reports where that lands rather than treating it as a second target.
+
+```{r percentiles}
+ref_df  <- comp_tbl %>%
+  transmute(reporter = variant, cds_length, gc_pct, gc3_pct)
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+print(pct_tbl)
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(pct_tbl$pct_expressed >= 0 & pct_tbl$pct_expressed <= 100 &
+                pct_tbl$pct_promoted  >= 0 & pct_tbl$pct_promoted  <= 100))
+```
+
+# 10. Density Panels
+
+The same panel style as `08_`, with one reference line per variant instead of
+one per rung. Because every variant is the same length, the length panel would
+draw four lines on top of each other and is deliberately omitted.
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+
+# A single-hue ramp ordered by GC3, so the legend reads as a series rather than
+# as four unrelated constructs. Deliberately the same dark-blue family `07_`
+# and `08_` use for reporter reference lines: grey and orange are spoken for by
+# the two gene distributions, and the project reserves orange for eIF3d.
+variant_cols <- setNames(
+  colorRampPalette(c("#A6CEE3", "#0072B2", "#03314D"))(nrow(comp_tbl)),
+  comp_tbl$variant)
+
+ref_plot_df <- ref_df %>%
+  mutate(color    = unname(variant_cols[reporter]),
+         linetype = "solid",
+         reporter = factor(reporter, levels = reporter))
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, single-eGFP HiBiT reporter GC3 series",
+  outfile = paste0("cds_reporter_12_density_cds_gc3_", run_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols)
+```
+
+```{r panel_gc, fig.width=9.5, fig.height=5.5}
+p_gc <- plot_density_luc(
+  expressed, promoted, "gc_pct",
+  xlab    = "CDS GC content (%)",
+  title   = "CDS GC content, MDA-MB-231, single-eGFP HiBiT reporter GC3 series",
+  outfile = paste0("cds_reporter_12_density_cds_gc_", run_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols)
+```
+
+# 11. Per-Part GC3
+
+The construct-wide number can be met evenly or carried by one part. eGFP is 241
+of the 264 free codons, so it will dominate by weight whatever happens - the
+question this panel answers is whether the 23-codon GS+FLAG stage is pulling in
+the same direction or being overridden. Section 7's fallback makes that a real
+question rather than a rhetorical one: at the extreme targets the GS+FLAG stage
+is deliberately held back from its full share.
+
+```{r part_bars, fig.width=9, fig.height=5}
+part_tbl <- tibble(
+  variant = rep(names(variants), each = 3),
+  part    = rep(c(sprintf("GS linker (%dxGGGGS)", params$gs_repeats),
+                  "FLAG (1x)", "eGFP"), times = length(variants)),
+  seq     = as.vector(rbind(map_chr(variants, "gs"),
+                            map_chr(variants, "flag"),
+                            map_chr(variants, "egfp")))
+) %>%
+  mutate(gc3_pct = map_dbl(seq, compute_gc3_pct),
+         gc_pct  = map_dbl(seq, gc_pct_of),
+         variant = factor(variant, levels = names(variants)),
+         part    = factor(part, levels = unique(part)))
+
+stopifnot(
+  "Part GC3 out of range" = all(between(part_tbl$gc3_pct, 0, 100)),
+  "Part GC out of range"  = all(between(part_tbl$gc_pct, 0, 100)),
+  "A part sequence is missing" = !any(is.na(part_tbl$seq))
+)
+
+p_parts <- ggplot(part_tbl, aes(part, gc3_pct, fill = variant)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_hline(yintercept = MEDIAN_GC3, linetype = "dashed", color = "grey30") +
+  annotate("text", x = Inf, y = MEDIAN_GC3, label = "expressed median",
+           hjust = 1.05, vjust = -0.6, size = 3.2, color = "grey30") +
+  scale_fill_manual(values = variant_cols, name = NULL) +
+  labs(x = NULL, y = "GC3 content (%)",
+       title = "GC3 by part, single-eGFP HiBiT reporter GC3 series",
+       subtitle = sprintf("n = %d variants; expressed median %.1f%%",
+                          nrow(comp_tbl), MEDIAN_GC3)) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+print(p_parts)
+ggsave(here("plots", paste0("cds_reporter_12_part_gc3_", run_tag, ".pdf")),
+       p_parts, width = 9, height = 5)
+
+print(part_tbl %>%
+        dplyr::select(variant, part, gc3_pct, gc_pct) %>%
+        mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        pivot_wider(names_from = part, values_from = c(gc3_pct, gc_pct)) %>%
+        as.data.frame())
+```
+
+# 12. Codon-Usage Drift
+
+The diagnostic that decides whether an extreme variant is usable. Reaching a GC3
+target far from the median means preferring codons the cell uses less, and past
+some point the construct stops being a GC3 variant of a typical mRNA and becomes
+an mRNA full of rare codons - a confound, since rare codons slow elongation in
+their own right.
+
+Two measures, both over the **free codons only** (the fixed core is the same in
+every variant and would dilute both):
+
+- **mean synonymous usage** - the average 231 usage proportion of the chosen
+  codons. The expressed transcriptome's own value is the reference.
+- **worst-case rarity** - the lowest usage proportion drawn, and how many
+  positions sit below the `min_codon_prop` floor. A mean can look healthy while
+  a handful of positions are terrible.
+
+```{r usage_drift}
+free_idx <- c(length(hibit_cv) + seq_len(n_gs),                       # GS linker
+              length(hibit_cv) + n_gs + length(p2a_cv) + seq_len(length(flag_cv)),
+              length(hibit_cv) + n_gs + length(p2a_cv) + length(flag_cv) +
+                length(waldo_cv) + seq_len(length(egfp_cv)))
+stopifnot(
+  "Free index does not select 264 codons" = length(free_idx) == 264,
+  # The free index is built from block lengths, so an off-by-one would still
+  # produce 264 entries while pointing at the wrong codons. Anchor it: the
+  # fixed blocks must be exactly the positions it leaves out.
+  "Free index overlaps a fixed block" =
+    !any(free_idx %in% c(seq_along(hibit_cv),
+                         length(hibit_cv) + n_gs + seq_along(p2a_cv),
+                         length(hibit_cv) + n_gs + length(p2a_cv) +
+                           length(flag_cv) + seq_along(waldo_cv)))
+)
+
+# Reference: the usage a draw would average if it followed 231 usage exactly,
+# i.e. the usage-weighted mean usage within each free position's amino acid.
+ref_mean_use <- mean(map_dbl(AA[c(gs_cv, flag_cv, egfp_cv)], function(a) {
+  cods <- sense[AA[sense] == a]
+  sum(USE[cods] * USE[cods])
+}))
+
+drift_tbl <- map2_dfr(names(variants), variants, function(nm, v) {
+  free_cods <- v$cv[free_idx]
+  u <- USE[free_cods]
+  tibble(variant      = nm,
+         mean_usage   = mean(u),
+         min_usage    = min(u),
+         n_below_floor = sum(u < params$min_codon_prop),
+         pct_below_floor = 100 * mean(u < params$min_codon_prop))
+}) %>%
+  mutate(variant = factor(variant, levels = names(variants)),
+         gc3_target = targets,
+         usage_ratio = mean_usage / ref_mean_use)
+
+print(drift_tbl %>% mutate(across(where(is.double), ~ round(.x, 3))) %>%
+        as.data.frame())
+cat(sprintf("\n231-usage-weighted reference mean usage: %.3f\n", ref_mean_use))
+
+stopifnot(
+  "Usage proportions out of range" =
+    all(between(drift_tbl$mean_usage, 0, 1) & between(drift_tbl$min_usage, 0, 1)),
+  # Positions below the floor can only come from an amino acid whose menu would
+  # otherwise have been emptied (pick_list keeps the most-used codon in that
+  # case). Anything else means the floor is not being applied.
+  "A variant drew codons below the floor at more than 5% of free positions" =
+    all(drift_tbl$pct_below_floor <= 5)
+)
+
+p_drift <- ggplot(drift_tbl, aes(gc3_target, mean_usage, color = variant)) +
+  geom_hline(yintercept = ref_mean_use, linetype = "dashed", color = "grey30") +
+  annotate("text", x = Inf, y = ref_mean_use, label = "231 usage reference",
+           hjust = 1.05, vjust = -0.6, size = 3.2, color = "grey30") +
+  geom_line(aes(group = 1), color = "grey60") +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = variant_cols, name = NULL) +
+  labs(x = "CDS GC3 target (%)",
+       y = "Mean synonymous usage of the recoded codons",
+       title = "Codon-usage drift across the GC3 series",
+       subtitle = sprintf("free codons only (n = %d of %d); dashed = 231 usage",
+                          length(free_idx), n_total)) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+print(p_drift)
+ggsave(here("plots", paste0("cds_reporter_12_usage_drift_", run_tag, ".pdf")),
+       p_drift, width = 8, height = 5)
+```
+
+```{r drift_summary}
+worst <- drift_tbl %>% dplyr::slice_min(usage_ratio, n = 1)
+cat(sprintf("Least 231-like variant: %s (mean usage %.1f%% of the reference)\n",
+            worst$variant, 100 * worst$usage_ratio))
+cat("Read this alongside the GC3 panel: a variant that hits its target but sits\n",
+    "well below the reference is trading codon realism for composition.\n", sep = "")
+```
+
+# 13. Outputs
+
+```{r write_outputs}
+outdir <- here("output", "cds_reporter_design")
+
+# Every part of this construct is stop-free, so the assembled ORF has no
+# terminator. `cds` stays the SENSE ORF - it is what the GC3 figures, the
+# percentiles and section 6's gate against `08_` are all computed on - and
+# `cds_ordered` is what gets synthesised: the same sequence plus a terminal
+# TAA. The stop goes at the END of the full CDS and nowhere else; one upstream
+# of P2A would terminate translation before FLAG and eGFP exist.
+ORF_STOP  <- "TAA"
+seqs_ordered <- paste0(seqs, ORF_STOP)
+
+stopifnot(
+  "A variant already carries a stop codon: appending one would duplicate it" =
+    !any(map_lgl(seqs, ~ any(codon_split(.x) %in% STOP_CODONS))),
+  "An ordered variant does not end in the terminator" =
+    all(map_lgl(seqs_ordered, ~ tail(codon_split(.x), 1) == ORF_STOP)),
+  "An ordered variant carries a stop before the end" =
+    !any(map_lgl(seqs_ordered,
+                 ~ any(head(codon_split(.x), -1) %in% STOP_CODONS))),
+  "Adding the terminator did not add exactly one codon" =
+    all(nchar(seqs_ordered) == nchar(seqs) + 3),
+  # The stop must not disturb the composition the series is built around: GC3
+  # is measured on internal codons, which excludes it by definition.
+  "Appending the stop changed the measured GC3" =
+    all(abs(map_dbl(seqs_ordered, orf_gc3_pct) - comp_tbl$gc3_pct) < 1e-9)
+)
+cat("Terminal", ORF_STOP, "appended to all", length(seqs),
+    "variants; each ORF now carries exactly one stop, at its end\n")
+
+seq_tbl <- tibble(
+  variant    = names(variants),
+  gc3_target = targets,
+  source     = comp_tbl$source,
+  nt         = comp_tbl$cds_length,
+  nt_ordered = comp_tbl$cds_length + 3L,
+  gc_pct     = comp_tbl$gc_pct,
+  gc3_pct    = comp_tbl$gc3_pct,
+  gs_linker  = map_chr(variants, "gs"),
+  flag       = map_chr(variants, "flag"),
+  egfp       = map_chr(variants, "egfp"),
+  cds         = unname(seqs),
+  cds_ordered = unname(seqs_ordered)
+)
+write_csv(seq_tbl, file.path(outdir,
+                             paste0("12_gc3_series_sequences_", run_tag, ".csv")))
+write_csv(comp_tbl, file.path(outdir,
+                              paste0("12_gc3_series_composition_", run_tag, ".csv")))
+write_csv(drift_tbl, file.path(outdir,
+                               paste0("12_gc3_series_usage_drift_", run_tag, ".csv")))
+write_csv(part_tbl %>% dplyr::select(-seq),
+          file.path(outdir, paste0("12_gc3_series_part_composition_", run_tag, ".csv")))
+write_csv(pct_tbl, file.path(outdir,
+                             paste0("12_gc3_series_percentiles_vs_231_", run_tag, ".csv")))
+
+cat("Wrote 5 tables to", outdir, "\n")
+```
+
+```{r session}
+sessionInfo()
+```

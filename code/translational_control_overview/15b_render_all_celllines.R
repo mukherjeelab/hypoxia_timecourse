@@ -55,6 +55,14 @@ args <- commandArgs(TRUE); fs <- if (args[1] %in% c("intrinsic", "intrinsic_capb
 # to the intrinsic figure. They are kept out of the default figures: provisional, RPKM-based.
 with_capbind <- args[1] == "intrinsic_capbind"
 tag <- if (fs == "") "all_celllines" else if (with_capbind) "all_celllines_intrinsic_capbind" else "all_celllines_intrinsic"
+# Optional second argument "normshap12": per-gene-normalized SHAP shares, plus a panel restricted
+# to the 12 features of the target-subtype heatmap (26b_, top 12 by share at si3d hypoxia 1hr).
+#   Rscript code/translational_control_overview/15b_render_all_celllines.R intrinsic_capbind normshap12
+normshap12 <- length(args) > 1 && args[2] == "normshap12"
+SUBSET12 <- paste("cds_gc,gc3_internal,transcript_gc,log2_cds_length,log2_total_length,log2_utr5_length,",
+                  "log2_utr3_length,csc_internal,tai_gtrnadb,tco_struct_accessibility_cds_mean,",
+                  "g4mer_mean_cds,proline_fraction", sep = "")
+if (normshap12) tag <- paste0(tag, "_normshap12")
 rmarkdown::render(here::here("code/translational_control_overview/15_shap_heatmap.Rmd"),
   params = list(experiments = mk(fs), allow_mixed_genes = TRUE, reduced_suffix = "",
                 # Correlated-feature clusters computed on THIS model's feature set: the intrinsic
@@ -62,12 +70,14 @@ rmarkdown::render(here::here("code/translational_control_overview/15_shap_heatma
                 # external feature the model never saw (memberships verified identical otherwise).
                 clusters_suffix = paste0("eif33d_promotes_hypoxia_1hr_lfc0.5_tcoreg", fs, T),
                 out_tag = tag,
+                share_basis = if (normshap12) "per_gene" else "pooled",
+                feature_subset = if (normshap12) SUBSET12 else "",
                 footnote = if (grepl("*", mk(fs), fixed = TRUE)) FOOT else ""),
   output_file = paste0("15_shap_heatmap_", tag, ".html"),
   intermediates_dir = tempfile(), quiet = TRUE, envir = new.env())
 # The model-free companions (Spearman rho per feature; top-100 mean values) use the same columns,
 # intrinsic only by design. Each column's matrix comes from 16_/17_'s matrix_map by suffix tag.
-if (fs == "_intrinsic") for (nb in c("16_feature_correlation_heatmap", "17_top100_feature_means_heatmap"))
+if (fs == "_intrinsic" && !normshap12) for (nb in c("16_feature_correlation_heatmap", "17_top100_feature_means_heatmap"))
   rmarkdown::render(here::here("code/translational_control_overview", paste0(nb, ".Rmd")),
     params = list(experiments = mk(fs), out_tag = tag,
                   footnote = if (grepl("*", mk(fs), fixed = TRUE)) FOOT else ""),

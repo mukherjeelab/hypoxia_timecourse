@@ -1,0 +1,648 @@
+---
+title: "Liu 2026 eEF1A K55me2: ribo-seq + RNA-seq, sgMETTL13 vs sgControl"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "05_riboseq_deseq2.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(DESeq2)
+})
+```
+
+# Plan
+
+**Data.** GEO GSE335287 (Liu et al. 2026, *Nat Cell Biol* 28:2321): ribo-seq and matched
+RNA-seq of T3M4 pancreatic cancer cells, sgControl vs sgMETTL13. Raw gene-level counts,
+keyed by gene symbol. Per the paper's methods, ribo counts are P-sites summed over RefSeq
+CDSs.
+
+**Replicates.** The deposited file has **2 replicates per condition**. The methods say three
+biological replicates; only two are in GEO.
+
+**Sign convention.** To match our MDA-MB-231 files (log2(sictrl / si3d), positive = factor
+promotes), DESeq2 is run with **sgMETTL13 as reference and sgControl as test**:
+
+> LFC = log2(sgControl / sgMETTL13). Positive = METTL13 promotes.
+
+This is the **opposite** of Liu's own tables (sgMETTL13 / sgControl), which notebooks 01-03
+used as-is.
+
+**This first pass** loads the counts, keeps protein-coding genes, checks the knockdown and the
+library PCA (Extended Data Fig. 5b), and plots count histograms to choose a count filter.
+No filter and no DESeq2 yet.
+
+# Load counts
+
+```{r load}
+counts_path <- here("accessories", "liu2026_GSE335287_raw_counts.txt")
+raw <- read.delim(counts_path, check.names = FALSE)
+
+stopifnot(names(raw)[1] == "geneID", ncol(raw) == 9,
+          !anyDuplicated(raw$geneID), !anyNA(raw))
+
+counts <- raw %>% column_to_rownames("geneID") %>% as.matrix()
+stopifnot(all(counts >= 0), all(counts == round(counts)))
+
+metadata <- tibble(sample_name = colnames(counts)) %>%
+  separate(sample_name, c("condition", "library", "rep"), sep = "_", remove = FALSE) %>%
+  mutate(library = tolower(library),
+         comparison_variable = condition)
+
+stopifnot(all(table(metadata$condition, metadata$library) == 2),
+          setequal(metadata$condition, c("sgControl", "sgMETTL13")),
+          setequal(metadata$library, c("ribo", "rna")))
+
+knitr::kable(metadata)
+cat("Genes:", nrow(counts), "\n")
+```
+
+# Keep protein-coding genes
+
+The counts are summed over RefSeq CDSs, so nearly every gene is already protein-coding. Symbols
+are matched to GENCODE v49; a gene is kept if any of its GENCODE entries has biotype
+`protein_coding`. Genes with zero counts in all 8 libraries are dropped too.
+
+```{r protein_coding}
+anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                 col_names = c("gene_id", "symbol", "type", "species", "source"),
+                 show_col_types = FALSE)
+pc_symbols <- unique(anno$symbol[anno$type == "protein_coding"])
+
+not_pc   <- setdiff(rownames(counts), pc_symbols)
+all_zero <- rownames(counts)[rowSums(counts) == 0]
+
+cat("Not protein-coding in GENCODE v49:", length(not_pc), "\n")
+print(not_pc)
+cat("Zero in all 8 libraries:", length(all_zero), "\n")
+
+counts <- counts[!rownames(counts) %in% c(not_pc, all_zero), ]
+stopifnot(all(rownames(counts) %in% pc_symbols), all(rowSums(counts) > 0),
+          "METTL13" %in% rownames(counts))
+cat("Genes kept:", nrow(counts), "\n")
+```
+
+# Library sizes and detected genes
+
+```{r libsize}
+lib_summary <- metadata %>%
+  mutate(reads_millions = colSums(counts)[sample_name] / 1e6,
+         genes_detected = colSums(counts > 0)[sample_name])
+knitr::kable(lib_summary %>% dplyr::select(sample_name, library, reads_millions, genes_detected),
+             digits = 2)
+```
+
+# Check 1: METTL13 knockdown
+
+The knockdown target must fall in sgMETTL13. With our sign convention that is a **positive**
+log2(sgControl / sgMETTL13). The values here come from DESeq2 size-factor-normalized counts,
+with size factors estimated within each library type, before any model is fit. For
+reference, Liu's separate RNA-seq (Supplementary Table 3, GSE292825) gives METTL13
+log2(KD / WT) = -2.78, i.e. +2.78 in our convention. That is a different experiment, so
+only the direction is asserted.
+
+```{r check_knockdown}
+norm_within <- function(lib) {
+  m <- counts[, metadata$sample_name[metadata$library == lib]]
+  sweep(m, 2, estimateSizeFactorsForMatrix(m), "/")
+}
+norm_counts <- cbind(norm_within("ribo"), norm_within("rna"))[, metadata$sample_name]
+
+mettl13 <- metadata %>%
+  mutate(norm_count = norm_counts["METTL13", sample_name]) %>%
+  group_by(library) %>%
+  summarise(sgControl = mean(norm_count[condition == "sgControl"]),
+            sgMETTL13 = mean(norm_count[condition == "sgMETTL13"]),
+            log2_sgControl_over_sgMETTL13 = log2(sgControl / sgMETTL13))
+knitr::kable(mettl13, digits = 2)
+
+stopifnot("METTL13 is not lower in sgMETTL13" =
+            all(mettl13$log2_sgControl_over_sgMETTL13 > 1))
+```
+
+# Check 2: PCA of all libraries (Extended Data Fig. 5b)
+
+The paper: libraries *"separate primarily by RNA source along PC1, while sgControl and
+sgMETTL13 samples also segregate, particularly in the ribosome profiling data"*. VST on all 8
+libraries with a blind design, using the 500 most variable genes (the `plotPCA` default).
+
+```{r check_pca, fig.width = 5.5, fig.height = 4}
+dds_all <- DESeqDataSetFromMatrix(counts, colData = as.data.frame(metadata), design = ~ 1)
+vsd <- vst(dds_all, blind = TRUE)
+
+pca_df <- plotPCA(vsd, intgroup = c("condition", "library"), returnData = TRUE)
+pct    <- round(100 * attr(pca_df, "percentVar"), 1)
+
+# PC1 must split ribo from RNA completely
+pc1_by_lib <- split(pca_df$PC1, pca_df$library)
+stopifnot("PC1 does not separate ribo from RNA" =
+            max(pc1_by_lib$ribo) < min(pc1_by_lib$rna) ||
+            min(pc1_by_lib$ribo) > max(pc1_by_lib$rna))
+
+# Within ribo libraries, the two conditions must not overlap on PC2
+ribo_pc2 <- pca_df %>% filter(library == "ribo") %>% { split(.$PC2, .$condition) }
+cat("Ribo PC2 by condition:\n"); print(ribo_pc2)
+stopifnot("PC2 does not separate conditions within ribo" =
+            max(ribo_pc2$sgControl) < min(ribo_pc2$sgMETTL13) ||
+            min(ribo_pc2$sgControl) > max(ribo_pc2$sgMETTL13))
+
+condition_colors <- c(sgControl = "grey40", sgMETTL13 = "#0072B2")
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = condition, shape = library)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = condition_colors, name = NULL) +
+  scale_shape_manual(values = c(ribo = 16, rna = 17), labels = c(ribo = "Ribo-seq", rna = "RNA-seq"),
+                     name = NULL) +
+  labs(x = sprintf("PC1 (%s%%)", pct[1]), y = sprintf("PC2 (%s%%)", pct[2]),
+       title = "Liu 2026 T3M4 libraries",
+       subtitle = sprintf("VST, top 500 variable genes; n = %d genes, 2 reps per group",
+                          nrow(counts))) +
+  theme_classic(base_size = 12)
+p_pca
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_05_library_pca.pdf"), p_pca, width = 5.5, height = 4)
+```
+
+# Count histograms
+
+One panel per library, log2(raw count + 1). Genes with a count of zero sit in the bar at 0. A
+separate low-count hump would argue for a filter placed in the valley between the humps.
+
+```{r histograms, fig.width = 9, fig.height = 4.5}
+hist_df <- as_tibble(counts, rownames = "symbol") %>%
+  pivot_longer(-symbol, names_to = "sample_name", values_to = "count") %>%
+  left_join(metadata, by = "sample_name") %>%
+  mutate(library = factor(library, levels = c("ribo", "rna"), labels = c("Ribo-seq", "RNA-seq")))
+
+p_hist <- ggplot(hist_df, aes(log2(count + 1), fill = condition)) +
+  geom_histogram(binwidth = 0.25, boundary = 0) +
+  facet_wrap(~ library + sample_name, nrow = 2) +
+  scale_fill_manual(values = condition_colors, guide = "none") +
+  labs(x = "log2(raw count + 1)", y = "Genes",
+       title = "Gene count distributions, Liu 2026 T3M4",
+       subtitle = sprintf("n = %d protein-coding genes per library", nrow(counts))) +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank())
+p_hist
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_05_count_histograms.pdf"), p_hist, width = 9, height = 4.5)
+```
+
+## Summed counts per library type
+
+As in `timecourse_qc.Rmd`: sum each gene's counts across the 4 RNA libraries and across the
+4 ribo libraries, and plot log2(rowSums). The expression threshold is read off these
+two histograms, applied to each library type separately, and a gene is kept only if it
+passes in both.
+
+```{r histogram_rowsums, fig.width = 9, fig.height = 3.5}
+cts_rna  <- counts[, metadata$sample_name[metadata$library == "rna"]]
+cts_ribo <- counts[, metadata$sample_name[metadata$library == "ribo"]]
+
+cat("Genes with zero summed counts (not shown, log2 = -Inf): RNA", sum(rowSums(cts_rna) == 0),
+    "| Ribo", sum(rowSums(cts_ribo) == 0), "\n")
+
+par(mfrow = c(1, 2))
+hist(log2(rowSums(cts_rna)),  breaks = 60, main = "RNA: log2(rowSums) distribution",
+     xlab = "log2(summed count, 4 libraries)")
+hist(log2(rowSums(cts_ribo)), breaks = 60, main = "Ribo: log2(rowSums) distribution",
+     xlab = "log2(summed count, 4 libraries)")
+
+if (isTRUE(params$save_plots)) {
+  pdf(here("plots", "liu2026_05_rowsums_histograms.pdf"), width = 9, height = 3.5)
+  par(mfrow = c(1, 2))
+  hist(log2(rowSums(cts_rna)),  breaks = 60, main = "RNA: log2(rowSums) distribution",
+       xlab = "log2(summed count, 4 libraries)")
+  hist(log2(rowSums(cts_ribo)), breaks = 60, main = "Ribo: log2(rowSums) distribution",
+       xlab = "log2(summed count, 4 libraries)")
+  dev.off()
+}
+```
+
+# Expression filter
+
+Thresholds chosen from the histograms above: log2(rowSums) **> 8 in RNA** (> 256 reads over
+4 libraries) and **> 6 in ribo** (> 64 reads). The ribo cut is lower because the ribo
+libraries are about 4x shallower. A gene must pass both.
+
+```{r filter}
+rna_cut  <- 8
+ribo_cut <- 6
+
+keep_rna  <- rownames(cts_rna)[log2(rowSums(cts_rna))   > rna_cut]
+keep_ribo <- rownames(cts_ribo)[log2(rowSums(cts_ribo)) > ribo_cut]
+keep      <- intersect(keep_rna, keep_ribo)
+
+cat("Pass RNA:", length(keep_rna), "| Pass Ribo:", length(keep_ribo), "| Pass both:", length(keep), "\n")
+
+counts_filt <- counts[keep, ]
+stopifnot("METTL13" %in% rownames(counts_filt))
+```
+
+# DESeq2
+
+Same calls as `eif3e_eif3d_normoxia_and_hypoxia.Rmd`, without spike-ins (none were
+sequenced), so size factors are standard median-of-ratios. **sgMETTL13 is the reference**,
+so every LFC is log2(sgControl / sgMETTL13): positive = METTL13 promotes.
+
+```{r deseq}
+source(here("code", "functions.R"))
+
+norm_matrix <- createNormMatrix(counts_filt, metadata, control_condition = "sgMETTL13")
+
+run_mode <- function(mode) {
+  deFunction(countsMatrix = counts_filt, allCounts_Norm = norm_matrix, metadata = metadata,
+             control_condition = "sgMETTL13", test_condition = "sgControl", mode = mode)
+}
+res_rna  <- run_mode("RNA")
+res_ribo <- run_mode("RIBO")
+res_te   <- run_mode("TE")
+
+results <- categorize_translation_changes(res_rna, res_ribo, res_te,
+                                          padj_cutoff = 0.05, lfc_cutoff = 0)
+knitr::kable(results$summary_table)
+```
+
+# Check 1 (DESeq2): METTL13 knockdown
+
+```{r check_knockdown_deseq}
+mettl13_res <- results$categorized_table %>% filter(gene_id == "METTL13")
+knitr::kable(mettl13_res, digits = 3)
+
+stopifnot("METTL13 rna_lfc should be strongly positive (sgControl / sgMETTL13)" =
+            mettl13_res$rna_lfc > 1,
+          "METTL13 ribo_lfc should be strongly positive (sgControl / sgMETTL13)" =
+            mettl13_res$ribo_lfc > 1)
+
+# Range checks
+stopifnot(all(is.finite(c(res_rna$log2FoldChange, res_ribo$log2FoldChange, res_te$log2FoldChange))),
+          all(c(res_rna$padj, res_ribo$padj, res_te$padj) >= 0 &
+              c(res_rna$padj, res_ribo$padj, res_te$padj) <= 1, na.rm = TRUE))
+```
+
+# RNA vs ribo changes
+
+```{r category_plot, fig.width = 5.5, fig.height = 4}
+p_cat <- results$plot +
+  labs(x = "RNA log2(sgControl / sgMETTL13)", y = "Ribo log2(sgControl / sgMETTL13)",
+       title = "Liu 2026 T3M4, sgControl vs sgMETTL13",
+       subtitle = sprintf("Positive = METTL13 promotes; n = %d genes, 2 reps", nrow(counts_filt)))
+p_cat
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_05_rna_vs_ribo_categories.pdf"), p_cat, width = 5.5, height = 4)
+```
+
+# Volcano plots
+
+Shrunken (apeglm) LFCs, as saved, against DESeq2 padj. Significant = padj < 0.05.
+Positive LFC = lower in sgMETTL13 = METTL13 promotes.
+
+```{r volcano, fig.width = 10, fig.height = 4}
+volcano_df <- bind_rows(RNA = res_rna, Ribo = res_ribo, TE = res_te, .id = "readout") %>%
+  dplyr::select(readout, gene_id, log2FoldChange, padj) %>%
+  filter(!is.na(padj)) %>%
+  mutate(readout = factor(readout, levels = c("RNA", "Ribo", "TE")),
+         direction = case_when(padj < 0.05 & log2FoldChange > 0 ~ "METTL13 promotes",
+                               padj < 0.05 & log2FoldChange < 0 ~ "METTL13 inhibits",
+                               TRUE                             ~ "Not significant"),
+         direction = factor(direction, levels = c("METTL13 promotes", "METTL13 inhibits",
+                                                  "Not significant"))) %>%
+  arrange(desc(direction))
+
+volcano_n <- volcano_df %>%
+  group_by(readout) %>%
+  summarise(label = sprintf("promotes %d\ninhibits %d\nn = %d",
+                            sum(direction == "METTL13 promotes"),
+                            sum(direction == "METTL13 inhibits"), n()))
+
+p_volcano <- ggplot(volcano_df, aes(log2FoldChange, -log10(padj), colour = direction)) +
+  geom_point(size = 1, alpha = 0.7, stroke = 0) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_text(data = volcano_n, aes(x = Inf, y = Inf, label = label), inherit.aes = FALSE,
+            hjust = 1.1, vjust = 1.2, size = 3) +
+  facet_wrap(~ readout, nrow = 1) +
+  scale_colour_manual(values = c("METTL13 promotes" = "#CC79A7", "METTL13 inhibits" = "#0072B2",
+                                 "Not significant" = "grey70"), name = NULL) +
+  labs(x = "log2(sgControl / sgMETTL13), shrunken", y = "-log10 padj",
+       title = "Liu 2026 T3M4, sgControl vs sgMETTL13",
+       subtitle = "Positive = METTL13 promotes; DESeq2, 2 reps per group") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), legend.position = "bottom") +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)))
+p_volcano
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_05_volcano_rna_ribo_te.pdf"), p_volcano, width = 10, height = 4)
+```
+
+# RNA, ribo and TE distributions with and without METTL13
+
+Per gene and condition, from `createNormMatrix` (all 8 libraries normalized together):
+
+- RNA = log2(mean normalized RNA count)
+- Ribo = log2(mean normalized ribo count)
+- TE = log2(mean normalized ribo / mean normalized RNA). The absolute TE offset is arbitrary
+  but shared by both conditions.
+
+Top row: each condition's distribution. Bottom row: the per-gene change, log2(sgControl /
+sgMETTL13), **unshrunken**, because apeglm sets the DESeq2 RNA and TE LFCs to ~0 for almost
+every gene (see the volcano).
+
+```{r distributions, fig.width = 11, fig.height = 7}
+mean_norm <- function(cond, lib)
+  rowMeans(norm_matrix[, metadata$sample_name[metadata$condition == cond & metadata$library == lib]])
+
+level_df <- bind_rows(
+  RNA  = tibble(gene_id = rownames(norm_matrix),
+                sgControl = log2(mean_norm("sgControl", "rna")),
+                sgMETTL13 = log2(mean_norm("sgMETTL13", "rna"))),
+  Ribo = tibble(gene_id = rownames(norm_matrix),
+                sgControl = log2(mean_norm("sgControl", "ribo")),
+                sgMETTL13 = log2(mean_norm("sgMETTL13", "ribo"))),
+  TE   = tibble(gene_id = rownames(norm_matrix),
+                sgControl = log2(mean_norm("sgControl", "ribo") / mean_norm("sgControl", "rna")),
+                sgMETTL13 = log2(mean_norm("sgMETTL13", "ribo") / mean_norm("sgMETTL13", "rna"))),
+  .id = "readout") %>%
+  mutate(readout = factor(readout, levels = c("RNA", "Ribo", "TE")),
+         change  = sgControl - sgMETTL13)
+stopifnot(all(is.finite(level_df$sgControl)), all(is.finite(level_df$sgMETTL13)))
+
+level_stats <- level_df %>%
+  group_by(readout) %>%
+  summarise(label_level = sprintf("median %.2f vs %.2f\npaired Wilcoxon p = %.2g\nn = %d genes",
+                                  median(sgControl), median(sgMETTL13),
+                                  wilcox.test(sgControl, sgMETTL13, paired = TRUE)$p.value, n()),
+            label_change = sprintf("median %.3f\nn = %d genes", median(change), n()))
+knitr::kable(level_stats)
+
+level_long <- level_df %>%
+  pivot_longer(c(sgControl, sgMETTL13), names_to = "condition", values_to = "value")
+
+p_level <- ggplot(level_long, aes(value, colour = condition, fill = condition)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_text(data = level_stats, aes(x = Inf, y = Inf, label = label_level), inherit.aes = FALSE,
+            hjust = 1.05, vjust = 1.2, size = 3) +
+  facet_wrap(~ readout, nrow = 1, scales = "free") +
+  scale_colour_manual(values = condition_colors, name = NULL) +
+  scale_fill_manual(values = condition_colors, name = NULL) +
+  labs(x = "log2 normalized count (RNA, Ribo) or log2(ribo / RNA) (TE)", y = "Density",
+       title = "Per condition") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), legend.position = "bottom")
+
+p_change <- ggplot(level_df, aes(change)) +
+  geom_density(colour = "black", fill = "black", alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_text(data = level_stats, aes(x = Inf, y = Inf, label = label_change), inherit.aes = FALSE,
+            hjust = 1.05, vjust = 1.2, size = 3) +
+  facet_wrap(~ readout, nrow = 1, scales = "free_y") +
+  labs(x = "log2(sgControl / sgMETTL13), unshrunken", y = "Density",
+       title = "Change", subtitle = "Positive = METTL13 promotes") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank())
+
+p_dist <- patchwork::wrap_plots(p_level, p_change, ncol = 1)
+p_dist
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_05_rna_ribo_te_distributions.pdf"), p_dist, width = 11, height = 7)
+```
+
+# Replicate concordance
+
+The RNA arm returns no significant genes, not even METTL13. Spearman correlation of
+normalized log2 counts within each library type, on the filtered genes, shows why.
+
+```{r replicate_cor}
+norm_filt <- log2(norm_matrix + 1)
+for (lib in c("ribo", "rna")) {
+  s <- metadata$sample_name[metadata$library == lib]
+  cat("\n", lib, "\n")
+  print(round(cor(norm_filt[, s], method = "spearman"), 3))
+}
+
+dispersion_floor <- function(lib) {
+  s   <- metadata$sample_name[metadata$library == lib]
+  cd  <- data.frame(Condition = factor(metadata$condition[match(s, metadata$sample_name)]))
+  dds <- DESeq(DESeqDataSetFromMatrix(counts_filt[, s], cd, ~ Condition), quiet = TRUE)
+  median(dispersions(dds))
+}
+disp <- c(ribo = dispersion_floor("ribo"), rna = dispersion_floor("rna"))
+knitr::kable(tibble(library = names(disp), median_dispersion = disp,
+                    implied_cv = sqrt(disp)), digits = 3)
+```
+
+**Do the RNA changes replicate?** Compute the log2(sgControl / sgMETTL13) change twice, once
+from the rep1 libraries and once from rep2, and correlate the two across genes. A real change
+gives a positive correlation.
+
+```{r replicate_lfc}
+rep_change <- function(lib, rep) {
+  ctl <- metadata$sample_name[metadata$library == lib & metadata$condition == "sgControl" & metadata$rep == rep]
+  ko  <- metadata$sample_name[metadata$library == lib & metadata$condition == "sgMETTL13" & metadata$rep == rep]
+  log2((norm_matrix[, ctl] + 1) / (norm_matrix[, ko] + 1))
+}
+rep_cor <- sapply(c(ribo = "ribo", rna = "rna"), function(lib)
+  cor(rep_change(lib, "rep1"), rep_change(lib, "rep2"), method = "spearman"))
+knitr::kable(tibble(library = names(rep_cor), rep1_vs_rep2_change_spearman = rep_cor), digits = 3)
+
+stopifnot("ribo changes should replicate" = rep_cor[["ribo"]] > 0.4)
+
+# Cross-paired check: rep1 control with rep2 KO, vs rep2 control with rep1 KO. If the RNA
+# anticorrelation is about specific libraries rather than how replicates were paired, it
+# should survive re-pairing.
+cross_change <- function(lib, ctl_rep, ko_rep) {
+  ctl <- metadata$sample_name[metadata$library == lib & metadata$condition == "sgControl" & metadata$rep == ctl_rep]
+  ko  <- metadata$sample_name[metadata$library == lib & metadata$condition == "sgMETTL13" & metadata$rep == ko_rep]
+  log2((norm_matrix[, ctl] + 1) / (norm_matrix[, ko] + 1))
+}
+cross_cor <- sapply(c(ribo = "ribo", rna = "rna"), function(lib)
+  cor(cross_change(lib, "rep1", "rep2"), cross_change(lib, "rep2", "rep1"), method = "spearman"))
+knitr::kable(tibble(library = names(cross_cor), cross_paired_change_spearman = cross_cor), digits = 3)
+```
+
+## Heatmaps
+
+Left: Spearman correlation of all 8 libraries (log2 normalized counts). Every pair is
+positive, so the RNA problem shows only as `sgMETTL13_RNA_rep1` being the palest row. Right:
+Spearman correlation of the four replicate-level changes, log2(sgControl / sgMETTL13). This is
+where the anticorrelation is visible.
+
+```{r heatmaps, fig.width = 6, fig.height = 5}
+sample_cor <- cor(norm_filt, method = "spearman")
+annot <- metadata %>% dplyr::select(sample_name, condition, library) %>%
+  column_to_rownames("sample_name") %>% as.data.frame()
+annot_colors <- list(condition = condition_colors,
+                     library = c(ribo = "grey20", rna = "grey85"))
+
+pheatmap::pheatmap(sample_cor, display_numbers = TRUE, number_format = "%.3f",
+                   annotation_row = annot, annotation_col = annot, annotation_colors = annot_colors,
+                   color = colorRampPalette(c("white", "#D55E00"))(100),
+                   main = sprintf("Library correlation, Spearman (n = %d genes)", nrow(norm_filt)))
+if (isTRUE(params$save_plots))
+  pheatmap::pheatmap(sample_cor, display_numbers = TRUE, number_format = "%.3f",
+                     annotation_row = annot, annotation_col = annot, annotation_colors = annot_colors,
+                     color = colorRampPalette(c("white", "#D55E00"))(100),
+                     main = sprintf("Library correlation, Spearman (n = %d genes)", nrow(norm_filt)),
+                     filename = here("plots", "liu2026_05_heatmap_library_correlation.pdf"),
+                     width = 7, height = 6)
+```
+
+RNA and ribo libraries separately, each on its own color scale so that the within-type
+differences are visible (in the combined heatmap they are compressed by the ribo-vs-RNA gap).
+
+```{r heatmaps_by_library, fig.width = 5.5, fig.height = 4.2}
+library_heatmap <- function(lib, filename = NA) {
+  s <- metadata$sample_name[metadata$library == lib]
+  m <- sample_cor[s, s]
+  pheatmap::pheatmap(m, display_numbers = TRUE, number_format = "%.3f",
+                     annotation_row = annot[s, "condition", drop = FALSE],
+                     annotation_col = annot[s, "condition", drop = FALSE],
+                     annotation_colors = list(condition = condition_colors),
+                     color = colorRampPalette(c("white", "#D55E00"))(100),
+                     breaks = seq(min(m), 1, length.out = 101),
+                     main = sprintf("%s libraries\nSpearman, n = %d genes",
+                                    c(ribo = "Ribo-seq", rna = "RNA-seq")[[lib]], nrow(norm_filt)),
+                     filename = filename, width = 5.5, height = 4.2)
+}
+for (lib in c("rna", "ribo")) {
+  library_heatmap(lib)
+  if (isTRUE(params$save_plots))
+    library_heatmap(lib, here("plots", sprintf("liu2026_05_heatmap_%s_library_correlation.pdf", lib)))
+}
+```
+
+```{r heatmap_changes, fig.width = 5, fig.height = 4.2}
+change_mat <- cbind(`RNA rep1`  = rep_change("rna",  "rep1"), `RNA rep2`  = rep_change("rna",  "rep2"),
+                    `Ribo rep1` = rep_change("ribo", "rep1"), `Ribo rep2` = rep_change("ribo", "rep2"))
+change_cor <- cor(change_mat, method = "spearman")
+stopifnot(isTRUE(all.equal(change_cor["RNA rep1", "RNA rep2"], rep_cor[["rna"]])))
+
+change_heatmap <- function(filename = NA)
+  pheatmap::pheatmap(change_cor, display_numbers = TRUE, number_format = "%.2f",
+                     cluster_rows = FALSE, cluster_cols = FALSE,
+                     color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(100),
+                     breaks = seq(-1, 1, length.out = 101),
+                     main = sprintf("Change log2(sgControl / sgMETTL13)\nper replicate, Spearman (n = %d genes)",
+                                    nrow(change_mat)),
+                     filename = filename, width = 5, height = 4.2)
+change_heatmap()
+if (isTRUE(params$save_plots))
+  change_heatmap(here("plots", "liu2026_05_heatmap_replicate_change_correlation.pdf"))
+```
+
+**Finding.** The ribo change replicates (Spearman ~+0.63). The RNA change does **not**: the
+rep1 and rep2 estimates are *anti*-correlated (~-0.38), and re-pairing the replicates makes it
+stronger (~-0.74), so it comes from the libraries, not from how they were paired. It traces
+mainly to `sgMETTL13_RNA_rep1`, which correlates worse with its own replicate than with either
+control and is the RNA library most similar to the ribo libraries (library heatmap below). So this dataset cannot
+say whether mRNA levels change on METTL13 loss, and that noise passes straight into TE, because
+TE is ribo relative to RNA. In practice:
+
+- **Ribo LFC is the reliable readout** from this dataset (1,366 genes at padj < 0.05).
+- **RNA LFC is uninformative** (0 genes significant; apeglm shrinks all to ~0).
+- **TE LFC** is usable only unshrunken, as a noisy ranking; shrunken, only ~5 genes are
+  confidently non-zero (apeglm s-value < 0.01, next section).
+
+For RNA-level questions, use Liu's separate RNA-seq (Supplementary Table 3, GSE292825).
+
+# Unshrunken LFCs and s-values
+
+`deFunction()` returns only apeglm-shrunken LFCs. The same three models are refit here to keep
+the unshrunken (MLE) LFCs and apeglm **s-values** (the probability that the sign of the shrunken
+LFC is wrong; the confidence measure that matches a shrunken estimate). The refit must reproduce
+`deFunction`'s shrunken LFCs, which proves it is the same model.
+
+```{r mle_svalue}
+fit_mode <- function(mode) {
+  s  <- if (mode == "TE") metadata$sample_name else
+        metadata$sample_name[metadata$library == tolower(mode)]
+  cd <- metadata %>% filter(sample_name %in% s) %>%
+    mutate(Condition = factor(condition, levels = c("sgMETTL13", "sgControl")),
+           SeqType   = factor(library, levels = c("rna", "ribo"))) %>%
+    as.data.frame()
+  design <- if (mode == "TE") ~ Condition + SeqType + Condition:SeqType else ~ Condition
+  coef   <- if (mode == "TE") "ConditionsgControl.SeqTyperibo" else "Condition_sgControl_vs_sgMETTL13"
+  dds <- DESeq(DESeqDataSetFromMatrix(counts_filt[, cd$sample_name], cd, design), quiet = TRUE)
+  mle <- results(dds, name = coef, independentFiltering = FALSE)
+  shr <- lfcShrink(dds, coef = coef, type = "apeglm", svalue = TRUE, quiet = TRUE)
+  tibble(gene_id = rownames(mle), lfc_mle = mle$log2FoldChange,
+         lfc_shrunk = shr$log2FoldChange, svalue = shr$svalue)
+}
+refit <- map(c(rna = "RNA", ribo = "RIBO", te = "TE"), fit_mode)
+
+# Same model as deFunction: shrunken LFCs must agree
+for (m in names(refit)) {
+  ref <- list(rna = res_rna, ribo = res_ribo, te = res_te)[[m]]
+  d <- max(abs(refit[[m]]$lfc_shrunk - ref$log2FoldChange[match(refit[[m]]$gene_id, ref$gene_id)]))
+  cat(m, "max |refit - deFunction| shrunken LFC:", signif(d, 2), "\n")
+  stopifnot("refit does not reproduce deFunction" = d < 1e-3)
+}
+
+refit_wide <- imap(refit, ~ .x %>% dplyr::select(gene_id, lfc_mle, svalue) %>%
+                     rename_with(function(n) paste0(.y, "_", n), -gene_id)) %>%
+  purrr::reduce(left_join, by = "gene_id")
+
+tibble(readout = names(refit),
+       `s < 0.005` = map_int(refit, ~ sum(.x$svalue < 0.005)),
+       `s < 0.01`  = map_int(refit, ~ sum(.x$svalue < 0.01)),
+       `s < 0.05`  = map_int(refit, ~ sum(.x$svalue < 0.05))) %>% knitr::kable()
+
+cat("TE genes with s-value < 0.01:\n")
+refit$te %>% filter(svalue < 0.01) %>% arrange(svalue) %>% knitr::kable(digits = 4)
+```
+
+# Save
+
+Same columns as our `translation_categories_*.csv` files (`*_lfc` are apeglm-shrunken), plus
+`{rna,ribo,te}_lfc_mle` (unshrunken) and `{rna,ribo,te}_svalue`. `gene_id` holds the **gene
+symbol** here, because the GEO counts carry no Ensembl IDs; `symbol` repeats it so joins on
+`symbol` work as they do on our files.
+
+```{r save}
+out <- results$categorized_table %>%
+  left_join(res_rna  %>% dplyr::select(gene_id, rna_padj  = padj), by = "gene_id") %>%
+  left_join(res_ribo %>% dplyr::select(gene_id, ribo_padj = padj), by = "gene_id") %>%
+  left_join(res_te   %>% dplyr::select(gene_id, te_padj   = padj), by = "gene_id") %>%
+  left_join(refit_wide, by = "gene_id") %>%
+  mutate(symbol = gene_id)
+stopifnot(all(is.finite(out$te_lfc_mle)), all(is.finite(out$ribo_lfc_mle)))
+
+stopifnot(nrow(out) == nrow(counts_filt), !anyDuplicated(out$gene_id))
+
+out_dir <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+write_csv(out, file.path(out_dir, "translation_categories_sgcontrol_vs_sgmettl13_liu2026.csv"))
+write_csv(results$summary_table,
+          file.path(out_dir, "translation_summary_sgcontrol_vs_sgmettl13_liu2026.csv"))
+cat("Wrote", nrow(out), "genes\n")
+```
+
+```{r session}
+sessionInfo()
+```

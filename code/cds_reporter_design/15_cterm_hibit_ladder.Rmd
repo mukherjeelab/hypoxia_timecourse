@@ -1,0 +1,853 @@
+---
+title: "CDS reporter design 15 - C-terminal HiBiT eGFP ladder, no P2A"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  min_gfp_copies: 0
+  max_gfp_copies: 3
+  target_group: "expressed"
+  min_codon_prop: 0.08
+  max_homopolymer: 6
+  xmax_kb: 3
+  seed: 9
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    min_gfp_copies  = 0,           # rungs are min..max eGFP copies
+    max_gfp_copies  = 3,           #   (0 includes the no-GFP rung)
+    target_group    = "expressed", # "expressed" | "promoted" - whose medians
+    min_codon_prop  = 0.08,        # drop codons used less than this within AA
+    max_homopolymer = 6,           # longest run of one base allowed
+    xmax_kb         = 3,           # length panel clipped here
+    seed            = 9            # project standard
+  )
+}
+```
+
+# Overview
+
+A new ladder, not a variant of `08_`:
+
+```
+FLAG - W - hiBIT                                    (only when min_gfp_copies = 0)
+FLAG - W - GFP - W - hiBIT
+FLAG - W - GFP - W - GFP - W - hiBIT
+FLAG - W - GFP - W - GFP - W - GFP - W - hiBIT      (W = Waldo linker)
+...one more Waldo + GFP per rung
+```
+
+The rung range is set by `min_gfp_copies` / `max_gfp_copies`. **The 1-4x range
+is the one to use**, and `16_render_1to4x.R` renders it: the no-GFP rung is 96
+nt, which is below 99.9% of expressed mRNAs and holds under one ribosome at
+typical spacing, so it is not a shorter version of the same process but a
+different regime. Starting at 1x gives 855 / 1,614 / 2,373 / 3,132 nt - the
+31st to 89th percentile - with the 1x rung landing essentially on the
+eIF3d-promoted median of 891 nt.
+
+**Three things changed from the `08_` ladder, and the first one changes what the
+reporter measures.**
+
+1. **P2A is gone.** In `08_` HiBiT sat upstream of P2A and was released by
+   ribosomal skipping at around codon 46, so HiBiT signal reported how many
+   ribosomes reached that point - essentially initiation. Here the construct is
+   a **single uninterrupted polypeptide with HiBiT at the C terminus**, so
+   HiBiT appears only when a ribosome finishes the entire ORF. The readout is
+   now completion of full-length synthesis, which is what makes a length series
+   worth building: each rung asks the ribosome to travel 759 nt further.
+2. **No (GGGGS)x3 linker.** It existed in `08_` to keep the P2A-derived tail off
+   HiBiT. With P2A gone there is no tail, and the Waldo linker is itself a
+   flexible Gly/Ser/Ala spacer, so a second flexible linker would be redundant.
+3. **A Waldo linker at every junction**, not just between eGFP copies: after
+   FLAG, between each pair of eGFP copies, and before HiBiT. Each one carries
+   an in-frame `GAATTC`, so a rung with *k* linkers carries exactly *k* EcoRI
+   sites - 1, 2, 3 and 4 across the ladder. That count is pinned, not reported.
+
+**HiBiT sits at the extreme C terminus, with nothing after it.** That is the
+vendor's default placement, and it is deliberate: complementation with LgBiT
+needs HiBiT to adopt an extended conformation, and anything appended makes it
+an internal tag, which is documented to give reduced signal and slower
+equilibration. A PEST degron was considered and **left out for this build** for
+exactly that reason - these constructs make a stable protein.
+
+**The ladder is NOT nested.** In `08_` each rung was a prefix of the next;
+here HiBiT terminates every rung, so only the `FLAG-W` head is shared. Each
+rung is therefore recoded as its own construct rather than by extending the
+previous one.
+
+**What is recoded, and what is not.** FLAG and every eGFP copy are recoded
+synonymously onto the MDA-MB-231 composition. **HiBiT and the Waldo linkers are
+held bit-identical** - HiBiT because it is a published, affinity-tuned 11-mer,
+the Waldo linkers because recoding them would destroy the EcoRI sites the
+cloning depends on. The initiator is fixed.
+
+**A short rung cannot hit the GC3 target as precisely as a long one**, because
+GC3 moves in steps of one free codon. The no-GFP rung, if included, has only 8
+free codons (FLAG's) against 23 fixed, giving steps of ~3.2 points; every rung
+carrying eGFP has hundreds and steps by well under half a point. Section 8
+therefore states the reachable tolerance **per rung** rather than applying one
+bound to all of them.
+
+# 1. Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+source(here("code", "cds_reporter_design", "recoder.R"))
+```
+
+```{r params_chunk}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+gfp_copies <- params$min_gfp_copies:params$max_gfp_copies
+
+# The historical tag is kept verbatim when the ladder starts at 0, so the
+# 0-3x outputs already on disk are overwritten in place rather than orphaned
+# beside a newly-named set. Any other range gets its own tag.
+run_tag <- if (params$min_gfp_copies == 0)
+  paste0("upto", params$max_gfp_copies, "x_", params$target_group) else
+  paste0(params$min_gfp_copies, "to", params$max_gfp_copies, "x_",
+         params$target_group)
+
+stopifnot(
+  "min_gfp_copies must not be negative" = params$min_gfp_copies >= 0,
+  "max_gfp_copies must exceed min_gfp_copies" =
+    params$max_gfp_copies > params$min_gfp_copies,
+  "target_group must be 'expressed' or 'promoted'" =
+    params$target_group %in% c("expressed", "promoted"),
+  "min_codon_prop must be in (0, 1/6)" =
+    params$min_codon_prop > 0 && params$min_codon_prop < 1 / 6,
+  "max_homopolymer must be at least 4" = params$max_homopolymer >= 4
+)
+```
+
+# 2. Import and Verify the Parts
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts$part)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("hibit", "flag3x", "egfp", "waldo linker")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+hibit  <- pseq[["hibit"]]
+flag3x <- pseq[["flag3x"]]
+egfp   <- pseq[["egfp"]]
+waldo  <- pseq[["waldo linker"]]
+flag1x <- substr(flag3x, 43, 66)
+
+aa_of <- function(s) as.character(translate(DNAString(s)))
+rc_aa <- function(s) as.character(translate(reverseComplement(DNAString(s))))
+
+HIBIT_AA  <- "VSGWRLFKKIS"
+FLAG_AA   <- "DYKDDDDK"
+FLAG3X_AA <- "DYKDHDGDYKDHDIDYKDDDDK"
+WALDO_AA  <- "GSAGSAAGSGEF"
+EGFP_AA   <- aa_of(egfp)
+
+stopifnot(
+  "hibit does not encode the 11-residue HiBiT peptide" = aa_of(hibit) == HIBIT_AA,
+  "hibit is not 33 nt" = nchar(hibit) == 33,
+  # The spreadsheet carries SmBiT as well, and the two peptides are both 11
+  # residues. Reading the wrong row would give a construct that is the right
+  # length, in frame, stop-free and entirely wrong.
+  "the HiBiT row encodes the SmBiT peptide: the wrong row was read" =
+    aa_of(hibit) != "VTGYRLFEEIL",
+  "flag3x does not encode the canonical 3xFLAG peptide" = aa_of(flag3x) == FLAG3X_AA,
+  "1xFLAG is not the 24 nt C-terminal repeat of flag3x" =
+    nchar(flag1x) == 24 && endsWith(flag3x, flag1x),
+  "1xFLAG does not encode the DYKDDDDK epitope" = aa_of(flag1x) == FLAG_AA,
+  "egfp is not 723 nt"           = nchar(egfp) == 723,
+  "egfp does not start with ATG" = substr(egfp, 1, 3) == "ATG",
+  # The GFP chromophore. avGFP numbers it T65-Y66-G67, but eGFP carries an extra
+  # Val at position 2, so it sits at 66-68 here. TYG also occurs at residue 39,
+  # so a motif-presence check would pass on a sequence with no chromophore.
+  "egfp protein does not carry the TYG chromophore at residues 66-68" =
+    substr(EGFP_AA, 66, 68) == "TYG",
+  "waldo linker is not 36 nt" = nchar(waldo) == 36,
+  "waldo linker does not encode GSAGSAAGSGEF" = aa_of(waldo) == WALDO_AA,
+  "waldo linker does not end with an in-frame GAATTC EcoRI site" =
+    endsWith(waldo, "GAATTC") && (nchar(waldo) - 6) %% 3 == 0,
+  # Orientation: paired with the assertion that the reverse complement does NOT
+  # encode the same peptide, so the check is discriminative.
+  "Both orientations encode HiBiT: the check is not discriminative" =
+    rc_aa(hibit) != HIBIT_AA,
+  "Both orientations encode eGFP: the check is not discriminative" =
+    rc_aa(egfp) != EGFP_AA
+)
+stopifnot("A part carries a stop codon" =
+            !any(map_lgl(list(hibit, flag1x, egfp, waldo),
+                         ~ any(codon_split(.x) %in% STOP_CODONS))))
+
+# eGFP is supplied with its own initiator. Here it is an INTERNAL part, never
+# the start of the ORF, so that ATG is just a Met residue in the middle of the
+# polypeptide - which is fine, but worth stating because `08_` used eGFP the
+# same way and the codon is never treated as a start.
+cat("Parts verified. eGFP's leading ATG is internal in this layout (Met",
+    substr(EGFP_AA, 1, 1), "at the eGFP junction).\n")
+```
+
+# 3. MDA-MB-231 Background and the GC3 Target
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+```
+
+```{r build_metrics}
+cds_seqs    <- build_cds_seqs(here("accessories", "human",
+                                   "txdb.gencode49.sqlite"))
+cds_int     <- DNAStringSet(trim_internal(as.character(cds_seqs)))
+names(cds_int) <- names(cds_seqs)
+
+cds_nostop  <- subseq(cds_seqs, start = 1L,
+                      end = BiocGenerics::width(cds_seqs) - 3L)
+metrics_all <- tibble(
+  transcript_id_clean = names(cds_seqs),
+  cds_length = BiocGenerics::width(cds_nostop),
+  gc_pct  = as.numeric(letterFrequency(cds_nostop, letters = "GC",
+                                       as.prob = TRUE)) * 100,
+  gc3_pct = sapply(as.character(cds_int), compute_gc3_pct, USE.NAMES = FALSE)
+)
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+stopifnot(
+  "GC3% out of range" = all(between(expressed$gc3_pct, 0, 100)),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+
+target_df  <- if (params$target_group == "expressed") expressed else promoted
+TARGET_GC3 <- median(target_df$gc3_pct)
+cat(sprintf("Expressed n = %s (median %s nt, GC3 %.1f%%); promoted n = %s (median %s nt)\n",
+            fmt_n(nrow(expressed)), fmt_n(median(expressed$cds_length)),
+            TARGET_GC3, fmt_n(nrow(promoted)),
+            fmt_n(median(promoted$cds_length))))
+```
+
+# 4. Codon Usage of the Expressed Transcriptome
+
+```{r codon_usage}
+GEN <- GENETIC_CODE
+AA  <- setNames(as.character(GEN), names(GEN))
+stopifnot("Codon-to-amino-acid lookup lost its names" =
+            identical(names(AA), names(GEN)))
+sense <- names(GEN)[AA != "*"]
+
+expr_seqs <- cds_int[names(cds_int) %in% expressed$transcript_id_clean]
+cf <- trinucleotideFrequency(expr_seqs, step = 3)
+stopifnot("trinucleotideFrequency lost its codon column names" =
+            !is.null(colnames(cf)) && all(names(GEN) %in% colnames(cf)))
+
+usage <- tibble(codon = colnames(cf), count = colSums(cf)) %>%
+  filter(AA[codon] != "*") %>%
+  mutate(aa = AA[codon]) %>%
+  group_by(aa) %>% mutate(prop = count / sum(count)) %>% ungroup()
+stopifnot(
+  "Synonymous proportions do not sum to 1 within every amino acid" =
+    all(abs((usage %>% group_by(aa) %>% summarise(s = sum(prop)))$s - 1) < 1e-9),
+  "A sense codon is missing from the usage table" = setequal(usage$codon, sense)
+)
+leu <- usage %>% filter(aa == "L") %>% dplyr::slice_max(prop, n = 1)
+stopifnot("CTG is not the most-used Leu codon: usage table may be misaligned" =
+            leu$codon == "CTG")
+
+USE   <- setNames(usage$prop, usage$codon)
+BASES <- c("A", "C", "G", "T")
+
+pick_list <- function(cods) {
+  keep <- cods[USE[cods] >= params$min_codon_prop]
+  if (!length(keep)) cods[which.max(USE[cods])] else keep
+}
+MENU <- map(split(sense, AA[sense]), function(cods) {
+  by_base <- map(setNames(BASES, BASES), ~ cods[str_sub(cods, 3, 3) == .x])
+  map(by_base[lengths(by_base) > 0], pick_list)
+})
+```
+
+```{r base_ratios}
+b3_col  <- str_sub(colnames(cf), 3, 3)
+tx_n3   <- sapply(setNames(BASES, BASES),
+                  function(b) rowSums(cf[, b3_col == b, drop = FALSE]))
+tx_pct3 <- 100 * tx_n3 / rowSums(tx_n3)
+med3 <- apply(tx_pct3, 2, median)
+R_G <- med3[["G"]] / (med3[["G"]] + med3[["C"]])
+R_A <- med3[["A"]] / (med3[["A"]] + med3[["T"]])
+stopifnot(
+  "Third-base split ratios are out of range" =
+    between(R_G, 0, 1) && between(R_A, 0, 1),
+  "Split ratios and the GC3 target disagree: they are not the same statistic" =
+    abs((med3[["G"]] + med3[["C"]]) / sum(med3) * 100 - TARGET_GC3) < 1
+)
+cat(sprintf("G:(G+C) = %.3f   A:(A+T) = %.3f\n", R_G, R_A))
+```
+
+# 5. Build the Ladder
+
+Each rung is its own construct: HiBiT terminates every one, so there is no
+nested prefix to extend. The free codons - FLAG's 8 plus 241 per eGFP copy - are
+drawn as **one assignment per rung**, because the third-base target is a count
+over the whole construct and the free codons are not contiguous.
+
+```{r builder}
+R <- make_recoder(TARGET_GC3, R_G, R_A, MENU, USE, AA, params$max_homopolymer)
+ORF_STOP <- "TAA"
+
+# Part layout for a rung with n eGFP copies: a Waldo linker at every junction.
+layout_for <- function(n) {
+  out <- list(list(name = "ATG + FLAG (1x)", seq = paste0("ATG", flag1x),
+                   free = TRUE))
+  for (k in seq_len(n)) {
+    out <- c(out, list(list(name = sprintf("Waldo linker %d", k), seq = waldo,
+                            free = FALSE)),
+                  list(list(name = sprintf("eGFP copy %d", k), seq = egfp,
+                            free = TRUE)))
+  }
+  c(out, list(list(name = sprintf("Waldo linker %d", n + 1), seq = waldo,
+                   free = FALSE)),
+         list(list(name = "hiBIT", seq = hibit, free = FALSE)))
+}
+
+build_rung <- function(n, seed = params$seed) {
+  lay    <- layout_for(n)
+  cvs    <- map(lay, ~ codon_split(.x$seq))
+  ends   <- cumsum(lengths(cvs)); starts <- ends - lengths(cvs) + 1L
+  all_cv <- unlist(cvs, use.names = FALSE)
+
+  # Free: every codon of a free part EXCEPT the construct's initiator, which is
+  # position 1 (the ATG prepended to FLAG).
+  free_idx <- unlist(map(which(map_lgl(lay, "free")),
+                         ~ starts[.x]:ends[.x]))
+  free_idx <- setdiff(free_idx, 1L)
+  fixed_idx <- setdiff(seq_along(all_cv), free_idx)
+  stopifnot("The initiator is not fixed" = 1L %in% fixed_idx)
+
+  free_cv    <- all_cv[free_idx]
+  free_menus <- MENU[AA[free_cv]]
+  assemble   <- function(b) { out <- all_cv; out[free_idx] <- b; out }
+
+  n_waldo <- n + 1L   # every junction carries one
+  set.seed(seed)
+  need  <- R$block_needs(length(free_cv), all_cv[fixed_idx])
+  drawn <- R$draw_clean_block(free_cv, need, assemble = assemble,
+                              n_linkers = n_waldo, menus = free_menus,
+                              max_try = 5000)
+
+  recoded_cv <- assemble(drawn$block)
+  sense_seq  <- paste0(recoded_cv, collapse = "")
+
+  cat(sprintf("  %d eGFP: %d codons (%d free, %d fixed), %d Waldo linkers; clean draw %d\n",
+              n, length(all_cv), length(free_cv), length(fixed_idx),
+              n_waldo, drawn$tries))
+
+  list(
+    n_gfp = n, n_waldo = n_waldo,
+    original_sense = paste0(map_chr(lay, "seq"), collapse = ""),
+    sense = sense_seq,
+    full  = paste0(sense_seq, ORF_STOP),
+    parts = tibble(part   = map_chr(lay, "name"),
+                   free   = map_lgl(lay, "free"),
+                   before = map_chr(lay, "seq"),
+                   after  = map_chr(seq_along(lay),
+                                    ~ paste0(recoded_cv[starts[.x]:ends[.x]],
+                                             collapse = ""))))
+}
+
+cat("Building", length(gfp_copies), "rungs:\n")
+rungs <- map(gfp_copies, build_rung)
+names(rungs) <- ifelse(gfp_copies == 0, "FLAG-W-hiBIT",
+                       sprintf("FLAG-W-%dxGFP-W-hiBIT", gfp_copies))
+seqs <- map_chr(rungs, "full")
+
+# One colour per rung, matching the ramp 07_/08_ use so a rung reads as the same
+# rung across notebooks.
+rung_cols <- setNames(
+  colorRampPalette(c("#A6CEE3", "#0072B2", "#03314D"))(length(rungs)),
+  names(rungs))
+```
+
+# 6. Validation
+
+```{r validate_protein}
+walk2(names(rungs), rungs, function(nm, r) {
+  stopifnot(
+    "Recoded rung differs in length from the original" =
+      nchar(r$sense) == nchar(r$original_sense),
+    "Recoding changed the protein" =
+      aa_of(r$sense) == aa_of(r$original_sense),
+    "Rung lost frame" = nchar(r$full) %% 3 == 0,
+    "Rung does not start with the initiator" = substr(r$full, 1, 3) == "ATG",
+    "Rung does not end in the terminator" =
+      tail(codon_split(r$full), 1) == ORF_STOP,
+    "Rung carries a stop codon before the end" =
+      !any(head(codon_split(r$full), -1) %in% STOP_CODONS),
+    # HiBiT and every Waldo linker must be bit-identical.
+    "HiBiT is not bit-identical in the recoded rung" =
+      r$parts$after[r$parts$part == "hiBIT"] == hibit,
+    "A Waldo linker is not bit-identical in the recoded rung" =
+      all(r$parts$after[str_starts(r$parts$part, "Waldo")] == waldo),
+    # Discriminative companion: the free parts must NOT be unchanged.
+    "A free part was not recoded" = all(
+      (r$parts$before != r$parts$after)[r$parts$free])
+  )
+})
+cat("All rungs: protein unchanged, HiBiT and Waldo bit-identical,",
+    "every free part recoded, one stop at the end\n")
+
+# HiBiT must be the LAST thing before the stop - the whole point of the design,
+# and checked on the protein rather than on the part order.
+walk2(names(rungs), rungs, function(nm, r) {
+  prot <- aa_of(r$sense)
+  stopifnot(
+    "HiBiT is not at the extreme C terminus" = endsWith(prot, HIBIT_AA),
+    "HiBiT appears more than once" =
+      str_count(prot, fixed(HIBIT_AA)) == 1,
+    "FLAG is not at the N terminus" =
+      str_detect(substr(prot, 1, 1 + nchar(FLAG_AA)), fixed(FLAG_AA))
+  )
+})
+cat("Every rung: FLAG at the N terminus, HiBiT the final", nchar(HIBIT_AA),
+    "residues, present once\n")
+```
+
+```{r validate_motifs}
+ec <- map_int(rungs, ~ str_count(.x$full, fixed("GAATTC")))
+stopifnot(
+  "EcoRI site count does not equal the Waldo linker count" =
+    all(ec == map_int(rungs, "n_waldo")),
+  "The EcoRI counts are not 1,2,3,4 across the ladder" =
+    identical(as.integer(ec), as.integer(gfp_copies + 1))
+)
+cat("EcoRI sites per rung:", paste(ec, collapse = ", "),
+    "(one per Waldo linker, as designed)\n")
+
+max_run <- map_int(rungs, ~ max(nchar(str_extract_all(.x$full,
+                                                      "(A+|C+|G+|T+)")[[1]])))
+stopifnot("A rung carries a homopolymer longer than max_homopolymer" =
+            all(max_run <= params$max_homopolymer))
+cat("Longest homopolymer per rung:", paste(max_run, collapse = ", "),
+    "nt (cap", params$max_homopolymer, ")\n")
+```
+
+The eGFP copies within a rung are drawn independently, so the tandem repeat that
+a naive multi-copy construct carries should be gone. Measured against the
+original, which must **fail** the same test.
+
+```{r validate_repeats}
+kmers <- function(s, k) unique(substring(s, 1:(nchar(s) - k + 1), k:nchar(s)))
+longest_shared <- function(a, b) {
+  last <- 0
+  for (k in seq(10, min(nchar(a), nchar(b)), by = 5)) {
+    if (!length(intersect(kmers(a, k), kmers(b, k)))) break
+    last <- k
+  }
+  last
+}
+
+top <- rungs[[length(rungs)]]
+copies <- top$parts$after[str_starts(top$parts$part, "eGFP")]
+if (length(copies) > 1) {
+  prs <- combn(seq_along(copies), 2)
+  shared <- map_int(seq_len(ncol(prs)),
+                    ~ longest_shared(copies[prs[1, .x]], copies[prs[2, .x]]))
+  cat("Longest exact match between eGFP copies:",
+      paste(sprintf("%d-%d: %d nt", prs[1, ], prs[2, ], shared),
+            collapse = ", "), "\n")
+  stopifnot(
+    "Two recoded eGFP copies are identical" = !any(duplicated(copies)),
+    "Recoded copies still share a long exact repeat" = all(shared < 100),
+    # Discriminative companion: the ORIGINAL copies are identical, so the same
+    # measure must return the full copy length on them.
+    "Repeat measure fails to detect identical original copies" =
+      longest_shared(egfp, egfp) >= nchar(egfp) - 10
+  )
+}
+```
+
+# 7. Lengths
+
+```{r lengths}
+part_tbl <- map2_dfr(names(rungs), rungs, function(nm, r)
+  r$parts %>% transmute(construct = nm, part, free,
+                        nt = nchar(after), codons = nt / 3,
+                        gc3_before = map_dbl(before, compute_gc3_pct),
+                        gc3_after  = map_dbl(after,  compute_gc3_pct)))
+
+cat("Subsection sizes (identical in every rung):\n")
+print(part_tbl %>% distinct(part, nt, codons) %>%
+        mutate(part = sub(" \\d+$", "", part)) %>%
+        distinct(part, nt, codons) %>% as.data.frame(), row.names = FALSE)
+
+len_tbl <- tibble(
+  construct   = names(rungs),
+  gfp_copies  = gfp_copies,
+  n_waldo     = map_int(rungs, "n_waldo"),
+  cds_length  = map_int(rungs, ~ nchar(.x$sense)),   # stop-free, plotted basis
+  nt_ordered  = map_int(rungs, ~ nchar(.x$full)),
+  protein_aa  = map_int(rungs, ~ nchar(.x$sense) / 3),
+  ecori       = as.integer(ec))
+
+print(as.data.frame(len_tbl), row.names = FALSE)
+
+# The arithmetic the layout implies, asserted rather than observed: each rung is
+# the bare rung plus k copies of (Waldo + eGFP).
+expected <- 3 + nchar(flag1x) + nchar(waldo) + nchar(hibit) +
+  gfp_copies * (nchar(waldo) + nchar(egfp))
+# Joined, not compared positionally: `group_by()` returns groups in sorted
+# order, which is NOT the ladder order (0x, 1x, 2x, 3x sorts as FLAG-W-1xGFP...,
+# FLAG-W-hiBIT, ...). Lining the two vectors up by position compares the wrong
+# rows and either fires spuriously or, worse, passes on a real mismatch.
+part_sums <- part_tbl %>%
+  group_by(construct) %>% summarise(part_nt = sum(nt), .groups = "drop")
+len_check <- len_tbl %>% left_join(part_sums, by = "construct")
+
+stopifnot(
+  "Rung lengths do not match the layout arithmetic" =
+    all(len_tbl$cds_length == expected),
+  "The ordered length is not the sense length plus one stop codon" =
+    all(len_tbl$nt_ordered == len_tbl$cds_length + 3),
+  "A construct is missing from the part table" = !any(is.na(len_check$part_nt)),
+  "Part lengths do not sum to the construct length" =
+    all(len_check$part_nt == len_check$cds_length)
+)
+cat(sprintf("\nEach eGFP copy adds %d nt (Waldo %d + eGFP %d).\n",
+            nchar(waldo) + nchar(egfp), nchar(waldo), nchar(egfp)))
+
+# This ladder is NOT nested, unlike 08_: HiBiT terminates every rung. Asserted,
+# because the obvious mental model of a copy ladder is the nested one.
+stopifnot(
+  "A rung is a prefix of the next: this ladder is not supposed to be nested" =
+    !any(map_lgl(seq_len(nrow(len_tbl) - 1),
+                 ~ startsWith(rungs[[.x + 1]]$sense, rungs[[.x]]$sense)))
+)
+cat("Ladder is not nested - only the FLAG-Waldo head is shared.\n")
+```
+
+# 8. Composition
+
+```{r composition}
+comp_tbl <- len_tbl %>%
+  mutate(gc3_pct    = map_dbl(rungs, ~ compute_gc3_pct(trim_internal(.x$full))),
+         gc_pct     = map_dbl(rungs, ~ gc_pct_of(.x$sense)),
+         gc3_before = map_dbl(rungs, ~ compute_gc3_pct(
+           trim_internal(paste0(.x$original_sense, ORF_STOP)))),
+         n_free     = map_int(rungs, ~ sum(.x$parts$free *
+                                             nchar(.x$parts$after) / 3) - 1),
+         d_gc3      = gc3_pct - TARGET_GC3,
+         # One free codon moves construct GC3 by 100/basis points, so a rung
+         # cannot be expected to land closer than that. Stating the reachable
+         # tolerance per rung is the honest bound; a single number would be
+         # far too loose for the eGFP rungs and impossible for the bare one.
+         step_pts   = 100 / (cds_length / 3 - 1),
+         tol        = pmax(1, step_pts))
+
+print(comp_tbl %>% dplyr::select(construct, cds_length, n_free, gc3_before,
+                                 gc3_pct, d_gc3, step_pts, gc_pct) %>%
+        mutate(across(where(is.double), ~ round(.x, 2))) %>%
+        as.data.frame(), row.names = FALSE)
+
+stopifnot(
+  "A rung missed its GC3 target by more than one free codon's worth" =
+    all(abs(comp_tbl$d_gc3) <= comp_tbl$tol)
+)
+cat(sprintf("\nGC3 target %.1f%%. Shortest rung: %s free codons, step %.2f points.\n",
+            TARGET_GC3, fmt_n(comp_tbl$n_free[1]), comp_tbl$step_pts[1]))
+cat(sprintf("All %d rungs land within %.2f points of target (own step %.2f-%.2f).\n",
+            nrow(comp_tbl), max(abs(comp_tbl$d_gc3)),
+            min(comp_tbl$step_pts), max(comp_tbl$step_pts)))
+```
+
+## The firefly control
+
+The transfection-efficiency control is **firefly luc2P on its own** - nothing
+else in the coding sequence, no mCherry, no HA, no linker, no P2A.
+
+**As supplied it is GC3 78.3%**, which is the 87th percentile of expressed
+mRNAs and the 95th of the eIF3d-promoted set - a markedly GC3-rich message
+sitting beside a ladder pinned at the 57.3% median. So it is **recoded onto the
+same target as the ladder**, by the same recoder, protein unchanged. Both values
+are reported below and the panels draw the recoded one.
+
+**What recoding a normaliser does and does not change.** It does not change the
+protein, the length, or firefly's suitability as a transfection control. It does
+change the construct's absolute luminescence, because codon choice affects how
+well a message is translated - so the recoded control is not interchangeable
+with the as-supplied plasmid in an experiment already normalised to the latter.
+Pick one and keep it.
+
+Every sense codon except the initiator is free; there is no part of this
+construct that has to stay fixed, unlike the ladder's HiBiT and Waldo linkers.
+
+```{r firefly_control}
+ff_raw   <- pseq[["firefly"]]
+ff_sense <- substr(ff_raw, 1, nchar(ff_raw) - 3)
+ff_stop  <- substr(ff_raw, nchar(ff_raw) - 2, nchar(ff_raw))
+PEST_AA  <- "NSHGFPPEVEEQAAGTLPMSCAQESGMDRHPAACASARINV"
+
+stopifnot(
+  "firefly does not start with ATG" = substr(ff_raw, 1, 3) == "ATG",
+  "firefly does not end in a stop codon" = ff_stop %in% STOP_CODONS,
+  "firefly carries an internal stop codon" =
+    !any(head(codon_split(ff_raw), -1) %in% STOP_CODONS),
+  # The control is specifically luc2P - luc2 PLUS the degron. The PEST-less
+  # luc2 is a prefix of this sequence and would pass every length and frame
+  # test, so the degron is asserted by peptide.
+  "firefly does not carry the 41-aa PEST degron at its C terminus" =
+    endsWith(aa_of(ff_sense), PEST_AA)
+)
+
+ff_cv      <- codon_split(ff_sense)
+ff_free    <- ff_cv[-1]                       # the initiator stays fixed
+set.seed(params$seed)
+ff_need    <- R$block_needs(length(ff_free), ff_cv[1])
+ff_drawn   <- R$draw_clean_block(
+  ff_free, ff_need,
+  assemble  = function(b) c(ff_cv[1], b),
+  n_linkers = NA,                             # standalone: no EcoRI requirement
+  menus = MENU[AA[ff_free]], max_try = 5000)
+
+ff_new_sense <- paste0(c(ff_cv[1], ff_drawn$block), collapse = "")
+ff_new_full  <- paste0(ff_new_sense, ff_stop)
+
+stopifnot(
+  "Recoding changed the firefly protein" =
+    aa_of(ff_new_sense) == aa_of(ff_sense),
+  "Recoding changed the firefly length" =
+    nchar(ff_new_sense) == nchar(ff_sense),
+  "The recoded firefly lost the PEST degron" =
+    endsWith(aa_of(ff_new_sense), PEST_AA),
+  "The recoded firefly carries a stop before the end" =
+    !any(head(codon_split(ff_new_full), -1) %in% STOP_CODONS),
+  "The recoded firefly does not end in its terminator" =
+    tail(codon_split(ff_new_full), 1) == ff_stop,
+  "The recoded firefly exceeds the homopolymer cap" =
+    max(nchar(str_extract_all(ff_new_full, "(A+|C+|G+|T+)")[[1]])) <=
+      params$max_homopolymer,
+  # Discriminative companion: it must actually have changed.
+  "firefly was not recoded" = ff_new_sense != ff_sense
+)
+
+ff_gc3_before <- compute_gc3_pct(trim_internal(ff_raw))
+ff_gc3_after  <- compute_gc3_pct(trim_internal(ff_new_full))
+
+cat(sprintf("firefly luc2P control: %d nt ordered, %d nt stop-free, %d aa (luc2 %d + PEST %d)\n",
+            nchar(ff_new_full), nchar(ff_new_sense), nchar(aa_of(ff_new_sense)),
+            nchar(aa_of(ff_new_sense)) - nchar(PEST_AA), nchar(PEST_AA)))
+cat(sprintf("  GC3 %.1f%% -> %.1f%% (target %.1f%%) | GC %.1f%% -> %.1f%%\n",
+            ff_gc3_before, ff_gc3_after, TARGET_GC3,
+            gc_pct_of(ff_sense), gc_pct_of(ff_new_sense)))
+cat(sprintf("  codons changed %s of %s free; clean draw %d\n",
+            fmt_n(sum(codon_split(ff_new_sense) != ff_cv)),
+            fmt_n(length(ff_free)), ff_drawn$tries))
+cat(sprintf("  internal EcoRI sites: %d -> %d (reported, not constrained)\n",
+            str_count(ff_raw, fixed("GAATTC")),
+            str_count(ff_new_full, fixed("GAATTC"))))
+
+stopifnot("The recoded firefly missed the GC3 target by more than 1 point" =
+            abs(ff_gc3_after - TARGET_GC3) <= 1)
+
+ff_ref <- tibble(reporter   = "firefly luc2P (control, recoded)",
+                 cds_length = nchar(ff_new_sense),
+                 gc_pct     = gc_pct_of(ff_new_sense),
+                 gc3_pct    = ff_gc3_after)
+```
+
+```{r percentiles}
+ref_df  <- bind_rows(
+  comp_tbl %>% transmute(reporter = construct, cds_length, gc_pct, gc3_pct),
+  ff_ref)
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+print(pct_tbl)
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(between(pct_tbl$pct_expressed, 0, 100) &
+                  between(pct_tbl$pct_promoted, 0, 100)))
+```
+
+# 9. Length and GC3 Panels
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+# The ladder keeps its blue ramp; the firefly control is drawn in Okabe-Ito
+# reddish purple and dashed, so it does not read as a fifth rung. Orange and
+# sky blue are reserved for eIF3d and eIF3e, and orange is already the promoted
+# distribution on these panels.
+ref_plot_df <- ref_df %>%
+  mutate(color    = ifelse(reporter %in% names(rung_cols),
+                           unname(rung_cols[reporter]), "#CC79A7"),
+         linetype = ifelse(reporter %in% names(rung_cols), "solid", "dashed"),
+         reporter = factor(reporter, levels = reporter))
+stopifnot("A reference line has no colour" = !any(is.na(ref_plot_df$color)))
+
+# One constant for both length panels, annotated and bare: they must share a
+# clip to be comparable, and two literals would drift the moment one changed.
+XMAX_KB <- params$xmax_kb
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, C-terminal HiBiT ladder",
+  outfile = paste0("cds_reporter_15_density_cds_length_", run_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = XMAX_KB)
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, C-terminal HiBiT ladder",
+  outfile = paste0("cds_reporter_15_density_cds_gc3_", run_tag, ".pdf"),
+  luc_tbl = ref_plot_df, group_cols = group_cols)
+```
+
+The same length panel with the rungs removed, for use where the figure is making
+a point about the transcriptome rather than about where a rung sits in it.
+
+```{r panel_length_nolines, fig.width=9.5, fig.height=5.5}
+p_len_bare <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231",
+  outfile = paste0("cds_reporter_15_density_cds_length_nolines_", run_tag, ".pdf"),
+  luc_tbl = NULL, group_cols = group_cols,
+  xscale  = 1000, xmax = XMAX_KB)
+
+stopifnot(
+  "The no-line panel plots different data from the panel with lines" =
+    identical(dplyr::select(p_len$data, group, .x),
+              dplyr::select(p_len_bare$data, group, .x)),
+  "The no-line panel still carries reference lines" =
+    nrow(ggplot2::layer_data(p_len_bare, 2)) == 0
+)
+cat("No-line length panel matches the annotated one on data;",
+    "reference lines dropped.\n")
+```
+
+# 10. Outputs
+
+```{r write_outputs}
+outdir <- here("output", "cds_reporter_design")
+
+seq_tbl <- comp_tbl %>%
+  dplyr::select(construct, gfp_copies, n_waldo, ecori, cds_length, nt_ordered,
+                protein_aa, gc_pct, gc3_pct, gc3_before) %>%
+  mutate(cds_ordered = unname(seqs),
+         cds_sense   = map_chr(rungs, "sense"))
+write_csv(seq_tbl, file.path(outdir,
+          paste0("15_cterm_hibit_ladder_sequences_", run_tag, ".csv")))
+write_csv(part_tbl, file.path(outdir,
+          paste0("15_cterm_hibit_ladder_parts_", run_tag, ".csv")))
+write_csv(pct_tbl, file.path(outdir,
+          paste0("15_cterm_hibit_ladder_percentiles_vs_231_", run_tag, ".csv")))
+
+cat("Wrote 3 tables to", outdir, "\n")
+cat("Synthesise from `cds_ordered` (includes the terminal", ORF_STOP, ").\n")
+```
+
+```{r session}
+sessionInfo()
+```

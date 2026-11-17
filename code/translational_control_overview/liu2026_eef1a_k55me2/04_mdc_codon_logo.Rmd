@@ -1,0 +1,169 @@
+---
+title: "Liu 2026 eEF1A K55me2: codon triplet logos for MDCs vs other codons (Fig. 2f)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "04_mdc_codon_logo.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(Biostrings)
+  library(ggseqlogo)
+})
+```
+
+# Plan
+
+Reproduce Fig. 2f of Liu et al. 2026: sequence logos of the 12 **MDCs** (METTL13-dependent
+codons - codons enriched in mRNAs whose nascent protein falls on METTL13 knockout) against the
+other 49 sense codons. The paper's claim: *"a strong preference for adenine or uracil (A/U) at
+the third (wobble) position (11 out of 12 MDCs) in comparison to all coding codons (30 out of
+61 codons; Fig. 2f)"*.
+
+**Construction.** Each codon counts once, unweighted by usage. Letter height = frequency x
+information content, IC = 2 - Shannon entropy (bits), with **no small-sample correction**. That
+choice is not stated in the paper; it is the one that reproduces the published heights (MDC
+position 3 ~0.7 bits; the corrected version would give ~0.5).
+
+# Extract the MDC list from the paper
+
+The 12 MDCs appear only as labels in Fig. 2 (the red points in panel a, listed under "MDCs" in
+the figure text). Rather than retype them, the codons are parsed from the PDF's text layer using
+macOS PDFKit, then checked against four independent statements in the paper. Figure-label text can be
+scrambled in extraction, so the list has **not** been confirmed by eye against the red points in
+Fig. 2a; the assertions below are what it rests on.
+
+```{r extract}
+pdf_path <- here("accessories", "liu2026_ncb_s41556-026-02085-6.pdf")
+stopifnot(file.exists(pdf_path))
+
+js <- sprintf(paste0('ObjC.import("PDFKit"); var d=$.PDFDocument.alloc.initWithURL(',
+                     '$.NSURL.fileURLWithPath("%s")); var s=""; for (var i=0;i<d.pageCount;i++)',
+                     '{ s+="\\n"+d.pageAtIndex(i).string.js } s'), pdf_path)
+paper_txt <- paste(system2("osascript", c("-l", "JavaScript", "-e", shQuote(js)), stdout = TRUE),
+                   collapse = "\n")
+stopifnot("PDF text extraction returned nothing" = nchar(paper_txt) > 1e5,
+          grepl("Identification of METTL13-dependent codons", paper_txt, fixed = TRUE))
+
+hits <- str_match_all(paper_txt, "\\nMDCs\\s*\\n((?:[ACGU]{3} ){11}[ACGU]{3})\\s*\\n")[[1]]
+cat("Lines matching 'MDCs' + 12 codons:", nrow(hits), "\n")
+stopifnot("expected exactly one MDC label line in the figure text" = nrow(hits) == 1)
+
+mdc <- str_split(hits[1, 2], " ")[[1]]
+cat("MDCs:", mdc, "\n")
+```
+
+# Checks
+
+```{r checks}
+gc_rna <- setNames(GENETIC_CODE, chartr("T", "U", names(GENETIC_CODE)))
+sense  <- names(gc_rna)[gc_rna != "*"]
+stopifnot(length(sense) == 61)
+
+other <- setdiff(sense, mdc)
+
+stopifnot(
+  "12 unique MDCs"                = length(mdc) == 12, !anyDuplicated(mdc),
+  "all MDCs are sense codons"     = all(mdc %in% sense),
+  "49 other codons"               = length(other) == 49,
+  # Main text names these three as MDCs (smFRET UUU vs UUC; Fig. 2h legend: CCA and CCU)
+  "UUU, CCA, CCU named in text"   = all(c("UUU", "CCA", "CCU") %in% mdc),
+  # "11 out of 12 MDCs" end in A/U
+  "11 of 12 MDCs end in A/U"      = sum(substr(mdc, 3, 3) %in% c("A", "U")) == 11,
+  # "30 out of 61 codons" end in A/U
+  "30 of 61 sense codons end A/U" = sum(substr(sense, 3, 3) %in% c("A", "U")) == 30
+)
+
+# Fig. 2h x axis lists the MDC amino acids: K N T R P* E A V S L F (* = two proline MDCs)
+aa <- AMINO_ACID_CODE[as.character(gc_rna[mdc])]
+aa1 <- as.character(gc_rna[mdc])
+fig2h_aa <- c("K", "N", "T", "R", "P", "E", "A", "V", "S", "L", "F")
+print(table(aa1))
+stopifnot("MDC amino acids differ from the Fig. 2h axis" = setequal(unique(aa1), fig2h_aa),
+          "Fig. 2h marks proline as having two MDCs" = sum(aa1 == "P") == 2,
+          "every other amino acid has one MDC" = all(table(aa1)[setdiff(fig2h_aa, "P")] == 1))
+
+tibble(codon = mdc, amino_acid = aa1, third = substr(mdc, 3, 3)) %>% knitr::kable()
+```
+
+# Logo heights
+
+```{r heights}
+logo_matrix <- function(codons) {
+  m <- sapply(1:3, function(i)
+    table(factor(substr(codons, i, i), levels = c("A", "C", "G", "U"))) / length(codons))
+  ic <- 2 + colSums(ifelse(m > 0, m * log2(m), 0))   # 2 - entropy, bits
+  heights <- sweep(m, 2, ic, `*`)
+  colnames(heights) <- 1:3
+  list(freq = m, ic = ic, heights = heights)
+}
+
+lm_mdc   <- logo_matrix(mdc)
+lm_other <- logo_matrix(other)
+
+ic_tab <- rbind(MDCs = lm_mdc$ic, `Other codons` = lm_other$ic)
+colnames(ic_tab) <- paste("position", 1:3)
+knitr::kable(ic_tab, digits = 3, caption = "Information content per position (bits)")
+knitr::kable(lm_mdc$heights, digits = 3, caption = "MDC letter heights (bits)")
+
+# Published panel: MDC position 3 stack ~0.7 bits, A above U; positions 1-2 small; other codons flat
+stopifnot(
+  "MDC position-3 IC outside the published ~0.7" = between(lm_mdc$ic[3], 0.65, 0.70),
+  "A should be the tallest letter at MDC position 3" =
+    names(which.max(lm_mdc$heights[, 3])) == "A",
+  "C should be the tallest letter at MDC position 2" =
+    names(which.max(lm_mdc$heights[, 2])) == "C",
+  "MDC positions 1-2 should be small" = all(lm_mdc$ic[1:2] < 0.25),
+  "other codons should be near flat" = all(lm_other$ic < 0.1)
+)
+```
+
+# Figure
+
+Letter colors avoid the paper's orange and sky blue, which are reserved for eIF3d and eIF3e in
+this project.
+
+```{r logo, fig.width = 6, fig.height = 2.6}
+nt_cols <- make_col_scheme(chars = c("A", "C", "G", "U"),
+                           cols  = c("#009E73", "#0072B2", "black", "#D55E00"))
+
+p_logo <- ggseqlogo(list(MDCs = lm_mdc$heights, `Other codons` = lm_other$heights),
+                    method = "custom", seq_type = "rna", col_scheme = nt_cols, ncol = 2) +
+  scale_y_continuous(limits = c(0, 0.75), breaks = seq(0, 0.75, 0.25)) +
+  labs(x = "Nucleotide position", y = "Bits",
+       caption = sprintf("n = %d MDCs, %d other sense codons; each codon counted once",
+                         length(mdc), length(other))) +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), strip.text = element_text(size = 12),
+        legend.position = "none")
+
+p_logo
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_04_mdc_codon_logo.pdf"), p_logo, width = 6, height = 2.6)
+```
+
+```{r session}
+sessionInfo()
+```

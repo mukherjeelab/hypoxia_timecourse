@@ -1,0 +1,341 @@
+---
+title: "KRAS expression and KRAS transcriptional program: MDA-MB-231 vs MCF7-SIX1, siCTRL normoxia"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  n_null: 1000
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "08_kras_expression_mda231_vs_mcf7six1.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(GenomicFeatures)
+  library(msigdbr)
+})
+```
+
+# Plan
+
+Liu 2026 links METTL13 / eEF1A K55me2 to KRAS-driven cancers. Two questions, in control
+(siCTRL, normoxia) cells:
+
+1. Is **KRAS** itself highly expressed in MDA-MB-231 or MCF7-SIX1?
+2. Is the **KRAS transcriptional program** (MSigDB `HALLMARK_KRAS_SIGNALING_UP`) higher in one
+   line than the other?
+
+**Samples.** siCTRL normoxia RNA-seq (not ribo-seq):
+
+- MDA-MB-231: `Input_Ribo_RNAseq` at 1hr and 4hr, 3 reps each (`metadata_231_timecourse.csv`).
+- MCF7-SIX1: NM2023_0104 / 0114 / 0124 (rRNA-depletion, KAPA RNA HyperPrep).
+
+**The two lines were not quantified the same way.** MCF7-SIX1 used a GENCODE v26 Salmon index;
+MDA-MB-231 used a newer index with *Drosophila* spike-in and decoy sequences; the library preps
+differ. Raw TPM is therefore **not directly comparable between lines**. The primary readout is
+each gene's **percentile within its own sample**, which is unaffected by those differences.
+Cross-line TPM is shown, labelled as indicative.
+
+**Gene TPM.** Each line's transcript TPM is mapped to genes with **its own index's
+annotation**: GENCODE v49 (`txdb.gencode49.sqlite`) for MDA-MB-231, and the other repo's
+`gencode.v26.primary.info.csv.gz` for MCF7-SIX1. Mapping the v26 transcripts through v49 loses
+every transcript retired since v26; a first version did that and put ACTB at 40 TPM in MCF7,
+because its main v26 isoform (ENST00000331789, 921 TPM) no longer exists in v49. TPM is then
+summed per gene, matched on version-stripped Ensembl gene ID, restricted to protein-coding genes
+(v49 definition) quantified in both lines, and renormalized to 1e6 per sample. That removes fly,
+rRNA and other non-coding signal.
+
+# Load and quantify
+
+```{r load}
+mda_dir  <- here("2025_MDAcells_riboseq", "salmon")
+mcf7_dir <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia/salmon"
+
+meta_231 <- read_csv(here("accessories", "metadata_231_timecourse.csv"), show_col_types = FALSE) %>%
+  dplyr::rename(id = 1) %>%
+  filter(type == "Input_Ribo_RNAseq", treatment == "siCTRL", condition == "normoxia", hours %in% c(1, 4))
+samples <- bind_rows(
+  meta_231 %>% transmute(sample = id, cell_line = "MDA-MB-231", rep, hours,
+                         path = file.path(mda_dir, id, "quant.sf.gz")),
+  tibble(sample = c("NM2023_0104", "NM2023_0114", "NM2023_0124"), cell_line = "MCF7-SIX1",
+         rep = c("RepA", "RepB", "RepC"), hours = 1,
+         path = file.path(mcf7_dir, sample, "quant.sf.gz")))
+stopifnot(nrow(samples) == 9, all(file.exists(samples$path)),
+          sum(samples$cell_line == "MDA-MB-231") == 6)
+knitr::kable(samples %>% dplyr::select(-path))
+
+strip <- function(x) sub("\\..*", "", x)
+
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+tx2gene <- list(
+  "MDA-MB-231" = AnnotationDbi::select(txdb, keys(txdb, "TXNAME"), c("TXNAME", "GENEID"), "TXNAME") %>%
+    transmute(tx = strip(TXNAME), gene_id = strip(GENEID)),
+  "MCF7-SIX1" = read_csv(file.path(dirname(mcf7_dir), "accessories", "gencode.v26.primary.info.csv.gz"),
+                         col_names = c("gene_id", "tx", "biotype", "symbol"), show_col_types = FALSE) %>%
+    filter(!str_detect(tx, "^pre_"), !str_detect(tx, "_PAR_Y")) %>%   # PAR_Y copies duplicate chrX IDs
+    transmute(tx = strip(tx), gene_id = strip(gene_id)))
+stopifnot(!anyDuplicated(tx2gene[[1]]$tx), !anyDuplicated(tx2gene[[2]]$tx))
+
+anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                 col_names = c("gene_id", "symbol", "type", "species", "source"), show_col_types = FALSE)
+pc <- anno %>% filter(type == "protein_coding", species == "human") %>%
+  distinct(gene_id = strip(gene_id), symbol)
+stopifnot(!anyDuplicated(pc$gene_id))
+
+gene_tpm_one <- function(path, line) {
+  q <- read_tsv(path, show_col_types = FALSE) %>%
+    filter(!str_detect(Name, "_PAR_Y")) %>%
+    mutate(tx = strip(Name)) %>%
+    left_join(tx2gene[[line]], by = "tx")
+  attr_mapped <- sum(q$TPM[!is.na(q$gene_id)]) / sum(q$TPM)
+  q %>% filter(gene_id %in% pc$gene_id) %>%
+    group_by(gene_id) %>% summarise(tpm = sum(TPM), .groups = "drop") %>%
+    mutate(frac_tpm_mapped = attr_mapped)
+}
+raw <- samples %>% mutate(q = map2(path, cell_line, gene_tpm_one)) %>%
+  dplyr::select(sample, cell_line, q) %>% unnest(q)
+
+raw %>% distinct(sample, cell_line, frac_tpm_mapped) %>% knitr::kable(digits = 3,
+  caption = "Fraction of each sample's TPM whose transcript maps to a gene in its own index annotation")
+stopifnot(all(raw$frac_tpm_mapped[raw$cell_line == "MCF7-SIX1"] > 0.99))
+
+# Protein-coding genes quantified in both lines (index versions differ)
+shared <- raw %>% distinct(cell_line, gene_id) %>% dplyr::count(gene_id) %>% filter(n == 2) %>% pull(gene_id)
+
+tpm <- raw %>%
+  filter(gene_id %in% shared) %>%
+  group_by(sample) %>% mutate(tpm = tpm / sum(tpm) * 1e6) %>% ungroup() %>%
+  left_join(pc, by = "gene_id") %>%
+  group_by(sample) %>%
+  mutate(pct = 100 * percent_rank(tpm)) %>%   # percentile within sample
+  ungroup()
+
+cat("Protein-coding genes in both lines:", length(shared), "\n")
+stopifnot(all(abs(tapply(tpm$tpm, tpm$sample, sum) - 1e6) < 1),
+          "KRAS" %in% tpm$symbol)
+```
+
+# Checks
+
+Cell-line identity and housekeeping spot-checks, so a swapped sample or a broken join cannot
+pass silently. MCF7 is ER-positive and epithelial; MDA-MB-231 is ER-negative and mesenchymal.
+
+```{r checks}
+med <- tpm %>% group_by(cell_line, symbol) %>% summarise(tpm = median(tpm), pct = median(pct), .groups = "drop")
+spot <- med %>% filter(symbol %in% c("ACTB", "GAPDH", "ESR1", "GATA3", "VIM", "CDH1", "KRAS")) %>%
+  pivot_wider(names_from = cell_line, values_from = c(tpm, pct))
+knitr::kable(spot, digits = 1)
+
+get <- function(line, gene, col = "pct") med[[col]][med$cell_line == line & med$symbol == gene]
+stopifnot(
+  "ACTB / GAPDH should be top-percentile in every sample" =
+    all(tpm$pct[tpm$symbol %in% c("ACTB", "GAPDH")] > 95),
+  "ESR1 should be far higher in MCF7-SIX1 (ER+) than MDA-MB-231 (ER-)" =
+    get("MCF7-SIX1", "ESR1") > 75 && get("MDA-MB-231", "ESR1") < 50,
+  "VIM should be far higher in MDA-MB-231 (mesenchymal)" =
+    get("MDA-MB-231", "VIM") > 90 && get("MDA-MB-231", "VIM", "tpm") > 10 * get("MCF7-SIX1", "VIM", "tpm")
+)
+
+# Replicates agree within a line
+wide <- tpm %>% dplyr::select(sample, gene_id, tpm) %>% pivot_wider(names_from = sample, values_from = tpm)
+rep_cor <- cor(log2(as.matrix(wide[, -1]) + 1), method = "spearman")
+print(round(rep_cor, 3))
+for (line in unique(samples$cell_line)) {
+  s <- samples$sample[samples$cell_line == line]
+  stopifnot(min(rep_cor[s, s]) > 0.9)
+}
+```
+
+# 1. KRAS expression
+
+```{r kras, fig.width = 6, fig.height = 3.5}
+kras <- tpm %>% filter(symbol == "KRAS") %>% left_join(samples %>% dplyr::select(sample, hours), by = "sample")
+knitr::kable(kras %>% dplyr::select(cell_line, sample, hours, tpm, pct), digits = 1)
+
+line_colors <- c("MDA-MB-231" = "#CC79A7", "MCF7-SIX1" = "#0072B2")
+
+p_kras <- ggplot(kras, aes(cell_line, pct, colour = cell_line)) +
+  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey50") +
+  geom_jitter(width = 0.1, height = 0, size = 2.5) +
+  scale_colour_manual(values = line_colors, guide = "none") +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = NULL, y = "KRAS percentile within sample",
+       title = "KRAS mRNA, siCTRL normoxia",
+       subtitle = sprintf("%d protein-coding genes\nmedian TPM %.1f (MDA-MB-231) vs %.1f (MCF7-SIX1)",
+                          length(shared), median(kras$tpm[kras$cell_line == "MDA-MB-231"]),
+                          median(kras$tpm[kras$cell_line == "MCF7-SIX1"]))) +
+  coord_flip() +
+  theme_classic(base_size = 12)
+p_kras
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_08_kras_percentile.pdf"), p_kras, width = 6, height = 3.8)
+```
+
+# 2. KRAS transcriptional program
+
+**Score.** For each sample, the mean within-sample percentile of the gene set's genes. A
+percentile is unaffected by library prep and index, so scores are comparable across lines.
+`HALLMARK_KRAS_SIGNALING_DN` (genes repressed by KRAS) is the internal contrast: an active
+program should raise UP and not DN.
+
+**Null.** The line difference in score (MDA-MB-231 minus MCF7-SIX1) for `r params$n_null`
+random gene sets of the same size, drawn from the same shared protein-coding genes with
+`set.seed(9)`. Empirical p = (k + 1) / (n + 1), two-sided.
+
+```{r program}
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H")
+sets <- list(KRAS_UP = "HALLMARK_KRAS_SIGNALING_UP", KRAS_DN = "HALLMARK_KRAS_SIGNALING_DN") %>%
+  map(~ intersect(unique(hallmark$gene_symbol[hallmark$gs_name == .x]), tpm$symbol))
+cat("Genes in data: KRAS_UP", length(sets$KRAS_UP), "| KRAS_DN", length(sets$KRAS_DN), "\n")
+stopifnot(lengths(sets) > 150)
+
+pct_mat <- tpm %>% filter(!is.na(symbol)) %>% distinct(sample, symbol, .keep_all = TRUE) %>%
+  dplyr::select(sample, symbol, pct) %>% pivot_wider(names_from = sample, values_from = pct) %>%
+  column_to_rownames("symbol") %>% as.matrix()
+mda  <- samples$sample[samples$cell_line == "MDA-MB-231"]
+mcf7 <- samples$sample[samples$cell_line == "MCF7-SIX1"]
+
+line_diff <- function(genes) {
+  s <- colMeans(pct_mat[genes, , drop = FALSE])
+  mean(s[mda]) - mean(s[mcf7])
+}
+
+set.seed(9)
+program <- imap_dfr(sets, function(genes, nm) {
+  obs  <- line_diff(genes)
+  null <- replicate(params$n_null, line_diff(sample(rownames(pct_mat), length(genes))))
+  scores <- colMeans(pct_mat[genes, ])
+  tibble(set = nm, n_genes = length(genes),
+         mean_score_MDA = mean(scores[mda]), mean_score_MCF7 = mean(scores[mcf7]),
+         diff_MDA_minus_MCF7 = obs,
+         null_sd = sd(null),
+         z = (obs - mean(null)) / sd(null),
+         empirical_p = (sum(abs(null - mean(null)) >= abs(obs - mean(null))) + 1) / (params$n_null + 1))
+})
+knitr::kable(program, digits = 3)
+```
+
+```{r program_plot, fig.width = 7, fig.height = 4}
+gene_diff <- tibble(symbol = rownames(pct_mat),
+                    diff = rowMeans(pct_mat[, mda]) - rowMeans(pct_mat[, mcf7])) %>%
+  mutate(group = case_when(symbol %in% sets$KRAS_UP ~ "KRAS signaling UP",
+                           symbol %in% sets$KRAS_DN ~ "KRAS signaling DN",
+                           TRUE ~ "All other genes"),
+         group = factor(group, levels = c("KRAS signaling UP", "KRAS signaling DN", "All other genes")))
+n_grp <- table(gene_diff$group)
+grp_lab <- setNames(sprintf("%s (n = %s)", names(n_grp), format(as.integer(n_grp), big.mark = ",", trim = TRUE)),
+                    names(n_grp))
+
+# Empirical p cannot go below 1 / (n_null + 1); report it as a bound there
+fmt_p <- function(p) if (p <= 1 / (params$n_null + 1)) sprintf("<= %.3g", p) else sprintf("= %.3g", p)
+
+p_prog <- ggplot(gene_diff, aes(diff, colour = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  stat_ecdf(linewidth = 0.8) +
+  scale_colour_manual(values = c("KRAS signaling UP" = "#D55E00", "KRAS signaling DN" = "#009E73",
+                                 "All other genes" = "grey70"), labels = grp_lab, name = NULL) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.6, size = 3.2,
+           label = sprintf("UP: diff %+.1f, null p %s\nDN: diff %+.1f, null p %s",
+                           program$diff_MDA_minus_MCF7[1], fmt_p(program$empirical_p[1]),
+                           program$diff_MDA_minus_MCF7[2], fmt_p(program$empirical_p[2]))) +
+  labs(x = "Percentile in MDA-MB-231 minus MCF7-SIX1 (per gene)", y = "Cumulative fraction",
+       title = "KRAS transcriptional program, siCTRL normoxia",
+       subtitle = "Right of zero = higher in MDA-MB-231") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_blank())
+p_prog
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_08_kras_program_cdf.pdf"), p_prog, width = 7, height = 4)
+```
+
+# 3. KRAS program within each line
+
+The plot above is a contrast between lines. This asks the question inside one line: where do
+the KRAS UP and DN genes rank among all genes, using each gene's within-sample percentile
+averaged over that line's replicates. All other genes sit near a uniform distribution (the
+diagonal) by construction. An active program shows UP shifted right of all other genes and DN
+shifted left. Gene sets are not expression-matched, so a set can sit right of the diagonal just by
+containing well-expressed genes; the **gap between UP and DN** is the readable quantity.
+
+```{r within_line, fig.width = 7, fig.height = 4}
+within_cdf <- function(line, cols) {
+  fp <- function(p) { s <- format.pval(p, digits = 2); if (startsWith(s, "<")) s else paste("=", s) }
+  df <- tibble(symbol = rownames(pct_mat), pct = rowMeans(pct_mat[, cols, drop = FALSE])) %>%
+    mutate(group = factor(case_when(symbol %in% sets$KRAS_UP ~ "KRAS signaling UP",
+                                    symbol %in% sets$KRAS_DN ~ "KRAS signaling DN",
+                                    TRUE ~ "All other genes"),
+                          levels = c("KRAS signaling UP", "KRAS signaling DN", "All other genes")))
+  x <- split(df$pct, df$group)
+  w_up <- wilcox.test(x[["KRAS signaling UP"]], x[["All other genes"]])
+  w_dn <- wilcox.test(x[["KRAS signaling DN"]], x[["All other genes"]])
+  w_ud <- wilcox.test(x[["KRAS signaling UP"]], x[["KRAS signaling DN"]])
+  med  <- map_dbl(x, median)
+  n    <- lengths(x)
+  lab  <- setNames(sprintf("%s (n = %s)", names(n), format(n, big.mark = ",", trim = TRUE)), names(n))
+
+  p <- ggplot(df, aes(pct, colour = group)) +
+    stat_ecdf(linewidth = 0.8) +
+    scale_colour_manual(values = c("KRAS signaling UP" = "#D55E00", "KRAS signaling DN" = "#009E73",
+                                   "All other genes" = "grey70"), labels = lab, name = NULL) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.4, size = 3.2,
+             label = sprintf(paste0("median percentile: UP %.1f, DN %.1f, other %.1f\n",
+                                    "Wilcoxon vs other: UP p %s, DN p %s\nUP vs DN p %s"),
+                             med[["KRAS signaling UP"]], med[["KRAS signaling DN"]], med[["All other genes"]],
+                             fp(w_up$p.value), fp(w_dn$p.value),
+                             fp(w_ud$p.value))) +
+    labs(x = sprintf("Within-sample expression percentile, %s (mean of %d reps)", line, length(cols)),
+         y = "Cumulative fraction",
+         title = sprintf("KRAS transcriptional program in %s", line),
+         subtitle = "siCTRL normoxia; right = more highly expressed") +
+    theme_classic(base_size = 12) +
+    theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+          legend.background = element_blank())
+  list(plot = p, medians = med,
+       p = c(UP_vs_other = w_up$p.value, DN_vs_other = w_dn$p.value, UP_vs_DN = w_ud$p.value))
+}
+
+within <- list(`MCF7-SIX1` = within_cdf("MCF7-SIX1", mcf7), `MDA-MB-231` = within_cdf("MDA-MB-231", mda))
+stopifnot(abs(within[["MCF7-SIX1"]]$medians[["All other genes"]] - 50) < 2)   # uniform by construction
+
+within[["MCF7-SIX1"]]$plot
+within[["MDA-MB-231"]]$plot
+
+imap_dfr(within, ~ tibble(line = .y, median_UP = .x$medians[["KRAS signaling UP"]],
+                          median_DN = .x$medians[["KRAS signaling DN"]],
+                          UP_minus_DN = .x$medians[["KRAS signaling UP"]] - .x$medians[["KRAS signaling DN"]],
+                          p_UP_vs_other = .x$p[["UP_vs_other"]], p_DN_vs_other = .x$p[["DN_vs_other"]],
+                          p_UP_vs_DN = .x$p[["UP_vs_DN"]])) %>%
+  knitr::kable(digits = 3)
+
+if (isTRUE(params$save_plots)) {
+  ggsave(here("plots", "liu2026_08_kras_program_within_mcf7six1.pdf"), within[["MCF7-SIX1"]]$plot,
+         width = 7, height = 4)
+  ggsave(here("plots", "liu2026_08_kras_program_within_mda231.pdf"), within[["MDA-MB-231"]]$plot,
+         width = 7, height = 4)
+}
+```
+
+```{r session}
+sessionInfo()
+```

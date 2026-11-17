@@ -1,0 +1,529 @@
+---
+title: "99 - Does the AGAACG motif occur more often in eIF3d-promoted mRNAs (1 hr hypoxia, MDA-MB-231)?"
+author: "Kate Matlin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  motif: "AGAACG"
+  geneset: "hypoxia_3d_promotes_TE_1hr_lfc0.5"
+  set_label: "eIF3d hypoxia promotes"
+editor_options:
+  chunk_output_type: console
+---
+
+Asks whether a short sequence motif (default `AGAACG`, sense strand of the mRNA) is
+more common in mRNAs whose translation eIF3d promotes at 1 hr hypoxia than in two
+comparators:
+
+1. **Negative control set** (`negative_control_genes.csv`): genes screened for having
+   *no* si3d TE effect (|TE LFC| < 0.5 and padj > 0.3 in every si3d contrast). This is a
+   screened set, not a neutral background.
+2. **Rest of the transcriptome**: every transcript in the MDA-MB-231 feature matrix that
+   is *not* in the gene set (negative controls included), so the gene set is compared
+   with everything except itself.
+
+Transcripts and isoforms are those of the 231 feature matrix (most abundant isoform per
+gene, one per gene). Sequences are re-extracted from GENCODE v49 exactly as in the
+feature-matrix builder (`01_feature_extraction.Rmd`) and asserted to reproduce its
+region lengths and GC.
+
+**Why a plain enrichment is not enough.** The chance of containing any 6-mer rises with
+region length and depends on base composition. AGAACG also contains a CpG, which is
+depleted in human mRNA and enriched in GC-rich transcripts. Three readouts, in order of
+how much they control:
+
+- **Presence and density** per region (Fisher test on fraction with >= 1 hit; Wilcoxon on
+  hits per kb). Raw, uncontrolled.
+- **Logistic regression** of presence on group + log2 region length + region GC.
+- **Anagram null**: the same enrichment computed for every rearrangement of the motif's
+  letters (same A/C/G/T composition). If AGAACG is special, it should rank at the top of
+  its anagrams; if its enrichment is shared by its anagrams, it reflects composition and
+  length, not the motif. A CpG-matched subset (anagrams that also contain one CG) is
+  reported separately.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# `params` only exists during knit; fallbacks match the YAML defaults.
+if (!exists("params") || !is.list(params)) {
+  params <- list(motif = "AGAACG",
+                 geneset = "hypoxia_3d_promotes_TE_1hr_lfc0.5",
+                 set_label = "eIF3d hypoxia promotes")
+}
+```
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+```
+
+```{r constants}
+MOTIF <- toupper(params$motif)
+stopifnot("motif must be A/C/G/T only" = grepl("^[ACGT]+$", MOTIF))
+
+SET_LABEL  <- params$set_label
+NEG_LABEL  <- "Negative control"
+REST_LABEL <- "Rest of transcriptome"
+
+kd_factor <- if (grepl("_3e_", params$geneset)) "eIF3e" else "eIF3d"
+set_col   <- c(eIF3d = "#E69F00", eIF3e = "#56B4E9")[[kd_factor]]
+group_cols <- setNames(c(set_col, "black", "grey70"), c(SET_LABEL, NEG_LABEL, REST_LABEL))
+
+REGIONS <- c("utr5", "cds", "utr3", "transcript")
+region_labels <- c(utr5 = "5' UTR", cds = "CDS", utr3 = "3' UTR", transcript = "Full transcript")
+
+plot_path <- function(x) here("plots", paste0("99_", tolower(MOTIF), "_", x, ".pdf"))
+```
+
+---
+
+# Section 1: Sequences
+
+```{r load_matrix}
+feature_matrix <- readRDS(
+  here("output", "predictive_modeling", "feature_matrix_external_stability.rds")
+)
+stopifnot("one transcript per gene expected" = !anyDuplicated(feature_matrix$gene_id_clean),
+          "duplicate transcript IDs" = !anyDuplicated(feature_matrix$transcript_id_clean))
+keep_tx <- feature_matrix$transcript_id_clean
+cat("Transcripts in feature matrix:", length(keep_tx), "\n")
+```
+
+```{r extract_sequences}
+txdb   <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+get_region <- function(grl) {
+  grl  <- grl[sub("\\..*", "", names(grl)) %in% keep_tx]
+  seqs <- extractTranscriptSeqs(genome, grl)
+  names(seqs) <- sub("\\..*", "", names(seqs))
+  seqs
+}
+
+seqs <- list(
+  utr5 = get_region(fiveUTRsByTranscript(txdb, use.names = TRUE)),
+  cds  = get_region(cdsBy(txdb, by = "tx", use.names = TRUE)),
+  utr3 = get_region(threeUTRsByTranscript(txdb, use.names = TRUE))
+)
+
+# Full transcript = 5'UTR + CDS + 3'UTR, in that order. A missing UTR contributes "".
+pad <- function(s) {
+  out <- setNames(rep("", length(keep_tx)), keep_tx)
+  out[names(s)] <- as.character(s)
+  out
+}
+seq_chr <- lapply(seqs, pad)
+seq_chr$transcript <- paste0(seq_chr$utr5, seq_chr$cds, seq_chr$utr3)
+names(seq_chr$transcript) <- keep_tx
+
+cat("Sequences extracted (transcripts with region):\n")
+print(sapply(seqs, length))
+```
+
+```{r validate_extraction}
+# The re-extracted sequences must be the feature matrix's sequences: lengths and GC must
+# reproduce the saved columns. A mismatch would mean a different isoform or annotation.
+fm <- feature_matrix %>% dplyr::select(transcript_id_clean, utr5_length, cds_length,
+                                       utr3_length, utr5_gc, cds_gc, utr3_gc)
+gc_pct <- function(x) {
+  w <- nchar(x)
+  ifelse(w == 0, NA_real_, 100 * str_count(x, "[GC]") / w)
+}
+chk <- tibble(transcript_id_clean = keep_tx,
+              utr5_w = nchar(seq_chr$utr5), cds_w = nchar(seq_chr$cds),
+              utr3_w = nchar(seq_chr$utr3),
+              utr5_g = gc_pct(seq_chr$utr5), cds_g = gc_pct(seq_chr$cds),
+              utr3_g = gc_pct(seq_chr$utr3)) %>%
+  left_join(fm, by = "transcript_id_clean")
+
+len_match <- c(
+  utr5 = mean(chk$utr5_w == coalesce(chk$utr5_length, 0)),
+  cds  = mean(chk$cds_w  == coalesce(chk$cds_length, 0)),
+  utr3 = mean(chk$utr3_w == coalesce(chk$utr3_length, 0)))
+gc_dev <- c(
+  utr5 = max(abs(chk$utr5_g - chk$utr5_gc), na.rm = TRUE),
+  cds  = max(abs(chk$cds_g  - chk$cds_gc),  na.rm = TRUE),
+  utr3 = max(abs(chk$utr3_g - chk$utr3_gc), na.rm = TRUE))
+cat("Fraction of transcripts whose region length matches the feature matrix:\n")
+print(round(len_match, 4))
+cat("Max |GC% deviation| from feature matrix:\n"); print(signif(gc_dev, 3))
+
+stopifnot("region lengths do not reproduce the feature matrix" = all(len_match > 0.999),
+          "region GC does not reproduce the feature matrix" = all(gc_dev < 1e-6),
+          "GC out of range" = all(between(chk$cds_g, 0, 100), na.rm = TRUE))
+```
+
+---
+
+# Section 2: Gene groups
+
+```{r gene_groups}
+geneset_path <- here("output", "genesets", paste0(params$geneset, ".csv"))
+stopifnot("gene set CSV not found" = file.exists(geneset_path))
+pos_genes <- unique(read_csv(geneset_path, show_col_types = FALSE)$ensembl_gene)
+
+neg_genes <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                      show_col_types = FALSE) %>%
+  dplyr::mutate(g = sub("\\..*", "", gene_id)) %>% dplyr::pull(g) %>% unique()
+
+stopifnot("positive set overlaps negative set" = length(intersect(pos_genes, neg_genes)) == 0)
+
+groups <- feature_matrix %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol) %>%
+  dplyr::mutate(
+    is_pos = gene_id_clean %in% pos_genes,
+    is_neg = gene_id_clean %in% neg_genes)
+
+cat("Gene set:", params$geneset, "\n")
+cat("  genes in CSV:", length(pos_genes), "| in feature matrix:", sum(groups$is_pos), "\n")
+cat("Negative controls: genes in CSV:", length(neg_genes),
+    "| in feature matrix:", sum(groups$is_neg), "\n")
+cat("Rest of transcriptome (everything not in the gene set):", sum(!groups$is_pos), "\n")
+stopifnot("gene set too small" = sum(groups$is_pos) >= 50)
+```
+
+---
+
+# Section 3: Motif counts
+
+Counts are on the sense strand, overlapping hits allowed. Hits spanning a region
+boundary (e.g. 5'UTR / CDS junction) count only in the full-transcript column.
+
+```{r count_motif}
+count_motif <- function(motif, x) {
+  # vcountPattern on a DNAStringSet; empty strings give 0
+  as.integer(vcountPattern(motif, DNAStringSet(x), fixed = TRUE))
+}
+
+# Spot-check the counter on known strings, including an overlapping case.
+stopifnot(count_motif("AGAACG", c("AGAACG", "TTAGAACGAGAACGTT", "CGTTCT", "")) ==
+            c(1, 2, 0, 0),   # reverse complement (CGTTCT) must NOT count
+          count_motif("AAA", "AAAA") == 2)
+
+motif_long <- map_dfr(REGIONS, function(r) {
+  x <- seq_chr[[r]]
+  tibble(transcript_id_clean = keep_tx, region = r,
+         length = nchar(x), gc = gc_pct(x), hits = count_motif(MOTIF, x))
+}) %>%
+  dplyr::filter(length >= nchar(MOTIF)) %>%
+  dplyr::mutate(present = hits > 0, per_kb = 1000 * hits / length) %>%
+  left_join(groups, by = "transcript_id_clean")
+
+# Full-transcript hits must be at least the sum of region hits (junction-spanning hits
+# are the only difference).
+reg_sum <- motif_long %>% dplyr::filter(region != "transcript") %>%
+  group_by(transcript_id_clean) %>% summarise(s = sum(hits), .groups = "drop")
+full <- motif_long %>% dplyr::filter(region == "transcript") %>%
+  dplyr::select(transcript_id_clean, hits) %>% left_join(reg_sum, by = "transcript_id_clean")
+stopifnot("full-transcript hits below sum of regions" = all(full$hits >= coalesce(full$s, 0L)))
+
+motif_long %>% group_by(region) %>%
+  summarise(n_tx = n(), frac_present = mean(present), median_per_kb = median(per_kb),
+            .groups = "drop") %>%
+  dplyr::mutate(region = region_labels[region]) %>% print()
+```
+
+```{r comparison_table}
+# Two comparisons, each with its own comparator. A long table with one row per
+# transcript per comparison keeps the plotting and testing code shared.
+comp_data <- bind_rows(
+  motif_long %>% dplyr::filter(is_pos | is_neg) %>%
+    dplyr::mutate(comparison = "vs negative control",
+                  group = if_else(is_pos, SET_LABEL, NEG_LABEL)),
+  motif_long %>%
+    dplyr::mutate(comparison = "vs rest of transcriptome",
+                  group = if_else(is_pos, SET_LABEL, REST_LABEL))
+) %>%
+  dplyr::mutate(group = factor(group, levels = names(group_cols)),
+                comparison = factor(comparison,
+                                    levels = c("vs negative control", "vs rest of transcriptome")),
+                region = factor(region, levels = REGIONS))
+```
+
+---
+
+# Section 4: Raw enrichment
+
+```{r raw_tests}
+raw_tests <- comp_data %>%
+  group_by(comparison, region) %>%
+  group_modify(function(d, k) {
+    is_set <- d$group == SET_LABEL
+    ft <- fisher.test(table(factor(is_set, c(TRUE, FALSE)), factor(d$present, c(TRUE, FALSE))))
+    wt <- wilcox.test(d$per_kb[is_set], d$per_kb[!is_set])
+    tibble(n_set = sum(is_set), n_comp = sum(!is_set),
+           frac_set = mean(d$present[is_set]), frac_comp = mean(d$present[!is_set]),
+           odds_ratio = unname(ft$estimate), fisher_p = ft$p.value,
+           mean_per_kb_set = mean(d$per_kb[is_set]), mean_per_kb_comp = mean(d$per_kb[!is_set]),
+           wilcox_p = wt$p.value)
+  }) %>% ungroup() %>%
+  dplyr::mutate(fisher_padj = p.adjust(fisher_p, "BH"),
+                wilcox_padj = p.adjust(wilcox_p, "BH"))
+
+raw_tests %>%
+  dplyr::mutate(region = region_labels[as.character(region)],
+                across(c(frac_set, frac_comp, odds_ratio, mean_per_kb_set, mean_per_kb_comp),
+                       ~ round(.x, 3)),
+                across(c(fisher_p, fisher_padj, wilcox_p, wilcox_padj), ~ signif(.x, 3))) %>%
+  knitr::kable(caption = paste0(MOTIF, ": presence (Fisher) and hits per kb (Wilcoxon). ",
+                                "BH across all 8 tests per readout."))
+
+write_csv(raw_tests, here("output", "predictive_modeling",
+                          paste0("99_", tolower(MOTIF), "_raw_enrichment.csv")))
+```
+
+```{r plot_presence, fig.width = 10, fig.height = 4.5}
+pres_df <- comp_data %>%
+  group_by(comparison, region, group) %>%
+  summarise(n = n(), k = sum(present), frac = k / n, .groups = "drop") %>%
+  dplyr::mutate(se = sqrt(frac * (1 - frac) / n))
+
+lab_df <- raw_tests %>%
+  dplyr::mutate(label = paste0("OR = ", round(odds_ratio, 2),
+                               "\npadj = ", signif(fisher_padj, 2)))
+
+p_pres <- ggplot(pres_df, aes(region, 100 * frac, fill = group)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_errorbar(aes(ymin = 100 * (frac - se), ymax = 100 * (frac + se)),
+                position = position_dodge(0.8), width = 0.25) +
+  geom_text(aes(y = 0, label = paste0("n=", n)), position = position_dodge(0.8),
+            vjust = -0.4, size = 2.4, color = "white") +
+  geom_text(data = lab_df, aes(region, Inf, label = label), inherit.aes = FALSE,
+            vjust = 1.2, size = 2.8) +
+  facet_wrap(~ comparison) +
+  scale_x_discrete(labels = region_labels) +
+  scale_fill_manual(values = group_cols) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(x = NULL, y = paste0("% of transcripts with >= 1 ", MOTIF), fill = NULL,
+       title = paste0(MOTIF, " presence by mRNA region"),
+       subtitle = "MDA-MB-231, 1 hr hypoxia; error bars = binomial SE") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_pres
+ggsave(plot_path("presence"), p_pres, width = 10, height = 4.5)
+```
+
+```{r plot_density, fig.width = 10, fig.height = 6}
+p_dens <- comp_data %>%
+  ggplot(aes(per_kb, color = group)) +
+  stat_ecdf(linewidth = 0.8) +
+  facet_grid(comparison ~ region, labeller = labeller(region = region_labels)) +
+  scale_color_manual(values = group_cols) +
+  coord_cartesian(xlim = c(0, quantile(comp_data$per_kb, 0.99))) +
+  geom_text(data = raw_tests %>%
+              dplyr::mutate(label = paste0("Wilcoxon padj = ", signif(wilcox_padj, 2),
+                                           "\nn = ", n_set, " vs ", n_comp)),
+            aes(x = Inf, y = -Inf, label = label), inherit.aes = FALSE,
+            hjust = 1.05, vjust = -0.5, size = 2.6) +
+  labs(x = paste0(MOTIF, " hits per kb"), y = "Cumulative fraction", color = NULL,
+       title = paste0(MOTIF, " density by mRNA region")) +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_dens
+ggsave(plot_path("density_ecdf"), p_dens, width = 10, height = 6)
+```
+
+---
+
+# Section 5: Adjusted for region length and GC
+
+Logistic regression of presence (>= 1 hit) on group membership, log2 region length and
+region GC%. The group odds ratio is the enrichment that length and composition do not
+explain.
+
+```{r adjusted}
+adj_tests <- comp_data %>%
+  group_by(comparison, region) %>%
+  group_modify(function(d, k) {
+    d$is_set <- as.integer(d$group == SET_LABEL)
+    fit <- glm(present ~ is_set + log2(length) + gc, family = binomial, data = d)
+    co  <- summary(fit)$coefficients["is_set", ]
+    ci  <- confint.default(fit)["is_set", ]
+    tibble(adj_odds_ratio = exp(co[["Estimate"]]),
+           ci_low = exp(ci[[1]]), ci_high = exp(ci[[2]]), adj_p = co[["Pr(>|z|)"]])
+  }) %>% ungroup() %>%
+  dplyr::mutate(adj_padj = p.adjust(adj_p, "BH"))
+
+adj_tests %>%
+  dplyr::mutate(region = region_labels[as.character(region)],
+                across(c(adj_odds_ratio, ci_low, ci_high), ~ round(.x, 3)),
+                across(c(adj_p, adj_padj), ~ signif(.x, 3))) %>%
+  knitr::kable(caption = "Group odds ratio adjusted for log2 region length + region GC (Wald 95% CI).")
+
+write_csv(adj_tests, here("output", "predictive_modeling",
+                          paste0("99_", tolower(MOTIF), "_adjusted_enrichment.csv")))
+```
+
+```{r plot_adjusted, fig.width = 8, fig.height = 4}
+or_df <- bind_rows(
+  raw_tests %>% transmute(comparison, region, or = odds_ratio, lo = NA_real_, hi = NA_real_,
+                          model = "Raw"),
+  adj_tests %>% transmute(comparison, region, or = adj_odds_ratio, lo = ci_low, hi = ci_high,
+                          model = "Adjusted (length + GC)"))
+
+p_or <- ggplot(or_df, aes(or, factor(region, levels = rev(REGIONS)), shape = model)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.2,
+                 position = position_dodge(0.5), color = set_col) +
+  geom_point(position = position_dodge(0.5), size = 2.5, color = set_col) +
+  facet_wrap(~ comparison) +
+  scale_y_discrete(labels = region_labels) +
+  scale_x_log10() +
+  labs(x = paste0("Odds ratio, ", MOTIF, " present (", SET_LABEL, " vs comparator)"),
+       y = NULL, shape = NULL) +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_or
+ggsave(plot_path("odds_ratio"), p_or, width = 8, height = 4)
+```
+
+---
+
+# Section 6: Is it the motif, or its composition? (anagram null)
+
+Every distinct rearrangement of the motif's letters has the same base composition, so
+it shares any enrichment that comes from the gene set being, say, A-rich or CpG-rich.
+The same raw presence odds ratio is computed for each anagram, and the motif's rank among
+them is reported. Empirical p = (k + 1) / (n + 1), where k = anagrams at least as enriched
+and n = anagrams other than the motif; the floor is 1 / (n + 1), not 0.
+
+```{r anagrams}
+perms <- function(chars) {
+  if (length(chars) <= 1) return(paste(chars, collapse = ""))
+  u <- unique(chars)
+  unlist(lapply(u, function(ch) paste0(ch, perms(chars[-match(ch, chars)]))))
+}
+anagrams <- unique(perms(strsplit(MOTIF, "")[[1]]))
+n_cg_motif <- str_count(MOTIF, "(?=CG)")
+cpg_matched <- anagrams[str_count(anagrams, "(?=CG)") == n_cg_motif]
+stopifnot("motif missing from its own anagrams" = MOTIF %in% anagrams,
+          "anagram set not unique" = !anyDuplicated(anagrams))
+cat("Anagrams:", length(anagrams), "| with the same CpG count as", MOTIF, ":",
+    length(cpg_matched), "\n")
+
+region_sets <- lapply(setNames(REGIONS, REGIONS), function(r) {
+  x <- seq_chr[[r]]
+  x <- x[nchar(x) >= nchar(MOTIF)]
+  DNAStringSet(x)
+})
+
+# Presence matrix per region: transcripts x anagrams
+presence <- lapply(region_sets, function(s) {
+  m <- vapply(anagrams, function(a) vcountPattern(a, s, fixed = TRUE) > 0,
+              logical(length(s)))
+  rownames(m) <- names(s)
+  m
+})
+stopifnot("anagram presence for motif disagrees with direct count" =
+  all(sapply(REGIONS, function(r) {
+    d <- motif_long %>% dplyr::filter(region == r)
+    identical(unname(presence[[r]][d$transcript_id_clean, MOTIF]), d$present)
+  })))
+
+log_or <- function(a_set, a_comp) {
+  # Haldane-corrected log2 odds ratio of presence, set vs comparator
+  p1 <- (sum(a_set) + 0.5) / (length(a_set) - sum(a_set) + 0.5)
+  p2 <- (sum(a_comp) + 0.5) / (length(a_comp) - sum(a_comp) + 0.5)
+  log2(p1 / p2)
+}
+
+comparators <- list(
+  "vs negative control"      = list(set = groups$transcript_id_clean[groups$is_pos],
+                                    comp = groups$transcript_id_clean[groups$is_neg]),
+  "vs rest of transcriptome" = list(set = groups$transcript_id_clean[groups$is_pos],
+                                    comp = groups$transcript_id_clean[!groups$is_pos]))
+
+anagram_res <- imap_dfr(comparators, function(cmp, cname) {
+  map_dfr(REGIONS, function(r) {
+    m  <- presence[[r]]
+    is <- rownames(m) %in% cmp$set
+    ic <- rownames(m) %in% cmp$comp
+    tibble(comparison = cname, region = r, anagram = colnames(m),
+           log2_or = apply(m, 2, function(col) log_or(col[is], col[ic])),
+           frac_set = colMeans(m[is, , drop = FALSE]),
+           cpg_matched = colnames(m) %in% cpg_matched)
+  })
+})
+
+anagram_summary <- anagram_res %>%
+  group_by(comparison, region) %>%
+  summarise(
+    motif_log2_or = log2_or[anagram == MOTIF],
+    rank_all = sum(log2_or >= motif_log2_or),
+    n_all = n(),
+    p_all = (sum(log2_or[anagram != MOTIF] >= motif_log2_or) + 1) / n(),
+    median_anagram_log2_or = median(log2_or[anagram != MOTIF]),
+    rank_cpg = sum(log2_or[cpg_matched] >= motif_log2_or),
+    n_cpg = sum(cpg_matched),
+    p_cpg = (sum(log2_or[cpg_matched & anagram != MOTIF] >= motif_log2_or) + 1) /
+            sum(cpg_matched),
+    median_cpg_anagram_log2_or = median(log2_or[cpg_matched & anagram != MOTIF]),
+    .groups = "drop")
+
+anagram_summary %>%
+  dplyr::mutate(region = region_labels[region],
+                across(where(is.double), ~ signif(.x, 3))) %>%
+  knitr::kable(caption = paste0("Rank of ", MOTIF, " among its anagrams (1 = most enriched). ",
+                                "p_all / p_cpg: empirical one-sided p."))
+
+write_csv(anagram_res, here("output", "predictive_modeling",
+                            paste0("99_", tolower(MOTIF), "_anagram_null.csv")))
+```
+
+```{r plot_anagrams, fig.width = 10, fig.height = 6}
+p_ana <- anagram_res %>%
+  dplyr::mutate(kind = case_when(anagram == MOTIF ~ MOTIF,
+                                 cpg_matched ~ "Anagram, same CpG count",
+                                 TRUE ~ "Anagram, other")) %>%
+  ggplot(aes(factor(region, levels = REGIONS), log2_or)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_jitter(data = ~ dplyr::filter(.x, kind != MOTIF),
+              aes(color = kind), width = 0.15, height = 0, size = 1.4, alpha = 0.8) +
+  geom_point(data = ~ dplyr::filter(.x, kind == MOTIF),
+             color = set_col, size = 4, shape = 18) +
+  geom_text(data = anagram_summary,
+            aes(region, Inf, label = paste0("rank ", rank_all, "/", n_all,
+                                            "\nCpG: ", rank_cpg, "/", n_cpg)),
+            inherit.aes = FALSE, vjust = 1.1, size = 2.7) +
+  facet_wrap(~ comparison, ncol = 1) +
+  scale_x_discrete(labels = region_labels) +
+  scale_color_manual(values = c("Anagram, same CpG count" = "#0072B2",
+                                "Anagram, other" = "grey70")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+  labs(x = NULL, y = "log2 odds ratio of presence (gene set vs comparator)", color = NULL,
+       title = paste0(MOTIF, " (diamond) against its own anagrams"),
+       subtitle = paste0("Same base composition; ", length(anagrams), " anagrams, ",
+                         length(cpg_matched), " with the same CpG count")) +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+p_ana
+ggsave(plot_path("anagram_null"), p_ana, width = 10, height = 6)
+```
+
+---
+
+# Summary
+
+```{r summary}
+summary_tbl <- raw_tests %>%
+  dplyr::select(comparison, region, frac_set, frac_comp, odds_ratio, fisher_padj) %>%
+  left_join(adj_tests %>% dplyr::select(comparison, region, adj_odds_ratio, adj_padj),
+            by = c("comparison", "region")) %>%
+  left_join(anagram_summary %>%
+              dplyr::mutate(region = factor(region, levels = REGIONS),
+                            comparison = factor(comparison, levels = levels(raw_tests$comparison))) %>%
+              dplyr::select(comparison, region, rank_all, n_all, p_all, rank_cpg, n_cpg, p_cpg),
+            by = c("comparison", "region"))
+
+summary_tbl %>%
+  dplyr::mutate(region = region_labels[as.character(region)],
+                across(c(frac_set, frac_comp, odds_ratio, adj_odds_ratio), ~ round(.x, 3)),
+                across(c(fisher_padj, adj_padj, p_all, p_cpg), ~ signif(.x, 3))) %>%
+  knitr::kable(caption = paste0(MOTIF, ": raw, length/GC-adjusted and anagram-null results"))
+```
+
+```{r session_info}
+sessionInfo()
+```

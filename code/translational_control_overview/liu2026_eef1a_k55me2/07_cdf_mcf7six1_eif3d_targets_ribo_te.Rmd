@@ -1,0 +1,247 @@
+---
+title: "Liu 2026 eEF1A K55me2: ribo and TE change on METTL13 loss in MCF7-SIX1 eIF3d-promoted mRNAs (CDF)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  neg_seed: 9
+  save_plots: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "07_cdf_mcf7six1_eif3d_targets_ribo_te.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+})
+```
+
+# Plan
+
+The same two CDFs as `06_cdf_eif3d_targets_ribo_te.Rmd`, with the gene sets taken from
+**MCF7-SIX1, si3d, hypoxia 1hr** instead of MDA-MB-231.
+
+**Groups.**
+
+- **eIF3d-promoted** (orange): `mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv`, intersected
+  with the MCF7-SIX1 feature matrix. TE > 0.5 and padj < 0.05, promotes-positive (negated from
+  the source's log2(si3d / sictrl) by `10m_mcf7six1_outcome_prep.Rmd`).
+- **Negative control** (black): a size-matched `set.seed(9)` draw from
+  `mcf7six1_3d_negative_controls_lfc0.5.csv` (|TE| < 0.5 and padj > 0.3 in both hypoxia and
+  normoxia), using the same procedure as notebook 07's `create_target`: pool intersected with
+  the matrix, positives removed, `sample(pool, n_positives)`. No MCF7-SIX1 classifier draw was
+  ever saved, so this draw is **re-made, not reproduced**.
+- **All other genes** (grey): every other gene in the Liu results.
+
+**Readouts** from `05_riboseq_deseq2.Rmd`, log2(sgControl / sgMETTL13), positive = METTL13
+promotes: **(A)** ribo LFC as saved (shrunken), **(B)** TE LFC unshrunken (noisy, because the
+Liu RNA arm does not replicate).
+
+# Load the Liu ribo-seq results
+
+```{r load_liu}
+liu_csv <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2",
+                "translation_categories_sgcontrol_vs_sgmettl13_liu2026.csv")
+if (!file.exists(liu_csv)) stop("Run 05_riboseq_deseq2.Rmd first: ", liu_csv, " not found")
+liu <- read_csv(liu_csv, show_col_types = FALSE)
+
+stopifnot(all(c("gene_id", "ribo_lfc", "te_lfc_mle") %in% names(liu)), !anyDuplicated(liu$gene_id),
+          all(is.finite(liu$ribo_lfc)), all(is.finite(liu$te_lfc_mle)),
+          "METTL13 ribo_lfc not positive - Liu contrast direction flipped" =
+            liu$ribo_lfc[liu$gene_id == "METTL13"] > 1)
+cat("Liu genes:", nrow(liu), "\n")
+```
+
+# MCF7-SIX1 gene sets
+
+```{r load_sets}
+pos_csv <- read_csv(here("output", "genesets", "mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                    show_col_types = FALSE)
+neg_csv <- read_csv(here("output", "genesets", "mcf7six1_3d_negative_controls_lfc0.5.csv"),
+                    show_col_types = FALSE)
+matrix_genes <- readRDS(here("output", "translational_control_overview",
+                             "feature_matrix_tco_mcf7six1.rds"))$gene_id_clean
+stopifnot(!anyDuplicated(matrix_genes), !anyDuplicated(pos_csv$ensembl_gene),
+          !anyDuplicated(neg_csv$ensembl_gene))
+```
+
+## Check: direction and definitions
+
+The MCF7-SIX1 source is log2(si3d / sictrl), the opposite of MDA-MB-231; the gene-set file
+stores the negated, promotes-positive value. Its membership must be exactly te_lfc > 0.5 and
+padj < 0.05 in `10m_`'s promotes-positive table, where the negation was verified with three
+independent rulers.
+
+```{r direction}
+mcf7_te <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv"),
+                    show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+expected_pos <- mcf7_te %>% filter(te_lfc > 0.5, !is.na(te_padj), te_padj < 0.05) %>% pull(gene_id_clean)
+
+stopifnot(
+  "gene set is not te_lfc > 0.5 & padj < 0.05 in the promotes-positive table" =
+    setequal(expected_pos, pos_csv$ensembl_gene),
+  "gene set should be labelled promotes-positive" =
+    all(grepl("promotes-positive", pos_csv$gs_description)),
+  all(pos_csv$te_lfc > 0.5), all(pos_csv$te_padj < 0.05),
+  all(abs(neg_csv$te_lfc) < 0.5), all(neg_csv$te_padj > 0.3),
+  length(intersect(pos_csv$ensembl_gene, neg_csv$ensembl_gene)) == 0
+)
+cat("Promoted:", nrow(pos_csv), "| negative pool:", nrow(neg_csv), "\n")
+```
+
+## Size-matched negative draw
+
+```{r draw}
+pos_in <- pos_csv %>% filter(ensembl_gene %in% matrix_genes)
+pool   <- neg_csv %>% filter(ensembl_gene %in% matrix_genes, !ensembl_gene %in% pos_in$ensembl_gene)
+stopifnot("negative pool not larger than the positive set" = nrow(pool) > nrow(pos_in))
+
+set.seed(params$neg_seed)
+neg_draw <- sample(pool$ensembl_gene, nrow(pos_in))
+
+cat("Positives in matrix:", nrow(pos_in), "of", nrow(pos_csv),
+    "| pool in matrix minus positives:", nrow(pool),
+    "| drawn:", length(neg_draw), "\n")
+stopifnot(length(neg_draw) == nrow(pos_in), !anyDuplicated(neg_draw))
+```
+
+# Match set genes to Liu genes
+
+On symbol, as in `06_`. Liu's genes are RefSeq symbols; the MCF7-SIX1 sets carry GENCODE
+symbols. A gene symbol that appears twice in the negative pool is not drawn here, but the
+check below guards it.
+
+```{r match}
+sets <- bind_rows(
+  pos_in %>% transmute(gene_id_clean = ensembl_gene, symbol = db_gene_symbol, group = "eIF3d-promoted"),
+  neg_csv %>% filter(ensembl_gene %in% neg_draw) %>%
+    transmute(gene_id_clean = ensembl_gene, symbol = db_gene_symbol, group = "Negative control"))
+stopifnot(nrow(sets) == 2 * nrow(pos_in), !anyNA(sets$symbol), !anyDuplicated(sets$symbol))
+
+raw_genes <- read.delim(here("accessories", "liu2026_GSE335287_raw_counts.txt"))$geneID
+sets %>%
+  group_by(group) %>%
+  summarise(n_set = n(),
+            in_liu_results    = sum(symbol %in% liu$gene_id),
+            removed_by_filter = sum(symbol %in% raw_genes & !symbol %in% liu$gene_id),
+            absent_from_file  = sum(!symbol %in% raw_genes),
+            fraction_in_liu   = mean(symbol %in% liu$gene_id)) %>%
+  knitr::kable(digits = 3)
+
+matched <- sets %>% filter(symbol %in% liu$gene_id) %>% dplyr::rename(liu_gene = symbol)
+```
+
+# CDFs
+
+```{r cdf_function}
+grp_levels <- c("eIF3d-promoted", "Negative control", "All other genes")
+grp_colors <- c("eIF3d-promoted" = "#E69F00", "Negative control" = "black",
+                "All other genes" = "grey70")
+
+plot_df <- liu %>%
+  left_join(matched %>% dplyr::select(liu_gene, group), by = c("gene_id" = "liu_gene")) %>%
+  mutate(group = factor(replace_na(group, "All other genes"), levels = grp_levels))
+
+cdf_plot <- function(col, xlab, title) {
+  x  <- split(plot_df[[col]], plot_df$group)
+  n  <- lengths(x)[grp_levels]
+  w  <- list(pn = wilcox.test(x[["eIF3d-promoted"]],   x[["Negative control"]]),
+             po = wilcox.test(x[["eIF3d-promoted"]],   x[["All other genes"]]),
+             no = wilcox.test(x[["Negative control"]], x[["All other genes"]]))
+  labs_n <- setNames(sprintf("%s (n = %s)", grp_levels, trimws(format(n, big.mark = ","))), grp_levels)
+  stats <- tibble(comparison = c("promoted vs neg ctrl", "promoted vs other", "neg ctrl vs other"),
+                  wilcoxon_p = map_dbl(w, "p.value"))
+  meds  <- map_dbl(x, median)[grp_levels]
+
+  p <- ggplot(plot_df, aes(.data[[col]], colour = group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    stat_ecdf(linewidth = 0.8) +
+    coord_cartesian(xlim = quantile(plot_df[[col]], c(0.005, 0.995))) +
+    scale_colour_manual(values = grp_colors, labels = labs_n, breaks = grp_levels, name = NULL) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.6, size = 3.2,
+             label = sprintf("promoted vs neg ctrl: Wilcoxon p = %s\nmedian %.3f vs %.3f",
+                             format.pval(w$pn$p.value, digits = 2),
+                             meds[["eIF3d-promoted"]], meds[["Negative control"]])) +
+    labs(x = xlab, y = "Cumulative fraction", title = title,
+         subtitle = "Groups: eIF3d TE, MCF7-SIX1 hypoxia 1hr") +
+    theme_classic(base_size = 12) +
+    theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+          legend.background = element_blank())
+  list(plot = p, stats = stats, medians = meds)
+}
+```
+
+## (A) Ribo LFC (shrunken, as saved)
+
+```{r cdf_ribo, fig.width = 6.5, fig.height = 4.5}
+cdf_ribo <- cdf_plot("ribo_lfc",
+                     "Ribo log2(sgControl / sgMETTL13), positive = METTL13 promotes",
+                     "METTL13 KO ribosome occupancy (Liu 2026, T3M4)")
+cdf_ribo$plot
+knitr::kable(cdf_ribo$stats, digits = 4)
+knitr::kable(enframe(cdf_ribo$medians, "group", "median_ribo_lfc"), digits = 3)
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_07_cdf_ribo_mcf7six1_eif3d_promoted_hypoxia_1hr.pdf"), cdf_ribo$plot,
+         width = 6.5, height = 4.5)
+```
+
+## (B) TE LFC (unshrunken)
+
+```{r cdf_te, fig.width = 6.5, fig.height = 4.5}
+cdf_te <- cdf_plot("te_lfc_mle",
+                   "TE log2(sgControl / sgMETTL13), unshrunken; positive = METTL13 promotes",
+                   "METTL13 KO TE (Liu 2026, T3M4)")
+cdf_te$plot
+knitr::kable(cdf_te$stats, digits = 4)
+knitr::kable(enframe(cdf_te$medians, "group", "median_te_lfc_mle"), digits = 3)
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_07_cdf_te_unshrunken_mcf7six1_eif3d_promoted_hypoxia_1hr.pdf"),
+         cdf_te$plot, width = 6.5, height = 4.5)
+```
+
+## (C) TE LFC (shrunken, as saved)
+
+apeglm shrinks the TE LFC to ~0 for nearly every gene (the Liu RNA arm does not replicate), so
+nearly every gene sits within about +/-5e-6. The axis is zoomed to that range; these
+differences are far too small to mean anything biologically. Shown for comparison with (B).
+
+```{r cdf_te_shrunken, fig.width = 6.5, fig.height = 4.5}
+cat("Genes with |shrunken TE LFC| < 0.01:", sum(abs(plot_df$te_lfc) < 0.01), "of", nrow(plot_df), "\n")
+cdf_te_shr <- cdf_plot("te_lfc",
+                       "TE log2(sgControl / sgMETTL13), shrunken; positive = METTL13 promotes",
+                       "METTL13 KO TE, shrunken (Liu 2026, T3M4)")
+# Shrunken values sit within about +/-5e-6 (99% of genes); zoom there, axis in units of 1e-6
+cdf_te_shr$plot <- cdf_te_shr$plot +
+  coord_cartesian(xlim = c(-6e-6, 6e-6)) +
+  scale_x_continuous(labels = function(x) x * 1e6) +
+  labs(x = "TE log2(sgControl / sgMETTL13), shrunken, x 1e-6\npositive = METTL13 promotes")
+cdf_te_shr$plot
+knitr::kable(cdf_te_shr$stats, digits = 4)
+knitr::kable(enframe(cdf_te_shr$medians, "group", "median_te_lfc_shrunken"), digits = 5)
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_07_cdf_te_shrunken_mcf7six1_eif3d_promoted_hypoxia_1hr.pdf"), cdf_te_shr$plot, width = 6.5, height = 4.5)
+```
+
+```{r session}
+sessionInfo()
+```

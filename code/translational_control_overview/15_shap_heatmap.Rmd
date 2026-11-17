@@ -18,6 +18,8 @@ params:
   footnote: ""
   dir_cutoff: 0.3
   n_beeswarm: 15
+  share_basis: "pooled"
+  feature_subset: ""
 editor_options:
   chunk_output_type: console
 ---
@@ -91,12 +93,32 @@ exps <- parse_experiments(params$experiments)
 cat("experiments:", nrow(exps), "\n")
 print(as.data.frame(exps), row.names = FALSE)
 
+# share_basis decides how a feature's share is formed from the explain set's per-gene SHAP:
+#   "pooled"   - 11_'s share_pct: mean |SHAP| over genes, as % of the sum over features. Genes
+#                with large |SHAP| dominate.
+#   "per_gene" - each gene's |SHAP| is first divided by that gene's total |SHAP| (the
+#                normalization 26b_ clusters on), then averaged, so every gene counts equally.
+# Both are % of ALL modelled features and sum to 100 per column. Direction is shap_value_cor in
+# both: Spearman cor(feature value, SHAP) over the same explain-set genes.
+stopifnot("share_basis must be 'pooled' or 'per_gene'" =
+            params$share_basis %in% c("pooled", "per_gene"))
 read_one <- function(label, suffix) {
   f <- file.path(out_dir, paste0("shapreg_feature_", suffix, ".csv"))
   if (!file.exists(f)) { warning("missing: ", f); return(NULL) }
-  read_csv(f, show_col_types = FALSE) %>%
+  d <- read_csv(f, show_col_types = FALSE) %>%
     transmute(experiment = label, feature, family,
               share = share_pct, direction = shap_value_cor)
+  pg <- read_csv(file.path(out_dir, paste0("shapreg_per_gene_", suffix, ".csv")),
+                 show_col_types = FALSE)
+  A <- abs(as.matrix(pg[d$feature]))
+  # The per-gene file must reproduce the stored pooled share, or it is not the same explain set.
+  stopifnot("per-gene SHAP does not reproduce share_pct" =
+              max(abs(100 * colMeans(A) / sum(colMeans(A)) - d$share)) < 1e-6)
+  if (params$share_basis == "per_gene") {
+    stopifnot("a gene has zero total |SHAP|" = all(rowSums(A) > 0))
+    d$share <- 100 * colMeans(A / rowSums(A))
+  }
+  d
 }
 long <- pmap_dfr(list(exps$label, exps$suffix), read_one)
 stopifnot("no SHAP outputs found for any experiment" = nrow(long) > 0)
@@ -833,6 +855,45 @@ draw_signed(sfe, tagf("15_heatmap_features_signed_share", "pdf"),
 cat(sprintf("families with a sign: %d of %d cells | features: %d of %d cells (cutoff |cor| >= %.1f%s)\n",
             sum(!is.na(sf$v)), length(sf$v), sum(!is.na(sfe$v)), length(sfe$v), params$dir_cutoff,
             if (length(unstable)) sprintf(", %d seed-unstable features withheld", length(unstable)) else ""))
+```
+
+# 2b-ii. Signed share, selected features only
+
+Runs only when `feature_subset` is set. Same cell rule as 2b - share carrying the sign of
+cor(value, SHAP), grey where |cor| < `r params$dir_cutoff` - restricted to the listed features,
+in the listed order, with a gap between families. Shares are still % of ALL modelled features,
+so the rows do not sum to 100; the rest of the model holds the remainder.
+
+```{r fig_signed_subset, fig.width = max(7, 0.6 * nrow(exps) + 6), fig.height = 7, eval = nzchar(params$feature_subset)}
+sub_feats <- str_trim(str_split(params$feature_subset, ",")[[1]])
+stopifnot("feature_subset names a feature not in these models" = all(sub_feats %in% rownames(M)))
+# Keep the listed order but make each family contiguous, so the gaps separate whole families.
+sub_feats <- sub_feats[order(match(fam_of[sub_feats], unique(fam_of[sub_feats])))]
+ss <- signed_mat(M[sub_feats, , drop = FALSE], Md[sub_feats, , drop = FALSE], unstable)
+fam_sub <- fam_of[sub_feats]
+lim <- max(abs(ss$v), na.rm = TRUE)
+sub_args <- list(mat = ss$v, color = colorRampPalette(c("#0072B2", "white", "#D55E00"))(101),
+                 breaks = seq(-lim, lim, length.out = 102), na_col = "grey85",
+                 cluster_rows = FALSE, cluster_cols = ncol(ss$v) > 2,
+                 gaps_row = which(head(fam_sub, -1) != tail(fam_sub, -1)),
+                 annotation_row = data.frame(family = fam_sub, row.names = sub_feats),
+                 annotation_col = anno_col,
+                 annotation_colors = c(list(family = fam_cols[unique(fam_sub)]), anno_col_colors),
+                 display_numbers = if (ncol(ss$v) <= 4) ss$lab else FALSE,
+                 fontsize_number = 7, number_color = "black",
+                 labels_col = lab_for(ss$v), fontsize_row = 9, fontsize_col = 9, cellwidth = 42)
+draw_and_save(sub_args, tagf("15_heatmap_features_signed_share_subset", "pdf"), width = 7.5,
+              scale_title = sprintf("signed %sSHAP share (%%)\ngrey: |direction| < %.1f",
+                                    if (params$share_basis == "per_gene") "normalized " else "",
+                                    params$dir_cutoff))
+sub_tbl <- tibble(feature = sub_feats, family = fam_sub) %>%
+  bind_cols(as_tibble(round(ss$v, 2)))
+print(as.data.frame(sub_tbl), row.names = FALSE)
+cat(sprintf("\nthe %d features hold %.1f%% (median over columns) of total SHAP; %d of %d cells grey\n",
+            length(sub_feats), median(colSums(M[sub_feats, , drop = FALSE])),
+            sum(is.na(ss$v)), length(ss$v)))
+if (isTRUE(params$save_plots))
+  write_csv(sub_tbl, file.path(out_dir, tagf("15_signed_share_subset", "csv")))
 ```
 
 # 2c. Beeswarm (single experiment only)

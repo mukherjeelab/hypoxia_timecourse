@@ -1,0 +1,401 @@
+---
+title: "CDS reporter design 18 - expected results for the PEST/HiBiT length ladder"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  run_tag: "upto3x_expressed"
+  window_log2: 0.25      # +/- this many log2 units of each reporter's length
+  min_window_n: 100      # a window with fewer genes than this is not a prediction
+  n_boot: 2000
+  seed: 9
+---
+
+```{r}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(run_tag = "upto3x_expressed", window_log2 = 0.25,
+                 min_window_n = 100, n_boot = 2000, seed = 9)
+}
+```
+
+# Overview
+
+The expected-result figure for the ladder built in `17_`, drawn **from the
+measured si3d data rather than by hand**. Two figures:
+
+- **Top half** - predicted HiBiT readout per reporter, four bars each
+  (normoxia sictrl / si3d, hypoxia sictrl / si3d).
+- **Bottom half** - the delta, `sictrl / si3d`, normoxia vs hypoxia.
+
+Both carry **all four rungs**, including the two middle ones, because the
+claim being tested is a gradient and a three-point short/medium/long cartoon
+cannot show whether it is monotonic.
+
+**Each reporter is predicted from the genes that share its length.** For a
+reporter of *L* nt, the prediction is the median `te_lfc` of expressed
+MDA-MB-231 genes whose CDS is within `window_log2` of *L* (0.25 log2 = +/-19%).
+`te_lfc` is log2(sictrl / si3d) of translation efficiency, so it is on exactly
+the axis the assay reads out.
+
+**Two readouts are drawn, and the difference between them is the point.**
+
+| Readout | Predicted log2(sictrl / si3d) |
+|---|---|
+| HiBiT alone | `te_lfc(reporter)` |
+| HiBiT / firefly | `te_lfc(reporter) - te_lfc(firefly)` |
+
+The firefly control is **1,773 nt**, which sits in the middle of the ladder.
+Dividing by it subtracts the length effect *at the firefly's own length*, so
+the normalised series is pinned near zero at rung 3 by construction and the
+whole range is compressed. This is not a modelling artifact - it is what a
+ratio to a mid-length normaliser does to a length experiment.
+
+**What this does NOT predict.** Bars are normalised within each reporter to its
+own sictrl-normoxia value, so **heights are comparable within a facet and not
+across facets**. Whether a longer reporter gives less absolute signal than a
+shorter one is a separate question these contrasts cannot answer, and drawing
+it would be inventing a result. The prediction is also the **TE component
+only**: a transfected plasmid's mRNA level does not have to follow the
+endogenous `rna_lfc`, so no RNA term is added.
+
+**A single reporter is a single gene.** These are medians of thousands of
+genes; CDS length correlates with `te_lfc` at rho = -0.17 in hypoxia, so length
+accounts for a few percent of the variance between genes. What the ladder
+measures cleanly is the *within-series* comparison, because `17_` holds GC3,
+UTRs and codon content constant across rungs. Do not expect any one rung to
+land on its window's median.
+
+# 1. Libraries and reporter lengths
+
+```{r libs}
+library(tidyverse)
+library(here)
+
+outdir  <- here("output", "cds_reporter_design")
+plotdir <- here("plots")
+set.seed(params$seed)
+```
+
+Lengths are **imported from `17_`'s own output**, never retyped, so a rebuild
+of the ladder moves this figure with it.
+
+```{r reporter_lengths}
+seq_csv <- file.path(outdir, paste0("17_pest_hibit_ladder_sequences_",
+                                    params$run_tag, ".csv"))
+stopifnot("17_ sequence table not found - knit 17_ first" = file.exists(seq_csv))
+
+rep_tbl <- read_csv(seq_csv, show_col_types = FALSE)
+
+CONTROL <- "firefly luc+PEST"
+ladder <- rep_tbl %>% filter(construct != CONTROL) %>%
+  arrange(cds_length) %>%
+  transmute(reporter = construct, gfp_copies, cds_length)
+control <- rep_tbl %>% filter(construct == CONTROL)
+
+stopifnot(
+  "Expected four ladder rungs" = nrow(ladder) == 4,
+  "The firefly control is missing from the 17_ table" = nrow(control) == 1,
+  "Rung lengths are not strictly increasing" =
+    all(diff(ladder$cds_length) > 0),
+  # The control must sit INSIDE the ladder's range, or the compression this
+  # notebook is about would not arise and the figure would be making a
+  # different point than its text.
+  "The firefly control is not inside the ladder's length range" =
+    control$cds_length > min(ladder$cds_length) &&
+    control$cds_length < max(ladder$cds_length)
+)
+
+LCTRL <- control$cds_length
+cat(sprintf("Ladder: %s nt. Control: %s nt (between rungs %d and %d).\n",
+            paste(format(ladder$cds_length, big.mark = ","), collapse = " / "),
+            format(LCTRL, big.mark = ","),
+            sum(ladder$cds_length < LCTRL), sum(ladder$cds_length < LCTRL) + 1))
+```
+
+# 2. Contrasts
+
+Three contrasts, all MDA-MB-231:
+
+- **si3d hypoxia 1hr** and **si3d normoxia 1+4hr** (time-regressed, which is
+  the project's normoxia comparator for si3d) give the knockdown effect.
+- **siCTRL hypoxia vs normoxia 1hr** gives how much the sictrl bar itself moves
+  between conditions, which is what sets the two sictrl bar heights.
+
+```{r load_contrasts}
+read_tc <- function(f) read_csv(here("output", f), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+kd <- list(
+  "Normoxia" = read_tc("translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+  "Hypoxia"  = read_tc("translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"))
+
+# The siCTRL hypoxia-vs-normoxia contrast. CLAUDE.md pins this file's identity.
+ctrl_hn <- read_tc("translation_categories_1hr.csv")
+
+# Direction check on BOTH knockdown files: these hold the sictrl_vs_si3d
+# coefficient despite the filename stating the ratio the other way round, so
+# EIF3D's own rna_lfc must be strongly positive.
+walk2(names(kd), kd, function(nm, d) {
+  v <- d$rna_lfc[d$symbol == "EIF3D"]
+  stopifnot("EIF3D rna_lfc is not strongly positive: direction may be flipped" =
+              length(v) == 1 && v > 2)
+  cat(sprintf("Direction check - %s: EIF3D rna_lfc %.2f\n", nm, v))
+})
+```
+
+```{r lengths_join}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+gene_len <- fm %>% transmute(gene_id_clean, cds_length) %>%
+  distinct(gene_id_clean, .keep_all = TRUE)
+stopifnot("No CDS lengths recovered" = nrow(gene_len) > 5000)
+
+attach_len <- function(d) d %>% inner_join(gene_len, by = "gene_id_clean") %>%
+  filter(!is.na(te_lfc), cds_length > 0)
+kd      <- map(kd, attach_len)
+ctrl_hn <- attach_len(ctrl_hn)
+
+cat(sprintf("Genes with a length and a te_lfc: %s (si3d), %s (siCTRL hyp/nor)\n",
+            format(nrow(kd[[1]]), big.mark = ","),
+            format(nrow(ctrl_hn), big.mark = ",")))
+```
+
+# 3. Length windows
+
+```{r windows}
+# Median te_lfc of the genes whose CDS length is within the window of L, with a
+# bootstrap interval so the figure can show how soft each prediction is.
+win_median <- function(d, L, w = params$window_log2, B = params$n_boot) {
+  v <- d$te_lfc[abs(log2(d$cds_length) - log2(L)) < w]
+  stopifnot("A length window holds too few genes to predict from" =
+              length(v) >= params$min_window_n)
+  bs <- replicate(B, median(sample(v, length(v), replace = TRUE)))
+  tibble(n = length(v), med = median(v),
+         lo = unname(quantile(bs, 0.025)), hi = unname(quantile(bs, 0.975)))
+}
+
+lengths_all <- c(ladder$cds_length, LCTRL)
+
+win_tbl <- map_dfr(names(kd), function(cond)
+  map_dfr(lengths_all, function(L)
+    win_median(kd[[cond]], L) %>% mutate(condition = cond, cds_length = L))) %>%
+  mutate(is_control = cds_length == LCTRL)
+
+ctrl_tbl <- map_dfr(lengths_all, function(L)
+  win_median(ctrl_hn, L) %>% mutate(cds_length = L))
+
+cat("\nsi3d effect, median te_lfc = log2(sictrl/si3d), by length window:\n")
+print(win_tbl %>%
+        transmute(cds_length, condition, n,
+                  te_lfc = round(med, 3),
+                  ci = sprintf("[%.3f, %.3f]", lo, hi),
+                  role = ifelse(is_control, "CONTROL", "rung")) %>%
+        arrange(condition, cds_length) %>% as.data.frame(), row.names = FALSE)
+
+cat("\nsiCTRL hypoxia vs normoxia, median te_lfc, by length window:\n")
+print(ctrl_tbl %>% transmute(cds_length, n, te_lfc = round(med, 3)) %>%
+        as.data.frame(), row.names = FALSE)
+```
+
+The premise of the experiment, asserted rather than assumed: the si3d effect
+must **decline with CDS length in hypoxia**, and must do so **more steeply than
+in normoxia**. If either fails, the ladder has nothing to detect and this
+figure should not be drawn.
+
+```{r premise_checks}
+slope_of <- function(cond) {
+  x <- win_tbl %>% filter(condition == cond, !is_control) %>% arrange(cds_length)
+  coef(lm(med ~ log2(cds_length), data = x))[[2]]
+}
+s_hyp <- slope_of("Hypoxia"); s_nor <- slope_of("Normoxia")
+
+hyp_rungs <- win_tbl %>% filter(condition == "Hypoxia", !is_control) %>%
+  arrange(cds_length) %>% pull(med)
+
+stopifnot(
+  "The si3d effect does not fall monotonically with length in hypoxia" =
+    all(diff(hyp_rungs) < 0),
+  "The hypoxia length slope is not negative" = s_hyp < 0,
+  # Discriminative companion: normoxia is the condition the gradient is NOT
+  # supposed to be in. If the two slopes matched, the figure's whole
+  # hypoxia-vs-normoxia contrast would be measuring nothing.
+  "Hypoxia's length gradient is not steeper than normoxia's" = s_hyp < s_nor
+)
+cat(sprintf("Length slope of te_lfc (per log2 nt): hypoxia %.4f, normoxia %.4f (%.1fx steeper)\n",
+            s_hyp, s_nor, s_hyp / s_nor))
+```
+
+# 4. Build the expected bar heights
+
+For each reporter and condition, with `d` = the si3d effect on that readout and
+`c` = the sictrl condition effect, all in log2:
+
+```
+  normoxia sictrl  =  1
+  normoxia si3d    =  2^(-d_nor)
+  hypoxia  sictrl  =  2^( c )
+  hypoxia  si3d    =  2^( c - d_hyp )
+```
+
+The HiBiT-alone readout uses the reporter's own values; the HiBiT/firefly
+readout subtracts the control's, which is the ratio taken in log space.
+
+```{r expectations}
+get1 <- function(tb, L, cond = NULL) {
+  r <- tb %>% filter(cds_length == L)
+  if (!is.null(cond)) r <- r %>% filter(condition == cond)
+  stopifnot("Expected exactly one window row" = nrow(r) == 1)
+  r
+}
+
+ctrl_d <- set_names(map_dbl(names(kd), ~ get1(win_tbl, LCTRL, .x)$med), names(kd))
+ctrl_c <- get1(ctrl_tbl, LCTRL)$med
+
+delta_tbl <- map_dfr(seq_len(nrow(ladder)), function(i) {
+  L <- ladder$cds_length[i]
+  map_dfr(names(kd), function(cond) {
+    w  <- get1(win_tbl, L, cond)
+    cc <- get1(ctrl_tbl, L)$med
+    tibble(
+      reporter   = ladder$reporter[i], cds_length = L, condition = cond, n = w$n,
+      readout    = c("HiBiT alone", "HiBiT / firefly"),
+      delta      = c(w$med,            w$med - ctrl_d[[cond]]),
+      delta_lo   = c(w$lo,             w$lo  - ctrl_d[[cond]]),
+      delta_hi   = c(w$hi,             w$hi  - ctrl_d[[cond]]),
+      cond_shift = c(cc,               cc    - ctrl_c))
+  })
+}) %>%
+  mutate(readout  = factor(readout, levels = c("HiBiT alone", "HiBiT / firefly")),
+         condition = factor(condition, levels = c("Normoxia", "Hypoxia")),
+         facet    = sprintf("%s nt\n(n = %s)", format(cds_length, big.mark = ","),
+                            format(n, big.mark = ",")),
+         facet    = fct_reorder(facet, cds_length))
+
+# The normalised series must be ~zero at the rung closest to the control's
+# length. That is the compression this notebook exists to show, so it is
+# asserted rather than left for the reader to notice.
+near <- delta_tbl %>% filter(readout == "HiBiT / firefly") %>%
+  dplyr::slice_min(abs(cds_length - LCTRL), n = 2, with_ties = TRUE)
+stopifnot(
+  "Normalising to the control does not flatten the rung nearest its length" =
+    all(abs(near$delta) < 0.05),
+  # Discriminative companion: the UNNORMALISED series must not be flat there,
+  # or the flattening is a property of the data, not of the normalisation.
+  "The unnormalised series is already flat at the control's length" =
+    all(abs(delta_tbl$delta[delta_tbl$readout == "HiBiT alone" &
+                              delta_tbl$cds_length %in% near$cds_length]) > 0.1)
+)
+
+bar_tbl <- delta_tbl %>%
+  transmute(reporter, cds_length, facet, readout, condition, n,
+            sictrl = ifelse(condition == "Normoxia", 1, 2^cond_shift),
+            si3d   = sictrl / 2^delta) %>%
+  pivot_longer(c(sictrl, si3d), names_to = "knockdown", values_to = "signal") %>%
+  mutate(knockdown = factor(knockdown, levels = c("sictrl", "si3d")))
+
+cat("Predicted sictrl/si3d ratio by reporter and readout:\n")
+print(delta_tbl %>%
+        transmute(cds_length, condition, readout,
+                  log2_ratio = round(delta, 3),
+                  fold = round(2^delta, 3)) %>%
+        arrange(readout, condition, cds_length) %>%
+        as.data.frame(), row.names = FALSE)
+```
+
+# 5. Top half - predicted signal per reporter
+
+```{r plot_top, fig.width=11, fig.height=7}
+# sictrl is deliberately NOT given a hue: orange and sky blue are reserved for
+# eIF3d and eIF3e, and si3d must be the orange one.
+kd_cols   <- c("sictrl" = "grey55", "si3d" = "#E69F00")
+cond_cols <- c("Normoxia" = "#009E73", "Hypoxia" = "#D55E00")
+
+p_top <- ggplot(bar_tbl, aes(x = condition, y = signal, fill = knockdown)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_hline(yintercept = 1, linetype = "dotted", color = "grey40") +
+  scale_fill_manual(values = kd_cols, name = NULL) +
+  facet_grid(readout ~ facet) +
+  labs(
+    x = NULL, y = "Predicted HiBiT signal\n(relative to sictrl normoxia)",
+    title = "Expected result, PEST/HiBiT length ladder",
+    subtitle = paste0(
+      "Predicted from median te_lfc of MDA-MB-231 genes within ",
+      sprintf("%.0f%%", 100 * (2^params$window_log2 - 1)),
+      " of each reporter's CDS length. ",
+      "si3d hypoxia 1hr and normoxia 1+4hr; n per window in the strip.\n",
+      "Bars are scaled within each reporter, so heights compare WITHIN a",
+      " panel, not across panels.")) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.spacing = unit(0.9, "lines"))
+
+print(p_top)
+ggsave(file.path(plotdir, paste0("cds_reporter_18_expected_signal_",
+                                 params$run_tag, ".pdf")),
+       p_top, width = 11, height = 7)
+```
+
+# 6. Bottom half - the delta
+
+```{r plot_bottom, fig.width=11, fig.height=7}
+p_bot <- ggplot(delta_tbl, aes(x = condition, y = delta, fill = condition)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = delta_lo, ymax = delta_hi), width = 0.18,
+                color = "grey25", linewidth = 0.5) +
+  geom_hline(yintercept = 0, color = "grey25", linewidth = 0.4) +
+  scale_fill_manual(values = cond_cols, name = NULL) +
+  facet_grid(readout ~ facet, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "log2( sictrl HiBiT / si3d HiBiT )",
+    title = "Expected delta, sictrl vs si3d, by reporter length",
+    subtitle = paste0(
+      "Positive = eIF3d promotes. Error bars are 95% bootstrap intervals on",
+      " the window median (", format(params$n_boot, big.mark = ","),
+      " resamples).\nThe firefly control is ",
+      format(LCTRL, big.mark = ","),
+      " nt, inside the ladder, so the lower row is pinned near zero at that",
+      " length by construction.")) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.spacing = unit(0.9, "lines"))
+
+print(p_bot)
+ggsave(file.path(plotdir, paste0("cds_reporter_18_expected_delta_",
+                                 params$run_tag, ".pdf")),
+       p_bot, width = 11, height = 7)
+```
+
+# 7. Output
+
+```{r write_outputs}
+write_csv(delta_tbl %>% dplyr::select(reporter, cds_length, condition, n,
+                                      readout, delta, delta_lo, delta_hi,
+                                      cond_shift),
+          file.path(outdir, paste0("18_expected_reporter_results_",
+                                   params$run_tag, ".csv")))
+write_csv(win_tbl, file.path(outdir,
+          paste0("18_length_window_te_lfc_", params$run_tag, ".csv")))
+cat("Wrote 2 tables to", outdir, "\n")
+```
+
+```{r session}
+sessionInfo()
+```

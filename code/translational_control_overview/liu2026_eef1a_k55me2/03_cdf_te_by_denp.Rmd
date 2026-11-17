@@ -1,0 +1,259 @@
+---
+title: "Liu 2026 eEF1A K55me2: eIF3d TE change (hypoxia 1hr) in METTL13-dependent proteins (CDF)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  te_csv: "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"
+  save_plots: TRUE
+  save_table: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "03_cdf_te_by_denp.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(org.Hs.eg.db)
+  library(GenomicFeatures)
+})
+```
+
+# Plan
+
+The reverse of the CDF notebook: the x axis is **our** eIF3d TE change at hypoxia 1hr in
+MDA-MB-231, for every gene DESeq2 tested, and the curves split genes by Liu's call on METTL13
+knockout in T3M4.
+
+**Axis.** `te_lfc` = log2(sictrl / si3d) of translation efficiency (the file name says
+`si3d_vs_sictrl`; the coefficient is the reverse). Positive = si3d lowers TE = eIF3d
+**promotes** translation.
+
+**Groups.**
+
+- **dDENP** (reddish purple): newly made protein falls on METTL13 KO (P < 0.05), i.e. needs
+  eEF1A K55me2.
+- **uDENP** (dark blue): newly made protein rises on METTL13 KO (P < 0.05).
+- **Detected, unchanged** (dark grey): detected by Liu, P >= 0.05. This is the fair comparator
+  for the two DENP curves. Mass spec detects abundant, well-translated proteins first, so
+  detected genes are not a random draw from the transcriptome.
+- **Not detected** (light grey): every other gene we tested.
+
+# Load
+
+```{r load}
+liu_csv <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2",
+                "liu2026_table2a_denps.csv")
+if (!file.exists(liu_csv)) stop("Run 01_import_denps_volcano.Rmd first: ", liu_csv, " not found")
+liu <- read_csv(liu_csv, show_col_types = FALSE)
+stopifnot(
+  nrow(liu) == 2364L, !anyDuplicated(liu$uniprot),
+  identical(as.integer(table(liu$denp)[c("dDENP", "uDENP", "Unchanged")]), c(672L, 163L, 1529L))
+)
+
+te <- read_csv(here("output", params$te_csv), show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  filter(!is.na(te_lfc))
+stopifnot(!anyDuplicated(te$gene_id_clean), all(is.finite(te$te_lfc)))
+cat("Genes with a TE estimate:", nrow(te), "\n")
+```
+
+## Check: contrast direction
+
+EIF3D's own RNA must be strongly positive (the siRNA depletes it, so sictrl > si3d).
+
+```{r direction}
+eif3d_rna <- te$rna_lfc[te$symbol == "EIF3D"]
+cat("EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+stopifnot("EIF3D rna_lfc not strongly positive - contrast direction flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+```
+
+## Restrict to primary-assembly genes
+
+Our quantification includes alternate-haplotype and patch copies of some genes (e.g. FLOT1 has
+three ENSG IDs). Each copy gets its own TE estimate, and they disagree (FLOT1: 1.00, 0.03,
+0.04), so counting them would give one protein several x positions. The GENCODE v49 TxDb
+holds primary-assembly genes only, so it decides which copy is real.
+
+```{r primary}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+primary_ids <- unique(sub("\\..*", "", names(genes(txdb, single.strand.genes.only = FALSE))))
+stopifnot("ENSG00000137312" %in% primary_ids,     # FLOT1, primary
+          !"ENSG00000236271" %in% primary_ids)    # FLOT1, alt haplotype
+
+n_alt <- sum(!te$gene_id_clean %in% primary_ids)
+te <- te %>% filter(gene_id_clean %in% primary_ids)
+cat("Dropped", n_alt, "non-primary-assembly genes; kept", nrow(te), "\n")
+```
+
+# Map Liu proteins to genes
+
+UniProt -> Ensembl gene via `org.Hs.eg.db` (`r as.character(packageVersion("org.Hs.eg.db"))`),
+restricted to primary-assembly genes with a TE estimate. A protein encoded by more than one
+distinct gene symbol (histone H4: one protein, several H4C genes) cannot be attributed to one
+mRNA and is dropped. If two proteins point at one gene with **different** calls, that gene is
+dropped too.
+
+```{r map}
+map <- AnnotationDbi::select(org.Hs.eg.db, keys = liu$uniprot, keytype = "UNIPROT",
+                             columns = "ENSEMBL") %>%
+  as_tibble() %>%
+  filter(!is.na(ENSEMBL)) %>%
+  distinct(uniprot = UNIPROT, gene_id_clean = ENSEMBL) %>%
+  inner_join(te %>% dplyr::select(gene_id_clean, symbol), by = "gene_id_clean")
+
+# Spot-check known accessions
+spot <- c(P60228 = "EIF3E", P21980 = "TGM2", P52895 = "AKR1C2", O75955 = "FLOT1")
+stopifnot("UniProt spot-check failed" =
+            all(map_lgl(names(spot), ~ spot[[.x]] %in% map$symbol[map$uniprot == .x])))
+stopifnot("FLOT1 should map to exactly one primary gene" =
+            sum(map$uniprot == "O75955") == 1)
+
+multi_symbol <- map %>% group_by(uniprot) %>%
+  summarise(n_sym = n_distinct(symbol), symbols = paste(unique(symbol), collapse = ","),
+            .groups = "drop") %>%
+  filter(n_sym > 1)
+cat("Proteins encoded by >1 distinct gene symbol (dropped):", nrow(multi_symbol), "\n")
+print(multi_symbol)
+
+gene_calls <- map %>%
+  filter(!uniprot %in% multi_symbol$uniprot) %>%
+  inner_join(liu %>% dplyr::select(uniprot, denp, liu_log2fc = log2fc), by = "uniprot") %>%
+  group_by(gene_id_clean) %>%
+  summarise(n_prot = n(), n_calls = n_distinct(denp), denp = dplyr::first(denp),
+            uniprot = paste(uniprot, collapse = ","), .groups = "drop")
+
+conflict <- gene_calls %>% filter(n_calls > 1)
+cat("Genes hit by >1 protein:", sum(gene_calls$n_prot > 1),
+    "| with conflicting calls (dropped):", nrow(conflict), "\n")
+gene_calls <- gene_calls %>% filter(n_calls == 1)
+
+cat("Liu proteins placed on a gene:", n_distinct(unlist(str_split(gene_calls$uniprot, ","))),
+    "of", nrow(liu), "\n")
+stopifnot(!anyDuplicated(gene_calls$gene_id_clean))
+```
+
+# CDF
+
+```{r cdf, fig.width = 6.5, fig.height = 4.5}
+grp_levels <- c("dDENP", "uDENP", "Detected, unchanged", "Not detected")
+grp_colors <- c("dDENP" = "#CC79A7", "uDENP" = "#0072B2",
+                "Detected, unchanged" = "grey40", "Not detected" = "grey70")
+
+ambiguous_genes <- map$gene_id_clean[map$uniprot %in% multi_symbol$uniprot]
+
+plot_df <- te %>%
+  dplyr::select(gene_id_clean, symbol, te_lfc, te_padj) %>%
+  left_join(gene_calls %>% dplyr::select(gene_id_clean, denp, uniprot), by = "gene_id_clean") %>%
+  # genes from dropped ambiguous/conflicting proteins were detected but cannot be called;
+  # keep them out of every curve rather than miscounting them as "not detected"
+  filter(!gene_id_clean %in% c(ambiguous_genes, conflict$gene_id_clean)) %>%
+  mutate(group = case_when(
+    denp == "dDENP"     ~ "dDENP",
+    denp == "uDENP"     ~ "uDENP",
+    denp == "Unchanged" ~ "Detected, unchanged",
+    TRUE                ~ "Not detected"
+  ),
+  group = factor(group, levels = grp_levels))
+
+n_by <- table(plot_df$group)
+print(n_by)
+stopifnot(all(n_by[c("dDENP", "uDENP")] > 50))
+
+grp_lab <- setNames(sprintf("%s (n = %s)", grp_levels,
+                            trimws(format(as.integer(n_by[grp_levels]), big.mark = ","))),
+                    grp_levels)
+
+x <- split(plot_df$te_lfc, plot_df$group)
+w_d <- wilcox.test(x[["dDENP"]], x[["Detected, unchanged"]])
+w_u <- wilcox.test(x[["uDENP"]], x[["Detected, unchanged"]])
+w_du <- wilcox.test(x[["dDENP"]], x[["uDENP"]])
+
+p_cdf <- ggplot(plot_df, aes(te_lfc, colour = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  stat_ecdf(linewidth = 0.8) +
+  scale_colour_manual(values = grp_colors, labels = grp_lab, breaks = grp_levels, name = NULL) +
+  coord_cartesian(xlim = quantile(plot_df$te_lfc, c(0.005, 0.995))) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.4, size = 3.2,
+           label = sprintf(paste0("Wilcoxon vs detected, unchanged:\n",
+                                  "dDENP p = %s, uDENP p = %s\n",
+                                  "dDENP vs uDENP p = %s"),
+                           format.pval(w_d$p.value, digits = 2),
+                           format.pval(w_u$p.value, digits = 2),
+                           format.pval(w_du$p.value, digits = 2))) +
+  labs(x = "TE log2 fold change, sictrl vs si3d (hypoxia 1hr)",
+       y = "Cumulative fraction",
+       title = "eIF3d TE change by METTL13 KO call",
+       subtitle = "MDA-MB-231 TE; DENP calls from Liu 2026 (T3M4)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_blank())
+
+p_cdf
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_03_cdf_te_hypoxia_1hr_by_denp.pdf"), p_cdf, width = 6.5, height = 4.5)
+```
+
+The x range is clipped to the central 99% of genes for display; the statistics use every gene.
+
+```{r stats}
+plot_df %>%
+  group_by(group) %>%
+  summarise(n = n(), median_te_lfc = median(te_lfc),
+            pct_eif3d_promoted = 100 * mean(te_lfc > 0.5 & te_padj < 0.05, na.rm = TRUE),
+            .groups = "drop") %>%
+  knitr::kable(digits = 3)
+
+tibble(comparison = c("dDENP vs detected, unchanged", "uDENP vs detected, unchanged", "dDENP vs uDENP"),
+       median_diff = c(median(x[["dDENP"]]) - median(x[["Detected, unchanged"]]),
+                       median(x[["uDENP"]]) - median(x[["Detected, unchanged"]]),
+                       median(x[["dDENP"]]) - median(x[["uDENP"]])),
+       wilcoxon_p = c(w_d$p.value, w_u$p.value, w_du$p.value)) %>%
+  knitr::kable(digits = 4)
+```
+
+**Reading (2026-11-12 knit).** Both DENP classes sit to the right of detected-unchanged by a
+similar amount (dDENP +0.036, uDENP +0.061 median TE LFC), and they do not differ from each
+other (p = 0.17). So higher eIF3d dependence tracks being METTL13-*responsive*, not the
+*direction* of the response, which is not what a shared codon mechanism would predict (the
+paper's dDENPs are AU3-rich, uDENPs GC3-rich). The largest shift in the figure is detection
+itself: detected genes have median TE LFC 0.38 vs 0.26 for undetected ones, because mass spec
+favors abundant, well-translated proteins. The DENP effect is about a quarter of that, so a
+residual abundance difference between DENPs and unchanged proteins could account for it and
+has not been ruled out.
+
+`pct_eif3d_promoted` is the share of each group in the eIF3d-promoted gene-set definition
+(TE LFC > 0.5, padj < 0.05), before the feature-matrix intersection the classifier applies.
+
+# Save
+
+```{r save}
+if (isTRUE(params$save_table)) {
+  out <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2",
+              "liu2026_te_hypoxia_1hr_by_denp.csv")
+  plot_df %>% dplyr::select(gene_id_clean, symbol, uniprot, group, te_lfc, te_padj) %>% write_csv(out)
+  cat("Wrote", out, "\n")
+}
+```
+
+```{r session}
+sessionInfo()
+```

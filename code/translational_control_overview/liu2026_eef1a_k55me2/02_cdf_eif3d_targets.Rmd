@@ -1,0 +1,360 @@
+---
+title: "Liu 2026 eEF1A K55me2: nascent-protein change in eIF3d-promoted mRNAs (CDF)"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  # The saved gene set of the notebook-02 model run whose seed-9 draw is used. All 22 saved
+  # hypoxia 1hr runs share an identical draw (checked 2026-11-12), so this choice is a label.
+  model_suffix: "eif33d_promotes_hypoxia_1hr_lfc0.5_tco_corrected_both_clipaggregate"
+  matrix_rds: "feature_matrix_tco.rds"
+  neg_seed: 9
+  save_plots: TRUE
+  save_table: TRUE
+editor_options:
+  chunk_output_type: console
+---
+
+```{r params_fallback, include=FALSE}
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  .fm <- rmarkdown::yaml_front_matter(here::here("code", "translational_control_overview",
+                                                 "liu2026_eef1a_k55me2", "02_cdf_eif3d_targets.Rmd"))
+  params <- lapply(.fm$params, function(z) if (is.list(z) && !is.null(z$value)) z$value else z)
+  rm(.fm)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(org.Hs.eg.db)
+})
+```
+
+# Plan
+
+Do mRNAs whose translation eIF3d promotes in MDA-MB-231 at hypoxia 1hr also lose (or gain)
+nascent protein synthesis when METTL13, the eEF1A K55 dimethyltransferase, is knocked out?
+
+**Groups.**
+
+- **eIF3d-promoted** (orange): the 1,436 genes the classifier uses as its positive class -
+  `hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` intersected with the feature matrix. TE log2(sictrl /
+  si3d) > 0.5, padj < 0.05.
+- **Negative control** (black): the classifier's size-matched negative class - 1,436 genes
+  drawn with `set.seed(9)` from `negative_control_genes.csv` (|TE LFC| < 0.5 and padj > 0.3 in
+  every si3d contrast), after removing positives from the pool. This is a **screened** set,
+  chosen for having no eIF3d effect, not a random background.
+- **All other detected proteins** (grey): every other protein in Liu Table 2A.
+
+**Readout.** Liu Table 2A, imported and checked against Fig. 1c in notebook 01: log2 fold
+change of newly synthesized protein, sgMETTL13 / sgControl, T3M4 cells. Negative = less
+protein made without K55me2.
+
+**What size-matching does not survive.** The two classes are equal in the model but are not
+equally detected by mass spec, so they are unequal here. That is reported, not corrected:
+the plotted negatives are exactly the model's.
+
+# Load the Liu table
+
+```{r load_liu}
+liu_csv <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2",
+                "liu2026_table2a_denps.csv")
+if (!file.exists(liu_csv))
+  stop("Run 01_import_denps_volcano.Rmd first: ", liu_csv, " not found")
+liu <- read_csv(liu_csv, show_col_types = FALSE)
+
+# Re-assert what 01 verified, so a stale or edited CSV cannot pass silently
+stopifnot(
+  nrow(liu) == 2364L, !anyDuplicated(liu$uniprot),
+  all(is.finite(liu$log2fc)),
+  identical(as.integer(table(liu$denp)[c("dDENP", "uDENP", "Unchanged")]), c(672L, 163L, 1529L))
+)
+cat("Liu proteins:", nrow(liu), "\n")
+```
+
+# Load the model's gene sets
+
+```{r load_sets}
+out_tco  <- here("output", "translational_control_overview")
+sets_csv <- file.path(out_tco, paste0("rf_model_gene_sets_", params$model_suffix, ".csv"))
+stopifnot("model gene-set CSV not found - knit 02_rf_model.Rmd with these params" =
+            file.exists(sets_csv))
+
+model_sets <- read_csv(sets_csv, show_col_types = FALSE)
+print(dplyr::count(model_sets, eif3d_target))
+
+pos_genes <- model_sets$gene_id_clean[model_sets$eif3d_target == "promotes"]
+neg_genes <- model_sets$gene_id_clean[model_sets$eif3d_target == "does_not_promote"]
+
+stopifnot(
+  setequal(unique(model_sets$eif3d_target), c("promotes", "does_not_promote")),
+  !anyDuplicated(model_sets$gene_id_clean),
+  length(pos_genes) == 1436L, length(neg_genes) == 1436L,
+  length(intersect(pos_genes, neg_genes)) == 0,
+  all(grepl("^ENSG[0-9]{11}$", model_sets$gene_id_clean))   # version-stripped
+)
+```
+
+## Check: the saved negatives are the seed-9 draw
+
+Rebuild the draw exactly as `02_rf_model.Rmd` does (`create_target` chunk) and require it to
+reproduce the saved negative class gene for gene. If this fails, the CSV is from a different
+seed, pool or matrix and the black curve would be mislabelled.
+
+```{r rederive_draw}
+matrix_genes <- readRDS(file.path(out_tco, params$matrix_rds))$gene_id_clean
+pos_csv  <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                     show_col_types = FALSE)
+neg_pool <- read_csv(here("output", "predictive_modeling", "negative_control_genes.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+pos_in <- pos_csv %>% filter(ensembl_gene %in% matrix_genes)
+pool   <- neg_pool %>%
+  filter(gene_id_clean %in% matrix_genes, !gene_id_clean %in% pos_in$ensembl_gene)
+
+set.seed(params$neg_seed)
+redrawn <- sample(pool$gene_id_clean, min(nrow(pos_in), nrow(pool)))
+
+cat("Positive CSV:", nrow(pos_csv), "| in matrix:", nrow(pos_in),
+    "| negative pool:", nrow(neg_pool), "| pool in matrix minus positives:", nrow(pool), "\n")
+stopifnot(
+  "positives are not the gene-set CSV intersected with the matrix" =
+    setequal(pos_in$ensembl_gene, pos_genes),
+  "re-derived seed-9 draw does not reproduce the saved negatives" =
+    setequal(redrawn, neg_genes)
+)
+cat("Seed", params$neg_seed, "draw reproduced: all", length(neg_genes), "negatives match\n")
+```
+
+## Check: direction of the eIF3d contrast
+
+The TE files are log2(sictrl / si3d) despite their `si3d_vs_sictrl` filename. EIF3D's own RNA
+must be strongly positive (the siRNA removes it), and every positive must have TE LFC > 0.5.
+The negatives must sit inside the |TE LFC| < 0.5 band.
+
+```{r direction}
+te <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+               show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+eif3d_rna <- te$rna_lfc[te$symbol == "EIF3D"]
+cat("EIF3D rna_lfc at hypoxia 1hr:", round(eif3d_rna, 2), "\n")
+stopifnot("EIF3D rna_lfc not strongly positive - contrast direction flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+
+te_pos <- te %>% filter(gene_id_clean %in% pos_genes)
+te_neg <- te %>% filter(gene_id_clean %in% neg_genes)
+stopifnot(
+  nrow(te_pos) == length(pos_genes), nrow(te_neg) == length(neg_genes),
+  all(te_pos$te_lfc > 0.5), all(te_pos$te_padj < 0.05),
+  all(abs(te_neg$te_lfc) < 0.5)
+)
+tibble(group = c("eIF3d-promoted", "Negative control"),
+       median_te_lfc = c(median(te_pos$te_lfc), median(te_neg$te_lfc)),
+       range_te_lfc  = c(paste(round(range(te_pos$te_lfc), 2), collapse = " to "),
+                         paste(round(range(te_neg$te_lfc), 2), collapse = " to "))) %>%
+  knitr::kable(digits = 3)
+```
+
+# Map Liu proteins to genes
+
+Table 2A carries UniProt accessions only. Mapping uses `org.Hs.eg.db`
+(`r as.character(packageVersion("org.Hs.eg.db"))`), UniProt -> Ensembl gene.
+
+Most one-to-many hits are the same gene on an alternate haplotype or patch (FLOT1, BAG6, CANX,
+CSNK2B...). Those copies get a TE estimate of their own in our table, but they carry the same
+symbol and the set gene is always the primary-assembly copy, so they are harmless. The real
+ambiguity is a protein encoded by **more than one distinct gene symbol** we measured, such as
+histone H4 (7 tested H4C genes, one protein): the mass spec cannot say which gene's mRNA made
+it, so such a protein is left grey rather than assigned to the orange or black group.
+
+```{r map}
+map <- AnnotationDbi::select(org.Hs.eg.db, keys = liu$uniprot, keytype = "UNIPROT",
+                             columns = c("ENSEMBL", "SYMBOL")) %>%
+  as_tibble() %>%
+  filter(!is.na(ENSEMBL)) %>%
+  distinct(uniprot = UNIPROT, gene_id_clean = ENSEMBL, symbol = SYMBOL)
+
+n_unmapped <- sum(!liu$uniprot %in% map$uniprot)
+cat("Unmapped proteins:", n_unmapped, "of", nrow(liu), "\n")
+stopifnot("too many unmapped proteins - wrong keytype or annotation" = n_unmapped < 50)
+
+# Spot-check known accessions
+spot <- c(P60228 = "EIF3E", P14174 = "MIF", P21980 = "TGM2", P52895 = "AKR1C2")
+got  <- map %>% filter(uniprot %in% names(spot)) %>% distinct(uniprot, symbol)
+stopifnot("UniProt spot-check failed" =
+            all(map_lgl(names(spot), ~ spot[[.x]] %in% got$symbol[got$uniprot == .x])))
+
+tested_sym <- te %>% filter(!is.na(te_padj)) %>% distinct(gene_id_clean, tested_symbol = symbol)
+
+prot <- map %>%
+  left_join(tested_sym, by = "gene_id_clean") %>%
+  mutate(group = case_when(gene_id_clean %in% pos_genes ~ "eIF3d-promoted",
+                           gene_id_clean %in% neg_genes ~ "Negative control")) %>%
+  group_by(uniprot) %>%
+  summarise(
+    n_tested_symbols = n_distinct(na.omit(tested_symbol)),
+    groups         = paste(sort(unique(na.omit(group))), collapse = "+"),
+    symbols        = paste(unique(symbol), collapse = ","),
+    gene_ids       = paste(unique(gene_id_clean[!is.na(group)]), collapse = ","),
+    .groups = "drop"
+  )
+
+stopifnot("a protein maps to both an eIF3d-promoted and a negative-control gene" =
+            !any(grepl("\\+", prot$groups)))
+
+ambiguous <- prot %>% filter(groups != "", n_tested_symbols > 1)
+cat("Labelled proteins encoded by >1 distinct tested gene symbol (left grey):", nrow(ambiguous), "\n")
+stopifnot("histone H4 should be the canonical ambiguous case" = "P62805" %in% ambiguous$uniprot)
+if (nrow(ambiguous) > 0) print(ambiguous)
+
+liu_lab <- liu %>%
+  left_join(prot, by = "uniprot") %>%
+  mutate(group = case_when(
+    uniprot %in% ambiguous$uniprot ~ "All other proteins",
+    groups == "eIF3d-promoted"     ~ "eIF3d-promoted",
+    groups == "Negative control"   ~ "Negative control",
+    TRUE                           ~ "All other proteins"
+  ))
+
+stopifnot(nrow(liu_lab) == nrow(liu), !anyDuplicated(liu_lab$uniprot))
+
+# Genes hit by more than one protein are counted once per protein; report them
+multi <- map %>% filter(uniprot %in% liu_lab$uniprot[liu_lab$group != "All other proteins"],
+                        gene_id_clean %in% c(pos_genes, neg_genes)) %>%
+  group_by(gene_id_clean) %>% filter(n_distinct(uniprot) > 1) %>% ungroup()
+cat("Set genes detected as >1 Liu protein:", n_distinct(multi$gene_id_clean), "\n")
+```
+
+## Detection
+
+```{r detection}
+det <- tibble(
+  group    = c("eIF3d-promoted", "Negative control"),
+  in_model = c(length(pos_genes), length(neg_genes)),
+  proteins_in_liu = c(sum(liu_lab$group == "eIF3d-promoted"),
+                      sum(liu_lab$group == "Negative control"))
+)
+det_genes <- c(n_distinct(map$gene_id_clean[map$uniprot %in% liu_lab$uniprot[liu_lab$group == "eIF3d-promoted"] & map$gene_id_clean %in% pos_genes]),
+               n_distinct(map$gene_id_clean[map$uniprot %in% liu_lab$uniprot[liu_lab$group == "Negative control"] & map$gene_id_clean %in% neg_genes]))
+det <- det %>% mutate(genes_detected = det_genes, pct_detected = 100 * genes_detected / in_model)
+knitr::kable(det, digits = 1)
+
+fisher_det <- fisher.test(matrix(c(det$genes_detected, det$in_model - det$genes_detected), 2))
+cat("Detection, promoted vs negative control: odds ratio",
+    round(fisher_det$estimate, 2), ", Fisher p =", signif(fisher_det$p.value, 3), "\n")
+```
+
+eIF3d-promoted genes are detected about twice as often as negative controls. Mass spec
+detects abundant, well-translated proteins first, so detection itself is selective: the two
+detected groups are not random samples of their parent sets, and the comparison below is
+between the **detected** members only.
+
+# CDF
+
+```{r cdf, fig.width = 6.5, fig.height = 4.5}
+grp_levels <- c("eIF3d-promoted", "Negative control", "All other proteins")
+grp_colors <- c("eIF3d-promoted" = "#E69F00", "Negative control" = "black",
+                "All other proteins" = "grey70")
+
+plot_df <- liu_lab %>% mutate(group = factor(group, levels = grp_levels))
+n_by    <- table(plot_df$group)
+grp_lab <- setNames(sprintf("%s (n = %s)", grp_levels, trimws(format(as.integer(n_by[grp_levels]), big.mark = ","))),
+                    grp_levels)
+
+x_pos <- plot_df$log2fc[plot_df$group == "eIF3d-promoted"]
+x_neg <- plot_df$log2fc[plot_df$group == "Negative control"]
+x_oth <- plot_df$log2fc[plot_df$group == "All other proteins"]
+stopifnot(length(x_pos) > 30, length(x_neg) > 30)
+
+w_pn <- wilcox.test(x_pos, x_neg)
+w_po <- wilcox.test(x_pos, x_oth)
+w_no <- wilcox.test(x_neg, x_oth)
+
+p_cdf <- ggplot(plot_df, aes(log2fc, colour = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  stat_ecdf(linewidth = 0.8) +
+  scale_colour_manual(values = grp_colors, labels = grp_lab, breaks = grp_levels, name = NULL) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.6, size = 3.4,
+           label = sprintf("promoted vs neg ctrl: Wilcoxon p = %s\nmedian %.3f vs %.3f",
+                           format.pval(w_pn$p.value, digits = 2),
+                           median(x_pos), median(x_neg))) +
+  labs(x = "log2 fold change in nascent protein, sgMETTL13 vs sgControl",
+       y = "Cumulative fraction",
+       title = "METTL13 KO nascent proteome (Liu 2026, T3M4)",
+       subtitle = "Groups: eIF3d TE, MDA-MB-231 hypoxia 1hr") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_blank())
+
+p_cdf
+
+if (isTRUE(params$save_plots))
+  ggsave(here("plots", "liu2026_02_cdf_eif3d_promoted_hypoxia_1hr.pdf"), p_cdf,
+         width = 6.5, height = 4.5)
+```
+
+```{r stats}
+tibble(
+  comparison = c("promoted vs negative control", "promoted vs all other", "negative control vs all other"),
+  n          = c(sprintf("%d vs %d", length(x_pos), length(x_neg)),
+                 sprintf("%d vs %d", length(x_pos), length(x_oth)),
+                 sprintf("%d vs %d", length(x_neg), length(x_oth))),
+  median_diff = c(median(x_pos) - median(x_neg), median(x_pos) - median(x_oth),
+                  median(x_neg) - median(x_oth)),
+  wilcoxon_p  = c(w_pn$p.value, w_po$p.value, w_no$p.value)
+) %>% knitr::kable(digits = 4)
+```
+
+**Reading (2026-11-12 knit).** The separation is the **negative control shifted down**, not the
+eIF3d-promoted set shifted up: promoted sits on top of all other proteins (median difference
++0.004, p = 0.08), while the negative controls lose more nascent protein on METTL13 KO than
+everything else (median -0.177 vs -0.127 for all others, p = 0.019). The negative set is
+screened for *no* eIF3d effect and is known to be GC-rich, so this may be a property of the
+screen rather than of eIF3d. An expressed-background comparator would settle which.
+
+## Liu's own calls by group
+
+Fraction of each group the paper called dDENP (down on METTL13 KO, P < 0.05) or uDENP (up).
+
+```{r denp_by_group}
+denp_tab <- liu_lab %>%
+  mutate(group = factor(group, levels = grp_levels)) %>%
+  dplyr::count(group, denp) %>%
+  group_by(group) %>% mutate(pct = 100 * n / sum(n)) %>% ungroup()
+denp_tab %>% dplyr::select(-n) %>%
+  pivot_wider(names_from = denp, values_from = pct) %>%
+  left_join(dplyr::count(liu_lab, group = factor(group, levels = grp_levels), name = "n"), by = "group") %>%
+  knitr::kable(digits = 1)
+
+f_d <- liu_lab %>% filter(group != "All other proteins") %>%
+  with(fisher.test(table(group == "eIF3d-promoted", denp == "dDENP")))
+cat("dDENP enrichment, promoted vs negative control: odds ratio",
+    round(f_d$estimate, 2), ", Fisher p =", signif(f_d$p.value, 3), "\n")
+```
+
+# Save
+
+```{r save}
+if (isTRUE(params$save_table)) {
+  out <- here("output", "translational_control_overview", "liu2026_eef1a_k55me2",
+              "liu2026_table2a_eif3d_hypoxia_1hr_groups.csv")
+  liu_lab %>%
+    dplyr::select(uniprot, protein_name, symbols, gene_ids, group, log2fc, neglog10_p, denp) %>%
+    write_csv(out)
+  cat("Wrote", out, "\n")
+}
+```
+
+```{r session}
+sessionInfo()
+```

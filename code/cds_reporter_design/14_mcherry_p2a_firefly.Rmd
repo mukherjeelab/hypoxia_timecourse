@@ -1,0 +1,909 @@
+---
+title: "CDS reporter design 14 - mCherry/firefly P2A constructs, both orientations"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  min_codon_prop: 0.08
+  max_homopolymer: 6
+  gs_repeats: 3
+  gs_max_repeat: 6
+  gs_max_homopolymer: 4
+  xmax_kb: 3
+  seed: 9
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    min_codon_prop     = 0.08,  # drop codons used less than this within their AA
+    max_homopolymer    = 6,     # longest run of one base allowed
+    gs_repeats         = 3,     # GGGGS units in the linker upstream of P2A
+    gs_max_repeat      = 6,     # longest exact repeat allowed inside it (nt)
+    gs_max_homopolymer = 4,     # tighter homopolymer cap inside it
+    xmax_kb            = 3,     # length panel clipped here
+    seed               = 9      # project standard
+  )
+}
+```
+
+# Overview
+
+The firefly transfection-efficiency control, in **both orientations**:
+
+```
+C-terminal firefly   mCherry - HA - (GGGGS)x3 - P2A - firefly
+N-terminal firefly   firefly - (GGGGS)x3 - P2A - mCherry - HA
+```
+
+Each is one ORF, measured as one CDS. The notebook answers the same two
+questions for both - **how long** and **where does GC3 sit** - and places them
+together on the two panels `01_` uses, with nothing else on the figure.
+
+**A 1xHA tag sits at mCherry's own C terminus in both**, which puts it in a
+different place in the ORF each time: immediately before the GS linker when
+mCherry leads, and at the very end of the construct when mCherry trails. It
+follows mCherry rather than a fixed position, so the builder works from an
+ordered part layout rather than an upstream/downstream pair.
+
+**The two orientations are the same length, exactly, and that is structural
+rather than a coincidence.** Both constructs hold the same five parts; only
+their order differs. Every part's terminal stop is stripped and a single `TAA`
+is appended to the finished ORF, so neither orientation can gain or lose a
+codon relative to the other. Both are 2,613 nt ordered. A length comparison
+between them is therefore perfectly controlled, and on the length panel the two
+reference lines fall on top of each other - drawn with different linetypes so
+neither is hidden.
+
+**Composition as supplied is nowhere near typical.** mCherry is GC3 97.0% and
+the GS linker's naive encoding is GC3 100%, putting either assembled construct
+near **GC3 83.5%** against an expressed-transcriptome median of 57.3%. So
+mCherry, the GS linker and firefly are **recoded synonymously** onto the 231
+composition in each orientation. The protein is unchanged at every position and
+the length cannot change, because synonymous recoding never does.
+
+**P2A is the one part held fixed in both.** It works by ribosomal skipping of
+its own Gly-Pro bond, so its sequence is the mechanism rather than a carrier of
+composition.
+
+**Assembly rules, each forced rather than chosen:**
+
+1. **Every part's terminal stop is stripped.** A stop 5' of P2A would end
+   translation before the downstream protein ever appears, and mCherry can no
+   longer be 3'-most on its own now that HA follows it. Both mCherry and
+   firefly are supplied with one, so both lose it.
+2. **A single `TAA` is appended to the finished ORF**, at the end of the full
+   CDS and nowhere else. Applying one rule to both orientations is what makes
+   their lengths identical by construction rather than by arithmetic accident.
+3. **The (GGGGS)x3 linker always sits between the upstream part and P2A**, in
+   both orientations, as it does in the HiBiT ladder: P2A leaves its own
+   18-residue tail fused to whatever is upstream, and a flexible spacer keeps
+   that tail off the upstream protein's fold. The spreadsheet has no GS linker
+   row, so its DNA is designed here.
+4. **No EcoRI constraint.** The eGFP ladder pins the `GAATTC` count because its
+   Waldo linker carries the one intended site; these constructs have no Waldo
+   linker, so there is no site to protect and the count is reported rather than
+   constrained.
+
+**Lengths are reported stop-free**, matching how the gene CDS lengths on the
+panels are measured. The ordered insert is 3 nt longer than the plotted number.
+
+# 1. Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+source(here("code", "cds_reporter_design", "recoder.R"))
+```
+
+```{r params_chunk}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+stopifnot(
+  "min_codon_prop must be in (0, 1/6)" =
+    params$min_codon_prop > 0 && params$min_codon_prop < 1 / 6,
+  "max_homopolymer must be at least 4" = params$max_homopolymer >= 4,
+  "gs_repeats must be at least 2 for the repeat checks to mean anything" =
+    params$gs_repeats >= 2,
+  "gs_max_repeat must be below the 15 nt GGGGS unit length" =
+    params$gs_max_repeat >= 3 && params$gs_max_repeat < 15,
+  "gs_max_homopolymer must not exceed the construct-wide cap" =
+    params$gs_max_homopolymer >= 4 &&
+    params$gs_max_homopolymer <= params$max_homopolymer
+)
+```
+
+# 2. Import and Verify the Parts
+
+```{r read_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+
+parts <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts$part)))
+pseq <- setNames(parts$seq, parts$part)
+
+needed <- c("mcherry", "p2a", "firefly", "ha")
+stopifnot(
+  "A required part is missing from cds seq.xlsx" = all(needed %in% names(pseq)),
+  "A part contains non-ACGT characters" = all(!grepl("[^ACGT]", pseq[needed])),
+  "A part is not divisible by 3" = all(nchar(pseq[needed]) %% 3 == 0)
+)
+
+mcherry_raw <- pseq[["mcherry"]]
+p2a         <- pseq[["p2a"]]
+firefly_raw <- pseq[["firefly"]]
+ha          <- pseq[["ha"]]
+
+aa_of <- function(s) as.character(translate(DNAString(s)))
+rc_aa <- function(s) as.character(translate(reverseComplement(DNAString(s))))
+
+P2A_AA <- "ATNFSLLKQAGDVEENPGP"
+HA_AA  <- "YPYDVPDYA"
+
+stopifnot(
+  "p2a does not encode the expected 19-aa P2A peptide" = aa_of(p2a) == P2A_AA,
+  # 1xHA. The spreadsheet also carries `3x ha` (29 aa) and a 1-codon `ha
+  # linker`; this is the bare 9-residue epitope, asserted by peptide so the
+  # wrong row cannot be picked up silently.
+  "ha does not encode the 9-residue HA epitope YPYDVPDYA" = aa_of(ha) == HA_AA,
+  "ha is not 27 nt" = nchar(ha) == 27,
+  "ha carries a stop codon" = !any(codon_split(ha) %in% STOP_CODONS),
+  "Both orientations encode HA: the check is not discriminative" =
+    rc_aa(ha) != HA_AA,
+  # Both parts must be able to serve as the ORF's initiator, since either can
+  # be the upstream one.
+  "mcherry does not start with ATG" = substr(mcherry_raw, 1, 3) == "ATG",
+  "firefly does not start with ATG" = substr(firefly_raw, 1, 3) == "ATG",
+  # Orientation: a sequence can be in frame, the right length and still
+  # backwards, so each check is paired with the assertion that the reverse
+  # complement does NOT encode the same peptide.
+  "Both orientations encode P2A: the check is not discriminative" =
+    rc_aa(p2a) != P2A_AA,
+  "Both orientations encode mCherry: the check is not discriminative" =
+    rc_aa(mcherry_raw) != aa_of(mcherry_raw),
+  "Both orientations encode firefly: the check is not discriminative" =
+    rc_aa(firefly_raw) != aa_of(firefly_raw)
+)
+```
+
+```{r verify_stops}
+# Rules 1 and 2 are only well defined if BOTH parts carry a terminal stop: that
+# is what makes the two orientations the same length, since exactly one stop is
+# stripped whichever way round they go. Asserted rather than assumed.
+mch_cv <- codon_split(mcherry_raw)
+ff_cv  <- codon_split(firefly_raw)
+
+stopifnot(
+  "mCherry does not end in a stop codon" = tail(mch_cv, 1) %in% STOP_CODONS,
+  "mCherry has an internal stop codon" =
+    !any(head(mch_cv, -1) %in% STOP_CODONS),
+  "firefly does not end in a stop codon" = tail(ff_cv, 1) %in% STOP_CODONS,
+  "firefly has an internal stop codon" =
+    !any(head(ff_cv, -1) %in% STOP_CODONS),
+  "P2A carries a stop codon" = !any(codon_split(p2a) %in% STOP_CODONS)
+)
+cat(sprintf("mCherry %d nt, terminal %s | firefly %d nt, terminal %s\n",
+            nchar(mcherry_raw), tail(mch_cv, 1),
+            nchar(firefly_raw), tail(ff_cv, 1)))
+```
+
+**The firefly sequence is checked against the copy already in the repo.**
+`code/predictive_modeling/62_cds_length_gc_hypoxia_promotes.Rmd` carries the
+lab's luc2P inline. Parsing it out of that file and asserting the spreadsheet
+matches is the project's standing rule - import and verify, never transcribe -
+and here it is also the check that catches the **PEST-less** version of the same
+gene, which is a prefix of this one and would otherwise pass every length, frame
+and start-codon test.
+
+```{r verify_firefly_against_repo}
+nb62 <- readLines(here("code", "predictive_modeling",
+                       "62_cds_length_gc_hypoxia_promotes.Rmd"), warn = FALSE)
+ff_line <- grep("^ff_seq <- toupper", nb62)
+stopifnot("Could not find ff_seq in notebook 62_" = length(ff_line) == 1)
+ff_repo <- toupper(sub('.*toupper\\("([acgtACGT]+)".*', "\\1", nb62[ff_line]))
+
+stopifnot(
+  "The spreadsheet firefly does not match the luc2P sequence in notebook 62_" =
+    identical(firefly_raw, ff_repo),
+  "Parsed repo sequence is implausibly short: the regex did not capture it" =
+    nchar(ff_repo) > 1000
+)
+cat(sprintf("firefly verified against 62_: %d nt, bit-identical\n",
+            nchar(ff_repo)))
+
+PEST_AA <- "NSHGFPPEVEEQAAGTLPMSCAQESGMDRHPAACASARINV"
+ff_aa_full <- aa_of(substr(firefly_raw, 1, nchar(firefly_raw) - 3))
+stopifnot(
+  "firefly does not carry the 41-aa PEST degron at its C terminus" =
+    endsWith(ff_aa_full, PEST_AA)
+)
+cat(sprintf("firefly is luc2P: %d aa = luc2 %d aa + the %d-aa PEST degron\n",
+            nchar(ff_aa_full), nchar(ff_aa_full) - nchar(PEST_AA),
+            nchar(PEST_AA)))
+```
+
+# 3. MDA-MB-231 Background and the GC3 Target
+
+Same derivation as `01_` and `08_`: the target is computed from the transcript
+set the panels plot, never typed in.
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+```
+
+```{r build_metrics}
+cds_seqs    <- build_cds_seqs(here("accessories", "human",
+                                   "txdb.gencode49.sqlite"))
+cds_int     <- DNAStringSet(trim_internal(as.character(cds_seqs)))
+names(cds_int) <- names(cds_seqs)
+
+cds_nostop  <- subseq(cds_seqs, start = 1L,
+                      end = BiocGenerics::width(cds_seqs) - 3L)
+metrics_all <- tibble(
+  transcript_id_clean = names(cds_seqs),
+  cds_length = BiocGenerics::width(cds_nostop),
+  gc_pct  = as.numeric(letterFrequency(cds_nostop, letters = "GC",
+                                       as.prob = TRUE)) * 100,
+  gc3_pct = sapply(as.character(cds_int), compute_gc3_pct, USE.NAMES = FALSE)
+)
+
+expressed <- tx_all %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+promoted <- tx_promotes %>%
+  inner_join(metrics_all, by = "transcript_id_clean") %>% filter(cds_length > 0)
+
+stopifnot(
+  "GC3% out of range" = all(between(expressed$gc3_pct, 0, 100)),
+  "GC3 median not in expected range [40, 65]" =
+    between(median(expressed$gc3_pct), 40, 65)
+)
+actb <- expressed %>% filter(symbol == "ACTB") %>% dplyr::slice(1)
+stopifnot("ACTB CDS GC% outside expected 50-70%" = between(actb$gc_pct, 50, 70))
+
+TARGET_GC3 <- median(expressed$gc3_pct)
+cat(sprintf("Expressed n = %s, GC3 target %.2f%%, median length %s nt\n",
+            fmt_n(nrow(expressed)), TARGET_GC3,
+            fmt_n(median(expressed$cds_length))))
+cat(sprintf("Promoted  n = %s, median GC3 %.1f%%, median length %s nt\n",
+            fmt_n(nrow(promoted)), median(promoted$gc3_pct),
+            fmt_n(median(promoted$cds_length))))
+```
+
+# 4. Codon Usage of the Expressed Transcriptome
+
+```{r codon_usage}
+GEN <- GENETIC_CODE
+AA  <- setNames(as.character(GEN), names(GEN))
+stopifnot("Codon-to-amino-acid lookup lost its names" =
+            identical(names(AA), names(GEN)))
+sense <- names(GEN)[AA != "*"]
+
+expr_seqs <- cds_int[names(cds_int) %in% expressed$transcript_id_clean]
+cf <- trinucleotideFrequency(expr_seqs, step = 3)
+stopifnot("trinucleotideFrequency lost its codon column names" =
+            !is.null(colnames(cf)) && all(names(GEN) %in% colnames(cf)))
+
+usage <- tibble(codon = colnames(cf), count = colSums(cf)) %>%
+  filter(AA[codon] != "*") %>%
+  mutate(aa = AA[codon]) %>%
+  group_by(aa) %>% mutate(prop = count / sum(count)) %>% ungroup()
+stopifnot(
+  "Synonymous proportions do not sum to 1 within every amino acid" =
+    all(abs((usage %>% group_by(aa) %>% summarise(s = sum(prop)))$s - 1) < 1e-9),
+  "A sense codon is missing from the usage table" = setequal(usage$codon, sense)
+)
+leu <- usage %>% filter(aa == "L") %>% dplyr::slice_max(prop, n = 1)
+stopifnot("CTG is not the most-used Leu codon: usage table may be misaligned" =
+            leu$codon == "CTG")
+
+USE   <- setNames(usage$prop, usage$codon)
+BASES <- c("A", "C", "G", "T")
+
+pick_list <- function(cods) {
+  keep <- cods[USE[cods] >= params$min_codon_prop]
+  if (!length(keep)) cods[which.max(USE[cods])] else keep
+}
+MENU <- map(split(sense, AA[sense]), function(cods) {
+  by_base <- map(setNames(BASES, BASES), ~ cods[str_sub(cods, 3, 3) == .x])
+  map(by_base[lengths(by_base) > 0], pick_list)
+})
+```
+
+```{r base_ratios}
+b3_col  <- str_sub(colnames(cf), 3, 3)
+tx_n3   <- sapply(setNames(BASES, BASES),
+                  function(b) rowSums(cf[, b3_col == b, drop = FALSE]))
+tx_pct3 <- 100 * tx_n3 / rowSums(tx_n3)
+med3 <- apply(tx_pct3, 2, median)
+R_G <- med3[["G"]] / (med3[["G"]] + med3[["C"]])
+R_A <- med3[["A"]] / (med3[["A"]] + med3[["T"]])
+stopifnot(
+  "Third-base split ratios are out of range" =
+    between(R_G, 0, 1) && between(R_A, 0, 1),
+  "Split ratios and the GC3 target disagree: they are not the same statistic" =
+    abs((med3[["G"]] + med3[["C"]]) / sum(med3) * 100 - TARGET_GC3) < 1
+)
+cat(sprintf("G:(G+C) = %.3f   A:(A+T) = %.3f\n", R_G, R_A))
+```
+
+# 5. The GS Linker
+
+```{r gs_linker}
+GS_UNIT_AA <- "GGGGS"
+GS_UNIT_NT <- 3L * nchar(GS_UNIT_AA)
+gs_aa      <- strrep(GS_UNIT_AA, params$gs_repeats)
+
+# The linker's PRE-recode state is the naive encoding - the most-used codon per
+# residue in this same 231 table - which is what a synthesis vendor's optimizer
+# returns and is the exact tandem repeat the recoding has to break.
+gs_naive <- naive_encoding(gs_aa, usage)
+gs_cv    <- codon_split(gs_naive)
+n_gs     <- length(gs_cv)
+
+gs_units <- function(linker)
+  substring(linker,
+            seq(1L, by = GS_UNIT_NT, length.out = params$gs_repeats),
+            seq(GS_UNIT_NT, by = GS_UNIT_NT, length.out = params$gs_repeats))
+longest_homopolymer <- function(s)
+  max(nchar(str_extract_all(s, "(A+|C+|G+|T+)")[[1]]))
+
+stopifnot(
+  "The naive GS linker does not encode the GGGGS repeat" =
+    aa_of(gs_naive) == gs_aa,
+  "The naive GS linker is not a tandem repeat: the repeat constraint has no motivation" =
+    length(unique(gs_units(gs_naive))) == 1L
+)
+
+# Glycine's only G-ending codon is GGG, and inside a polyglycine run it is
+# always followed by another GG, so picking it puts a 5 nt G run in the linker.
+# The construct-wide menu cannot say "not here", so the linker's glycines give
+# up G and the G-enders the target needs go elsewhere.
+gs_menus <- map(MENU[AA[gs_cv]], function(m)
+  if (identical(m[["G"]], "GGG")) m[names(m) != "G"] else m)
+stopifnot("The GS menu restriction did not remove GGG" =
+            !any(map_lgl(gs_menus, ~ "GGG" %in% unlist(.x))))
+cat("Naive GS linker:", gs_naive, "| GC3",
+    round(compute_gc3_pct(gs_naive), 1), "%\n")
+```
+
+# 6. Build Both Orientations
+
+One builder, driven by an **ordered part layout** rather than an
+upstream/downstream pair. HA follows mCherry wherever mCherry sits, so the two
+orientations are not mirror images of one another and a builder phrased as
+"upstream part, linker, P2A, downstream part" cannot express them both.
+
+Every sense codon except the initiator and P2A's nineteen is free, and they are
+drawn as **one assignment** rather than block by block, because the third-base
+target is a count over the whole construct and splitting it between parts would
+need an arbitrary allocation. `assign_third_bases` reads amino acids off a plain
+vector and never looks at position, so the free codons do not have to be
+contiguous - which is what lets HA, sitting in a different place in each
+orientation, be handled without a special case.
+
+```{r builder}
+R <- make_recoder(TARGET_GC3, R_G, R_A, MENU, USE, AA, params$max_homopolymer)
+
+strip_terminal_stop <- function(s)
+  if (tail(codon_split(s), 1) %in% STOP_CODONS) substr(s, 1, nchar(s) - 3) else s
+
+P2A_PART <- "P2A (fixed)"
+GS_PART  <- sprintf("GS linker (%dxGGGGS)", params$gs_repeats)
+ORF_STOP <- "TAA"
+
+# Sense forms of every part: stops stripped, so the ORF gains exactly one
+# terminator at the very end regardless of how the parts are ordered.
+sense_parts <- list(
+  "mCherry"       = strip_terminal_stop(mcherry_raw),
+  "HA (1x)"       = ha,
+  GS_PART         = gs_naive,
+  P2A_PART        = p2a,
+  "firefly luc2P" = strip_terminal_stop(firefly_raw))
+names(sense_parts)[3:4] <- c(GS_PART, P2A_PART)
+
+stopifnot(
+  "A sense part still carries a stop codon" =
+    !any(map_lgl(sense_parts, ~ any(codon_split(.x) %in% STOP_CODONS)))
+)
+
+# layout: the part names in construct order.
+build_orientation <- function(label, layout, seed = params$seed) {
+  stopifnot(
+    "A layout names a part that does not exist" =
+      all(layout %in% names(sense_parts)),
+    "A layout does not use every part exactly once" =
+      setequal(layout, names(sense_parts)) && !any(duplicated(layout))
+  )
+
+  cvs    <- map(sense_parts[layout], codon_split)
+  ends   <- cumsum(lengths(cvs))
+  starts <- ends - lengths(cvs) + 1L
+  all_cv <- unlist(cvs, use.names = FALSE)
+
+  idx_of <- function(nm) {
+    i <- match(nm, layout); starts[i]:ends[i]
+  }
+
+  # Fixed: the construct's initiator (position 1, whichever part leads) and all
+  # of P2A. Everything else is free.
+  fixed_idx <- c(1L, idx_of(P2A_PART))
+  free_idx  <- setdiff(seq_along(all_cv), fixed_idx)
+  free_cv   <- all_cv[free_idx]
+
+  # Per-position menus. The GS linker's glycines give up GGG - inside a
+  # polyglycine run it is always followed by another GG, which would put a 5 nt
+  # G run in the linker - so those positions carry a narrowed menu that a menu
+  # keyed by amino acid cannot express.
+  gs_global  <- idx_of(GS_PART)
+  free_menus <- map(seq_along(free_idx), function(k) {
+    g <- free_idx[k]
+    m <- MENU[[AA[[all_cv[g]]]]]
+    if (g %in% gs_global && identical(m[["G"]], "GGG")) m[names(m) != "G"] else m
+  })
+  gs_in_block <- which(free_idx %in% gs_global)
+  stopifnot(
+    "The GS linker is not entirely free" = length(gs_in_block) == n_gs,
+    "The GS menu restriction did not remove GGG" =
+      !any(map_lgl(free_menus[gs_in_block], ~ "GGG" %in% unlist(.x)))
+  )
+
+  assemble <- function(b) { out <- all_cv; out[free_idx] <- b; out }
+
+  gs_ok <- function(block) {
+    linker <- paste0(block[gs_in_block], collapse = "")
+    anyDuplicated(gs_units(linker)) == 0L &&
+      max_internal_repeat(linker) <= params$gs_max_repeat &&
+      longest_homopolymer(linker) <= params$gs_max_homopolymer
+  }
+
+  set.seed(seed)
+  need  <- R$block_needs(length(free_cv), all_cv[fixed_idx])
+  drawn <- R$draw_clean_block(
+    free_cv, need, assemble = assemble,
+    n_linkers = NA,            # no EcoRI requirement in these constructs
+    extra_ok = gs_ok, menus = free_menus, max_try = 5000)
+
+  recoded_cv    <- assemble(drawn$block)
+  recoded_sense <- paste0(recoded_cv, collapse = "")
+
+  cat(sprintf("%-18s %s | free %d of %d codons; clean draw %d\n",
+              label, paste(layout, collapse = " - "),
+              length(free_cv), length(all_cv), drawn$tries))
+
+  list(
+    label = label, layout = layout,
+    original_sense = paste0(unlist(sense_parts[layout]), collapse = ""),
+    sense = recoded_sense,
+    full  = paste0(recoded_sense, ORF_STOP),
+    parts = tibble(
+      part   = layout,
+      before = map_chr(layout, ~ sense_parts[[.x]]),
+      after  = map_chr(layout, ~ paste0(recoded_cv[idx_of(.x)], collapse = ""))),
+    p2a_at = idx_of(P2A_PART)
+  )
+}
+
+builds <- list(
+  build_orientation("C-terminal firefly",
+                    c("mCherry", "HA (1x)", GS_PART, P2A_PART, "firefly luc2P")),
+  build_orientation("N-terminal firefly",
+                    c("firefly luc2P", GS_PART, P2A_PART, "mCherry", "HA (1x)"))
+)
+names(builds) <- map_chr(builds, "label")
+
+construct_names <- c("C-terminal firefly" = "mCherry-HA-GS-P2A-firefly",
+                     "N-terminal firefly" = "firefly-GS-P2A-mCherry-HA")
+```
+
+# 7. Validation
+
+Checked on DNA translated independently rather than on the bookkeeping that
+produced it, for both orientations.
+
+```{r validate_protein}
+walk(builds, function(b) {
+  stopifnot(
+    "Recoded ORF differs in length from the original" =
+      nchar(b$sense) == nchar(b$original_sense),
+    "Recoding changed the protein" =
+      aa_of(b$sense) == aa_of(b$original_sense),
+    "Recoded ORF lost frame" = nchar(b$full) %% 3 == 0,
+    "Recoded ORF does not start with the initiator" =
+      substr(b$full, 1, 3) == "ATG",
+    # The terminator rule, both halves of it: exactly one stop, at the very end.
+    "Recoded ORF does not end in the terminator" =
+      tail(codon_split(b$full), 1) == ORF_STOP,
+    "Recoded ORF carries a stop before the end - including before P2A" =
+      !any(head(codon_split(b$full), -1) %in% STOP_CODONS),
+    "P2A is not bit-identical in the recoded construct" =
+      paste0(codon_split(b$sense)[b$p2a_at], collapse = "") == p2a,
+    # Discriminative companion: the free parts must NOT be unchanged, or
+    # nothing was recoded and every composition check below would still pass.
+    "A free part was not recoded" =
+      all((b$parts$before != b$parts$after)[b$parts$part != P2A_PART])
+  )
+})
+cat("Both orientations: protein unchanged, P2A bit-identical, all free parts changed\n")
+cat("Both ORFs carry exactly one stop codon, at the end\n")
+
+walk(builds, function(b) {
+  n_changed <- sum(codon_split(b$sense) != codon_split(b$original_sense))
+  cat(sprintf("  %-18s %s aa protein; %s codons changed\n", b$label,
+              fmt_n(nchar(b$sense) / 3), fmt_n(n_changed)))
+})
+```
+
+**HA must sit at mCherry's own C terminus in both**, which is the point of the
+layout. Checked on the protein rather than on the part order, so a layout typo
+could not pass.
+
+```{r validate_ha}
+walk(builds, function(b) {
+  prot    <- aa_of(b$sense)
+  mch_pep <- aa_of(sense_parts[["mCherry"]])
+  # The HA epitope must begin exactly where the mCherry peptide ends.
+  mch_at <- str_locate(prot, fixed(mch_pep))
+  stopifnot(
+    "The mCherry peptide is not present in the construct" = !is.na(mch_at[1]),
+    "HA does not immediately follow mCherry" =
+      substr(prot, mch_at[2] + 1, mch_at[2] + nchar(HA_AA)) == HA_AA
+  )
+  cat(sprintf("  %-18s mCherry ends at residue %d, HA at %d-%d\n", b$label,
+              mch_at[2], mch_at[2] + 1, mch_at[2] + nchar(HA_AA)))
+})
+
+# Discriminative companion: HA must appear ONCE, or a duplicated tag would
+# satisfy the adjacency test above while the construct carried two epitopes.
+walk(builds, function(b)
+  stopifnot("HA appears more than once in the construct" =
+              str_count(aa_of(b$sense), fixed(HA_AA)) == 1))
+cat("HA present exactly once in each construct, immediately after mCherry\n")
+```
+
+**The two orientations must be the same length.** Every part's stop is stripped
+and one terminator is appended, so the two ORFs hold the same codons in a
+different order - asserted against the part arithmetic rather than observed.
+
+```{r validate_length_match}
+lens <- map_int(builds, ~ nchar(.x$sense))
+expected <- sum(nchar(unlist(sense_parts)))
+stopifnot(
+  "The two orientations are not the same length" = length(unique(lens)) == 1,
+  "Orientation lengths do not match the part arithmetic" =
+    unique(lens) == expected
+)
+cat(sprintf("Both orientations: %s nt stop-free, %s nt ordered, identical by construction\n",
+            fmt_n(unique(lens)), fmt_n(unique(lens) + 3)))
+
+# Discriminative companion: same length must NOT mean same sequence, or the
+# builder is returning one construct twice.
+stopifnot("The two orientations are the same sequence" =
+            builds[[1]]$sense != builds[[2]]$sense)
+
+# Both must carry both full proteins, whichever way round they go.
+mch_pep <- aa_of(sense_parts[["mCherry"]])
+ff_pep  <- aa_of(sense_parts[["firefly luc2P"]])
+walk(builds, function(b) {
+  prot <- aa_of(b$sense)
+  stopifnot(
+    "Recoded construct does not contain the mCherry peptide" =
+      str_detect(prot, fixed(mch_pep)),
+    "Recoded construct does not contain the firefly peptide" =
+      str_detect(prot, fixed(ff_pep))
+  )
+})
+cat("Both constructs carry the full mCherry and firefly peptides\n")
+```
+
+```{r validate_motifs}
+walk(builds, function(b) {
+  max_run <- max(nchar(str_extract_all(b$full, "(A+|C+|G+|T+)")[[1]]))
+  stopifnot("A construct carries a homopolymer longer than the cap" =
+              max_run <= params$max_homopolymer)
+  cat(sprintf("  %-18s longest homopolymer %d nt (cap %d) | EcoRI sites %d (before recoding %d)\n",
+              b$label, max_run, params$max_homopolymer,
+              str_count(b$full, fixed("GAATTC")),
+              str_count(paste0(b$original_sense, ORF_STOP), fixed("GAATTC"))))
+})
+```
+
+```{r validate_gs_linker}
+gs_stats <- bind_rows(
+  tibble(construct = "Naive (most-used codon)", seq = gs_naive),
+  map_dfr(builds, ~ tibble(construct = .x$label,
+                           seq = .x$parts$after[.x$parts$part == GS_PART]))) %>%
+  mutate(n_units   = map_int(seq, ~ length(unique(gs_units(.x)))),
+         repeat_nt = map_int(seq, max_internal_repeat),
+         homo_nt   = map_int(seq, longest_homopolymer),
+         gc3_pct   = map_dbl(seq, compute_gc3_pct))
+print(gs_stats %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+
+walk(builds, function(b) {
+  s <- b$parts$after[b$parts$part == GS_PART]
+  stopifnot(
+    "A recoded GS linker changed the peptide" = aa_of(s) == gs_aa,
+    "Two GGGGS units in a recoded linker are identical" =
+      length(unique(gs_units(s))) == params$gs_repeats,
+    "A recoded GS linker still carries a long internal repeat" =
+      max_internal_repeat(s) <= params$gs_max_repeat,
+    "A recoded GS linker exceeds its homopolymer cap" =
+      longest_homopolymer(s) <= params$gs_max_homopolymer
+  )
+})
+stopifnot(
+  # Discriminative companions: both measures must FIRE on the naive encoding.
+  "The repeat measure does not detect the naive tandem repeat" =
+    max_internal_repeat(gs_naive) >= nchar(gs_naive) - GS_UNIT_NT,
+  "The naive encoding passes the unit-distinctness check: not discriminative" =
+    length(unique(gs_units(gs_naive))) < params$gs_repeats
+)
+```
+
+```{r spot_checks}
+# Biological spot-checks on proteins that must survive the recoding intact.
+# Positions are derived from the SUPPLIED sequence, never typed in, so the
+# check cannot drift if a part is replaced.
+myg <- str_locate(mch_pep, "MYG")
+stopifnot("No MYG chromophore tripeptide found in the supplied mCherry" =
+            !is.na(myg[1]))
+
+walk(builds, function(b) {
+  mch_new <- b$parts$after[b$parts$part == "mCherry"]
+  ff_new  <- b$parts$after[b$parts$part == "firefly luc2P"]
+  ha_new  <- b$parts$after[b$parts$part == "HA (1x)"]
+  stopifnot(
+    "mCherry chromophore moved or was lost" =
+      identical(str_locate(aa_of(mch_new), "MYG"), myg),
+    "The recoded firefly lost the PEST degron" =
+      endsWith(aa_of(ff_new), PEST_AA),
+    "The recoded HA no longer encodes the epitope" = aa_of(ha_new) == HA_AA,
+    "Recoded codons are not 231-like" =
+      mean(USE[codon_split(paste0(mch_new, ff_new, ha_new))]) > 0.25
+  )
+})
+cat(sprintf("Both orientations: mCherry MYG chromophore at residues %d-%d, firefly PEST intact, HA epitope intact\n",
+            myg[1], myg[2]))
+```
+
+# 8. The Answer: Length and GC3
+
+```{r composition}
+part_tbl <- map_dfr(builds, function(b)
+  b$parts %>%
+    mutate(construct = b$label,
+           nt = nchar(after), codons = nt / 3,
+           gc3_before = map_dbl(before, compute_gc3_pct),
+           gc3_after  = map_dbl(after,  compute_gc3_pct),
+           gc_before  = map_dbl(before, gc_pct_of),
+           gc_after   = map_dbl(after,  gc_pct_of)) %>%
+    dplyr::select(construct, part, nt, codons, gc3_before, gc3_after,
+                  gc_before, gc_after))
+
+print(part_tbl %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+
+comp_tbl <- map_dfr(builds, function(b) tibble(
+  construct   = construct_names[[b$label]],
+  orientation = b$label,
+  nt_ordered  = nchar(b$full),
+  cds_length  = nchar(b$sense),            # stop-free, the plotted basis
+  protein_aa  = nchar(b$sense) / 3,
+  gc3_before  = compute_gc3_pct(trim_internal(paste0(b$original_sense,
+                                                     ORF_STOP))),
+  gc3_pct     = compute_gc3_pct(trim_internal(b$full)),
+  gc_pct      = gc_pct_of(b$sense)))
+
+cat("\n=== Firefly transfection-efficiency control, both orientations ===\n")
+print(comp_tbl %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+
+# Joined, not compared positionally: `group_by()` returns groups in sorted
+# order, which need not be build order. Here the two happen to coincide
+# ("C-terminal" sorts before "N-terminal"), so a positional comparison passes
+# by luck - rename either orientation and it would silently compare the wrong
+# rows. `part_tbl`'s construct column holds the orientation label, so the join
+# is on that.
+part_sums <- part_tbl %>%
+  group_by(construct) %>% summarise(part_nt = sum(nt), .groups = "drop") %>%
+  dplyr::rename(orientation = construct)
+len_check <- comp_tbl %>% left_join(part_sums, by = "orientation")
+
+stopifnot(
+  "A construct missed its GC3 target by more than 1 point" =
+    all(abs(comp_tbl$gc3_pct - TARGET_GC3) <= 1),
+  "An orientation is missing from the part table" =
+    !any(is.na(len_check$part_nt)),
+  "Part lengths do not sum to the construct length" =
+    all(len_check$part_nt == len_check$cds_length)
+)
+cat(sprintf("\nGC3 target %.1f%%; both constructs within %.2f points.\n",
+            TARGET_GC3, max(abs(comp_tbl$gc3_pct - TARGET_GC3))))
+```
+
+```{r percentiles}
+ref_df  <- comp_tbl %>%
+  transmute(reporter = construct, cds_length, gc_pct, gc3_pct)
+pct_tbl <- reporter_percentiles(expressed, promoted, ref_df)
+print(pct_tbl)
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(between(pct_tbl$pct_expressed, 0, 100) &
+                  between(pct_tbl$pct_promoted, 0, 100)))
+```
+
+# 9. Panels
+
+Both constructs, nothing else on the figure.
+
+**On the length panel the two lines coincide exactly**, since the orientations
+are the same length. They are drawn solid and dashed so the second is not
+hidden under the first - the same reason the helper carries a linetype column
+at all.
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+
+# Okabe-Ito dark blue and reddish purple. Grey and orange are the two gene
+# distributions, and the project reserves orange for eIF3d and sky blue for
+# eIF3e, so neither can be used for a construct without the line reading as a
+# factor.
+ref_plot_df <- ref_df %>%
+  mutate(color    = c("#0072B2", "#CC79A7"),
+         linetype = c("solid", "dashed"),
+         reporter = factor(reporter, levels = reporter))
+```
+
+```{r panel_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab    = "CDS length (kb)",
+  title   = "CDS length, MDA-MB-231, firefly/mCherry P2A controls",
+  outfile = "cds_reporter_14_density_cds_length.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols,
+  xscale  = 1000, xmax = params$xmax_kb)
+```
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab    = "CDS GC3 content (%)",
+  title   = "CDS GC3 content, MDA-MB-231, firefly/mCherry P2A controls",
+  outfile = "cds_reporter_14_density_cds_gc3.pdf",
+  luc_tbl = ref_plot_df, group_cols = group_cols)
+```
+
+# 10. Outputs
+
+```{r write_outputs}
+outdir <- here("output", "cds_reporter_design")
+
+# One row per construct, with the recoded parts in a column named for the part
+# rather than by position: the two orientations hold the same five parts in a
+# different order, so `part1`/`part4` columns would mean different things in
+# the two rows and could not be read down the column.
+#
+# `cds` is the full ordered ORF including the terminal stop - these constructs
+# terminate, unlike `08_`/`12_`, so there is no separate stop-free column to
+# synthesise from.
+seq_tbl <- map_dfr(builds, function(b) {
+  parts_wide <- set_names(as.list(b$parts$after),
+                          c("mcherry", "ha", "gs_linker", "p2a",
+                            "firefly")[match(b$parts$part,
+                                             c("mCherry", "HA (1x)", GS_PART,
+                                               P2A_PART, "firefly luc2P"))])
+  tibble(construct   = construct_names[[b$label]],
+         orientation = b$label,
+         layout      = paste(b$parts$part, collapse = " - "),
+         nt_ordered  = nchar(b$full),
+         nt_stopfree = nchar(b$sense),
+         protein_aa  = nchar(b$sense) / 3,
+         stop_codon  = ORF_STOP,
+         !!!parts_wide,
+         cds         = b$full)
+}) %>%
+  left_join(comp_tbl %>% dplyr::select(construct, gc3_pct, gc3_before, gc_pct),
+            by = "construct")
+stopifnot(
+  "A part column is missing from the exported sequence table" =
+    all(c("mcherry", "ha", "gs_linker", "p2a", "firefly") %in% names(seq_tbl))
+)
+
+write_csv(seq_tbl, file.path(outdir, "14_p2a_controls_sequences.csv"))
+write_csv(part_tbl, file.path(outdir, "14_p2a_controls_part_composition.csv"))
+write_csv(comp_tbl, file.path(outdir, "14_p2a_controls_composition.csv"))
+write_csv(pct_tbl,  file.path(outdir, "14_p2a_controls_percentiles_vs_231.csv"))
+
+cat("Wrote 4 tables to", outdir, "\n")
+```
+
+```{r session}
+sessionInfo()
+```

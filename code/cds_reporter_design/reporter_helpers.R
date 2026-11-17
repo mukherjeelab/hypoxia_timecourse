@@ -436,9 +436,16 @@ build_cds_metrics <- function(txdb_path) {
 
 # expressed / promoted: data frames carrying transcript_id_clean,
 # gene_id_clean and the three metric columns.
+# metric_fmt: optional function(x) -> string, used for the numbers the legend
+# carries (each group's median, each reference line's own value). The default
+# below handles the two metrics this folder started with - a length in nt and a
+# percentage - by branching on the column name, which cannot extend to a third.
+# A caller plotting anything else (a 5'UTR length, a log2 axis) passes its own
+# formatter rather than being silently labelled a percentage. Omitting it keeps
+# the original behaviour exactly, so no existing panel changes.
 plot_density_luc <- function(expressed, promoted, xvar, xlab, title, outfile,
                              luc_tbl = NULL, group_cols,
-                             xscale = 1, xmax = NULL) {
+                             xscale = 1, xmax = NULL, metric_fmt = NULL) {
   # luc_tbl = NULL draws the gene distributions alone, with no reference lines.
   # An empty table is built with the columns the code below expects rather than
   # branching around every use of it, so the no-reference case walks the same
@@ -460,10 +467,12 @@ plot_density_luc <- function(expressed, promoted, xvar, xlab, title, outfile,
   # each density curve, the construct's own value for each reference line. Units
   # follow the metric, not the axis - the length axis is drawn in kb because kb
   # ticks are readable, but a construct is specified in nt, so the label says nt.
-  fmt_metric <- function(x) {
+  fmt_metric <- if (!is.null(metric_fmt)) metric_fmt else function(x) {
     if (xvar == "cds_length") sprintf("%s nt", fmt_n(round(x)))
     else sprintf("%.1f%%", x)
   }
+  stopifnot("metric_fmt must be a function of one argument" =
+              is.function(fmt_metric))
 
   lev    <- levels(df$group)
   n_tab  <- df %>%

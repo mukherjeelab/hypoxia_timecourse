@@ -1,0 +1,372 @@
+---
+title: "CDS reporter design 13 - 5'UTR length in the MDA-MB-231 landscape"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  ref_utr5_nt: 190
+  xmax_nt: 1000
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    ref_utr5_nt = 190,    # the reference line, in nt
+    xmax_nt     = 1000    # linear panel clipped here; the log2 panel is not
+  )
+}
+```
+
+# Overview
+
+The 5'UTR counterpart to `01_`'s CDS panels: how long are the 5'UTRs of the
+expressed MDA-MB-231 transcriptome, and of the mRNAs eIF3d translationally
+promotes in hypoxia, with a reference line at `r params$ref_utr5_nt` nt.
+
+**Same transcripts, same groups, same estimator as `01_`.** The two gene sets
+are built exactly as they are there and in `08_` - the expressed set is the
+feature matrix's transcript per gene, the promoted set is `te_lfc > 0.5` and
+`te_padj < 0.05` at hypoxia 1hr - and the panel is drawn by the same
+`plot_density_luc`. So a 5'UTR panel and a CDS panel describe the same mRNAs
+and can be read side by side.
+
+**The distribution is strongly right-skewed, so there are two panels.** 5'UTR
+length runs from a few nt to over 10 kb with a median near 130, which on a
+linear axis is a spike against the origin and a tail nobody can read. The
+linear panel is drawn clipped at `r params$xmax_nt` nt because that is the
+panel that matches `01_`'s style; the **log2 panel is the one to read**, and
+its legend still reports medians in nt, since the median survives a monotone
+transform unchanged.
+
+**The reference line is only interpretable with its percentile**, which
+section 5 reports against both groups - a line drawn without one says where a
+number is, not whether it is unusual.
+
+# 1. Load Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r params_chunk}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+stopifnot(
+  "ref_utr5_nt must be a positive length" =
+    length(params$ref_utr5_nt) == 1 && params$ref_utr5_nt > 0,
+  "xmax_nt must leave the reference line on the panel" =
+    params$xmax_nt > params$ref_utr5_nt
+)
+cat("Reference line:", params$ref_utr5_nt, "nt | linear panel clipped at",
+    params$xmax_nt, "nt\n")
+```
+
+# 2. The Two Gene Sets
+
+Identical derivation to `01_` and `08_`, repeated rather than inherited so this
+notebook fails on its own if the contrast or the matrix changes.
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+```
+
+# 3. 5'UTR Lengths
+
+Taken from the same GENCODE v49 TxDb the CDS panels use. A 5'UTR can be split
+across exons, so the length is the **summed exon width**, not the span from the
+transcript start to the ATG - which would include introns and overstate it.
+
+```{r utr5_lengths}
+txdb <- AnnotationDbi::loadDb(here("accessories", "human",
+                                   "txdb.gencode49.sqlite"))
+u5     <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+u5_len <- sum(BiocGenerics::width(u5))
+names(u5_len) <- sub("\\..*", "", names(u5_len))
+
+stopifnot(
+  "Duplicate transcript IDs after version stripping" =
+    !any(duplicated(names(u5_len))),
+  "A 5'UTR length is not a positive integer" =
+    all(u5_len > 0) && all(u5_len == as.integer(u5_len))
+)
+cat("Transcripts with an annotated 5'UTR in GENCODE v49:",
+    fmt_n(length(u5_len)), "\n")
+
+utr5_all <- tibble(transcript_id_clean = names(u5_len),
+                   utr5_length = as.integer(u5_len))
+```
+
+**The extraction is verified against a column that already exists.** `01_` in
+`code/predictive_modeling/` wrote `utr5_length` into the feature matrix from the
+same annotation. Recomputing it here and asserting the two agree exactly is
+cheaper than trusting either, and it is the check that would fire if the TxDb
+were rebuilt differently or if `fiveUTRsByTranscript` were handed the wrong
+grouping.
+
+```{r verify_against_matrix}
+check <- fm %>%
+  transmute(transcript_id_clean, fm_len = as.numeric(utr5_length)) %>%
+  inner_join(utr5_all, by = "transcript_id_clean")
+
+stopifnot(
+  "The feature matrix and the TxDb disagree on 5'UTR length" =
+    all(check$fm_len == check$utr5_length),
+  "Too few transcripts matched to make the check meaningful" =
+    nrow(check) > 5000
+)
+cat(sprintf("Verified against feature_matrix_external_stability.rds: %s transcripts, max deviation %g\n",
+            fmt_n(nrow(check)), max(abs(check$fm_len - check$utr5_length))))
+```
+
+**The panel is restricted to the transcripts the CDS panels also describe.**
+Without this the 5'UTR and CDS figures would be drawn on two slightly different
+sets and their n would differ for a reason that has nothing to do with 5'UTRs.
+`build_cds_seqs` is what defines that set: in frame, terminal stop present,
+`cds_end_NF` dropped.
+
+```{r restrict_to_cds_set}
+cds_ok <- names(build_cds_seqs(here("accessories", "human",
+                                    "txdb.gencode49.sqlite")))
+
+utr5_tbl <- utr5_all %>% filter(transcript_id_clean %in% cds_ok)
+
+expressed <- tx_all %>%
+  inner_join(utr5_tbl, by = "transcript_id_clean")
+promoted <- tx_promotes %>%
+  inner_join(utr5_tbl, by = "transcript_id_clean")
+
+# What the restriction and the annotation between them removed, stated rather
+# than left as an unexplained drop in n.
+cat(sprintf("Expressed: %s of %s transcripts carry a 5'UTR and a complete CDS\n",
+            fmt_n(nrow(expressed)), fmt_n(nrow(tx_all))))
+cat(sprintf("Promoted:  %s of %s\n",
+            fmt_n(nrow(promoted)), fmt_n(nrow(tx_promotes))))
+
+# The promoted set is NOT a subset of the expressed set, by construction: the
+# block above recovers a transcript from the salmon quantifications for every
+# promoted gene the feature matrix has no row for, and those transcripts are in
+# `tx_promotes` without being in `tx_all`. Asserting subset membership would
+# fail on correct data. What can be asserted is that the augmentation is the
+# ONLY source of the difference - anything else would mean the two sets were
+# built from different transcript lists.
+outside <- setdiff(promoted$transcript_id_clean, expressed$transcript_id_clean)
+stopifnot(
+  "5'UTR lengths must be positive" = all(expressed$utr5_length > 0),
+  "A promoted transcript is outside the expressed set for a reason other than the salmon augmentation" =
+    all(outside %in% extra_tx_df$transcript_id_clean),
+  "Median 5'UTR length outside the expected 50-400 nt range" =
+    between(median(expressed$utr5_length), 50, 400)
+)
+cat(sprintf("%s promoted transcripts sit outside the expressed set, all recovered from salmon for genes the feature matrix lacks\n",
+            fmt_n(length(outside))))
+```
+
+```{r spot_check}
+# Biological spot-check: TOP mRNAs - the cytosolic ribosomal proteins - have
+# characteristically SHORT 5'UTRs, a pyrimidine tract right at the cap. If the
+# extraction had picked up 3'UTRs, or summed the genomic span, this ordering
+# would not hold.
+rp <- expressed %>% filter(str_detect(symbol, "^RP[SL]\\d"))
+stopifnot(
+  "Too few ribosomal protein genes found for the spot-check" = nrow(rp) >= 50,
+  "Ribosomal protein 5'UTRs are not shorter than the median: extraction suspect" =
+    median(rp$utr5_length) < median(expressed$utr5_length)
+)
+cat(sprintf("Spot-check: %d ribosomal protein mRNAs, median 5'UTR %g nt vs %g nt transcriptome-wide\n",
+            nrow(rp), median(rp$utr5_length), median(expressed$utr5_length)))
+
+cat("\nExpressed 5'UTR length quantiles (nt):\n")
+print(round(quantile(expressed$utr5_length,
+                     c(.05, .25, .5, .75, .9, .95, .99))))
+```
+
+# 4. Panels
+
+```{r density_setup}
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+
+# The reference line. Black, per the project's color convention: grey and
+# orange are spoken for by the two gene distributions, and orange is reserved
+# for eIF3d, so a third hue there would read as a factor.
+ref_tbl <- tibble(
+  reporter    = sprintf("%g nt", params$ref_utr5_nt),
+  utr5_length = params$ref_utr5_nt,
+  color       = "black",
+  linetype    = "solid")
+
+# Lengths, not percentages, so the legend needs its own formatter - the helper's
+# default would print "190.0%".
+fmt_nt <- function(x) sprintf("%s nt", fmt_n(round(x)))
+```
+
+```{r panel_linear, fig.width=9.5, fig.height=5.5}
+p_lin <- plot_density_luc(
+  expressed, promoted, "utr5_length",
+  xlab       = "5'UTR length (nt)",
+  title      = "5'UTR length, MDA-MB-231",
+  outfile    = "cds_reporter_13_density_utr5_length.pdf",
+  luc_tbl    = ref_tbl, group_cols = group_cols,
+  xmax       = params$xmax_nt,
+  metric_fmt = fmt_nt)
+```
+
+The same data on a log2 axis. **This is the readable one** - the linear panel
+above spends most of its width on a tail holding a few percent of the
+transcripts, and compresses the range where almost every mRNA actually sits.
+
+```{r panel_log2, fig.width=9.5, fig.height=5.5}
+expressed_l <- expressed %>% mutate(log2_utr5_length = log2(utr5_length))
+promoted_l  <- promoted  %>% mutate(log2_utr5_length = log2(utr5_length))
+ref_tbl_l   <- ref_tbl %>% mutate(log2_utr5_length = log2(utr5_length))
+
+# The legend still reports nt: the median of the log2 values back-transforms to
+# the median in nt exactly, because the median commutes with any monotone
+# transform. Reporting log2 units there would make the two panels look like
+# they disagree.
+p_log <- plot_density_luc(
+  expressed_l, promoted_l, "log2_utr5_length",
+  xlab       = "log2 5'UTR length (nt)",
+  title      = "5'UTR length, MDA-MB-231",
+  outfile    = "cds_reporter_13_density_utr5_length_log2.pdf",
+  luc_tbl    = ref_tbl_l, group_cols = group_cols,
+  metric_fmt = function(x) fmt_nt(2^x))
+
+stopifnot(
+  "Back-transformed log2 median does not equal the nt median" =
+    abs(2^median(expressed_l$log2_utr5_length) -
+          median(expressed$utr5_length)) < 1e-6
+)
+```
+
+# 5. Where the Reference Line Sits
+
+```{r percentile}
+pct_tbl <- tibble(
+  group = c("All expressed mRNAs", "eIF3d hypoxia promotes"),
+  n     = c(nrow(expressed), nrow(promoted)),
+  median_nt = c(median(expressed$utr5_length), median(promoted$utr5_length)),
+  pct_at_or_below = c(
+    100 * mean(expressed$utr5_length <= params$ref_utr5_nt),
+    100 * mean(promoted$utr5_length  <= params$ref_utr5_nt))
+)
+print(pct_tbl %>% mutate(across(where(is.double), ~ round(.x, 1))) %>%
+        as.data.frame())
+
+stopifnot("Percentiles must lie in [0, 100]" =
+            all(between(pct_tbl$pct_at_or_below, 0, 100)))
+
+cat(sprintf("\n%g nt is the %.1fth percentile of expressed 5'UTRs and the %.1fth of the promoted set.\n",
+            params$ref_utr5_nt, pct_tbl$pct_at_or_below[1],
+            pct_tbl$pct_at_or_below[2]))
+
+# Disjoint comparison, matching what the panels report: the promoted set against
+# every OTHER expressed transcript, not against a pool containing itself.
+rest <- expressed %>% filter(!gene_id_clean %in% promoted$gene_id_clean)
+wt   <- wilcox.test(promoted$utr5_length, rest$utr5_length)
+cat(sprintf("Promoted (n = %s, median %g nt) vs other expressed (n = %s, median %g nt): Wilcoxon p = %s\n",
+            fmt_n(nrow(promoted)), median(promoted$utr5_length),
+            fmt_n(nrow(rest)), median(rest$utr5_length),
+            format.pval(wt$p.value, digits = 3)))
+```
+
+# 6. Outputs
+
+```{r write_outputs}
+outdir <- here("output", "cds_reporter_design")
+
+write_csv(pct_tbl, file.path(outdir, "13_utr5_length_summary.csv"))
+write_csv(
+  bind_rows(expressed %>% mutate(group = "expressed"),
+            promoted  %>% mutate(group = "promoted")) %>%
+    dplyr::select(group, transcript_id_clean, gene_id_clean, symbol,
+                  utr5_length),
+  file.path(outdir, "13_utr5_lengths_by_group.csv"))
+
+cat("Wrote 2 tables to", outdir, "\n")
+```
+
+```{r session}
+sessionInfo()
+```
