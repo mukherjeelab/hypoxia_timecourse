@@ -7,6 +7,12 @@ params:
   padj: 0.05
   min_lfc_both: 1
   n_top: 2
+  highlight: ""
+  controls: ""
+  controls_label: "Pos controls from Roiuk et al"
+  controls_tx: ""
+  neg_controls: ""
+  neg_controls_label: "Negative control"
 ---
 
 **Question.** Which mRNAs does eIF3d promote most strongly in hypoxia in **both** MDA-MB-231
@@ -18,7 +24,18 @@ Contrast: si3d knockdown, hypoxia 1hr, in each cell line. A gene qualifies if it
 significant in both lines (`te_padj` < `params$padj`) and its TE LFC is at least
 `params$min_lfc_both` in **both** lines (the floor). Qualifying genes are ranked by the **mean** of
 the two TE LFCs, so a larger fold change ranks higher; the floor stops one line carrying a gene
-that is weak in the other. The top `params$n_top` are highlighted. Normoxia plays no part in the
+that is weak in the other. The top `params$n_top` are highlighted. Setting `params$highlight` to
+comma-separated symbols (e.g. `"HERPUD1,TBPL1,RPP14,AGPAT1"`) highlights those genes instead,
+whether or not they pass the ranking rule; outputs then carry the symbols in their filenames.
+`params$controls` adds a second group (e.g. `"BCL2L12,TPRA1"`, the positive controls from the
+Teleman set 1 list in `POSITIVE_CONTROLS.md`) to the normoxia-vs-hypoxia scatter only, in
+Okabe-Ito dark blue, since orange and sky blue are reserved for eIF3d and eIF3e.
+`params$neg_controls` (e.g. `"ACTB"`) adds negative controls the same way, in black.
+`params$controls_tx` (e.g. `"TPRA1=ENST00000296210"`) pins a control to one transcript in the
+region density plots, in both cell lines, instead of each line's expressed transcript - used for
+TPRA1 so the plots show the 315-nt 5'UTR tested in the Teleman data (set 1), which is what a reporter
+would carry. Its region lengths and GC come from `transcript_length_gc.R`
+(`output/finding_positive_controls/transcript_length_gc.csv`, GENCODE v49). Normoxia plays no part in the
 ranking; it is only the x axis of the plot.
 
 **Direction.** All LFCs are log2(sictrl / si3d), so positive = knockdown lowers TE = eIF3d
@@ -33,7 +50,9 @@ only one it has).
 
 ```{r setup, message=FALSE, warning=FALSE}
 if (!exists("params") || !is.list(params)) {
-  params <- list(padj = 0.05, min_lfc_both = 1, n_top = 2)
+  params <- list(padj = 0.05, min_lfc_both = 1, n_top = 2, highlight = "",
+                 controls = "", controls_label = "Pos controls from Roiuk et al",
+                 neg_controls = "", neg_controls_label = "Negative control", controls_tx = "")
 }
 library(tidyverse); library(here); library(ggrepel)
 kd_orange <- "#E69F00"
@@ -96,6 +115,26 @@ cat("qualify (padj <", params$padj, "and TE LFC >=", params$min_lfc_both, "in bo
 stopifnot(nrow(ranked) >= params$n_top)
 
 top <- ranked %>% slice_head(n = params$n_top)
+# Optional hand-picked genes (Kate, 2026-11-20). Taken from all genes tested in both lines,
+# not from `ranked`, so a gene below the floor (e.g. AGPAT1, MCF7-SIX1 0.73) can still be shown.
+hl_syms <- trimws(strsplit(params$highlight, ",")[[1]])
+hl_syms <- hl_syms[hl_syms != ""]
+if (length(hl_syms)) {
+  top <- hyp %>% filter(symbol %in% hl_syms) %>%
+    mutate(mean_lfc = (lfc_231 + lfc_mcf) / 2) %>%
+    arrange(match(symbol, hl_syms))
+  stopifnot("a highlight symbol is not tested at hypoxia 1hr in both lines (or is duplicated)" =
+              identical(top$symbol, hl_syms))
+}
+out_tag <- if (length(hl_syms)) paste0("_", paste(hl_syms, collapse = "_")) else ""
+ctrl_syms <- trimws(strsplit(params$controls, ",")[[1]])
+ctrl_syms <- ctrl_syms[ctrl_syms != ""]
+stopifnot("a gene is in both highlight and controls" = !any(ctrl_syms %in% top$symbol))
+if (length(ctrl_syms)) out_tag <- paste0(out_tag, "_ctrl_", paste(ctrl_syms, collapse = "_"))
+neg_syms <- trimws(strsplit(params$neg_controls, ",")[[1]])
+neg_syms <- neg_syms[neg_syms != ""]
+stopifnot("a gene is in neg_controls and another group" = !any(neg_syms %in% c(top$symbol, ctrl_syms)))
+if (length(neg_syms)) out_tag <- paste0(out_tag, "_neg_", paste(neg_syms, collapse = "_"))
 ranked %>% slice_head(n = 15) %>%
   mutate(across(c(lfc_231, lfc_mcf, mean_lfc), ~ round(.x, 2)),
          across(c(padj_231, padj_mcf), ~ signif(.x, 2)),
@@ -133,7 +172,19 @@ pd <- bind_rows(line_df("mda231",   "MDA-MB-231"),
   mutate(cell_line = factor(cell_line, levels = c("MDA-MB-231", "MCF7-SIX1")))
 
 hl <- pd %>% filter(gene_id_clean %in% top$gene_id_clean)
-stopifnot("a top gene is missing from a normoxia file" = nrow(hl) == 2 * params$n_top)
+stopifnot("a top gene is missing from a normoxia file" = nrow(hl) == 2 * nrow(top))
+neg <- pd %>% filter(symbol %in% neg_syms)
+stopifnot("a negative control is missing from a cell line (or duplicated)" =
+            nrow(neg) == 2 * length(neg_syms))
+ctrl <- pd %>% filter(symbol %in% ctrl_syms)
+stopifnot("a control gene is missing from a cell line (or its symbol is duplicated)" =
+            nrow(ctrl) == 2 * length(ctrl_syms))
+lab_pts <- bind_rows(hl %>% mutate(group = "Selected eIF3d targets"),
+                     ctrl %>% mutate(group = params$controls_label),
+                     neg %>% mutate(group = params$neg_controls_label)) %>%
+  mutate(group = factor(group, levels = c("Selected eIF3d targets", params$controls_label,
+                                          params$neg_controls_label)))
+group_cols <- setNames(c(kd_orange, "#0072B2", "black"), levels(lab_pts$group))
 
 stats <- pd %>% group_by(cell_line) %>%
   summarise(n = n(), r = cor(x, y), .groups = "drop") %>%
@@ -149,7 +200,7 @@ hl %>% transmute(cell_line, symbol, normoxia_te_lfc = round(x, 2),
 # Zoom to the central 99.8% of genes on each axis (always keeping the highlighted genes in
 # view); a handful of extreme genes otherwise stretch the axes to +/-15 and squash the density.
 # Zooming with coord_equal() does not drop data, so R still uses every gene.
-lims <- range(quantile(c(pd$x, pd$y), c(0.001, 0.999)), hl$x, hl$y) + c(-0.25, 0.25)
+lims <- range(quantile(c(pd$x, pd$y), c(0.001, 0.999)), lab_pts$x, lab_pts$y) + c(-0.25, 0.25)
 n_out <- sum(pd$x < lims[1] | pd$x > lims[2] | pd$y < lims[1] | pd$y > lims[2])
 cat(sprintf("view: %.2f to %.2f; %d gene-points fall outside it (both panels)\n",
             lims[1], lims[2], n_out))
@@ -158,9 +209,10 @@ p <- ggplot(pd, aes(x, y)) +
   geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
   geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.3) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_point(data = hl, colour = kd_orange, size = 2.5) +
-  geom_text_repel(data = hl, aes(label = symbol), colour = "black", size = 4,
-                  min.segment.length = 0, box.padding = 0.6, seed = 9) +
+  geom_point(data = lab_pts, aes(colour = group), size = 2.5) +
+  scale_colour_manual(values = group_cols, name = NULL) +
+  geom_text_repel(data = lab_pts, aes(label = symbol), colour = "black", size = 4,
+                  min.segment.length = 0, box.padding = 0.6, max.overlaps = Inf, seed = 9) +
   geom_text(data = stats, aes(x = -Inf, y = Inf, label = lab), inherit.aes = FALSE,
             hjust = -0.05, vjust = 1.4, size = 3.5) +
   facet_wrap(~ cell_line, labeller = labeller(cell_line = function(s)
@@ -168,23 +220,106 @@ p <- ggplot(pd, aes(x, y)) +
   coord_equal(xlim = lims, ylim = lims) +
   labs(x = "TE log2 fold change, normoxia (log2 sictrl / si3d)",
        y = "TE log2 fold change, hypoxia 1hr (log2 sictrl / si3d)",
-       title = sprintf("Top %d eIF3d-promoted mRNAs in hypoxia, both cell lines", params$n_top),
-       subtitle = sprintf(paste("Positive = eIF3d promotes translation. Grey: all genes.",
-                                "%d gene-points lie outside the view"), n_out)) +
-  theme_classic(base_size = 12)
+       title = if (length(hl_syms)) "Selected eIF3d-promoted mRNAs in hypoxia, both cell lines" else
+         sprintf("Top %d eIF3d-promoted mRNAs in hypoxia, both cell lines", params$n_top),
+       subtitle = "Positive = eIF3d promotes translation. Grey: all genes") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = if (length(c(ctrl_syms, neg_syms))) "bottom" else "none")
 p
-ggsave(here("plots", "finding_positive_controls_04_top_targets_te_normoxia_vs_hypoxia.pdf"),
+ggsave(here("plots", paste0("finding_positive_controls_04_top_targets_te_normoxia_vs_hypoxia", out_tag, ".pdf")),
        p, width = 10, height = 5)
+```
+
+## 3b. Same genes, mRNA change: normoxia vs hypoxia
+
+The same layout as section 3, with the **mRNA** log2 fold change (RNA-seq, sictrl / si3d) in
+place of TE, to show whether each gene's mRNA level also moves on eIF3d knockdown. Both lines
+use apeglm-shrunken LFCs: MDA-MB-231 `rna_lfc` from the same TE files; MCF7-SIX1
+`rna_lfc_shrunk` from `00_mcf7six1_hypoxia_si3d_categories.Rmd` (knit once per condition), whose
+TE files carry no RNA column.
+
+**MDA-MB-231 mRNA is spike-in normalized and knockdown lowers total mRNA per cell**, so its cloud
+sits above zero on both axes (median `rna_lfc` 0.41 at hypoxia 1hr, 0.51 at normoxia 1+4hr; see
+CLAUDE.md). A gene at the cloud's centre there is typical, not unchanged. MCF7-SIX1 is not
+spike-in normalized and centres near zero.
+
+```{r plot_rna_data}
+mcf_rna <- function(cond) {
+  f <- here("output", "finding_positive_controls",
+            paste0("mcf7six1_", cond, "_1hr_si3d_rna_ribo_te_categories.csv"))
+  stopifnot("knit 00_mcf7six1_hypoxia_si3d_categories.Rmd for this condition first" = file.exists(f))
+  read_csv(f, show_col_types = FALSE) %>%
+    transmute(gene_id_clean = sub("\\..*", "", gene_id), symbol, rna_lfc = rna_lfc_shrunk)
+}
+mcf_rna_n <- mcf_rna("normoxia"); mcf_rna_h <- mcf_rna("hypoxia")
+# direction: si3d depletes EIF3D mRNA, so its promotes-positive RNA LFC must be large and positive
+for (d in list(mcf_rna_n, mcf_rna_h)) stopifnot("MCF7-SIX1 RNA direction" = d$rna_lfc[d$symbol == "EIF3D"] > 1.5)
+
+pd_rna <- bind_rows(
+  te$mda231_normoxia %>% dplyr::select(gene_id_clean, symbol, x = rna_lfc) %>%
+    inner_join(te$mda231_hypoxia %>% dplyr::select(gene_id_clean, y = rna_lfc), by = "gene_id_clean") %>%
+    mutate(cell_line = "MDA-MB-231"),
+  mcf_rna_n %>% dplyr::select(gene_id_clean, symbol, x = rna_lfc) %>%
+    inner_join(mcf_rna_h %>% dplyr::select(gene_id_clean, y = rna_lfc), by = "gene_id_clean") %>%
+    mutate(cell_line = "MCF7-SIX1")) %>%
+  filter(!is.na(x), !is.na(y)) %>%
+  mutate(cell_line = factor(cell_line, levels = c("MDA-MB-231", "MCF7-SIX1")))
+
+lab_rna <- lab_pts %>% dplyr::select(gene_id_clean, cell_line, group) %>%
+  inner_join(pd_rna, by = c("gene_id_clean", "cell_line"))
+stopifnot("a labelled gene has no RNA LFC in one line" = nrow(lab_rna) == nrow(lab_pts))
+
+stats_rna <- pd_rna %>% group_by(cell_line) %>%
+  summarise(n = n(), r = cor(x, y), med_x = median(x), med_y = median(y), .groups = "drop") %>%
+  mutate(lab = sprintf("Pearson R = %.2f, n = %s", r, format(n, big.mark = ",")))
+stats_rna %>% knitr::kable(digits = 3)
+lab_rna %>% transmute(cell_line, symbol, group, normoxia_rna_lfc = round(x, 2),
+                      hypoxia_rna_lfc = round(y, 2)) %>% arrange(cell_line, group) %>% knitr::kable()
+```
+
+```{r plot_rna, fig.width = 10, fig.height = 5}
+# EIF3D itself (~+3 to +4) is the extreme the 99.8% zoom exists to exclude; labelled genes stay in view
+lims_r <- range(quantile(c(pd_rna$x, pd_rna$y), c(0.001, 0.999)), lab_rna$x, lab_rna$y) + c(-0.25, 0.25)
+p_rna <- ggplot(pd_rna, aes(x, y)) +
+  geom_point(colour = "grey70", size = 0.3, alpha = 0.3) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(data = lab_rna, aes(colour = group), size = 2.5) +
+  scale_colour_manual(values = group_cols, name = NULL) +
+  geom_text_repel(data = lab_rna, aes(label = symbol), colour = "black", size = 4,
+                  min.segment.length = 0, box.padding = 0.6, max.overlaps = Inf, seed = 9) +
+  geom_text(data = stats_rna, aes(x = -Inf, y = Inf, label = lab), inherit.aes = FALSE,
+            hjust = -0.05, vjust = 1.4, size = 3.5) +
+  facet_wrap(~ cell_line, labeller = labeller(cell_line = function(s)
+    paste0(s, "\nx: ", x_lab[s]))) +
+  coord_equal(xlim = lims_r, ylim = lims_r) +
+  labs(x = "mRNA log2 fold change, normoxia (log2 sictrl / si3d)",
+       y = "mRNA log2 fold change, hypoxia 1hr (log2 sictrl / si3d)",
+       title = "mRNA change on eIF3d knockdown, same genes",
+       subtitle = "Positive = mRNA lower after knockdown. Grey: all genes. MDA-MB-231 is spike-in normalized") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = if (length(c(ctrl_syms, neg_syms))) "bottom" else "none")
+p_rna
+ggsave(here("plots", paste0("finding_positive_controls_04_top_targets_rna_normoxia_vs_hypoxia", out_tag, ".pdf")),
+       p_rna, width = 10, height = 5)
 ```
 
 ## 4. Length and GC by mRNA region: top genes against expressed genes and eIF3d targets
 
 Each cell line uses its own feature matrix, built on the transcript **that line expresses**
 (MDA-MB-231: `feature_matrix_tco.rds`; MCF7-SIX1: `feature_matrix_tco_mcf7six1.rds`), so a
-gene's transcript can differ between the two rows. **Expressed genes** = genes in that matrix that
+gene's transcript can differ between the two rows. **One exception, ACTB in MCF7-SIX1:** that matrix lists
+ENST00000425660, which carries 0.1% of ACTB mRNA and is an artifact of the GENCODE v26 / v49
+mismatch (see `POSITIVE_CONTROLS.md`, ACTB). Its 5'UTR matches MANE but its CDS (378 nt) and 3'UTR
+(1,383 nt) do not, so ACTB's MCF7-SIX1 row is replaced by the MANE transcript ENST00000646664 (the
+mRNA both lines actually express), taken from the MDA-MB-231 matrix where it is the selected
+transcript. Region features are sequence-derived, so they do not depend on the cell line. **Expressed genes** = genes in that matrix that
 were also tested for TE in that line at hypoxia 1hr. **eIF3d-promoted** = that line's existing
 gene set (hypoxia 1hr, TE LFC > 0.5, padj < 0.05). Grey is every other expressed gene, so the
-two groups do not overlap. The dashed lines mark the top genes from section 2. One figure per
+two groups do not overlap. Dashed lines mark the selected genes in their scatter colour: orange for
+the eIF3d targets, dark blue for `params$controls`, black for `params$neg_controls`. A control
+pinned by `params$controls_tx` shows that transcript in both panels. One figure per
 region (5'UTR, CDS, 3'UTR), each built by the same function.
 
 ```{r region_data}
@@ -201,6 +336,14 @@ fm <- imap_dfr(mats, function(f, line) {
     dplyr::select(gene_id_clean, transcript_id_clean, symbol,
                   all_of(paste0(names(regions), "_length")), all_of(paste0(names(regions), "_gc")))
   stopifnot(!anyDuplicated(m$gene_id_clean))
+  if (line == "MCF7-SIX1") {
+    mane <- readRDS(here("output", "translational_control_overview", mats[["MDA-MB-231"]])) %>%
+      filter(symbol == "ACTB") %>% dplyr::select(all_of(names(m)))
+    stopifnot("ACTB override: expected the v26 artifact in MCF7-SIX1 and MANE in 231" =
+                m$transcript_id_clean[m$symbol == "ACTB"] == "ENST00000425660",
+              nrow(mane) == 1, mane$transcript_id_clean == "ENST00000646664")
+    m <- bind_rows(m %>% filter(symbol != "ACTB"), mane)
+  }
   gs <- read_csv(here("output", "genesets", gsets[[line]]), show_col_types = FALSE)$ensembl_gene
   m %>% filter(gene_id_clean %in% tested[[line]]) %>%
     mutate(cell_line = line,
@@ -223,20 +366,52 @@ region_figure <- function(r) {
 
   top_r <- ud %>% filter(gene_id_clean %in% top$gene_id_clean)
   stopifnot("a top gene is missing this region in a cell line's matrix" =
-              nrow(top_r) == 2 * params$n_top)
+              nrow(top_r) == 2 * nrow(top))
+  neg_r <- ud %>% filter(symbol %in% neg_syms)
+  stopifnot("a negative control is missing this region in a cell line's matrix" =
+              nrow(neg_r) == 2 * length(neg_syms))
+  ctrl_r <- ud %>% filter(symbol %in% ctrl_syms)
+  stopifnot("a positive control is missing this region in a cell line's matrix" =
+              nrow(ctrl_r) == 2 * length(ctrl_syms))
+  # pinned transcripts (params$controls_tx): same transcript in both lines, from transcript_length_gc.csv
+  pins <- trimws(strsplit(params$controls_tx, ",")[[1]]); pins <- pins[pins != ""]
+  if (length(pins)) {
+    pin <- tibble(symbol = sub("=.*", "", pins), pin_tx = sub(".*=", "", pins))
+    stopifnot("controls_tx names a gene that is not in controls" = all(pin$symbol %in% ctrl_syms))
+    tlg <- read_csv(here("output", "finding_positive_controls", "transcript_length_gc.csv"),
+                    show_col_types = FALSE) %>% filter(region == r)
+    pin <- pin %>% left_join(tlg, by = c("pin_tx" = "transcript_id_clean"))
+    stopifnot("a pinned transcript is not in transcript_length_gc.csv; run transcript_length_gc.R on it" =
+                !anyNA(pin$length_nt))
+    ctrl_r <- ctrl_r %>% left_join(pin %>% dplyr::select(symbol, pin_tx, pin_len = length_nt, pin_gc = gc_pct),
+                                   by = "symbol") %>%
+      mutate(transcript_id_clean = coalesce(pin_tx, transcript_id_clean),
+             length_nt = coalesce(as.numeric(pin_len), as.numeric(length_nt)),
+             gc = coalesce(pin_gc, gc), log2_length = log2(length_nt)) %>%
+      dplyr::select(-pin_tx, -pin_len, -pin_gc)
+  }
+  # lines and labels take the scatter colours: targets orange, negative controls black
+  mark_r <- bind_rows(top_r %>% mutate(role = "eIF3d target", line_col = kd_orange),
+                      ctrl_r %>% mutate(role = "positive control", line_col = "#0072B2"),
+                      neg_r %>% mutate(role = "negative control", line_col = "black"))
   # percentile of each top gene among all expressed genes in that line
-  tab <- top_r %>% rowwise() %>%
+  tab <- mark_r %>% rowwise() %>%
     mutate(length_pctile = round(100 * mean(ud$length_nt[ud$cell_line == cell_line] <= length_nt)),
            gc_pctile     = round(100 * mean(ud$gc[ud$cell_line == cell_line] <= gc))) %>%
     ungroup() %>%
-    transmute(cell_line, symbol, transcript_id_clean, length_nt, gc = round(gc, 1),
+    transmute(cell_line, role, symbol, transcript_id_clean, length_nt, gc = round(gc, 1),
               length_pctile, gc_pctile)
 
   long <- ud %>% pivot_longer(c(log2_length, gc), names_to = "feature", values_to = "value")
-  top_long <- top_r %>% pivot_longer(c(log2_length, gc), names_to = "feature", values_to = "value") %>%
-    # within each panel, the left-most gene is labelled to the left of its line, the rest right
+  top_long <- mark_r %>% pivot_longer(c(log2_length, gc), names_to = "feature", values_to = "value") %>%
+    # within each panel, one label per row, stacked in order of value so neighbouring lines never
+    # share a row; every label starts just right of its own line, so it cannot be read as the
+    # label of the line to its left (the top genes sit mid-distribution, never at the right edge)
     group_by(cell_line, feature) %>%
-    mutate(hj = if_else(value == min(value), 1.08, -0.08)) %>% ungroup()
+    mutate(row = rank(value, ties.method = "first"),
+           vj  = 1.3 + 1.3 * (row - 1),
+           hj  = -0.04) %>%
+    ungroup()
   feat_lab <- c(log2_length = sprintf("log2 %s length (nt)", rlab), gc = sprintf("%s GC (%%)", rlab))
   long$feature <- factor(long$feature, levels = names(feat_lab))
   top_long$feature <- factor(top_long$feature, levels = names(feat_lab))
@@ -246,27 +421,38 @@ region_figure <- function(r) {
                               value[group != "eIF3d promoted"])$p.value,
               n_set = sum(group == "eIF3d promoted"), n_bg = sum(group != "eIF3d promoted"),
               .groups = "drop") %>%
-    mutate(lab = sprintf("Wilcoxon p = %.2g\nn = %d promoted, %s other", p, n_set,
-                         format(n_bg, big.mark = ",")))
+    # the test goes in the panel header, where neither the dashed lines nor a label box can
+    # cover it or the curves
+    mutate(panel = sprintf("%s, %s\nWilcoxon p = %.2g; n = %d promoted, %s other", cell_line,
+                           feat_lab[as.character(feature)], p, n_set, trimws(format(n_bg, big.mark = ','))),
+           panel = factor(panel, levels = panel[order(cell_line, feature)]))
+  long     <- long     %>% left_join(wil %>% dplyr::select(cell_line, feature, panel), by = c("cell_line", "feature"))
+  top_long <- top_long %>% left_join(wil %>% dplyr::select(cell_line, feature, panel), by = c("cell_line", "feature"))
+  stopifnot(!anyNA(long$panel), !anyNA(top_long$panel))
 
   p <- ggplot(long, aes(value, colour = group)) +
     geom_density(fill = NA, linewidth = 0.8) +
-    geom_vline(data = top_long, aes(xintercept = value), linetype = "dashed", colour = "black") +
-    geom_text(data = top_long, aes(x = value, y = Inf, label = symbol, hjust = hj),
-              inherit.aes = FALSE, vjust = 1.3, size = 3.2) +
-    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-    geom_text(data = wil, aes(x = -Inf, y = Inf, label = lab), inherit.aes = FALSE,
-              hjust = -0.05, vjust = 3.2, size = 3) +
-    facet_wrap(cell_line ~ feature, scales = "free", nrow = 2,
-               labeller = labeller(feature = feat_lab, .multi_line = FALSE)) +
+    geom_vline(data = top_long, aes(xintercept = value), linetype = "dashed",
+               colour = top_long$line_col) +
+    # white-backed so the dashed lines of neighbouring genes do not run through the text
+    geom_label(data = top_long, aes(x = value, y = Inf, label = symbol, hjust = hj, vjust = vj),
+               inherit.aes = FALSE, size = 3.2, fill = "white", label.size = 0,
+               colour = top_long$line_col,
+               label.padding = unit(0.08, "lines")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12 + 0.1 * (nrow(top) + length(ctrl_syms) + length(neg_syms))))) +
+    facet_wrap(~ panel, scales = "free", nrow = 2) +
     scale_colour_manual(values = c("All other expressed genes" = "grey70",
                                    "eIF3d promoted" = kd_orange)) +
     labs(x = NULL, y = "Density", colour = NULL,
          title = sprintf("%s of the top eIF3d-promoted mRNAs, hypoxia 1hr", rlab),
-         subtitle = "Each cell line on its own expressed transcript. Dashed: top genes") +
+         subtitle = if (length(c(ctrl_syms, neg_syms)))
+           paste0("Dashed: orange = selected eIF3d targets, blue = positive controls",
+                  if (length(pins)) paste0(" (", paste(sub("=", " ", pins), collapse = ", "), " in both lines)") else "",
+                  ",\nblack = negative controls") else
+           "Each cell line on its own expressed transcript. Dashed: selected genes") +
     theme_classic(base_size = 12) +
     theme(legend.position = "bottom")
-  ggsave(here("plots", sprintf("finding_positive_controls_04_top_targets_%s_length_gc.pdf", r)),
+  ggsave(here("plots", sprintf("finding_positive_controls_04_top_targets_%s_length_gc%s.pdf", r, out_tag)),
          p, width = 10, height = 7)
   list(plot = p, top = tab, wilcox = wil %>% dplyr::select(cell_line, feature, n_set, n_bg, p))
 }
@@ -300,5 +486,5 @@ figs$utr3$plot
 ```{r save_region_tables}
 imap_dfr(figs, ~ mutate(.x$top, region = regions[[.y]]), .id = NULL) %>%
   relocate(region) %>%
-  write_csv(file.path(out_dir, "04_top_targets_region_length_gc.csv"))
+  write_csv(file.path(out_dir, paste0("04_top_targets_region_length_gc", out_tag, ".csv")))
 ```

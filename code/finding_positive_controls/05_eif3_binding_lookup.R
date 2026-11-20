@@ -2,8 +2,9 @@
 # Reads every source table directly (not the feature matrix, whose clip_lee_glu_dep_bound
 # column holds the complete-media set - see CAP_BINDING_DATA.md).
 #
-# Usage: Rscript code/finding_positive_controls/05_eif3_binding_lookup.R [n_top]
-#   n_top (default 7) = how many genes to take from 04_'s ranking
+# Usage: Rscript code/finding_positive_controls/05_eif3_binding_lookup.R [n_top | SYMBOLS]
+#   n_top (default 7) = how many genes to take from 04_'s ranking, or comma-separated symbols
+#   (e.g. BSG,ACTB) to look up any genes; outputs then get a _SYMBOLS suffix
 #   (output/finding_positive_controls/04_top_eif3d_targets_hypoxia_both_lines.csv)
 # Writes output/finding_positive_controls/05_eif3_binding_lookup_{long,summary}.csv
 #
@@ -21,7 +22,8 @@ suppressPackageStartupMessages({
   library(AnnotationDbi); library(org.Hs.eg.db)
 })
 args <- commandArgs(trailingOnly = TRUE)
-n_top <- if (length(args)) as.integer(args[1]) else 7L
+by_symbol <- length(args) > 0 && grepl("[A-Za-z]", args[1])
+n_top <- if (length(args) && !by_symbol) as.integer(args[1]) else 7L
 D <- "/Users/katematlin/github/mpra_preliminary/data"
 strip <- function(x) sub("\\..*", "", x)
 
@@ -29,6 +31,14 @@ ranked <- read_csv(here("output", "finding_positive_controls",
                         "04_top_eif3d_targets_hypoxia_both_lines.csv"), show_col_types = FALSE)
 cand <- ranked %>% slice_head(n = n_top) %>%
   dplyr::select(rank, gene_id_clean, symbol, lfc_231, lfc_mcf, mean_lfc)
+if (by_symbol) {
+  syms <- trimws(strsplit(args[1], ",")[[1]])
+  cand <- tibble(rank = seq_along(syms), symbol = syms,
+                 gene_id_clean = unname(mapIds(org.Hs.eg.db, syms, "ENSEMBL", "SYMBOL"))) %>%
+    left_join(ranked %>% dplyr::select(gene_id_clean, lfc_231, lfc_mcf, mean_lfc), by = "gene_id_clean")
+  stopifnot("a symbol did not map to an Ensembl gene" = !anyNA(cand$gene_id_clean))
+}
+sfx <- if (by_symbol) paste0("_", gsub(",", "_", args[1])) else ""
 # spot-check genes with a known answer (removed before output)
 checks <- tibble(symbol = c("JUN", "ALKBH5")) %>%
   mutate(gene_id_clean = mapIds(org.Hs.eg.db, symbol, "ENSEMBL", "SYMBOL"))
@@ -154,8 +164,8 @@ summary <- cand %>%
 
 out <- here("output", "finding_positive_controls")
 write_csv(long %>% arrange(match(gene_id_clean, cand$gene_id_clean), dataset, condition),
-          file.path(out, "05_eif3_binding_lookup_long.csv"))
-write_csv(summary, file.path(out, "05_eif3_binding_lookup_summary.csv"))
+          file.path(out, paste0("05_eif3_binding_lookup_long", sfx, ".csv")))
+write_csv(summary, file.path(out, paste0("05_eif3_binding_lookup_summary", sfx, ".csv")))
 print(as.data.frame(long %>% arrange(match(gene_id_clean, cand$gene_id_clean)) %>%
                       dplyr::select(symbol, dataset, condition, evidence)))
 print(as.data.frame(summary %>% dplyr::select(rank, symbol, cate_peaks_overlapping)))
