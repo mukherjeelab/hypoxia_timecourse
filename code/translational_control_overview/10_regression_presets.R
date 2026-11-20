@@ -148,7 +148,26 @@ REG_PRESETS <- list(
   # Family nulls transfer unchanged: shuffle_families still works on a regression, and
   # impurity importance is still non-negative, so the shuffled arm is still the floor.
   g4      = family_arms_reg("g4", "tcoreg_g4"),
-  peptide = family_arms_reg("nascent_peptide,polya_track", "tcoreg_pep")
+  peptide = family_arms_reg("nascent_peptide,polya_track", "tcoreg_pep"),
+  # Does spike-in normalisation change what the intrinsic model learns? (Kate, 2026-11-19)
+  # Intrinsic block only, GC split into GC1/GC2/GC3 (01r_ matrix) with the aggregate cds_gc and
+  # transcript_gc removed so the forest cannot fall back on them. The arms differ ONLY in the
+  # outcome file: the no-spike file is built by spikein_literature_comparison/05_ from the same
+  # counts and samples, and has the same gene universe, so a given split_seed puts the same genes
+  # in train and test in both arms and the comparison is paired.
+  spikein = local({
+    base <- list(include_blocks = "intrinsic", matrix_rds = "feature_matrix_tco_posgc.rds",
+                 annotation_csv = "feature_annotation_tco_posgc.csv",
+                 exclude_features = "cds_gc,transcript_gc")
+    nospike_csv <- "translation_categories_si3d_vs_sictrl_hypoxia_1hr_nospike.csv"
+    list(
+      spike   = c(base, list(feature_set_label = "tcoreg_posgc_intrinsic")),
+      nospike = c(base, list(feature_set_label = "tcoreg_posgc_intrinsic_nospike",
+                             outcome_csv = nospike_csv, anchor_csv = nospike_csv,
+                             # stratify on the spike-in y so both arms get the same split
+                             split_strata_csv = "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"))
+    )
+  })
 )
 
 PRESET_FAMILIES_REG <- list(
@@ -156,7 +175,8 @@ PRESET_FAMILIES_REG <- list(
   hyperparams = NA_character_,
   population  = NA_character_,
   g4          = "g4",
-  peptide     = c("nascent_peptide", "polya_track")
+  peptide     = c("nascent_peptide", "polya_track"),
+  spikein     = NA_character_
 )
 
 # --- one representative per correlated cluster -------------------------------------------

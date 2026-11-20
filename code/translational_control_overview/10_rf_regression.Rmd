@@ -18,6 +18,8 @@ params:
   include_blocks: "intrinsic,external"
   clip_mode: "aggregate"
   matrix_rds: "feature_matrix_tco.rds"
+  # annotation matching matrix_rds (e.g. feature_annotation_tco_posgc.csv from 01r_)
+  annotation_csv: "feature_annotation.csv"
   feature_set_label: "tcoreg"
   variant_set: "corrected"
   initiation_score: "both"
@@ -29,6 +31,17 @@ params:
   outcome_col: "te_lfc"
   outcome_padj_col: "te_padj"
   direction_check_csv: ""
+  # contrast-anchor reference. "" = the translation_categories file params imply. Set it only
+  # when outcome_csv is a deliberate re-quantification of that SAME contrast (e.g. the no-spike
+  # file from spikein_literature_comparison/05_, whose own checks pin its identity) - the
+  # implied spike-in file would otherwise fire the anchor by design.
+  anchor_csv: ""
+  # createDataPartition stratifies on y's quantiles, so two outcomes on the SAME genes get
+  # DIFFERENT splits at one split_seed. Set this to another outcome file (in output/, same
+  # outcome_col) to stratify on ITS values instead, which reproduces that file's split exactly
+  # and makes a two-outcome comparison paired. "" = stratify on this run's own y (the default,
+  # so every existing run is unchanged).
+  split_strata_csv: ""
   negate_outcome: FALSE
   cell_line: "MDA-MB-231"
   outcome_kind: "te"
@@ -401,7 +414,7 @@ Reads the feature matrix, its annotation table, and the outcome file for this co
 
 ```{r load_data}
 features_raw <- readRDS(file.path(out_dir, params$matrix_rds))
-annotation   <- read_csv(file.path(out_dir, "feature_annotation.csv"), show_col_types = FALSE)
+annotation   <- read_csv(file.path(out_dir, params$annotation_csv), show_col_types = FALSE)
 stopifnot("annotation does not match the matrix" =
             setequal(annotation$feature, colnames(features_raw)))
 cat("Matrix:", nrow(features_raw), "x", ncol(features_raw), "\n")
@@ -553,7 +566,10 @@ if (params$outcome_kind == "te_condition") {
   # The siCTRL hypoxia-vs-normoxia runs model the hypoxia response ON PURPOSE, so the te_lfc guard
   # inverts: the 1hr outcome must BE the matrix's te_lfc (F7), and the other timepoints are
   # different contrasts of the same response, so their correlation with it is expected.
-  if (grepl("sictrl_hypoxia_vs_normoxia_te_1hr", params$outcome_csv, fixed = TRUE))
+  # MDA-MB-231 only: the matrix's te_lfc is 231's contrast, and the MCF7-SIX1 outcome file
+  # (mcf7six1_sictrl_hypoxia_vs_normoxia_te_1hr.csv) contains the same substring.
+  if (params$cell_line == "MDA-MB-231" &&
+      grepl("sictrl_hypoxia_vs_normoxia_te_1hr", params$outcome_csv, fixed = TRUE))
     # Tolerance, not ==: the outcome CSV is a write_csv / read_csv round trip of the same values.
     stopifnot("the siCTRL 1hr hypoxia outcome does not reproduce the matrix's te_lfc (F7)" = dev_te < 1e-9)
   stopifnot("the target tracks an absolute TE level too closely" = abs(r_ind) < 0.5)
@@ -678,8 +694,11 @@ if ("symbol" %in% names(dir_src) && "rna_lfc" %in% names(dir_src) &&
   # outcome_csv. When outcome_csv overrides to a different contrast the two disagree and this
   # fires; that override path is what this check guards, and 10z_'s wrong_condition_file
   # mutation is what proves it fires.
-  implied_file <- paste0("translation_categories_si", params$gene, "_vs_sictrl_",
-                         params$condition, "_", params$timepoint, ".csv")
+  implied_file <- if (nzchar(params$anchor_csv)) params$anchor_csv else
+    paste0("translation_categories_si", params$gene, "_vs_sictrl_",
+           params$condition, "_", params$timepoint, ".csv")
+  if (nzchar(params$anchor_csv))
+    cat("contrast anchor reference overridden by anchor_csv:", params$anchor_csv, "\n")
   if (file.exists(here("output", implied_file))) {
     ref <- read_csv(here("output", implied_file), show_col_types = FALSE) %>%
       filter(symbol == kd_symbol)
@@ -990,8 +1009,19 @@ if (nzchar(params$shuffle_families)) {
 # use forest_seed, so across a sweep every difference is attributable to which genes were held
 # out. createDataPartition bins a numeric y into quantiles, so the two splits stay
 # distributionally matched rather than merely random.
+strata_y <- model_data$y
+if (nzchar(params$split_strata_csv)) {
+  st <- read_csv(here("output", params$split_strata_csv), show_col_types = FALSE) %>%
+    transmute(gene_id_clean = sub("[.].*", "", gene_id), sy = .data[[params$outcome_col]])
+  stopifnot("split_strata_csv has duplicate genes" = !anyDuplicated(st$gene_id_clean))
+  strata_y <- st$sy[match(model_data$gene_id_clean, st$gene_id_clean)]
+  stopifnot("split_strata_csv lacks a value for a modelled gene - the split could not be paired" =
+              !anyNA(strata_y))
+  cat(sprintf("Split stratified on %s (Spearman with this run's y: %.3f)\n",
+              params$split_strata_csv, cor(strata_y, model_data$y, method = "spearman")))
+}
 set.seed(SPLIT_SEED)
-train_idx  <- createDataPartition(model_data$y, p = 0.8, list = FALSE)
+train_idx  <- createDataPartition(strata_y, p = 0.8, list = FALSE)
 train_data <- model_data[train_idx, ]
 test_data  <- model_data[-train_idx, ]
 cat(sprintf("Train %d (median y %+.4f, MAD %.4f) | Test %d (median y %+.4f, MAD %.4f)\n",

@@ -1,0 +1,811 @@
+---
+title: "CDS reporter design 19 - is firefly a putative eIF3d target? Firefly vs the four NanoLuc constructs"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  ff_utr5_annotated: 207
+  ff_utr5_retained: 433
+  xmax_cds_nt: 6000
+  xmax_utr5_nt: 1000
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    ff_utr5_annotated = 207,  # firefly 5'UTR: unspliced minus the Promega-annotated intron
+    ff_utr5_retained  = 433,  # firefly 5'UTR if the intron were retained (not plotted)
+    xmax_cds_nt       = 6000, # CDS length panel clipped here
+    xmax_utr5_nt      = 1000  # linear 5'UTR panel clipped here; the log2 panel is not
+  )
+}
+```
+
+# Overview
+
+**The question.** The luciferase assays normalise a HiBiT or NanoLuc reporter
+against firefly. That only works if firefly is *not itself* eIF3d-dependent -
+dividing by a co-regulated control subtracts part of the effect being measured.
+So: where does firefly sit in the distributions that the eIF3d models rank
+highest, relative to the four synonymous NanoLuc constructs it is meant to
+normalise?
+
+**Three axes, chosen because they are what the models use.** GC3 (synonymous
+codon choice), CDS length, and 5'UTR length. Each is drawn as the expressed
+MDA-MB-231 transcriptome and the eIF3d hypoxia-promoted set, with a reference
+line per construct.
+
+**Terms used below.**
+
+* *expressed set* - the feature matrix's one transcript per gene, restricted to
+  transcripts with a complete CDS (in frame, terminal stop present; GENCODE
+  `cds_end_NF` dropped).
+* *promoted set* - genes with `te_lfc > 0.5` and `te_padj < 0.05` in the si3d
+  hypoxia 1hr contrast. Positive `te_lfc` means eIF3d **promotes**, because
+  these files carry the `sictrl_vs_si3d` coefficient despite the filename
+  stating the ratio the other way round. Asserted below on EIF3D's own
+  `rna_lfc`.
+* *the four constructs* - the synonymous NanoLuc variants in
+  `accessories/transcribed_plasmids.xlsx`: `parent_bidir`, its codon-shuffled
+  `negative_control_3d`, `3d-adapted` (GC3 driven down) and `3d-anti_adapted`
+  (GC3 driven up). All four share one 5'UTR, one 3'UTR, one protein and one CDS
+  length; only the codons differ.
+
+**Firefly's 5'UTR is `r params$ff_utr5_annotated` nt, from the vector
+annotation.** The firefly transcript carries the same CMV backbone and the same
+5'UTR intron as the four NanoLuc constructs. Transcription starts
+`r params$ff_utr5_retained` nt upstream of the ATG (section 3 locates the TSS
+from a CMV landmark rather than assuming it), and the Promega annotation of this
+vector gives the intron as the 226 nt that section 3 locates, leaving a
+**`r params$ff_utr5_annotated` nt** mature 5'UTR. That is the single value
+plotted. The vector annotation is the primary evidence for its own construct, so
+it is what this notebook uses.
+
+**One recorded caveat, which does not change the plotted value.** The firefly
+copy of the intron differs from the NanoLuc copy by a `CAGG` deletion at the 3'
+splice site, so the annotated intron's last two nt are `CA`, not the `AG` a
+canonical acceptor needs; the nearest downstream `AG` is 13 nt further on.
+Section 3 reports this and the 5'UTR it would imply, and asserts nothing that
+contradicts the annotation. It is noted because it is the kind of detail that
+would otherwise be rediscovered later, and because resolving it definitively
+needs RT-PCR, RNA-seq or a sequenced transcript rather than more sequence
+reading. The difference is under 0.1 log2 units and under one percentile point
+of the 5'UTR distribution, which section 6 reports, so no conclusion in this
+notebook turns on it.
+
+# 1. Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+```{r param_checks}
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+stopifnot(
+  "firefly 5'UTR params must be positive lengths" =
+    params$ff_utr5_annotated > 0 && params$ff_utr5_retained > 0,
+  "the unspliced 5'UTR must be the longer of the two" =
+    params$ff_utr5_retained > params$ff_utr5_annotated,
+  "x axis limits must leave every reference line on the panel" =
+    params$xmax_utr5_nt > params$ff_utr5_retained
+)
+```
+
+# 2. Construct sequences
+
+The four NanoLuc constructs come from the derived table
+`33a_parse_plasmid_sequences.R` writes, so this notebook inherits every check
+that script makes (intron spliced and verified as a single GT..AG match, the
+four confirmed as synonymous variants of one backbone, each CDS still carrying
+its designed sequence from the codon-adaptation notebook). Firefly is parsed
+from the same spreadsheet here, because that script deliberately does not emit
+it.
+
+```{r load_constructs}
+PARSED <- here("accessories", "transcribed_plasmids_parsed.csv")
+stopifnot(
+  "transcribed_plasmids_parsed.csv is missing - run 33a_parse_plasmid_sequences.R first" =
+    file.exists(PARSED))
+
+nl4 <- read_csv(PARSED, show_col_types = FALSE)
+stopifnot(
+  "the four NanoLuc constructs are not all present" =
+    setequal(nl4$construct, c("parent_bidir", "negative_control_3d",
+                              "3d-adapted", "3d-anti_adapted")),
+  # These are the properties that make them a controlled synonymous comparison.
+  # Re-asserted here so this notebook fails on its own if the table is rebuilt.
+  "the four constructs no longer share one CDS length" =
+    n_distinct(nl4$cds_nt) == 1,
+  "the four constructs no longer share one 5'UTR length" =
+    n_distinct(nl4$utr5_nt) == 1
+)
+cat(sprintf("Four NanoLuc constructs: CDS %d nt, spliced 5'UTR %d nt (shared)\n",
+            nl4$cds_nt[1], nl4$utr5_nt[1]))
+```
+
+```{r load_firefly}
+clean_seq <- function(x) toupper(gsub("[^A-Za-z]", "", x))
+
+sheet <- read_excel(here("accessories", "transcribed_plasmids.xlsx")) %>%
+  transmute(construct, tx = clean_seq(transcribed_seq), cds = clean_seq(CDS))
+
+FF <- "firefly luc"
+stopifnot(
+  "the firefly row is missing from the spreadsheet" = FF %in% sheet$construct,
+  "sequences contain non-ACGT characters" =
+    all(strsplit(paste0(sheet$tx, sheet$cds, collapse = ""), "")[[1]] %in%
+          c("A", "C", "G", "T"))
+)
+
+ff_tx  <- sheet$tx[sheet$construct == FF]
+ff_cds <- sheet$cds[sheet$construct == FF]
+
+ff_hits <- gregexpr(ff_cds, ff_tx, fixed = TRUE)[[1]]
+stopifnot(
+  "the firefly CDS does not occur exactly once in its transcript" =
+    length(ff_hits) == 1 && ff_hits[1] > 0)
+ff_cds_start <- ff_hits[1]
+
+cat(sprintf("firefly: transcript %d nt, CDS %d nt starting at %d\n",
+            nchar(ff_tx), nchar(ff_cds), ff_cds_start))
+```
+
+**Biological spot-check on the firefly ORF.** It must be luc2P - luc2 carrying
+the same mouse ODC PEST degron the NanoLuc and Renilla lab constructs carry -
+and not the PEST-less luc2, which is a prefix of it and so passes every length
+and frame check. Asserted on the translated protein at both ends.
+
+```{r firefly_spot_checks}
+PEST_AA <- "SHGFPPEVEEQAAGTLPMSCAQESGMDRHPAACASARINV"
+LUC2_N  <- "MEDAKNIKKGPAPFYPLEDGTAGEQLHKAMKRYALVPGTIAFTDAHIE"
+
+stopifnot(
+  "firefly CDS length is not a multiple of 3" = nchar(ff_cds) %% 3 == 0,
+  "firefly CDS does not start with ATG"       = substr(ff_cds, 1, 3) == "ATG",
+  "firefly CDS does not end in a stop codon"  =
+    substr(ff_cds, nchar(ff_cds) - 2, nchar(ff_cds)) %in% c("TAA", "TAG", "TGA")
+)
+
+ff_sense <- substr(ff_cds, 1, nchar(ff_cds) - 3)   # stop stripped
+ff_aa    <- as.character(translate(DNAString(ff_sense)))
+
+stopifnot(
+  "firefly has an internal stop codon" = !str_detect(ff_aa, fixed("*")),
+  "firefly does not encode the luc2 N-terminus"   = startsWith(ff_aa, LUC2_N),
+  "firefly is missing the C-terminal ODC PEST degron (luc2, not luc2P?)" =
+    endsWith(ff_aa, PEST_AA)
+)
+cat(sprintf("firefly ORF: %d nt sense, %d aa, luc2 N-terminus and ODC PEST degron both present\n",
+            nchar(ff_sense), nchar(ff_aa)))
+```
+
+# 3. The firefly 5'UTR: TSS and intron
+
+**The TSS is located from the CMV landmark, not assumed.** The firefly entry in
+the spreadsheet begins inside the CMV promoter, upstream of where transcription
+starts. The landmark `GTTTAGTGAACCGTCAGAT` spans the start: the `GTCAGAT` inside
+it is exactly where the four NanoLuc transcripts begin, and those are entered
+from their TSS. So the same motif fixes firefly's.
+
+```{r firefly_tss}
+LANDMARK  <- "GTTTAGTGAACCGTCAGAT"
+TSS_MOTIF <- "GTCAGAT"
+
+lm_hits <- gregexpr(LANDMARK, ff_tx, fixed = TRUE)[[1]]
+stopifnot(
+  "the CMV landmark does not occur exactly once in the firefly entry" =
+    length(lm_hits) == 1 && lm_hits[1] > 0)
+
+ff_tss <- lm_hits[1] + (regexpr(TSS_MOTIF, LANDMARK, fixed = TRUE) - 1L)
+
+# The four NanoLuc transcripts are entered FROM the TSS, so their 5'UTR must
+# begin with this motif. That is what licenses using it to locate firefly's.
+stopifnot(
+  "the NanoLuc 5'UTRs do not begin at the TSS motif - the landmark no longer anchors the start" =
+    all(startsWith(nl4$utr5, TSS_MOTIF)))
+
+ff_utr5_unspliced <- substr(ff_tx, ff_tss, ff_cds_start - 1L)
+
+cat(sprintf("firefly TSS at position %d; %d nt of the entry sit upstream of it\n",
+            ff_tss, ff_tss - 1L))
+cat(sprintf("firefly unspliced 5'UTR: %d nt, begins %s, ends ...%s\n",
+            nchar(ff_utr5_unspliced), substr(ff_utr5_unspliced, 1, 12),
+            substr(ff_utr5_unspliced, nchar(ff_utr5_unspliced) - 11,
+                   nchar(ff_utr5_unspliced))))
+
+stopifnot(
+  "the unspliced firefly 5'UTR is not the expected retained-intron length" =
+    nchar(ff_utr5_unspliced) == params$ff_utr5_retained,
+  # The construct's Kozak. If the CDS start were misplaced this would not hold.
+  "the firefly 5'UTR does not end on the gccacc Kozak" =
+    endsWith(ff_utr5_unspliced, "GCCACC")
+)
+```
+
+**The intron, and the missing acceptor.** The intron sequence is taken from the
+NanoLuc backbone, whose copy is intact, and the firefly copy is then located by
+aligning on the shared upstream flank. The two differ, which is the point: the
+firefly copy is 3 nt shorter at its 3' end and ends in `CA` rather than `AG`.
+Combined with the `G` missing from the start of the downstream exon, that is the
+`CAGG` deletion.
+
+```{r firefly_intron}
+# The intact intron, as the NanoLuc backbone carries it. Recovered from the
+# parsed table by difference rather than transcribed: the parsed 5'UTR is the
+# spliced one, and the spreadsheet entry is unspliced, so the intron is what
+# splicing removed. Deriving it this way means a change to either file is
+# caught here instead of silently disagreeing with a pasted constant.
+nl_parent_tx <- sheet$tx[sheet$construct == "parent_bidir"]
+nl_parent_u5 <- nl4$utr5[nl4$construct == "parent_bidir"]
+
+nl_u5_unspliced <- substr(nl_parent_tx, 1,
+                          gregexpr(nl4$cds[nl4$construct == "parent_bidir"],
+                                   nl_parent_tx, fixed = TRUE)[[1]][1] - 1L)
+
+# The spliced 5'UTR is the unspliced one with one internal block removed, so the
+# intron's LENGTH is known by difference. Its POSITION is not: a greedy shared
+# prefix overshoots the donor here, because the intron and the downstream exon
+# both begin GT. So every position whose removal reproduces the spliced 5'UTR is
+# enumerated, and the GT..AG rule picks among them.
+intron_n <- nchar(nl_u5_unspliced) - nchar(nl_parent_u5)
+stopifnot("the spliced and unspliced NanoLuc 5'UTRs are the same length" =
+            intron_n > 0)
+
+excise <- function(s, p, n) paste0(substr(s, 1, p - 1L),
+                                   substr(s, p + n, nchar(s)))
+cand <- Filter(
+  function(p) excise(nl_u5_unspliced, p, intron_n) == nl_parent_u5,
+  seq_len(nchar(nl_u5_unspliced) - intron_n + 1L))
+stopifnot("no excision of the expected length reproduces the spliced 5'UTR" =
+            length(cand) > 0)
+
+gt_ag <- Filter(function(p) {
+  b <- substr(nl_u5_unspliced, p, p + intron_n - 1L)
+  startsWith(b, "GT") && endsWith(b, "AG")
+}, cand)
+stopifnot(
+  "no GT..AG intron of the expected length reproduces the spliced 5'UTR" =
+    length(gt_ag) == 1)
+
+pre_n     <- gt_ag[[1]] - 1L
+NL_INTRON <- substr(nl_u5_unspliced, gt_ag[[1]], gt_ag[[1]] + intron_n - 1L)
+
+cat(sprintf("%d excision position(s) of %d nt reproduce the spliced 5'UTR; %d obeys GT..AG\n",
+            length(cand), intron_n, length(gt_ag)))
+stopifnot(
+  "the recovered NanoLuc intron does not reconstitute the unspliced 5'UTR" =
+    excise(nl_u5_unspliced, pre_n + 1L, intron_n) == nl_parent_u5,
+  "the recovered NanoLuc intron does not obey the GT..AG rule" =
+    startsWith(NL_INTRON, "GT") && endsWith(NL_INTRON, "AG")
+)
+cat(sprintf("NanoLuc intron recovered by difference: %d nt, GT..%s\n",
+            nchar(NL_INTRON), substr(NL_INTRON, nchar(NL_INTRON) - 1,
+                                     nchar(NL_INTRON))))
+
+# Locate firefly's copy on the shared upstream flank. The flank is taken from
+# the NanoLuc intron's own context, so nothing is pasted in.
+FLANK_N <- 12L
+flank <- substr(nl_u5_unspliced, pre_n - FLANK_N + 1L, pre_n)
+
+ff_flank_hits <- gregexpr(flank, ff_utr5_unspliced, fixed = TRUE)[[1]]
+stopifnot(
+  "the shared pre-intron flank is not unique in the firefly 5'UTR" =
+    length(ff_flank_hits) == 1 && ff_flank_hits[1] > 0)
+ff_intron_start <- ff_flank_hits[1] + FLANK_N
+
+cat(sprintf("shared pre-intron flank %s: NanoLuc at %d, firefly at %d (linker differs by %d nt)\n",
+            flank, pre_n + 1L, ff_intron_start,
+            ff_intron_start - (pre_n + 1L)))
+```
+
+```{r firefly_acceptor}
+# How far the firefly copy tracks the NanoLuc intron before diverging.
+ff_from_donor <- substr(ff_utr5_unspliced, ff_intron_start,
+                        nchar(ff_utr5_unspliced))
+shared_n <- 0L
+while (shared_n < nchar(NL_INTRON) &&
+       substr(ff_from_donor, shared_n + 1L, shared_n + 1L) ==
+       substr(NL_INTRON, shared_n + 1L, shared_n + 1L)) shared_n <- shared_n + 1L
+
+stopifnot(
+  "the firefly intron copy does not begin with a GT donor" =
+    startsWith(ff_from_donor, "GT"),
+  "the firefly and NanoLuc introns diverge too early to be the same element" =
+    shared_n > 150L
+)
+cat(sprintf("firefly tracks the NanoLuc intron for %d of its %d nt, then diverges\n",
+            shared_n, nchar(NL_INTRON)))
+
+cat(sprintf("the divergence is internal, not at the 3' end: firefly's copy runs %d nt in total\n",
+            nchar(ff_from_donor)))
+```
+
+**The annotated intron is the Promega annotation for this vector**, held as an
+explicit constant and then *located* in the transcript rather than trusted - the
+same pattern `33a_parse_plasmid_sequences.R` uses for the NanoLuc intron. The
+length cannot be derived from where the two copies diverge, because the
+divergence is internal (an `AGC` to `AAG` change partway through) rather than at
+the 3' end, so the annotation is the source for it. The mature 5'UTR is the
+unspliced one minus this block.
+
+```{r firefly_annotated_utr5}
+# Promega's annotated 5'UTR intron for the firefly vector. Asserted below to
+# occur exactly once in the unspliced 5'UTR, wholly inside it, with a GT donor.
+FF_INTRON <- paste0(
+  "GTGAGTACTCCCTCTCAAAAGCGGGCATGACTTCTGCGCTAAGATTGTCAGTTTCCAAAAACGAGGAGGATTTGATAT",
+  "TCACCTGGCCCGCGGTGATGCCTTTGAGGGTGGCCGCGTCCATCTGGTCAGAAAAGACAATCTTTTTGTTGTCAAGTT",
+  "GAGGTGTGGCAGGCTTGAGATCTGGCCATACACTTGAGTGACAATGACATCCACTTTGCCTTTCTCTCCA")
+
+ff_int_hits <- gregexpr(FF_INTRON, ff_utr5_unspliced, fixed = TRUE)[[1]]
+stopifnot(
+  "the annotated firefly intron does not occur exactly once in the unspliced 5'UTR" =
+    length(ff_int_hits) == 1 && ff_int_hits[1] > 0)
+
+# It must sit at the donor position the shared flank independently located.
+stopifnot(
+  "the annotated intron does not start at the donor the shared flank locates" =
+    ff_int_hits[1] == ff_intron_start)
+
+ff_intron_len   <- nchar(FF_INTRON)
+ff_utr5_annot_n <- nchar(ff_utr5_unspliced) - ff_intron_len
+
+cat(sprintf("annotated intron %d nt at position %d, last 2 nt = %s\n",
+            ff_intron_len, ff_int_hits[1],
+            substr(FF_INTRON, ff_intron_len - 1L, ff_intron_len)))
+
+cat(sprintf("annotated intron %d nt -> mature firefly 5'UTR %d nt (unspliced %d nt)\n",
+            ff_intron_len, ff_utr5_annot_n, nchar(ff_utr5_unspliced)))
+
+stopifnot(
+  "the firefly 5'UTR derived from the annotated intron is not the expected length" =
+    ff_utr5_annot_n == params$ff_utr5_annotated,
+  "the annotated intron must lie wholly inside the 5'UTR" =
+    ff_intron_start + ff_intron_len - 1L <= nchar(ff_utr5_unspliced),
+  "the annotated intron does not begin with a GT donor" =
+    startsWith(FF_INTRON, "GT"),
+  # It is the firefly copy, not the NanoLuc one: the two must differ, or the
+  # wrong sequence has been pasted in.
+  "the annotated firefly intron is identical to the NanoLuc intron" =
+    FF_INTRON != NL_INTRON
+)
+```
+
+**The caveat, recorded and not acted on.** The annotated intron's 3' end is `CA`
+rather than `AG`, because the firefly copy carries a `CAGG` deletion relative to
+the NanoLuc backbone. The nearest downstream `AG` is reported below together
+with the 5'UTR it would imply. Nothing downstream uses it; it is here so the
+observation is written down with its numbers rather than rediscovered.
+
+```{r firefly_acceptor_caveat}
+annot_end <- substr(ff_from_donor, ff_intron_len - 1L, ff_intron_len)
+cat(sprintf("annotated intron ends in %s (a canonical acceptor would be AG)\n",
+            annot_end))
+
+ag_pos <- NA_integer_
+for (i in seq(ff_intron_len - 1L, nchar(ff_from_donor) - 1L)) {
+  if (substr(ff_from_donor, i, i + 1L) == "AG") { ag_pos <- i + 1L; break }
+}
+
+if (is.na(annot_end) || annot_end == "AG") {
+  cat("  the annotated 3' end is already AG; no caveat applies\n")
+} else {
+  stopifnot("no downstream AG found in the firefly 5'UTR" = !is.na(ag_pos))
+  cat(sprintf("  nearest downstream AG ends %d nt further on: intron %d nt -> 5'UTR %d nt\n",
+              ag_pos - ff_intron_len, ag_pos,
+              nchar(ff_utr5_unspliced) - ag_pos))
+  cat(sprintf("  plotted value stays %d nt, from the vector annotation\n",
+              params$ff_utr5_annotated))
+}
+```
+
+# 4. Gene sets
+
+Built exactly as in `01_`, `08_` and `13_`, repeated rather than inherited so
+this notebook fails on its own if the contrast or the matrix changes.
+
+```{r load_promotes}
+te_hyp <- read_csv(
+  here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+  show_col_types = FALSE)
+
+# Direction check. These files hold the sictrl_vs_si3d coefficient despite the
+# filename stating the ratio the other way round, so positive te_lfc = eIF3d
+# promotes. EIF3D's own rna_lfc must be strongly positive because the siRNA
+# depletes its target.
+eif3d_rna <- te_hyp %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+            length(eif3d_rna) == 1 && eif3d_rna > 2)
+cat("Direction check - EIF3D rna_lfc:", round(eif3d_rna, 2), "\n")
+
+promotes <- te_hyp %>%
+  filter(te_lfc > lfc_cutoff, te_padj < padj_cutoff) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("Expected 1604 eIF3d hypoxia-promoted genes" = nrow(promotes) == 1604)
+cat("eIF3d hypoxia 1hr promoted genes:", nrow(promotes), "\n")
+```
+
+```{r transcripts}
+fm <- readRDS(here("output", "predictive_modeling",
+                   "feature_matrix_external_stability.rds"))
+tx_all      <- fm %>% dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+tx_promotes <- tx_all %>% filter(gene_id_clean %in% promotes$gene_id_clean)
+
+missing_gene_ids <- promotes$gene_id_clean[
+  !promotes$gene_id_clean %in% tx_all$gene_id_clean]
+
+tx_map <- read_tsv(
+  here("accessories", "human", "tx2gene_hs_dm_v49_r111.tsv.gz"),
+  col_names = c("transcript_id", "gene_id"), col_types = "cc") %>%
+  filter(str_starts(transcript_id, "ENST")) %>%
+  transmute(transcript_id_clean = sub("\\..*", "", transcript_id),
+            gene_id_clean       = sub("\\..*", "", gene_id))
+
+hyp_samples <- c("NM2025_0094", "NM2025_0095", "NM2025_0096")
+hyp_files   <- setNames(
+  file.path(here("2025_MDAcells_riboseq", "salmon"), hyp_samples, "quant.sf.gz"),
+  hyp_samples)
+stopifnot("Hypoxia siCTRL quant files missing" = all(file.exists(hyp_files)))
+
+extra_tx_df <- map_dfr(names(hyp_files), function(s) {
+  read_tsv(hyp_files[[s]], col_types = "cdddd",
+           col_names = c("Name", "Length", "EffectiveLength", "TPM", "NumReads"),
+           skip = 1) %>% dplyr::select(Name, TPM)
+}) %>%
+  group_by(Name) %>% summarise(mean_tpm = mean(TPM), .groups = "drop") %>%
+  mutate(transcript_id_clean = sub("\\..*", "", Name)) %>%
+  inner_join(tx_map, by = "transcript_id_clean") %>%
+  filter(gene_id_clean %in% missing_gene_ids, mean_tpm > 0) %>%
+  group_by(gene_id_clean) %>%
+  dplyr::slice_max(mean_tpm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(promotes %>% dplyr::select(gene_id_clean, symbol) %>% distinct(),
+            by = "gene_id_clean") %>%
+  dplyr::select(transcript_id_clean, gene_id_clean, symbol)
+
+tx_promotes <- bind_rows(tx_promotes, extra_tx_df)
+cat(sprintf("Promoted transcripts: %s (%s recovered from salmon)\n",
+            fmt_n(nrow(tx_promotes)), fmt_n(nrow(extra_tx_df))))
+```
+
+# 5. Gene metrics
+
+```{r cds_metrics}
+TXDB <- here("accessories", "human", "txdb.gencode49.sqlite")
+cds_metrics <- build_cds_metrics(TXDB)
+
+stopifnot(
+  "Gene CDS GC% out of range"  =
+    all(cds_metrics$gc_pct  >= 0 & cds_metrics$gc_pct  <= 100),
+  "Gene CDS GC3% out of range" =
+    all(cds_metrics$gc3_pct >= 0 & cds_metrics$gc3_pct <= 100),
+  "Gene CDS lengths must be divisible by 3" =
+    all(cds_metrics$cds_length %% 3 == 0),
+  # Project convention: GC3 median must sit in 40-65%.
+  "Transcriptome GC3 median outside the expected 40-65% range" =
+    between(median(cds_metrics$gc3_pct), 40, 65)
+)
+cat(sprintf("Transcriptome GC3 median: %.1f%%\n", median(cds_metrics$gc3_pct)))
+```
+
+```{r utr5_lengths}
+txdb   <- AnnotationDbi::loadDb(TXDB)
+u5     <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+u5_len <- sum(BiocGenerics::width(u5))
+names(u5_len) <- sub("\\..*", "", names(u5_len))
+
+stopifnot(
+  "Duplicate transcript IDs after version stripping" =
+    !any(duplicated(names(u5_len))),
+  "A 5'UTR length is not a positive integer" =
+    all(u5_len > 0) && all(u5_len == as.integer(u5_len))
+)
+utr5_all <- tibble(transcript_id_clean = names(u5_len),
+                   utr5_length = as.integer(u5_len))
+
+# Verified against a column that already exists, rather than trusting either.
+check <- fm %>%
+  transmute(transcript_id_clean, fm_len = as.numeric(utr5_length)) %>%
+  inner_join(utr5_all, by = "transcript_id_clean")
+stopifnot(
+  "The feature matrix and the TxDb disagree on 5'UTR length" =
+    all(check$fm_len == check$utr5_length),
+  "Too few transcripts matched to make the check meaningful" = nrow(check) > 5000
+)
+cat(sprintf("5'UTR extraction verified against the feature matrix: %s transcripts, max deviation %g\n",
+            fmt_n(nrow(check)), max(abs(check$fm_len - check$utr5_length))))
+```
+
+```{r assemble}
+# One table per group, carrying all three metrics, restricted to transcripts
+# with a complete CDS so the three panels describe the same mRNAs.
+metrics <- cds_metrics %>% inner_join(utr5_all, by = "transcript_id_clean")
+
+expressed <- tx_all      %>% inner_join(metrics, by = "transcript_id_clean")
+promoted  <- tx_promotes %>% inner_join(metrics, by = "transcript_id_clean")
+
+cat(sprintf("Expressed: %s of %s transcripts carry a 5'UTR and a complete CDS\n",
+            fmt_n(nrow(expressed)), fmt_n(nrow(tx_all))))
+cat(sprintf("Promoted:  %s of %s\n",
+            fmt_n(nrow(promoted)), fmt_n(nrow(tx_promotes))))
+
+outside <- setdiff(promoted$transcript_id_clean, expressed$transcript_id_clean)
+stopifnot(
+  "A promoted transcript is outside the expressed set for a reason other than the salmon augmentation" =
+    all(outside %in% extra_tx_df$transcript_id_clean),
+  "Median 5'UTR length outside the expected 50-400 nt range" =
+    between(median(expressed$utr5_length), 50, 400)
+)
+```
+
+```{r spot_check_genes}
+# Biological spot-check: the cytosolic ribosomal proteins have characteristically
+# SHORT 5'UTRs and above-median GC3. If either extraction had picked up the wrong
+# region or the wrong codon position, these orderings would not hold.
+rp <- expressed %>% filter(str_detect(symbol, "^RP[SL]\\d"))
+stopifnot(
+  "Too few ribosomal protein genes for the spot-check" = nrow(rp) >= 50,
+  "Ribosomal protein 5'UTRs are not shorter than the median: extraction suspect" =
+    median(rp$utr5_length) < median(expressed$utr5_length)
+)
+cat(sprintf("Spot-check: %d ribosomal protein mRNAs, median 5'UTR %g nt vs %g nt transcriptome-wide\n",
+            nrow(rp), median(rp$utr5_length), median(expressed$utr5_length)))
+```
+
+# 6. Reference lines
+
+**The constructs are measured on the same bases as the genes.** CDS length and
+total GC use the stop-stripped CDS; GC3 uses internal codons only (initiator and
+stop removed), matching `gc3_internal` in the modelling, because GC3 exists to
+measure synonymous choice and the forced initiator is not one. Those are the
+`orf_gc_pct` / `orf_gc3_pct` helpers, so nothing here defines its own metric.
+
+```{r reference_table}
+ref <- bind_rows(
+  nl4 %>% transmute(
+    construct, cds_with_stop = cds, utr5_length = as.numeric(utr5_nt)),
+  tibble(construct = "firefly",
+         cds_with_stop = ff_cds, utr5_length = params$ff_utr5_annotated)
+) %>%
+  mutate(
+    sense      = substr(cds_with_stop, 1, nchar(cds_with_stop) - 3),
+    cds_length = nchar(sense),
+    gc_pct     = map_dbl(sense, orf_gc_pct),
+    gc3_pct    = map_dbl(sense, orf_gc3_pct)
+  )
+
+stopifnot(
+  "Construct GC% out of range"  = all(ref$gc_pct  >= 0 & ref$gc_pct  <= 100),
+  "Construct GC3% out of range" = all(ref$gc3_pct >= 0 & ref$gc3_pct <= 100),
+  "Construct CDS lengths must be divisible by 3" = all(ref$cds_length %% 3 == 0),
+  "Construct 5'UTR lengths must be positive"     = all(ref$utr5_length > 0)
+)
+
+# Biological spot-check: the designed GC3 ordering of the synonymous series.
+g <- setNames(ref$gc3_pct, ref$construct)
+stopifnot(
+  "designed GC3 ordering is wrong: adapted < parent < anti-adapted expected" =
+    g[["3d-adapted"]] < g[["parent_bidir"]] &&
+    g[["parent_bidir"]] < g[["3d-anti_adapted"]],
+  "the negative control should match the parent's GC3 (same codon composition)" =
+    abs(g[["negative_control_3d"]] - g[["parent_bidir"]]) < 1e-9
+)
+
+print(as.data.frame(ref %>%
+  dplyr::select(construct, cds_length, gc_pct, gc3_pct, utr5_length) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))))
+```
+
+```{r reference_style}
+# Colors. Okabe-Ito orange (#E69F00) and sky blue (#56B4E9) are reserved
+# project-wide for eIF3d and eIF3e and are not used to label a construct; orange
+# is already the promoted-set curve here. Firefly keeps the bluish green it has
+# in notebooks 62_ and 68_ so the panels are readable against those. The four
+# NanoLuc constructs keep the hues 33_plasmid_predictions.Rmd gives them.
+#
+# parent_bidir and negative_control_3d are IDENTICAL on GC3 and CDS length by
+# construction (the control is a synonymous shuffle of the parent), so a solid
+# line would be completely hidden by the other. The control is dashed for that
+# reason, not as decoration.
+style <- tribble(
+  ~construct,                   ~color,     ~linetype,
+  "firefly",                    "#009E73",  "solid",
+  "parent_bidir",               "black",    "solid",
+  "negative_control_3d",        "black",    "dashed",
+  "3d-adapted",                 "#D55E00",  "solid",
+  "3d-anti_adapted",            "#0072B2",  "solid"
+)
+stopifnot("every construct needs a style" =
+            setequal(style$construct, ref$construct))
+
+ref <- ref %>%
+  left_join(style, by = "construct") %>%
+  mutate(construct = factor(construct, levels = style$construct)) %>%
+  arrange(construct) %>%
+  dplyr::rename(reporter = construct)
+
+group_cols <- c("All expressed mRNAs"    = "grey70",
+                "eIF3d hypoxia promotes" = "#E69F00")
+
+fmt_nt  <- function(x) sprintf("%s nt", fmt_n(round(x)))
+fmt_pct <- function(x) sprintf("%.1f%%", x)
+```
+
+**What the plotted 5'UTR would have to be wrong by to matter.** The annotated
+value is the one drawn; the alternatives from section 3's caveat are listed
+beside it only to show the panel's reading does not turn on them.
+
+```{r firefly_utr5_sensitivity}
+pct_u5 <- function(v) c(
+  expressed = 100 * mean(expressed$utr5_length <= v),
+  promoted  = 100 * mean(promoted$utr5_length  <= v))
+
+sens <- tibble(
+  candidate = c("annotated intron (plotted)",
+                "first downstream AG",
+                "intron retained"),
+  utr5_nt   = c(params$ff_utr5_annotated,
+                nchar(ff_utr5_unspliced) - ag_pos,
+                nchar(ff_utr5_unspliced))
+) %>%
+  mutate(log2_nt       = round(log2(utr5_nt), 2),
+         pct_expressed = round(map_dbl(utr5_nt, ~ pct_u5(.x)[["expressed"]]), 1),
+         pct_promoted  = round(map_dbl(utr5_nt, ~ pct_u5(.x)[["promoted"]]),  1))
+print(as.data.frame(sens))
+
+cat(sprintf("\nPlotted vs the acceptor alternative: %.2f log2 units and %.1f percentile points apart.\n",
+            abs(sens$log2_nt[1] - sens$log2_nt[2]),
+            abs(sens$pct_expressed[1] - sens$pct_expressed[2])))
+```
+
+# 7. Panels
+
+```{r panel_gc3, fig.width=9.5, fig.height=5.5}
+p_gc3 <- plot_density_luc(
+  expressed, promoted, "gc3_pct",
+  xlab       = "CDS GC3 (%), internal codons",
+  title      = "GC3: firefly vs the four NanoLuc constructs, MDA-MB-231",
+  outfile    = "cds_reporter_19_density_gc3_firefly_vs_nanoluc.pdf",
+  luc_tbl    = ref, group_cols = group_cols,
+  metric_fmt = fmt_pct)
+```
+
+```{r panel_cds_length, fig.width=9.5, fig.height=5.5}
+p_len <- plot_density_luc(
+  expressed, promoted, "cds_length",
+  xlab       = "CDS length (nt)",
+  title      = "CDS length: firefly vs the four NanoLuc constructs, MDA-MB-231",
+  outfile    = "cds_reporter_19_density_cds_length_firefly_vs_nanoluc.pdf",
+  luc_tbl    = ref, group_cols = group_cols,
+  xmax       = params$xmax_cds_nt,
+  metric_fmt = fmt_nt)
+```
+
+```{r panel_utr5_linear, fig.width=9.5, fig.height=5.5}
+p_u5 <- plot_density_luc(
+  expressed, promoted, "utr5_length",
+  xlab       = "5'UTR length (nt)",
+  title      = "5'UTR length: firefly vs the four NanoLuc constructs, MDA-MB-231",
+  outfile    = "cds_reporter_19_density_utr5_length_firefly_vs_nanoluc.pdf",
+  luc_tbl    = ref, group_cols = group_cols,
+  xmax       = params$xmax_utr5_nt,
+  metric_fmt = fmt_nt)
+```
+
+The 5'UTR distribution is strongly right-skewed, so the same data on a log2
+axis. **This is the readable one** - the linear panel spends most of its width
+on a tail holding a few percent of the transcripts.
+
+```{r panel_utr5_log2, fig.width=9.5, fig.height=5.5}
+expressed_l <- expressed %>% mutate(log2_utr5_length = log2(utr5_length))
+promoted_l  <- promoted  %>% mutate(log2_utr5_length = log2(utr5_length))
+ref_l       <- ref       %>% mutate(log2_utr5_length = log2(utr5_length))
+
+stopifnot("log2 transform changed the median 5'UTR length" =
+            abs(2^median(expressed_l$log2_utr5_length) -
+                  median(expressed$utr5_length)) < 1e-6)
+
+p_u5_log <- plot_density_luc(
+  expressed_l, promoted_l, "log2_utr5_length",
+  xlab       = "log2 5'UTR length",
+  title      = "log2 5'UTR length: firefly vs the four NanoLuc constructs, MDA-MB-231",
+  outfile    = "cds_reporter_19_density_log2_utr5_length_firefly_vs_nanoluc.pdf",
+  luc_tbl    = ref_l, group_cols = group_cols,
+  metric_fmt = function(x) sprintf("%s nt", fmt_n(round(2^x))))
+```
+
+# 8. Percentiles
+
+**A reference line is only interpretable with its percentile attached.** For
+each construct and each metric: where it falls within the expressed
+transcriptome, and within the eIF3d-promoted set.
+
+```{r percentiles}
+pct_of <- function(x, v) 100 * mean(x <= v)
+
+pct_tbl <- ref %>%
+  dplyr::select(reporter, cds_length, gc_pct, gc3_pct, utr5_length) %>%
+  pivot_longer(-reporter, names_to = "metric", values_to = "value") %>%
+  rowwise() %>%
+  mutate(
+    pct_expressed = pct_of(expressed[[metric]], value),
+    pct_promoted  = pct_of(promoted[[metric]],  value),
+    median_expressed = median(expressed[[metric]]),
+    median_promoted  = median(promoted[[metric]])
+  ) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+
+print(as.data.frame(pct_tbl))
+
+OUTDIR <- here("output", "cds_reporter_design")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+write_csv(pct_tbl, file.path(OUTDIR, "19_firefly_vs_nanoluc_percentiles.csv"))
+write_csv(ref %>% dplyr::select(reporter, cds_length, gc_pct, gc3_pct, utr5_length),
+          file.path(OUTDIR, "19_firefly_vs_nanoluc_construct_properties.csv"))
+cat("\nExported to output/cds_reporter_design/:\n",
+    " 19_firefly_vs_nanoluc_percentiles.csv\n",
+    " 19_firefly_vs_nanoluc_construct_properties.csv\n")
+```
+
+# 9. Where firefly sits
+
+```{r summary}
+ff_row <- pct_tbl %>% filter(reporter == "firefly")
+nl_row <- pct_tbl %>% filter(reporter == "parent_bidir")
+
+for (m in c("gc3_pct", "cds_length", "utr5_length")) {
+  f <- ff_row %>% filter(metric == m)
+  n <- nl_row %>% filter(metric == m)
+  cat(sprintf("%-12s firefly %8.1f -> %4.1fth pct expressed, %4.1fth of promoted | parent NanoLuc %8.1f -> %4.1fth, %4.1fth\n",
+              m, f$value, f$pct_expressed, f$pct_promoted,
+              n$value, n$pct_expressed, n$pct_promoted))
+}
+
+# Wilcoxon, promoted vs every OTHER expressed transcript, for each metric. The
+# disjoint comparison, matching what the panels report.
+rest <- expressed %>% filter(!gene_id_clean %in% promoted$gene_id_clean)
+cat("\nPromoted vs other expressed (Wilcoxon):\n")
+for (m in c("gc3_pct", "cds_length", "utr5_length")) {
+  wt <- wilcox.test(promoted[[m]], rest[[m]])
+  cat(sprintf("  %-12s promoted median %8.1f vs %8.1f: p = %s\n",
+              m, median(promoted[[m]]), median(rest[[m]]),
+              format.pval(wt$p.value, digits = 3)))
+}
+```
+
+**How to read this.** The eIF3d-promoted set is shifted relative to the rest of
+the transcriptome on each of these axes (section 9 gives the direction and the
+p-value). A reporter that sits deep inside the promoted set's range on the axes
+that separate it is a reporter whose own translation may respond to eIF3d
+depletion, which makes it a poor denominator. The percentile columns are the
+quantity to compare, not the raw value: the three metrics have different units
+and very different spreads.
+
+**What this cannot tell you.** These are compositional features, not a
+measurement. Firefly landing inside the promoted range means it *resembles* the
+regulated mRNAs on features the models weight, not that it is regulated. The
+direct test is firefly's own signal under si3d in the transfected cells, which
+no sequence analysis substitutes for.

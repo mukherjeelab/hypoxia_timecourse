@@ -1,0 +1,273 @@
+---
+title: "GSEA TE gene sets: MDA-MB-231 and MCF7-SIX1, eIF3d and eIF3e"
+author: "Kate"
+date: "2026-11-17"
+output: html_document
+params:
+  padj_cut: 0.05
+  lfc_cut: 0.5
+  min_genes_warn: 15
+editor_options:
+  chunk_output_type: console
+---
+
+Up/down TE gene sets for GSEA, one long CSV in the same format as
+`counts/all_combined_sigs_1_28_26.csv`
+(`db_gene_symbol, ensembl_gene, gs_name, gs_description, gs_source_species`), plus each
+gene's `te_lfc` and `te_padj` so a stricter cutoff can be applied downstream. Both are in the
+promotes-positive orientation for every cell line.
+
+**Contrasts**
+
+- MDA-MB-231, si3d and si3e: normoxia (the 1+4hr time-regressed contrast, labelled just
+  "normoxia") and hypoxia 1hr, 4hr, 24hr.
+- MCF7-SIX1, si3d and si3e: normoxia and hypoxia, 1hr only (the only timepoint).
+
+**Definitions**
+
+- `promotes` = padj < `padj_cut` and TE LFC > `lfc_cut`; `inhibits` = TE LFC < -`lfc_cut`.
+  TE LFC is log2(sictrl / si3x) in every input here, so positive means the knockdown
+  *lowers* TE, meaning the factor promotes translation. The MCF7-SIX1 files in `output/` were
+  already negated from the source log2(si3x / sictrl); this is asserted below.
+- **No size cap.** Several sets exceed fgsea/clusterProfiler's default maximum set size
+  (500), so raise `maxGSSize` or filter on `te_lfc`/`te_padj` first. Two of them (231 si3e
+  normoxia promotes, si3e hypoxia 24hr inhibits) are inflated because the whole TE
+  distribution shifted (median +0.62 / -0.58), so "significant" there mostly means "above /
+  below the median".
+- The knocked-down factor (EIF3D in si3d contrasts, EIF3E in si3e) is removed from its own
+  contrast's sets: its TE change is the siRNA, not eIF3-dependent regulation.
+- Sets under `min_genes_warn` are still written, but flagged, because GSEA's default minimum
+  set size (15) will skip them.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!exists("params") || !is.list(params)) {
+  params <- list(padj_cut = 0.05, lfc_cut = 0.5, min_genes_warn = 15)
+}
+```
+
+```{r load_libraries, message=FALSE}
+library(here)
+library(tidyverse)
+```
+
+## Contrast table
+
+```{r contrasts}
+contrasts <- tribble(
+  ~cell_line,   ~kd,  ~condition,  ~timepoint, ~file,                                                       ~rna_file,
+  "MDA-MB-231", "3d", "normoxia",  "",         "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv", NA,
+  "MDA-MB-231", "3e", "normoxia",  "",         "te_si3e_vs_sictrl_normoxia_1and4hr.csv",                     "rna_si3e_vs_sictrl_normoxia_1and4hr.csv",
+  "MDA-MB-231", "3d", "hypoxia",   "1hr",      "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",      NA,
+  "MDA-MB-231", "3d", "hypoxia",   "4hr",      "translation_categories_si3d_vs_sictrl_hypoxia_4hr.csv",      NA,
+  "MDA-MB-231", "3d", "hypoxia",   "24hr",     "translation_categories_si3d_vs_sictrl_hypoxia_24hr.csv",     NA,
+  "MDA-MB-231", "3e", "hypoxia",   "1hr",      "translation_categories_si3e_vs_sictrl_hypoxia_1hr.csv",      NA,
+  "MDA-MB-231", "3e", "hypoxia",   "4hr",      "translation_categories_si3e_vs_sictrl_hypoxia_4hr.csv",      NA,
+  "MDA-MB-231", "3e", "hypoxia",   "24hr",     "translation_categories_si3e_vs_sictrl_hypoxia_24hr.csv",     NA,
+  "MCF7-SIX1",  "3d", "normoxia",  "1hr",      "translation_categories_si3d_vs_sictrl_mcf7six1_normoxia_1hr.csv", NA,
+  "MCF7-SIX1",  "3d", "hypoxia",   "1hr",      "translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv",  NA,
+  "MCF7-SIX1",  "3e", "normoxia",  "1hr",      "translation_categories_si3e_vs_sictrl_mcf7six1_normoxia_1hr.csv", NA,
+  "MCF7-SIX1",  "3e", "hypoxia",   "1hr",      "translation_categories_si3e_vs_sictrl_mcf7six1_hypoxia_1hr.csv",  NA
+)
+
+stopifnot("missing input file" =
+  all(file.exists(here("output", contrasts$file))),
+  all(file.exists(here("output", na.omit(contrasts$rna_file)))))
+
+read_contrast <- function(f) read_csv(here("output", f), show_col_types = FALSE)
+```
+
+## Direction checks
+
+**MDA-MB-231:** the knocked-down factor's own mRNA must be strongly depleted, so its
+`rna_lfc` (log2 sictrl / si3x) must be strongly positive. The si3e normoxia TE file has no RNA
+column, so its matched RNA file is used.
+
+```{r direction_231}
+target_of <- c("3d" = "EIF3D", "3e" = "EIF3E")
+
+dir_231 <- contrasts %>%
+  filter(cell_line == "MDA-MB-231") %>%
+  mutate(target_rna_lfc = pmap_dbl(list(file, rna_file, kd), function(f, rf, k) {
+    x <- read_contrast(if (is.na(rf)) f else rf)
+    v <- x$rna_lfc[x$symbol == target_of[[k]]]
+    stopifnot("target gene missing or duplicated" = length(v) == 1)
+    v
+  }))
+```
+
+```{r direction_231_assert}
+dir_231 %>% dplyr::select(kd, condition, timepoint, target_rna_lfc) %>% print()
+stopifnot("knockdown target rna_lfc not strongly positive: direction may have flipped" =
+  all(dir_231$target_rna_lfc > 1))
+```
+
+**MCF7-SIX1:** there is no `rna_lfc`, so two other checks are used. (1) `te_lfc` must equal
+the negated source `log2FoldChange`, so the stored column is already log2(sictrl / si3x).
+(2) The matched MDA-MB-231 contrast is independent data and must correlate positively
+(Spearman). Hypoxia is matched to 231 hypoxia 1hr, and normoxia to 231 normoxia 1+4hr.
+
+```{r direction_mcf7}
+mcf7 <- contrasts %>% filter(cell_line == "MCF7-SIX1")
+match_231 <- function(k, cond) {
+  contrasts %>%
+    filter(cell_line == "MDA-MB-231", kd == k, condition == cond,
+           timepoint %in% c("", "1hr")) %>%
+    pull(file)
+}
+
+dir_mcf7 <- mcf7 %>%
+  mutate(
+    max_negation_dev = map_dbl(file, function(f) {
+      x <- read_contrast(f)
+      max(abs(x$te_lfc + x$source_log2FoldChange), na.rm = TRUE)
+    }),
+    rho_vs_231 = pmap_dbl(list(file, kd, condition), function(f, k, cond) {
+      m <- read_contrast(f) %>% dplyr::select(gene_id, te_mcf7 = te_lfc)
+      a <- read_contrast(match_231(k, cond)) %>% dplyr::select(gene_id, te_231 = te_lfc)
+      j <- inner_join(mutate(m, gene_id = sub("\\..*", "", gene_id)),
+                      mutate(a, gene_id = sub("\\..*", "", gene_id)), by = "gene_id")
+      cor(j$te_mcf7, j$te_231, method = "spearman", use = "complete.obs")
+    })
+  )
+dir_mcf7 %>% dplyr::select(kd, condition, max_negation_dev, rho_vs_231) %>% print()
+stopifnot("MCF7-SIX1 te_lfc is not the negated source LFC" =
+            all(dir_mcf7$max_negation_dev < 1e-12),
+          "MCF7-SIX1 anti-correlates with matched 231 contrast: direction flipped" =
+            all(dir_mcf7$rho_vs_231 > 0))
+```
+
+Two more MCF7-SIX1 checks. (3) Compare against the **raw DESeq2 output in the producing
+repo**, not just the copy's own `source_log2FoldChange` column: that output is
+log2(si3x / sictrl) (interaction coefficient, reference `sictrl`), so our `te_lfc` must be
+exactly its negative. If the copy in `output/` had been negated twice, or not at all, this
+fails. (4) The si3d promotes sets must reproduce the earlier MCF7-SIX1 gene-set notebook
+(`42_prepare_mcf7six1_genesets.Rmd`), which built them independently.
+
+```{r direction_mcf7_source}
+src_dir <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia/counts"
+src_file <- c("3d_hypoxia" = "hypoxia_si_ctrl_3d.csv", "3d_normoxia" = "normoxia_sictrl_3d.csv",
+              "3e_hypoxia" = "hypoxia_si_ctrl_3e.csv", "3e_normoxia" = "normoxia_sictrl_3e.csv")
+
+if (dir.exists(src_dir)) {
+  src_check <- mcf7 %>%
+    mutate(max_dev_vs_raw_source = pmap_dbl(list(file, kd, condition), function(f, k, cond) {
+      s <- read_csv(file.path(src_dir, src_file[[paste0(k, "_", cond)]]), show_col_types = FALSE)
+      j <- inner_join(read_contrast(f), dplyr::select(s, gene_id, raw = log2FoldChange),
+                      by = "gene_id")
+      stopifnot("too few genes matched the source" = nrow(j) > 10000)
+      max(abs(j$te_lfc + j$raw), na.rm = TRUE)
+    }))
+  src_check %>% dplyr::select(kd, condition, max_dev_vs_raw_source) %>% print()
+  stopifnot("MCF7-SIX1 te_lfc is not the negated raw DESeq2 output" =
+              all(src_check$max_dev_vs_raw_source < 1e-12))
+} else {
+  warning("MCF7-SIX1 source repo not found; raw-source direction check skipped")
+}
+
+for (cond in c("hypoxia", "normoxia")) {
+  ref <- read_csv(here("output", "genesets",
+                       paste0("mcf7six1_", cond, "_3d_promotes_TE_1hr_lfc0.5.csv")),
+                  show_col_types = FALSE)
+  ours <- read_contrast(paste0("translation_categories_si3d_vs_sictrl_mcf7six1_", cond, "_1hr.csv")) %>%
+    filter(te_padj < params$padj_cut, te_lfc > params$lfc_cut)
+  ok <- setequal(sub("\\..*", "", ours$gene_id), sub("\\..*", "", ref$ensembl_gene))
+  cat(cond, "si3d promotes:", nrow(ours), "genes; matches earlier gene-set notebook:", ok, "\n")
+  stopifnot("MCF7-SIX1 si3d promotes set does not reproduce notebook 42" = ok)
+}
+```
+
+## Build gene sets
+
+```{r build}
+describe <- function(cell_line, kd, condition, timepoint, direction) {
+  cond_txt <- if (cell_line == "MDA-MB-231" && condition == "normoxia") {
+    "in normoxia (1hr and 4hr pooled, time-regressed)"
+  } else {
+    paste0("in ", condition, " at ", timepoint)
+  }
+  norm_txt <- if (cell_line == "MDA-MB-231") ", spike-in normalized" else ""
+  paste0("genes whose translation is ", c(promotes = "promoted", inhibits = "inhibited")[[direction]], " by eIF", kd, " ", cond_txt,
+         " in ", cell_line, " cells (padj < ", params$padj_cut,
+         ", |TE LFC| > ", params$lfc_cut, "; TE LFC = log2(sictrl / si", kd, "), positive = promoted)", norm_txt)
+}
+
+build_one <- function(cell_line, kd, condition, timepoint, file, direction) {
+  x <- read_contrast(file) %>%
+    filter(!is.na(te_padj), te_padj < params$padj_cut,
+           symbol != target_of[[kd]] | is.na(symbol))
+  x <- if (direction == "promotes") filter(x, te_lfc >  params$lfc_cut)
+       else                          filter(x, te_lfc < -params$lfc_cut)
+  x <- x %>% arrange(desc(abs(te_lfc)))
+
+  gs_name <- paste(c(cell_line, condition, kd, direction, "TE",
+                     if (cell_line == "MDA-MB-231" && condition == "hypoxia") timepoint),
+                   collapse = "_")
+  x %>%
+    transmute(db_gene_symbol = symbol,
+              ensembl_gene = sub("\\..*", "", gene_id),
+              gs_name = gs_name,
+              gs_description = describe(cell_line, kd, condition, timepoint, direction),
+              gs_source_species = "homo sapiens",
+              te_lfc, te_padj)
+}
+
+jobs <- contrasts %>%
+  dplyr::select(cell_line, kd, condition, timepoint, file) %>%
+  crossing(direction = c("promotes", "inhibits"))
+
+built <- pmap(jobs, build_one)
+gene_sets <- bind_rows(built)
+```
+
+## Checks
+
+```{r checks}
+summary_df <- jobs %>%
+  mutate(gs_name = map_chr(built, ~ if (nrow(.x)) .x$gs_name[1] else NA_character_),
+         n_genes = map_int(built, nrow),
+         median_abs_te_lfc = map_dbl(built, ~ median(abs(.x$te_lfc))),
+         below_gsea_min = n_genes < params$min_genes_warn,
+         above_gsea_default_max = n_genes > 500) %>%
+  dplyr::select(gs_name, cell_line, kd, condition, timepoint, direction, n_genes,
+                median_abs_te_lfc, below_gsea_min, above_gsea_default_max)
+
+stopifnot(
+  "a set came out empty" = all(summary_df$n_genes > 0),
+  "duplicate set names" = !anyDuplicated(summary_df$gs_name),
+  "promotes set has a non-positive te_lfc" =
+    all(gene_sets$te_lfc[grepl("_promotes_", gene_sets$gs_name)] > params$lfc_cut),
+  "inhibits set has a non-negative te_lfc" =
+    all(gene_sets$te_lfc[grepl("_inhibits_", gene_sets$gs_name)] < -params$lfc_cut),
+  "te_padj above cutoff" = all(gene_sets$te_padj < params$padj_cut),
+  "duplicate gene within a set" =
+    !anyDuplicated(gene_sets[c("gs_name", "ensembl_gene")]),
+  "knocked-down factor present in its own set" =
+    !any((grepl("_3d_", gene_sets$gs_name) & gene_sets$db_gene_symbol %in% "EIF3D") |
+         (grepl("_3e_", gene_sets$gs_name) & gene_sets$db_gene_symbol %in% "EIF3E"))
+)
+
+# no gene can be both promoted and inhibited within one contrast
+overlap <- gene_sets %>%
+  mutate(contrast = sub("_(promotes|inhibits)_", "_", gs_name),
+         dir = str_extract(gs_name, "promotes|inhibits")) %>%
+  distinct(contrast, ensembl_gene, dir) %>%
+  dplyr::count(contrast, ensembl_gene) %>%
+  filter(n > 1)
+stopifnot("gene in both up and down set of one contrast" = nrow(overlap) == 0)
+
+knitr::kable(summary_df)
+```
+
+Sets flagged `below_gsea_min` are written but will be skipped by GSEA at its default
+minimum size of 15. Sets flagged `above_gsea_default_max` need `maxGSSize` raised (or a
+stricter `te_lfc`/`te_padj` filter) or GSEA will skip them.
+
+## Write
+
+```{r write}
+out_file <- here("output", "genesets", "gsea_te_signatures_231_mcf7six1.csv")
+write_csv(gene_sets, out_file)
+write_csv(summary_df, here("output", "genesets", "gsea_te_signatures_231_mcf7six1_summary.csv"))
+cat("Wrote", nrow(gene_sets), "rows,", n_distinct(gene_sets$gs_name), "gene sets to", out_file, "\n")
+```

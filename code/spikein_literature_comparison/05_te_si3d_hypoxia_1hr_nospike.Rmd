@@ -1,0 +1,490 @@
+---
+title: "si3d vs sictrl, hypoxia 1hr, without spike-ins"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Purpose
+
+Builds the **no-spike-in** counterpart of `translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv`
+so the intrinsic regression model can be refit on it and compared against the spike-in outcome.
+
+The no-spike si3d result already exists for **normoxia** only, computed in memory by
+`code/analyzing_spikeins.Rmd` (section "Effect of eIF3e and eIF3d on General Translation
+(Normoxia)") and never saved. This notebook reuses that exact recipe - `createNormMatrix(spikein =
+NULL)` then `deFunction(spikeInMatrix = NULL)` on `human_allCounts_raw.csv` + `metadata_clean.csv`
+- and changes only `condition`.
+
+Before trusting the hypoxia result, the same code path has to reproduce everything that already
+exists. Every comparison lands in one check table (`output/spikein_literature_comparison/
+05_nospike_reproduction_checks.csv`), and the last chunk fails the knit if any check deviates.
+
+| check | reference | what it proves |
+|---|---|---|
+| A1 | `04_te_si3{d,e}_vs_sictrl_normoxia_nospike_1and4hr.csv` (normoxia **1+4hr time-regressed**, `04_bar_te_si3d_si3e_with_nospike_vs_literature.Rmd`), value by value | reproduces **the** saved normoxia no-spike result - the one behind the Standard vs Spike-in figure |
+| A2 | normoxia si3d + si3e no-spike 1/4/24hr sig counts and sample counts, as printed in `analyzing_spikeins.html` | the per-timepoint loop here is the loop there |
+| B | `deseq_results_{1,4,24}hr_nospike.csv` (sictrl hypoxia vs normoxia, `timecourse_qc.Rmd`), value by value | the no-spike machinery reproduces a **saved** no-spike file exactly under today's package versions |
+| C | `translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv` with spikes switched **on**, value by value | the samples and counts used here are the ones behind the spike-in outcome, so spike-ins are the only thing that changes |
+| D | the hypoxia no-spike TE in both reference orientations | the reference-level choice (sictrl vs si3d) does not change the answer beyond a sign |
+| E | EIF3D direction ruler, gene universe | direction and coverage of the new file |
+
+**Direction.** The saved spike-in files are log2(sictrl / si3d) (DESeq2 runs si3d as the
+reference; see CLAUDE.md). The output here is run in that same orientation, so it needs no
+negation and is directly comparable column for column. Positive = knockdown lowers it = eIF3d
+promotes.
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(here)
+})
+library(dplyr)  # after DESeq2, so AnnotationDbi does not mask select
+source(here("code", "functions.R"))
+
+out_dir <- here("output", "spikein_literature_comparison")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Values must agree to this tolerance to count as reproduced. DESeq2 + apeglm are deterministic,
+# so anything above floating-point noise is a real difference and is reported.
+TOL <- 1e-8
+
+checks <- list()
+# gate = FALSE records a check that is REPORTED but does not stop the knit. Used only for a
+# deviation that has been characterised (see section D); every reproduction check gates.
+add_check <- function(id, what, expected, observed, pass, note = "", gate = TRUE) {
+  checks[[length(checks) + 1]] <<- tibble(
+    id = id, what = what, expected = as.character(expected),
+    observed = as.character(observed), pass = pass, gate = gate, note = note)
+  cat(sprintf("[%s] %-4s %s | expected %s | observed %s %s\n",
+              if (pass) "PASS" else if (gate) "FAIL" else "DEVIATION (reported)",
+              id, what, expected, observed, note))
+}
+cmp_values <- function(id, what, ref, new, key = "gene_id", gate = TRUE) {
+  # ref and new: data frames with key + value columns of the same names
+  vals <- setdiff(intersect(names(ref), names(new)), key)
+  j <- inner_join(ref, new, by = key, suffix = c(".ref", ".new"))
+  add_check(id, paste(what, "- shared genes"), nrow(ref), nrow(j),
+            nrow(j) == nrow(ref) && nrow(j) == nrow(new),
+            sprintf("(ref %d, new %d)", nrow(ref), nrow(new)))
+  for (v in vals) {
+    a <- j[[paste0(v, ".ref")]]; b <- j[[paste0(v, ".new")]]
+    na_mismatch <- sum(is.na(a) != is.na(b))
+    d <- max(abs(a - b), na.rm = TRUE)
+    add_check(id, paste(what, "-", v, "max |dev|"), sprintf("< %g", TOL), signif(d, 3),
+              d < TOL && na_mismatch == 0,
+              if (na_mismatch) sprintf("(%d NA mismatches)", na_mismatch) else "", gate = gate)
+  }
+}
+```
+
+# Load
+
+Identical inputs to `analyzing_spikeins.Rmd` and `eif3e_eif3d_normoxia_and_hypoxia.Rmd`.
+
+```{r load}
+allCounts <- read_csv(here("output", "human_allCounts_raw.csv"), show_col_types = FALSE) %>%
+  column_to_rownames("gene_id") %>% as.matrix()
+spikein <- read_csv(here("output", "dros_spikeInCounts_raw.csv"), show_col_types = FALSE) %>%
+  column_to_rownames("gene_id") %>% as.matrix()
+top500_ids <- rownames(spikein)   # eif3e_eif3d_normoxia_and_hypoxia.Rmd uses every spike row
+metadata_clean <- read_csv(here("output", "metadata_clean.csv"), show_col_types = FALSE)
+gene_symbols <- read_csv(here("output", "deseq_results_1hr_spike.csv"), show_col_types = FALSE) %>%
+  dplyr::select(gene_id, symbol)
+
+cat("allCounts:", dim(allCounts), "| spike-in rows:", nrow(spikein),
+    "| metadata:", nrow(metadata_clean), "samples\n")
+stopifnot("spike-in rows leaked into the human count matrix" =
+            !any(rownames(spikein) %in% rownames(allCounts)))
+```
+
+```{r helpers}
+# One function for every run below, so each check exercises the code that builds the output.
+# kd_samples() is the analyzing_spikeins.Rmd filter; run_de() is its createNormMatrix + deFunction
+# pair, with spike-ins optional so check C can switch them back on.
+kd_samples <- function(cond, tp, kd) metadata_clean %>%
+  filter(hours == tp, condition == cond, treatment %in% c("sictrl", kd)) %>%
+  mutate(comparison_variable = treatment)
+
+run_de <- function(md, control, test, mode, spike = FALSE) {
+  cnt <- allCounts[, md$sample_name]
+  sp  <- if (spike) spikein[, md$sample_name] else NULL
+  ks  <- if (spike) top500_ids else NULL
+  nm  <- createNormMatrix(allCounts = cnt, metadata = md, control_condition = control,
+                          spikein = sp, keepSpikes = ks)
+  suppressMessages(capture.output(
+    res <- deFunction(countsMatrix = cnt, allCounts_Norm = nm, metadata = md,
+                      control_condition = control, test_condition = test,
+                      spikeInMatrix = sp, keepSpikes = ks, mode = mode)))
+  res %>% dplyr::select(gene_id, baseMean, log2FoldChange, lfcSE, pvalue, padj)
+}
+```
+
+# A1. Normoxia 1+4hr time-regressed: reproduce the saved no-spike file
+
+MDA-MB-231 normoxia is always the time-regressed 1+4hr contrast (`hours` as a covariate). Its
+no-spike TE was saved by `04_bar_te_si3d_si3e_with_nospike_vs_literature.Rmd` with
+`deFunction_time_normalized(control = siX, test = "sictrl")` - the same si3d-reference
+orientation as the hypoxia file built here, so no negation anywhere.
+
+```{r check_A1}
+md_1and4 <- function(kd) {
+  m <- metadata_clean %>% filter(condition == "normoxia", treatment %in% c("sictrl", kd),
+                                 hours %in% c(1, 4)) %>%
+    mutate(comparison_variable = treatment)
+  m$hours <- as.factor(m$hours)
+  m
+}
+normoxia_1and4_nospike <- list()
+for (kd in c("si3d", "si3e")) {
+  md  <- md_1and4(kd)
+  cnt <- allCounts[, md$sample_name]
+  nm  <- createNormMatrix(allCounts = cnt, metadata = md, control_condition = kd,
+                          spikein = NULL, keepSpikes = NULL)
+  suppressMessages(capture.output(
+    r <- deFunction_time_normalized(countsMatrix = cnt, allCounts_Norm = nm, metadata = md,
+                                    control_condition = kd, test_condition = "sictrl",
+                                    spikeInMatrix = NULL, keepSpikes = NULL, mode = "TE")))
+  normoxia_1and4_nospike[[kd]] <- r
+  ref <- read_csv(here("output", "spikein_literature_comparison",
+                       sprintf("04_te_%s_vs_sictrl_normoxia_nospike_1and4hr.csv", kd)),
+                  show_col_types = FALSE)
+  cmp_values("A1", sprintf("%s normoxia 1+4hr no-spike TE", kd),
+             ref %>% dplyr::select(gene_id, te_lfc, te_padj),
+             r %>% dplyr::select(gene_id, te_lfc = log2FoldChange, te_padj = padj))
+}
+```
+
+# A2. Normoxia per timepoint: reproduce the analyzing_spikeins.Rmd loop
+
+Reference values are what `analyzing_spikeins.html` (rendered 2026-11-18) printed from its two
+loops. They are read from the rendered file, not typed here.
+
+```{r check_A}
+html_txt <- readLines(here("code", "analyzing_spikeins.html"), warn = FALSE) %>%
+  paste(collapse = "\n")
+grab <- function(kd) {
+  # The banner appears twice in the HTML: once inside the echoed code, once as printed output
+  # ("## === Running ..."). The printed one anchors the loop's output; the first three
+  # "Samples:" and "Significant genes" lines after it are that loop's 1/4/24hr results, since
+  # each loop's output is printed before the next loop's code.
+  start <- regexpr(sprintf("## === Running %s vs siCTRL TE analysis \\(no spike-in, normoxia\\)", kd),
+                   html_txt, fixed = FALSE)
+  stopifnot("loop output not found in analyzing_spikeins.html" = start > 0)
+  seg <- substr(html_txt, start, start + 8000)
+  s <- as.integer(str_match_all(seg, "## Samples: (\\d+)")[[1]][, 2])
+  g <- as.integer(str_match_all(seg, "Significant genes \\(padj &lt; 0\\.05\\): (\\d+)")[[1]][, 2])
+  list(samples = head(s, 3), sig = head(g, 3))
+}
+
+normoxia_nospike <- list()
+for (kd in c("si3d", "si3e")) {
+  ref <- grab(kd)
+  stopifnot("expected three timepoints in the reference" =
+              length(ref$samples) == 3, length(ref$sig) == 3)
+  for (i in seq_along(c(1, 4, 24))) {
+    tp <- c(1, 4, 24)[i]
+    md <- kd_samples("normoxia", tp, kd)
+    # analyzing_spikeins.Rmd orientation: sictrl reference, then negate
+    r  <- run_de(md, control = "sictrl", test = kd, mode = "TE")
+    r$log2FoldChange <- -r$log2FoldChange
+    normoxia_nospike[[paste(kd, tp)]] <- r
+    add_check("A2", sprintf("%s normoxia %dhr - samples", kd, tp),
+              ref$samples[i], nrow(md), nrow(md) == ref$samples[i])
+    n_sig <- sum(r$padj < 0.05, na.rm = TRUE)
+    add_check("A2", sprintf("%s normoxia %dhr - TE genes padj < 0.05", kd, tp),
+              ref$sig[i], n_sig, n_sig == ref$sig[i])
+  }
+}
+```
+
+The rendered notebook prints only counts. As a stronger normoxia check, compare the no-spike
+normoxia 1hr TE with the spike-in normoxia 1hr TE the way the original density plot does, so the
+hypoxia shift below has a normoxia yardstick next to it.
+
+```{r normoxia_context}
+shift_tbl <- function(nospike, spike_file, label) {
+  sp <- read_csv(here("output", spike_file), show_col_types = FALSE)
+  j  <- inner_join(sp %>% dplyr::select(gene_id, te_spike = te_lfc),
+                   nospike %>% dplyr::select(gene_id, te_nospike = log2FoldChange), by = "gene_id") %>%
+    filter(!is.na(te_spike), !is.na(te_nospike))
+  tibble(contrast = label, n = nrow(j),
+         median_spike = median(j$te_spike), median_nospike = median(j$te_nospike),
+         median_shift = median(j$te_spike) - median(j$te_nospike),
+         sd_spike = sd(j$te_spike), sd_nospike = sd(j$te_nospike),
+         spearman = cor(j$te_spike, j$te_nospike, method = "spearman"),
+         pearson  = cor(j$te_spike, j$te_nospike))
+}
+context <- bind_rows(
+  shift_tbl(normoxia_1and4_nospike[["si3d"]], "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+            "si3d normoxia 1+4hr (time-regressed)"),
+  shift_tbl(normoxia_nospike[["si3d 1"]],  "translation_categories_si3d_vs_sictrl_normoxia_1hr.csv",  "si3d normoxia 1hr"),
+  shift_tbl(normoxia_nospike[["si3d 4"]],  "translation_categories_si3d_vs_sictrl_normoxia_4hr.csv",  "si3d normoxia 4hr"),
+  shift_tbl(normoxia_nospike[["si3d 24"]], "translation_categories_si3d_vs_sictrl_normoxia_24hr.csv", "si3d normoxia 24hr"))
+print(context)
+```
+
+# B. Reproduce a saved no-spike file, value by value
+
+`timecourse_qc.Rmd` saved the sictrl hypoxia-vs-normoxia no-spike TE at all three timepoints. It
+used `control = "normoxia"` and `comparison_variable = condition`.
+
+```{r check_B}
+for (tp in c(1, 4, 24)) {
+  ref <- read_csv(here("output", sprintf("deseq_results_%dhr_nospike.csv", tp)),
+                  show_col_types = FALSE) %>%
+    dplyr::select(gene_id, log2FoldChange, lfcSE, pvalue, padj)
+  md  <- metadata_clean %>% filter(treatment == "sictrl", hours == tp) %>%
+    mutate(comparison_variable = condition)
+  new <- run_de(md, control = "normoxia", test = "hypoxia", mode = "TE") %>%
+    dplyr::select(gene_id, log2FoldChange, lfcSE, pvalue, padj)
+  cmp_values("B", sprintf("sictrl hyp vs nor %dhr no-spike TE", tp), ref, new)
+}
+```
+
+# C. Hypoxia 1hr with spikes ON reproduces the spike-in outcome
+
+Same samples, same orientation (`control = "si3d"`, `test = "sictrl"`) and same spike-in rows as
+`eif3e_eif3d_normoxia_and_hypoxia.Rmd`. If this matches, the only difference between the spike-in
+file and the no-spike file built in D is the spike-ins.
+
+```{r check_C}
+md_hyp <- kd_samples("hypoxia", 1, "si3d")
+cat("hypoxia 1hr si3d/sictrl samples:", nrow(md_hyp), "\n")
+print(dplyr::count(md_hyp, treatment, library))
+
+spike_ref <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"),
+                      show_col_types = FALSE)
+spike_new <- map(c(RNA = "RNA", RIBO = "RIBO", TE = "TE"),
+                 ~ run_de(md_hyp, control = "si3d", test = "sictrl", mode = .x, spike = TRUE))
+for (m in names(spike_new)) {
+  p <- tolower(m)
+  ref <- spike_ref %>% dplyr::select(gene_id, lfc = !!paste0(p, "_lfc"), padj = !!paste0(p, "_padj"))
+  new <- spike_new[[m]] %>% dplyr::select(gene_id, lfc = log2FoldChange, padj)
+  cmp_values("C", sprintf("hypoxia 1hr si3d spike-in %s", m), ref, new)
+}
+```
+
+# D. Hypoxia 1hr without spike-ins
+
+```{r run_D}
+nospike <- map(c(RNA = "RNA", RIBO = "RIBO", TE = "TE"),
+               ~ run_de(md_hyp, control = "si3d", test = "sictrl", mode = .x))
+
+# The analyzing_spikeins.Rmd orientation (sictrl reference, negated) against the orientation
+# used here (si3d reference, as in every spike-in file).
+te_flipped <- run_de(md_hyp, control = "sictrl", test = "si3d", mode = "TE") %>%
+  mutate(log2FoldChange = -log2FoldChange)
+cmp_values("D", "hypoxia no-spike TE, si3d-ref vs sictrl-ref (negated)",
+           nospike$TE %>% dplyr::select(gene_id, lfc = log2FoldChange, padj),
+           te_flipped %>% dplyr::select(gene_id, lfc = log2FoldChange, padj), gate = FALSE)
+
+jo <- inner_join(nospike$TE, te_flipped, by = "gene_id", suffix = c(".a", ".b")) %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  mutate(d = log2FoldChange.a - log2FoldChange.b)
+sig_a <- jo$padj.a < 0.05; sig_b <- jo$padj.b < 0.05
+n_disagree <- sum(sig_a != sig_b, na.rm = TRUE)
+add_check("D", "orientations: genes called padj < 0.05 differently", 0, n_disagree, n_disagree == 0,
+          sprintf("(%d vs %d significant)", sum(sig_a, na.rm = TRUE), sum(sig_b, na.rm = TRUE)))
+rho_o <- cor(jo$log2FoldChange.a, jo$log2FoldChange.b, method = "spearman", use = "complete.obs")
+add_check("D", "orientations: Spearman of shrunken TE LFC", "> 0.999", round(rho_o, 5), rho_o > 0.999)
+add_check("D", "orientations: genes with |shrunken LFC dev| > 0.5", 0, sum(abs(jo$d) > 0.5, na.rm = TRUE),
+          sum(abs(jo$d) > 0.5, na.rm = TRUE) == 0,
+          sprintf("(> 0.01: %d; median |dev| %.4f)", sum(abs(jo$d) > 0.01, na.rm = TRUE),
+                  median(abs(jo$d), na.rm = TRUE)), gate = FALSE)
+```
+
+**The shrunken LFC depends on which level is the reference, for a handful of genes.** DESeq2's
+Wald statistics are orientation-invariant - padj agrees to ~1e-4 and the significant set is
+identical - but apeglm's shrunken LFC is not. For ~14 genes one orientation shrinks the estimate
+to about +/-0.2 with a small SE while the other leaves it near +/-4 with a large SE: the
+posterior has two modes and the optimiser lands in a different one. The same thing happens in
+**normoxia** (14 genes > 0.5, 627 significant in both orientations, checked separately), so it is
+a property of apeglm on this design, not of this run. It also means `analyzing_spikeins.Rmd`'s
+normoxia no-spike curve (sictrl reference) carries the other mode for those genes.
+
+**This file uses the si3d reference**, the orientation of every spike-in
+`translation_categories_*` file, so the spike vs no-spike comparison treats both outcomes the
+same way. The deviation is recorded in the check table and does not gate the knit; significance
+and rank agreement, which do gate, are unaffected. The genes concerned:
+
+```{r orientation_genes}
+jo %>% filter(abs(d) > 0.1) %>% arrange(desc(abs(d))) %>%
+  transmute(symbol, baseMean = round(baseMean.a, 1),
+            lfc_si3d_ref = round(log2FoldChange.a, 3), lfc_sictrl_ref = round(log2FoldChange.b, 3),
+            se_si3d_ref = round(lfcSE.a, 3), se_sictrl_ref = round(lfcSE.b, 3),
+            padj = signif(padj.a, 3)) %>%
+  as_tibble() %>% print(n = Inf)
+```
+
+```{r assemble_D}
+nospike_tbl <- nospike$RNA %>% dplyr::select(gene_id, rna_lfc = log2FoldChange, rna_padj = padj) %>%
+  full_join(nospike$RIBO %>% dplyr::select(gene_id, ribo_lfc = log2FoldChange, ribo_padj = padj), by = "gene_id") %>%
+  full_join(nospike$TE %>% dplyr::select(gene_id, te_lfc = log2FoldChange, te_padj = padj), by = "gene_id") %>%
+  left_join(gene_symbols, by = "gene_id") %>%
+  dplyr::select(gene_id, symbol, rna_lfc, ribo_lfc, te_lfc, rna_padj, ribo_padj, te_padj)
+
+for (v in c("rna_lfc", "ribo_lfc", "te_lfc"))
+  stopifnot("non-finite LFC" = all(is.finite(nospike_tbl[[v]][!is.na(nospike_tbl[[v]])])))
+```
+
+# E. Direction and coverage
+
+```{r check_E}
+e3d <- nospike_tbl %>% filter(symbol == "EIF3D")
+stopifnot("EIF3D missing from the no-spike table" = nrow(e3d) == 1)
+add_check("E", "EIF3D rna_lfc (direction ruler; must be > 2)", "> 2",
+          round(e3d$rna_lfc, 3), e3d$rna_lfc > 2)
+e3d_sp <- spike_ref %>% filter(symbol == "EIF3D")
+add_check("E", "EIF3D te_lfc has the same sign as the spike-in file",
+          sprintf("sign of %+.3f", e3d_sp$te_lfc), sprintf("%+.3f", e3d$te_lfc),
+          sign(e3d$te_lfc) == sign(e3d_sp$te_lfc))
+add_check("E", "gene universe identical to the spike-in file", nrow(spike_ref), nrow(nospike_tbl),
+          setequal(spike_ref$gene_id, nospike_tbl$gene_id))
+add_check("E", "genes with a non-NA te_lfc", sum(!is.na(spike_ref$te_lfc)),
+          sum(!is.na(nospike_tbl$te_lfc)),
+          sum(!is.na(spike_ref$te_lfc)) == sum(!is.na(nospike_tbl$te_lfc)))
+```
+
+# What spike-ins change, hypoxia vs normoxia
+
+The shift and agreement between the spike-in and no-spike TE, hypoxia 1hr next to the three
+normoxia timepoints from section A. The 2024-repo file is the same samples quantified against
+GENCODE v26 with its own gene filter, so it is an **independent** reproduction, not an exact one:
+it should correlate highly with the no-spike result, and more highly than with the spike-in one.
+
+```{r spike_effect}
+hyp_nospike_res <- nospike$TE
+context <- bind_rows(
+  shift_tbl(hyp_nospike_res, "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv", "si3d hypoxia 1hr"),
+  context)
+print(context, width = Inf)
+
+ext_path <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia/counts/counts_231/hypoxia_si_ctrl_3d.csv"
+if (file.exists(ext_path)) {
+  ext <- read_csv(ext_path, show_col_types = FALSE) %>%
+    transmute(g = sub("[.].*", "", gene_id), te_2024 = -log2FoldChange)   # sictrl ref -> negate
+  jj <- nospike_tbl %>% transmute(g = sub("[.].*", "", gene_id), te_nospike = te_lfc) %>%
+    inner_join(spike_ref %>% transmute(g = sub("[.].*", "", gene_id), te_spike = te_lfc), by = "g") %>%
+    inner_join(ext, by = "g") %>% drop_na()
+  r_ns <- cor(jj$te_nospike, jj$te_2024, method = "spearman")
+  r_sp <- cor(jj$te_spike,   jj$te_2024, method = "spearman")
+  cat(sprintf("2024-repo no-spike (v26) vs this no-spike: Spearman %.3f | vs spike-in: %.3f | n = %d\n",
+              r_ns, r_sp, nrow(jj)))
+  add_check("E", "2024-repo no-spike agrees better with this no-spike than with spike-in",
+            sprintf("> %.3f", r_sp), round(r_ns, 3), r_ns > r_sp, sprintf("(n = %d)", nrow(jj)))
+}
+```
+
+## Distribution with and without spike-ins
+
+Styled to match the normoxia figure in `analyzing_spikeins.Rmd` (`si3d_te_density_plot`): the
+same two fills (`#87610e` no spike-in, `#E69F00` spike-in), alpha 0.6, x limited to +/-2, dashed
+line at 0. Both files are log2(sictrl / si3d), so positive = knockdown lowers TE. Panel n is the
+number of genes with a non-NA TE in each curve.
+
+```{r density_plot, fig.width=4.5, fig.height=3}
+library(ggprism)
+spike_fills <- c("No spike-in" = "#87610e", "Spike-in" = "#E69F00")
+
+dens_df <- function(spike_te, nospike_te, label) bind_rows(
+  tibble(lfc = spike_te,   normalization = "Spike-in"),
+  tibble(lfc = nospike_te, normalization = "No spike-in")) %>%
+  filter(!is.na(lfc)) %>%
+  mutate(panel = label,
+         normalization = factor(normalization, levels = names(spike_fills)))
+
+density_panel <- function(df, title) {
+  n_lab <- df %>% dplyr::count(normalization) %>%
+    summarise(lab = paste0(normalization, ": n = ", format(n, big.mark = ","), collapse = "\n")) %>%
+    pull(lab)
+  ggplot(df, aes(lfc, fill = normalization)) +
+    geom_density(alpha = 0.6, linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "gray40", linewidth = 0.5) +
+    scale_fill_manual(values = spike_fills) +
+    scale_x_continuous(limits = c(-2, 2)) +
+    annotate("text", x = Inf, y = Inf, label = n_lab, hjust = 1.05, vjust = 1.3, size = 2.8) +
+    labs(title = title, x = "TE log2FC (sictrl / si3d)", y = "Density", fill = NULL) +
+    theme_prism() +
+    theme(axis.text = element_text(size = 9), axis.title = element_text(size = 10),
+          plot.title = element_text(size = 11, face = "bold"),
+          legend.position = "bottom", legend.text = element_text(size = 9))
+}
+
+hyp_df <- dens_df(spike_ref$te_lfc, nospike_tbl$te_lfc, "Hypoxia 1hr")
+p_hyp  <- density_panel(hyp_df, "sictrl vs si3d, hypoxia 1hr")
+print(p_hyp)
+ggsave(here("plots", "05_si3d_te_spike_comparison_hypoxia_1hr.pdf"), p_hyp, width = 4.5, height = 3)
+```
+
+Normoxia **1+4hr time-regressed** (the project's normoxia contrast, and the one in the original
+Standard vs Spike-in figure) next to hypoxia 1hr. The normoxia curves are the saved files
+section A1 reproduced exactly.
+
+```{r density_plot_both, fig.width=8, fig.height=3}
+nor_spike   <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv"),
+                        show_col_types = FALSE)
+nor_nospike <- read_csv(here("output", "spikein_literature_comparison",
+                             "04_te_si3d_vs_sictrl_normoxia_nospike_1and4hr.csv"),
+                        show_col_types = FALSE)
+nor_lab <- "Normoxia 1+4hr (time-regressed)"
+both_df <- bind_rows(
+  dens_df(nor_spike$te_lfc, nor_nospike$te_lfc, nor_lab),
+  hyp_df) %>%
+  mutate(panel = factor(panel, levels = c(nor_lab, "Hypoxia 1hr")))
+p_both <- ggplot(both_df, aes(lfc, fill = normalization)) +
+  geom_density(alpha = 0.6, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray40", linewidth = 0.5) +
+  scale_fill_manual(values = spike_fills) +
+  scale_x_continuous(limits = c(-2, 2)) +
+  facet_wrap(~ panel, nrow = 1) +
+  geom_text(data = both_df %>% dplyr::count(panel, normalization) %>%
+              group_by(panel) %>%
+              summarise(lab = paste0(normalization, ": n = ", format(n, big.mark = ","),
+                                     collapse = "\n"), .groups = "drop"),
+            aes(x = Inf, y = Inf, label = lab), inherit.aes = FALSE,
+            hjust = 1.05, vjust = 1.3, size = 2.8) +
+  labs(title = "sictrl vs si3d", x = "TE log2FC (sictrl / si3d)", y = "Density", fill = NULL) +
+  theme_prism() +
+  theme(axis.text = element_text(size = 9), axis.title = element_text(size = 10),
+        strip.text = element_text(face = "bold", size = 10),
+        strip.background = element_rect(fill = "grey90"),
+        plot.title = element_text(size = 11, face = "bold"),
+        legend.position = "bottom", legend.text = element_text(size = 9))
+print(p_both)
+ggsave(here("plots", "05_si3d_te_spike_comparison_normoxia1and4hr_vs_hypoxia_1hr.pdf"), p_both,
+       width = 8, height = 3)
+```
+
+# Write
+
+```{r write}
+check_tbl <- bind_rows(checks)
+write_csv(check_tbl, file.path(out_dir, "05_nospike_reproduction_checks.csv"))
+write_csv(context,   file.path(out_dir, "05_spike_vs_nospike_shift_by_contrast.csv"))
+# Written to a temp file and renamed, so a model render reading this file mid-knit never sees a
+# partial CSV.
+.dest <- here("output", "translation_categories_si3d_vs_sictrl_hypoxia_1hr_nospike.csv")
+.tmp  <- paste0(.dest, ".tmp")
+write_csv(nospike_tbl, .tmp)
+stopifnot("could not replace the no-spike CSV" = file.rename(.tmp, .dest))
+cat("Wrote translation_categories_si3d_vs_sictrl_hypoxia_1hr_nospike.csv:",
+    nrow(nospike_tbl), "genes\n")
+
+cat(sprintf("\n%d of %d checks passed; %d reported deviation(s) that do not gate\n",
+            sum(check_tbl$pass), nrow(check_tbl), sum(!check_tbl$pass & !check_tbl$gate)))
+if (any(!check_tbl$pass)) print(check_tbl %>% filter(!pass), width = Inf)
+stopifnot("one or more gating checks failed - see 05_nospike_reproduction_checks.csv" =
+            all(check_tbl$pass | !check_tbl$gate))
+```

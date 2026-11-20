@@ -18,12 +18,20 @@ suffix <- "eif33d_promotes_hypoxia_1hr_lfc0.5_tco4e_corrected_both_clipaggregate
 top_n  <- 20L
 engine <- "kernelshap"   # or "treeshap"
 n_boot <- 2000L
+# annotation matching the model's matrix (feature_annotation_tco_posgc.csv for 01r_ models)
+annotation_csv <- "feature_annotation.csv"
+# bar fill: "block" = the four broad categories (original), "region" = feature_colours.R's
+# mRNA-region categories, as in 03i_'s signed bar chart
+fill_by <- "block"
 ## ---------------------------------------------------------------------------------
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) >= 1) suffix <- args[1]
 if (length(args) >= 2) top_n  <- as.integer(args[2])
 if (length(args) >= 3) engine <- args[3]
+if (length(args) >= 4) annotation_csv <- args[4]
+if (length(args) >= 5) fill_by <- args[5]
+stopifnot("fill_by must be block or region" = fill_by %in% c("block", "region"))
 stopifnot("engine must be treeshap or kernelshap" = engine %in% c("treeshap", "kernelshap"))
 # 03_shap.Rmd tags its SHAP outputs with the engine; the MODEL files are shared between engines
 etag <- if (engine == "treeshap") "" else paste0("_", engine)
@@ -39,7 +47,7 @@ stopifnot("model or SHAP output missing" = all(file.exists(f)),
 
 md   <- readRDS(f["data"])
 shap <- read_csv(f["gene"], show_col_types = FALSE)
-ann  <- read_csv(file.path(O, "feature_annotation.csv"), show_col_types = FALSE)
+ann  <- read_csv(file.path(O, annotation_csv), show_col_types = FALSE)
 ref  <- read_csv(f["feat"], show_col_types = FALSE)
 stopifnot(identical(md$suffix, suffix),
           setequal(setdiff(names(shap), c("gene_id_clean", "symbol")), md$feature_cols),
@@ -89,6 +97,11 @@ plot_df <- top %>% left_join(ci, by = "feature") %>%
          category = factor(category, levels = names(category_colors)),
          feature  = fct_reorder(feature, signed))
 stopifnot("feature missing from annotation" = !anyNA(plot_df$block))
+if (fill_by == "region") {
+  source(here("code", "translational_control_overview", "feature_colours.R"))
+  plot_df$category <- feature_category(as.character(plot_df$feature), ann)
+  category_colors  <- FEATURE_COLOURS
+}
 crosses <- plot_df$feature[plot_df$lo < 0 & plot_df$hi > 0]
 cat(sprintf("top %d of %d features | %d genes | %d bootstrap resamples\n",
             nrow(plot_df), length(md$feature_cols), n_genes, n_boot))
@@ -96,7 +109,7 @@ cat("95% CI crosses zero:", if (length(crosses)) paste(crosses, collapse = ", ")
 
 what <- sub("_lfc.*", "", sub("^eif33d_promotes_", "si3d ", suffix))
 p <- ggplot(plot_df, aes(signed, feature, fill = category)) +
-  geom_col(width = 0.7) +
+  geom_col(width = 0.7, colour = if (fill_by == "region") "grey20" else NA, linewidth = 0.25) +
   geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.4) +
   geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.35, linewidth = 0.4, colour = "grey20") +
   scale_fill_manual(values = category_colors, name = NULL, drop = TRUE) +
@@ -115,8 +128,9 @@ p <- ggplot(plot_df, aes(signed, feature, fill = category)) +
         plot.caption.position = "plot", plot.title.position = "plot")
 print(p)   # shows in the Plots pane when run interactively
 
-out_pdf <- here("plots", paste0("03k_shap_bar_gene_bootstrap_", suffix, etag, "_top", top_n, ".pdf"))
+ftag <- if (fill_by == "region") "_region" else ""
+out_pdf <- here("plots", paste0("03k_shap_bar_gene_bootstrap_", suffix, etag, "_top", top_n, ftag, ".pdf"))
 ggsave(out_pdf, p, width = 9, height = 0.3 * nrow(plot_df) + 2.8)
 write_csv(plot_df %>% arrange(desc(mean_abs_shap)),
-          file.path(O, paste0("shap_bar_gene_bootstrap_", suffix, etag, "_top", top_n, ".csv")))
+          file.path(O, paste0("shap_bar_gene_bootstrap_", suffix, etag, "_top", top_n, ftag, ".csv")))
 cat("wrote", out_pdf, "\n")

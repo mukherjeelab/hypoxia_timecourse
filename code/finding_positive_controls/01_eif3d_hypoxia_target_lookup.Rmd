@@ -1,0 +1,306 @@
+---
+title: "Are candidate transcripts eIF3d targets in hypoxia? (MDA-MB-231 and MCF7-SIX1)"
+output:
+  html_document:
+    toc: true
+params:
+  transcript_csv: "set1_5utr_transcripts.csv"
+  lfc: 0.5
+  padj: 0.05
+---
+
+**Question.** For a list of candidate transcripts (positive-control candidates for reporters),
+is each one an eIF3d translation target in hypoxia, in MDA-MB-231 and in MCF7-SIX1?
+
+**Definition of "eIF3d target" used here.** A gene whose translation efficiency (TE) drops on
+eIF3d knockdown: TE log2 fold change (sictrl / si3d, promotes-positive) > `params$lfc` and
+`te_padj` < `params$padj`. This is exactly the definition behind the existing gene sets
+`hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` (MDA-MB-231) and
+`mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv` (MCF7-SIX1); both are reproduced and asserted
+below. The opposite call ("eIF3d inhibits") is TE log2 fold change < -`params$lfc` at the same padj.
+
+**Important caveat: the TE data is gene-level.** DESeq2 was run on gene counts, so the answer
+is about the *gene*, not the specific isoform you gave. Section 4 reports whether the isoform
+you gave is the same one our feature matrices treat as the dominant isoform in each cell line.
+
+Add a new set by writing another CSV with columns `set, symbol_given, transcript_id_given` in
+this folder and knitting with `params = list(transcript_csv = "<file>.csv")`.
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!exists("params") || !is.list(params)) {
+  params <- list(transcript_csv = "set1_5utr_transcripts.csv", lfc = 0.5, padj = 0.05)
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(GenomicFeatures)
+  library(AnnotationDbi)
+})
+out_dir <- here("output", "finding_positive_controls")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+set_tag <- tools::file_path_sans_ext(basename(params$transcript_csv))
+```
+
+## 1. Candidate transcripts -> genes
+
+Transcripts are mapped to genes through the GENCODE v49 transcript database on the
+**version-stripped** transcript ID, so a version mismatch between your ID and v49 does not
+lose the transcript. The symbol you gave is checked against the mapped gene, never used to map.
+
+```{r candidates}
+cand <- read_csv(here("code", "finding_positive_controls", params$transcript_csv),
+                 show_col_types = FALSE) %>%
+  mutate(transcript_id_given = str_trim(transcript_id_given),
+         transcript_id_clean = sub("\\..*", "", transcript_id_given),
+         symbol_given        = str_trim(symbol_given))
+stopifnot(all(c("set", "symbol_given", "transcript_id_given") %in% names(cand)),
+          !anyDuplicated(cand$transcript_id_clean))
+
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+tx2gene <- AnnotationDbi::select(txdb, keys = keys(txdb, "TXNAME"), keytype = "TXNAME",
+                                 columns = c("TXNAME", "GENEID")) %>%
+  transmute(transcript_id_v49   = TXNAME,
+            transcript_id_clean = sub("\\..*", "", TXNAME),
+            gene_id_v49         = GENEID,
+            gene_id_clean       = sub("\\..*", "", GENEID))
+
+anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                 col_names = c("gene_id", "symbol", "biotype", "species", "source"),
+                 show_col_types = FALSE) %>%
+  distinct(gene_id_clean = sub("\\..*", "", gene_id), symbol)
+
+cand <- cand %>%
+  left_join(tx2gene, by = "transcript_id_clean") %>%
+  left_join(anno, by = "gene_id_clean")
+
+unmapped <- cand %>% filter(is.na(gene_id_clean))
+if (nrow(unmapped) > 0) {
+  cat("Transcripts NOT in GENCODE v49:", paste(unmapped$transcript_id_given, collapse = ", "), "\n")
+}
+cand %>%
+  mutate(version_matches_v49 = transcript_id_given == transcript_id_v49,
+         symbol_matches      = toupper(symbol_given) == symbol) %>%
+  dplyr::select(symbol_given, transcript_id_given, transcript_id_v49, version_matches_v49,
+                gene_id_clean, symbol, symbol_matches) %>%
+  knitr::kable()
+
+stopifnot("a given symbol disagrees with the gene its transcript maps to" =
+            all(toupper(cand$symbol_given) == cand$symbol, na.rm = TRUE))
+```
+
+## 2. TE results
+
+**MDA-MB-231.** `translation_categories_si3d_vs_sictrl_hypoxia_{1,4,24}hr.csv`. The filename
+says si3d_vs_sictrl but the DESeq2 coefficient is **sictrl_vs_si3d**, so positive `te_lfc`
+= eIF3d promotes. Verified below: EIF3D's own `rna_lfc` must be strongly positive.
+
+**MCF7-SIX1.** `translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv` is already
+negated from the raw log2(si3d / sictrl) (`source_log2FoldChange`), so positive `te_lfc` =
+eIF3d promotes, matching 231. Only 1hr exists for MCF7-SIX1, and there is no `rna_lfc`, so the
+231 direction check cannot run; instead we assert the negation and EIF3D's own TE sign
+(raw TE of the depleted factor is positive, +1.79, so the negated value must be negative).
+
+```{r load_te}
+read_231 <- function(tp) {
+  read_csv(here("output", sprintf("translation_categories_si3d_vs_sictrl_hypoxia_%s.csv", tp)),
+           show_col_types = FALSE) %>%
+    mutate(gene_id_clean = sub("\\..*", "", gene_id))
+}
+te231 <- set_names(c("1hr", "4hr", "24hr")) %>% map(read_231)
+
+for (tp in names(te231)) {
+  e <- te231[[tp]] %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+  cat(sprintf("231 hypoxia %s: EIF3D rna_lfc = %.2f\n", tp, e))
+  stopifnot("231 direction flipped: EIF3D rna_lfc should be strongly positive" = e > 1.5)
+}
+
+te_mcf <- read_csv(here("output", "translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv"),
+                   show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+stopifnot("MCF7-SIX1 te_lfc is not the negation of the source LFC" =
+            isTRUE(all.equal(te_mcf$te_lfc, -te_mcf$source_log2FoldChange)))
+e_mcf <- te_mcf %>% filter(symbol == "EIF3D") %>% pull(te_lfc)
+cat(sprintf("MCF7-SIX1 hypoxia 1hr: EIF3D te_lfc (promotes-positive) = %.2f\n", e_mcf))
+stopifnot("MCF7-SIX1 direction check failed" = e_mcf < -1)
+```
+
+### Reproduce the existing gene sets (so "target" here means the same thing)
+
+```{r reproduce_genesets}
+gs231 <- read_csv(here("output", "genesets", "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                  show_col_types = FALSE)
+gsmcf <- read_csv(here("output", "genesets", "mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv"),
+                  show_col_types = FALSE)
+rep231 <- te231[["1hr"]] %>% filter(te_lfc > 0.5, te_padj < 0.05) %>% pull(gene_id_clean)
+repmcf <- te_mcf %>% filter(te_lfc > 0.5, te_padj < 0.05) %>% pull(gene_id_clean)
+cat("231 set:", length(rep231), "recomputed vs", nrow(gs231), "saved\n")
+cat("MCF7-SIX1 set:", length(repmcf), "recomputed vs", nrow(gsmcf), "saved\n")
+stopifnot(setequal(rep231, gs231$ensembl_gene), setequal(repmcf, gsmcf$ensembl_gene))
+```
+
+## 3. Calls
+
+```{r calls}
+call_status <- function(lfc, padj, present) {
+  case_when(
+    !present                                   ~ "not detected",
+    is.na(padj)                                ~ "not tested (padj NA)",
+    padj < params$padj & lfc >  params$lfc     ~ "eIF3d TARGET (promotes)",
+    padj < params$padj & lfc < -params$lfc     ~ "eIF3d inhibits",
+    padj < params$padj                         ~ "significant, |LFC| below cutoff",
+    TRUE                                       ~ "not significant"
+  )
+}
+
+lookup <- function(te, label) {
+  cand %>%
+    dplyr::select(set, symbol_given, transcript_id_given, gene_id_clean) %>%
+    left_join(te %>% dplyr::select(gene_id_clean, te_lfc, te_padj) %>%
+                mutate(present = TRUE), by = "gene_id_clean") %>%
+    mutate(present = coalesce(present, FALSE),
+           status  = call_status(te_lfc, te_padj, present),
+           dataset = label)
+}
+
+calls_long <- bind_rows(
+  lookup(te231[["1hr"]],  "MDA-MB-231 hypoxia 1hr"),
+  lookup(te231[["4hr"]],  "MDA-MB-231 hypoxia 4hr"),
+  lookup(te231[["24hr"]], "MDA-MB-231 hypoxia 24hr"),
+  lookup(te_mcf,          "MCF7-SIX1 hypoxia 1hr")
+)
+stopifnot(!anyDuplicated(calls_long[c("transcript_id_given", "dataset")]))
+
+fmt <- function(lfc, padj) ifelse(is.na(lfc), "-", sprintf("%.2f (%.2g)", lfc, padj))
+summary_tbl <- calls_long %>%
+  mutate(cell = paste0(status, " | ", fmt(te_lfc, te_padj))) %>%
+  dplyr::select(symbol_given, transcript_id_given, dataset, cell) %>%
+  pivot_wider(names_from = dataset, values_from = cell)
+```
+
+**Primary answer (1hr hypoxia, both cell lines).** Cells read `status | TE LFC (padj)`.
+
+```{r primary}
+summary_tbl %>%
+  dplyr::select(symbol_given, transcript_id_given,
+                `MDA-MB-231 hypoxia 1hr`, `MCF7-SIX1 hypoxia 1hr`) %>%
+  knitr::kable()
+
+calls_long %>%
+  filter(dataset %in% c("MDA-MB-231 hypoxia 1hr", "MCF7-SIX1 hypoxia 1hr")) %>%
+  dplyr::count(dataset, status) %>%
+  knitr::kable()
+```
+
+**Later 231 hypoxia timepoints** (no MCF7-SIX1 counterpart exists).
+
+```{r later}
+summary_tbl %>%
+  dplyr::select(symbol_given, `MDA-MB-231 hypoxia 4hr`, `MDA-MB-231 hypoxia 24hr`) %>%
+  knitr::kable()
+```
+
+## 3b. Translation category: is the change Exclusive?
+
+Categories come from `categorize_translation_changes()` (`code/functions.R`), with
+"significant" meaning padj < 0.05 and **no fold-change cutoff** (`lfc_cutoff = 0`, as at every
+call site in this project):
+
+- **Exclusive**: ribosome footprints and TE change, mRNA does not. A purely translational effect.
+- **TE_only**: TE changes, neither RNA nor footprints do on their own.
+- **Buffered**: RNA changes and TE changes (footprints may or may not), so translation partly offsets the mRNA change.
+- **Forwarded**: RNA and footprints change together, TE does not. An mRNA-level effect.
+
+For MDA-MB-231 this is the saved `category` column, re-derived from the three padj columns
+below to confirm it used `lfc_cutoff = 0`. For MCF7-SIX1 it comes from
+`00_mcf7six1_hypoxia_si3d_categories.Rmd`, which fits the RNA-only and ribo-only contrasts
+the saved MCF7-SIX1 file lacks (run that notebook first).
+
+```{r categories}
+recat <- function(r, b, t) {
+  sr <- !is.na(r) & r < 0.05; sb <- !is.na(b) & b < 0.05; st <- !is.na(t) & t < 0.05
+  case_when(sr & sb & !st ~ "Forwarded", !sr & sb & st ~ "Exclusive",
+            sr & st ~ "Buffered", st ~ "TE_only", TRUE ~ "Not_sig")
+}
+for (tp in names(te231)) {
+  d <- te231[[tp]]
+  stopifnot("231 saved category is not the padj-only (lfc_cutoff = 0) definition" =
+              all(recat(d$rna_padj, d$ribo_padj, d$te_padj) == d$category))
+}
+
+cat_mcf_path <- here("output", "finding_positive_controls",
+                     "mcf7six1_hypoxia_1hr_si3d_rna_ribo_te_categories.csv")
+stopifnot("run 00_mcf7six1_hypoxia_si3d_categories.Rmd first" = file.exists(cat_mcf_path))
+cat_mcf <- read_csv(cat_mcf_path, show_col_types = FALSE) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+# same TE as the file used above
+chk <- inner_join(cat_mcf, te_mcf, by = "gene_id_clean")
+# Shrinkage changes LFC magnitude a lot for low-count genes, and pulls ~60 non-significant
+# genes (padj >= 0.4) across zero; among significant genes the sign must agree.
+sig <- chk$te_padj.x < 0.05
+stopifnot(nrow(chk) == nrow(te_mcf),
+          max(abs(chk$te_padj.x - chk$te_padj.y)) < 1e-8,
+          all(sign(chk$te_lfc.x[sig]) == sign(chk$te_lfc.y[sig])))
+
+cat_cols <- function(d, label) d %>%
+  transmute(gene_id_clean, dataset = label, category, rna_lfc, rna_padj, ribo_lfc, ribo_padj)
+cats_long <- bind_rows(
+  cat_cols(te231[["1hr"]],  "MDA-MB-231 hypoxia 1hr"),
+  cat_cols(te231[["4hr"]],  "MDA-MB-231 hypoxia 4hr"),
+  cat_cols(te231[["24hr"]], "MDA-MB-231 hypoxia 24hr"),
+  cat_cols(cat_mcf,         "MCF7-SIX1 hypoxia 1hr")
+)
+calls_long <- calls_long %>% left_join(cats_long, by = c("gene_id_clean", "dataset"))
+stopifnot(!anyDuplicated(calls_long[c("transcript_id_given", "dataset")]))
+
+calls_long %>%
+  filter(dataset %in% c("MDA-MB-231 hypoxia 1hr", "MCF7-SIX1 hypoxia 1hr")) %>%
+  mutate(cell = ifelse(present, sprintf("%s | %s | RNA %.2f (%.2g), ribo %.2f (%.2g)",
+                                        status, category, rna_lfc, rna_padj, ribo_lfc, ribo_padj),
+                       "not detected")) %>%
+  dplyr::select(symbol_given, dataset, cell) %>%
+  pivot_wider(names_from = dataset, values_from = cell) %>%
+  knitr::kable()
+```
+
+The TE log2 fold change in the MCF7-SIX1 category file is unshrunk, so it differs slightly
+from the shrunk value in section 3; padj is identical, and the target call uses the section 3
+value.
+
+## 4. Is the given isoform the one our matrices use?
+
+The TE call above is gene-level. If the 5'UTR you plan to clone comes from a different isoform
+than the dominant one in that cell line, the gene-level TE result may not describe it.
+`feature_matrix_tco.rds` (231) and `feature_matrix_tco_mcf7six1.rds` (MCF7-SIX1) each hold one
+transcript per gene, chosen as that cell line's most-abundant isoform.
+
+```{r isoform}
+fm_tx <- function(p) {
+  readRDS(here("output", "translational_control_overview", p)) %>%
+    distinct(gene_id_clean, transcript_id_clean)
+}
+iso <- cand %>%
+  dplyr::select(symbol_given, transcript_id_given, transcript_id_clean, gene_id_clean) %>%
+  left_join(fm_tx("feature_matrix_tco.rds") %>%
+              dplyr::rename(tx_231 = transcript_id_clean), by = "gene_id_clean") %>%
+  left_join(fm_tx("feature_matrix_tco_mcf7six1.rds") %>%
+              dplyr::rename(tx_mcf7six1 = transcript_id_clean), by = "gene_id_clean") %>%
+  mutate(same_as_231      = transcript_id_clean == tx_231,
+         same_as_mcf7six1 = transcript_id_clean == tx_mcf7six1)
+stopifnot(!anyDuplicated(iso$transcript_id_given))
+iso %>% dplyr::select(-transcript_id_clean, -gene_id_clean) %>% knitr::kable()
+```
+
+## 5. Save
+
+```{r save}
+out <- calls_long %>%
+  left_join(iso %>% dplyr::select(transcript_id_given, tx_231, tx_mcf7six1,
+                                  same_as_231, same_as_mcf7six1),
+            by = "transcript_id_given")
+write_csv(out, file.path(out_dir, sprintf("%s_eif3d_hypoxia_calls.csv", set_tag)))
+cat("Wrote", file.path(out_dir, sprintf("%s_eif3d_hypoxia_calls.csv", set_tag)), "\n")
+```
+
+```{r session}
+sessionInfo()
+```

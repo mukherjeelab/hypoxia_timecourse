@@ -62,7 +62,7 @@ feature_category <- function(features, ann) {
     fam %in% c("structure_cds", "codon_optimality", "nascent_peptide", "polya_track") ~ "CDS",
     fam == "g4"                                               ~ region,
     fam %in% c("gc", "length") & grepl("^(log2_)?total_length$|^transcript_gc$", features) ~ "Full transcript",
-    fam == "gc" & grepl("^gc3", features)                     ~ "CDS",
+    fam == "gc" & grepl("^gc[123]", features)                     ~ "CDS",
     fam %in% c("gc", "length")                                ~ region,
     TRUE                                                      ~ NA_character_)
   if (anyNA(cat)) stop("no colour category for: ", paste(features[is.na(cat)], collapse = ", "),

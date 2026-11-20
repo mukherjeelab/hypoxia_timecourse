@@ -201,6 +201,50 @@ here writes to `output/predictive_modeling/`. Outputs go to
 | `02_sweep_presets.R` | the sweep arms, shared by `02b_` and `02c_` so a reported result stays re-runnable |
 | `02b_neg_subsample_sweep.R` | `Rscript 02b_... <preset>`; 20 `neg_seed` x N arms (~5 min for 3 arms). No argument lists the presets |
 | `02c_sweep_stability.Rmd` | reports any preset (`params$preset`); **the null band any claim must clear** |
+| `10_rf_regression.Rmd` | the regression counterpart; its replication axis is **`split_seed`, not `neg_seed`** - a regression on all genes has no negative draw. Swept by `10b_`, reported by `10c_` |
+| `33a_parse_plasmid_sequences.R` | the reporter constructs -> `accessories/transcribed_plasmids_parsed.csv` (five rows) |
+| `33b_`/`33c_`/`33d_` | construct features **from sequence**, because a plasmid has no annotation: sequence, RNAplfold, G4mer |
+| `33e_`/`33f_`/`33g_` | assert those reimplementations reproduce the stored matrix **on real transcripts**; all 57 match exactly |
+| `33h_construct_score_sweep.R` | scores the constructs across 20 fits per model and deletes each fit after, so disk stays flat |
+| `33_plasmid_predictions.Rmd` | do the constructs look like eIF3d targets? Predictions + per-construct SHAP |
+| `34_gc3_sweep.Rmd` | synonymous GC3 sweep on the **parent NanoLuc backbone**, so it filters to the NanoLuc four |
+
+**Scoring reporter constructs: `33a_` -> features -> `33h_` -> `33_`.** Five constructs - the
+four synonymous NanoLuc variants and **firefly**, the normaliser. Only the **intrinsic** block is
+usable: the external block is measurements on endogenous genes, and median-imputing would give
+every construct the same values while pulling each score toward the average gene. Nothing here
+needs the cluster - all 57 features for all five take **~24 s locally**, G4mer included. The
+cluster figures in `g4mer/README.md` and the structure precompute are transcriptome-wide jobs.
+
+Four traps, each of which has already cost time:
+
+- **Firefly is not a member of the synonymous series.** It has its own vector UTRs, a non-human
+  ORF and 2.8x the CDS length, so the series' assertions (one CDS length, one protein, one 5'UTR,
+  one 3'UTR) are **scoped to the four**, and the universal structural checks are a function
+  called on both sets so they cannot silently stop covering firefly. Anything reading the parsed
+  CSV must filter: `34_` asserts one backbone and takes `utr5[1]`, which firefly breaks *and*
+  could silently supply the backbone from, depending on row order.
+- **A construct id must not contain whitespace.** The spreadsheet row is `firefly luc`; RNAplfold
+  writes `<name>_lunp` and the reader rebuilds that path from the id, so the fold produced a file
+  nothing could find. Emitted ids are normalised and the parser asserts this.
+- **13 of the 57 features are constant across all five** - all three Kozak columns,
+  `ppp_motif_density`, all three `g4mer_frac_above_*`, three `term_stop_*`, `term_plus4_G`/`_T`,
+  `term_window_gc` - because the vector supplies the start context and the stop. They still carry
+  a large per-construct SHAP, since **SHAP is relative to the training baseline, not to the other
+  constructs**. `kozak_pwm_score_v2` is a top-3 "driver" for every construct and explains no
+  difference between any of them. **To compare constructs, use the SHAP difference.**
+- **`negative_control_3d` is not a predicted-target negative control.** It differs from the parent
+  in only **7 of 57** features, all CDS structure and G4 positional, so it scores
+  indistinguishably (0.828 vs 0.838). It is a codon-*composition* control by design - correct, but
+  the panel has no low-prediction arm.
+
+**Firefly's 5'UTR is 207 nt** - 433 nt from the CMV TSS (located from the landmark
+`GTTTAGTGAACCGTCAGAT`, whose `GTCAGAT` is where the NanoLuc transcripts begin) minus the 226 nt
+Promega-annotated intron. Its intron copy carries a **`CAGG` deletion** at the 3' splice site, so
+the annotated acceptor is `CA` rather than `AG`; the deletion is **asserted**, not excepted, and
+the alternative reading (first downstream `AG`, 194 nt) is 0.09 log2 units away and changes
+nothing. Per Kate: trust the vector annotation. `code/cds_reporter_design/19_` derives all of it
+from sequence and places firefly in the transcriptome distributions.
 
 **`fidelity_tol = 0.02` from `07c_` does not transfer, and `max_abs` is the wrong statistic.**
 `03_shap.Rmd` derives its own bound instead of inheriting one, and measuring it shows why: on

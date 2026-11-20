@@ -19,14 +19,32 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # What this notebook does
 
-Four reporter constructs - a parent NanoLuc, a codon-**adapted** variant, an **anti-adapted**
-variant, and a **negative control** that is a positional shuffle of the parent's own codons -
-are scored by the models built on MDA-MB-231 transcripts, to ask how much each one *looks like*
-an mRNA whose translation depends on eIF3d.
+Five reporter constructs are scored by the models built on MDA-MB-231 transcripts, to ask how
+much each one *looks like* an mRNA whose translation depends on eIF3d:
+
+* the **NanoLuc synonymous series** - a parent, a codon-**adapted** variant, an
+  **anti-adapted** variant, and a **negative control** that is a positional shuffle of the
+  parent's own codons. These four share one backbone, one protein and one CDS length, so only
+  codon choice separates them.
+* **firefly** (luc2P), the transfection-efficiency normaliser the assays divide by. It is
+  **not** a member of that series - different vector UTRs, a non-human ORF, 2.8x the CDS
+  length - and it is here for a different question: a normaliser that is itself
+  eIF3d-dependent would subtract part of the effect being measured.
+
+**Read the two questions separately.** Within the synonymous series the comparison is
+controlled and the separation is close to arithmetic, since codon usage is what the strongest
+features measure. Firefly's score is a *screen*, not a controlled contrast.
+
+**Every number here is a median over 20 model fits, not a single fit.** The classifier keeps
+every positive and draws a size-matched negative class, so one fit reports the probability of
+one arbitrary draw; the draw alone moves test AUC by ~0.07 on these models. Section 2 reports
+the spread and how often each construct's call flips.
+`33h_construct_score_sweep.R` runs the sweep: `neg_seed` 1-20 for the classifiers, and
+`split_seed` 1-20 for the regressions, which have no negative draw because they use all genes.
 
 **Four models, all intrinsic (57 sequence-derived features).** The external block is 12
 measurements made on endogenous genes (eIF3 CLIP, DAP5 sensitivity, published half-lives,
-DHX29); a plasmid has none of them, and median-imputing would give all four constructs the
+DHX29); a plasmid has none of them, and median-imputing would give all five constructs the
 same values while shifting every score toward the average gene. So the intrinsic model is the
 only version where every input is real.
 
@@ -55,14 +73,50 @@ suppressPackageStartupMessages({
 })
 O <- here("output", "translational_control_overview")
 cache <- file.path(O, "plasmid_features.rds")
+
+# Construct order, colours and short labels. Defined here because sections 2 and 3 both use them.
+ord <- c("3d-adapted", "parent_bidir", "negative_control_3d", "3d-anti_adapted", "firefly")
+# The Okabe-Ito orange and sky blue are reserved project-wide for eIF3d and eIF3e, and every
+# construct here is an eIF3d experiment, so neither is used to label one construct. The parent
+# and its shuffled control get black and grey rather than two near-identical greys.
+# Firefly keeps the bluish green it carries in 62_, 68_ and cds_reporter_design/19_, so the
+# normaliser is the same colour wherever it appears.
+cols <- c("3d-adapted" = "#D55E00", "parent_bidir" = "black",
+          "negative_control_3d" = "grey60", "3d-anti_adapted" = "#0072B2",
+          "firefly" = "#009E73")
+# All four NanoLuc variants are NanoLuc; "parent nano" names the unmodified one explicitly so a
+# reader does not have to know that parent_bidir is the NanoLuc parent (33a_ asserts its CDS
+# starts with the nanoluc_original designed sequence).
+short <- c("3d-adapted" = "adapted", "parent_bidir" = "parent nano",
+           "negative_control_3d" = "neg ctrl", "3d-anti_adapted" = "anti-adapted",
+           "firefly" = "firefly")
+stopifnot("every construct needs a colour and a short label" =
+            all(ord %in% names(cols)) && all(ord %in% names(short)))
+
+# How many individual features the per-feature SHAP figure shows.
+TOP_N_FEAT <- 18
 ```
 
-# 1. Features for the four constructs
+# 1. Features for the five constructs
 
 ```{r features}
 pl <- read_csv(here("accessories", "transcribed_plasmids_parsed.csv"), show_col_types = FALSE)
-stopifnot("expected the four NanoLuc constructs" = nrow(pl) == 4,
-          "constructs are not one backbone" = n_distinct(pl$utr5) == 1 && n_distinct(pl$utr3) == 1)
+FIREFLY <- "firefly"
+NL4     <- c("parent_bidir", "negative_control_3d", "3d-adapted", "3d-anti_adapted")
+nl4     <- pl %>% filter(construct %in% NL4)
+
+stopifnot(
+  "expected five constructs - run 33a_parse_plasmid_sequences.R" = nrow(pl) == 5,
+  "the four NanoLuc constructs are not all present" = nrow(nl4) == 4,
+  "firefly is missing" = FIREFLY %in% pl$construct,
+  # Scoped to the NanoLuc four ON PURPOSE. Firefly has its own UTRs and is not a member of the
+  # synonymous series; asserting one backbone across all five would fail on correct data.
+  "the NanoLuc four are not one backbone" =
+    n_distinct(nl4$utr5) == 1 && n_distinct(nl4$utr3) == 1,
+  "the NanoLuc four no longer share one CDS length" = n_distinct(nl4$cds_nt) == 1,
+  # The thing that makes firefly a different question, asserted rather than described.
+  "firefly unexpectedly shares the NanoLuc backbone" =
+    !pl$utr5[pl$construct == FIREFLY] %in% nl4$utr5)
 
 if (params$recompute_features || !file.exists(cache)) {
   source(here("code", "translational_control_overview", "33b_sequence_features.R"))
@@ -101,23 +155,41 @@ cat("features:", length(FC), "| constructs:", nrow(X), "| no missing values\n")
 
 ## Which features can differ at all
 
-The four share a backbone and a protein, so most features are identical by construction. This
-table is the honest denominator for everything below: only these columns can separate them,
-and between the parent and its shuffled control only the position-dependent ones can.
+**Two denominators, because there are two questions.** The NanoLuc four share a backbone and a
+protein, so most features are identical by construction and only a handful of columns can
+separate them - that handful is the honest denominator for the synonymous comparison, and
+between the parent and its shuffled control only the position-dependent ones can move at all.
+Firefly shares none of that, so for firefly nearly everything differs and the table says
+little; what matters there is *which* differences the model acts on, which is section 3.
 
 ```{r what_varies}
-varies <- f %>% dplyr::select(id, all_of(FC)) %>% pivot_longer(-id) %>%
-  group_by(name) %>% summarise(n_distinct = n_distinct(round(value, 10)),
-                               spread = diff(range(value)), .groups = "drop") %>%
-  filter(n_distinct > 1) %>% arrange(desc(spread))
-cat(nrow(varies), "of", length(FC), "features differ between constructs;",
-    length(FC) - nrow(varies), "are identical\n")
+n_varying <- function(d, who) {
+  v <- d %>% dplyr::select(id, all_of(FC)) %>% pivot_longer(-id) %>%
+    group_by(name) %>% summarise(n_distinct = n_distinct(round(value, 10)),
+                                 spread = diff(range(value)), .groups = "drop") %>%
+    filter(n_distinct > 1) %>% arrange(desc(spread))
+  cat(sprintf("%-22s %2d of %d features differ, %2d identical\n",
+              who, nrow(v), length(FC), length(FC) - nrow(v)))
+  v
+}
+varies_nl4 <- n_varying(f %>% filter(id %in% NL4), "NanoLuc four:")
+varies_all <- n_varying(f,                          "all five:")
+
 pn <- f %>% filter(id %in% c("parent_bidir", "negative_control_3d")) %>%
   dplyr::select(all_of(FC)) %>% summarise(across(everything(), ~ diff(range(.x)))) %>%
   pivot_longer(everything()) %>% filter(value > 1e-10)
-cat("parent vs negative control (identical codon composition):", nrow(pn), "features differ -",
+cat("\nparent vs negative control (identical codon composition):", nrow(pn), "features differ -",
     paste(pn$name, collapse = ", "), "\n")
-print(as.data.frame(varies), digits = 4)
+
+# Features that are CONSTANT across all five cannot explain any difference the models report.
+# The vector supplies the start context, so the initiation family lands here - worth stating
+# before any attribution, since "initiation strength" is then off the table by construction.
+const5 <- setdiff(FC, varies_all$name)
+cat("\nconstant across all five (cannot separate any construct):", length(const5), "\n  ",
+    paste(const5, collapse = ", "), "\n")
+
+cat("\nFeatures that vary within the NanoLuc synonymous series:\n")
+print(as.data.frame(varies_nl4), digits = 4)
 ```
 
 # 2. Predictions
@@ -137,19 +209,35 @@ predict_one <- function(suffix, kind, label) {
   # a median leaves that median unchanged, so the saved (already imputed) training split carries
   # the same medians the model was fitted with.
   meds <- md$train %>% dplyr::select(all_of(FC)) %>% summarise(across(everything(), median, na.rm = TRUE))
-  ref <- ref_matrix %>% dplyr::select(transcript_id_clean, all_of(FC))
+  ref <- ref_matrix %>% dplyr::select(transcript_id_clean, gene_id_clean, all_of(FC))
   for (cl in FC) ref[[cl]][is.na(ref[[cl]])] <- meds[[cl]]
 
   pr <- function(newdata) {
     p <- predict(mdl, data = as.data.frame(newdata))$predictions
     if (is.matrix(p)) p[, md$pos_label] else p
   }
+  # EVERY gene in the matrix gets a prediction, whatever its role in fitting this model, so the
+  # reference distribution is a MIXTURE of three populations with different meanings:
+  #   trained on  - the forest fitted these rows, and predict() uses all 1000 trees including
+  #                 the ones that saw them, so these predictions are overfit and pushed to the
+  #                 extremes (measured below: sd ~1.5x the held-out sd in both model types)
+  #   held out    - honest
+  #   never seen  - honest. Only the CLASSIFIER has these: it fits the positives plus a
+  #                 size-matched negative draw, so ~72% of the transcriptome was never in it.
+  #                 The regression fits every gene, so 80% of ITS reference is training rows.
+  # Percentiles against the mixture are therefore biased, which is why pct_honest exists.
+  ref_pred <- pr(ref[, FC])
+  status <- ifelse(ref$gene_id_clean %in% md$train$gene_id_clean, "trained on",
+            ifelse(ref$gene_id_clean %in% md$test$gene_id_clean,  "held out", "never seen"))
+  honest <- ref_pred[status != "trained on"]
+  stopifnot("no honest reference genes - the split no longer carries gene ids" = length(honest) > 0)
+
   # Computed before the tibble: inside tibble(), `kind` would resolve to the column being
   # created rather than to the argument.
   is_pos <- if (kind == "classifier") md$test$eif3d_target == md$pos_label else md$test$y > 0.5
   tibble(label = label, kind = kind, suffix = suffix,
          construct = rownames(X), pred = pr(X[, FC]),
-         ref_pred = list(pr(ref[, FC])),
+         ref_pred = list(ref_pred), ref_status = list(status), honest_pred = list(honest),
          test_pred = list(pr(md$test[, FC])),
          test_is_pos = list(is_pos))
 }
@@ -157,6 +245,8 @@ predict_one <- function(suffix, kind, label) {
 preds <- pmap_dfr(list(MODELS$suffix, MODELS$kind, MODELS$label), predict_one) %>%
   rowwise() %>%
   mutate(pct_transcriptome = 100 * mean(ref_pred < pred),
+         # The reportable one: against genes this forest never fitted.
+         pct_honest        = 100 * mean(honest_pred < pred),
          pct_heldout_pos   = 100 * mean(test_pred[test_is_pos] < pred)) %>%
   ungroup()
 
@@ -168,57 +258,195 @@ preds %>%
   mutate(cell = sprintf("%.3f (%.0f%%)", pred, pct_transcriptome)) %>%
   dplyr::select(construct, kind, label, cell) %>%
   pivot_wider(names_from = c(kind, label), values_from = cell) %>%
-  arrange(match(construct, c("3d-adapted", "parent_bidir", "negative_control_3d", "3d-anti_adapted"))) %>%
+  arrange(match(construct, ord)) %>%
   as.data.frame() %>% print()
 cat("\ncell = prediction (percentile among all transcripts under that model)\n")
 ```
 
+## Across 20 fits - this is the reportable version
+
+The table above is **one draw**. `33h_construct_score_sweep.R` refits each model 20 times,
+varying only the thing that carries its noise - the negative draw for the classifiers
+(`neg_seed`), the train/test split for the regressions (`split_seed`), which have no negative
+draw because they use every gene. Within a seed all five constructs are scored by a model that
+saw identical genes, so the comparison between constructs is paired even though the absolute
+level moves.
+
+**The call stability column is the one to read.** A classifier probability is calibrated against
+a training set balanced 50/50, so 0.5 is the nominal cut; `frac_called` is the fraction of the
+20 fits that put a construct above it. A construct at 10/20 has no call at all.
+
+```{r sweep}
+SW_P <- file.path(O, "construct_sweep_predictions.csv")
+SW_S <- file.path(O, "construct_sweep_shap.csv")
+stopifnot("run 33h_construct_score_sweep.R first" = file.exists(SW_P) && file.exists(SW_S))
+
+sw <- read_csv(SW_P, show_col_types = FALSE) %>%
+  mutate(construct = factor(construct, ord))
+sw_shap <- read_csv(SW_S, show_col_types = FALSE) %>%
+  mutate(construct = factor(construct, ord))
+
+stopifnot(
+  "the sweep does not cover all five constructs" = n_distinct(sw$construct) == 5,
+  "the sweep features do not match the models' feature list" =
+    setequal(unique(sw_shap$feature), FC))
+
+n_seeds <- n_distinct(sw$seed)
+cat(sprintf("%d seeds x %d constructs x %d model runs\n", n_seeds, n_distinct(sw$construct),
+            n_distinct(paste(sw$kind, sw$label))))
+
+sw_sum <- sw %>%
+  group_by(kind, label, construct) %>%
+  summarise(n = n(), median = median(pred), sd = sd(pred),
+            p05 = quantile(pred, 0.05), p95 = quantile(pred, 0.95),
+            pct_tx = median(pct_transcriptome),
+            frac_called = if (first(kind) == "classifier") mean(pred > 0.5) else NA_real_,
+            .groups = "drop") %>%
+  arrange(kind, label, construct)
+
+print(as.data.frame(sw_sum %>% mutate(across(where(is.numeric), ~ round(.x, 3)))))
+```
+
+```{r sweep_fig, fig.width = 11, fig.height = 6.5}
+# Every fit as a point, the median as a bar. The draw-to-draw spread is the thing a single-fit
+# figure hides, so it is drawn rather than summarised.
+psw <- sw %>%
+  mutate(panel = paste0(kind, " | ", label)) %>%
+  ggplot(aes(pred, construct, colour = construct)) +
+  geom_vline(data = tibble(panel = unique(paste0(sw$kind, " | ", sw$label))) %>%
+               filter(str_starts(panel, "classifier")),
+             aes(xintercept = 0.5), linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  geom_point(alpha = 0.45, size = 1.6,
+             position = position_jitter(height = 0.12, width = 0, seed = 9)) +
+  stat_summary(fun = median, geom = "point", shape = 124, size = 9, colour = "black") +
+  facet_wrap(~ panel, scales = "free_x") +
+  scale_colour_manual(values = cols, guide = "none") +
+  scale_y_discrete(labels = short) +
+  labs(x = "prediction", y = NULL,
+       title = sprintf("Five constructs, %d fits each", n_seeds),
+       subtitle = "classifier: P(target), dashed line = the 50/50 nominal cut | regression: predicted si3d TE log2FC\nblack tick = median; each point is one fit, varying only the negative draw (classifier) or the split (regression)") +
+  theme_classic(base_size = 12) +
+  theme(plot.subtitle = element_text(size = 9, colour = "grey30"))
+print(psw)
+ggsave(here("plots", "33_construct_sweep_predictions.pdf"), psw, width = 11, height = 6.5)
+```
+
+**Firefly against the series it normalises.** The paired difference is the readable quantity:
+within each seed, firefly minus the parent NanoLuc. Pairing removes the draw-to-draw level
+shift, which is several times larger than the difference being measured.
+
+```{r sweep_paired}
+paired <- sw %>%
+  dplyr::select(kind, label, seed, construct, pred) %>%
+  filter(construct %in% c("firefly", "parent_bidir")) %>%
+  pivot_wider(names_from = construct, values_from = pred) %>%
+  mutate(diff = firefly - parent_bidir)
+
+print(as.data.frame(paired %>%
+  group_by(kind, label) %>%
+  summarise(n = n(), median_diff = median(diff), sd_diff = sd(diff),
+            n_firefly_higher = sum(diff > 0),
+            p_wilcox = wilcox.test(firefly, parent_bidir, paired = TRUE)$p.value,
+            .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3)))))
+
+cat("\nFor scale, the draw-to-draw sd of the parent's own prediction:\n")
+print(as.data.frame(sw %>% filter(construct == "parent_bidir") %>%
+  group_by(kind, label) %>% summarise(sd_across_seeds = signif(sd(pred), 3), .groups = "drop")))
+```
+
 ```{r fig_predictions, fig.width = 12, fig.height = 7.5}
 suppressPackageStartupMessages(library(ggrepel))
-ord <- c("3d-adapted", "parent_bidir", "negative_control_3d", "3d-anti_adapted")
-# The Okabe-Ito orange and sky blue are reserved project-wide for eIF3d and eIF3e, and every
-# construct here is an eIF3d experiment, so neither is used to label one construct. The parent
-# and its shuffled control get black and grey rather than two near-identical greys.
-cols <- c("3d-adapted" = "#D55E00", "parent_bidir" = "black",
-          "negative_control_3d" = "grey60", "3d-anti_adapted" = "#0072B2")
-short <- c("3d-adapted" = "adapted", "parent_bidir" = "parent",
-           "negative_control_3d" = "neg ctrl", "3d-anti_adapted" = "anti-adapted")
 
-bg <- preds %>% dplyr::select(kind, label, ref_pred) %>% distinct(kind, label, .keep_all = TRUE) %>%
-  unnest(ref_pred) %>% mutate(panel = paste0(kind, " | ", label))
+# Two versions of the same panel, on purpose.
+#   pooled - the original single-curve reading, with the PROVENANCE of the curve stated: which
+#            genes it is made of and what role each played in fitting the model
+#   split  - the same curve separated by that role, because an unlabelled mixture invites reading
+#            a construct against a distribution that is 23% (classifier) or 80% (regression)
+#            overfit training predictions
+bg_all <- preds %>% dplyr::select(kind, label, ref_pred, ref_status) %>%
+  distinct(kind, label, .keep_all = TRUE) %>%
+  unnest(c(ref_pred, ref_status)) %>%
+  mutate(panel = paste0(kind, " | ", label),
+         ref_status = factor(ref_status, c("trained on", "held out", "never seen")))
+status_lty <- c("trained on" = "dotted", "held out" = "solid", "never seen" = "dashed")
+
 pt <- preds %>% mutate(panel = paste0(kind, " | ", label),
                        construct = factor(construct, ord), lab = short[as.character(construct)])
 
+# Composition of the pooled curve, computed BEFORE the axis clipping so the numbers describe the
+# whole reference set rather than the visible window.
+comp <- bg_all %>% count(panel, ref_status) %>%
+  group_by(panel) %>% mutate(pct = round(100 * n / sum(n))) %>% ungroup()
+comp_txt <- comp %>% group_by(panel) %>%
+  summarise(txt = sprintf("%s = %s", panel[1],
+                          paste(sprintf("%s %s (%d%%)", format(n, big.mark = ","),
+                                        as.character(ref_status), pct), collapse = ", ")),
+            .groups = "drop") %>% pull(txt) %>% paste(collapse = "\n")
+cat("Composition of the reference distribution:\n", comp_txt, "\n", sep = "")
+
 # The regression predictions occupy a narrow slice of a wide distribution, so an unzoomed axis
-# stacks all four constructs on one tick. Each panel is clipped to the central 98% of its own
+# stacks all five constructs on one tick. Each panel is clipped to the central 98% of its own
 # reference distribution, widened if needed to hold every construct.
-lims <- bg %>% group_by(panel) %>%
+lims <- bg_all %>% group_by(panel) %>%
   summarise(lo = quantile(ref_pred, 0.01), hi = quantile(ref_pred, 0.99), .groups = "drop") %>%
   left_join(pt %>% group_by(panel) %>% summarise(pmin = min(pred), pmax = max(pred), .groups = "drop"),
             by = "panel") %>%
   mutate(pad = 0.08 * (pmax(hi, pmax) - pmin(lo, pmin)),
          lo = pmin(lo, pmin) - pad, hi = pmax(hi, pmax) + pad)
-bg  <- bg %>% left_join(lims, by = "panel") %>% filter(ref_pred >= lo, ref_pred <= hi)
+bg <- bg_all %>% left_join(lims, by = "panel") %>% filter(ref_pred >= lo, ref_pred <= hi)
 
-p <- ggplot(bg, aes(ref_pred)) +
-  geom_density(fill = "grey85", colour = "grey55", alpha = 0.7, linewidth = 0.4) +
-  geom_vline(data = pt, aes(xintercept = pred, colour = construct), linewidth = 0.9) +
-  geom_text_repel(data = pt, aes(x = pred, y = 0, label = lab, colour = construct),
-                  angle = 90, hjust = 0, size = 3.1, direction = "x", seed = 9,
-                  box.padding = 0.25, min.segment.length = 0.1, segment.size = 0.3,
-                  show.legend = FALSE) +
-  facet_wrap(~ panel, scales = "free") +
-  scale_colour_manual(values = cols, name = NULL, labels = short) +
-  expand_limits(y = 0) +
-  labs(x = "model prediction", y = "density",
-       title = "Where the constructs fall against all transcripts",
-       subtitle = sprintf("grey = all %s transcripts scored by the same model; axes clipped to the central 98%% of each distribution",
-                          format(nrow(ref_matrix), big.mark = ",")),
-       caption = "Classifier: P(eIF3d-promoted), calibrated on a balanced training set, so 0.5 is not 'a typical transcript'.\nRegression: predicted TE log2FC on si3d.") +
-  theme_classic(base_size = 12) +
-  theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"))
-print(p)
-ggsave(here("plots", "33_plasmid_predictions.pdf"), p, width = 12, height = 7.5)
+CAP_COMMON <- paste0(
+  "Classifier: P(eIF3d-promoted), calibrated on a balanced training set, so 0.5 is not 'a typical transcript'. ",
+  "Regression: predicted TE log2FC on si3d.")
+
+build_fig <- function(split) {
+  base <- ggplot(bg, aes(ref_pred))
+  dens <- if (split)
+    list(geom_density(aes(linetype = ref_status), colour = "grey35", fill = NA, linewidth = 0.55),
+         scale_linetype_manual(values = status_lty, name = NULL))
+  else
+    list(geom_density(fill = "grey85", colour = "grey55", alpha = 0.7, linewidth = 0.4))
+
+  base + dens +
+    geom_vline(data = pt, aes(xintercept = pred, colour = construct), linewidth = 0.9) +
+    geom_text_repel(data = pt, aes(x = pred, y = 0, label = lab, colour = construct),
+                    angle = 90, hjust = 0, size = 3.1, direction = "x", seed = 9,
+                    box.padding = 0.25, min.segment.length = 0.1, segment.size = 0.3,
+                    show.legend = FALSE) +
+    facet_wrap(~ panel, scales = "free") +
+    scale_colour_manual(values = cols, name = NULL, labels = short) +
+    expand_limits(y = 0) +
+    labs(x = "model prediction", y = "density",
+         title = "Where the constructs fall against all transcripts",
+         subtitle = if (split)
+           sprintf("all %s transcripts scored by the same model, SPLIT BY ROLE IN FITTING; axes clipped to the central 98%%",
+                   format(nrow(ref_matrix), big.mark = ","))
+         else
+           sprintf("all %s transcripts scored by the same model; axes clipped to the central 98%% of each distribution",
+                   format(nrow(ref_matrix), big.mark = ",")),
+         caption = if (split)
+           paste0("Every gene is scored regardless of status. 'Trained on' predictions are overfit - predict() uses all trees, including those that saw the row -\n",
+                  "so that curve is wider and should not be used to place a construct. Read against 'held out' and 'never seen'.\n",
+                  "The classifier fits the positives plus a size-matched negative draw, so most of the transcriptome is never seen; the regression fits every gene.\n",
+                  CAP_COMMON)
+         else
+           paste0("Where the predicted values come from: every transcript in feature_matrix_tco.rds is scored by the saved model, whatever its role in fitting it.\n",
+                  comp_txt, "\n",
+                  "'Trained on' predictions are overfit, so this pooled curve is wider than an honest one. See the split version for the same data separated by role.\n",
+                  CAP_COMMON)) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top",
+          plot.caption = element_text(hjust = 0, size = 7.5, colour = "grey30"))
+}
+
+p_pooled <- build_fig(split = FALSE)
+print(p_pooled)
+ggsave(here("plots", "33_plasmid_predictions.pdf"), p_pooled, width = 12, height = 7.5)
+
+p_split <- build_fig(split = TRUE)
+print(p_split)
+ggsave(here("plots", "33_plasmid_predictions_by_status.pdf"), p_split, width = 12, height = 7.5)
 ```
 
 The four models use different scales, so percentile against the transcriptome is the one view
@@ -237,7 +465,7 @@ ppct <- ggplot(pp, aes(pct_transcriptome, construct, colour = construct)) +
   scale_y_discrete(labels = short) +
   scale_x_continuous(limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
   labs(x = "percentile among all transcripts", y = NULL,
-       title = "The same four predictions on one comparable scale",
+       title = "The same predictions on one comparable scale",
        subtitle = "dashed = the median transcript; higher = looks more like an eIF3d-dependent mRNA") +
   theme_classic(base_size = 12) +
   theme(panel.grid.major.y = element_line(colour = "grey92"))
@@ -250,7 +478,7 @@ ggsave(here("plots", "33_plasmid_percentiles.pdf"), ppct, width = 9, height = 4.
 SHAP is run on the **regression** models, where the forest is a regression forest and TreeSHAP
 applies directly - no surrogate, so no fidelity apparatus is needed. (The classifier is a
 probability forest, which `treeshap` cannot take; `03_shap.Rmd` handles that with a surrogate,
-which is not worth importing for four sequences.) Values are additive, so a family's
+which is not worth importing for five sequences.) Values are additive, so a family's
 contribution is the exact sum of its members'.
 
 ```{r shap, fig.width = 11, fig.height = 7}
@@ -285,6 +513,143 @@ pf <- fam %>%
 print(pf)
 ggsave(here("plots", "33_plasmid_shap_families.pdf"), pf, width = 11, height = 7)
 print(as.data.frame(fam %>% pivot_wider(names_from = construct, values_from = shap)), digits = 3)
+```
+
+## Family attribution across 20 fits
+
+The figure above is the default split. The sweep gives each family's contribution a spread, so
+a family is only worth reading if its contribution is large next to that spread. Family sums are
+**exact**, because SHAP is additive.
+
+```{r shap_families_sweep, fig.width = 11, fig.height = 7}
+fam_sw <- sw_shap %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature") %>%
+  group_by(label, seed, construct, family) %>%
+  summarise(shap = sum(shap), .groups = "drop")
+
+fam_med <- fam_sw %>%
+  group_by(label, construct, family) %>%
+  summarise(median = median(shap), p05 = quantile(shap, 0.05),
+            p95 = quantile(shap, 0.95), .groups = "drop")
+
+pfs <- fam_med %>%
+  mutate(family = fct_reorder(family, abs(median), .fun = max)) %>%
+  ggplot(aes(median, family, colour = construct)) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.4) +
+  geom_linerange(aes(xmin = p05, xmax = p95),
+                 position = position_dodge(width = 0.7), linewidth = 0.5) +
+  geom_point(position = position_dodge(width = 0.7), size = 1.8) +
+  facet_wrap(~ label) +
+  scale_colour_manual(values = cols, name = NULL, labels = short) +
+  labs(x = "summed SHAP (predicted si3d TE log2FC)", y = NULL,
+       title = "What drives each construct's predicted TE change",
+       subtitle = sprintf("Regression models, TreeSHAP. Point = median over %d fits, bar = 5-95%%. Family sums are exact.",
+                          n_distinct(fam_sw$seed)),
+       caption = "Positive = pushes the predicted si3d TE log2FC up (more eIF3d-dependent).") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top", plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"),
+        plot.subtitle = element_text(size = 9, colour = "grey30"))
+print(pfs)
+ggsave(here("plots", "33_construct_sweep_shap_families.pdf"), pfs, width = 11, height = 7)
+```
+
+## Per-feature, ordered by the hypoxia regression model's own importance
+
+The family figure sums within a block, which is the right way to resolve credit between
+correlated columns but hides which member moves. This is the same decomposition drawn per
+**feature**, for the top `r TOP_N_FEAT` features of the **hypoxia regression** model ranked by
+that model's impurity importance, and the same features are shown in both panels so the two
+conditions are directly comparable.
+
+**Bars of equal length across all five constructs mean the feature is constant.** SHAP is
+measured against the training baseline, not against the other constructs, so a feature every
+construct shares still carries a large contribution - it just cannot explain any difference
+between them. The Kozak columns are the clearest case.
+
+```{r shap_features_fig, fig.width = 12, fig.height = 8.5}
+imp_hyp <- read_csv(
+  file.path(O, paste0("rfreg_importance_",
+                      MODELS$suffix[MODELS$kind == "regression" & MODELS$label == "hypoxia 1hr"],
+                      ".csv")), show_col_types = FALSE)
+stopifnot("the hypoxia regression importance file does not carry the model's features" =
+            all(FC %in% imp_hyp$feature))
+
+top_feats <- imp_hyp %>% arrange(desc(importance)) %>% slice_head(n = TOP_N_FEAT) %>% pull(feature)
+
+# Constant features are marked on the axis rather than dropped: that they rank highly and still
+# explain nothing between constructs is the point.
+const_feats <- setdiff(FC, varies_all$name)
+
+# Axis labels: shorten the RNAplfold prefix, which is long enough to be clipped, and mark any
+# feature that is constant across the five constructs.
+pretty_feat <- function(x) sub("^tco_struct_accessibility_", "struct_", x)
+lab_of <- setNames(
+  paste0(pretty_feat(top_feats), ifelse(top_feats %in% const_feats, "  (constant)", "")),
+  top_feats)
+stopifnot("two features collapsed to the same axis label" = !any(duplicated(lab_of)))
+
+# top_feats is in descending importance. A discrete ggplot axis places level 1 at the BOTTOM, so
+# the levels run least-important first and the biggest driver ends up at the TOP.
+feat_plot <- sw_shap %>%
+  filter(feature %in% top_feats) %>%
+  group_by(label, construct, feature) %>%
+  summarise(median = median(shap), .groups = "drop") %>%
+  mutate(flab = factor(lab_of[as.character(feature)], levels = rev(unname(lab_of))))
+
+pff <- ggplot(feat_plot, aes(median, flab, fill = construct)) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.4) +
+  geom_col(position = position_dodge(width = 0.78), width = 0.72) +
+  facet_wrap(~ label) +
+  scale_fill_manual(values = cols, name = NULL, labels = short) +
+  labs(x = "median SHAP over 20 fits (predicted si3d TE log2FC)", y = NULL,
+       title = "What drives each construct's predicted TE change, per feature",
+       subtitle = sprintf("Top %d features of the HYPOXIA regression model by its own importance, same features in both panels",
+                          TOP_N_FEAT),
+       caption = paste0("Positive = pushes the predicted si3d TE log2FC up (more eIF3d-dependent).\n",
+                        "Equal bars across all five = a constant feature: it contributes, but explains no difference between constructs.")) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        axis.text.y = element_text(size = 9),
+        plot.caption = element_text(hjust = 0, size = 8, colour = "grey30"),
+        plot.subtitle = element_text(size = 9, colour = "grey30"))
+print(pff)
+ggsave(here("plots", "33_construct_sweep_shap_features.pdf"), pff, width = 12, height = 8.5)
+
+cat("\nRank in the hypoxia regression model, and whether the feature can separate constructs:\n")
+print(as.data.frame(imp_hyp %>% arrange(desc(importance)) %>% slice_head(n = TOP_N_FEAT) %>%
+  transmute(rank = row_number(), feature, importance = round(importance, 1),
+            separates = ifelse(feature %in% const_feats, "NO - constant across all five", "yes"))))
+```
+
+## Top per-feature drivers
+
+Family sums hide which member is doing the work, which matters most for firefly: its gc and
+length families move for several reasons at once. These are the individual features with the
+largest median |SHAP| per construct, with the sign.
+
+```{r shap_features_sweep}
+feat_med <- sw_shap %>%
+  group_by(label, construct, feature) %>%
+  summarise(median = median(shap), p05 = quantile(shap, 0.05),
+            p95 = quantile(shap, 0.95),
+            # A driver whose sign is not stable across fits is not a driver.
+            frac_same_sign = max(mean(shap > 0), mean(shap < 0)), .groups = "drop") %>%
+  left_join(ann %>% dplyr::select(feature, family), by = "feature")
+
+top_drivers <- feat_med %>%
+  group_by(label, construct) %>%
+  slice_max(abs(median), n = 8, with_ties = FALSE) %>%
+  arrange(label, construct, desc(abs(median))) %>%
+  ungroup()
+
+print(as.data.frame(top_drivers %>%
+  dplyr::select(label, construct, feature, family, median, p05, p95, frac_same_sign) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))))
+
+write_csv(feat_med, file.path(O, "construct_sweep_shap_features.csv"))
+write_csv(fam_med,  file.path(O, "construct_sweep_shap_families.csv"))
+write_csv(sw_sum,   file.path(O, "construct_sweep_summary.csv"))
+cat("\nwrote construct_sweep_shap_features.csv, construct_sweep_shap_families.csv, construct_sweep_summary.csv\n")
 ```
 
 # 4. Export

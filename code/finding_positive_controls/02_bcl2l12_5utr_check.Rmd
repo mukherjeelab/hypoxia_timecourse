@@ -1,0 +1,224 @@
+---
+title: "`r params$symbol`: does the candidate transcript's 5'UTR match the one our cells express?"
+output:
+  html_document:
+    toc: true
+params:
+  symbol: "BCL2L12"
+  given_tx: "ENST00000441864"
+---
+
+**Why.** BCL2L12 is an eIF3d target (Exclusive category) in hypoxia 1hr in both MDA-MB-231
+and MCF7-SIX1 (`01_eif3d_hypoxia_target_lookup.Rmd`). That TE result is gene-level. The
+transcript proposed as the reporter source (`params$given_tx`) is not the most abundant
+BCL2L12 isoform in either cell line, so the question is whether its 5'UTR is the 5'UTR the
+TE measurement mostly reflects.
+
+Two things are checked:
+
+1. **Sequence.** Every BCL2L12 5'UTR in GENCODE v49, built from exon coordinates
+   (`fiveUTRsByTranscript`) on hg38, and the given 5'UTR compared against each.
+2. **Abundance.** Salmon TPM per BCL2L12 transcript in the samples the TE was measured on
+   (hypoxia 1hr, siCTRL and si3d RNA-seq), in each cell line, as a share of the gene's TPM.
+   This is the isoform mixture the gene-level result averages over.
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!exists("params") || !is.list(params)) {
+  params <- list(symbol = "BCL2L12", given_tx = "ENST00000441864")
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(GenomicFeatures)
+  library(AnnotationDbi)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(Biostrings)
+})
+mcf_repo <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+out_dir  <- here("output", "finding_positive_controls")
+```
+
+## 1. Transcripts of the gene
+
+```{r transcripts}
+txdb <- loadDb(here("accessories", "human", "txdb.gencode49.sqlite"))
+anno <- read_tsv(here("accessories", "human", "gene_anno_hs_dm_v49_r111.tsv"),
+                 col_names = c("gene_id", "symbol", "biotype", "species", "source"),
+                 show_col_types = FALSE)
+gene_v <- anno %>% filter(symbol == params$symbol) %>% distinct(gene_id) %>% pull(gene_id)
+stopifnot(length(gene_v) == 1)
+
+tx <- AnnotationDbi::select(txdb, keys = gene_v, keytype = "GENEID",
+                            columns = c("TXNAME", "TXID")) %>%
+  mutate(tx_clean = sub("\\..*", "", TXNAME))
+stopifnot(params$given_tx %in% tx$tx_clean)
+
+main_231 <- readRDS(here("output", "translational_control_overview", "feature_matrix_tco.rds")) %>%
+  filter(gene_id_clean == sub("\\..*", "", gene_v)) %>% pull(transcript_id_clean)
+main_mcf <- readRDS(here("output", "translational_control_overview", "feature_matrix_tco_mcf7six1.rds")) %>%
+  filter(gene_id_clean == sub("\\..*", "", gene_v)) %>% pull(transcript_id_clean)
+mane <- read_csv(here("accessories", "human", "mane_select_v49.csv"),
+                 col_names = c("gene_id_clean", "transcript_id_clean", "symbol"),
+                 show_col_types = FALSE) %>%
+  filter(gene_id_clean == sub("\\..*", "", gene_v)) %>% pull(transcript_id_clean)
+stopifnot(length(mane) <= 1)
+if (!length(main_231)) cat("Gene is not in the 231 feature matrix (no expressed-in-231 transcript recorded).\n")
+if (!length(main_mcf)) cat("Gene is not in the MCF7-SIX1 feature matrix.\n")
+cat("Given:", params$given_tx, "| expressed in 231:", main_231,
+    "| expressed in MCF7-SIX1:", main_mcf, "| MANE Select:", mane, "\n")
+
+utr_grl <- fiveUTRsByTranscript(txdb, use.names = TRUE)
+cds_grl <- cdsBy(txdb, by = "tx", use.names = TRUE)
+utr_seq <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                 utr_grl[names(utr_grl) %in% tx$TXNAME])
+names(utr_seq) <- sub("\\..*", "", names(utr_seq))
+
+# first 3 nt of CDS, to confirm the UTR ends at an AUG
+cds_start <- extractTranscriptSeqs(BSgenome.Hsapiens.UCSC.hg38,
+                                   cds_grl[names(cds_grl) %in% tx$TXNAME])
+names(cds_start) <- sub("\\..*", "", names(cds_start))
+
+tx_tbl <- tx %>%
+  transmute(transcript = tx_clean, TXNAME) %>%
+  mutate(utr5_len    = width(utr_seq)[match(transcript, names(utr_seq))],
+         cds_len     = width(cds_start)[match(transcript, names(cds_start))],
+         start_codon = as.character(subseq(cds_start, 1, 3))[match(transcript, names(cds_start))],
+         role = str_remove(paste0(
+           ifelse(transcript == params$given_tx, "; given", ""),
+           ifelse(transcript %in% main_231, "; expressed in 231", ""),
+           ifelse(transcript %in% main_mcf, "; expressed in MCF7-SIX1", ""),
+           ifelse(transcript %in% mane, "; MANE Select", "")), "^; "))
+knitr::kable(tx_tbl)
+```
+
+## 2. Sequence comparison
+
+```{r compare}
+given_seq <- utr_seq[[params$given_tx]]
+stopifnot(length(given_seq) > 0)
+
+cmp <- map_dfr(setdiff(names(utr_seq), params$given_tx), function(t) {
+  s <- utr_seq[[t]]
+  # the 3' end of the 5'UTR abuts the start codon; compare from that end
+  a <- rev(strsplit(as.character(given_seq), "")[[1]])
+  b <- rev(strsplit(as.character(s), "")[[1]])
+  k <- min(length(a), length(b))
+  shared_3p <- sum(cumprod(a[1:k] == b[1:k]))
+  aln <- pairwiseAlignment(given_seq, s, type = "global")
+  tibble(transcript = t, utr5_len = length(s),
+         identical = as.character(s) == as.character(given_seq),
+         given_is_3p_suffix = endsWith(as.character(s), as.character(given_seq)),
+         other_is_3p_suffix = endsWith(as.character(given_seq), as.character(s)),
+         shared_nt_from_AUG = shared_3p,
+         pct_identity_global = round(pid(aln, type = "PID2"), 1))
+})
+if (nrow(cmp) == 0) {
+  cat("No other transcript of this gene has an annotated 5'UTR to compare against.\n")
+} else {
+  cmp %>% arrange(desc(shared_nt_from_AUG)) %>% knitr::kable()
+}
+```
+
+`shared_nt_from_AUG` counts how many nucleotides upstream of the start codon are identical
+between the two 5'UTRs, reading 5' from the AUG. That is the part of the leader a scanning
+ribosome sees last, and the part a reporter would share.
+
+### Upstream AUGs
+
+Every ATG in the 5'UTR, with its distance to the main start codon, whether it is in frame
+with the main CDS, and where its reading frame stops: inside the 5'UTR (a uORF), or past
+the main AUG (an overlapping ORF; in-frame ones would make an N-terminal extension).
+
+```{r uaug}
+uaug_table <- function(t) {
+  u    <- as.character(utr_seq[[t]])
+  full <- paste0(u, as.character(cds_start[[t]]))
+  pos  <- as.integer(gregexpr("ATG", u, fixed = TRUE)[[1]])
+  pos  <- pos[pos > 0]
+  if (!length(pos)) return(tibble(transcript = t, uATG_pos = NA_integer_))
+  map_dfr(pos, function(p) {
+    codons <- substring(full, seq(p, nchar(full) - 2, 3), seq(p + 2, nchar(full), 3))
+    stop_i <- which(codons %in% c("TAA", "TAG", "TGA"))[1]
+    stop_end <- if (is.na(stop_i)) NA_integer_ else p + 3 * stop_i - 1
+    tibble(transcript = t, uATG_pos = p, nt_upstream_of_main_AUG = nchar(u) - p + 1,
+           in_frame_with_CDS = (nchar(u) - p + 1) %% 3 == 0,
+           context_m3_p4 = paste0(substr(full, p - 3, p - 3), "..ATG", substr(full, p + 3, p + 3)),
+           orf_ends = case_when(is.na(stop_end) ~ "no stop in sequence",
+                                stop_end <= nchar(u) ~ "inside 5'UTR (uORF)",
+                                (nchar(u) - p + 1) %% 3 == 0 ~ "N-terminal extension (in frame, no stop before main AUG)",
+                                TRUE ~ "past main AUG (overlapping)"),
+           orf_codons = ifelse(is.na(stop_i), NA, stop_i))
+  })
+}
+uaug <- map_dfr(unique(c(params$given_tx, main_231, main_mcf, mane)), uaug_table)
+knitr::kable(uaug)
+uaug %>% group_by(transcript) %>% summarise(n_uATG = sum(!is.na(uATG_pos))) %>% knitr::kable()
+```
+
+### Exon structure: given, expressed and MANE Select
+
+```{r exons}
+show_exons <- function(t) {
+  g <- utr_grl[[tx$TXNAME[tx$tx_clean == t]]]
+  tibble(transcript = t, exon = seq_along(g), chr = as.character(seqnames(g)),
+         start = start(g), end = end(g), strand = as.character(strand(g)), width = width(g))
+}
+map_dfr(unique(c(params$given_tx, main_231, main_mcf, mane)), show_exons) %>% knitr::kable()
+```
+
+### Sequences
+
+```{r seqs}
+for (t in unique(c(params$given_tx, main_231, main_mcf, mane))) {
+  cat(">", t, " 5'UTR, ", width(utr_seq[t]), " nt\n", sep = "")
+  cat(paste(strsplit(as.character(utr_seq[[t]]), "(?<=.{60})", perl = TRUE)[[1]],
+            collapse = "\n"), "\n\n")
+}
+```
+
+## 3. Isoform abundance in the TE samples (hypoxia 1hr RNA-seq)
+
+```{r abundance}
+read_quant <- function(f) {
+  read_tsv(f, show_col_types = FALSE) %>%
+    transmute(transcript = sub("\\..*", "", str_extract(Name, "^[^|]+")), TPM)
+}
+
+meta231 <- read_csv(here("accessories", "metadata_231_timecourse.csv"), show_col_types = FALSE) %>%
+  filter(type == "Input_Ribo_RNAseq", condition == "hypoxia", hours == 1,
+         treatment %in% c("siCTRL", "si3d")) %>%
+  transmute(id, treatment = ifelse(treatment == "siCTRL", "sictrl", treatment),
+            file = here("2025_MDAcells_riboseq", "salmon", id, "quant.sf.gz"),
+            cell = "MDA-MB-231")
+metamcf <- read_csv(file.path(mcf_repo, "counts/calculate_te/metadata.csv"), show_col_types = FALSE) %>%
+  filter(library == "rna", condition == "hypoxia", treatment %in% c("sictrl", "si3d")) %>%
+  transmute(id = sample_id, treatment,
+            file = file.path(mcf_repo, "salmon", sample_id, "quant.sf.gz"),
+            cell = "MCF7-SIX1")
+meta <- bind_rows(meta231, metamcf)
+stopifnot(nrow(meta) == 12, all(file.exists(meta$file)))
+
+ab <- meta %>%
+  mutate(q = map(file, read_quant)) %>%
+  unnest(q) %>%
+  filter(transcript %in% tx$tx_clean)
+
+share <- ab %>%
+  group_by(cell, treatment, transcript) %>%
+  summarise(TPM = mean(TPM), .groups = "drop_last") %>%
+  mutate(share_pct = round(100 * TPM / sum(TPM), 1), TPM = round(TPM, 2)) %>%
+  ungroup() %>%
+  left_join(tx_tbl %>% dplyr::select(transcript, utr5_len, role), by = "transcript")
+
+share %>%
+  dplyr::select(cell, treatment, transcript, role, utr5_len, TPM, share_pct) %>%
+  pivot_wider(names_from = treatment, values_from = c(TPM, share_pct)) %>%
+  arrange(cell, desc(share_pct_sictrl)) %>%
+  knitr::kable()
+
+write_csv(share, file.path(out_dir, sprintf("%s_isoform_share_hypoxia_1hr.csv", params$symbol)))
+```
+
+```{r session}
+sessionInfo()
+```

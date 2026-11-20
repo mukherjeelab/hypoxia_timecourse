@@ -1,0 +1,502 @@
+---
+title: "CDS length of eIF3d-promoted mRNAs by cell line and condition"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  xmax_cds_nt: 6000
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    xmax_cds_nt = 6000  # x axis clipped here; densities use every transcript
+  )
+}
+```
+
+# Overview
+
+The CDS length panel from `19_firefly_vs_nanoluc_target_features.Rmd`, repeated
+for every cell line and condition with an eIF3d TE contrast and stacked on one
+shared x axis, so the promoted-set shift can be compared across datasets in one
+figure. No reporter constructs are drawn.
+
+**The four panels.**
+
+| cell line | condition | contrast file |
+|---|---|---|
+| MDA-MB-231 | hypoxia 1hr | `output/translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv` |
+| MDA-MB-231 | normoxia 1+4hr, time-regressed | `output/translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv` |
+| MCF7-SIX1 | hypoxia 1hr | `output/translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv` |
+| MCF7-SIX1 | normoxia 1hr | `output/translation_categories_si3d_vs_sictrl_mcf7six1_normoxia_1hr.csv` |
+
+MDA-MB-231 normoxia uses the time-regressed 1+4hr contrast rather than plain 1hr
+(the project convention). MCF7-SIX1 has only a 1hr timepoint.
+
+**Terms used below.**
+
+* *promoted set* - genes with `te_lfc > 0.5` and `te_padj < 0.05` in that
+  panel's si3d contrast. Every file here is promotes-positive: the MDA-MB-231
+  files carry the `sictrl_vs_si3d` coefficient (despite the filename), and the
+  MCF7-SIX1 files were negated from log2(si3d / sictrl) by
+  `10m_mcf7six1_outcome_prep.Rmd`. Both are asserted below.
+* *rest of the transcriptome* - every other transcript in that cell line's
+  expressed set. Disjoint from the promoted set, so the two curves are the two
+  groups the Wilcoxon test compares. (Notebook 19 drew all expressed mRNAs,
+  promoted included, as its grey curve; this one draws the rest.)
+* *expressed set* - one transcript per gene, **that cell line's own dominant
+  isoform**: `feature_matrix_external_stability.rds` for MDA-MB-231 (the matrix
+  notebook 19 uses) and `feature_matrix_tco_mcf7six1.rds` for MCF7-SIX1. 35% of
+  shared genes pick a different transcript in the two lines, so borrowing one
+  cell line's isoform for the other would put one molecule's length next to
+  another's measurement. Restricted to transcripts with a complete CDS in GENCODE
+  v49 (in frame, terminal stop present).
+* *CDS length* - nt, stop codon excluded, from `build_cds_metrics()`, the same
+  definition notebook 19 plots.
+
+**One difference from notebook 19.** Notebook 19 added back promoted genes that
+are missing from the MDA-MB-231 matrix by picking their top transcript from the
+hypoxia siCTRL salmon quant. That augmentation exists for one condition of one
+cell line only, so it is not repeated here; every panel uses its matrix alone and
+the number of promoted genes without a transcript is reported per panel. The
+MDA-MB-231 hypoxia panel's promoted n is therefore slightly smaller than notebook
+19's.
+
+# 1. Libraries
+
+```{r load_libraries}
+library(tidyverse)
+library(here)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+
+lfc_cutoff  <- 0.5
+padj_cutoff <- 0.05
+
+stopifnot("xmax_cds_nt must be positive" = params$xmax_cds_nt > 0)
+```
+
+# 2. Contrasts and promoted sets
+
+```{r registry}
+registry <- tribble(
+  ~cell_line,   ~condition,                         ~file,
+  "MDA-MB-231", "normoxia 1+4hr (time-regressed)",  "translation_categories_si3d_vs_sictrl_normoxia_1and4hr.csv",
+  "MDA-MB-231", "hypoxia 1hr",                      "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv",
+  "MCF7-SIX1",  "normoxia 1hr",                     "translation_categories_si3d_vs_sictrl_mcf7six1_normoxia_1hr.csv",
+  "MCF7-SIX1",  "hypoxia 1hr",                      "translation_categories_si3d_vs_sictrl_mcf7six1_hypoxia_1hr.csv"
+) %>%
+  # Row order sets the grid: normoxia left, hypoxia right; MDA-MB-231 on top,
+  # MCF7-SIX1 below (facet_wrap fills row by row).
+  mutate(panel = paste0(cell_line, ", ", condition),
+         path  = here("output", file))
+
+stopifnot("a contrast file is missing" = all(file.exists(registry$path)))
+
+contrasts <- setNames(
+  map(registry$path, ~ read_csv(.x, show_col_types = FALSE) %>%
+        mutate(gene_id_clean = sub("\\..*", "", gene_id))),
+  registry$panel)
+```
+
+**Direction checks.** MDA-MB-231: EIF3D's own `rna_lfc` must be strongly
+positive, because the siRNA depletes its target. MCF7-SIX1 has no `rna_lfc`, so
+that check would silently skip; instead assert that the file is the exact
+negation of the DESeq2 output it was written from, and that it correlates
+**positively** with the matched MDA-MB-231 contrast - the one ruler on
+independent data (`10m_` shows the un-negated orientation fails it in every
+contrast).
+
+```{r direction_checks}
+for (p in registry$panel[registry$cell_line == "MDA-MB-231"]) {
+  e <- contrasts[[p]] %>% filter(symbol == "EIF3D") %>% pull(rna_lfc)
+  stopifnot("EIF3D rna_lfc is not strongly positive: contrast direction may be flipped" =
+              length(e) == 1 && e > 2)
+  cat(sprintf("%-45s EIF3D rna_lfc = %+.2f\n", p, e))
+}
+
+matched_231 <- c("MCF7-SIX1, hypoxia 1hr"  = "MDA-MB-231, hypoxia 1hr",
+                 "MCF7-SIX1, normoxia 1hr" = "MDA-MB-231, normoxia 1+4hr (time-regressed)")
+for (p in names(matched_231)) {
+  d <- contrasts[[p]]
+  stopifnot(
+    "MCF7-SIX1 file is not the negation of its DESeq2 log2FoldChange" =
+      isTRUE(all.equal(d$te_lfc, -d$source_log2FoldChange)))
+  j <- inner_join(d %>% dplyr::select(gene_id_clean, mcf = te_lfc),
+                  contrasts[[matched_231[[p]]]] %>%
+                    dplyr::select(gene_id_clean, mda = te_lfc),
+                  by = "gene_id_clean") %>%
+    filter(is.finite(mcf), is.finite(mda))
+  rho <- cor(j$mcf, j$mda, method = "spearman")
+  stopifnot("MCF7-SIX1 TE does not correlate positively with the matched MDA-MB-231 contrast" =
+              rho > 0.05)
+  cat(sprintf("%-45s Spearman vs %s = %+.3f (n = %s)\n",
+              p, matched_231[[p]], rho, fmt_n(nrow(j))))
+}
+```
+
+```{r promoted_sets}
+promoted_genes <- map(contrasts, ~ .x %>%
+  filter(te_lfc > lfc_cutoff, !is.na(te_padj), te_padj < padj_cutoff) %>%
+  distinct(gene_id_clean) %>% pull(gene_id_clean))
+
+# Set sizes are the ones the project's gene set files and notebooks already
+# report (1,604 in notebook 19; 853 / 233 in 42_ and 10m_). 426 is the
+# normoxia 1+4hr count at this cut.
+expected_n <- c("MDA-MB-231, normoxia 1+4hr (time-regressed)" = 426,
+                "MDA-MB-231, hypoxia 1hr"                     = 1604,
+                "MCF7-SIX1, normoxia 1hr"                     = 233,
+                "MCF7-SIX1, hypoxia 1hr"                      = 853)
+stopifnot("a promoted set changed size" =
+            all(lengths(promoted_genes)[names(expected_n)] == expected_n))
+
+# Cross-check against the gene set CSVs where they exist, so this rebuild cannot
+# drift from the sets the models use.
+gs_files <- c("MDA-MB-231, hypoxia 1hr" = "hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
+              "MCF7-SIX1, hypoxia 1hr"  = "mcf7six1_hypoxia_3d_promotes_TE_1hr_lfc0.5.csv",
+              "MCF7-SIX1, normoxia 1hr" = "mcf7six1_normoxia_3d_promotes_TE_1hr_lfc0.5.csv")
+for (p in names(gs_files)) {
+  gs <- read_csv(here("output", "genesets", gs_files[[p]]), show_col_types = FALSE)
+  stopifnot("promoted set does not reproduce its gene set CSV" =
+              setequal(sub("\\..*", "", gs$ensembl_gene), promoted_genes[[p]]))
+}
+print(tibble(panel = names(promoted_genes), promoted_genes = lengths(promoted_genes)))
+```
+
+# 3. Transcripts and CDS length
+
+```{r cds_metrics}
+TXDB <- here("accessories", "human", "txdb.gencode49.sqlite")
+cds_metrics <- build_cds_metrics(TXDB) %>%
+  dplyr::select(transcript_id_clean, cds_length)
+
+stopifnot(
+  "CDS lengths must be divisible by 3" = all(cds_metrics$cds_length %% 3 == 0),
+  "CDS lengths must be positive"       = all(cds_metrics$cds_length > 0)
+)
+```
+
+```{r expressed_sets}
+matrices <- list(
+  "MDA-MB-231" = here("output", "predictive_modeling",
+                      "feature_matrix_external_stability.rds"),
+  "MCF7-SIX1"  = here("output", "translational_control_overview",
+                      "feature_matrix_tco_mcf7six1.rds"))
+
+expressed <- imap(matrices, function(path, cl) {
+  fm <- readRDS(path) %>%
+    dplyr::select(transcript_id_clean, gene_id_clean, symbol) %>%
+    distinct()
+  stopifnot("matrix is not one transcript per gene" =
+              !any(duplicated(fm$gene_id_clean)))
+  out <- fm %>% inner_join(cds_metrics, by = "transcript_id_clean")
+  cat(sprintf("%-11s %s of %s matrix transcripts carry a complete GENCODE v49 CDS\n",
+              cl, fmt_n(nrow(out)), fmt_n(nrow(fm))))
+  out
+})
+
+# Biological spot-check: ribosomal protein mRNAs are short. If the join had
+# attached the wrong length this would not hold.
+#
+# ACTB's full CDS is 1,125 nt (375 aa, stop excluded); asserted for MDA-MB-231
+# only. The MCF7-SIX1 matrix gives ACTB the 375 nt fragment ENST00000425660:
+# its quant is GENCODE v26, and transcripts retired since v26 are invisible to
+# the v49 dominant-isoform pick (~252 genes, ACTB the worst). That is a known,
+# unfixed property of the MCF7-SIX1 matrix, so it is reported, not asserted.
+e231 <- expressed[["MDA-MB-231"]]
+stopifnot("MDA-MB-231 ACTB CDS length is not 1,125 nt (stop excluded)" =
+            e231$cds_length[e231$symbol == "ACTB"] == 1125)
+cat(sprintf("ACTB CDS length: MDA-MB-231 %s nt, MCF7-SIX1 %s nt (v26 isoform issue)\n",
+            fmt_n(e231$cds_length[e231$symbol == "ACTB"]),
+            fmt_n(expressed[["MCF7-SIX1"]]$cds_length[expressed[["MCF7-SIX1"]]$symbol == "ACTB"])))
+
+for (cl in names(expressed)) {
+  e  <- expressed[[cl]]
+  rp <- e %>% filter(str_detect(symbol, "^RP[SL]\\d"))
+  stopifnot(
+    "too few ribosomal protein genes for the spot-check" = nrow(rp) >= 50,
+    "ribosomal protein CDSs are not shorter than the median: join suspect" =
+      median(rp$cds_length) < median(e$cds_length),
+    "median CDS length outside the expected 900-2,000 nt range" =
+      between(median(e$cds_length), 900, 2000)
+  )
+}
+```
+
+```{r assemble}
+plot_df <- pmap_dfr(registry, function(cell_line, condition, panel, ...) {
+  e   <- expressed[[cell_line]]
+  pro <- promoted_genes[[panel]]
+  n_missing <- sum(!pro %in% e$gene_id_clean)
+  cat(sprintf("%-45s %s of %s promoted genes have no complete-CDS transcript in the %s matrix\n",
+              panel, fmt_n(n_missing), fmt_n(length(pro)), cell_line))
+  e %>% mutate(panel = panel, cell_line = cell_line, condition = condition,
+               group = if_else(gene_id_clean %in% pro,
+                               "eIF3d promotes", "Rest of the transcriptome"))
+}) %>%
+  mutate(panel = factor(panel, levels = registry$panel),
+         group = factor(group, levels = c("Rest of the transcriptome",
+                                          "eIF3d promotes")))
+```
+
+```{r panel_stats}
+stats <- plot_df %>%
+  group_by(panel) %>%
+  summarise(
+    n_pro    = sum(group == "eIF3d promotes"),
+    n_rest   = sum(group == "Rest of the transcriptome"),
+    med_pro  = median(cds_length[group == "eIF3d promotes"]),
+    med_rest = median(cds_length[group == "Rest of the transcriptome"]),
+    p        = wilcox.test(cds_length[group == "eIF3d promotes"],
+                           cds_length[group == "Rest of the transcriptome"])$p.value,
+    .groups = "drop") %>%
+  mutate(strip = sprintf(
+    "%s\npromoted n = %s, median %s nt\nrest n = %s, median %s nt\nWilcoxon p = %s",
+    panel, fmt_n(n_pro), fmt_n(round(med_pro)), fmt_n(n_rest),
+    fmt_n(round(med_rest)), format.pval(p, digits = 2)))
+
+print(as.data.frame(stats %>% dplyr::select(-strip)))
+
+plot_df <- plot_df %>%
+  left_join(stats %>% dplyr::select(panel, strip), by = "panel") %>%
+  mutate(strip = factor(strip, levels = stats$strip[match(registry$panel, stats$panel)]))
+
+n_off <- sum(plot_df$cds_length > params$xmax_cds_nt)
+cat(sprintf("x axis clipped at %s nt; %s of %s plotted transcripts (%.1f%%) beyond it\n",
+            fmt_n(params$xmax_cds_nt), fmt_n(n_off), fmt_n(nrow(plot_df)),
+            100 * n_off / nrow(plot_df)))
+```
+
+# 4. Grid panel
+
+```{r stacked_cds_length, fig.width=12, fig.height=9}
+group_cols <- c("Rest of the transcriptome" = "grey70",
+                "eIF3d promotes"            = "#E69F00")
+
+p_stack <- ggplot(plot_df, aes(x = cds_length, color = group)) +
+  geom_density(fill = NA, linewidth = 1, trim = TRUE, key_glyph = "path") +
+  facet_wrap(~ strip, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = group_cols, breaks = names(group_cols), name = NULL) +
+  # coord_cartesian zooms without dropping rows, so each density is still
+  # estimated from every transcript; only the visible range is clipped.
+  scale_x_continuous(expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  coord_cartesian(xlim = c(0, params$xmax_cds_nt), ylim = c(0, NA)) +
+  labs(x = "CDS length (nt)", y = "Density",
+       title = "CDS length of eIF3d-promoted mRNAs by cell line and condition") +
+  theme_classic(base_size = 14) +
+  theme(strip.background = element_blank(),
+        strip.text       = element_text(hjust = 0, size = 11),
+        axis.text        = element_text(colour = "black"),
+        legend.position  = "bottom",
+        legend.text      = element_text(size = 11))
+
+print(p_stack)
+ggsave(here("plots", "20_cds_length_density_by_cell_line_condition.pdf"),
+       p_stack, width = 12, height = 9)
+```
+
+# 5. Shared targets: MDA-MB-231 and MCF7-SIX1
+
+**Shared target** - a gene in the eIF3d-promoted set of *both* cell lines in the
+same condition (normoxia: MDA-MB-231 1+4hr time-regressed with MCF7-SIX1 1hr;
+hypoxia: both 1hr). Matched at gene level, since the two cell lines can use
+different transcripts of the same gene.
+
+**Is the overlap more than chance?** A gene can only be shared if both
+experiments tested it, so the background is every gene with a non-NA `te_padj`
+in **both** contrasts, and both promoted sets are restricted to it before the
+Fisher test. Normoxia first, then hypoxia.
+
+```{r overlap}
+conditions <- tribble(
+  ~condition, ~panel_231,                                     ~panel_mcf7,
+  "normoxia", "MDA-MB-231, normoxia 1+4hr (time-regressed)",  "MCF7-SIX1, normoxia 1hr",
+  "hypoxia",  "MDA-MB-231, hypoxia 1hr",                      "MCF7-SIX1, hypoxia 1hr"
+)
+stopifnot("overlap panels must exist in the registry" =
+            all(c(conditions$panel_231, conditions$panel_mcf7) %in% registry$panel))
+
+tested <- function(p) contrasts[[p]] %>%
+  filter(!is.na(te_padj)) %>% distinct(gene_id_clean) %>% pull(gene_id_clean)
+
+overlap <- pmap(conditions, function(condition, panel_231, panel_mcf7) {
+  universe <- intersect(tested(panel_231), tested(panel_mcf7))
+  a <- intersect(promoted_genes[[panel_231]],  universe)
+  b <- intersect(promoted_genes[[panel_mcf7]], universe)
+  shared <- intersect(a, b)
+  stopifnot("a promoted gene is missing from its own tested set" =
+              all(promoted_genes[[panel_231]]  %in% tested(panel_231)) &&
+              all(promoted_genes[[panel_mcf7]] %in% tested(panel_mcf7)))
+  ft <- fisher.test(matrix(c(length(shared),
+                             length(a) - length(shared),
+                             length(b) - length(shared),
+                             length(universe) - length(union(a, b))),
+                           nrow = 2), alternative = "greater")
+  # Counts computed outside tibble(): inside it, a column named `shared` would
+  # shadow the gene vector for every later column.
+  n_sh <- length(shared); n_a <- length(a); n_b <- length(b)
+  list(condition = condition, shared = shared,
+       summary = tibble(
+         condition,
+         tested_in_both  = length(universe),
+         promoted_231    = n_a,
+         promoted_mcf7   = n_b,
+         shared          = n_sh,
+         expected        = round(n_a * n_b / length(universe), 1),
+         pct_of_231      = round(100 * n_sh / n_a, 1),
+         pct_of_mcf7     = round(100 * n_sh / n_b, 1),
+         odds_ratio      = round(unname(ft$estimate), 2),
+         fisher_p        = format.pval(ft$p.value, digits = 2)))
+})
+names(overlap) <- conditions$condition
+
+knitr::kable(map_dfr(overlap, "summary"))
+```
+
+```{r overlap_genes}
+# The shared genes, with each cell line's own transcript and CDS length, so a
+# gene whose two cell lines use different isoforms is visible rather than hidden.
+shared_tbl <- imap_dfr(overlap, function(o, cond) {
+  tibble(condition = cond, gene_id_clean = o$shared) %>%
+    left_join(expressed[["MDA-MB-231"]] %>%
+                dplyr::select(gene_id_clean, symbol,
+                              tx_231 = transcript_id_clean, cds_231 = cds_length),
+              by = "gene_id_clean") %>%
+    left_join(expressed[["MCF7-SIX1"]] %>%
+                dplyr::select(gene_id_clean, symbol_mcf7 = symbol,
+                              tx_mcf7 = transcript_id_clean, cds_mcf7 = cds_length),
+              by = "gene_id_clean") %>%
+    mutate(symbol = coalesce(symbol, symbol_mcf7),
+           same_transcript = tx_231 == tx_mcf7) %>%
+    dplyr::select(-symbol_mcf7)
+}) %>%
+  mutate(condition = factor(condition, levels = conditions$condition)) %>%
+  arrange(condition, cds_231)
+
+shared_tbl %>%
+  group_by(condition) %>%
+  summarise(shared = n(),
+            with_231_transcript  = sum(!is.na(tx_231)),
+            with_mcf7_transcript = sum(!is.na(tx_mcf7)),
+            same_transcript      = sum(same_transcript, na.rm = TRUE),
+            .groups = "drop") %>%
+  knitr::kable()
+
+write_csv(shared_tbl,
+          here("output", "20_si3d_promoted_shared_231_mcf7six1_by_condition.csv"))
+knitr::kable(shared_tbl %>% dplyr::select(condition, symbol, cds_231, cds_mcf7,
+                                          same_transcript))
+```
+
+**Shared targets on each panel.** The same grid as section 4, with a third curve
+for the shared targets in that condition, drawn on each cell line's own
+transcript, plus one rug tick per shared gene, because a density over a few
+dozen genes is shaped as much by the bandwidth as by the data. The shared genes
+are a subset of the promoted set, so the orange curve still includes them.
+
+```{r shared_stats}
+shared_by_panel <- set_names(
+  map(registry$panel, function(p) {
+    cond <- if (str_detect(p, "normoxia")) "normoxia" else "hypoxia"
+    overlap[[cond]]$shared
+  }),
+  registry$panel)
+
+plot_shared <- plot_df %>%
+  dplyr::select(-strip) %>%
+  filter(gene_id_clean %in% unlist(shared_by_panel)) %>%
+  filter(map2_lgl(gene_id_clean, as.character(panel),
+                  ~ .x %in% shared_by_panel[[.y]])) %>%
+  mutate(group = "Shared target (both cell lines)")
+
+stopifnot("every shared gene with a transcript must already be in the promoted group" =
+            all(paste(plot_shared$panel, plot_shared$gene_id_clean) %in%
+                  with(plot_df %>% filter(group == "eIF3d promotes"),
+                       paste(panel, gene_id_clean))))
+
+stats_shared <- plot_df %>%
+  group_by(panel) %>%
+  summarise(n_pro    = sum(group == "eIF3d promotes"),
+            med_pro  = median(cds_length[group == "eIF3d promotes"]),
+            n_rest   = sum(group == "Rest of the transcriptome"),
+            med_rest = median(cds_length[group == "Rest of the transcriptome"]),
+            .groups = "drop") %>%
+  left_join(plot_shared %>% group_by(panel) %>%
+              summarise(n_shared   = n(),
+                        med_shared = median(cds_length), .groups = "drop"),
+            by = "panel") %>%
+  rowwise() %>%
+  mutate(p_shared = wilcox.test(
+    plot_shared$cds_length[plot_shared$panel == panel],
+    plot_df$cds_length[plot_df$panel == panel &
+                         plot_df$group == "Rest of the transcriptome"])$p.value) %>%
+  ungroup() %>%
+  mutate(strip = sprintf(
+    "%s\nshared n = %s, median %s nt (vs rest p = %s)\npromoted n = %s, median %s nt\nrest n = %s, median %s nt",
+    panel, fmt_n(n_shared), fmt_n(round(med_shared)), format.pval(p_shared, digits = 2),
+    fmt_n(n_pro), fmt_n(round(med_pro)), fmt_n(n_rest), fmt_n(round(med_rest))))
+
+print(as.data.frame(stats_shared %>% dplyr::select(-strip)))
+
+strip_levels <- stats_shared$strip[match(registry$panel, stats_shared$panel)]
+add_strip <- function(d) d %>%
+  dplyr::select(-any_of("strip")) %>%
+  left_join(stats_shared %>% dplyr::select(panel, strip), by = "panel") %>%
+  mutate(strip = factor(strip, levels = strip_levels))
+
+plot_df_sh     <- add_strip(plot_df)
+plot_shared_sh <- add_strip(plot_shared)
+```
+
+```{r shared_cds_length, fig.width=12, fig.height=10}
+shared_cols <- c(group_cols,
+                 "Shared target (both cell lines)" = "#CC79A7")
+
+p_shared <- ggplot(mapping = aes(x = cds_length, color = group)) +
+  geom_density(data = plot_df_sh, fill = NA, linewidth = 1, trim = TRUE,
+               key_glyph = "path") +
+  geom_density(data = plot_shared_sh, fill = NA, linewidth = 1, trim = TRUE,
+               key_glyph = "path") +
+  geom_rug(data = plot_shared_sh, sides = "b", length = unit(0.04, "npc"),
+           alpha = 0.7, show.legend = FALSE) +
+  facet_wrap(~ strip, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = shared_cols, breaks = names(shared_cols), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  coord_cartesian(xlim = c(0, params$xmax_cds_nt), ylim = c(0, NA)) +
+  labs(x = "CDS length (nt)", y = "Density",
+       title = "eIF3d-promoted mRNAs shared by MDA-MB-231 and MCF7-SIX1") +
+  theme_classic(base_size = 14) +
+  theme(strip.background = element_blank(),
+        strip.text       = element_text(hjust = 0, size = 11),
+        axis.text        = element_text(colour = "black"),
+        legend.position  = "bottom",
+        legend.text      = element_text(size = 11))
+
+print(p_shared)
+ggsave(here("plots", "20_cds_length_density_shared_targets_231_mcf7six1.pdf"),
+       p_shared, width = 12, height = 10)
+```
+
+```{r session_info}
+sessionInfo()
+```

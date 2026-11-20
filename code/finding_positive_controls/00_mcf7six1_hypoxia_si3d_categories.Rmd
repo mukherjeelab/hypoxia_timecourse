@@ -1,0 +1,117 @@
+---
+title: "MCF7-SIX1 hypoxia si3d: RNA-only and ribo-only results, and translation categories"
+output:
+  html_document:
+    toc: true
+---
+
+**Why this exists.** MDA-MB-231's TE results carry a `category` column (Forwarded / Exclusive /
+Buffered / TE_only, from `categorize_translation_changes()` in `code/functions.R`). The saved
+MCF7-SIX1 hypoxia si3d result (`2024_eIF3e_hypoxia/counts/hypoxia_si_ctrl_3d.csv`) is the TE
+interaction term only, with no RNA-only or ribo-only contrast, so it cannot be categorized.
+This notebook fits those two contrasts on the same samples and counts, then categorizes.
+
+**Category definitions** (from `categorize_translation_changes()`; "sig" = padj < 0.05, and
+as at every call site in this project `lfc_cutoff = 0`, so significance alone):
+
+| category | RNA sig | ribo sig | TE sig |
+|---|---|---|---|
+| Exclusive | no | yes | yes |
+| TE_only | no | no | yes |
+| Buffered | yes | either | yes |
+| Forwarded | yes | yes | no |
+| Not_sig | otherwise | | |
+
+**How the fits match the original.** Same count matrix
+(`counts/calculate_te/raw_filtered_allCounts.csv`), same 12 samples (hypoxia sictrl + si3d,
+reps a-c, RNA + ribo), same `sictrl` reference, `cooksCutoff = FALSE`,
+`independentFiltering = FALSE`, no spike-ins, as in `5_hypoxicresponse.Rmd` ("si3d vs sictrl in
+hypoxia"). The TE fit is re-run and its padj asserted against the saved file before the new
+contrasts are trusted. RNA-only and ribo-only use `~ treatment` on their own library type.
+
+Raw MCF7-SIX1 LFCs are log2(si3d / sictrl); every LFC here is **negated** so positive = eIF3d
+promotes, matching MDA-MB-231 and this repo's MCF7-SIX1 TE file.
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(DESeq2)
+})
+source(here("code", "functions.R"))
+mcf_repo <- "/Users/katematlin/github/2024_eIF3e_hypoxia/2024_eIF3e_hypoxia"
+out_dir  <- here("output", "finding_positive_controls")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r data}
+meta <- read_csv(file.path(mcf_repo, "counts/calculate_te/metadata.csv"), show_col_types = FALSE) %>%
+  filter(condition == "hypoxia", treatment %in% c("sictrl", "si3d")) %>%
+  mutate(name      = paste(condition, treatment, rep, library, sep = "_"),
+         treatment = relevel(factor(treatment), ref = "sictrl"),
+         library   = relevel(factor(library),   ref = "rna"))
+stopifnot(nrow(meta) == 12, all(table(meta$treatment, meta$library) == 3))
+
+counts <- read_csv(file.path(mcf_repo, "counts/calculate_te/raw_filtered_allCounts.csv"),
+                   show_col_types = FALSE) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+stopifnot(all(meta$name %in% colnames(counts)))
+counts <- counts[, meta$name]
+```
+
+```{r fits, message=FALSE}
+fit <- function(cols, design, coef_idx) {
+  m   <- meta %>% filter(name %in% cols)
+  dds <- DESeqDataSetFromMatrix(counts[, m$name], colData = m, design = design)
+  dds <- DESeq(dds, quiet = TRUE)
+  nm  <- resultsNames(dds)[coef_idx]
+  cat("coefficient:", nm, "\n")
+  results(dds, name = nm, cooksCutoff = FALSE, independentFiltering = FALSE) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    transmute(gene_id, lfc = -log2FoldChange, padj)   # negate: promotes-positive
+}
+
+te   <- fit(meta$name, ~ treatment + library + treatment:library, 4)
+rna  <- fit(meta$name[meta$library == "rna"],  ~ treatment, 2)
+ribo <- fit(meta$name[meta$library == "ribo"], ~ treatment, 2)
+```
+
+### Reproduction and direction checks
+
+```{r checks}
+saved <- read_csv(file.path(mcf_repo, "counts/hypoxia_si_ctrl_3d.csv"), show_col_types = FALSE)
+chk <- inner_join(saved, te, by = "gene_id")
+cat("TE genes: saved", nrow(saved), "| refit", nrow(te), "| shared", nrow(chk), "\n")
+cat("max |padj difference| vs saved TE:", signif(max(abs(chk$padj.x - chk$padj.y)), 3), "\n")
+stopifnot("refit TE does not reproduce the saved MCF7-SIX1 TE padj" =
+            nrow(chk) == nrow(saved), max(abs(chk$padj.x - chk$padj.y)) < 1e-8)
+
+e <- function(df) df$lfc[df$gene_id == saved$gene_id[saved$symbol == "EIF3D"]]
+cat(sprintf("EIF3D (promotes-positive): rna %.2f, ribo %.2f, te %.2f\n", e(rna), e(ribo), e(te)))
+stopifnot("direction flipped: EIF3D RNA should fall on si3d (positive after negation)" = e(rna) > 1)
+```
+
+### Categorize
+
+```{r categorize}
+to_res <- function(df) df %>% transmute(gene_id, log2FoldChange = lfc, padj)
+cats <- categorize_translation_changes(to_res(rna), to_res(ribo), to_res(te),
+                                       padj_cutoff = 0.05, lfc_cutoff = 0.0)$categorized_table
+
+out <- cats %>%
+  left_join(rna  %>% dplyr::select(gene_id, rna_padj  = padj), by = "gene_id") %>%
+  left_join(ribo %>% dplyr::select(gene_id, ribo_padj = padj), by = "gene_id") %>%
+  left_join(te   %>% dplyr::select(gene_id, te_padj   = padj), by = "gene_id") %>%
+  left_join(saved %>% dplyr::select(gene_id, symbol), by = "gene_id") %>%
+  mutate(category = as.character(category))
+stopifnot(!anyDuplicated(out$gene_id))
+dplyr::count(out, category) %>% knitr::kable()
+
+write_csv(out, file.path(out_dir, "mcf7six1_hypoxia_1hr_si3d_rna_ribo_te_categories.csv"))
+```
+
+```{r session}
+sessionInfo()
+```

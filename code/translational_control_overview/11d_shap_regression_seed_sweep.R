@@ -63,6 +63,8 @@ total <- length(arms) * length(seeds)
 cat(sprintf("SHAP floor sweep: preset '%s', arms [%s], %d seeds = %d x (10_ + 11_)\n",
             preset, paste(names(arms), collapse = ", "), length(seeds), total))
 
+# Each render gets its own intermediates_dir (below), so several invocations of this script can
+# run concurrently - one per arm or seed range - without deleting each other's .knit.md.
 t0 <- Sys.time(); i <- 0L; failures <- character(0)
 for (arm_name in names(arms)) {
   arm <- arms[[arm_name]]
@@ -78,12 +80,14 @@ for (arm_name in names(arms)) {
           split_seed = s, run_cv = FALSE, save_plots = FALSE,
           save_model_data = TRUE, auc_bridge = TRUE, gate_feature_parity = FALSE,
           perm_n = perm_n)),
-        output_file = file.path(tempdir(), paste0("10_", suf, ".html")), quiet = TRUE)
+        output_file = file.path(tempdir(), paste0("10_", suf, ".html")), quiet = TRUE,
+        intermediates_dir = tempfile("im10_"))
       rmarkdown::render(
         file.path(src, "11_shap_regression.Rmd"),
         params = utils::modifyList(arm_for_shap(arm), list(
           split_seed = s, sweep_mode = TRUE, save_shap_plots = FALSE)),
-        output_file = file.path(tempdir(), paste0("11_", suf, ".html")), quiet = TRUE)
+        output_file = file.path(tempdir(), paste0("11_", suf, ".html")), quiet = TRUE,
+        intermediates_dir = tempfile("im11_"))
       TRUE
     }, error = function(e) { message("FAILED ", arm_name, " seed ", s, ": ",
                                      conditionMessage(e)); FALSE })
