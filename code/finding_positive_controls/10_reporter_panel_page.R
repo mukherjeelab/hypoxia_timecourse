@@ -29,7 +29,8 @@ t4 <- map_chr(seq_len(nrow(d)), function(i) paste0("<tr>", gene(i),
 t2 <- map_chr(seq_len(nrow(d)), function(i) paste0("<tr>", gene(i),
   "<td>", cell(d$te_nor_231[i]), "</td><td>", cell(d$te_nor_mcf[i]), "</td></tr>"))
 t5 <- map_chr(seq_len(nrow(d)), function(i) paste0("<tr>", gene(i),
-  "<td>", cell(d$te_hela_si3d[i]), "</td><td>", cell(d$te_hela_si3e[i]), "</td></tr>"))
+  "<td>", cell(d$te_hela_si3d[i]), "</td><td>", cell(d$te_hela_si3e[i]), "</td>",
+  '<td class="split tgt"><span class="call">', esc(d$hela_target[i]), "</span></td></tr>"))
 nc <- function(x) ifelse(grepl("^not called$|^0 of", x), sprintf('<span class="muted">%s</span>', esc(x)), esc(x))
 t3 <- map_chr(seq_len(nrow(d)), function(i) paste0("<tr>", gene(i),
   "<td>", nc(d$cap_binding_subunitseq[i]), "</td><td>", nc(d$lee2015_parclip[i]), "</td><td>", nc(d$desilva_eif3d_band[i]),

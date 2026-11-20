@@ -128,9 +128,9 @@ dt { font-weight: 600; } dd { margin: 0; color: var(--muted); }
 
 <section>
   <h2>HeLa eIF3d and eIF3e knockdown</h2>
-  <p>Herrmannová et al., eLife 2024. Ribosome profiling in HeLa at steady state (normoxia). TE log2 fold change, sictrl / knockdown (padj), oriented the same way as our data.</p>
+  <p>Herrmannová et al., eLife 2024. Ribosome profiling in HeLa at steady state (normoxia). TE log2 fold change, sictrl / knockdown (padj), oriented the same way as our data. The last column applies our own target rule (TE above 0.5, padj &lt; 0.05) to their values, so it is comparable with our calls; it is not a call the authors make.</p>
   <div class="scroll"><table>
-    <thead><tr><th>Gene</th><th>si3d</th><th>si3e</th></tr></thead>
+    <thead><tr><th>Gene</th><th>si3d</th><th>si3e</th><th class="split">Target in their data?</th></tr></thead>
     <tbody>
 %%T5%%
     </tbody>

@@ -93,9 +93,23 @@ ours <- ours %>% left_join(si3e %>% dplyr::select(-symbol), by = "g")
 hela3d <- rd("si3d_vs_sictrl_hela_normoxia_steadystate"); hela3e <- rd("si3e_vs_sictrl_hela_normoxia_steadystate")
 one <- function(d, s) { x <- d$rna_lfc[d$symbol %in% s]; stopifnot(length(x) == 1); x }  # HeLa has NA symbols
 stopifnot("HeLa si3d direction" = one(hela3d, "EIF3D") > 1.5, "HeLa si3e direction" = one(hela3e, "EIF3E") > 1.5)
+# Same target rule as our data (TE LFC > 0.5 and padj < 0.05), applied to their values, so the
+# call is ours and comparable - it is not a call Herrmannova et al. make about these genes.
+hela_call <- function(l, p) case_when(is.na(l) | is.na(p) ~ "not tested",
+                                      l > 0.5 & p < P ~ "target", l < -0.5 & p < P ~ "inhibited",
+                                      TRUE ~ "no")
 other <- gid %>%
-  left_join(hela3d %>% transmute(g, te_hela_si3d = fmt(te_lfc, te_padj)), by = "g") %>%
-  left_join(hela3e %>% transmute(g, te_hela_si3e = fmt(te_lfc, te_padj)), by = "g")
+  left_join(hela3d %>% transmute(g, te_hela_si3d = fmt(te_lfc, te_padj), h3d = hela_call(te_lfc, te_padj)), by = "g") %>%
+  left_join(hela3e %>% transmute(g, te_hela_si3e = fmt(te_lfc, te_padj), h3e = hela_call(te_lfc, te_padj)), by = "g") %>%
+  mutate(hela_target = case_when(
+    h3d == "target" & h3e == "target" ~ "Target of both",
+    h3d == "target" ~ "eIF3d target only",
+    h3e == "target" ~ "eIF3e target only",
+    h3d == "inhibited" & h3e == "inhibited" ~ "Inhibited by both",
+    h3d == "inhibited" ~ "eIF3d-inhibited",
+    h3e == "inhibited" ~ "eIF3e-inhibited",
+    TRUE ~ "Not a target")) %>%
+  dplyr::select(-h3d, -h3e)
 
 # --- binding (05_) ----------------------------------------------------------------------------
 bf <- file.path(out_dir, paste0("05_eif3_binding_lookup_summary_", paste(panel$symbol, collapse = "_"), ".csv"))
