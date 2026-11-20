@@ -3,7 +3,8 @@
 #
 # Usage: Rscript code/finding_positive_controls/08_reporter_panel_table.R
 # Needs: 05_eif3_binding_lookup.R run on the same genes (writes the _<GENES> summary), and
-#        00_mcf7six1_hypoxia_si3d_categories.Rmd knit for hypoxia (MCF7-SIX1 RNA/ribo/category).
+#        00_mcf7six1_hypoxia_si3d_categories.Rmd knit for hypoxia with kd = "si3d" and kd = "si3e"
+#        (MCF7-SIX1 RNA/ribo/category).
 # Writes output/finding_positive_controls/08_reporter_panel_table.csv
 #
 # Direction: every LFC is log2(sictrl / si3d or si3e); positive = the factor promotes.
@@ -47,6 +48,36 @@ ours <- gid %>%
   left_join(n231 %>% transmute(g, te_nor_231 = fmt(te_lfc, te_padj)), by = "g") %>%
   left_join(nmcf %>% transmute(g, te_nor_mcf = fmt(te_lfc, te_padj)), by = "g")
 
+# --- eIF3e knockdown (sictrl vs si3e), hypoxia 1hr, both lines ---------------------------------
+# 231: saved si3e file (TE/ribo/RNA/category). MCF7-SIX1: saved apeglm TE + 00_ knit with
+# kd = "si3e" for ribo/RNA/category. eIF3e target = TE LFC > 0.5 and padj < 0.05, the same rule
+# as the eIF3d target sets; TE LFC < -0.5 and padj < 0.05 is reported as eIF3e-inhibited.
+e231 <- rd("si3e_vs_sictrl_hypoxia_1hr"); emcf <- rd("si3e_vs_sictrl_mcf7six1_hypoxia_1hr")
+cemcf <- read_csv(file.path(out_dir, "mcf7six1_hypoxia_1hr_si3e_rna_ribo_te_categories.csv"),
+                  show_col_types = FALSE) %>% mutate(g = sub("\\..*", "", gene_id))
+stopifnot("231 si3e direction" = e231$rna_lfc[e231$symbol %in% "EIF3E"] > 1.5,
+          "MCF7-SIX1 si3e negation" = isTRUE(all.equal(emcf$te_lfc, -emcf$source_log2FoldChange)),
+          "MCF7-SIX1 si3e RNA direction" = cemcf$rna_lfc[cemcf$symbol %in% "EIF3E"] > 1.5)
+call3e <- function(l, p) case_when(is.na(l) | is.na(p) ~ "not tested",
+                                   l > 0.5 & p < P ~ "target", l < -0.5 & p < P ~ "inhibited",
+                                   TRUE ~ "not a target")
+si3e <- gid %>%
+  left_join(e231 %>% transmute(g, si3e_te_231 = fmt(te_lfc, te_padj), si3e_ribo_231 = fmt(ribo_lfc, ribo_padj),
+                               si3e_rna_231 = fmt(rna_lfc, rna_padj), si3e_category_231 = category,
+                               c231 = call3e(te_lfc, te_padj)), by = "g") %>%
+  left_join(emcf %>% transmute(g, si3e_te_mcf = fmt(te_lfc, te_padj), cmcf = call3e(te_lfc, te_padj)), by = "g") %>%
+  left_join(cemcf %>% transmute(g, si3e_ribo_mcf = fmt(ribo_lfc, ribo_padj), si3e_rna_mcf = fmt(rna_lfc, rna_padj),
+                                si3e_category_mcf = category), by = "g") %>%
+  mutate(eif3e_target = case_when(
+    c231 == "target" & cmcf == "target" ~ "target in both lines",
+    c231 == "target" ~ paste0("target in MDA-MB-231 only (MCF7-SIX1: ", cmcf, ")"),
+    cmcf == "target" ~ paste0("target in MCF7-SIX1 only (MDA-MB-231: ", c231, ")"),
+    c231 == "inhibited" | cmcf == "inhibited" ~
+      sprintf("not a target; inhibited (MDA-MB-231: %s, MCF7-SIX1: %s)", c231, cmcf),
+    TRUE ~ "not a target")) %>%
+  dplyr::select(-c231, -cmcf)
+ours <- ours %>% left_join(si3e %>% dplyr::select(-symbol), by = "g")
+
 # --- other datasets: HeLa eIF3d / eIF3e knockdown ---------------------------------------------
 hela3d <- rd("si3d_vs_sictrl_hela_normoxia_steadystate"); hela3e <- rd("si3e_vs_sictrl_hela_normoxia_steadystate")
 one <- function(d, s) { x <- d$rna_lfc[d$symbol %in% s]; stopifnot(length(x) == 1); x }  # HeLa has NA symbols
@@ -86,6 +117,7 @@ stopifnot(setequal(notes$symbol, panel$symbol))
 tab <- panel %>% left_join(ours, by = "symbol") %>% left_join(other, by = c("symbol", "g")) %>%
   left_join(bind, by = "symbol") %>% left_join(notes, by = "symbol") %>%
   dplyr::rename(gene_id_clean = g)
-stopifnot(nrow(tab) == nrow(panel), !anyNA(tab$te_231), !anyNA(tab$te_mcf), !anyNA(tab$category_mcf))
+stopifnot(nrow(tab) == nrow(panel), !anyNA(tab$te_231), !anyNA(tab$te_mcf), !anyNA(tab$category_mcf),
+          !anyNA(tab$si3e_te_231), !anyNA(tab$si3e_te_mcf), !anyNA(tab$si3e_category_mcf))
 write_csv(tab, file.path(out_dir, "08_reporter_panel_table.csv"))
 print(as.data.frame(tab %>% dplyr::select(-notes, -gene_id_clean)), right = FALSE)
