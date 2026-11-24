@@ -1,0 +1,278 @@
+---
+title: "CDS reporter design 21 - length reporter ORFs for Benchling"
+author: "Kate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+params:
+  sequences_csv: "17_pest_hibit_ladder_sequences_upto3x_expressed.csv"
+  export_tag: "lengthladder"
+---
+
+```{r}
+# Run chunk by chunk as well as knit. Knitting supplies `params` from the YAML
+# above; running interactively does not, so a stale `params` left in the global
+# environment by a previous notebook is dropped here and rebuilt below.
+if (exists("params") && !isTRUE(getOption("knitr.in.progress"))) rm(params)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r interactive_params}
+# Defaults for interactive use; must mirror the YAML header above.
+if (!isTRUE(getOption("knitr.in.progress"))) {
+  params <- list(
+    sequences_csv = "17_pest_hibit_ladder_sequences_upto3x_expressed.csv",
+    export_tag    = "lengthladder"
+  )
+}
+```
+
+# Overview
+
+Exports the four rungs of the destabilised length ladder built in
+`17_pest_hibit_ladder.Rmd` as plain ORFs, for import into Benchling:
+
+```
+3xFLAG - W - PEST - W - hiBIT                                   294 nt
+3xFLAG - W - 1xGFP - W - PEST - W - hiBIT                     1,053 nt
+3xFLAG - W - 2xGFP - W - PEST - W - hiBIT                     1,812 nt
+3xFLAG - W - 3xGFP - W - PEST - W - hiBIT                     2,571 nt   (W = Waldo linker)
+```
+
+**No cloning sequence is added here.** Vector backbone, homology arms and any
+assembly junctions are added in Benchling. What leaves this notebook is the
+coding sequence and nothing else, so whatever is pasted around it in Benchling
+is the only thing that can change it.
+
+**This notebook does not design sequence either.** Every base comes from `17_`'s
+exported CSV; the job here is to verify those ORFs are intact and reformat them.
+The firefly luc+PEST normaliser in that CSV is **dropped** - it is not a member
+of the length series (different vector UTRs, a non-human ORF and 2.8x the CDS
+length), so it is cloned on its own terms, not as a fifth rung.
+
+```{r libraries}
+library(tidyverse)
+library(here)
+library(readxl)
+library(Biostrings)
+
+source(here("code", "cds_reporter_design", "reporter_helpers.R"))
+```
+
+# 1. Read the ladder sequences
+
+`cds_ordered` is the full ORF **including the terminal stop codon** - that is
+the sequence to synthesise, and it is what gets exported. `cds_sense` is the
+same ORF without the stop and is what the length and GC columns in `17_`
+describe.
+
+```{r read_ladder}
+seq_path <- here("output", "cds_reporter_design", params$sequences_csv)
+stopifnot("Notebook 17 sequence CSV not found - knit 17_pest_hibit_ladder.Rmd first" =
+            file.exists(seq_path))
+
+ladder_all <- read_csv(seq_path, show_col_types = FALSE)
+
+expected_cols <- c("construct", "gfp_copies", "n_waldo", "ecori", "cds_length",
+                   "nt_ordered", "protein_aa", "gc_pct", "gc3_pct",
+                   "cds_ordered", "cds_sense")
+stopifnot(all(expected_cols %in% colnames(ladder_all)))
+
+# The firefly normaliser is the one row with no eGFP copy count.
+ladder <- ladder_all %>%
+  filter(!is.na(gfp_copies)) %>%
+  mutate(gfp_copies = as.integer(gfp_copies)) %>%
+  arrange(gfp_copies)
+
+stopifnot(
+  "Expected exactly four ladder rungs after dropping firefly" = nrow(ladder) == 4,
+  "Rungs are not 0-3 eGFP copies" = identical(ladder$gfp_copies, 0:3),
+  "Firefly was not present to drop - check the input CSV" =
+    nrow(ladder_all) == nrow(ladder) + 1
+)
+
+ladder %>%
+  dplyr::select(construct, gfp_copies, cds_length, nt_ordered, protein_aa,
+                gc_pct, gc3_pct, ecori) %>%
+  mutate(across(where(is.double), ~ round(.x, 1))) %>%
+  as.data.frame() %>% print(row.names = FALSE)
+```
+
+# 2. Verify the ORFs
+
+These re-derive from the bases themselves rather than trusting `17_`'s columns,
+so a wrong file or a mangled column is caught here and not at the bench.
+
+```{r validate_orfs}
+orf <- ladder$cds_ordered
+names(orf) <- ladder$construct
+
+stopifnot(
+  "An ORF contains a character other than A/C/G/T" =
+    all(str_detect(orf, "^[ACGT]+$")),
+  "An ORF does not start with ATG" = all(str_starts(orf, "ATG")),
+  "An ORF length is not a multiple of 3" = all(nchar(orf) %% 3 == 0),
+  "An ORF length disagrees with the recorded nt_ordered" =
+    all(nchar(orf) == ladder$nt_ordered),
+  "nt_ordered is not cds_length + one stop codon" =
+    all(ladder$nt_ordered == ladder$cds_length + 3),
+  "cds_sense is not cds_ordered minus the stop" =
+    all(substr(orf, 1, ladder$cds_length) == ladder$cds_sense)
+)
+
+# Translation: exactly one stop, and it is the last residue.
+prot <- map_chr(orf, ~ as.character(Biostrings::translate(Biostrings::DNAString(.x))))
+
+stopifnot(
+  "An ORF does not end in a stop codon" = all(str_ends(prot, "\\*")),
+  "An ORF carries an internal stop codon" = all(str_count(prot, "\\*") == 1),
+  "Translated length disagrees with the recorded protein_aa" =
+    all(nchar(prot) - 1 == ladder$protein_aa),
+  "EcoRI site count does not match the pinned Waldo linker count" =
+    all(str_count(orf, "GAATTC") == ladder$ecori)
+)
+```
+
+The peptide-level spot-checks need the identity of each part. Those constants
+are **imported from the same spreadsheet `17_` built the constructs from and
+translated here**, never retyped - a transcription error in a reference peptide
+would make the check agree with itself and pass on a wrong construct.
+
+```{r validate_parts}
+parts_xlsx <- here("accessories", "cds seq.xlsx")
+stopifnot("accessories/cds seq.xlsx not found" = file.exists(parts_xlsx))
+
+# Same parse as 17_, so the two notebooks cannot read the sheet differently.
+parts_tbl <- read_excel(parts_xlsx)
+names(parts_tbl)[1] <- "construct"
+parts_in <- parts_tbl %>%
+  filter(!is.na(construct), !is.na(cds)) %>%
+  transmute(part = tolower(str_trim(construct)),
+            seq  = toupper(gsub("\\s", "", cds)))
+stopifnot("Duplicate part names in cds seq.xlsx" = !any(duplicated(parts_in$part)))
+pseq <- setNames(parts_in$seq, parts_in$part)
+
+checked <- c("hibit", "flag3x", "hpest")
+stopifnot(
+  "cds seq.xlsx is missing a part this notebook checks" =
+    all(checked %in% names(pseq)),
+  "A checked part contains non-ACGT characters" =
+    all(!grepl("[^ACGT]", pseq[checked])),
+  "A checked part is not divisible by 3" =
+    all(nchar(pseq[checked]) %% 3 == 0)
+)
+
+aa_of     <- function(s) as.character(Biostrings::translate(Biostrings::DNAString(s)))
+hibit_aa  <- aa_of(pseq[["hibit"]])
+flag3x_aa <- aa_of(pseq[["flag3x"]])
+hpest_aa  <- aa_of(pseq[["hpest"]])
+
+# The degron part and reporter_helpers.R's PEST_AA must be the same 40-mer; if
+# they drift apart the firefly normaliser no longer carries the ladder's degron.
+stopifnot(
+  "The hpest part does not match PEST_AA in reporter_helpers.R" =
+    hpest_aa == PEST_AA
+)
+
+stopifnot(
+  "A rung does not begin with Met followed by the 3xFLAG peptide" =
+    all(substr(prot, 2, 1 + nchar(flag3x_aa)) == flag3x_aa),
+  "A rung does not end with the HiBiT peptide" =
+    all(str_ends(prot, fixed(paste0(hibit_aa, "*")))),
+  "HiBiT appears more than once in a rung" =
+    all(str_count(prot, fixed(hibit_aa)) == 1),
+  "A rung is missing the PEST degron" =
+    all(str_detect(prot, fixed(hpest_aa))),
+  "The PEST degron appears more than once in a rung" =
+    all(str_count(prot, fixed(hpest_aa)) == 1)
+)
+
+# Independent length reconstruction from 17_'s own part table: the parts of a
+# rung plus one stop codon must account for every base of its ORF.
+parts_path <- here("output", "cds_reporter_design",
+                   str_replace(params$sequences_csv, "_sequences_", "_parts_"))
+stopifnot("Notebook 17 parts CSV not found" = file.exists(parts_path))
+
+part_sums <- read_csv(parts_path, show_col_types = FALSE) %>%
+  group_by(construct) %>% summarise(parts_nt = sum(nt), .groups = "drop")
+
+chk <- ladder %>% dplyr::select(construct, nt_ordered) %>%
+  left_join(part_sums, by = "construct")
+stopifnot(
+  "A rung has no matching row in the parts table" = !any(is.na(chk$parts_nt)),
+  "Parts plus one stop codon do not reconstruct the ORF length" =
+    all(chk$parts_nt + 3 == chk$nt_ordered)
+)
+
+cat("4/4 ORFs verified: ATG start, single terminal stop, 3xFLAG head,",
+    "single PEST degron,\nterminal HiBiT, EcoRI count pinned to the linker",
+    "count, and part lengths reconstruct every ORF.\n")
+```
+
+# 3. Name and export
+
+```{r build_export}
+design <- ladder %>%
+  mutate(
+    # A construct id must not contain whitespace: downstream tools write and
+    # re-read files named after it, and a space silently breaks that round trip.
+    construct_id = str_replace_all(construct, "[^A-Za-z0-9]+", "_"),
+    seq_name     = paste(params$export_tag, construct_id, sep = "_")
+  )
+
+stopifnot(
+  "A sequence name contains whitespace" = !any(str_detect(design$seq_name, "\\s")),
+  "Sequence names are not unique" = !any(duplicated(design$seq_name))
+)
+
+benchling <- design %>%
+  transmute(
+    Name        = seq_name,
+    Bases       = cds_ordered,
+    Description = sprintf(
+      "%s; %d eGFP cop%s; %d nt ORF incl. stop; %d aa; GC %.1f%%, GC3 %.1f%%; %d EcoRI (Waldo linkers); from 17_pest_hibit_ladder; backbone and homology arms NOT included",
+      construct, gfp_copies, ifelse(gfp_copies == 1, "y", "ies"), nt_ordered, protein_aa, gc_pct, gc3_pct, ecori)
+  )
+
+as.data.frame(benchling %>% mutate(Bases = paste0(substr(Bases, 1, 24), "...")) ) %>%
+  print(row.names = FALSE)
+```
+
+Two files, both under `output/cds_reporter_design/`. The CSV is for Benchling's
+bulk DNA-sequence import (`Name` / `Bases` / `Description`); the FASTA is for
+drag-and-drop import, whichever route is less friction.
+
+```{r export}
+outdir <- here("output", "cds_reporter_design")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+tag <- params$export_tag
+
+csv_path <- file.path(outdir, paste0("21_benchling_import_", tag, ".csv"))
+write_csv(benchling, csv_path)
+
+fasta_path <- file.path(outdir, paste0("21_length_reporter_orfs_", tag, ".fasta"))
+Biostrings::writeXStringSet(
+  Biostrings::DNAStringSet(setNames(design$cds_ordered, design$seq_name)),
+  fasta_path)
+
+# Round trip: both files on disk must give back exactly the ORFs verified above.
+rt_fa  <- Biostrings::readDNAStringSet(fasta_path)
+rt_csv <- read_csv(csv_path, show_col_types = FALSE)
+stopifnot(
+  "FASTA round trip does not reproduce the ORFs" =
+    identical(as.character(rt_fa), setNames(design$cds_ordered, design$seq_name)),
+  "CSV round trip does not reproduce the ORFs" =
+    identical(rt_csv$Bases, design$cds_ordered),
+  "CSV round trip does not reproduce the names" =
+    identical(rt_csv$Name, design$seq_name)
+)
+
+cat("Wrote:\n ", csv_path, "\n ", fasta_path, "\n")
+```

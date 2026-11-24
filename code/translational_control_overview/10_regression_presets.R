@@ -167,6 +167,25 @@ REG_PRESETS <- list(
                              # stratify on the spike-in y so both arms get the same split
                              split_strata_csv = "translation_categories_si3d_vs_sictrl_hypoxia_1hr.csv"))
     )
+  }),
+  # The same spike-in question on the siCTRL cells' own hypoxic response: TE log2(hypoxia /
+  # normoxia) at 1hr, no knockdown (Kate, 2026-11-24). Features identical to `spikein`. Spike
+  # outcome from 10y_; no-spike outcome from 10yn_ (timecourse_qc.Rmd's deseq_results_1hr_nospike,
+  # same counts and samples). Paired the same way: the no-spike arm stratifies on the spike-in y.
+  spikein_ctrl = local({
+    spike_csv   <- "sictrl_hypoxia_vs_normoxia_te_1hr.csv"
+    nospike_csv <- "sictrl_hypoxia_vs_normoxia_te_1hr_nospike.csv"
+    base <- list(gene = "ctrl", condition = "hypvsnor", outcome_kind = "te_condition",
+                 include_blocks = "intrinsic", matrix_rds = "feature_matrix_tco_posgc.rds",
+                 annotation_csv = "feature_annotation_tco_posgc.csv",
+                 exclude_features = "cds_gc,transcript_gc")
+    list(
+      spike   = c(base, list(feature_set_label = "tcoreg_posgc_intrinsic", outcome_csv = spike_csv,
+                             outcome_desc = "siCTRL TE log2(hypoxia / normoxia), spike-in normalized")),
+      nospike = c(base, list(feature_set_label = "tcoreg_posgc_intrinsic_nospike",
+                             outcome_csv = nospike_csv, split_strata_csv = spike_csv,
+                             outcome_desc = "siCTRL TE log2(hypoxia / normoxia), no spike-in (median-of-ratios)"))
+    )
   })
 )
 
@@ -176,7 +195,8 @@ PRESET_FAMILIES_REG <- list(
   population  = NA_character_,
   g4          = "g4",
   peptide     = c("nascent_peptide", "polya_track"),
-  spikein     = NA_character_
+  spikein     = NA_character_,
+  spikein_ctrl = NA_character_
 )
 
 # --- one representative per correlated cluster -------------------------------------------
